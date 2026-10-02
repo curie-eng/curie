@@ -600,6 +600,8 @@ def build_memory_tools(
                 f"Refused: that fact is too large to store as one {memory} memory entry "
                 f"({exc}). Nothing was saved; state it more briefly."
             )
+        if isinstance(exc, MemoryFull) and exc.limit == "facts":
+            return _approval_error(f"Refused: {memory} memory is full: {exc}. Nothing was saved.")
         if isinstance(exc, MemoryFull):
             return _approval_error(f"Refused: {memory} memory is full ({exc}). Nothing was saved.")
         if isinstance(exc, FactNotFound):
@@ -610,7 +612,14 @@ def build_memory_tools(
     def ok(payload: dict[str, Any]) -> dict[str, Any]:
         return {"content": [{"type": "text", "text": json.dumps(payload)}]}
 
-    @tool(REMEMBER_TOOL, "Save one new fact to memory. Returns its id.", _REMEMBER_SCHEMA)
+    @tool(
+        REMEMBER_TOOL,
+        "Save one new fact to memory and return its id. This, or update for a fact "
+        "that already exists, is the only way to keep something for a later "
+        "conversation: a request to remember, note or make something stick, or to set "
+        "a standing instruction, means calling one of them.",
+        _REMEMBER_SCHEMA,
+    )
     async def remember(args: dict[str, Any]) -> dict[str, Any]:
         store, problem = pick(args)
         if store is None:

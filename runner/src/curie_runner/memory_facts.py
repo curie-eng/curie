@@ -64,6 +64,8 @@ Don't remember descriptions of people beyond their role, data and figures that b
 
 Agent memory: don't save anything here.
 
+Nothing is kept for later unless a remember or update call succeeds. When someone asks you to remember something worth keeping, make it stick, or set a standing instruction, and the rules above allow it, save it to channel memory with remember. If they want it in every channel, still save it to channel memory and tell them it only applies in this channel. Never say you saved, noted or will remember something unless that call succeeded. If it was refused or failed, say so.
+
 Use remember for a new fact, update to change a fact by its id, and forget to remove one. Save one fact per call."""  # noqa: E501
 
 # The longest statement the tools accept (#1461 review F4), and how many facts
@@ -93,16 +95,17 @@ class FactNotFound(MemoryFactsError):
 
 
 class MemoryFull(MemoryFactsError):
-    """The state API refused the write at one of its size caps (a 413).
+    """A write was refused because the memory, or this one fact, is too big.
 
-    ``limit`` says which: ``"value"`` when this one fact is over the per-value
-    cap, ``"namespace"`` when the memory as a whole is at its cap. Only the
-    second means the memory is full.
+    ``limit`` says which: ``"value"`` when this one fact is over the state API's
+    per-value cap, ``"namespace"`` when the memory as a whole is at the state
+    API's cap (both a 413), and ``"facts"`` when the memory already holds
+    ``MAX_FACTS_PER_MEMORY`` facts, the most boot shows the agent (#3624).
     """
 
-    def __init__(self, detail: str) -> None:
+    def __init__(self, detail: str, *, limit: str | None = None) -> None:
         super().__init__(detail)
-        self.limit = "value" if "per-value" in detail else "namespace"
+        self.limit = limit or ("value" if "per-value" in detail else "namespace")
 
 
 @dataclass(frozen=True)
@@ -182,8 +185,8 @@ class MemoryFactsStore:
     def _key_url(self, key: str) -> str:
         return f"{self._base}/{quote(key, safe='')}"
 
-    async def list(self) -> list[Fact]:
-        """Every fact in the namespace, newest first. Reserved keys are skipped."""
+    async def _entries(self) -> list[Any]:
+        """The namespace's raw ``{key, value}`` entries; empty when it does not exist."""
 
         async with (
             aiohttp.ClientSession(timeout=_TIMEOUT) as session,
@@ -196,8 +199,13 @@ class MemoryFactsStore:
             payload = await resp.json()
         if not isinstance(payload, list):
             raise MemoryFactsError("memory list is not a JSON array")
+        return payload
+
+    async def list(self) -> list[Fact]:
+        """Every fact in the namespace, newest first. Reserved keys are skipped."""
+
         facts: list[Fact] = []
-        for entry in payload:
+        for entry in await self._entries():
             if not isinstance(entry, Mapping):
                 continue
             fact = _parse_fact(str(entry.get("key") or ""), entry.get("value"))
@@ -253,8 +261,26 @@ class MemoryFactsStore:
         """Store a new fact under a freshly minted id and return the id.
 
         Never replaces a fact: every call mints its own ``fact-<uuid4>`` key.
+        Refused with ``MemoryFull`` (``limit == "facts"``), writing nothing, when
+        the memory already holds ``MAX_FACTS_PER_MEMORY`` facts: boot shows the
+        agent only that many, so one more would silently push the oldest out of
+        the prompt (#3624). Only facts boot would show count, which is what
+        ``list()`` returns: ``log``, ``guidance`` and malformed ``fact-*``
+        entries do not.
+
+        This check takes no lock. Any number of saves that run concurrently can
+        each pass it below the limit and all land, so a memory can go over the
+        limit. Boot then shows the newest ``MAX_FACTS_PER_MEMORY`` facts and says
+        how many it left out. That is a known, accepted limit.
         """
 
+        held = len(await self.list())
+        if held >= MAX_FACTS_PER_MEMORY:
+            raise MemoryFull(
+                f"it holds {held} facts, the most the agent can be shown "
+                f"({MAX_FACTS_PER_MEMORY}); update or forget an existing fact to make room",
+                limit="facts",
+            )
         fact_id = f"{FACT_KEY_PREFIX}{uuid.uuid4().hex}"
         await self._put(fact_id, _fact_value(statement, author, session_id))
         return fact_id

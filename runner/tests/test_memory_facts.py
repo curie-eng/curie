@@ -682,6 +682,139 @@ def test_an_unknown_id_is_reported_as_not_found(
 
 
 # --------------------------------------------------------------------------- #
+# 2a. Nothing is saved without a memory tool call (#3625)
+#
+# A compound request ("sign every reply in every channel", plus an aside) drew
+# the harness ``Skill`` tool instead of ``remember``, and the agent then said it
+# had "noted that as a standing instruction" with nothing saved. The guidance and
+# the ``remember`` description must both say that a memory tool call is the only
+# way anything is kept, and that the agent must not claim a save it did not make.
+# These pin short, stable phrases, not whole paragraphs, so the prose can be
+# reworded without breaking them. The API's copy of the guidance is held to this
+# text byte for byte by tests/test_memory_guidance_parity.py.
+# --------------------------------------------------------------------------- #
+
+# The rule: "nothing is saved" (or "kept") and, later in the same sentence,
+# "unless" -- the condition being a memory tool call.
+_NOTHING_UNLESS = re.compile(r"nothing is (?:saved|kept)[^.]*\bunless\b", re.IGNORECASE)
+# The ban on claiming: a negated "say"/"claim"/"tell", followed in the same
+# sentence by one of the claim words ("saved", "noted", "remember").
+_NO_CLAIM = re.compile(
+    r"(?:do not|don't|never|must not)\s+(?:say|claim|tell)[^.]*\b(?:saved|noted|remember)",
+    re.IGNORECASE,
+)
+
+
+def _sentences(text: str) -> list[str]:
+    return [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+
+
+def test_default_guidance_says_nothing_is_kept_without_a_memory_tool_call() -> None:
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    rules = [s for s in _sentences(DEFAULT_GUIDANCE) if _NOTHING_UNLESS.search(s)]
+    assert rules, DEFAULT_GUIDANCE
+    # The sentence carrying the rule names the tool whose success makes a save real.
+    assert any("remember" in s for s in rules), rules
+
+
+def test_default_guidance_forbids_claiming_a_save_that_did_not_happen() -> None:
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    assert _NO_CLAIM.search(DEFAULT_GUIDANCE), DEFAULT_GUIDANCE
+
+
+def _published_descriptions(options: Any) -> dict[str, str]:
+    """The live name and description of every tool the booted ``curie`` server lists."""
+
+    async def listed(instance: Any) -> list[tuple[str, str]]:
+        entry = instance.get_request_handler("tools/list")
+        result = await entry.handler(None, mcp_types.PaginatedRequestParams())
+        return [(tool.name, tool.description or "") for tool in result.tools]
+
+    instance = options.mcp_servers[APPROVAL_SERVER_NAME]["instance"]
+    return {
+        f"mcp__{APPROVAL_SERVER_NAME}__{name}": description
+        for name, description in anyio.run(listed, instance)
+    }
+
+
+def test_remember_description_says_it_is_the_only_way_to_keep_something(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, _prompt = _boot_options(monkeypatch, tmp_path, FakeStateApi(), channel=True)
+    description = _published_descriptions(options)[REMEMBER]
+    lowered = description.lower()
+    # "the only way" to keep something for later: no other tool saves.
+    assert "only way" in lowered, description
+    # A request phrased as a standing instruction means calling this tool.
+    assert "standing instruction" in lowered, description
+
+
+def test_remember_description_names_update_as_the_other_way_to_keep_something(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review L2: "the only way" must not leave out ``update``, or the model may
+    # read it literally and add a duplicate fact instead of changing the one
+    # that exists. The guidance already says "a remember or update call".
+    options, _prompt = _boot_options(monkeypatch, tmp_path, FakeStateApi(), channel=True)
+    description = _published_descriptions(options)[REMEMBER]
+    assert re.search(r"\bupdate\b", description, re.IGNORECASE), description
+
+
+def _save_paragraph() -> str:
+    """The paragraph of the default guidance that says when to call remember."""
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    paragraphs = [p for p in DEFAULT_GUIDANCE.split("\n\n") if "standing instruction" in p]
+    assert len(paragraphs) == 1, DEFAULT_GUIDANCE
+    return paragraphs[0]
+
+
+def test_save_paragraph_sends_standing_instructions_to_channel_memory() -> None:
+    # Review M1: the paragraph must name channel memory as where a standing
+    # instruction or "make it stick" request goes. Without it, a request to apply
+    # something "in every channel" pulls the model toward agent memory, which
+    # the guidance says not to write.
+    paragraph = _save_paragraph()
+    assert "channel memory" in paragraph.lower(), paragraph
+
+
+def test_save_paragraph_says_a_cross_channel_request_only_applies_here() -> None:
+    # Review M1: for a request to apply everywhere, the agent saves to channel
+    # memory and tells the person it only applies in this channel. Pinned as
+    # "only", then "this channel" or "here", in one sentence of the paragraph.
+    paragraph = _save_paragraph()
+    only_here = re.compile(r"\bonly\b[^.]*\b(?:this channel|here)\b", re.IGNORECASE)
+    assert any(only_here.search(s) for s in _sentences(paragraph)), paragraph
+
+
+def test_default_guidance_still_says_not_to_save_to_agent_memory() -> None:
+    # The M1 fix must not drop or soften the agent-memory ban.
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    assert "Agent memory: don't save anything here." in DEFAULT_GUIDANCE, DEFAULT_GUIDANCE
+
+
+# Review M2: the call-remember rule must be conditioned on the don't-save list
+# above it, not override it ("remember my API key" must not win). The pinned
+# phrase is one of "worth keeping", "allowed above" or "guidance allows", in the
+# same sentence as "remember". Any of the three ties the rule back to what the
+# guidance permits; the short alternation keeps the test from dictating prose.
+_ALLOWED_BY_GUIDANCE = re.compile(r"worth keeping|allowed above|guidance allows", re.IGNORECASE)
+
+
+def test_save_paragraph_limits_the_remember_call_to_what_the_guidance_allows() -> None:
+    paragraph = _save_paragraph()
+    tied = [
+        s
+        for s in _sentences(paragraph)
+        if "remember" in s.lower() and _ALLOWED_BY_GUIDANCE.search(s)
+    ]
+    assert tied, paragraph
+
+
+# --------------------------------------------------------------------------- #
 # 3. The toolPolicy exemption set
 # --------------------------------------------------------------------------- #
 
@@ -1518,3 +1651,160 @@ def test_a_statement_copying_the_leading_attribution_renders_after_the_real_auth
     [line] = [text for text in block.splitlines() if text.startswith(f"- [{A_NEW}] ")]
     assert line.startswith(f"- [{A_NEW}] UMALLORY9 on 2026-09-30 stated: "), line
     assert line == f"- [{A_NEW}] UMALLORY9 on 2026-09-30 stated: {statement}", line
+
+
+# #3624: a save past the boot limit is refused, not silently aged out -----------
+
+
+def _seed_facts(api: FakeStateApi, ns: str, count: int) -> list[str]:
+    """Seed ``count`` facts with distinct, increasing timestamps; return their ids."""
+
+    from datetime import timedelta
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    ids = [f"fact-{i:032x}" for i in range(count)]
+    for i, fact_id in enumerate(ids):
+        stamp = (start + timedelta(minutes=i)).isoformat().replace("+00:00", "Z")
+        api.seed(ns, fact_id, _fact_value(f"fact {i}", stamp))
+    return ids
+
+
+def test_add_is_refused_when_the_memory_holds_the_boot_limit() -> None:
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY, MemoryFull
+
+    api = FakeStateApi()
+    _seed_facts(api, AGENT_NS, MAX_FACTS_PER_MEMORY)
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            with pytest.raises(MemoryFull):
+                await _store(server).add(statement="one too many", author="U1", session_id="s")
+
+    anyio.run(go)
+    assert api.writes() == []
+    assert len(_facts(api, AGENT_NS)) == MAX_FACTS_PER_MEMORY
+
+
+def test_add_is_refused_when_the_memory_holds_more_than_the_boot_limit() -> None:
+    # A memory already past the limit (saved before the refusal existed) stays
+    # refused: the check is "at or over", not "exactly at".
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY, MemoryFull
+
+    api = FakeStateApi()
+    _seed_facts(api, AGENT_NS, MAX_FACTS_PER_MEMORY + 6)
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            with pytest.raises(MemoryFull):
+                await _store(server).add(statement="x", author="U1", session_id="s")
+
+    anyio.run(go)
+    assert api.writes() == []
+
+
+def test_add_succeeds_one_below_the_boot_limit_and_reaches_it() -> None:
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY
+
+    api = FakeStateApi()
+    _seed_facts(api, AGENT_NS, MAX_FACTS_PER_MEMORY - 1)
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            fact_id = await _store(server).add(
+                statement="the last one", author="U1", session_id="s"
+            )
+            assert FACT_KEY.match(fact_id), fact_id
+
+    anyio.run(go)
+    assert len(_facts(api, AGENT_NS)) == MAX_FACTS_PER_MEMORY
+
+
+def test_the_reserved_keys_do_not_count_toward_the_boot_limit() -> None:
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY
+
+    api = FakeStateApi()
+    _seed_facts(api, AGENT_NS, MAX_FACTS_PER_MEMORY - 1)
+    api.seed(AGENT_NS, "log", [{"content": "legacy"}])
+    api.seed(AGENT_NS, "guidance", {"text": "operator guidance"})
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            await _store(server).add(statement="still fits", author="U1", session_id="s")
+
+    anyio.run(go)
+    assert len(_facts(api, AGENT_NS)) == MAX_FACTS_PER_MEMORY
+
+
+def test_malformed_fact_entries_do_not_count_toward_the_boot_limit() -> None:
+    # Boot shows only the facts `list()` parses, and `forget` cannot remove the
+    # rest, so a malformed `fact-*` entry must not take a slot.
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY
+
+    api = FakeStateApi()
+    _seed_facts(api, AGENT_NS, MAX_FACTS_PER_MEMORY - 1)
+    api.seed(AGENT_NS, f"fact-{'a' * 32}", "just a string")
+    api.seed(AGENT_NS, f"fact-{'b' * 32}", {"author": "U1", "stated_at": "2026-09-01T00:00:00Z"})
+    api.seed(AGENT_NS, f"fact-{'c' * 32}", {"statement": ""})
+    api.seed(AGENT_NS, f"fact-{'d' * 32}", {"statement": 42})
+    api.seed(AGENT_NS, "fact-not-a-uuid", _fact_value("odd key", "2026-09-01T00:00:00Z"))
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            store = _store(server)
+            assert len(await store.list()) == MAX_FACTS_PER_MEMORY - 1
+            await store.add(statement="still fits", author="U1", session_id="s")
+            assert len(await store.list()) == MAX_FACTS_PER_MEMORY
+
+    anyio.run(go)
+
+
+def test_remember_is_refused_when_memory_holds_the_boot_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The case from #3624: past the limit the oldest fact would silently leave
+    # the prompt, so the save is refused and reported to the agent instead.
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY
+
+    api = FakeStateApi()
+    ids = _seed_facts(api, CHANNEL_NS, MAX_FACTS_PER_MEMORY)
+    [result] = _run_tools(
+        monkeypatch,
+        tmp_path,
+        api,
+        [(REMEMBER, {"memory": "channel", "statement": "the mailbox is ap-inbox"})],
+    )
+    text = _text(result)
+    assert _is_error(result), text
+    assert "Refused" in text, text
+    assert "Nothing was saved" in text, text
+    assert "forget" in text.lower(), text
+    assert set(_facts(api, CHANNEL_NS)) == set(ids)
+    assert len(_facts(api, CHANNEL_NS)) == MAX_FACTS_PER_MEMORY
+    assert not any(m == "PUT" for m, _p in api.writes()), api.writes()
+
+
+def test_update_and_forget_still_work_at_the_boot_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY
+
+    api = FakeStateApi()
+    ids = _seed_facts(api, CHANNEL_NS, MAX_FACTS_PER_MEMORY)
+    kept, dropped = ids[0], ids[1]
+    results = _run_tools(
+        monkeypatch,
+        tmp_path,
+        api,
+        [
+            (UPDATE, {"memory": "channel", "id": kept, "statement": "rewritten"}),
+            (FORGET, {"memory": "channel", "id": dropped}),
+            # Forgetting made room, so the next save fits.
+            (REMEMBER, {"memory": "channel", "statement": "now it fits"}),
+        ],
+    )
+    assert not any(_is_error(r) for r in results), [_text(r) for r in results]
+    facts = _facts(api, CHANNEL_NS)
+    assert facts[kept]["statement"] == "rewritten"
+    assert dropped not in facts
+    assert len(facts) == MAX_FACTS_PER_MEMORY
+    assert "now it fits" in {v["statement"] for v in facts.values()}
