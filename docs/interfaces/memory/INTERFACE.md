@@ -75,8 +75,9 @@ starts with `eval:` (#1909): that path omits the ref so the runner boots
 Beside the legacy `log`, memory also holds **facts**, read and written by
 `runner/src/curie_runner/memory_facts.py::MemoryFactsStore` rather than through
 the `MemoryStore` port. A fact is one key `fact-<32 hex>` whose value is
-`{statement, author, stated_at, session_id}`. Facts live in two namespaces
-reached with the same memory token:
+`{statement, author, stated_at, session_id}`. Facts live in two namespaces,
+read with the long-lived memory token and written with the turn's write
+credential (see "The memory credential" below):
 
 - **Agent memory**, at `CURIE_MEMORY_REF`, loaded in every channel. It also
   holds two reserved keys that are never facts: `log` (above) and `guidance`
@@ -117,10 +118,43 @@ off for this agent, nothing said here is kept for later conversations, and the
 agent must never say it saved, noted or will remember something. The
 tools take `memory: agent|channel`; the author is the turn's sender, never a
 tool argument. A write the state API refuses at its cap is reported to the model
-as refused. So is a `remember` into a memory that already holds 200 facts, the
+as refused, and so is one it refuses for the credential (a 403, `MemoryRefused`:
+"this memory cannot be written from this conversation"). So is a `remember` into a memory that already holds 200 facts, the
 most boot loads, so no fact silently leaves the prompt; `update` and `forget`
 still work there. The tools are exempt from bundle toolPolicy by published
 name, and the worker leaves them out of change receipts.
+
+### The memory credential (ADR-0188)
+
+The state API, not the sandbox, decides what a sandbox may do on the `memory`
+namespace (`apps/api/src/curie_api/routers/state.py::_check_memory_reach`).
+There are two sandbox credentials, both `scope="state"` tokens:
+
+- **Long-lived, read-only.** `CURIE_MEMORY_TOKEN` (and `CURIE_HISTORY_TOKEN`),
+  minted in `boot_env` with claims `{binding, memory: "read"}`. `binding` is
+  the boot binding's `"<kind>:<address>"`, or JSON null when the turn has none.
+- **Per turn, write.** Minted by
+  `apps/worker/src/curie_worker/binding.py::BindingResolver.turn_memory_token`
+  only when the agent has memory writes on, the turn names a binding and it is
+  not eval-isolated, with claims `{binding, memory: "write", sender, turn}`.
+  `sender` is the turn's `event.user`, or `<no person>`; `turn` is the queued
+  event id. It expires after the turn's remaining delivery budget (capped at
+  24 hours) plus 60 seconds. It rides the runner POST as `Event.memory_token`
+  (MEMORY-TOKEN-1..3), never the env. The runner keeps it on
+  `MemoryTurn.write_token`, and the tool stores present it, falling back to the
+  env token when the event has none.
+
+On `memory` the API allows a sandbox credential: agent memory; channel memory
+only for the binding its `binding` claim names (otherwise 403, checked before
+the binding lookup so it reveals nothing); writes (PUT, DELETE) only with
+`memory: "write"` and only on fact keys (`fact-` plus 32 lowercase hex, so
+never `guidance` or `log`); no POST append. On a PUT it stores the `sender`
+claim as the fact's `author`, whatever the body says, and refuses a value that
+is not a JSON object (422). The namespace listing for another binding leaves
+out its `memory` row. A token with no `memory` claim (from a worker older than
+ADR-0188) is read-only on agent memory and refused on channel memory, with a
+warning naming "legacy sandbox token". The platform key keeps full reach and
+the body's author.
 
 Upgrade order: a runner older than `CURIE_MEMORY_WRITES` ignores the flag and
 mounts the memory tools whenever it gets a channel ref. A newer worker sends
@@ -134,9 +168,11 @@ change.
 - **Scoped memory token (was: shared API key).** Earlier the state API's one
   shared platform key was forwarded into the sandbox as `CURIE_MEMORY_TOKEN`,
   granting that key's full scope. ADR-0033 (#410) closed that: the worker now
-  mints a scoped, agent-bound, HMAC-signed `state` token per turn, accepted only
+  mints a scoped, agent-bound, HMAC-signed `state` token per claim, accepted only
   by the state router and bound to this agent's namespace, so the sandbox
-  credential can no longer resolve approvals or reach another agent's state. The
+  credential can no longer resolve approvals or reach another agent's state.
+  ADR-0188 (#3623) narrows it further on memory, to its own channel and to
+  reads; writes need the per-turn credential above. The
   platform key still authenticates the state router for operators, the CLI, and
   the worker's own control-plane calls.
 - **Consolidation is an opt-in capability, not part of the port.** The core

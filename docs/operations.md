@@ -1919,18 +1919,30 @@ data too.
 ### Agent memory (0.12.0)
 
 0.12.0 adds agent and channel memory, with writes off by default (see
-[Letting the agent remember facts](#letting-the-agent-remember-facts)). Until
-[ADR-0188](adr/0188-the-sandbox-memory-credential-is-scoped-to-its-own-channel.md)
-is implemented, only the memory tools keep each channel's memory to itself.
-Code running in an agent's sandbox, such as a Bash command or a hook, can read
-and write the memory of any channel that agent serves, and can set any author
-on a fact it saves. It cannot reach another agent's memory. Turning writes off
-removes the tools but does not stop that code: it can still overwrite the
-agent's memory guidance and add agent facts.
+[Letting the agent remember facts](#letting-the-agent-remember-facts)). The
+state API holds each sandbox to its own channel's memory
+([ADR-0188](adr/0188-the-sandbox-memory-credential-is-scoped-to-its-own-channel.md)):
+code running in the sandbox, such as a Bash command or a hook, cannot read or
+write another channel's memory and cannot write the memory guidance. A fact's
+author is the sender of the turn the write happened in, while that turn's
+credential is held: code that copies the credential during a turn can write as
+that turn's sender until it expires at the turn's time limit, even after the
+turn has ended. A message steered into a live turn gets a credential for its
+own sender, which expires no later than the live turn's time limit when the
+same worker opened that turn, and at the message's own time limit otherwise. Refusing a credential once its turn ends is
+[#3776](https://github.com/curie-eng/curie/issues/3776). With writes off, the
+sandbox cannot write memory at all.
 
-So don't turn memory writes on for an agent that serves direct messages or
-sensitive channels. Tracked in
-[#3623](https://github.com/curie-eng/curie/issues/3623).
+Upgrade the worker with or before the API. A sandbox booted by an older worker
+holds a credential without the new claims; the API treats it as read-only on
+agent memory and refuses it on channel memory, logging a warning, until that
+sandbox is replaced (at most 24 hours).
+
+Conversation transcripts are not scoped this way yet: code in an agent's
+sandbox can still read and write the transcripts of the other channels that
+agent serves. So keep sensitive channels and direct messages on an agent of
+their own until
+[#3767](https://github.com/curie-eng/curie/issues/3767) is fixed.
 
 ### Bundles that carry their own stdio MCP servers (0.11.0)
 

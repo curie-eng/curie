@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -957,6 +958,21 @@ class _PressureResult:
     outcome: str
 
 
+@dataclass(frozen=True)
+class TurnMemoryGrant:
+    """What the kernel needs to mint a turn's memory write credential (ADR-0188).
+
+    Built in the routing block from the resolved deployment and the turn's
+    binding, and handed to ``_attempt``, which mints a fresh credential per
+    attempt onto the runner ``Event`` (never the boot env). Absent for a
+    targetless turn and an eval-isolated one."""
+
+    resolved: Any
+    kind: str
+    address: str
+    thread_key: str
+
+
 class ReclaimPreflightUnsafe(RuntimeError):
     """A transferred delivery could not be proven safe to re-execute.
 
@@ -1437,6 +1453,22 @@ _TURN_PROGRESS: ContextVar[TurnProgressPlan | None] = ContextVar(
 )
 
 
+@dataclass(frozen=True)
+class _MemoryMint:
+    """What this attempt's runner call needs to mint its memory credential.
+
+    Set for the routing of one attempt, and read where the turn actually opens
+    (``_start_turn_under_hook_control``) or steers. Minting there, rather than
+    when the attempt starts, ties the credential's expiry to the stream deadline
+    the runner call uses, after the sandbox claim (ADR-0188)."""
+
+    qevent: QueuedTurn
+    grant: TurnMemoryGrant
+
+
+_MEMORY_MINT: ContextVar[_MemoryMint | None] = ContextVar("curie_worker_memory_mint", default=None)
+
+
 def _hook_success_outcome() -> HookRunOutcome | None:
     carry = _HOOK_RUN_CARRY.get()
     if carry is None:
@@ -1794,6 +1826,11 @@ class Kernel:
         # Which threads are running which agent, so a kill interrupts the agent's
         # live turns. Populated while a turn owner streams.
         self._active_by_agent: dict[uuid.UUID, set[str]] = {}
+        # ADR-0188: the wall-clock stream deadline of each live turn this worker
+        # opened, by the memory grant's thread key. A steer's memory credential
+        # is capped at it, because a steer ends when the live turn ends. Entries
+        # past their deadline are dropped whenever one is recorded.
+        self._turn_deadlines: dict[str, float] = {}
         # In-process per-thread lock over the route/start critical section only.
         # asyncio.Lock is FIFO, so same-thread events from one worker open/steer
         # the runner in arrival order (ordering preserved under concurrent sends).
@@ -2787,6 +2824,9 @@ class Kernel:
             nav: NavAffordance | None = None
             packs: BehaviorPacks | None = None
             approval_routes: dict[str, Any] | None = None
+            # ADR-0188: a targetless turn names no binding, so it never gets a
+            # memory write credential.
+            memory_grant: TurnMemoryGrant | None = None
             if targetless:
                 # Routed by the hook run's agent, never a channel binding (#2963).
                 # The id is the one the hook row lookup parsed and matched, not
@@ -2983,6 +3023,15 @@ class Kernel:
                 # the stable sandbox/history identity (#1909 + ADR-0096).
                 if qevent.conversation_id.startswith("eval:"):
                     boot_env_kwargs["isolate_memory"] = True
+                else:
+                    # ADR-0188: an eval-isolated turn carries no memory, so no
+                    # write credential either.
+                    memory_grant = TurnMemoryGrant(
+                        resolved=resolved,
+                        kind=handle.kind,
+                        address=handle.channel,
+                        thread_key=thread_key,
+                    )
                 boot_env = self._binding.boot_env(
                     resolved,
                     thread_key,
@@ -3214,6 +3263,7 @@ class Kernel:
                         remaining_s=_remaining_budget(lease),
                         pressure_retried=False,
                         workspace_inference=workspace_inference,
+                        memory_grant=memory_grant,
                     )
                 except _WorkItemDeferred:
                     return
@@ -4837,6 +4887,7 @@ class Kernel:
         remaining_s: float | None = None,
         pressure_retried: bool,
         workspace_inference: _WorkspaceInferenceCarry,
+        memory_grant: TurnMemoryGrant | None = None,
     ) -> TurnOutcome:
         handle = qevent.reply_handle
         thread_key = _thread_key_for(qevent)
@@ -4871,6 +4922,13 @@ class Kernel:
                 logger.warning("booting-state update failed for %s", qevent.event_id)
 
         event = self._to_event(qevent)
+        # ADR-0188: this attempt's memory write credential is minted where the
+        # runner call is made, after the sandbox claim, so its expiry is the
+        # stream deadline that call uses and a retry gets its own. A steer mints
+        # from the same carry, so a steering sender writes under their own name.
+        memory_mint = _MEMORY_MINT.set(
+            None if memory_grant is None else _MemoryMint(qevent=qevent, grant=memory_grant)
+        )
 
         attachment_intent = self._attachments is not None and bool(qevent.attachments)
 
@@ -4891,6 +4949,8 @@ class Kernel:
             # before routed is assigned here. Canned and steered leave turn None.
             if routed is not None and routed.turn is not None:
                 self._unregister_run(agent_id, thread_key)
+                if memory_grant is not None:
+                    self._turn_deadlines.pop(memory_grant.thread_key, None)
                 routed.turn.close()
             progress_plan = _TURN_PROGRESS.get()
             if progress_plan is not None and self._progress is not None:
@@ -4981,6 +5041,8 @@ class Kernel:
                 # response first if lock cleanup itself fails or is cancelled.
                 await close_routed_turn()
                 raise
+            finally:
+                _MEMORY_MINT.reset(memory_mint)
         except CapacityExhaustedError as exc:
             rejection = exc.rejection
             logger.warning(
@@ -5063,6 +5125,7 @@ class Kernel:
                 remaining_s=retry_remaining,
                 pressure_retried=True,
                 workspace_inference=workspace_inference,
+                memory_grant=memory_grant,
             )
         except PendingPublicationError as exc:
             record_reclaimed_retry()
@@ -5318,6 +5381,7 @@ class Kernel:
                         if remaining_s is None
                         else remaining_s - (time.monotonic() - attempt_started)
                     ),
+                    memory_grant=memory_grant,
                 )
             outcome.workspace_inferred_repo = inferred
             if verified_review is not None:
@@ -5398,13 +5462,18 @@ class Kernel:
         )
         if progress is not None:
             extra["progress"] = progress
+        # ADR-0188: mint the memory credential here, after the claim, from the
+        # same ``remaining_s`` the stream timeout is bound from.
+        mint = _MEMORY_MINT.get()
+        if mint is not None:
+            event = self._with_memory_token(event, mint.qevent, mint.grant, remaining_s)
         carry = _HOOK_RUN_CARRY.get()
         if carry is not None and carry.recorder is not None and carry.ref is not None:
             async with carry.recorder.start_guard(carry.ref) as allowed:
                 if not allowed:
                     raise HookPaused("cron hook paused before runner start")
                 try:
-                    return await self._runner.start_turn(
+                    turn = await self._runner.start_turn(
                         handle.base_url,
                         event,
                         token=handle.token or None,
@@ -5415,8 +5484,11 @@ class Kernel:
                     if plan is not None and self._progress is not None:
                         await deactivate_turn_progress(self._progress, plan)
                     raise
+                if mint is not None:
+                    self._record_turn_deadline(mint.grant, remaining_s)
+                return turn
         try:
-            return await self._runner.start_turn(
+            turn = await self._runner.start_turn(
                 handle.base_url,
                 event,
                 token=handle.token or None,
@@ -5427,6 +5499,9 @@ class Kernel:
             if plan is not None and self._progress is not None:
                 await deactivate_turn_progress(self._progress, plan)
             raise
+        if mint is not None:
+            self._record_turn_deadline(mint.grant, remaining_s)
+        return turn
 
     async def _route_attachment_and_start(
         self,
@@ -6331,8 +6406,22 @@ class Kernel:
                             "runner pre-steer status carried no usable turn_active: %r",
                             status,
                         )
+            steer_event = event
+            mint = _MEMORY_MINT.get()
+            if mint is not None:
+                # ADR-0188: a steer ends when the live turn ends, so its
+                # credential never outlives that turn's stream deadline. A turn
+                # another worker opened has no recorded deadline here; the
+                # steer's own bound applies.
+                steer_event = self._with_memory_token(
+                    event,
+                    mint.qevent,
+                    mint.grant,
+                    remaining_s,
+                    cap_at=self._turn_deadlines.get(mint.grant.thread_key),
+                )
             steered = await self._runner.steer(
-                handle.base_url, event, token=handle.token or None, remaining_s=remaining_s
+                handle.base_url, steer_event, token=handle.token or None, remaining_s=remaining_s
             )
             if steered:
                 _record_route("steer")
@@ -8157,6 +8246,7 @@ class Kernel:
         *,
         workspace_deployment_id: uuid.UUID | None,
         remaining_s: float | None,
+        memory_grant: TurnMemoryGrant | None = None,
     ) -> TurnOutcome:
         """Re-prompt a factory execute turn that ended without publishing, ONCE.
 
@@ -8202,9 +8292,14 @@ class Kernel:
             if event.tool_access is not None:
                 # @spec WORKER-TOOL-ACCESS-2: the continuation opens a turn too.
                 await self._require_tool_access(handle, event.tool_access, left)
+            # ADR-0188: the continuation opens a turn too, with its own
+            # credential, minted from the budget its stream is bound from.
+            event = self._with_memory_token(event, qevent, memory_grant, left)
             turn = await self._runner.start_turn(
                 handle.base_url, event, token=handle.token or None, remaining_s=left
             )
+            if memory_grant is not None:
+                self._record_turn_deadline(memory_grant, left)
         except ToolAccessUnenforced as exc:
             logger.warning("work-item continuation refused for %s: %s", qevent.event_id, exc)
             return TurnOutcome(
@@ -8615,6 +8710,65 @@ class Kernel:
     def _backoff(self, attempt: int) -> float:
         raw: float = self._config.retry_backoff_base_s * (2 ** (attempt - 1))
         return min(self._config.retry_backoff_max_s, raw)
+
+    def _with_memory_token(
+        self,
+        event: Event,
+        qevent: QueuedTurn,
+        grant: TurnMemoryGrant | None,
+        remaining_s: float | None,
+        *,
+        cap_at: float | None = None,
+    ) -> Event:
+        """``event`` with this turn's memory write credential (ADR-0188).
+
+        Call it just before the runner call that opens or steers the turn, with
+        the ``remaining_s`` that call gets: the credential expires at that
+        call's stream deadline (``RunnerClient.turn_deadline_s``), and no later
+        than ``cap_at`` (a wall-clock time) when one is given, as for a steer.
+
+        No credential when there is no grant, the binding cannot mint (a double
+        without the method), or the resolver declines (writes off, no key). Nor
+        when the budget is spent (``remaining_s <= 0``): the stream then gets
+        only a 50 ms floor to fail fast, so there is no turn to cover. ``None``
+        is no budget in hand, which is the runner ceiling, not "spent". The
+        credential rides the event only (MEMORY-TOKEN-2/3): never the boot env,
+        never a log line."""
+
+        unminted = event.model_copy(update={"memory_token": None}) if event.memory_token else event
+        if grant is None or self._binding is None:
+            return unminted
+        mint = getattr(self._binding, "turn_memory_token", None)
+        if mint is None:
+            return unminted
+        if remaining_s is not None and remaining_s <= 0:
+            return unminted
+        ttl_s = self._runner.turn_deadline_s(remaining_s)
+        if cap_at is not None:
+            # Whole seconds down, since the binding rounds the lifetime up.
+            ttl_s = min(ttl_s, math.floor(cap_at - time.time()))
+            if ttl_s <= 0:
+                return unminted
+        token = mint(
+            grant.resolved,
+            kind=grant.kind,
+            address=grant.address,
+            thread_key=grant.thread_key,
+            sender=qevent.author or "",
+            turn=qevent.event_id,
+            ttl_s=ttl_s,
+        )
+        if not token:
+            return unminted
+        return event.model_copy(update={"memory_token": token})
+
+    def _record_turn_deadline(self, grant: TurnMemoryGrant, remaining_s: float | None) -> None:
+        """Remember the stream deadline of a turn just opened, for steer caps."""
+
+        now = time.time()
+        for key in [k for k, at in self._turn_deadlines.items() if at <= now]:
+            del self._turn_deadlines[key]
+        self._turn_deadlines[grant.thread_key] = now + self._runner.turn_deadline_s(remaining_s)
 
     @staticmethod
     def _to_event(qevent: QueuedTurn) -> Event:

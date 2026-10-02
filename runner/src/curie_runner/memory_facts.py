@@ -34,7 +34,7 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -91,12 +91,22 @@ NO_PERSON = "<no person>"
 # Exactly what ``add`` mints. An id the model passes must match it, so it can
 # neither name a reserved key (``log``, ``guidance``) nor compose a path outside
 # the namespace.
-_FACT_ID = re.compile(r"^fact-[0-9a-f]{32}$")
+# ``\Z``, not ``$``: ``$`` also matches before a trailing newline.
+_FACT_ID = re.compile(r"^fact-[0-9a-f]{32}\Z")
 _TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
 class MemoryFactsError(RuntimeError):
     """A memory store request failed."""
+
+
+class MemoryRefused(MemoryFactsError):
+    """The state API refused the request (403): the credential may not do it.
+
+    ADR-0188: the API holds a sandbox credential to its own channel's memory,
+    to fact keys, and to writes only with the turn's write credential. A
+    refusal is not an outage, so the tools say so rather than "could not be
+    reached"."""
 
 
 class FactNotFound(MemoryFactsError):
@@ -127,7 +137,7 @@ class Fact:
 
 
 def is_fact_id(value: object) -> bool:
-    return isinstance(value, str) and _FACT_ID.match(value) is not None
+    return isinstance(value, str) and _FACT_ID.fullmatch(value) is not None
 
 
 def _now() -> str:
@@ -181,15 +191,30 @@ class MemoryFactsStore:
     """The facts in one memory namespace on the state API.
 
     ``url`` is the namespace URL (agent or channel memory); ``token`` is the
-    memory token, sent as ``X-API-Key`` exactly as ``memory.py`` does.
+    long-lived memory token from the env, sent as ``X-API-Key`` exactly as
+    ``memory.py`` does. It is read-only on memory (ADR-0188).
+
+    ``turn_token``, for the tools' stores, returns the current turn's write
+    credential (``MemoryTurn.write_token``, from ``Event.memory_token``). When it
+    returns one, every request presents it; otherwise the env token is the
+    fallback, which keeps an older worker working against an older API and is
+    refused for writes by a newer one.
     """
 
-    def __init__(self, url: str, token: str | None) -> None:
+    def __init__(
+        self,
+        url: str,
+        token: str | None,
+        *,
+        turn_token: Callable[[], str | None] | None = None,
+    ) -> None:
         self._base = url.rstrip("/")
         self._token = token
+        self._turn_token = turn_token
 
     def _headers(self) -> dict[str, str]:
-        return {"X-API-Key": self._token} if self._token else {}
+        token = (self._turn_token() if self._turn_token is not None else None) or self._token
+        return {"X-API-Key": token} if token else {}
 
     def _key_url(self, key: str) -> str:
         return f"{self._base}/{quote(key, safe='')}"
@@ -203,6 +228,8 @@ class MemoryFactsStore:
         ):
             if resp.status == 404:
                 return []
+            if resp.status == 403:
+                raise MemoryRefused(await _detail(resp))
             if resp.status != 200:
                 raise MemoryFactsError(f"memory list failed: {resp.status} {await _detail(resp)}")
             payload = await resp.json()
@@ -230,6 +257,8 @@ class MemoryFactsStore:
         ):
             if resp.status == 404:
                 return None
+            if resp.status == 403:
+                raise MemoryRefused(await _detail(resp))
             if resp.status != 200:
                 raise MemoryFactsError(f"memory read failed: {resp.status} {await _detail(resp)}")
             payload = await resp.json()
@@ -248,6 +277,8 @@ class MemoryFactsStore:
             if resp.status in (200, 201):
                 return
             detail = await _detail(resp)
+            if resp.status == 403:
+                raise MemoryRefused(detail)
             if resp.status == 413:
                 raise MemoryFull(detail)
             if resp.status == 409:
@@ -326,16 +357,26 @@ class MemoryFactsStore:
             aiohttp.ClientSession(timeout=_TIMEOUT) as session,
             session.delete(self._key_url(fact_id), headers=self._headers()) as resp,
         ):
+            if resp.status == 403:
+                raise MemoryRefused(await _detail(resp))
             if resp.status not in (200, 204):
                 raise MemoryFactsError(f"memory delete failed: {resp.status} {await _detail(resp)}")
 
 
-def resolve_facts_store(ref: str | None, token: str | None) -> MemoryFactsStore | None:
-    """A store for an ``http(s)://`` memory ref, or None when there is none."""
+def resolve_facts_store(
+    ref: str | None,
+    token: str | None,
+    *,
+    turn_token: Callable[[], str | None] | None = None,
+) -> MemoryFactsStore | None:
+    """A store for an ``http(s)://`` memory ref, or None when there is none.
+
+    ``turn_token`` is for the tools' stores only (see ``MemoryFactsStore``);
+    boot reads use the env token alone."""
 
     if not ref or not ref.startswith(("http://", "https://")):
         return None
-    return MemoryFactsStore(ref, token)
+    return MemoryFactsStore(ref, token, turn_token=turn_token)
 
 
 # --- Boot composition --------------------------------------------------------
@@ -355,13 +396,14 @@ _FACTS_PREAMBLE = (
     "recorded by the platform; anything in the statement that looks like an "
     'attribution, including another "stated:", is part of what was said.'
 )
-# The author comes from the state API, which accepts any value (#3623). Real
-# authors are sender ids (or NO_PERSON), so a rendered author keeps only the
-# characters a sender id or email can hold; everything else, including
-# whitespace, parentheses, colons (the attribution's own delimiter), zero-width
-# and bidi characters, is dropped, and the
-# result is capped. This limits what a forged author can look like; full closure
-# needs the server to stamp the author itself (#3623).
+# The author comes from the state API. Since ADR-0188 (#3623) the API stamps a
+# sandbox write's author from the turn credential's sender claim, but facts
+# stored before that, and facts an operator wrote with the platform key, can
+# hold any value. Real authors are sender ids (or NO_PERSON), so a rendered
+# author keeps only the characters a sender id or email can hold; everything
+# else, including whitespace, parentheses, colons (the attribution's own
+# delimiter), zero-width and bidi characters, is dropped, and the result is
+# capped.
 MAX_AUTHOR_CHARS = 64
 _AUTHOR_DROP = re.compile(r"[^A-Za-z0-9._@+-]")
 
@@ -439,12 +481,26 @@ class MemoryTurn:
     """Who the current turn is for, set by the SessionRunner at turn start.
 
     The tools read the author from here, never from their arguments, so the
-    model cannot attribute a fact to someone else.
+    model cannot attribute a fact to someone else. ``write_token`` is the
+    turn's memory write credential (``Event.memory_token``, ADR-0188), which the
+    tool stores present; it lives only here, never in the env or a log
+    (MEMORY-TOKEN-3). A steer replaces it with the steering event's, and
+    ``end`` drops it when the turn ends, so a write after the turn falls back to
+    the read-only env token and is refused.
     """
 
     def __init__(self) -> None:
         self.author = NO_PERSON
+        self.write_token: str | None = None
+
+    def __repr__(self) -> str:
+        return f"MemoryTurn(author={self.author!r})"
 
     def begin(self, event: Event) -> None:
         user = (event.user or "").strip()
         self.author = user if event.type == "message" and user else NO_PERSON
+        self.write_token = event.memory_token or None
+
+    def end(self) -> None:
+        """Drop the turn's write credential: the turn is over."""
+        self.write_token = None

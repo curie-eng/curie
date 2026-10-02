@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import secrets
 import time
@@ -174,6 +175,11 @@ DECISION_ENV = BootEnv.env_key("approval_decision")
 FALSE_COMPLETION_CHECK_ENV = "CURIE_FALSE_COMPLETION_CHECK"
 # the worker re-mints every turn; this only bounds a leaked-token window (ADR-0033)
 SANDBOX_TOKEN_TTL_SECONDS = 24 * 60 * 60
+# ADR-0188: the ``sender`` claim of a turn with no person behind it (a job, an
+# eval). The runner renders the same string as "no author"
+# (``memory_facts.NO_PERSON``); ``tests/test_memory_fact_key_parity.py`` pins
+# the two.
+NO_PERSON = "<no person>"
 
 # #1909: local/cluster message-path eval stamps this prefix on conversation_id
 # so boot_env omits ambient agent memory. Frozen in
@@ -1021,15 +1027,16 @@ class BindingResolver:
         # opted every binding into one shared namespace, or this caller has no
         # binding to name (#1525 follow-up): a memory=False agent's bundle
         # composes ``/<namespace>/<key>`` onto whichever base it was handed
-        # here, unaware which shape it got -- the scoping decision lives
-        # entirely in which URL the worker minted, never in a credential claim
-        # (rejected alternative: widening ``sandbox_token`` -- it authenticates
-        # WHICH agent, and a partition key within that agent's own,
-        # already-fully-accessible store has no privilege to carry, so the API
-        # verifies it against ``agent_channels`` directly instead of trusting
-        # an opaque claim). Agent memory and history stay agent-wide either
-        # way; channel memory (below) is binding-scoped by design (ADR-0167,
-        # #1461) and is decided separately from this ``memory`` flag.
+        # here, unaware which shape it got. For general state the scoping
+        # decision lives in which URL the worker minted: a partition key within
+        # the agent's own store, which the API checks against
+        # ``agent_channels``. Memory is different (ADR-0188, which reverses the
+        # #1525 follow-up's rejection of a binding claim for memory): one
+        # channel's memory can hold a direct message, so the state token below
+        # carries a ``binding`` claim and the API holds it to that channel's
+        # memory. Agent memory and history stay agent-wide either way; channel
+        # memory (below) is binding-scoped by design (ADR-0167, #1461) and is
+        # decided separately from this ``memory`` flag.
         state_url = f"{base}/agents/{resolved.agent_id}/state"
         if not resolved.memory and kind is not None and address is not None:
             state_url = (
@@ -1037,8 +1044,10 @@ class BindingResolver:
                 f"{quote(kind, safe='')}/{quote(address, safe='')}"
             )
         # Channel memory (#1461, ADR-0167): the agent's memory namespace scoped
-        # to this turn's binding, on the same store and read/written with the
-        # same broad memory token. Reading channel memory needs no switch, so
+        # to this turn's binding, on the same store. The boot-env memory token
+        # only READS it (ADR-0188); a write needs the per-turn credential from
+        # ``turn_memory_token``, which rides the turn's ACI ``Event`` and never
+        # this env. Reading channel memory needs no switch, so
         # the ref is set whenever the turn names a binding (#3621). Whether the
         # agent may save to it is a separate flag, ``memory_writes`` (#3659),
         # sent explicitly alongside the ref so the runner mounts the remember,
@@ -1057,8 +1066,11 @@ class BindingResolver:
         # Mint scoped tokens (ADR-0033, #410) for this agent. Two scopes, because
         # the memory/history loaders and the bundle reach DIFFERENT namespaces:
         #  - the broad ``state`` token backs the memory and history tokens, whose
-        #    loaders MUST read/write the reserved ``memory``/``transcript``
-        #    namespaces to rehydrate the agent across suspend/resume;
+        #    loaders MUST read the reserved ``memory`` namespace and read/write
+        #    ``transcript`` to rehydrate the agent across suspend/resume. Its
+        #    ADR-0188 claims narrow it on memory: ``binding`` names the one
+        #    channel whose memory it reaches (JSON null for a turn with no
+        #    channel), and ``memory: "read"`` makes it read-only there;
         #  - the narrow ``state.app`` token backs the bundle-facing state token,
         #    which the API state router refuses on those reserved namespaces
         #    (#249) -- so a skill cannot corrupt memory/history by composing the
@@ -1076,6 +1088,7 @@ class BindingResolver:
                 agent=str(resolved.agent_id),
                 scope="state",
                 exp=exp,
+                claims={"binding": _binding_claim(kind, address), "memory": "read"},
             )
             app_state_token = sandbox_token.mint(
                 self._config.api_key,
@@ -1185,6 +1198,60 @@ class BindingResolver:
             env.pop(MEMORY_TOKEN_ENV, None)
             logger.info("eval isolate: omitted memory_ref for thread %s", thread_key)
         return env
+
+    def turn_memory_token(
+        self,
+        resolved: ResolvedDeployment,
+        *,
+        kind: str | None,
+        address: str | None,
+        thread_key: str,
+        sender: str,
+        turn: str,
+        ttl_s: float,
+    ) -> str | None:
+        """The per-turn memory write credential (ADR-0188), or None.
+
+        Sent as the turn's ``Event.memory_token`` (MEMORY-TOKEN-2), never in the
+        boot env: the boot-env token outlives the turn and so cannot name its
+        sender. A ``scope="state"`` token with ``{binding, memory: "write",
+        sender, turn}``; the API writes only fact keys with it, only on the
+        channel ``binding`` names, and stamps ``sender`` as the fact's author.
+
+        None unless there is a key to sign with, the agent has memory writes on,
+        the turn names a binding, and the thread is not eval-isolated (#1909).
+        The expiry is ``ttl_s``, the turn's own deadline, capped at the boot
+        token's lifetime, with no grace: the credential ends with the turn.
+        """
+
+        if not self._config.api_key or not resolved.memory_writes:
+            return None
+        binding = _binding_claim(kind, address)
+        if binding is None or is_eval_isolate_thread(thread_key):
+            return None
+        lifetime = min(math.ceil(max(0.0, ttl_s)), SANDBOX_TOKEN_TTL_SECONDS)
+        exp = int(time.time()) + lifetime
+        return sandbox_token.mint(
+            self._config.api_key,
+            agent=str(resolved.agent_id),
+            scope="state",
+            exp=exp,
+            claims={
+                "binding": binding,
+                "memory": "write",
+                "sender": sender.strip() or NO_PERSON,
+                "turn": turn,
+            },
+        )
+
+
+def _binding_claim(kind: str | None, address: str | None) -> str | None:
+    """The ADR-0188 ``binding`` claim: ``"<kind>:<address>"``, unquoted, the same
+    string as the API's ``_binding_scope`` and
+    ``workflow_state_entries.binding_scope``; None when the turn names no
+    binding."""
+
+    return f"{kind}:{address}" if kind and address else None
 
 
 def apply_model_env(

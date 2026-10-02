@@ -1348,6 +1348,9 @@ class SessionRunner:
                         int((time.monotonic() - start) * 1000),
                     )
                 self._active_state = None
+                if self._memory_turn is not None:
+                    # However the turn ended, its write credential ends with it.
+                    self._memory_turn.end()
                 if self._turn_progress is not None:
                     self._turn_progress.close()
                 if self._approval_gate is not None:

@@ -635,6 +635,15 @@ def build_runner(
         and not fake_model
     )
     memory_turn = MemoryTurn() if memory_tools_mounted else None
+
+    def turn_write_token() -> str | None:
+        # ADR-0188: the tools write with the turn's own credential, carried on
+        # Event.memory_token into MemoryTurn and never into the env.
+        return memory_turn.write_token if memory_turn is not None else None
+
+    channel_tool_store = resolve_facts_store(
+        config.channel_memory_ref, memory_token, turn_token=turn_write_token
+    )
     system_prompt = _compose_system_prompt(
         system_prompt,
         memory_preamble,
@@ -890,14 +899,16 @@ def build_runner(
                 memory_tools=(
                     build_memory_tools(
                         agent_store=resolve_facts_store(
-                            config.session.memory_ref, os.environ.get(MEMORY_TOKEN_ENV)
+                            config.session.memory_ref,
+                            os.environ.get(MEMORY_TOKEN_ENV),
+                            turn_token=turn_write_token,
                         ),
-                        channel_store=channel_facts_store,
+                        channel_store=channel_tool_store,
                         turn=memory_turn,
                         session_id=config.session.session_id,
                     )
                     if memory_tools_mounted
-                    and channel_facts_store is not None
+                    and channel_tool_store is not None
                     and memory_turn is not None
                     else ()
                 ),
