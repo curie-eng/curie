@@ -389,6 +389,7 @@ adopt_stored_local_api_key() {
 LOCAL_OTEL_SINK_NAME="curie-ladder-otel-sink-$$"
 LOCAL_OTEL_SINK_OWNED=0
 LOCAL_OTEL_NETWORK_OWNED=0
+LOCAL_OTEL_NETWORK=""
 LOCAL_OTEL_SINK_ACTIVE=0
 LOCAL_OTEL_ENDPOINT=""
 LOCAL_OTEL_METRICS_ENDPOINT=""
@@ -3594,7 +3595,8 @@ start_local_otel_sink() {
         return 1
     fi
 
-    local network=curie_runner
+    local network="${CURIE_DOCKER_NETWORK:-curie_runner}"
+    LOCAL_OTEL_NETWORK="$network"
     if ! docker network inspect "$network" >/dev/null 2>&1; then
         docker network create \
             --label "com.docker.compose.project=$COMPOSE_PROJECT" \
@@ -3694,7 +3696,7 @@ stop_local_otel_sink() {
         LOCAL_OTEL_SINK_OWNED=0
     fi
     if (( LOCAL_OTEL_NETWORK_OWNED )); then
-        docker network rm curie_runner >/dev/null 2>&1 || true
+        docker network rm "$LOCAL_OTEL_NETWORK" >/dev/null 2>&1 || true
         LOCAL_OTEL_NETWORK_OWNED=0
     fi
     LOCAL_OTEL_SINK_ACTIVE=0
