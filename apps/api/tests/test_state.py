@@ -16,6 +16,7 @@ from typing import Any
 
 import asyncpg
 import pytest
+from channel_protocol import scoped_conversation_id
 from curie_api.config import get_settings
 from curie_api.routers.state import (
     _NAMESPACE_LOCK_CLASS,
@@ -365,14 +366,12 @@ def test_sandbox_state_token_reads_reserved_namespaces_and_writes_only_fact_keys
     assert (
         client.get(f"/agents/{aid}/state/memory", headers={"X-API-Key": reader}).status_code == 200
     )
-    t = client.put(
-        f"/agents/{aid}/state/transcript/k", json={"value": {"n": 1}}, headers={"X-API-Key": reader}
-    )
+    # A sandbox reaches only its own binding's thread keys (#3767).
+    thread = scoped_conversation_id("slack", "C000000S01", "1700000000.000100")
+    transcript = f"/agents/{aid}/state/transcript/{thread}"
+    t = client.put(transcript, json={"value": {"n": 1}}, headers={"X-API-Key": reader})
     assert t.status_code == 200, t.text
-    assert (
-        client.get(f"/agents/{aid}/state/transcript/k", headers={"X-API-Key": reader}).status_code
-        == 200
-    )
+    assert client.get(transcript, headers={"X-API-Key": reader}).status_code == 200
 
     # Fact-key writes with the write credential.
     fact = f"/agents/{aid}/state/memory/fact-{'b' * 32}"

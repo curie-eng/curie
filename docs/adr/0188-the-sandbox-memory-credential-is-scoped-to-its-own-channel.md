@@ -184,10 +184,12 @@ to 4 hold even if code in the sandbox reads every credential the runner has.
   already decodes, plus one HMAC verify per request, as today. Decision 4 adds
   no database lookup. The binding check reuses the existing
   `agent_holds_channel_pair` query that `_binding_scope` already runs.
-- **Transcripts are not covered.** The same long-lived token reads and writes
-  every thread's transcript for the agent, across channels. Transcript keys are
-  thread keys, not binding paths, so scoping them is its own change and needs
-  its own issue. The `binding` claim added here is what that change would use.
+- **Transcripts are covered by #3767.** Transcript keys are thread keys, not
+  binding paths, so scoping them is a separate change,
+  [#3767](https://github.com/curie-eng/curie/issues/3767). It uses the
+  `binding` claim added here: the API maps a transcript key back to its binding
+  and holds the sandbox credential to its own channel's threads. A token minted
+  before this ADR keeps its transcript reach until it expires, with a warning.
 - **One more credential to mint per turn.** It is an HMAC over a few claims and
   costs nothing measurable, but it is a second thing the runner must route to
   the right tool call.
