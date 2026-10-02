@@ -1765,6 +1765,7 @@ def test_live_compound_request_saves_or_does_not_claim_to() -> None:
         },
     )
     runner = SessionRunner(
+        held_secrets=frozenset(),
         session_factory=lambda: ClaudeAgentSession(options),
         ceiling=0,
         tracer=RunTracer(None),
