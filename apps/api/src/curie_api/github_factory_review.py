@@ -154,7 +154,7 @@ def _bound(lineage: ThreadPublicationLineage) -> BoundReviewLineage:
     )
 
 
-async def _admit(
+async def admit_parsed_feedback(
     session: AsyncSession,
     feedback: UnverifiedFeedback,
     *,
@@ -265,7 +265,9 @@ async def handle_factory_review_delivery(
         feedback = parse_feedback(
             event, payload, delivery_id, github_html_base=settings.github_html_base
         )
-        outcome = await _admit(session, feedback, settings=settings, client=client)
+        outcome = await admit_parsed_feedback(
+            session, feedback, settings=settings, client=client
+        )
     except FeedbackUnavailable as exc:
         settle_review_delivery(audit, "retryable", exc.code)
         await session.commit()

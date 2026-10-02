@@ -455,7 +455,7 @@ async def admit_notice(
         return _admission_result(result, facts.request_id)
 
 
-async def _record_base_label(
+async def record_base_label_notice(
     session: AsyncSession, notice: FactoryNotice, verified: VerifiedIssue, settings: Settings
 ) -> WebhookResult:
     """A ``base:`` label changed: record whether it now disagrees (ADR 0186)."""
@@ -470,6 +470,12 @@ async def _record_base_label(
         raise FactoryRefused("identity_mismatch")
     await _record_label(session, item, verified, settings)
     return _ignored("base_label_recorded")
+
+
+async def cancel_notice(session: AsyncSession, notice: FactoryNotice) -> WebhookResult:
+    """Cancel one verified close or unlabel. Callers commit the session."""
+
+    return await _cancel(session, notice)
 
 
 async def _cancel(session: AsyncSession, notice: FactoryNotice) -> WebhookResult:
@@ -500,6 +506,55 @@ async def _cancel(session: AsyncSession, notice: FactoryNotice) -> WebhookResult
     if status == "cancellation_requested":
         return WebhookResult(status="factory_cancellation_requested")
     return WebhookResult(status="factory_cancelled")
+
+
+async def _with_label_event(
+    notice: FactoryNotice,
+    *,
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> FactoryNotice:
+    """Attach the newest human labeled event id. The delivery id stays put.
+
+    The events list is the same read the missed-label backstop uses. When
+    GitHub cannot answer, the route retries instead of admitting under the
+    webhook header.
+    """
+
+    from .factory_label_reconcile import _get_all, _last_label_event, _Unavailable
+
+    try:
+        token = await run_in_threadpool(
+            credentials_for(settings).token_for_verified_installation,
+            notice.repo_full_name,
+            notice.installation_id,
+        )
+    except (GitHubInstallationRefused, ValueError):
+        raise FactoryRefused("installation_unverified") from None
+    except GitHubAppError:
+        raise FeedbackUnavailable("installation_unavailable") from None
+    api = settings.github_api_url.rstrip("/")
+    repo_path = f"/repos/{repo_url_path(notice.repo_full_name)}"
+    label = notice.label or settings.github_factory_label
+    try:
+        events = await _get_all(
+            client,
+            api=api,
+            token=token,
+            path=f"{repo_path}/issues/{notice.issue_number}/events",
+            params={},
+        )
+    except _Unavailable:
+        raise FeedbackUnavailable("label_events_unavailable") from None
+    event = _last_label_event(events, label)
+    if event is None or type(event.get("id")) is not int:
+        raise FeedbackUnavailable("label_events_unavailable")
+    if event.get("performed_via_github_app") is not None:
+        raise FactoryRefused("app_authored")
+    actor = event.get("actor")
+    if not isinstance(actor, dict) or actor.get("type") == "Bot":
+        raise FactoryRefused("app_authored")
+    return replace(notice, label_event_id=event["id"])
 
 
 async def handle_factory_delivery(
@@ -544,10 +599,12 @@ async def handle_factory_delivery(
             raise FactoryRefused("repository_not_allowed")
         await _lock_issue(session, notice)
         verified = await verify_current(notice, settings=settings, client=client)
+        if notice.disposition == "admit":
+            notice = await _with_label_event(notice, settings=settings, client=client)
         if notice.disposition == "cancel":
-            outcome = await _cancel(session, notice)
+            outcome = await cancel_notice(session, notice)
         elif notice.disposition == "base_label":
-            outcome = await _record_base_label(session, notice, verified, settings)
+            outcome = await record_base_label_notice(session, notice, verified, settings)
         else:
             outcome = await admit_notice(session, notice, settings, verified, client)
     except FeedbackUnavailable as exc:

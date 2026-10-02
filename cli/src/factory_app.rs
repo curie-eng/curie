@@ -80,7 +80,7 @@ pub fn registration_steps() -> Vec<String> {
         "Open the link and click Create GitHub App; the name, permissions, and the disabled webhook are already filled in.".to_string(),
         "On the new App's settings page, note the App ID and click Generate a private key to download the .pem file.".to_string(),
         "Click Install App and install it on the repositories the factory may work in.".to_string(),
-        "Rerun: curie cluster factory --app-id <APP_ID> --private-key-file <PATH.pem> --webhook-secret-file <PATH>".to_string(),
+        "Rerun: curie cluster factory --intake poll --app-id <APP_ID> --private-key-file <PATH.pem>".to_string(),
     ]
 }
 

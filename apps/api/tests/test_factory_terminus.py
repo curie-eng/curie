@@ -532,6 +532,9 @@ def comments(monkeypatch: pytest.MonkeyPatch, clean_db: None) -> Any:
         monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
         monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
         monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "true")
+        # These tests drive signed deliveries. Poll mode would also read the
+        # GitHub stand in on every reconciler pass.
+        monkeypatch.setenv("GITHUB_FACTORY_INTAKE", "webhook")
         monkeypatch.setenv("GITHUB_FACTORY_LABEL", LABEL)
         monkeypatch.setenv("GITHUB_FACTORY_MENTION", "curie")
         monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
@@ -654,6 +657,7 @@ def _notices(request_id: uuid.UUID) -> list[dict[str, Any]]:
 
 def _label(client: Any, github: GitHubAPI, number: int) -> None:
     github.issue_number = number
+    github.advance_label_event(number)
     response = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "factory_admitted"

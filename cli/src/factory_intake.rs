@@ -42,6 +42,9 @@ pub struct FactoryIntakeOpts {
     pub private_key_file: Option<std::path::PathBuf>,
     /// Organization whose registration form the printed link opens.
     pub org: Option<String>,
+    /// `api.githubFactoryIntake` when this run must select a mode. `None`
+    /// leaves the recorded value unchanged.
+    pub intake: Option<String>,
 }
 
 /// Helm's floor for this command, matching `curie cluster upgrade`'s default.
@@ -224,6 +227,9 @@ pub fn intake_values(opts: &FactoryIntakeOpts, cidrs: &[String]) -> serde_json::
     if let Some(secret) = &opts.webhook_secret {
         api.insert("githubWebhookSecret".into(), serde_json::json!(secret));
     }
+    if let Some(intake) = &opts.intake {
+        api.insert("githubFactoryIntake".into(), serde_json::json!(intake));
+    }
     let mut values = serde_json::json!({ "api": api });
     if !opts.github_api_egress.is_empty() {
         let rules: Vec<serde_json::Value> = ipv4_cidrs(cidrs)
@@ -348,10 +354,21 @@ pub fn intake_gate_offenders(
     {
         bad.push("GITHUB_APP_PRIVATE_KEY");
     }
-    // The webhook secret stays required until polling intake ships a chart
-    // value; ADR 0187 is where this requirement drops for poll mode.
+    let intake = api_str(&api, "githubFactoryIntake");
     let secret = api_str(&api, "githubWebhookSecret");
-    if secret.is_empty() || secret == "dev-webhook-secret" {
+    let security_values = if planned.pointer("/security/allowDevDefaults").is_some() {
+        planned
+    } else {
+        recorded
+    };
+    let allow_dev_defaults =
+        crate::ops::lookup_dotted_flag(security_values, "security.allowDevDefaults");
+    let secret_is_missing = api
+        .get("githubWebhookSecret")
+        .is_none_or(serde_json::Value::is_null);
+    let published_secret =
+        secret == "dev-webhook-secret" || (secret_is_missing && allow_dev_defaults);
+    if published_secret || (intake == "webhook" && secret.trim().is_empty()) {
         bad.push("GITHUB_WEBHOOK_SECRET");
     }
     let label = api_str(&api, "githubFactoryLabel");
@@ -796,6 +813,7 @@ mod tests {
             app_id: None,
             private_key_file: None,
             org: None,
+            intake: None,
         }
     }
 
@@ -949,12 +967,118 @@ mod tests {
 
     #[test]
     fn gate_dev_default_secret_and_at_mention_are_offenders() {
-        let planned = serde_json::json!({"api": {
-            "githubWebhookSecret": "dev-webhook-secret", "githubFactoryMention": "@x"}});
-        assert_eq!(
-            intake_gate_offenders(&full(), &planned),
-            vec!["GITHUB_WEBHOOK_SECRET", "GITHUB_FACTORY_MENTION"]
-        );
+        // Webhook intake refuses both blank and published signing keys.
+        for secret in ["dev-webhook-secret", ""] {
+            let planned = serde_json::json!({"api": {
+                "githubFactoryIntake": "webhook",
+                "githubWebhookSecret": secret,
+                "githubFactoryMention": "@x"
+            }});
+            assert_eq!(
+                intake_gate_offenders(&full(), &planned),
+                vec!["GITHUB_WEBHOOK_SECRET", "GITHUB_FACTORY_MENTION"],
+                "{secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_poll_or_absent_intake_does_not_require_a_webhook_secret() {
+        let secrets = ["", "configured-webhook-secret"];
+        let intakes = [Some("poll"), None];
+        for secret in secrets {
+            for intake in intakes {
+                let mut recorded = full();
+                let api = recorded["api"].as_object_mut().unwrap();
+                api.insert("githubWebhookSecret".to_string(), serde_json::json!(secret));
+                if let Some(value) = intake {
+                    api.insert("githubFactoryIntake".to_string(), serde_json::json!(value));
+                }
+                let offenders = intake_gate_offenders(&recorded, &serde_json::json!({}));
+                assert!(
+                    offenders.is_empty(),
+                    "intake {intake:?} secret {secret:?} offenders {offenders:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gate_published_webhook_secret_is_refused_in_every_intake_mode() {
+        for intake in [Some("poll"), Some("webhook"), None] {
+            let mut recorded = full();
+            let api = recorded["api"].as_object_mut().unwrap();
+            api.insert(
+                "githubWebhookSecret".to_string(),
+                serde_json::json!("dev-webhook-secret"),
+            );
+            if let Some(value) = intake {
+                api.insert("githubFactoryIntake".to_string(), serde_json::json!(value));
+            }
+            assert_eq!(
+                intake_gate_offenders(&recorded, &serde_json::json!({})),
+                vec!["GITHUB_WEBHOOK_SECRET"],
+                "intake {intake:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_absent_or_null_secret_uses_effective_security_defaults() {
+        for intake in [Some("poll"), Some("webhook"), None] {
+            for null_secret in [false, true] {
+                for allow_dev_defaults in [serde_json::json!(true), serde_json::json!("true")] {
+                    let mut recorded = full();
+                    let api = recorded["api"].as_object_mut().unwrap();
+                    api.remove("githubWebhookSecret");
+                    if null_secret {
+                        api.insert("githubWebhookSecret".to_string(), serde_json::Value::Null);
+                    }
+                    if let Some(value) = intake {
+                        api.insert("githubFactoryIntake".to_string(), serde_json::json!(value));
+                    }
+                    recorded["security"] = serde_json::json!({
+                        "allowDevDefaults": allow_dev_defaults
+                    });
+                    assert_eq!(
+                        intake_gate_offenders(&recorded, &serde_json::json!({})),
+                        vec!["GITHUB_WEBHOOK_SECRET"]
+                    );
+
+                    let sealed_offenders = if intake == Some("webhook") {
+                        vec!["GITHUB_WEBHOOK_SECRET"]
+                    } else {
+                        vec![]
+                    };
+                    let planned = serde_json::json!({"security": {"allowDevDefaults": false}});
+                    assert_eq!(intake_gate_offenders(&recorded, &planned), sealed_offenders);
+                    recorded["security"]["allowDevDefaults"] = serde_json::json!(false);
+                    assert_eq!(
+                        intake_gate_offenders(&recorded, &serde_json::json!({})),
+                        sealed_offenders
+                    );
+                    let planned = serde_json::json!({"security": {"allowDevDefaults": true}});
+                    assert_eq!(
+                        intake_gate_offenders(&recorded, &planned),
+                        vec!["GITHUB_WEBHOOK_SECRET"]
+                    );
+                    let planned = serde_json::json!({"api": {
+                        "githubWebhookSecret": "configured-webhook-secret"
+                    }});
+                    recorded["security"]["allowDevDefaults"] = serde_json::json!(true);
+                    assert!(intake_gate_offenders(&recorded, &planned).is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gate_explicit_blank_poll_secret_disables_signatures_with_development_defaults() {
+        let mut recorded = full();
+        recorded["api"]["githubWebhookSecret"] = serde_json::json!("");
+        recorded["security"] = serde_json::json!({"allowDevDefaults": true});
+
+        assert!(intake_gate_offenders(&recorded, &serde_json::json!({})).is_empty());
     }
 
     #[test]

@@ -43,11 +43,19 @@ class FactoryNotice:
     label: str | None = None
     comment_id: int | None = None
     comment_body: str | None = None
+    label_event_id: int | None = None
 
     @property
     def request_id(self) -> uuid.UUID:
         if self.disposition == "mention":
             identity = f"https://github.com/factory/mention/{self.repository_id}/{self.comment_id}"
+        elif self.disposition == "admit" and self.label_event_id is not None:
+            # The timeline event is the admission identity, shared by poll and
+            # webhook. The webhook receipt stays the delivery header.
+            identity = (
+                f"https://github.com/factory/label/{self.repository_id}/"
+                f"{self.issue_number}/{self.label_event_id}"
+            )
         else:
             # Each labeled delivery is its own request, so a relabel starts a
             # new run. Redelivery of the same delivery is deduped upstream.
