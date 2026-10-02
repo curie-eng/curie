@@ -27,6 +27,7 @@ import urllib.request
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
+from urllib.parse import quote
 
 import pytest
 
@@ -388,3 +389,58 @@ def test_writes_off_put_returns_403(api_url: str) -> None:
     assert _http(f"{sandbox.env['CURIE_MEMORY_REF']}/{FACT}").status == 404
     # ...and the worker mints no write credential at all.
     assert sandbox.turn_token() is None
+
+
+def test_channel_a_sandbox_gets_403_on_channel_b_transcript(api_url: str) -> None:
+    # #3767: the same probe on history. Editing the thread key in
+    # CURIE_HISTORY_REF reached another channel's (or a DM's) conversation.
+    from channel_protocol import scoped_conversation_id
+
+    sandbox = _sandbox(api_url, memory_writes=True)
+    own_key = scoped_conversation_id("slack", sandbox.channel_a, "1700000000.000001")
+    other_key = scoped_conversation_id("slack", sandbox.channel_b, "1700000000.000001")
+    own_ref = sandbox.env["CURIE_HISTORY_REF"]
+    assert own_ref.endswith(f"/state/transcript/{quote(own_key, safe='')}"), own_ref
+    other_ref = own_ref.replace(quote(own_key, safe=""), quote(other_key, safe=""))
+    secret = [{"role": "user", "content": "a DM secret"}]
+    seeded = _http(other_ref, "PUT", {"value": secret})
+    assert seeded.status == 200, seeded
+
+    history_token = sandbox.env["CURIE_HISTORY_TOKEN"]
+    turn_token = sandbox.turn_token()
+    assert turn_token, "the worker minted no per-turn memory credential"
+    for key in (history_token, turn_token):
+        got = _http(other_ref, key=key)
+        assert got.status == 403, got
+        assert "a DM secret" not in json.dumps(got.body)
+        replaced = _http(other_ref, "PUT", {"value": [{"role": "user"}]}, key=key)
+        assert replaced.status == 403, replaced
+        appended = _http(f"{other_ref}/append", "POST", {"item": {"role": "user"}}, key=key)
+        assert appended.status == 403, appended
+        removed = _http(other_ref, "DELETE", key=key)
+        assert removed.status == 403, removed
+    listed = _http(own_ref.rsplit("/", 1)[0], key=history_token)
+    assert listed.status == 200, listed
+    assert other_key not in {row["key"] for row in listed.body}  # type: ignore[union-attr]
+
+    still = _http(other_ref)
+    assert still.status == 200, still
+    assert still.body["value"] == secret  # type: ignore[index]
+
+    # Its own thread keeps the history loader's whole cycle (replace, read,
+    # append) with the boot credential the runner holds.
+    history = [{"role": "user", "content": "ours"}]
+    assert _http(own_ref, "PUT", {"value": history}, key=history_token).status == 200
+    assert _http(own_ref, key=history_token).body["value"] == history  # type: ignore[index]
+    reply = {"role": "assistant", "content": "hi"}
+    appended = _http(f"{own_ref}/append", "POST", {"item": reply}, key=history_token)
+    assert appended.status == 200, appended
+
+    # A targetless cron's sandbox (no binding) keeps its own thread, and no
+    # channel's.
+    cron_key = scoped_conversation_id("@cron", sandbox.agent_id, f"cron-{uuid.uuid4().hex}")
+    cron_env = sandbox.resolver.boot_env(sandbox.resolved, cron_key)  # type: ignore[attr-defined]
+    cron_ref, cron_token = cron_env["CURIE_HISTORY_REF"], cron_env["CURIE_HISTORY_TOKEN"]
+    assert _http(cron_ref, "PUT", {"value": history}, key=cron_token).status == 200
+    assert _http(cron_ref, key=cron_token).status == 200
+    assert _http(other_ref, key=cron_token).status == 403
