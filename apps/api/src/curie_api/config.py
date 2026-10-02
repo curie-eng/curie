@@ -182,9 +182,11 @@ class Settings(BaseSettings):
     # A failed label delivery is never redelivered by GitHub (#3081). The work
     # item reconciler lists labeled open issues this often and admits any with
     # no WorkItem once its label is older than the grace, so a delivery still
-    # in flight lands first. 0 disables the listing.
-    github_factory_reconcile_interval_s: float = 300.0
-    github_factory_reconcile_grace_s: float = 300.0
+    # in flight lands first. 0 disables the listing. Both are bounded the way
+    # GITHUB_FACTORY_CI_WAIT_S is: a negative or non finite value is refused at
+    # boot rather than surfacing as a mid-reconcile timedelta error (#3709).
+    github_factory_reconcile_interval_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
+    github_factory_reconcile_grace_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
     # Public origin GitHub's image proxy fetches the live status card from
     # (#3077), e.g. https://curie.example.com. Empty omits the card image; the
     # status comment still carries the checklist and the result.
@@ -389,7 +391,10 @@ class Settings(BaseSettings):
     # guarantee needs a worker-side in-flight lease (follow-up); 900s covers the
     # common single-attempt case with margin.
     resume_reconciler_enabled: bool = True
-    resume_reconciler_interval_seconds: int = 30
+    # A zero or negative interval turns run_forever into a busy spin (a
+    # graveyard scan plus a Postgres query per iteration, back to back), so
+    # boot refuses it (#3725). enabled is the off-switch, not this field.
+    resume_reconciler_interval_seconds: int = Field(default=30, gt=0)
     resume_reconciler_grace_seconds: int = 900
     resume_reconciler_batch_limit: int = 100
 
@@ -626,9 +631,16 @@ class Settings(BaseSettings):
     # upstreams can create, and a per-hook counter would let a source multiply
     # its own allowance by inventing hook names.
     hook_backlog_limit: int = 64
-    hook_backlog_window_s: int = 60
+    # Both windows floor `backlog_reservation`'s time bucket (delivery.py), so 0
+    # divides by zero -- a 500 on every new delivery AFTER the claim was taken,
+    # with the claim unreleased until `channel_delivery_lease_s` lapses -- and
+    # a negative window makes the quota script's EXPIRE delete the counter
+    # immediately, silently disabling the quota. Bounded at construction the
+    # same way as GITHUB_FACTORY_RECONCILE_INTERVAL_S (#3709): refused at boot
+    # rather than surfacing mid-delivery (#3720).
+    hook_backlog_window_s: int = Field(default=60, gt=0)
     channel_binding_backlog_limit: int = 64
-    channel_binding_backlog_window_s: int = 60
+    channel_binding_backlog_window_s: int = Field(default=60, gt=0)
     # Sandbox ResourceQuota hard limits (#3209). The chart sets all four when
     # the quota object renders, and leaves all four unset otherwise. A partial
     # set is a broken install: the agent write refuses rather than skipping the

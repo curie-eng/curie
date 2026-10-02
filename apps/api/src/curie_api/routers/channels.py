@@ -74,10 +74,11 @@ from ..auth import require_api_key, verify_platform_key
 from ..channel_token import CHANNEL_ENQUEUE_SCOPE
 from ..config import get_settings
 from ..delivery import (
+    backlog_reservation,
     claim_delivery,
     duplicate_stream_id,
     enqueue_owned,
-    release_claim,
+    settle_failed_delivery,
     sha16,
     take_backlog_slot,
 )
@@ -693,6 +694,12 @@ async def ingest_turn(
         if current_generation != claims.generation:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
 
+    reservation = backlog_reservation(
+        key_prefix=f"{_CLAIM_PREFIX}:backlog:{row.id}",
+        window_s=settings.channel_binding_backlog_window_s,
+    )
+    preserve_quota = False
+
     # Two attempts, not a loop: the second exists only for the narrow case where
     # the claim key expired between our failed `SET NX` and the `GET` that would
     # have named its owner. If that repeats, the honest answer is "someone is
@@ -701,114 +708,123 @@ async def ingest_turn(
         if await claim_delivery(
             client, key, owner, settings.channel_delivery_lease_s
         ):
-            if not await take_backlog_slot(
-                client,
-                key_prefix=f"{_CLAIM_PREFIX}:backlog:{row.id}",
-                limit=settings.channel_binding_backlog_limit,
-                window_s=settings.channel_binding_backlog_window_s,
-            ):
-                # Over this binding's quota: give the claim back so the delivery
-                # is not locked out for a lease, and tell the adapter to retry.
-                # Metered per binding, so one compromised or runaway adapter
-                # cannot fill the shared stream for every other tenant.
-                await release_claim(client, key, owner)
-                logger.warning(
-                    "channel ingress refused event_id=%s kind=%s: binding backlog "
-                    "quota of %d per %ds exceeded",
-                    event_id,
-                    row.kind,
-                    settings.channel_binding_backlog_limit,
-                    settings.channel_binding_backlog_window_s,
-                )
-                raise HTTPException(
-                    status.HTTP_429_TOO_MANY_REQUESTS,
-                    "too many new deliveries for this binding; retry later",
-                    headers={
-                        "Retry-After": str(settings.channel_binding_backlog_window_s)
-                    },
-                )
-            # Minted and serialized only once this request holds both the claim
-            # and a quota slot: an adapter retrying an already-enqueued delivery
-            # is the steady state for an at-least-once ingress, and every one of
-            # those requests answers from `event_id` alone and would have thrown
-            # the payload away.
-            turn = _mint_turn(row, body, event_id)
-            carrier: dict[str, str] = {}
-            enqueue_error: Exception | None = None
-            enqueue_result: tuple[bool, str] | None = None
-            with operation_span(
-                "curie.queue.enqueue",
-                kind=SpanKind.PRODUCER,
-                attributes={"service.name": "curie-api", "source": "api"},
-            ) as span:
-                inject_trace_context(carrier)
-                try:
-                    enqueue_result = await enqueue_owned(
-                        client,
-                        key=key,
-                        stream=settings.runs_stream,
-                        owner=owner,
-                        payload=turn.model_dump_json(),
-                        payload_field=STREAM_PAYLOAD_FIELD,
-                        lease_s=settings.channel_delivery_lease_s,
-                        transport_field=(
-                            TRACEPARENT_STREAM_FIELD
-                            if TRACEPARENT_STREAM_FIELD in carrier
-                            else None
-                        ),
-                        transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+            try:
+                if not await take_backlog_slot(
+                    client,
+                    reservation=reservation,
+                    limit=settings.channel_binding_backlog_limit,
+                ):
+                    # Over this binding's quota: give the claim back so the delivery
+                    # is not locked out for a lease, and tell the adapter to retry.
+                    # Metered per binding, so one compromised or runaway adapter
+                    # cannot fill the shared stream for every other tenant.
+                    preserve_quota = True
+                    logger.warning(
+                        "channel ingress refused event_id=%s kind=%s: binding backlog "
+                        "quota of %d per %ds exceeded",
+                        event_id,
+                        row.kind,
+                        settings.channel_binding_backlog_limit,
+                        settings.channel_binding_backlog_window_s,
                     )
-                except Exception as exc:
-                    enqueue_error = exc
-                    span.set_status(StatusCode.ERROR)
-                    span.add_event("queue.enqueue.failed", {"outcome": "failure"})
-                else:
-                    assert enqueue_result is not None
-                    span.add_event(
-                        "queue.enqueued" if enqueue_result[0] else "queue.duplicate",
-                        {"outcome": "success" if enqueue_result[0] else "pending"},
+                    raise HTTPException(
+                        status.HTTP_429_TOO_MANY_REQUESTS,
+                        "too many new deliveries for this binding; retry later",
+                        headers={
+                            "Retry-After": str(settings.channel_binding_backlog_window_s)
+                        },
                     )
-            if enqueue_error is not None:
-                record_metric(
+                # Minted and serialized only once this request holds both the claim
+                # and a quota slot: an adapter retrying an already-enqueued delivery
+                # is the steady state for an at-least-once ingress, and every one of
+                # those requests answers from `event_id` alone and would have thrown
+                # the payload away.
+                turn = _mint_turn(row, body, event_id)
+                carrier: dict[str, str] = {}
+                enqueue_error: Exception | None = None
+                enqueue_result: tuple[bool, str] | None = None
+                with operation_span(
                     "curie.queue.enqueue",
-                    attributes={
-                        "service.name": "curie-api",
-                        "source": "api",
-                        "outcome": "failure",
-                    },
+                    kind=SpanKind.PRODUCER,
+                    attributes={"service.name": "curie-api", "source": "api"},
+                ) as span:
+                    inject_trace_context(carrier)
+                    try:
+                        enqueue_result = await enqueue_owned(
+                            client,
+                            key=key,
+                            stream=settings.runs_stream,
+                            owner=owner,
+                            payload=turn.model_dump_json(),
+                            payload_field=STREAM_PAYLOAD_FIELD,
+                            lease_s=settings.channel_delivery_lease_s,
+                            transport_field=(
+                                TRACEPARENT_STREAM_FIELD
+                                if TRACEPARENT_STREAM_FIELD in carrier
+                                else None
+                            ),
+                            transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+                        )
+                    except Exception as exc:
+                        enqueue_error = exc
+                        span.set_status(StatusCode.ERROR)
+                        span.add_event("queue.enqueue.failed", {"outcome": "failure"})
+                    else:
+                        assert enqueue_result is not None
+                        span.add_event(
+                            "queue.enqueued" if enqueue_result[0] else "queue.duplicate",
+                            {"outcome": "success" if enqueue_result[0] else "pending"},
+                        )
+                if enqueue_error is not None:
+                    record_metric(
+                        "curie.queue.enqueue",
+                        attributes={
+                            "service.name": "curie-api",
+                            "source": "api",
+                            "outcome": "failure",
+                        },
+                    )
+                    raise enqueue_error
+                assert enqueue_result is not None
+                enqueued, current = enqueue_result
+                if enqueued:
+                    record_metric(
+                        "curie.queue.enqueue",
+                        attributes={
+                            "service.name": "curie-api",
+                            "source": "api",
+                            "outcome": "success",
+                        },
+                    )
+                    record_metric(
+                        "curie.turn.accepted",
+                        attributes={
+                            "service.name": "curie-api",
+                            "source": "api",
+                            "outcome": "accepted",
+                        },
+                    )
+                    logger.info(
+                        "channel ingress enqueued event_id=%s stream_id=%s kind=%s",
+                        event_id,
+                        current,
+                        row.kind,
+                    )
+                    return TurnAccepted(
+                        event_id=event_id, stream_id=current, duplicate=False
+                    )
+                # Branch (c): our lease was re-claimed while we were slow. The other
+                # claimant owns the delivery; we do not enqueue on top of it.
+                return _duplicate(event_id, current, response)
+            except BaseException:
+                await settle_failed_delivery(
+                    client,
+                    key=key,
+                    owner=owner,
+                    reservation=reservation,
+                    preserve_quota=preserve_quota,
                 )
-                raise enqueue_error
-            assert enqueue_result is not None
-            enqueued, current = enqueue_result
-            if enqueued:
-                record_metric(
-                    "curie.queue.enqueue",
-                    attributes={
-                        "service.name": "curie-api",
-                        "source": "api",
-                        "outcome": "success",
-                    },
-                )
-                record_metric(
-                    "curie.turn.accepted",
-                    attributes={
-                        "service.name": "curie-api",
-                        "source": "api",
-                        "outcome": "accepted",
-                    },
-                )
-                logger.info(
-                    "channel ingress enqueued event_id=%s stream_id=%s kind=%s",
-                    event_id,
-                    current,
-                    row.kind,
-                )
-                return TurnAccepted(
-                    event_id=event_id, stream_id=current, duplicate=False
-                )
-            # Branch (c): our lease was re-claimed while we were slow. The other
-            # claimant owns the delivery; we do not enqueue on top of it.
-            return _duplicate(event_id, current, response)
+                raise
         held = await client.get(key)
         if held is not None:
             return _duplicate(event_id, _text(held), response)

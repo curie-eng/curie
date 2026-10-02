@@ -983,6 +983,7 @@ def test_one_thousand_forbidden_ids_do_not_create_metric_series(
             sandbox_id = f"sandbox-example-{index}"
             forbidden_values.update((session_id, user_id, event_id, sandbox_id))
             runner = SessionRunner(
+                max_usd_per_day=None,
                 held_secrets=frozenset(),
                 session_factory=FakeModelSession,
                 ceiling=0,

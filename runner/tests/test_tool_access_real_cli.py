@@ -235,6 +235,7 @@ def _run_turn(
             expected_mode = "default" if gate is not None else "bypassPermissions"
             assert options.permission_mode == expected_mode
             runner = SessionRunner(
+                max_usd_per_day=None,
                 held_secrets=frozenset(),
                 session_factory=lambda: ClaudeAgentSession(options),
                 ceiling=0,
@@ -615,6 +616,7 @@ def test_a_read_only_prompt_a_bundle_hook_delayed_never_runs_unrestricted(
                 },
             )
             runner = SessionRunner(
+                max_usd_per_day=None,
                 held_secrets=frozenset(),
                 session_factory=lambda: ClaudeAgentSession(options),
                 ceiling=0,

@@ -441,11 +441,31 @@ class CurieHookClient:
         placeholder: str,
         delivery_id: str,
     ) -> None:
+        if "." in delivery_id:
+            raise ValueError("a hook delivery id may not contain '.'")
         body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        signature = (
-            "sha256=" + hmac.new(self.config.hook_secret.encode(), body, hashlib.sha256).hexdigest()
-        )
         parsed = urllib.parse.urlsplit(self.config.hook_url)
+        hook = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
+        policies = urllib.parse.parse_qs(parsed.query, keep_blank_values=True).get(
+            "tool_access", []
+        )
+        if len(policies) > 1 or (policies and policies[0] != "read-only"):
+            raise ValueError("tool_access must be omitted or supplied once as read-only")
+        tool_access = policies[0] if policies else None
+        timestamp = str(int(time.time()))
+        context = json.dumps([hook, tool_access], ensure_ascii=True, separators=(",", ":")).encode(
+            "ascii"
+        )
+        material = (
+            b"curie.hook.delivery.v2\n"
+            + f"{timestamp}.{delivery_id}.{len(context)}:".encode()
+            + context
+            + body
+        )
+        signature = (
+            "sha256="
+            + hmac.new(self.config.hook_secret.encode(), material, hashlib.sha256).hexdigest()
+        )
         query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
         query.update(
             {
@@ -467,6 +487,7 @@ class CurieHookClient:
             headers={
                 "Content-Type": "application/json",
                 "X-Curie-Delivery-Id": delivery_id,
+                "X-Curie-Timestamp": timestamp,
                 "X-Curie-Signature-256": signature,
             },
         )
@@ -543,7 +564,7 @@ def process_message(
         },
         conversation_id=root_ts,
         placeholder=placeholder,
-        delivery_id=f"slack-email:{config.channel_id}:{root_ts}",
+        delivery_id=f"slack-email:{config.channel_id}:{root_ts.replace('.', ':')}",
     )
     return completed is not None
 

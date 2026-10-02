@@ -125,6 +125,10 @@ regexes = [
   # The provider prefix is intentionally present in the public fixture. The
   # complete finding is anchored so no other OpenRouter shaped value is covered.
   '''^credentials":"sk-or-v1-PLACEHOLDER"$''',
+  # The chart publishes this development caller pair in templates/_helpers.tpl.
+  # Match only the complete assignments used by the isolated upgrade matrix.
+  '''^connectorCaller\.signingKey=Y3VyaWUtZGV2LWNvbm5lY3Rvci1jYWxsZXItc2VlZCE=$''',
+  '''^connectorCaller\.verifyKey=tkmNbO5SSLE0IM84sH4uJ94DxtriNZ/APXha3FiyP6c=$''',
   # Slack token fixtures. The prefix is the whole point of the test that uses
   # them (curie seal / credcheck), so they cannot be shortened past it -- the
   # EXAMPLE marker is what makes them obviously not a live token.

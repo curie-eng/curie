@@ -1,7 +1,7 @@
 ---
 seam: Channel / ingress
 kind: CLEAN
-impls: 3 reply adapters behind the `ReplySink` port (Slack, HTTP, built-in cluster-message relay) + a second wire ingress producer (Rust CLI)
+impls: 4 reply adapters behind the `ReplySink` port (Slack, HTTP, built-in cluster-message relay, acknowledge-only GitHub) + a second wire ingress producer (Rust CLI)
 grade: B-
 vision_row: Communication
 epics:
@@ -16,7 +16,7 @@ order: 4
 
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 3 reply adapters behind the `ReplySink` port (Slack, HTTP, built-in cluster-message relay) + a second wire ingress producer (Rust CLI) &nbsp;·&nbsp; **Swap-readiness grade:** B-
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 4 reply adapters behind the `ReplySink` port (Slack, HTTP, built-in cluster-message relay, acknowledge-only GitHub) + a second wire ingress producer (Rust CLI) &nbsp;·&nbsp; **Swap-readiness grade:** B-
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -189,7 +189,17 @@ the authenticated HTTP edge: they neither construct a `QueuedTurn` nor implement
 binding's server-controlled endpoint. The built-in cluster-message publication path uses
 `_ClusterMessageReplyAdapter`
 (`apps/worker/src/curie_worker/reply_sink.py::_ClusterMessageReplyAdapter`) as the third
-`ReplySink` implementation and relays replies to the API. The swap proof that the protocol (not just
+`ReplySink` implementation and relays replies to the API. The fourth is
+`GitHubReplySink` (`apps/worker/src/curie_worker/reply_sink.py::GitHubReplySink`),
+selected for `kind == "github"` routes. It only acknowledges: it makes no network
+call and posts no streamed model text. A factory turn bound to a GitHub repository
+answers on GitHub through the factory notice and publication path instead: the API
+keeps the one live status comment and its labels
+(`apps/api/src/curie_api/factory_notices.py::sync_status_comments`), and the
+approval-gated pull request is recorded by the API publication control plane
+(`apps/api/src/curie_api/routers/publications.py`) and pushed by the worker's
+publication reconciler (`apps/worker/src/curie_worker/publication_loop.py`). That
+keeps exactly one GitHub response per request. The swap proof that the protocol (not just
 the service) is the seam: the Rust CLI mints the exact
 `QueuedTurn` wire payload with the same channel-neutral fields
 (`cli/src/queue.rs`) and drives the whole deployed system with zero Slack contact

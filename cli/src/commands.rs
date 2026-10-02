@@ -13,7 +13,7 @@ use clap::ValueEnum;
 use curie_aci_protocol::{Budget, EventType, OutboundEvent, SessionStatus};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{ApiClient, BudgetConfig, ChannelOutcome, RoutingCheck};
+use crate::api::{ApiClient, ChannelOutcome, RoutingCheck};
 use crate::bundle::{git_status_is_clean_for_pack, pack_tar_gz};
 use crate::docker::{self, CheckSpec, StartSpec};
 use crate::evals::{
@@ -2399,6 +2399,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
                 registry: None,
                 runner_image: None,
                 force: false,
+                platforms: Vec::new(),
             })
             .await
             {
@@ -6451,14 +6452,15 @@ pub async fn resume(opts: AgentActionOpts) -> Result<ResumeOutput> {
 }
 
 /// Output of `<tier> budget <agent>`: the dry-run plan, or the saved budget.
-/// `max_usd_per_day` is `None` when the platform default applies. Owns its data
-/// so it outlives the `ApiClient`.
+/// Each limit is `None` when the platform default applies. Owns its data so it
+/// outlives the `ApiClient`.
 #[derive(Debug)]
 pub enum BudgetOutput {
     DryRun(crate::ui::DryRunPlan),
     Done {
         agent: String,
         max_usd_per_day: Option<f64>,
+        max_output_tokens_per_run: Option<u64>,
     },
 }
 
@@ -6469,7 +6471,12 @@ impl crate::ui::CliOutput for BudgetOutput {
             BudgetOutput::Done {
                 agent,
                 max_usd_per_day,
-            } => serde_json::json!({"agent": agent, "max_usd_per_day": max_usd_per_day}),
+                max_output_tokens_per_run,
+            } => serde_json::json!({
+                "agent": agent,
+                "max_usd_per_day": max_usd_per_day,
+                "max_output_tokens_per_run": max_output_tokens_per_run,
+            }),
         }
     }
 
@@ -6479,42 +6486,87 @@ impl crate::ui::CliOutput for BudgetOutput {
             BudgetOutput::Done {
                 agent,
                 max_usd_per_day,
+                max_output_tokens_per_run,
             } => {
                 let usd = max_usd_per_day
                     .map(|v| format!("${v}/day"))
                     .unwrap_or_else(|| "platform default".to_string());
-                ui.payload(&format!("budget for {agent} set: max $/day {usd}"));
+                let tokens = max_output_tokens_per_run
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "platform default".to_string());
+                ui.payload(&format!(
+                    "budget for {agent} set: max output tokens/run {tokens}, max $/day {usd}"
+                ));
             }
         }
     }
 }
 
-/// `curie cluster budget <agent> --limit <n>`: set the agent budget
-/// (`PUT /agents/{id}/budget`). `--limit` sets the daily spend cap
-/// (`max_usd_per_day`, the primary `BudgetConfig` field the console surfaces as
-/// "Max $/day"); the per-run token cap is left at the platform default.
+/// Update the agent budget through `GET /agents/{id}/budget` followed by
+/// `PUT /agents/{id}/budget`. `--limit` sets `max_usd_per_day` and
+/// `--output-tokens` sets `max_output_tokens_per_run`. At least one is required;
+/// the current value of each unspecified field is preserved.
 /// `--dry-run` returns the plan and makes no request.
-pub async fn budget(opts: AgentActionOpts, limit: f64) -> Result<BudgetOutput> {
+pub async fn budget(
+    opts: AgentActionOpts,
+    limit: Option<f64>,
+    output_tokens: Option<u64>,
+) -> Result<BudgetOutput> {
     let ui = crate::ui::ui();
+    // Validated before the dry-run early return (#3710): a dry run shows what
+    // the real command would do, so it must refuse a --limit the real command
+    // would refuse instead of printing a plan for it.
+    if limit.is_none() && output_tokens.is_none() {
+        return Err(crate::exit::usage(
+            "at least one of --limit or --output-tokens is required",
+        ));
+    }
+    if let Some(limit) = limit {
+        if !limit.is_finite() || limit <= 0.0 {
+            return Err(crate::exit::usage(format!(
+                "--limit must be a finite value greater than 0 (got {limit})"
+            )));
+        }
+    }
+    if output_tokens == Some(0) {
+        return Err(crate::exit::usage(
+            "--output-tokens must be greater than 0 (got 0)",
+        ));
+    }
     if opts.dry_run {
+        let mut selected = serde_json::Map::new();
+        if let Some(limit) = limit {
+            selected.insert("max_usd_per_day".to_string(), serde_json::json!(limit));
+        }
+        if let Some(output_tokens) = output_tokens {
+            selected.insert(
+                "max_output_tokens_per_run".to_string(),
+                serde_json::json!(output_tokens),
+            );
+        }
         return Ok(BudgetOutput::DryRun(crate::ui::DryRunPlan {
-            lines: vec![format!(
-                "PUT {}/agents/<id>/budget  {{\"max_usd_per_day\":{limit}}}  (would resolve agent {:?} first)",
-                opts.api_url, opts.agent
-            )],
+            lines: vec![
+                format!(
+                    "GET {}/agents/<id>/budget  (would resolve agent {:?} first; read current fields to preserve unspecified limits)",
+                    opts.api_url, opts.agent
+                ),
+                format!(
+                    "PUT {}/agents/<id>/budget  {}  (update selected fields and preserve all unspecified current values, including platform defaults)",
+                    opts.api_url,
+                    serde_json::Value::Object(selected)
+                ),
+            ],
         }));
     }
-    if !limit.is_finite() || limit <= 0.0 {
-        return Err(crate::exit::usage(format!(
-            "--limit must be a finite value greater than 0 (got {limit})"
-        )));
-    }
-    let cfg = BudgetConfig {
-        max_output_tokens_per_run: None,
-        max_usd_per_day: Some(limit),
-    };
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
+    let mut cfg = client.get_budget(&agent.id).await?;
+    if let Some(limit) = limit {
+        cfg.max_usd_per_day = Some(limit);
+    }
+    if let Some(output_tokens) = output_tokens {
+        cfg.max_output_tokens_per_run = Some(output_tokens);
+    }
     let cl = ui.checklist();
     let step = cl.step(&format!("setting budget for {}", agent.name));
     let saved = match client.set_budget(&agent.id, &cfg).await {
@@ -6530,6 +6582,7 @@ pub async fn budget(opts: AgentActionOpts, limit: f64) -> Result<BudgetOutput> {
     Ok(BudgetOutput::Done {
         agent: agent.name,
         max_usd_per_day: saved.max_usd_per_day,
+        max_output_tokens_per_run: saved.max_output_tokens_per_run,
     })
 }
 
@@ -7857,7 +7910,9 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                 } else {
                     ui.payload(&format!("{agent} — {} pending approval(s):", records.len()));
                     for r in records {
-                        let tool = r.granted_tool.as_deref().unwrap_or("-");
+                        let tool =
+                            crate::render::action_label(r.granted_tool.as_deref().unwrap_or(""));
+                        let display = crate::approval_wording::approval_display(r);
                         let route = r.route.as_deref().unwrap_or("(requesting channel)");
                         // A null card_channel means an older row or a direct API
                         // write that omitted the field, for which the requesting
@@ -7888,8 +7943,8 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                         ui.kv(
                             &r.id,
                             &format!(
-                                "{}: {} [tool: {tool}, route: {route}, channel: {card}, current route approvers: {approvers}, by: {}]",
-                                r.summary, r.conversation_id, r.author
+                                "{}: {} [action: {tool}, route: {route}, channel: {card}, current route approvers: {approvers}, by: {}]",
+                                display, r.conversation_id, r.author
                             ),
                         );
                     }
@@ -9735,7 +9790,9 @@ impl crate::ui::CliOutput for HookFireOutput {
 }
 
 fn hook_fire_path(agent: &str, name: &str) -> String {
-    format!("/agents/{agent}/hooks/{name}/fire")
+    // Delegate to the same builder `fire_hook` encodes its request with, so the
+    // dry-run plan cannot drift from the path the real request uses (#3731).
+    crate::api::hook_fire_path(agent, name)
 }
 
 /// `<tier> hook fire`: run the hook now and print the record once it settles.
@@ -14207,7 +14264,7 @@ impl crate::ui::CliOutput for ConnectorBuildOutput {
 /// The flags `curie build --plugin-dir` carries.
 pub struct ConnectorBuildOpts {
     pub plugin_dir: PathBuf,
-    /// `Some(ref)` pushes a multi-platform index there; `None` builds the host
+    /// `Some(ref)` pushes every declared (or `platforms`) platform there; `None` builds the host
     /// platform into the local Docker daemon.
     pub registry: Option<String>,
     /// The platform runner a declared runner layer builds on; `None` is the
@@ -14215,6 +14272,9 @@ pub struct ConnectorBuildOpts {
     pub runner_image: Option<String>,
     /// Replace a registry lock with a local-daemon one deliberately.
     pub force: bool,
+    /// `--platform` values narrowing each declared set; empty builds every
+    /// declared platform.
+    pub platforms: Vec<String>,
 }
 
 /// `curie build --plugin-dir <dir>`: build every connector the bundle declares
@@ -14246,6 +14306,22 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
     if let Some(runner) = &decl.runner {
         cb::check_runner_source(&plugin_dir, runner)?;
     }
+    // Narrow every declared set before anything is built, so an undeclared
+    // `--platform` fails before minutes of builds.
+    let mut narrowed = std::collections::BTreeMap::new();
+    for (connector, spec) in &buildable {
+        if let Some(build) = &spec.build {
+            let set = cb::narrow_platforms(&build.platforms, &opts.platforms)
+                .with_context(|| format!("connectors.{connector}"))?;
+            narrowed.insert((*connector).clone(), set);
+        }
+    }
+    let runner_platforms = match &decl.runner {
+        Some(runner) => {
+            cb::narrow_platforms(&runner.build.platforms, &opts.platforms).context("runner")?
+        }
+        None => Vec::new(),
+    };
     if !crate::ops::on_path("docker") {
         bail!(
             "Docker is not installed or not on PATH. Install Docker \
@@ -14296,6 +14372,10 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
             opts.registry.as_deref(),
             &host,
             &metadata_dir,
+            narrowed
+                .get(connector)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
         ) {
             Ok(plan) => plan,
             Err(err) => {
@@ -14337,6 +14417,7 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
             base_arg,
             &host,
             &metadata_dir,
+            &runner_platforms,
         ) {
             Ok(plan) => run_one_connector_build(&plan, ui)
                 .await
@@ -14481,6 +14562,20 @@ pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
 }
 
 /// Run one connector's build and read back the immutable reference it produced.
+/// The fix for Docker's default driver refusing a multi-platform push: build
+/// the one platform the cluster runs, or switch to a docker-container builder.
+pub fn multi_platform_driver_fix(stderr: &str, host_platform: &str) -> Option<String> {
+    if !stderr.contains("Multi-platform build is not supported for the docker driver") {
+        return None;
+    }
+    Some(format!(
+        "the default Docker driver cannot push a multi-platform image. Rerun with \
+         `--platform {host_platform}` (or the architecture your cluster nodes run) to push \
+         one platform, or create a docker-container builder \
+         (`docker buildx create --driver docker-container --use`) to push them all"
+    ))
+}
+
 async fn run_one_connector_build(
     plan: &crate::connector_build::ConnectorBuildPlan,
     ui: &crate::ui::Ui,
@@ -14489,14 +14584,42 @@ async fn run_one_connector_build(
 
     let command = cb::build_argv(plan);
     ui.note(&format!("=== {} ===", command.display()));
-    // Inherit stdio so the build log streams like a hand-run build.
-    let status = tokio::process::Command::new(&command.program)
-        .args(command.argv())
-        .status()
-        .await
-        .context("failed to invoke docker")?;
+    // Inherit stdout so the build log streams like a hand-run build. A registry
+    // build tees stderr so a driver refusal can be answered with a fix.
+    let (status, stderr) = if plan.delivery == cb::Delivery::Registry {
+        use tokio::io::AsyncBufReadExt;
+        let mut child = tokio::process::Command::new(&command.program)
+            .args(command.argv())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to invoke docker")?;
+        let mut captured = String::new();
+        if let Some(pipe) = child.stderr.take() {
+            let mut lines = tokio::io::BufReader::new(pipe).lines();
+            while let Some(line) = lines.next_line().await.unwrap_or(None) {
+                eprintln!("{line}");
+                captured.push_str(&line);
+                captured.push('\n');
+            }
+        }
+        let status = child.wait().await.context("failed to wait for docker")?;
+        (status, captured)
+    } else {
+        let status = tokio::process::Command::new(&command.program)
+            .args(command.argv())
+            .status()
+            .await
+            .context("failed to invoke docker")?;
+        (status, String::new())
+    };
     if !status.success() {
-        bail!("building connector '{}' failed ({status})", plan.connector);
+        let message = format!("building connector '{}' failed ({status})", plan.connector);
+        if let Some(fix) = multi_platform_driver_fix(&stderr, &plan.host_platform) {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::failure(format!("{message}: {fix}")).with_fix(fix),
+            ));
+        }
+        bail!("{message}");
     }
     match plan.delivery {
         cb::Delivery::Registry => {
@@ -14644,6 +14767,22 @@ pub fn registry_manifest_argv(image: &str) -> crate::ops::OpsCommand {
     )
 }
 
+/// Ask docker for a single-image manifest's config blob, so a registry login
+/// is honored when the native blob fetch is refused.
+pub fn registry_config_argv(image: &str) -> crate::ops::OpsCommand {
+    crate::connector_build::plain_command(
+        "docker",
+        vec![
+            "buildx".into(),
+            "imagetools".into(),
+            "inspect".into(),
+            image.to_string(),
+            "--format".into(),
+            "{{json .Image}}".into(),
+        ],
+    )
+}
+
 /// The architectures the cluster's own nodes report.
 pub fn node_architectures_argv() -> crate::ops::OpsCommand {
     crate::connector_build::plain_command(
@@ -14686,6 +14825,28 @@ pub fn manifest_platforms(raw: &str) -> Result<std::collections::BTreeSet<String
         .collect())
 }
 
+/// The `config.digest` of a plain image manifest (one with no `manifests`
+/// array); `None` for an index or anything unparseable.
+pub fn single_manifest_config_digest(raw: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if parsed.get("manifests").is_some() {
+        return None;
+    }
+    parsed
+        .get("config")?
+        .get("digest")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The `os/architecture` an image config JSON names.
+pub fn config_platform(raw: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let os = parsed.get("os")?.as_str()?;
+    let arch = parsed.get("architecture")?.as_str()?;
+    Some(format!("{os}/{arch}"))
+}
+
 /// Refuse a cluster deploy whose locked image is gone from the registry, or
 /// whose resolved index cannot run on every node.
 ///
@@ -14697,6 +14858,7 @@ pub fn registry_preflight(
     inspect: std::result::Result<&str, String>,
     node_architectures: &std::collections::BTreeSet<String>,
     declared_platforms: &[String],
+    single_platform: Option<&str>,
 ) -> Result<()> {
     let raw = match inspect {
         Ok(raw) => raw,
@@ -14725,6 +14887,13 @@ pub fn registry_preflight(
             ),
         )
     })?;
+    // A plain single-image manifest covers the one platform its config names.
+    let covered = match single_platform {
+        Some(platform) if covered.is_empty() && single_manifest_config_digest(raw).is_some() => {
+            std::collections::BTreeSet::from([platform.to_string()])
+        }
+        _ => covered,
+    };
     let missing: Vec<String> = node_architectures
         .iter()
         .filter(|arch| !covered.contains(&format!("linux/{arch}")))
@@ -14814,11 +14983,40 @@ async fn run_registry_preflight(
                 "{native:#}, and `docker` is not on PATH to ask with a registry login"
             )),
         };
+        // A plain manifest names its platform only in its config blob; read
+        // it natively, and on failure leave the refusal standing.
+        let single_platform = match inspect
+            .as_deref()
+            .ok()
+            .and_then(single_manifest_config_digest)
+        {
+            Some(digest) => {
+                let native = crate::oci_registry::fetch_blob(&entry.image, &digest)
+                    .await
+                    .ok()
+                    .and_then(|blob| config_platform(&String::from_utf8_lossy(&blob)));
+                match native {
+                    Some(platform) => Some(platform),
+                    None if docker => {
+                        let (ok, raw, _) =
+                            crate::ops::run_capture(&registry_config_argv(&entry.image)).await?;
+                        if ok {
+                            config_platform(&raw)
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
         registry_preflight(
             &entry.image,
             inspect.as_deref().map_err(Clone::clone),
             &node_archs,
             &entry.platforms,
+            single_platform.as_deref(),
         )?;
     }
     Ok(())
@@ -15292,4 +15490,97 @@ async fn start_skill_connectors(
     }
     docker::wait_for_connectors_ready(&readiness_targets, readiness_timeout).await?;
     Ok(started)
+}
+
+#[cfg(test)]
+mod single_platform_preflight_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    const DOCKER_V2_MANIFEST: &str = r#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{"mediaType":"application/vnd.docker.container.image.v1+json","size":601,"digest":"sha256:0d64a902c265bc2c08f0b5978ac2641b0ed5bf60dead4de516ace9263308097e"},"layers":[]}"#;
+
+    const OCI_INDEX: &str = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","size":500,"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","platform":{"os":"linux","architecture":"amd64"}}]}"#;
+
+    const IMAGE: &str = "localhost:5001/factory/tempo@sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+    // B3
+    #[test]
+    fn a_plain_manifest_names_its_config_digest() {
+        assert_eq!(
+            single_manifest_config_digest(DOCKER_V2_MANIFEST).as_deref(),
+            Some("sha256:0d64a902c265bc2c08f0b5978ac2641b0ed5bf60dead4de516ace9263308097e")
+        );
+    }
+
+    #[test]
+    fn an_index_has_no_single_config_digest() {
+        assert_eq!(single_manifest_config_digest(OCI_INDEX), None);
+    }
+
+    // B4
+    #[test]
+    fn registry_config_argv_asks_docker_for_the_image_config() {
+        let cmd = registry_config_argv("localhost:35719/probe:1");
+        let rendered = format!("{cmd:?}");
+        for part in [
+            "docker",
+            "buildx",
+            "imagetools",
+            "inspect",
+            "localhost:35719/probe:1",
+            "--format",
+            "{{json .Image}}",
+        ] {
+            assert!(rendered.contains(part), "{part} missing from {rendered}");
+        }
+        assert_eq!(
+            config_platform(
+                "{\n  \"architecture\": \"amd64\",\n  \"os\": \"linux\",\n  \"config\": {}\n}"
+            )
+            .as_deref(),
+            Some("linux/amd64")
+        );
+    }
+
+    #[test]
+    fn config_platform_reads_os_and_architecture() {
+        assert_eq!(
+            config_platform(r#"{"os":"linux","architecture":"amd64","config":{}}"#).as_deref(),
+            Some("linux/amd64")
+        );
+    }
+
+    // B5
+    #[test]
+    fn a_single_platform_push_deploys_to_matching_nodes() {
+        registry_preflight(
+            IMAGE,
+            Ok(DOCKER_V2_MANIFEST),
+            &BTreeSet::from(["amd64".to_string()]),
+            &["linux/amd64".to_string(), "linux/arm64".to_string()],
+            Some("linux/amd64"),
+        )
+        .expect("a single-platform amd64 push covers amd64 nodes");
+    }
+
+    #[test]
+    fn a_single_platform_push_is_refused_on_other_architecture_nodes() {
+        let error = registry_preflight(
+            IMAGE,
+            Ok(DOCKER_V2_MANIFEST),
+            &BTreeSet::from(["arm64".to_string()]),
+            &["linux/amd64".to_string(), "linux/arm64".to_string()],
+            Some("linux/amd64"),
+        )
+        .expect_err("an amd64-only push cannot run on arm64 nodes");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("arm64"),
+            "the refusal should name arm64: {text}"
+        );
+        assert!(
+            text.contains(IMAGE),
+            "the refusal should name the image: {text}"
+        );
+    }
 }

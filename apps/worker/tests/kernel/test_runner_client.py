@@ -346,6 +346,7 @@ def test_kernel_final_break_closes_real_runner_stream_without_write_eof_error(
         monkeypatch.setattr(runner_server, "_event", wrapped_event)
         fake = FakeModelSession()
         runner = SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: fake,
             ceiling=0,
@@ -1316,6 +1317,7 @@ async def _assert_real_timeout_boundary(
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     fake = _TimeoutBoundaryFake(release_on_interrupt=release_on_interrupt)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
@@ -1572,6 +1574,7 @@ def test_production_http_timeout_handler_holds_next_query_until_ack(
     async def go() -> None:
         session = _ProductionTimeoutPostureSession()
         runner = SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=0,

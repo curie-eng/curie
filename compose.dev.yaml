@@ -412,6 +412,9 @@ services:
       DB_SCHEMA: curie
       # Per-install key from `curie local up`; the fallback is for raw compose only.
       API_KEY: ${CURIE_LOCAL_API_KEY:-curie-dev-key}
+      # Console request budgets use the socket peer address. Users behind one
+      # proxy share a budget because forwarded client addresses are untrusted.
+      FORWARDED_ALLOW_IPS: ""
       # Dedicated Slack approval-principal attestation key. It is independent
       # from API_KEY so an administrator holding the platform key cannot forge
       # the authenticated Slack identity/channel evidence accepted by the API.

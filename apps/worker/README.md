@@ -480,6 +480,16 @@ requests or promote them to read-only: loading one can execute dynamic context.
 Custom descriptions, summaries, failed warnings and undoable verdicts retain
 their existing meaning.
 
+<!-- @spec WORKER-RECEIPT-2 -->
+Every receipt description uses plain action wording, including failed native
+requests, MCP calls, and connector-provided summaries and details. Strip the
+MCP namespace, split identifier words, and describe the action without inferring
+success; an absent or invalid identifier becomes `action`. Replace identifier
+references in presentation metadata while preserving surrounding content and
+restore/failure meaning. Stored ledger identifiers and arguments remain unchanged.
+An MCP tool named like a native request is still a connector action, never
+suppressed or treated as a native completed request.
+
 Tests: `uv run pytest apps/worker/tests/kernel -q` runs against the real Valkey
 from `compose.dev.yaml`, the real sandbox substrate with a fake Kubernetes client whose
 sandboxes resolve to a local in-process fake runner, and a recording Slack sink.
@@ -1134,3 +1144,15 @@ selection refusal and the same recovery. When repository workspaces are
 disabled, the existing workspaces disabled refusal takes precedence before the
 file is resolved. Fresh workspace claims and suspended workspace resumes still
 receive attachments. Retained workspace replacement is tracked in #2728.
+
+Approval metadata references follow the same sentence boundary rules across API,
+worker, runner and the UI fallback for older API responses. A tool identifier
+followed by a sentence-ending period (including whitespace or closing punctuation)
+uses its plain action label. Filenames, extensions, paths, URLs and identifiers
+embedded within another word remain literal data, including Unicode text. The
+stored summary, exact grant target, arguments and nested content remain unchanged.
+
+Receipt and CLI progress metadata use the same reference-boundary vector as
+approval displays. Closing code quotes end a sentence reference just as closing
+parentheses, brackets and ordinary quotes do; requested filenames and paths stay
+literal. This wording changes neither answers nor stored actions.

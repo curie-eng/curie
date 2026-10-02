@@ -3,6 +3,9 @@
 Review round 2: a relabel must not move the base under a running execution, a
 refused readmission must not write a base, and an ignored relabel must reach a
 finalized status comment.
+
+GitHub issue label event identities follow:
+https://docs.github.com/en/rest/issues/events
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ def _train(monkeypatch: pytest.MonkeyPatch) -> None:
 def _labelled(client: Any, github: Any, number: int, *labels: str) -> Any:
     github.issue_number = number
     github.labels = [LABEL, *labels]
+    github.advance_label_event(number)
     return _post(
         client,
         "issues",

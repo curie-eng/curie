@@ -5,6 +5,7 @@
 //! the platform API's committed OpenAPI surface. Task I1.
 
 pub mod api;
+pub mod approval_wording;
 pub mod artifacts;
 pub mod bundle;
 pub mod channel;
@@ -28,6 +29,8 @@ pub mod eval_sampling;
 pub mod evals;
 pub mod examples;
 pub mod exit;
+pub mod factory_app;
+pub mod factory_intake;
 pub mod github_app;
 pub mod guide;
 pub mod installation;

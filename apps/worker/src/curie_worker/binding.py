@@ -160,6 +160,10 @@ RESUMED_KIND_ENV = BootEnv.env_key("approval_resumed_kind")
 # scoped token, minted by the kernel's resume overlay per work-item execution.
 PROGRESS_URL_ENV = BootEnv.env_key("progress_url")
 PROGRESS_TOKEN_ENV = BootEnv.env_key("progress_token")
+# ADR 0187 factory issue read: the API route and the execution scoped
+# capability naming this execution's WorkItem issue, minted per boot.
+ISSUE_READ_URL_ENV = BootEnv.env_key("issue_read_url")
+ISSUE_READ_TOKEN_ENV = BootEnv.env_key("issue_read_token")
 # ADR-0076 Stone 3 (#889, epic #512): the resolved terminal decision
 # ('approved'/'rejected'/'expired') of the approval this resume boot is
 # resuming from, so the runner can stamp it on the turn's OTel span and close
@@ -1201,6 +1205,7 @@ class BindingResolver:
             # (and the URL still emitted) on the no-key fake/local path.
             state_url=state_url,
             state_token=app_state_token,
+            channel_bound=True if kind and address else None,
         )
         # #517/#669 opt-in false-completion check: NOT a BootEnv.render_worker
         # kwarg (it is deliberately kept out of the frozen ACI contract, see

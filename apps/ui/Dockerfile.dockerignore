@@ -27,7 +27,10 @@ prototypes
 charts
 otel
 scripts
-tests
+tests/*
+!tests/vectors
+tests/vectors/*
+!tests/vectors/user-action-wording.json
 packages/plugin-format
 packages/aci-protocol/src
 packages/aci-protocol/tests

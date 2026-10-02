@@ -59,15 +59,42 @@ side-channel injections whose output surfaces on the open `/v1/event` stream (th
 proven steering pattern). The finish race (a steer arriving as a turn ends,
 409) is owned by the worker.
 
+### Caller feedback
+
+Connector availability notices describe unavailable connected services in plain
+language. Missing sign-in settings, rejected access, invalid connection settings,
+and unsuccessful connection attempts remain distinguishable; notices never show
+connector identifiers, credential environment-variable names, MCP terminology or
+sandbox details. Only observed causes are described. Retry counts may be shown,
+without promising that a retry will succeed.
+
+Technical diagnosis retains the connector name, credential names (never values),
+reason and refusal in logs. The shared connector diagnosis vector continues to
+verify this diagnostic representation. The final reply and tool exclusion hook
+use the caller representation. Recovery removes the notice as before.
+
+Policy refusals and changed approval details describe the action in ordinary
+words. MCP names use their last nonempty suffix, underscores and hyphens become
+spaces, and camel case becomes words; Bash and Skill are shell and instruction
+requests. Invalid labels fall back to “action”. Refusals still prevent execution,
+never mint an approval for a policy denial and never spend a mismatched grant.
+
 At boot, the runner snapshots held credential values before hosted connector
-environment cleanup. A common outbound boundary replaces those exact values
-and recognized secret patterns with placeholders in assistant replies and
-structured tool results. Protocol keys, control metadata and approval argument
-carriers retain their original values. A buffer shared across `TextDelta`
-chunks protects held values split between chunks. Clean text streams normally;
-overlapping matches may remain buffered until the overlap ends or the turn
-completes. Recognition of unknown token patterns does not guarantee protection
-for fragments split across chunks.
+environment cleanup. A common outbound boundary replaces those exact values,
+their standard and URL-safe base64 forms when that encoding is at least 8 characters, and recognized secret patterns
+with placeholders in assistant replies and structured tool results. Protocol
+keys, control metadata and approval argument carriers retain their original
+values. A buffer shared across `TextDelta` chunks protects held values split
+between chunks. Clean text streams normally; overlapping matches may remain
+buffered until the overlap ends or the turn completes. Recognition of unknown
+token patterns does not guarantee protection for fragments split across chunks.
+
+The SDK parent retains its model authentication. Its Bash tool uses a mandatory
+image owned launcher that removes platform credentials before Bash reads user
+startup files or SDK snapshots. The launcher isolates Python imports from the
+workspace and preserves the shell arguments, exit status and signals. Missing or
+nonexecutable launchers reject session startup instead of selecting another shell.
+Declared connector secrets remain available to bundle tools.
 
 Each `text_delta` the runner emits is one whole assistant text block, and a
 consumer joins deltas as they come. The same boundary therefore starts a later
@@ -162,7 +189,8 @@ turn whose `Event.tool_access` is `read-only`:
   classifier and this check. The MCP half is each connector's own annotation:
   a server that marks a tool `readOnlyHint: true` has classified it
   read-only. Curie's platform tools are not read-only, including
-  `mcp__curie__request_approval` and `mcp__curie__report_progress`, which the
+  `mcp__curie__request_approval`, `mcp__curie__report_progress` and
+  `mcp__curie__get_issue`, which the
   classifier treats as idempotent.
 - **RUNNER-TOOL-ACCESS-2:** Any other tool call is denied before it executes.
   The runner registers a PreToolUse callback for every tool and wraps every
@@ -411,3 +439,18 @@ explicitly selected with `CURIE_E2E_LIVE=1`, including the provider-side web
 search proof, may instead use an already-authenticated local Claude SDK. Without
 either authentication path they fail honestly rather than fabricating a live
 result.
+
+## Approval display wording
+
+Permission approval records retain the exact tool identifier and arguments.
+The card and waiting notice describe the requested action in plain language,
+including when a bundle has no summary template or its template cannot render.
+Do not present MCP identifiers or argument field names as prose. Preserve the
+requested values and do not imply that the pending action has run.
+
+Approval metadata references follow the same sentence boundary rules across API,
+worker, runner and the UI fallback for older API responses. A tool identifier
+followed by a sentence-ending period (including whitespace or closing punctuation)
+uses its plain action label. Filenames, extensions, paths, URLs and identifiers
+embedded within another word remain literal data, including Unicode text. The
+stored summary, exact grant target, arguments and nested content remain unchanged.

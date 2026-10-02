@@ -71,6 +71,18 @@ RUN /app/.venv/bin/pip install --no-cache-dir --no-deps \
         ./packages/telemetry-schema \
     && /app/.venv/bin/pip install --no-cache-dir --no-deps ./runner
 
+# Same-uid peers cannot read a locked process environ. exec clears that lock.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && mkdir -p /usr/local/lib/curie \
+    && gcc -shared -fPIC -O2 \
+        -o /usr/local/lib/curie/libproc_dumpable.so \
+        runner/src/curie_runner/proc_dumpable.c \
+    && apt-get purge -y gcc libc6-dev \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+ENV CURIE_PROC_DUMPABLE_PRELOAD=/usr/local/lib/curie/libproc_dumpable.so
+
 # Run as a non-root user. The claude-agent-sdk spawns
 # `claude --dangerously-skip-permissions` (permission_mode=bypassPermissions),
 # and Claude Code refuses that flag under uid 0 ("cannot be used with root/sudo

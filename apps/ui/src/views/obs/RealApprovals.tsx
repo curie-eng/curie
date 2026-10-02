@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { C } from "../../tokens";
 import { Button, Card, Chip, Dot, Modal, Notice, Table } from "../../primitives";
+import { actionLabel, approvalSummary } from "../../primitives/actionWording";
 import { useStore } from "../../state/store";
 import {
   ApiError,
@@ -260,14 +261,14 @@ function ApprovalDetail({
       >
         <div style={{ display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 14 }}>
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontSize: 15, fontWeight: 600, color: C.text, marginBottom: 6 }}>{approval.summary}</div>
+            <div style={{ fontSize: 15, fontWeight: 600, color: C.text, marginBottom: 6 }}>{approval.display_summary || approvalSummary(approval.summary)}</div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
               <StatusChip status={approval.status} />
               {approval.gate_kind ? (
                 <Chip color={C.text2} border={C.border}>{`gate: ${approval.gate_kind}`}</Chip>
               ) : null}
               {approval.granted_tool ? (
-                <Chip color={C.text2} border={C.border}>{approval.granted_tool}</Chip>
+                <Chip color={C.text2} border={C.border}>{actionLabel(approval.granted_tool)}</Chip>
               ) : null}
             </div>
           </div>
@@ -509,7 +510,7 @@ export function RealApprovals() {
                 accent: a.status === "pending" ? C.warn : undefined,
                 cells: [
                   <span data-testid="approval-summary" style={{ color: C.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" }}>
-                    {a.summary}
+                    {a.display_summary || approvalSummary(a.summary)}
                   </span>,
                   <span style={{ color: C.text2, fontFamily: C.mono, fontSize: 12 }}>{a.author}</span>,
                   <span style={{ color: C.muted, fontFamily: C.mono, fontSize: 12 }}>{a.route ?? "—"}</span>,

@@ -469,3 +469,39 @@ def test_a_work_item_boot_signs_the_run_pair_and_caps_exp() -> None:
     assert claims["exp"] == ceiling
     plain = _boot_env(WorkerConfig(connector_caller_signing_key=seed, **_SCOPED), _resolved())
     assert "run" not in _claims(plain["CURIE_CONNECTOR_CALLER_TOKEN"])
+
+
+def _boot_env_with_channel(
+    config: WorkerConfig,
+    resolved: ResolvedDeployment,
+    *,
+    kind: str | None,
+    address: str | None,
+) -> dict[str, str]:
+    resolver = BindingResolver.__new__(BindingResolver)
+    resolver._config = config  # type: ignore[attr-defined]
+    return resolver.boot_env(resolved, _THREAD, kind=kind, address=address)
+
+
+def test_boot_env_omits_channel_bound_without_kind_or_address() -> None:
+    env = _boot_env(WorkerConfig(), _resolved())
+    assert "CURIE_CHANNEL_BOUND" not in env
+
+
+def test_boot_env_marks_a_turn_bound_to_a_channel() -> None:
+    env = _boot_env_with_channel(
+        WorkerConfig(), _resolved(), kind="slack", address="C0EXAMPLE1"
+    )
+    assert env["CURIE_CHANNEL_BOUND"] == "1"
+
+
+def test_boot_env_omits_channel_bound_when_the_address_is_blank() -> None:
+    env = _boot_env_with_channel(WorkerConfig(), _resolved(), kind="slack", address="")
+    assert "CURIE_CHANNEL_BOUND" not in env
+
+
+def test_boot_env_omits_channel_bound_when_the_kind_is_blank() -> None:
+    env = _boot_env_with_channel(
+        WorkerConfig(), _resolved(), kind="", address="C0EXAMPLE1"
+    )
+    assert "CURIE_CHANNEL_BOUND" not in env

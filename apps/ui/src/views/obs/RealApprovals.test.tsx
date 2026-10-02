@@ -241,3 +241,18 @@ describe("RealApprovals (#867)", () => {
     expect(screen.queryByTestId("approve-btn")).not.toBeInTheDocument();
   });
 });
+
+
+describe("plain approval display", () => {
+  it("uses the display summary and a plain action label", async () => {
+    vi.mocked(listApprovals).mockResolvedValue([approval({
+      summary: 'Tool call awaiting approval: mcp__acme__file_attachment {"file_name":"example.pdf"}',
+      display_summary: "Approve file attachment. File name: example.pdf",
+      granted_tool: "mcp__acme__file_attachment",
+    })]);
+    renderView();
+    await userEvent.click(await screen.findByText("Approve file attachment. File name: example.pdf"));
+    expect(screen.getByTestId("approval-detail")).toHaveTextContent("file attachment");
+    expect(screen.getByTestId("approval-detail")).not.toHaveTextContent("mcp__acme__file_attachment");
+  });
+});

@@ -230,6 +230,24 @@ then an invented fact, then a failure text, then a wrong answer, then UNCLEAR.
 It counts each kind of thread and carries eval cases for the worst three FAILs,
 all in one Slack reply of under 3,000 characters.
 
+## Validator slice 1
+
+<!-- @spec VALIDATOR-README-1 -->
+A validation campaign runs a target-owned `acceptance/cases.json` fixed suite
+before invented probes, reports each criterion's executed cases and gaps, and
+plans 2–4 realistic user sessions. It grades read-or-ask steps from the user's
+seat. Attachments, actions, card resolution and state checks remain
+`BLOCKED: slice 2`, even on a marked installation. A missing or malformed suite,
+UNCLEAR, incomplete repeats or blocked steps cannot become PASS or full GO.
+
+See [the validator design](docs/VALIDATOR.md) for the separate suite format,
+configuration comparison, smoke, snapshot/restore and fault-injection contracts,
+and [phase 0 evidence](docs/PHASE-0.md) for approval and attachment limitations.
+The [illustrative suite](acceptance/cases.json) is sample data for a fictional
+target; the tester's own grading regressions remain in `evals/cases.json`.
+Human and campaign findings become permanent case drafts for a maintainer to
+commit. The shipped tool permissions and read-or-ask rule remain unchanged.
+
 ## Evals
 
 Each case in [`evals/cases.json`](evals/cases.json) hands the tester a recorded

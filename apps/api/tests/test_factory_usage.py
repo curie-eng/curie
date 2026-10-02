@@ -37,7 +37,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import anyio
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+from curie_runner.usage_report import UsageReporter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -500,3 +505,131 @@ def test_the_terminal_line_names_runs_that_reported_no_usage(priced: Any) -> Non
     (usage,) = [line for line in comment["body"].splitlines() if line.startswith("Usage:")]
     assert usage.endswith(MISSING_SUFFIX), usage
     assert "total at least $2.40" in usage
+
+
+def test_a_follow_up_turn_stores_only_its_increment_and_keeps_the_reviewer_role(
+    priced: Any,
+) -> None:
+    """Two turns of one request store the running model_usage once.
+
+    The runner posts each turn's own slice. The stored rows and the terminal
+    Usage line must sum to that slice, with the reviewer model still reviewer
+    after a follow-up that never sees the reviewer again.
+    """
+
+    captured: list[dict[str, Any]] = []
+
+    def _sdk_usage(inp: int, out: int) -> dict[str, int]:
+        return {
+            "input_tokens": inp,
+            "output_tokens": out,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }
+
+    def _model_usage(inp: int, out: int) -> dict[str, int]:
+        return {
+            "inputTokens": inp,
+            "outputTokens": out,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+        }
+
+    def _assistant(
+        model: str, usage: dict[str, int], *, parent: str | None = None
+    ) -> AssistantMessage:
+        return AssistantMessage(
+            content=[TextBlock(text="x")],
+            model=model,
+            parent_tool_use_id=parent,
+            usage=usage,
+        )
+
+    def _result(**overrides: Any) -> ResultMessage:
+        fields: dict[str, Any] = {
+            "subtype": "success",
+            "duration_ms": 1,
+            "duration_api_ms": 1,
+            "is_error": False,
+            "num_turns": 1,
+            "session_id": "sdk-session-PLACEHOLDER",
+            "result": "done",
+        }
+        fields.update(overrides)
+        return ResultMessage(**fields)
+
+    async def drive() -> None:
+        app = web.Application()
+
+        async def usage(request: web.Request) -> web.Response:
+            captured.append(await request.json())
+            return web.json_response({"recorded": True}, status=201)
+
+        app.router.add_post("/v1/work-item-progress/{request_id}/usage", usage)
+        server = TestServer(app)
+        await server.start_server()
+        try:
+            url = str(server.make_url("/v1/work-item-progress/example-request/usage"))
+            reporter = UsageReporter(url, "sbx.example-usage-token.signature")
+            reporter.observe(_assistant(IMPLEMENTER, _sdk_usage(1_000_000, 500_000)))
+            reporter.observe(
+                _assistant(REVIEWER, _sdk_usage(200_000, 100_000), parent="toolu_example")
+            )
+            await reporter.report(
+                _result(
+                    model_usage={
+                        IMPLEMENTER: _model_usage(1_000_000, 500_000),
+                        REVIEWER: _model_usage(200_000, 100_000),
+                    },
+                    uuid="turn-a",
+                ),
+                IMPLEMENTER,
+            )
+            reporter.observe(_assistant(IMPLEMENTER, _sdk_usage(500_000, 200_000)))
+            await reporter.report(
+                _result(
+                    model_usage={
+                        IMPLEMENTER: _model_usage(1_500_000, 700_000),
+                        REVIEWER: _model_usage(200_000, 100_000),
+                    },
+                    uuid="turn-b",
+                ),
+                IMPLEMENTER,
+            )
+        finally:
+            await server.close()
+
+    anyio.run(drive)
+    assert len(captured) == 2
+
+    client, github, sink, _book = priced
+    request_id = _admit(client, github, sink, 9630)
+    _reconcile()
+    epoch = _start_running(request_id)
+    for body in captured:
+        response = client.post(
+            f"/v1/work-item-progress/{request_id}/usage",
+            headers={"X-API-Key": _token(request_id)},
+            json=body,
+        )
+        assert response.status_code == 201, response.text
+    rows = _stored(request_id)
+    by_turn = {(row["turn_id"], row["role"], row["model"]): row for row in rows}
+    assert set(by_turn) == {
+        ("turn-a", "implementer", IMPLEMENTER),
+        ("turn-a", "reviewer", REVIEWER),
+        ("turn-b", "implementer", IMPLEMENTER),
+    }
+    assert by_turn[("turn-b", "implementer", IMPLEMENTER)]["input_tokens"] == 500_000
+    assert by_turn[("turn-b", "implementer", IMPLEMENTER)]["output_tokens"] == 200_000
+    assert by_turn[("turn-a", "reviewer", REVIEWER)]["output_tokens"] == 100_000
+    assert sum(row["output_tokens"] for row in rows) == 800_000
+
+    _finish_failed(client, request_id, epoch, "runner_escalated")
+    _reconcile()
+    (comment,) = _marked(sink, request_id)
+    (usage,) = [line for line in comment["body"].splitlines() if line.startswith("Usage:")]
+    assert usage == (
+        "Usage: implementer 2,200,000 tokens ($2.90), reviewers 300,000 tokens ($0.40), "
+        f"total $3.30 (estimated from {SOURCE} prices as of 2026-09-01)"
+    )

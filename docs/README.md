@@ -50,6 +50,10 @@ git history (`git log -- docs/`).
   declarative data rather than code, and what is wired today.
 - [`operations.md`](operations.md): running a cluster install, plus
   operator-facing findings from early installs.
+* [`guides/dark-factory-quickstart.md`](guides/dark-factory-quickstart.md):
+  from nothing to a pull request the dark factory opened on a new repository,
+  on a laptop kind cluster: your own GitHub App, factory intake, the tunnel,
+  the agent deploy, and troubleshooting.
 - [`guides/repository-toolchain-in-the-managed-sandbox.md`](guides/repository-toolchain-in-the-managed-sandbox.md):
   the supported recipe for installing a repository's dependencies and running
   its checks inside a managed sandbox, including the measured fail-closed

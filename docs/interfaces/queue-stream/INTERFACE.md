@@ -136,6 +136,16 @@ specs and handlers and issues only its own pre-claim `xpending_range`
 (`apps/worker/src/curie_worker/eval/stream.py`), reinforcing the wire shape as the
 real contract.
 
+Not every runs-stream producer goes through `StreamPublisher`. Besides the API
+writers listed under Known leakage, two schedulers `XADD` a `QueuedTurn` straight
+onto the runs stream with a raw client: the worker's cron scheduler
+(`apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop._enqueue`), and the
+API's WorkItem reconciler
+(`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._xadd`), which
+creates the consumer group with `XGROUP CREATE ... MKSTREAM`, retries once after a
+`NOGROUP`, and for a marked round sets a `SET NX EX` marker and appends in one EVAL
+Lua script (`_MARK_AND_XADD`).
+
 ## The port (as of #284 / ADR-0027)
 
 Drawn only at the **non-sacred** seams; the sacred concurrency kernel
@@ -170,7 +180,7 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
 - **The composition root still touches redis directly.** The client construction in
   `apps/worker/src/curie_worker/run.py` (by design) builds concrete
   `redis.Redis` / `redis.asyncio.Redis` handles and passes them into the ports.
-  (The audit's companion claim that the sacred `consumer.py` calls `XAUTOCLAIM`
+  (A companion claim that the sacred `consumer.py` calls `XAUTOCLAIM`
   directly does not hold: `consumer.py` names `XAUTOCLAIM` only in a docstring and a
   comment, and the actual call is the base's
   `apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._reclaim_once`,
@@ -240,6 +250,18 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   also reads the graveyard off-port (`xrevrange`, bounded by
   `apps/worker/src/curie_worker/config.py::WorkerConfig.completion_sweep_batch`,
   counting `dl_source=completion-outbox`).
+- **Two scheduler producers write the runs stream off-port.** The cron scheduler
+  (`apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop._enqueue`) issues a
+  raw `xadd` and, when it fails, marks the scheduled run failed in Postgres. The
+  WorkItem reconciler
+  (`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._xadd`) issues
+  its own `xgroup_create` with `mkstream`, a raw `xadd` with one `NOGROUP` retry, and
+  the `_MARK_AND_XADD` EVAL script. Neither uses `StreamPublisher`. A second broker
+  would have to supply, for these two alone: append of a one-field `payload` entry to
+  an ordered stream; idempotent creation of the stream and its consumer group, with an
+  error it can recognize as a missing group; and an atomic "set a TTL marker only if
+  absent, and append only if the marker was set" step, which is what keeps one
+  reconciler round from enqueueing the same turn twice.
 - **The redis-py exception surface leaks.** The ports type the verbs but not the error
   contract: `redis.exceptions` propagate through the callers unabstracted, so a non-redis
   broker must either raise redis-py-compatible exceptions or the call sites must learn its

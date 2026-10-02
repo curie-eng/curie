@@ -2218,13 +2218,23 @@ fn budget_output_validates_all_variants() {
     let some = BudgetOutput::Done {
         agent: "d".to_string(),
         max_usd_per_day: Some(5.0),
+        max_output_tokens_per_run: Some(64000),
     };
     assert_valid("budget.schema.json", &some.to_json());
     let none = BudgetOutput::Done {
         agent: "d".to_string(),
         max_usd_per_day: None,
+        max_output_tokens_per_run: None,
     };
     assert_valid("budget.schema.json", &none.to_json());
+    for (usd, tokens) in [(Some(5.0), None), (None, Some(64000))] {
+        let mixed = BudgetOutput::Done {
+            agent: "d".to_string(),
+            max_usd_per_day: usd,
+            max_output_tokens_per_run: tokens,
+        };
+        assert_valid("budget.schema.json", &mixed.to_json());
+    }
     let dry = BudgetOutput::DryRun(DryRunPlan {
         lines: vec!["PUT /budget".to_string()],
     });
@@ -2337,6 +2347,7 @@ fn approval_record() -> ApprovalRecord {
         status: "pending".to_string(),
         conversation_id: "C1".to_string(),
         summary: "run tests".to_string(),
+        display_summary: None,
         expires_at: Some("2026-01-01T00:00:00Z".to_string()),
         resolved_by: None,
         // #1078: the persisted card location for a route-bound approval.

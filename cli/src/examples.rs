@@ -818,6 +818,210 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     Ok(SreBotInstallResult::Installed(Box::new(deployed)))
 }
 
+/// Every tracked file of `examples/dark-factory`, embedded so a released
+/// binary can render the factory bundle without a source checkout (#3619).
+pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
+    (
+        "README.md",
+        include_bytes!("../../examples/dark-factory/README.md"),
+    ),
+    (
+        ".gitignore",
+        include_bytes!("../../examples/dark-factory/.gitignore"),
+    ),
+    (
+        "connectors.yaml",
+        include_bytes!("../../examples/dark-factory/connectors.yaml"),
+    ),
+    (
+        "runner.Dockerfile",
+        include_bytes!("../../examples/dark-factory/runner.Dockerfile"),
+    ),
+    (
+        ".claude-plugin/plugin.json",
+        include_bytes!("../../examples/dark-factory/.claude-plugin/plugin.json"),
+    ),
+    (
+        "agents/diff-reviewer.md",
+        include_bytes!("../../examples/dark-factory/agents/diff-reviewer.md"),
+    ),
+    (
+        "agents/plan-reviewer.md",
+        include_bytes!("../../examples/dark-factory/agents/plan-reviewer.md"),
+    ),
+    (
+        "progress/phases.json",
+        include_bytes!("../../examples/dark-factory/progress/phases.json"),
+    ),
+    (
+        "hooks/hooks.json",
+        include_bytes!("../../examples/dark-factory/hooks/hooks.json"),
+    ),
+    (
+        "hooks/review_gate.py",
+        include_bytes!("../../examples/dark-factory/hooks/review_gate.py"),
+    ),
+    (
+        "evals/cases.json",
+        include_bytes!("../../examples/dark-factory/evals/cases.json"),
+    ),
+    (
+        "skills/implement-issue/SKILL.md",
+        include_bytes!("../../examples/dark-factory/skills/implement-issue/SKILL.md"),
+    ),
+];
+
+/// Files rendered with the executable bit, matching their tracked mode.
+const DARK_FACTORY_EXECUTABLE_FILES: &[&str] = &["hooks/review_gate.py"];
+
+pub struct DarkFactoryRenderOpts {
+    pub out: PathBuf,
+}
+
+/// The dark factory runner layer each release publishes (#3747). Under ADR
+/// 0173 the bundle's owner builds its runner layer, and for this example that
+/// owner is the project, so `release.yaml` pushes it tagged by version.
+pub const DARK_FACTORY_RUNNER_REPOSITORY: &str = "ghcr.io/curie-eng/curie-dark-factory-runner";
+/// The platform runner the published layer is built on, at the same version.
+const PLATFORM_RUNNER_REPOSITORY: &str = "ghcr.io/curie-eng/curie-runner";
+
+pub struct DarkFactoryRenderOutput {
+    pub path: PathBuf,
+    /// The published runner layer the lock records, when one exists.
+    pub runner_image: Option<String>,
+    /// Why no published layer was locked, naming the build that replaces it.
+    pub runner_note: Option<String>,
+}
+
+impl CliOutput for DarkFactoryRenderOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "bundle_dir": self.path,
+            "rendered": true,
+            "runner_image": self.runner_image,
+            "runner_note": self.runner_note,
+        })
+    }
+
+    fn render(&self, ui: &Ui) {
+        if let Some(image) = &self.runner_image {
+            ui.note(&format!("runner layer locked to the published {image}"));
+        }
+        if let Some(note) = &self.runner_note {
+            ui.note(note);
+        }
+        ui.payload(&format!("Dark factory bundle: {}", self.path.display()));
+    }
+}
+
+/// Write the embedded dark-factory bundle into `opts.out`. Touches no cluster.
+/// Refuses an existing non-empty directory before writing anything.
+///
+/// A release build then locks the runner layer the release published for its
+/// own version, so `cluster deploy` needs no build step (#3747). A source build
+/// has no published layer to name, and says so instead of failing at deploy.
+pub async fn render_dark_factory(opts: DarkFactoryRenderOpts) -> Result<DarkFactoryRenderOutput> {
+    let out = opts.out;
+    if out.exists() {
+        let non_empty = !out.is_dir()
+            || std::fs::read_dir(&out)
+                .with_context(|| format!("reading render output {}", out.display()))?
+                .next()
+                .is_some();
+        if non_empty {
+            return Err(crate::exit::usage(format!(
+                "render output {} already exists and is not empty; pick an empty or new directory",
+                out.display()
+            )));
+        }
+    }
+    for (name, bytes) in DARK_FACTORY_BUNDLE_FILES {
+        let path = out.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+        #[cfg(unix)]
+        if DARK_FACTORY_EXECUTABLE_FILES.contains(name) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("marking {} executable", path.display()))?;
+        }
+    }
+    let version = crate::artifacts::version();
+    let published = match crate::artifacts::Channel::current() {
+        crate::artifacts::Channel::Dev => Err(format!(
+            "this curie {version} is a source build, so no dark factory runner layer is \
+             published for it."
+        )),
+        crate::artifacts::Channel::Release => {
+            let layer = published_index_digest(DARK_FACTORY_RUNNER_REPOSITORY, version).await?;
+            let base = published_index_digest(PLATFORM_RUNNER_REPOSITORY, version).await?;
+            match (layer, base) {
+                (Some(layer), Some(base)) => Ok((layer, base)),
+                _ => Err(format!(
+                    "no dark factory runner layer is published for curie {version} \
+                     ({DARK_FACTORY_RUNNER_REPOSITORY}:{version} or \
+                     {PLATFORM_RUNNER_REPOSITORY}:{version} was not found)."
+                )),
+            }
+        }
+    };
+    match published {
+        Ok((layer, base)) => {
+            let image = format!("{DARK_FACTORY_RUNNER_REPOSITORY}@{layer}");
+            lock_published_runner(
+                &out,
+                &image,
+                &format!("{PLATFORM_RUNNER_REPOSITORY}@{base}"),
+            )?;
+            Ok(DarkFactoryRenderOutput {
+                path: out,
+                runner_image: Some(image),
+                runner_note: None,
+            })
+        }
+        Err(reason) => Ok(DarkFactoryRenderOutput {
+            runner_note: Some(format!(
+                "{reason} Build the runner layer before deploying: `curie build --plugin-dir {} \
+                 --registry <ref>`.",
+                out.display()
+            )),
+            path: out,
+            runner_image: None,
+        }),
+    }
+}
+
+/// Record the published layer in the rendered bundle's lock, exactly as
+/// `curie build --registry` would have: the same entry shape, and the
+/// `source_digest` of the tree just written so the deploy's freshness check
+/// passes until someone edits the layer.
+fn lock_published_runner(out: &Path, image: &str, base: &str) -> Result<()> {
+    use crate::connector_build as cb;
+    let runner = cb::load(out)?
+        .runner
+        .context("the embedded dark factory connectors.yaml declares no runner layer")?;
+    let (context, _) = cb::check_runner_source(out, &runner)?;
+    let source_digest = cb::source_digest_of(&context, &runner.build).context("runner")?;
+    cb::write_lock(
+        out,
+        &cb::ConnectorLockFileDecl {
+            version: cb::LOCK_VERSION,
+            connectors: Default::default(),
+            runner: Some(cb::RunnerLockEntryDecl {
+                image: image.to_string(),
+                base: base.to_string(),
+                delivery: cb::Delivery::Registry,
+                platforms: runner.build.platforms.clone(),
+                source_digest,
+            }),
+        },
+        false,
+    )
+}
+
 pub async fn render_sre_bot(opts: SreBotRenderOpts) -> Result<SreBotRenderOutput> {
     if opts.out.exists() {
         return Err(crate::exit::usage(format!(
@@ -1360,6 +1564,18 @@ async fn resolve_tempo_index_digest() -> Result<String> {
 /// in one machine's Docker daemon -- so keeping the connector without resolving a
 /// published digest produces a bundle whose write path can never come up.
 async fn resolve_index_digest(repository: &str, tag: &str) -> Result<String> {
+    match published_index_digest(repository, tag).await? {
+        Some(digest) => Ok(digest),
+        None => bail!(
+            "could not resolve {repository}:{tag}: OCI index request returned HTTP 404 Not Found"
+        ),
+    }
+}
+
+/// [`resolve_index_digest`], with "this tag was never published" as `None`
+/// rather than an error. Any other failure, an unreachable registry included,
+/// stays an error: absence is a fact about the release, an outage is not.
+async fn published_index_digest(repository: &str, tag: &str) -> Result<Option<String>> {
     let path = repository
         .strip_prefix("ghcr.io/")
         .with_context(|| format!("{repository} is not a ghcr.io repository"))?
@@ -1405,6 +1621,9 @@ async fn resolve_index_digest(repository: &str, tag: &str) -> Result<String> {
         .send()
         .await
         .with_context(|| format!("fetching the OCI image index for {tagged}"))?;
+    if manifest_response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
     if !manifest_response.status().is_success() {
         bail!(
             "could not resolve {tagged}: OCI index request returned HTTP {}",
@@ -1444,7 +1663,7 @@ async fn resolve_index_digest(repository: &str, tag: &str) -> Result<String> {
         .collect::<String>();
     let digest = format!("sha256:{digest_hex}");
     validate_sha256_digest(&digest)?;
-    Ok(digest)
+    Ok(Some(digest))
 }
 
 fn validate_sha256_digest(digest: &str) -> Result<()> {
@@ -4561,5 +4780,127 @@ mod tests {
                 "unexpected error for {case}: {error:#}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dark_factory_render_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    fn source_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/dark-factory")
+    }
+
+    /// Every file under the example, relative to its root, excluding the lock
+    /// a local build writes.
+    fn source_files() -> Vec<(String, PathBuf)> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+            for entry in std::fs::read_dir(dir).expect("read example dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    if path.file_name().and_then(|n| n.to_str()) == Some("__pycache__") {
+                        continue;
+                    }
+                    walk(root, &path, out);
+                } else {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if rel == "connectors.lock.yaml" {
+                        continue;
+                    }
+                    out.push((rel, path));
+                }
+            }
+        }
+        let root = source_root();
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out);
+        out.sort();
+        out
+    }
+
+    // A1
+    #[test]
+    fn every_dark_factory_file_is_embedded_with_identical_bytes() {
+        let files = source_files();
+        assert!(
+            files.iter().any(|(rel, _)| rel == "hooks/review_gate.py"),
+            "fixture walk found no review gate: {files:?}"
+        );
+        for (rel, path) in &files {
+            let embedded = DARK_FACTORY_BUNDLE_FILES
+                .iter()
+                .find(|(name, _)| name == rel)
+                .unwrap_or_else(|| panic!("{rel} is in examples/dark-factory but not embedded"));
+            let on_disk = std::fs::read(path).unwrap();
+            assert_eq!(embedded.1, on_disk.as_slice(), "{rel} bytes differ");
+        }
+        for (name, _) in DARK_FACTORY_BUNDLE_FILES {
+            assert!(
+                files.iter().any(|(rel, _)| rel == name),
+                "{name} is embedded but not in examples/dark-factory"
+            );
+        }
+    }
+
+    // A2
+    #[tokio::test]
+    async fn render_writes_every_file_and_keeps_the_review_gate_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("factory");
+        let rendered = render_dark_factory(DarkFactoryRenderOpts { out: out.clone() })
+            .await
+            .expect("render into a new directory");
+        assert_eq!(rendered.path, out);
+        for (name, bytes) in DARK_FACTORY_BUNDLE_FILES {
+            let written = std::fs::read(out.join(name))
+                .unwrap_or_else(|e| panic!("{name} was not written: {e}"));
+            assert_eq!(written.as_slice(), *bytes, "{name} bytes differ");
+        }
+        let mode = std::fs::metadata(out.join("hooks/review_gate.py"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "review_gate.py mode {mode:o} is not executable"
+        );
+        let readme_mode = std::fs::metadata(out.join("README.md"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(readme_mode & 0o111, 0, "README.md should not be executable");
+        let json = rendered.to_json();
+        assert_eq!(json["rendered"], serde_json::json!(true));
+        assert_eq!(json["bundle_dir"], serde_json::json!(out));
+    }
+
+    // A3
+    #[tokio::test]
+    async fn render_into_a_non_empty_directory_is_refused_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("busy");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("keep.txt"), b"mine").unwrap();
+        let error = match render_dark_factory(DarkFactoryRenderOpts { out: out.clone() }).await {
+            Ok(_) => panic!("a non-empty out dir must be refused"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains(&out.display().to_string()),
+            "the refusal should name the directory: {error}"
+        );
+        let entries: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("keep.txt")]);
+        assert_eq!(std::fs::read(out.join("keep.txt")).unwrap(), b"mine");
     }
 }

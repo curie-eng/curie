@@ -2010,8 +2010,14 @@ one. Keep any agent-specific runner image on this release too.
 The first upgrade that gives the release a caller key rolls every hosted
 connector pod once, because its rendered Deployment gains the proxy. That is
 the `curie cluster up` upgrade of a release recording none. `curie cluster
-upgrade` generates no key, so a release it upgrades without one cannot deploy
-a hosted connector until a later `cluster up` or a key of your own. Upgrade note: a keep-alive Job that dialled the
+upgrade` generates no key and refuses an installed release unless its recorded
+values name a nonblank `connectorCaller.existingSecret` or supply both nonblank
+`connectorCaller.signingKey` and `connectorCaller.verifyKey`. The refusal names
+`connector_caller_pair_required` before drain, schema mutation or Helm apply,
+including dry run, same version and resume. Chart development defaults do not
+satisfy this recorded configuration requirement. Run the printed `curie cluster
+up` command without `--dev` to generate a missing pair; repair a partial pair
+by supplying both halves or a named Secret before retrying. Upgrade note: a keep-alive Job that dialled the
 connector Service now dials `<name>-direct`, keeping its port, because the
 connector Service lands on the proxy, which refuses a caller without a token.
 Its peer-ingress policy keeps naming the server's port.

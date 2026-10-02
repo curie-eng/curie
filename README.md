@@ -74,6 +74,11 @@ is the short path: what to get first, four commands, and the six mistakes that
 cost people an hour. The walkthrough below is the longer one, and teaches the
 parity ladder as it goes.
 
+**Want a labelled GitHub issue to become a pull request?**
+[`docs/guides/dark-factory-quickstart.md`](docs/guides/dark-factory-quickstart.md)
+takes you from nothing to a factory-opened pull request on a new repository,
+on a laptop kind cluster.
+
 ### Prerequisites
 
 - **Docker + Compose v2**: for the dev stack and the local runner container.

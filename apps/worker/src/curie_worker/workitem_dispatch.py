@@ -451,6 +451,30 @@ class WorkItemDispatchClient:
                 "work-item request view returned an unusable body"
             ) from exc
 
+    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+        """The execution scoped issue read capability (ADR 0187).
+
+        Returns the issue the capability names, as ``owner/repo#number``, and
+        the capability itself. The worker never reads the issue.
+        """
+
+        body = await self._post(
+            "/v1/internal/work-items/issue-read/context",
+            {"execution_request_id": str(request_id)},
+        )
+        try:
+            if uuid.UUID(str(body["execution_request_id"])) != request_id:
+                raise ValueError("issue read context names another execution")
+            capability = body["capability"]
+            if not isinstance(capability, str) or not capability:
+                raise ValueError("issue read context carries no capability")
+            return f"{body['repo_full_name']}#{int(body['issue_number'])}", capability
+        except (KeyError, TypeError, ValueError):
+            # The body carries the capability: never chain it into a log.
+            raise WorkItemTransportError(
+                "work-item issue read context returned an unusable body"
+            ) from None
+
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             response = await self._client.post(

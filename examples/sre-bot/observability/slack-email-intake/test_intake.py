@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 import yaml
+from curie_api import hook_signing
 
 HERE = Path(__file__).parent
 PLACEHOLDER = "Investigating this alert..."
@@ -243,7 +244,7 @@ def test_one_unacknowledged_root_becomes_one_targeted_turn(
     call = hook.calls[0]
     assert call["conversation_id"] == message["ts"]
     assert call["placeholder"] == "1790706162.900000"
-    assert call["delivery_id"] == "slack-email:C0EXAMPLE1:1790706162.161449"
+    assert call["delivery_id"] == "slack-email:C0EXAMPLE1:1790706162:161449"
     assert call["payload"]["subject"] == "ALARM: database unavailable"
     assert call["payload"]["email_text"] == "Database unavailable\n\ndb-1"
     assert "ignore" not in call["payload"]["email_text"]
@@ -265,7 +266,7 @@ def test_retry_reuses_the_pending_placeholder_and_stable_delivery(
 
     assert slack.posts == []
     assert hook.calls[0]["placeholder"] == "1790706163.000200"
-    assert hook.calls[0]["delivery_id"] == "slack-email:C0EXAMPLE1:1790706162.161449"
+    assert hook.calls[0]["delivery_id"] == "slack-email:C0EXAMPLE1:1790706162:161449"
 
 
 # @spec SRE-EMAIL-3
@@ -321,7 +322,14 @@ def test_hook_client_signs_exact_body_and_rejects_a_detached_receipt(
     assert "conversation_id=source-thread" in request.full_url
     assert "placeholder=reply-ts" in request.full_url
     assert request.headers["X-curie-delivery-id"] == "delivery-id"
-    expected = "sha256=" + hmac.new(b"hook-secret", request.data, hashlib.sha256).hexdigest()
+    expected = hook_signing.sign(
+        "hook-secret",
+        timestamp=request.headers["X-curie-timestamp"],
+        delivery_id="delivery-id",
+        hook="email-alert",
+        tool_access=None,
+        body=request.data,
+    )
     assert request.headers["X-curie-signature-256"] == expected
 
     def detached(_request: Any, _timeout: float) -> tuple[int, bytes]:
@@ -334,6 +342,101 @@ def test_hook_client_signs_exact_body_and_rejects_a_detached_receipt(
             placeholder="reply-ts",
             delivery_id="delivery-id",
         )
+
+
+@pytest.mark.parametrize("tool_access", [None, "read-only"])
+# @spec SRE-EMAIL-2
+def test_actual_scan_delivery_passes_canonical_verifier_and_preserves_retry_identity(
+    intake: ModuleType, monkeypatch: pytest.MonkeyPatch, tool_access: str | None
+) -> None:
+    env(monkeypatch)
+    url = "https://api.example.com/hooks/acme-agent/email%2Ealert"
+    if tool_access is not None:
+        url += "?tool_access=read%2Donly"
+    monkeypatch.setenv("CURIE_HOOK_URL", url)
+    monkeypatch.setattr(intake.time, "time", lambda: 1790706200.0)
+    captured: list[dict[str, Any]] = []
+
+    def send(request: Any, _timeout: float) -> tuple[int, bytes]:
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+        signed = {
+            "timestamp": request.headers.get("X-curie-timestamp"),
+            "delivery_id": request.headers["X-curie-delivery-id"],
+            "hook": "email.alert",
+            "tool_access": tool_access,
+            "body": request.data,
+            "header": request.headers["X-curie-signature-256"],
+        }
+        captured.append(signed)
+        if not hook_signing.verify("hook-secret", **signed, now=1790706200.0):
+            return 401, b"{}"
+        assert urllib.parse.unquote(urllib.parse.urlsplit(request.full_url).path).endswith(
+            "/email.alert"
+        )
+        assert query.get("tool_access") == ([tool_access] if tool_access is not None else None)
+        return 200, json.dumps({"conversation_id": query["conversation_id"][0]}).encode()
+
+    config = intake.Config.from_env()
+    message = root()
+    slack = FakeSlack([message])
+    client = intake.CurieHookClient(config, send=send)
+    state = intake.ScanState()
+    intake.scan_once(config, slack, client, now=1790706200.0, state=state)
+    intake.scan_once(config, slack, client, now=1790706201.0, state=state)
+
+    assert len(slack.posts) == 1
+    assert len(captured) == 2
+    first, retry = captured
+    assert first["delivery_id"] == "slack-email:C0EXAMPLE1:1790706162:161449"
+    assert retry["delivery_id"] == first["delivery_id"]
+    assert retry["body"] == first["body"]
+    assert first["timestamp"] == "1790706200"
+    assert b"Database unavailable" in first["body"]
+    for changes in (
+        {"hook": "another-hook"},
+        {"tool_access": None if tool_access is not None else "read-only"},
+        {"delivery_id": "another-receipt"},
+        {"timestamp": "1790706201"},
+        {"body": first["body"] + b" "},
+    ):
+        assert not hook_signing.verify(
+            "hook-secret", **{**first, **changes}, now=1790706200.0
+        )
+    body_only = "sha256=" + hmac.new(b"hook-secret", first["body"], hashlib.sha256).hexdigest()
+    assert not hook_signing.verify(
+        "hook-secret", **{**first, "header": body_only}, now=1790706200.0
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "tool_access=",
+        "tool_access=read-write",
+        "tool_access=read-only&tool_access=read-only",
+    ],
+)
+def test_hook_client_refuses_ambiguous_or_invalid_signed_policy_before_send(
+    intake: ModuleType, monkeypatch: pytest.MonkeyPatch, query: str
+) -> None:
+    env(monkeypatch)
+    monkeypatch.setenv(
+        "CURIE_HOOK_URL", f"https://api.example.com/hooks/acme-agent/email-alert?{query}"
+    )
+    captured: list[Any] = []
+
+    def send(request: Any, _timeout: float) -> tuple[int, bytes]:
+        captured.append(request)
+        return 200, b'{"conversation_id":"source-thread"}'
+
+    with pytest.raises(ValueError, match="tool_access"):
+        intake.CurieHookClient(intake.Config.from_env(), send=send).deliver(
+            {"source": "slack-email"},
+            conversation_id="source-thread",
+            placeholder="reply-ts",
+            delivery_id="delivery-id",
+        )
+    assert captured == []
 
 
 # @spec SRE-EMAIL-3
@@ -496,7 +599,7 @@ def test_pending_roots_remain_tracked_outside_discovery_until_completed(
     assert slack.posts == []
     assert [
         call["delivery_id"] for call in hook.calls if call["conversation_id"] == pending["ts"]
-    ] == ["slack-email:C0EXAMPLE1:1790701000.000000"] * 2
+    ] == ["slack-email:C0EXAMPLE1:1790701000:000000"] * 2
     acknowledge(slack, pending["ts"])
     intake.scan_once(config, slack, hook, now=1790706420.0, state=state)
     slack.calls.clear()

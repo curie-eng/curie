@@ -474,6 +474,35 @@ async def record_wait_ci(session: AsyncSession, request_id: uuid.UUID) -> bool:
     return True
 
 
+async def record_ci_rerun(session: AsyncSession, request_id: uuid.UUID, note: str) -> None:
+    """Record one flake-rerun attempt on the run (#3741).
+
+    The note is platform text, short enough for the status card, which renders
+    the latest phase-report note. A second ``wait_ci`` row does not carry a
+    loop round, so it does not consume a fix round.
+    """
+
+    if not 1 <= len(note) <= 280:
+        raise ValueError("ci rerun note length")
+    found = await session.scalar(
+        select(ExecutionRequestPhaseReport.id).where(
+            ExecutionRequestPhaseReport.execution_request_id == request_id,
+            ExecutionRequestPhaseReport.note == note,
+        )
+    )
+    if found is not None:
+        await session.rollback()
+        return
+    session.add(
+        ExecutionRequestPhaseReport(
+            execution_request_id=request_id,
+            phase=WAIT_CI_PHASE,
+            note=note,
+        )
+    )
+    await session.commit()
+
+
 # --- the phase view (pure) ------------------------------------------------------
 
 PhaseState = Literal["done", "current", "redo", "pending", "blocked"]

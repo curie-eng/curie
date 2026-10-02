@@ -1,0 +1,166 @@
+{
+  "description": "Presentation labels only. Never change stored tool IDs or infer status from the label. MCP namespace uses the last suffix; native mapping applies only to exact native IDs.",
+  "vectors": [
+    {
+      "tool": null,
+      "label": "action"
+    },
+    {
+      "tool": "",
+      "label": "action"
+    },
+    {
+      "tool": "mcp__acme__",
+      "label": "action"
+    },
+    {
+      "tool": "mcp__only",
+      "label": "action"
+    },
+    {
+      "tool": "bad\nname",
+      "label": "action"
+    },
+    {
+      "tool": "mcp__acme__file_attachment",
+      "label": "file attachment"
+    },
+    {
+      "tool": "mcp__acme__nested__createInvoice",
+      "label": "create invoice"
+    },
+    {
+      "tool": "mcp__acme__Skill",
+      "label": "skill"
+    },
+    {
+      "tool": "mcp__acme__Bash",
+      "label": "bash"
+    },
+    {
+      "tool": "mcp__acme__HTTPServer",
+      "label": "http server"
+    },
+    {
+      "tool": "restart-deployment",
+      "label": "restart deployment"
+    },
+    {
+      "tool": "Bash",
+      "label": "shell request"
+    },
+    {
+      "tool": "Skill",
+      "label": "instruction request"
+    },
+    {
+      "tool": "Read",
+      "label": "read file"
+    },
+    {
+      "tool": "Write",
+      "label": "write file"
+    },
+    {
+      "tool": "Edit",
+      "label": "edit file"
+    },
+    {
+      "tool": "MultiEdit",
+      "label": "edit files"
+    },
+    {
+      "tool": "Glob",
+      "label": "find files"
+    },
+    {
+      "tool": "Grep",
+      "label": "search files"
+    },
+    {
+      "tool": "WebFetch",
+      "label": "fetch web page"
+    },
+    {
+      "tool": "WebSearch",
+      "label": "search web"
+    }
+  ],
+  "metadata_references": [
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.",
+      "display": "Review send message."
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message. Next",
+      "display": "Review send message. Next"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.)",
+      "display": "Review send message.)"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.\"",
+      "display": "Review send message.\""
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.'",
+      "display": "Review send message.'"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.]",
+      "display": "Review send message.]"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.`",
+      "display": "Review send message.`"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.\nNext",
+      "display": "Review send message.\nNext"
+    },
+    {
+      "tool": "mcp__acme__계정조회",
+      "summary": "Review mcp__acme__계정조회.",
+      "display": "Review 계정조회."
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.json",
+      "display": "Review mcp__acme__send_message.json"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.backup.txt",
+      "display": "Review mcp__acme__send_message.backup.txt"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review /tmp/mcp__acme__send_message",
+      "display": "Review /tmp/mcp__acme__send_message"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review https://example.com/mcp__acme__send_message",
+      "display": "Review https://example.com/mcp__acme__send_message"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review prefixmcp__acme__send_message.",
+      "display": "Review prefixmcp__acme__send_message."
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review 문서mcp__acme__send_message.",
+      "display": "Review 문서mcp__acme__send_message."
+    }
+  ]
+}
