@@ -365,10 +365,14 @@ def _env(
     server: TestServer,
     *,
     channel: bool = True,
+    writes: bool | None = None,
 ) -> dict[str, str]:
+    """Boot env; ``writes=None`` sends no CURIE_MEMORY_WRITES, like an older worker."""
+
     monkeypatch.delenv("CURIE_STATE_URL", raising=False)
     monkeypatch.delenv("CURIE_STATE_TOKEN", raising=False)
     monkeypatch.delenv("CURIE_CHANNEL_MEMORY_REF", raising=False)
+    monkeypatch.delenv("CURIE_MEMORY_WRITES", raising=False)
     monkeypatch.setenv("CURIE_MEMORY_TOKEN", MEMORY_TOKEN)
     env = {
         "CURIE_PLUGIN_DIR": str(_bundle(tmp_path / "bundle")),
@@ -381,6 +385,9 @@ def _env(
     if channel:
         env["CURIE_CHANNEL_MEMORY_REF"] = str(server.make_url(CHANNEL_NS))
         monkeypatch.setenv("CURIE_CHANNEL_MEMORY_REF", env["CURIE_CHANNEL_MEMORY_REF"])
+    if writes is not None:
+        env["CURIE_MEMORY_WRITES"] = "1" if writes else "0"
+        monkeypatch.setenv("CURIE_MEMORY_WRITES", env["CURIE_MEMORY_WRITES"])
     monkeypatch.setenv("CURIE_MEMORY_REF", env["CURIE_MEMORY_REF"])
     return env
 
@@ -468,6 +475,7 @@ def _boot_options(
     *,
     channel: bool,
     token: bool = True,
+    writes: bool | None = None,
 ) -> tuple[Any, str | None]:
     """Boot against the fake API; return the SDK options and the system prompt."""
 
@@ -475,7 +483,7 @@ def _boot_options(
 
     async def go() -> None:
         async with TestServer(api.app()) as server:
-            env = _env(monkeypatch, tmp_path, server, channel=channel)
+            env = _env(monkeypatch, tmp_path, server, channel=channel, writes=writes)
             if not token:
                 env.pop("CURIE_MEMORY_TOKEN", None)
                 monkeypatch.delenv("CURIE_MEMORY_TOKEN", raising=False)
@@ -1285,6 +1293,7 @@ def _gated_boot(
     *,
     fake_model: bool,
     token: bool,
+    writes: bool | None = None,
 ) -> tuple[Any, set[str]]:
     """Boot with a permission gate and a channel ref; return the gate and the tools."""
 
@@ -1293,7 +1302,7 @@ def _gated_boot(
 
     async def go() -> None:
         async with TestServer(api.app()) as server:
-            env = _env(monkeypatch, tmp_path, server, channel=True)
+            env = _env(monkeypatch, tmp_path, server, channel=True, writes=writes)
             env["CURIE_APPROVAL_REQUIRED_TOOLS"] = "Bash"
             if not token:
                 env.pop("CURIE_MEMORY_TOKEN", None)
@@ -1449,6 +1458,209 @@ def test_boot_log_counts_are_capped_at_the_per_memory_limit(
     match = _FACTS_LOG.match(lines[0])
     assert match, lines[0]
     assert (match.group("agent"), match.group("channel")) == (str(MAX_FACTS_PER_MEMORY), "1")
+
+
+# #3621: CURIE_MEMORY_WRITES splits reading channel memory from writing it -----
+#
+# The worker now sends the channel ref whenever the turn has a binding, and
+# says separately whether writes are on. Off: the channel facts still load, but
+# no tools and no guidance. Absent: an older worker, where a ref means writes on.
+
+_CHANNEL_LINES = (
+    f"- [{C_NEW}] U1 on 2026-09-04 stated: channel new fact",
+    f"- [{C_OLD}] U1 on 2026-08-03 stated: channel old fact",
+)
+
+
+def _only_facts_line(caplog: pytest.LogCaptureFixture) -> re.Match[str]:
+    lines = _facts_log_lines(caplog)
+    assert len(lines) == 1, lines
+    match = _FACTS_LOG.match(lines[0])
+    assert match, lines[0]
+    return match
+
+
+def test_channel_facts_load_when_memory_writes_are_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    caplog.set_level(logging.INFO, logger="curie_runner")
+    options, prompt = _boot_options(
+        monkeypatch, tmp_path, _seeded_api(), channel=True, writes=False
+    )
+
+    # The channel's stored facts are in the boot prompt.
+    assert prompt is not None
+    for line in _CHANNEL_LINES:
+        assert line in prompt, prompt
+    # But writes are off: no remember/update/forget and no guidance about them.
+    assert not (MEMORY_TOOLS & _published(options)), _published(options)
+    assert DEFAULT_GUIDANCE.strip() not in prompt
+    match = _only_facts_line(caplog)
+    assert match.group("guidance") == "none"
+    assert int(match.group("channel")) > 0
+    assert (match.group("agent"), match.group("channel")) == ("2", "2")
+
+
+def test_writes_off_keeps_agent_facts_and_drops_operator_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    operator = "OPERATOR-GUIDANCE-MARKER"
+    _options, prompt = _boot_options(
+        monkeypatch, tmp_path, _seeded_api(guidance=operator), channel=True, writes=False
+    )
+    assert prompt is not None
+    assert operator not in prompt
+    assert f"- [{A_NEW}] U1 on 2026-09-02 stated: agent new fact" in prompt
+    assert _CHANNEL_LINES[0] in prompt
+
+
+@pytest.mark.parametrize("writes", [True, None], ids=["writes-on", "older-worker"])
+def test_a_ref_with_writes_on_or_unset_mounts_tools_guidance_and_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    writes: bool | None,
+) -> None:
+    # True is today's behaviour; None is an older worker that only ever sent
+    # the ref with writes on, so the ref alone still means writes on.
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    caplog.set_level(logging.INFO, logger="curie_runner")
+    options, prompt = _boot_options(
+        monkeypatch, tmp_path, _seeded_api(), channel=True, writes=writes
+    )
+    assert MEMORY_TOOLS <= _published(options)
+    assert prompt is not None
+    assert DEFAULT_GUIDANCE.strip() in prompt
+    for line in _CHANNEL_LINES:
+        assert line in prompt, prompt
+    match = _only_facts_line(caplog)
+    assert (match.group("channel"), match.group("guidance")) == ("2", "default")
+
+
+def test_writes_off_mounts_no_memory_tools_and_claims_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_runner.approval import is_platform_owned_tool, platform_tool_names
+
+    gate, published = _gated_boot(monkeypatch, tmp_path, fake_model=False, token=True, writes=False)
+    assert not (MEMORY_TOOLS & published), published
+    assert gate.memory_tools_mounted is False
+    # The toolPolicy exemption follows the gate, so it claims none of them.
+    exempt = platform_tool_names(
+        state_server_mounted=gate.state_server_mounted,
+        memory_tools_mounted=gate.memory_tools_mounted,
+    )
+    assert not (MEMORY_TOOLS & exempt)
+    for name in MEMORY_TOOLS:
+        assert not is_platform_owned_tool(
+            name,
+            state_server_mounted=gate.state_server_mounted,
+            memory_tools_mounted=gate.memory_tools_mounted,
+        )
+
+
+@pytest.mark.parametrize("writes", [True, None], ids=["writes-on", "older-worker"])
+def test_writes_on_or_unset_mounts_the_tools_and_claims_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writes: bool | None
+) -> None:
+    gate, published = _gated_boot(
+        monkeypatch, tmp_path, fake_model=False, token=True, writes=writes
+    )
+    assert MEMORY_TOOLS <= published
+    assert gate.memory_tools_mounted is True
+
+
+# The writes-off notice (#3621) ---------------------------------------------------
+#
+# With writes off the agent has no memory tools, so it must be told that nothing
+# said here is kept, or it "saves" through some other tool and says it did. The
+# notice text is pinned only by these minimal, case-insensitive substrings:
+#   - "turned off"            (saving memory is turned off for this agent)
+#   - "not be kept"           (nothing said here will be kept for later)
+#   - "never say" ... "saved" (in one sentence: never claim to have saved it)
+
+_NEVER_SAY_SAVED = re.compile(r"never say[^.]*\bsaved\b", re.IGNORECASE)
+
+
+def _has_writes_off_notice(prompt: str) -> bool:
+    lowered = prompt.lower()
+    return (
+        "turned off" in lowered
+        and "not be kept" in lowered
+        and _NEVER_SAY_SAVED.search(prompt) is not None
+    )
+
+
+def test_writes_off_boot_prompt_says_saving_is_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    caplog.set_level(logging.INFO, logger="curie_runner")
+    options, prompt = _boot_options(
+        monkeypatch, tmp_path, _seeded_api(), channel=True, writes=False
+    )
+
+    assert prompt is not None
+    assert "turned off" in prompt.lower(), prompt
+    assert "not be kept" in prompt.lower(), prompt
+    assert _NEVER_SAY_SAVED.search(prompt), prompt
+    # The notice sits where the guidance would: above the bundle prompt.
+    assert prompt.lower().index("not be kept") < prompt.index(BUNDLE_PROMPT)
+    # The channel facts still show; the guidance and the tools do not.
+    for line in _CHANNEL_LINES:
+        assert line in prompt, prompt
+    assert DEFAULT_GUIDANCE.strip() not in prompt
+    assert not (MEMORY_TOOLS & _published(options)), _published(options)
+    assert _only_facts_line(caplog).group("guidance") == "none"
+
+
+@pytest.mark.parametrize("writes", [True, None], ids=["writes-on", "older-worker"])
+def test_writes_on_boot_prompt_carries_guidance_not_the_off_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writes: bool | None
+) -> None:
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE
+
+    _options, prompt = _boot_options(
+        monkeypatch, tmp_path, _seeded_api(), channel=True, writes=writes
+    )
+    assert prompt is not None
+    assert DEFAULT_GUIDANCE.strip() in prompt
+    assert not _has_writes_off_notice(prompt), prompt
+    assert "not be kept" not in prompt.lower(), prompt
+
+
+@pytest.mark.parametrize("writes", [False, None], ids=["writes-off", "unset"])
+def test_an_unbound_turn_gets_no_writes_off_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writes: bool | None
+) -> None:
+    _options, prompt = _boot_options(
+        monkeypatch, tmp_path, _seeded_api(), channel=False, writes=writes
+    )
+    assert prompt is not None
+    assert not _has_writes_off_notice(prompt), prompt
+    assert "not be kept" not in prompt.lower(), prompt
+
+
+def test_writes_off_never_reads_the_operator_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review L3: guidance is read only when writes are on. A custom guidance is
+    # stored, so a boot that read it would GET the key; the preamble's own gate
+    # would still hide the text, which is why the request itself is counted.
+    operator = "OPERATOR-GUIDANCE-MARKER"
+    api = _seeded_api(guidance=operator)
+    _options, prompt = _boot_options(monkeypatch, tmp_path, api, channel=True, writes=False)
+
+    guidance_gets = [
+        path for method, path, _ in api.requests if method == "GET" and path.endswith("/guidance")
+    ]
+    assert guidance_gets == [], api.requests
+    assert prompt is not None
+    assert operator not in prompt
 
 
 # --------------------------------------------------------------------------- #

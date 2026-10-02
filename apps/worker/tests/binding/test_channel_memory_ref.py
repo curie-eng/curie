@@ -1,12 +1,16 @@
-"""#1461: the worker hands the runner a channel memory ref only when writes are on.
+"""#1461, #3621: the worker hands the runner a channel memory ref and a writes flag.
 
 ``CURIE_CHANNEL_MEMORY_REF`` is the binding-scoped memory namespace
-(``.../agents/<id>/state/bindings/<kind>/<address>/memory``). The runner mounts
-the remember/update/forget tools only when it is set, so this ref IS the on/off
-switch the sandbox sees. It is set iff the agent's ``memory_writes`` setting is
-on, the turn names a binding (kind and address), and the turn is not
-memory-isolated (eval). DB-free: ``boot_env`` is exercised on a bare resolver,
-like ``test_eval_memory_isolation.py``.
+(``.../agents/<id>/state/bindings/<kind>/<address>/memory``). The runner reads
+channel facts from it, so it is set whenever the turn names a binding (kind and
+address) and is not memory-isolated (eval), whether memory writes are on or
+off. Reading memory needs no switch (#3621).
+
+``CURIE_MEMORY_WRITES`` (#3659) is the switch for the remember, update and
+forget tools. The worker sends it explicitly, ``1`` or ``0`` from the agent's
+``memory_writes`` setting, whenever it sends a channel ref, and never without
+one. DB-free: ``boot_env`` is exercised on a bare resolver, like
+``test_eval_memory_isolation.py``.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from curie_worker.config import WorkerConfig
 
 _AGENT = uuid.UUID("11111111-1111-4111-8111-111111111111")
 _KEY = "CURIE_CHANNEL_MEMORY_REF"
+_WRITES = "CURIE_MEMORY_WRITES"
 
 
 def _resolved(**overrides: object) -> ResolvedDeployment:
@@ -66,29 +71,58 @@ def test_kind_and_address_are_url_quoted() -> None:
     )
 
 
-def test_writes_off_omits_the_channel_memory_ref() -> None:
+def test_writes_off_still_passes_the_channel_memory_ref() -> None:
+    # #3621: turning writes off must not hide the channel's stored facts.
+    env = _boot_env(_resolved(memory_writes=False), kind="slack", address="C0123")
+    assert env[_KEY] == f"{_base()}/agents/{_AGENT}/state/bindings/slack/C0123/memory"
+    # The same ref a writes-on turn gets.
+    on = _boot_env(_resolved(memory_writes=True), kind="slack", address="C0123")
+    assert env[_KEY] == on[_KEY]
+
+
+@pytest.mark.parametrize(("writes", "flag"), [(True, "1"), (False, "0")], ids=["on", "off"])
+def test_memory_writes_is_sent_explicitly_with_the_channel_ref(writes: bool, flag: str) -> None:
+    env = _boot_env(_resolved(memory_writes=writes), kind="slack", address="C0123")
+    assert _KEY in env
+    assert env[_WRITES] == flag
+
+
+def test_the_default_agent_sends_the_ref_with_writes_off() -> None:
+    # memory_writes defaults to off; the default agent still reads channel memory.
     env = _boot_env(_resolved(), kind="slack", address="C0123")
-    assert _KEY not in env
-    # Guard against a vacuous pass: the same call with writes on does set it.
-    assert _KEY in _boot_env(_resolved(memory_writes=True), kind="slack", address="C0123")
+    assert _KEY in env
+    assert env[_WRITES] == "0"
 
 
+@pytest.mark.parametrize("writes", [True, False], ids=["writes-on", "writes-off"])
 @pytest.mark.parametrize(
     "kw",
     [{}, {"kind": "slack"}, {"address": "C0123"}],
     ids=["no-binding", "kind-only", "address-only"],
 )
-def test_no_binding_omits_the_channel_memory_ref(kw: dict[str, str]) -> None:
-    assert _KEY not in _boot_env(_resolved(memory_writes=True), **kw)
-    assert _KEY in _boot_env(_resolved(memory_writes=True), kind="slack", address="C0123")
+def test_no_binding_omits_the_channel_memory_ref(kw: dict[str, str], writes: bool) -> None:
+    env = _boot_env(_resolved(memory_writes=writes), **kw)
+    assert _KEY not in env
+    assert _WRITES not in env
+    # Guard against a vacuous pass: the same agent with a binding gets both.
+    bound = _boot_env(_resolved(memory_writes=writes), kind="slack", address="C0123")
+    assert _KEY in bound
+    assert _WRITES in bound
 
 
-def test_an_isolated_turn_omits_the_channel_memory_ref() -> None:
-    on = _resolved(memory_writes=True)
-    assert _KEY in _boot_env(on, kind="slack", address="C0123")
-    assert _KEY not in _boot_env(on, kind="slack", address="C0123", isolate_memory=True)
-    # The legacy eval thread prefix isolates the same way.
-    assert _KEY not in _boot_env(on, "eval:1720000000.000100", kind="slack", address="C0123")
+@pytest.mark.parametrize("writes", [True, False], ids=["writes-on", "writes-off"])
+def test_an_isolated_turn_omits_the_channel_memory_ref(writes: bool) -> None:
+    agent = _resolved(memory_writes=writes)
+    bound = _boot_env(agent, kind="slack", address="C0123")
+    assert _KEY in bound
+    assert _WRITES in bound
+    for env in (
+        _boot_env(agent, kind="slack", address="C0123", isolate_memory=True),
+        # The legacy eval thread prefix isolates the same way.
+        _boot_env(agent, "eval:1720000000.000100", kind="slack", address="C0123"),
+    ):
+        assert _KEY not in env
+        assert _WRITES not in env
 
 
 def test_the_memory_scoped_agent_shape_does_not_change_the_ref() -> None:

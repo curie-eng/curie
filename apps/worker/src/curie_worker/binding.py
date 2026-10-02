@@ -427,8 +427,10 @@ class ResolvedDeployment(BaseModel):
     # to go stale.
     memory: bool = False
     # Whether the operator turned memory writes on for this agent (#1461,
-    # ADR-0167). On, a bound turn's runner gets its channel memory ref and
-    # mounts the remember/update/forget tools; off (the default), neither.
+    # ADR-0167). A bound turn's runner gets its channel memory ref either way,
+    # so stored facts stay readable (#3621); this flag rides with it as
+    # CURIE_MEMORY_WRITES and decides only whether the remember/update/forget
+    # tools mount. Off is the default.
     # Not selected by the resolver statements: the column arrives in migration
     # 0068 and resolution runs against older schemas, so the kernel reads it
     # with ``memory_writes_for`` and copies it on, as with runner_resources.
@@ -1036,14 +1038,15 @@ class BindingResolver:
             )
         # Channel memory (#1461, ADR-0167): the agent's memory namespace scoped
         # to this turn's binding, on the same store and read/written with the
-        # same broad memory token. Its presence is the runner's signal to mount
-        # the memory tools, so it is set only when the operator turned memory
-        # writes on and the turn names a binding. An eval-isolated turn carries
-        # no memory at all, so it gets none either.
+        # same broad memory token. Reading channel memory needs no switch, so
+        # the ref is set whenever the turn names a binding (#3621). Whether the
+        # agent may save to it is a separate flag, ``memory_writes`` (#3659),
+        # sent explicitly alongside the ref so the runner mounts the remember,
+        # update and forget tools only when the operator turned writes on. An
+        # eval-isolated turn carries no memory at all, so it gets neither.
         channel_memory_ref: str | None = None
         if (
-            resolved.memory_writes
-            and kind is not None
+            kind is not None
             and address is not None
             and not (isolate_memory or is_eval_isolate_thread(thread_key))
         ):
@@ -1138,6 +1141,11 @@ class BindingResolver:
             history_token=state_token,
             memory_token=state_token,
             channel_memory_ref=channel_memory_ref,
+            # The writes switch rides only with a channel ref, as an explicit
+            # bool; without a ref there is nothing to write to.
+            memory_writes=(
+                bool(resolved.memory_writes) if channel_memory_ref is not None else None
+            ),
             # The general state store exposed to bundle code (#249): the NARROW
             # ``state.app`` token authorizes the URL -- refused on the reserved
             # memory/transcript namespaces server-side -- so the token is omitted
