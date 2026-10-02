@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-FIXTURE = Path(__file__).resolve().parents[1] / "cli/scripts/fixtures/terminal-provider-error.py"
+FIXTURE = Path(__file__).resolve().parents[2] / "cli/scripts/fixtures/terminal-provider-error.py"
 
 
 @contextmanager
