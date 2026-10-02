@@ -172,6 +172,7 @@ def _full_boot_env() -> BootEnv:
         fake_model=True,
         history_ref=_HISTORY_REF,
         channel_memory_ref=_CHANNEL_MEMORY_REF,
+        memory_writes=True,
         history_token="st-history-token",
         memory_token="st-memory-token",
         state_url="http://api:8000/agents/agent-abc/state",
@@ -558,6 +559,7 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         connector_caller_token="cct.payload.signature",
         bundle_version="abc123def456",
         channel_memory_ref=_CHANNEL_MEMORY_REF,
+        memory_writes=True,
     )
     worker_owned = set(BootEnv.env_keys(producer="worker"))
     assert set(maximal) <= worker_owned
@@ -790,6 +792,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_FAKE_MODEL",
         "CURIE_HISTORY_REF",
         "CURIE_CHANNEL_MEMORY_REF",
+        "CURIE_MEMORY_WRITES",
         "CURIE_HISTORY_TOKEN",
         "CURIE_MEMORY_TOKEN",
         "CURIE_STATE_URL",
@@ -1070,3 +1073,79 @@ def test_from_env_reads_an_empty_channel_memory_ref_as_unset() -> None:
 def test_channel_memory_ref_is_a_worker_only_env_key() -> None:
     assert BootEnv.env_key("channel_memory_ref") == "CURIE_CHANNEL_MEMORY_REF"
     assert _producers_of("CURIE_CHANNEL_MEMORY_REF") == {"worker"}
+
+
+# --- Memory writes flag (#3659) ----------------------------------------------
+
+
+@pytest.mark.parametrize(("declared", "rendered"), [(True, "1"), (False, "0")])
+def test_render_worker_emits_the_memory_writes_flag_explicitly(
+    declared: bool, rendered: str
+) -> None:
+    """The worker sends the flag as ``1``/``0``: an explicit off is not an omission.
+
+    The runner reads an absent flag as an older worker (a channel ref means
+    writes are on), so ``False`` must reach the pod as ``0``, never be dropped.
+    """
+    env = _worker_env(channel_memory_ref=_CHANNEL_MEMORY_REF, memory_writes=declared)
+    assert env["CURIE_MEMORY_WRITES"] == rendered
+
+
+def test_render_worker_omits_the_memory_writes_flag_when_not_given() -> None:
+    assert "CURIE_MEMORY_WRITES" not in _worker_env()
+    assert "CURIE_MEMORY_WRITES" not in _worker_env(memory_writes=None)
+
+
+@pytest.mark.parametrize("declared", [True, False, None])
+def test_memory_writes_survives_the_worker_render_and_the_consumer_parse(
+    declared: bool | None,
+) -> None:
+    boot = BootEnv.from_env(
+        _worker_env(channel_memory_ref=_CHANNEL_MEMORY_REF, memory_writes=declared) | _SUBSTRATE_ENV
+    )
+    assert boot.memory_writes is declared
+    assert BootEnv.from_env(boot.to_env()) == boot
+
+
+@pytest.mark.parametrize(("declared", "rendered"), [(True, "1"), (False, "0")])
+def test_to_env_emits_the_memory_writes_flag_as_one_or_zero(declared: bool, rendered: str) -> None:
+    boot = BootEnv(session=_boot_session(), memory_writes=declared)
+    assert boot.to_env()["CURIE_MEMORY_WRITES"] == rendered
+    assert BootEnv.from_env(boot.to_env()).memory_writes is declared
+
+
+def test_to_env_omits_the_memory_writes_flag_when_unset() -> None:
+    boot = BootEnv(session=_boot_session())
+    assert boot.memory_writes is None
+    assert "CURIE_MEMORY_WRITES" not in boot.to_env()
+
+
+@pytest.mark.parametrize(
+    ("raw", "parsed"), [("1", True), ("true", True), ("0", False), ("false", False)]
+)
+def test_from_env_reads_the_memory_writes_flag(raw: str, parsed: bool) -> None:
+    env = BootEnv(session=_boot_session()).to_env()
+    env["CURIE_MEMORY_WRITES"] = raw
+    assert BootEnv.from_env(env).memory_writes is parsed
+
+
+@pytest.mark.parametrize("raw", ["yes", "2", "on", "off", "garbage"])
+def test_from_env_reads_an_unknown_memory_writes_value_as_off(raw: str) -> None:
+    # None means "an old worker, a ref means writes on", which would fail open.
+    env = BootEnv(session=_boot_session(), channel_memory_ref=_CHANNEL_MEMORY_REF).to_env()
+    env["CURIE_MEMORY_WRITES"] = raw
+    assert BootEnv.from_env(env).memory_writes is False
+
+
+def test_from_env_reads_an_absent_or_empty_memory_writes_flag_as_unset() -> None:
+    """Absent is an older worker, distinct from an explicit off."""
+    env = BootEnv(session=_boot_session()).to_env()
+    assert "CURIE_MEMORY_WRITES" not in env
+    assert BootEnv.from_env(env).memory_writes is None
+    env["CURIE_MEMORY_WRITES"] = ""
+    assert BootEnv.from_env(env).memory_writes is None
+
+
+def test_memory_writes_is_a_worker_only_env_key() -> None:
+    assert BootEnv.env_key("memory_writes") == "CURIE_MEMORY_WRITES"
+    assert _producers_of("CURIE_MEMORY_WRITES") == {"worker"}
