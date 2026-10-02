@@ -115,6 +115,8 @@ impl RunnerClient {
             publication_context: None,
             // `skill` turns are unrestricted; no flag sets a tool access yet.
             tool_access: None,
+            // `skill` turns carry no memory write credential.
+            memory_token: None,
         };
         let resp = self
             .http

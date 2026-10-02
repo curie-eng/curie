@@ -16,6 +16,7 @@ from typing import Any
 
 import asyncpg
 import pytest
+from channel_protocol import scoped_conversation_id
 from curie_api.config import get_settings
 from curie_api.routers.state import (
     _NAMESPACE_LOCK_CLASS,
@@ -223,6 +224,49 @@ def test_app_scoped_token_is_refused_on_reserved_namespaces(
         assert client.delete(f"/agents/{aid}/state/{ns}/k", headers=headers).status_code == 403
 
 
+def test_app_scoped_token_is_refused_on_binding_scoped_memory(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # #1461: channel memory lives at /state/bindings/<kind>/<address>/memory and
+    # holds facts the prompt treats as remembered. The bundle's narrow state.app
+    # token must be fenced off it exactly as off agent memory, on every verb,
+    # while the runner's per-turn write credential for THIS binding still
+    # reaches it (ADR-0188: a sandbox writes channel memory only with a write
+    # credential whose binding claim names the channel).
+    aid = _agent(client, auth_headers)
+    app = mint(get_settings().api_key, agent=aid, scope="state.app", exp=_FAR_FUTURE)
+    writer = mint(
+        get_settings().api_key,
+        agent=aid,
+        scope="state",
+        exp=_FAR_FUTURE,
+        claims={
+            "binding": "slack:C000000S01",
+            "memory": "write",
+            "sender": "U0000001",
+            "turn": "evt-1461",
+        },
+    )
+    base = f"/agents/{aid}/state/bindings/slack/C000000S01/memory"
+    fact = f"{base}/fact-{'a' * 32}"
+    headers = {"X-API-Key": app}
+
+    put = client.put(fact, json={"value": {"statement": "x"}}, headers=headers)
+    assert put.status_code == 403, put.text
+    assert "reserved" in put.text
+    assert client.get(fact, headers=headers).status_code == 403
+    assert client.get(base, headers=headers).status_code == 403
+    assert (
+        client.post(f"{base}/log/append", json={"item": 1}, headers=headers).status_code
+        == 403
+    )
+    assert client.delete(fact, headers=headers).status_code == 403
+
+    ok = client.put(fact, json={"value": {"statement": "x"}}, headers={"X-API-Key": writer})
+    assert ok.status_code == 200, ok.text
+    assert client.get(fact, headers={"X-API-Key": writer}).status_code == 200
+
+
 def test_namespace_enumeration_hides_reserved_from_the_app_token(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
@@ -267,22 +311,77 @@ def test_app_scoped_token_works_on_a_non_reserved_namespace(
     assert client.get(url, headers=headers).json()["value"] == {"n": 1}
 
 
-def test_broad_state_token_and_platform_key_reach_reserved_namespaces(
+def test_platform_key_reaches_reserved_namespaces(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    # The loaders MUST reach memory/transcript to rehydrate: the broad ``state``
-    # token (their credential) and the platform key are both unrestricted. If this
-    # regressed, memory/history rehydration would break -- the reason the fix
-    # gates on scope, not on the namespace alone.
+    # The platform key (operators, ``curie cluster memory``) stays unrestricted
+    # on the reserved namespaces, any key, ADR-0188 included.
     aid = _agent(client, auth_headers)
-    broad = mint(get_settings().api_key, agent=aid, scope="state", exp=_FAR_FUTURE)
+    for ns in ("memory", "transcript"):
+        r = client.put(
+            f"/agents/{aid}/state/{ns}/k", json={"value": {"n": 1}}, headers=auth_headers
+        )
+        assert r.status_code == 200, f"{ns}: {r.text}"
 
-    for headers in ({"X-API-Key": broad}, auth_headers):
-        for ns in ("memory", "transcript"):
-            r = client.put(
-                f"/agents/{aid}/state/{ns}/k", json={"value": {"n": 1}}, headers=headers
-            )
-            assert r.status_code == 200, f"{ns}: {r.text}"
+
+def test_sandbox_state_token_reads_reserved_namespaces_and_writes_only_fact_keys(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # The loaders MUST reach memory/transcript to rehydrate: boot only reads
+    # memory and reads/writes transcripts, so the sandbox's state credentials
+    # keep that reach. What ADR-0188 removes is writing arbitrary memory keys:
+    # a sandbox writes only fact keys, and only with the per-turn write
+    # credential. A write to ``memory/k`` is now 403.
+    aid = _agent(client, auth_headers)
+    api_key = get_settings().api_key
+    reader = mint(
+        api_key,
+        agent=aid,
+        scope="state",
+        exp=_FAR_FUTURE,
+        claims={"binding": "slack:C000000S01", "memory": "read"},
+    )
+    writer = mint(
+        api_key,
+        agent=aid,
+        scope="state",
+        exp=_FAR_FUTURE,
+        claims={
+            "binding": "slack:C000000S01",
+            "memory": "write",
+            "sender": "U0000001",
+            "turn": "evt-reserved",
+        },
+    )
+    seeded = client.put(
+        f"/agents/{aid}/state/memory/guidance",
+        json={"value": {"text": "be brief"}},
+        headers=auth_headers,
+    )
+    assert seeded.status_code == 200, seeded.text
+
+    # Reads: memory (agent memory) and the transcript, with the read credential.
+    got = client.get(f"/agents/{aid}/state/memory/guidance", headers={"X-API-Key": reader})
+    assert got.status_code == 200, got.text
+    assert (
+        client.get(f"/agents/{aid}/state/memory", headers={"X-API-Key": reader}).status_code == 200
+    )
+    # A sandbox reaches only its own binding's thread keys (#3767).
+    thread = scoped_conversation_id("slack", "C000000S01", "1700000000.000100")
+    transcript = f"/agents/{aid}/state/transcript/{thread}"
+    t = client.put(transcript, json={"value": {"n": 1}}, headers={"X-API-Key": reader})
+    assert t.status_code == 200, t.text
+    assert client.get(transcript, headers={"X-API-Key": reader}).status_code == 200
+
+    # Fact-key writes with the write credential.
+    fact = f"/agents/{aid}/state/memory/fact-{'b' * 32}"
+    w = client.put(fact, json={"value": {"statement": "x"}}, headers={"X-API-Key": writer})
+    assert w.status_code == 200, w.text
+
+    # Any other memory key is refused, even with the write credential.
+    for headers in ({"X-API-Key": reader}, {"X-API-Key": writer}):
+        r = client.put(f"/agents/{aid}/state/memory/k", json={"value": {"n": 1}}, headers=headers)
+        assert r.status_code == 403, r.text
 
 
 def test_put_get_list_delete_round_trip(

@@ -282,6 +282,7 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/hook-secret",
     "/agents/{agent_id}/kill",
     "/agents/{agent_id}/memory",
+    "/agents/{agent_id}/memory/guidance",
     "/agents/{agent_id}/memory/{index}",
     "/agents/{agent_id}/memory/{index}/provenance",
     "/agents/{agent_id}/resume",
@@ -346,6 +347,7 @@ _HTTP_OPERATIONS = [
     "/v1/internal/cluster-message-replies/{reply_ref}",
     "/v1/internal/github/reviews/{event_id}/reserve",
     "/v1/internal/github/reviews/{event_id}/verify",
+    "/v1/internal/memory/closed-turns",
     "/v1/internal/publications",
     "/v1/internal/publications/precheck/context",
     "/v1/internal/publications/lineage",
@@ -373,6 +375,8 @@ _HTTP_OPERATIONS = [
     "/v1/work-item-progress/{request_id}",
     "/v1/work-item-progress/{request_id}/usage",
     "/v1/work-item-progress/{request_id}/verification",
+    # Deliberate progress from a running turn (ADR 0130).
+    "/v1/turn-progress/{progress_id}",
     "/v1/factory/cards/{token}.svg",
     "/schedules",
     "/schedules/{agent}/{name}/pause",
@@ -419,6 +423,13 @@ _STATE_MUTATION_ATTRIBUTES = {
     "service.name": ["curie-api"],
     "op": ["delete", "edit"],
     "namespace": ["memory", "transcript", "other"],
+}
+# Requests the state API allowed for a pre-ADR-0188 sandbox token (#3767): its
+# transcript reach stays unscoped until the token expires. The agent and path
+# are in the warning line, never on the metric.
+_STATE_LEGACY_TOKEN_ATTRIBUTES = {
+    "service.name": ["curie-api"],
+    "namespace": ["transcript"],
 }
 _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
     "service.name": ["curie-api"],
@@ -667,6 +678,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Agent state and memory entries removed or rewritten.",
         True,
         _STATE_MUTATION_ATTRIBUTES,
+    ),
+    "curie.state.legacy_token": _definition(
+        "counter",
+        "{request}",
+        "State requests allowed for a sandbox token minted before ADR-0188.",
+        True,
+        _STATE_LEGACY_TOKEN_ATTRIBUTES,
     ),
     "curie.work_item.reconciler.step.failure": _definition(
         "counter",

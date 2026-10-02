@@ -72,7 +72,11 @@ from .consumer_liveness import ConsumerLivenessStore
 from .delivery_lease import DeliveryLease, DeliveryLeaseStore, LeaseLostError
 from .kernel import Kernel, _thread_key_for
 from .markers import Markers
-from .progress import ProgressStore, sweep_pending_progress
+from .progress import (
+    ProgressStore,
+    sweep_pending_progress,
+    sweep_pending_progress_inboxes,
+)
 from .stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
 from .upgrade_drain import UpgradeDrainGate
 
@@ -184,7 +188,7 @@ class Consumer(StreamConsumer):
         kernel: Kernel,
         config: WorkerConfig,
         leases: DeliveryLeaseStore,
-        max_concurrency: int = 16,
+        max_concurrency: int | None = None,
         drain: UpgradeDrainGate | None = None,
     ) -> None:
         # Capacity parking requires a real delivery fence, so every runs
@@ -208,8 +212,12 @@ class Consumer(StreamConsumer):
         self._kernel = kernel
         self._config = config
         self._waits = CapacityWaitStore(redis, config)
-        self._max_concurrency = max_concurrency
-        self._sem = asyncio.Semaphore(max_concurrency)
+        # None, which the production entry point passes, sizes the lane from
+        # CURIE_WORKER_MAX_CONCURRENCY; an explicit value is for tests.
+        self._max_concurrency = (
+            config.max_concurrency if max_concurrency is None else max_concurrency
+        )
+        self._sem = asyncio.Semaphore(self._max_concurrency)
         self._inflight: set[asyncio.Task[None]] = set()
         # The reclaim/dead-letter knobs the shared base machinery reads. Built
         # after self._config is stored; handler is the bound self._dispatch. The
@@ -251,9 +259,7 @@ class Consumer(StreamConsumer):
         off the pending list, not the group's start id). An existing group is
         left untouched.
         """
-        await self._ensure_group(
-            self._config.stream, self._config.consumer_group, start_id="$"
-        )
+        await self._ensure_group(self._config.stream, self._config.consumer_group, start_id="$")
 
     async def run(self) -> None:
         await self.ensure_group()
@@ -389,9 +395,7 @@ class Consumer(StreamConsumer):
 
     async def _repair_expiry_notices(self) -> None:
         for record in await self._waits.expiry_notices_due():
-            token = await self._waits.claim_expiry_notice(
-                record.event_id, record.generation
-            )
+            token = await self._waits.claim_expiry_notice(record.event_id, record.generation)
             if token is None:
                 continue
             delivered = False
@@ -407,9 +411,7 @@ class Consumer(StreamConsumer):
                         }
                     )
                 async with asyncio.timeout(capacity_wait_module._NOTICE_SEND_TIMEOUT_S):
-                    ack = await self._kernel.notify_capacity_expired(
-                        qevent, cause=record.cause
-                    )
+                    ack = await self._kernel.notify_capacity_expired(qevent, cause=record.cause)
                 delivered = True
                 reply_ref = ack.ref
             except asyncio.CancelledError:
@@ -444,14 +446,8 @@ class Consumer(StreamConsumer):
         lease: DeliveryLease,
     ) -> None:
         record = await self._waits.get(qevent.event_id)
-        if (
-            record is not None
-            and not record.grant_confirmed
-            and record.grant_epoch is not None
-        ):
-            result = await self._kernel.resolve_capacity_grant(
-                qevent, record.grant_epoch
-            )
+        if record is not None and not record.grant_confirmed and record.grant_epoch is not None:
+            result = await self._kernel.resolve_capacity_grant(qevent, record.grant_epoch)
             if result == "granted":
                 confirmed = await self._waits.confirm_grant(
                     qevent.event_id, generation, lease, record.grant_epoch
@@ -471,7 +467,9 @@ class Consumer(StreamConsumer):
         if record is None:
             return
         delivered, reply_ref = await self._kernel.expire_capacity_wait(
-            qevent, lease=lease, cause=record.cause,
+            qevent,
+            lease=lease,
+            cause=record.cause,
             grant_epoch=record.grant_epoch,
         )
         if not await self._waits.mark_terminal(qevent.event_id, generation):
@@ -611,8 +609,7 @@ class Consumer(StreamConsumer):
                             lease, qevent.event_id, consumer=self._spec.consumer
                         ):
                             logger.debug(
-                                "approval resume %s is in flight; acknowledging "
-                                "redundant entry %s",
+                                "approval resume %s is in flight; acknowledging redundant entry %s",
                                 qevent.event_id,
                                 entry_id,
                             )
@@ -759,9 +756,7 @@ class Consumer(StreamConsumer):
                                 lease.raise_if_lost()
                                 wait_record = await self._waits.get(qevent.event_id)
                                 if wait_record is None:
-                                    await self._kernel.notify_turn_not_started(
-                                        qevent, lease=lease
-                                    )
+                                    await self._kernel.notify_turn_not_started(qevent, lease=lease)
                             except LeaseLostError:
                                 logger.warning(
                                     "skipping the not-started notice for entry %s: this "
@@ -849,19 +844,11 @@ class Consumer(StreamConsumer):
             if WAIT_GENERATION_FIELD in fields:
                 generation = int(fields[WAIT_GENERATION_FIELD])
                 record = await self._waits.get(qevent.event_id)
-                if (
-                    record is None
-                    or record.generation != generation
-                    or record.grant_epoch is None
-                ):
+                if record is None or record.generation != generation or record.grant_epoch is None:
                     return
-                await self._kernel.resolve_capacity_grant(
-                    qevent, record.grant_epoch
-                )
+                await self._kernel.resolve_capacity_grant(qevent, record.grant_epoch)
                 return
-            await self._kernel.interrupt_thread(
-                _thread_key_for(qevent), "delivery lease lost"
-            )
+            await self._kernel.interrupt_thread(_thread_key_for(qevent), "delivery lease lost")
         except Exception:
             logger.exception(
                 "could not interrupt the runner for entry %s after its delivery "
@@ -982,6 +969,7 @@ class Consumer(StreamConsumer):
                 await self._kernel.reap_orphans()
                 await self._kernel.sweep_pending_completions()
                 await self._sweep_pending_progress()
+                await self._drain_pending_progress_inboxes()
                 await self._drain_thread_reset_requests()
             except Exception:
                 logger.exception("maintenance tick failed")
@@ -1009,6 +997,14 @@ class Consumer(StreamConsumer):
             await sweep_pending_progress(ProgressStore(self._valkey, self._config))
         except Exception:
             logger.exception("progress outbox sweep failed")
+
+    async def _drain_pending_progress_inboxes(self) -> None:
+        """Recover accepted ADR-0130 commands left by a stopped live pump."""
+
+        try:
+            await sweep_pending_progress_inboxes(ProgressStore(self._valkey, self._config))
+        except Exception:
+            logger.exception("progress inbox drain failed")
 
     async def _observe_capacity_waits(self) -> None:
         try:

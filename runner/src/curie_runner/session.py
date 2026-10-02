@@ -74,6 +74,7 @@ from .memory import (
     consolidate_memory,
     utcnow_iso,
 )
+from .memory_facts import MemoryTurn
 from .otel import RunTracer, _GenerationSpan
 from .progress import ProgressActivity
 from .redact import OutboundRedactor
@@ -85,6 +86,7 @@ from .tool_access import (
     TurnToolAccess,
 )
 from .translate import TurnState, translate_message
+from .turn_progress import ProgressCapability, TurnProgress
 from .usage_report import UsageSink
 
 logger = logging.getLogger(__name__)
@@ -303,6 +305,8 @@ class SessionRunner:
         progress_activity: ProgressActivity | None = None,
         usage_reporter: UsageSink | None = None,
         primary_model: str | None = None,
+        turn_progress: TurnProgress | None = None,
+        memory_turn: MemoryTurn | None = None,
         tool_access: TurnToolAccess | None = None,
         attachment_notice: str | None = None,
     ) -> None:
@@ -330,9 +334,16 @@ class SessionRunner:
         # None when no progress URL and token were injected.
         self._usage_reporter = usage_reporter
         self._primary_model = primary_model
+        # Who the memory tools attribute a fact to (#1461); None when the
+        # tools are not mounted. Set at each turn start from the inbound event.
+        self._memory_turn = memory_turn
         # Session-wide activity counters for report_progress (#3077); None when
         # no progress tool is mounted.
         self._progress_activity = progress_activity
+        # The deliberate progress tool's holder (ADR 0130), shared with the
+        # tool: opened with each turn's capability, closed when the turn ends.
+        # None when the tool is not mounted (a factory execution).
+        self._turn_progress = turn_progress
         self._ceiling = ceiling
         self._max_usd_per_day = max_usd_per_day
         self._tracer = tracer
@@ -809,7 +820,13 @@ class SessionRunner:
             self._session_id,
         )
 
-    async def steer(self, text: str, *, tool_access: ToolAccess | None = None) -> bool:
+    async def steer(
+        self,
+        text: str,
+        *,
+        event: Event | None = None,
+        tool_access: ToolAccess | None = None,
+    ) -> bool:
         """Inject a follow-up message into the live turn without consuming output.
 
         Returns False when no turn is active (the finish-race boundary F1 owns:
@@ -817,6 +834,10 @@ class SessionRunner:
         on the already-open turn's NDJSON stream. A steer under a different tool
         access than the live turn's is refused the same way, so neither message
         runs under the other's access (RUNNER-TOOL-ACCESS-4).
+
+        ``event`` is the steered frame. When given, the memory tools' author is
+        rebound to its sender before the model sees the text (#1461), exactly as
+        turn start does, so a fact saved in reply is attributed to whoever said it.
         """
 
         if self._session is None or not self._turn_open or not self._turn_ready:
@@ -830,6 +851,8 @@ class SessionRunner:
             # and a restricted steer joins no turn.
             return False
         self._unrestricted_prompt_sent = True
+        if event is not None and self._memory_turn is not None:
+            self._memory_turn.begin(event)
         await self._session.query(text)
         if self._active_state is not None:
             self._active_state.assistant_group = None
@@ -920,18 +943,26 @@ class SessionRunner:
         parent: Context | None = None,
         turn_epoch: str | None = None,
         admission_required: bool = False,
+        progress: ProgressCapability | None = None,
     ) -> AsyncGenerator[str]:
         """Run one turn, streaming ACI NDJSON lines and enforcing the budget.
 
         Returns an async *generator* (not just an iterator): the server wraps it
         in ``contextlib.aclosing`` so a client disconnect finalizes it on the
         driving task, and ``aclosing`` requires the ``aclose`` a generator has.
+
+        ``progress`` is this turn's deliberate progress capability (ADR 0130),
+        held only while the turn is open.
         """
 
         redactor = OutboundRedactor(self._held_secrets)
         async with contextlib.aclosing(
             self._run_turn(
-                event, parent=parent, turn_epoch=turn_epoch, admission_required=admission_required
+                event,
+                parent=parent,
+                turn_epoch=turn_epoch,
+                admission_required=admission_required,
+                progress=progress,
             )
         ) as stream:
             async for line in stream:
@@ -948,6 +979,7 @@ class SessionRunner:
         parent: Context | None,
         turn_epoch: str | None,
         admission_required: bool,
+        progress: ProgressCapability | None,
     ) -> AsyncGenerator[str]:
         if self._session is None:
             raise RuntimeError("session not started")
@@ -967,6 +999,8 @@ class SessionRunner:
             self._persistence_owned = False
             self._turn_open = True
             self._history_durable = False
+            if self._turn_progress is not None:
+                self._turn_progress.open(progress)
             # Not ready until turn-start connector recovery completes (#2634):
             # the turn is accepted and owns its epoch, but no query has been
             # sent, so steer is refused and a stop is recorded without an SDK
@@ -974,6 +1008,8 @@ class SessionRunner:
             self._turn_ready = False
             state = TurnState(tool_access=event.tool_access)
             self._active_state = state
+            if self._memory_turn is not None:
+                self._memory_turn.begin(event)
             # A permission-gate block belongs to exactly one turn: clear any
             # prior turn's residue before the model runs (#245).
             if self._approval_gate is not None:
@@ -1314,6 +1350,11 @@ class SessionRunner:
                         int((time.monotonic() - start) * 1000),
                     )
                 self._active_state = None
+                if self._memory_turn is not None:
+                    # However the turn ended, its write credential ends with it.
+                    self._memory_turn.end()
+                if self._turn_progress is not None:
+                    self._turn_progress.close()
                 if self._approval_gate is not None:
                     self._approval_gate.clear_publication_context()
                 try:

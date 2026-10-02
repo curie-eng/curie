@@ -1059,6 +1059,11 @@
             "title": "Memory",
             "type": "boolean"
           },
+          "memory_writes": {
+            "default": false,
+            "title": "Memory Writes",
+            "type": "boolean"
+          },
           "model": {
             "anyOf": [
               {
@@ -1295,6 +1300,17 @@
             ],
             "title": "Memory"
           },
+          "memory_writes": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Writes"
+          },
           "model": {
             "anyOf": [
               {
@@ -1428,8 +1444,22 @@
       },
       "ApprovalApprovers": {
         "additionalProperties": false,
-        "description": "WHO may resolve a route's approvals (#420), as opposed to the binding's\n``resolution``, which is only WHERE the interactive card posts.\n\nDeclaring an approvers block is what lets a request sit in a broad channel\nwhere everyone can see it while only a narrow set may act on it. Omitting it\nkeeps the zero-setup default: the resolution-card channel's members are the\napprovers. Notification recipients never enter this policy.",
+        "description": "WHO may resolve a route's approvals (#420), as opposed to the binding's\n``resolution``, which is only WHERE the interactive card posts.\n\nDeclaring an approvers block is what lets a request sit in a broad channel\nwhere everyone can see it while only a narrow set may act on it. Omitting it\nkeeps the zero-setup default in Slack: the resolution-card channel's members\nare the approvers. Notification recipients never enter this policy.\n\n``group`` and ``users`` are Slack's entries; ``emails`` is email's (ADR-0177 amendment).\nEach surface reads only its own: a Slack card never reads ``emails``, and an\nemail card never reads ``users`` or ``group``.",
         "properties": {
+          "emails": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emails"
+          },
           "group": {
             "anyOf": [
               {
@@ -1462,6 +1492,20 @@
       "ApprovalApproversOut": {
         "description": "Repair-oriented read projection of the stored approver declaration.",
         "properties": {
+          "emails": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emails"
+          },
           "group": {
             "anyOf": [
               {
@@ -2547,7 +2591,7 @@
       },
       "ApprovalRequestingSurfaceTarget": {
         "additionalProperties": false,
-        "description": "Show the card in the conversation that asked, on any channel (ADR-0177).\n\nThe other form of a route's ``resolution``: instead of a fixed Slack\nchannel, the card goes where the request was asked, exactly as a routeless\napproval's card already does. Who may answer then follows the channel the\ncard lands on: Slack keeps its approver sets, and any other channel admits\nthe requester alone (``approvers.RequesterOnly``).\n\nStrict on purpose. ``mode`` is the whole object: a stray ``kind`` or\n``address`` beside it is a mix of the two forms, which the ADR refuses\nrather than guessing which half the operator meant.",
+        "description": "Show the card in the conversation that asked, on any channel (ADR-0177).\n\nThe other form of a route's ``resolution``: instead of a fixed Slack\nchannel, the card goes where the request was asked, exactly as a routeless\napproval's card already does. Who may answer then follows the channel the\ncard lands on: Slack keeps its approver sets, and any other channel admits\nonly an address on the route's approver ``emails`` (``approvers.EmailApprovers``,\nADR-0177 amendment).\n\nStrict on purpose. ``mode`` is the whole object: a stray ``kind`` or\n``address`` beside it is a mix of the two forms, which the ADR refuses\nrather than guessing which half the operator meant.",
         "properties": {
           "mode": {
             "const": "requesting_surface",
@@ -4710,6 +4754,43 @@
         "title": "MemoryEntryOut",
         "type": "object"
       },
+      "MemoryGuidanceIn": {
+        "description": "Operator memory guidance for one agent (#1461).\n\nStored verbatim at ``memory/guidance`` as ``{\"text\": ...}``; the runner shows\nit to the model beside its memory tools in place of the platform default.",
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "MemoryGuidanceIn",
+        "type": "object"
+      },
+      "MemoryGuidanceOut": {
+        "description": "The agent's effective memory guidance and where it comes from (#1461).\n\n``source`` is ``operator`` when guidance is stored for the agent, else\n``default`` and ``text`` is the platform default.",
+        "properties": {
+          "source": {
+            "enum": [
+              "default",
+              "operator"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "source"
+        ],
+        "title": "MemoryGuidanceOut",
+        "type": "object"
+      },
       "MemoryProvenanceOut": {
         "description": "Where a memory entry was learned from (#264 ``Provenance`` shape).\n\n``source`` distinguishes an operator-seeded record (``operator``) from a\nsession-learned one. Absent or null means learned/unspecified, matching\nrecords written before the operator seed path existed.",
         "properties": {
@@ -4791,6 +4872,28 @@
           "content"
         ],
         "title": "MemoryTraceBackOut",
+        "type": "object"
+      },
+      "MemoryTurnClosedIn": {
+        "description": "The worker reporting that a turn has ended (#3776): from now on the API\nrefuses memory writes made with that turn's per-turn credential (ADR-0188),\neven before it expires. ``turn`` is the credential's ``turn`` claim, opaque\nto the API.",
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "turn": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Turn",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "turn"
+        ],
+        "title": "MemoryTurnClosedIn",
         "type": "object"
       },
       "MetricPoint": {
@@ -4896,6 +4999,16 @@
         ],
         "title": "MetricsSummary",
         "type": "object"
+      },
+      "MilestoneClass": {
+        "description": "Why a durable interruption is warranted (ADR-0130 section 3).\n\nA class is a reason, not a step: a chain may skip one or repeat one while\nits milestone budget lasts.",
+        "enum": [
+          "evidence",
+          "scope",
+          "verification"
+        ],
+        "title": "MilestoneClass",
+        "type": "string"
       },
       "ModelUsageEntry": {
         "additionalProperties": false,
@@ -5249,6 +5362,22 @@
         ],
         "title": "ProgressReport",
         "type": "object"
+      },
+      "ProgressState": {
+        "description": "The initial state set, in ADR-0130 section 1's order.",
+        "enum": [
+          "queued",
+          "investigating",
+          "awaiting-approval",
+          "preparing-workspace",
+          "testing",
+          "publishing",
+          "complete",
+          "failed",
+          "cancelled"
+        ],
+        "title": "ProgressState",
+        "type": "string"
       },
       "PublicationContext": {
         "description": "API issued authority and observation for one execution's publication read.\n\nThe capability authorizes only the publication precheck endpoint. It must\nstay outside model text, transcripts, workspace files and logs. The queued\nevent identifier is a correlation value, not proof of an active turn.\nObservation metadata records the API read at dispatch; consumers must make\na fresh comparison before handling an empty publication proposal.",
@@ -7455,6 +7584,66 @@
         "title": "TurnAccepted",
         "type": "object"
       },
+      "TurnProgressBody": {
+        "additionalProperties": false,
+        "description": "A ``ProgressCommand`` and the worker/runner position for it.\n\nClosed like the command: an unknown field is refused. ``generation`` is\nallocated durably by the worker and ``seq`` orders commands within it.",
+        "properties": {
+          "generation": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "milestone": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MilestoneClass"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Requests a durable milestone reply of this class. The milestone budget is the platform's to apply, not the command's to state."
+          },
+          "seq": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Seq",
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ProgressState"
+          },
+          "summary": {
+            "maxLength": 200,
+            "minLength": 1,
+            "pattern": "^[^\n\r\u000b\f\u001c\u001d\u001e\u0085\u2028\u2029]+$",
+            "title": "Summary",
+            "type": "string"
+          },
+          "update_id": {
+            "description": "Identifies this update within its record, for idempotency.",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$",
+            "title": "Update Id",
+            "type": "string"
+          },
+          "version": {
+            "const": "1.0",
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "update_id",
+          "state",
+          "summary",
+          "generation",
+          "seq"
+        ],
+        "title": "TurnProgressBody",
+        "type": "object"
+      },
       "TurnSource": {
         "description": "What started this turn: a person speaking, or the system doing a job.\n\nADR-0079's new event kind. The values are the three the ADR names, and the\ndistinction the kernel actually acts on is binary: ``SLACK`` is a person's\nmessage and may steer a live turn; ``WEBHOOK`` and ``CRON`` are jobs, and a\njob is an OUTPUT, never a steering input. ``is_job`` is that predicate, kept\nhere rather than re-derived at each call site so a fourth value cannot be\nadded without deciding which side of the line it falls on.\n\n**This is a different axis from ``ReplyHandle.kind`` and the two do not\ncollapse.** ``kind`` answers *where the reply goes* (slack, email); ``source``\nanswers *what caused the turn*. A nightly digest posted into a Slack channel\nis ``kind=\"slack\"`` with ``source=CRON``: same transport as a mention, and it\nmust not steer whatever conversation is live in that thread. Reading either\nfield off the other is the silent misroute both exist to close.\n\n``SLACK`` is the ADR's spelling for \"a person's chat message\", which was the\nonly such ingress when ADR-0079 was accepted. A channel port turn from a\nhuman on another transport (an email that a person actually sent) is that\nsame category on a different ``kind``, and giving it its own value is a NEW\nENUM VALUE -- breaking under this package's rules, so it is a deliberate,\nseparately-decided bump rather than something this change assumes.",
         "enum": [
@@ -8486,6 +8675,63 @@
           }
         },
         "title": "WorkItemUsageRole",
+        "type": "object"
+      },
+      "WorkspaceCredentialOut": {
+        "description": "The workspace clone credential, plus the base a factory WorkItem froze.\n\nThe worker clones ``base_branch`` and pins ``base_commit`` (ADR 0186). Both\nare None outside the factory and on legacy WorkItems.",
+        "properties": {
+          "authorization_header": {
+            "title": "Authorization Header",
+            "type": "string"
+          },
+          "base_branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Branch"
+          },
+          "base_commit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Commit"
+          },
+          "clone_url": {
+            "title": "Clone Url",
+            "type": "string"
+          },
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "clone_url",
+          "authorization_header"
+        ],
+        "title": "WorkspaceCredentialOut",
         "type": "object"
       },
       "WorkspaceCredentialRequest": {
@@ -10438,6 +10684,185 @@
           }
         },
         "summary": "Create Memory",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/agents/{agent_id}/memory/guidance": {
+      "delete": {
+        "description": "Remove operator guidance, so the platform default applies again (#1461).\n\nRemoving guidance that is not stored is a no-op, still 204.",
+        "operationId": "delete_memory_guidance_agents__agent_id__memory_guidance_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Memory Guidance",
+        "tags": [
+          "memory"
+        ]
+      },
+      "get": {
+        "description": "The agent's effective memory guidance and its source (#1461).",
+        "operationId": "get_memory_guidance_agents__agent_id__memory_guidance_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryGuidanceOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Memory Guidance",
+        "tags": [
+          "memory"
+        ]
+      },
+      "put": {
+        "description": "Store operator guidance, replacing any earlier one (#1461).\n\nThe runner reads it at the next session boot; a live thread keeps the\nguidance it booted with.",
+        "operationId": "put_memory_guidance_agents__agent_id__memory_guidance_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryGuidanceIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryGuidanceOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Memory Guidance",
         "tags": [
           "memory"
         ]
@@ -14296,7 +14721,7 @@
     },
     "/hooks/{agent_id}/{hook}": {
       "post": {
-        "description": "Verify one hook delivery and enqueue it as a turn.\n\n``tool_access=read-only`` opts into the existing TOOL-ACCESS contract.\nBefore requesting it, the operator must verify homogeneous worker artifacts\nimplementing TOOL-ACCESS-6 and compatible runner artifacts. This API does\nnot discover worker support; an old worker can discard the field. The\nimplementing worker checks the exact target runner before dispatch. Omission\npreserves ordinary hooks, including approvals. The receipt proves only the\nqueued policy, not runtime enforcement or successful reply delivery.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names -- with ``fullmatch``, since the pattern's ``$``\n   matches before a trailing newline and would let one into those keys;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the timestamp, delivery id, decoded hook name, parsed\n   requested policy and raw body, with the timestamp required and inside\n   ``hook_signing.TOLERANCE_S``; a missing delivery id is verified as the\n   empty string, so an absent id is only reported to a caller who could sign;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),\n   after both of those and before anything is claimed;\n7. routability, then the claim, quota and enqueue.",
+        "description": "Verify one hook delivery and enqueue it as a turn.\n\n``tool_access=read-only`` opts into the existing TOOL-ACCESS contract.\nBefore requesting it, the operator must verify homogeneous worker artifacts\nimplementing TOOL-ACCESS-6 and compatible runner artifacts. This API does\nnot discover worker support; an old worker can discard the field. The\nimplementing worker checks the exact target runner before dispatch. Omission\npreserves ordinary hooks, including approvals. The receipt proves only the\nqueued policy, not runtime enforcement or successful reply delivery.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names -- with ``fullmatch``, since the pattern's ``$``\n   matches before a trailing newline and would let one into those keys;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the timestamp, delivery id, decoded hook name, parsed\n   requested policy and raw body, with the timestamp required and inside\n   ``hook_signing.TOLERANCE_S``; a missing delivery id is verified as the\n   empty string, so an absent id is only reported to a caller who could sign;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. the optional explicit reply TARGET, after authentication so malformed\n   coordinates reveal nothing to an unsigned caller;\n7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),\n   after both of those and before anything is claimed;\n8. routability, then the claim, quota and enqueue.",
         "operationId": "ingest_hook_hooks__agent_id___hook__post",
         "parameters": [
           {
@@ -14364,6 +14789,38 @@
                 }
               ],
               "title": "Adapter"
+            }
+          },
+          {
+            "in": "query",
+            "name": "conversation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Conversation Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "placeholder",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Placeholder"
             }
           },
           {
@@ -15727,6 +16184,59 @@
         "summary": "Verify Review",
         "tags": [
           "internal-github-reviews"
+        ]
+      }
+    },
+    "/v1/internal/memory/closed-turns": {
+      "post": {
+        "description": "Record that a turn has ended; idempotent. The record expires once no\ncredential for the turn could still be valid (``MEMORY_TURN_CLOSED_TTL_S``).",
+        "operationId": "close_memory_turn_v1_internal_memory_closed_turns_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryTurnClosedIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Close Memory Turn",
+        "tags": [
+          "internal-memory"
         ]
       }
     },
@@ -17247,7 +17757,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryCredentialOut"
+                  "$ref": "#/components/schemas/WorkspaceCredentialOut"
                 }
               }
             },
@@ -17337,6 +17847,76 @@
         "summary": "Select Workspace Repository",
         "tags": [
           "internal-workspaces"
+        ]
+      }
+    },
+    "/v1/turn-progress/{progress_id}": {
+      "post": {
+        "description": "Append one command to the chain's inbox for the worker's pump.\n\n202 means the command is queued for the chain, not that it was applied:\nthe worker's store may still refuse it as a duplicate, out of order, past\nthe chain's update cap, or for a state only the platform sets.",
+        "operationId": "accept_turn_progress_v1_turn_progress__progress_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "progress_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Progress Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TurnProgressBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Accept Turn Progress V1 Turn Progress  Progress Id  Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Accept Turn Progress",
+        "tags": [
+          "turn-progress"
         ]
       }
     },

@@ -183,7 +183,14 @@ verifies, that has not expired and that names a listed agent
 (`apps/worker/src/curie_connector_proxy/caller.py::decide`), strips the header
 and forwards it to the server over loopback with its `Host` unchanged and its
 body as sent, never decoded
-(`apps/worker/src/curie_connector_proxy/server.py::make_app`). It checks every
+(`apps/worker/src/curie_connector_proxy/server.py::make_app`). On that forward
+it sets `X-Curie-Agent` from the verified token. When the token also carries
+`run` and `work_item` (ADR 0178), it sets `X-Curie-Run` and
+`X-Curie-Work-Item` from those claims. Inbound copies of the three headers
+are dropped first, so a caller cannot supply them. A token without the pair
+sets no run headers. A connector trusts the identity headers only on this
+loopback forward. The `-direct` Service skips the proxy, so a connector
+reached there has no run. It checks every
 path the same way, the MCP client's OAuth discovery and registration requests
 included. Its log line quotes the path, and aiohttp's own error and access logs
 redact a caller token. Any other request gets a 403 carrying a JSON-RPC error and no

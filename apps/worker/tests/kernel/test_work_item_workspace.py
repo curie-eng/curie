@@ -88,6 +88,7 @@ class _Workspace:
                 env=dict(kwargs.get("env") or {}),
                 workspace_repo=kwargs.get("repo_full_name"),
                 agent_name=kwargs.get("agent_name"),
+                caller_run=kwargs.get("caller_run"),
             )
             return SimpleNamespace(handle=handoff, prepared=None)
         handle = self.substrate.claim(  # type: ignore[attr-defined]
@@ -95,6 +96,7 @@ class _Workspace:
             env=kwargs.get("env"),
             agent_name=kwargs.get("agent_name"),
             workspace_repo=kwargs.get("repo_full_name"),
+            caller_run=kwargs.get("caller_run"),
         )
         return SimpleNamespace(handle=handle, prepared=None)
 
@@ -954,12 +956,12 @@ def _fail_settled_release(h: object) -> None:
     h.substrate.release = release  # type: ignore[attr-defined]
 
 
-def test_consecutive_work_items_with_the_same_budget_adopt_the_sandbox(
+def test_consecutive_work_items_replace_the_sandbox_even_with_the_same_budget(
     make_harness,
 ) -> None:
-    """#3071: a matching turn budget is no reason to replace a live runner.
-    The first work item's release fails, so its live sandbox survives, and the
-    next work item with the same budget adopts it instead of claiming again."""
+    """ADR 0178: two work items are two runs, so a matching turn budget does
+    not let the second adopt the first's runner. The first release fails, the
+    live sandbox survives, and the next run still claims a fresh one."""
 
     async def exercise() -> None:
         async with make_harness(
@@ -975,10 +977,11 @@ def test_consecutive_work_items_with_the_same_budget_adopt_the_sandbox(
                 )
 
             envs = h.fake_k8s.claim_envs
-            assert len(envs) == 1
+            assert len(envs) == 2
             assert (envs[0] or {}).get("CURIE_MAX_TURNS") == "5"
+            assert (envs[1] or {}).get("CURIE_MAX_TURNS") == "5"
             # Each execution ends without publishing, so each gets its one
-            # continuation turn (#3128) on the same adopted runner.
+            # continuation turn (#3128) on the runner booted for that run.
             assert len(h.runner.opened) == 4
             assert h.runner.opened[0] == f"Resolve {ISSUE_URL}"
             assert h.runner.opened[2] == f"Resolve {ISSUE_URL}"

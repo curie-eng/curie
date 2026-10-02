@@ -39,6 +39,7 @@ detail, and documentation drift on one version-selectable system diagram.
 - [Handling a Slack mention (message flow)](#handling-a-slack-mention-message-flow)
   - [The four kernel invariants](#the-four-kernel-invariants)
   - [Handling approvals (human in the loop)](#handling-approvals-human-in-the-loop)
+  - [Deliberate progress (ADR 0130)](#deliberate-progress-adr-0130)
 - [Pushing agent versions with git (deploy flow)](#pushing-agent-versions-with-git-deploy-flow)
 - [One worker, two hidden seams: substrate and transport](#one-worker-two-hidden-seams-substrate-and-transport)
   - [Substrate seam — `SandboxClient`](#substrate-seam--sandboxclient)
@@ -278,13 +279,19 @@ sequenceDiagram
     alt no live turn for this thread
         W->>S: claim(thread_ts) / resume
         S-->>W: SandboxHandle (pod cold-created from SandboxTemplate)
-        W->>R: POST /v1/event {message}
+        W->>V: allocate and activate durable progress generation
+        W->>R: POST /v1/event {message} (+ progress URL, token, generation headers on a person's turn)
     else turn already live for this thread
         W->>R: POST /v1/steer {text}
         Note over W,R: 409 if the turn finished first (finish race), worker opens a fresh turn on the same idle sandbox
     end
 
     R->>A: model call (streaming)
+    opt the model calls mcp__curie__progress on a turn holding a capability
+        R->>P: POST /v1/turn-progress/{progress_id} (turn.progress token + generation)
+        P->>V: validate active generation; XADD inbox + SADD pending index atomically
+        W->>V: live pump or maintenance drainer applies inbox (rendering off, no outbox enqueue)
+    end
     R-->>W: NDJSON: text_delta*, tool notes*, final
     R--)O: gen_ai spans (agent.run root + generation/tool sibling intervals)
 
@@ -383,6 +390,38 @@ Three properties keep an approval from becoming a standing permission:
 - Membership for "who may approve" resolves in the API, never in the sandbox (ADR-0034).
 - The resumed sandbox boots with a scoped state token rather than the platform key (ADR-0033).
 - The post-approval allowance is one-shot and bound to the granting agent (ADR-0035), so an approval cannot be replayed into a standing permission.
+
+### Deliberate progress (ADR 0130)
+
+A long turn can report short task state while it runs
+([ADR-0130](docs/adr/0130-deliberate-progress-is-bounded-durable-channel-state.md)).
+The report never rides the ACI stream: tool notes stay internal telemetry, and
+the frozen ACI is unchanged. Instead the kernel boots only an eligible human
+Slack thread (or its approval resume) with a direct runner eligibility fact, so
+other sessions mount neither the tool nor its prompt. It durably allocates and
+activates a monotonically increasing chain generation with a short renewable
+server-time lease, then sends a `turn.progress` sandbox token bound to
+`progress_id:generation`, the
+generation, and the URL as runner control headers on `POST /v1/event`. A
+startup keeper renews the active generation while the worker waits for the
+runner's response headers; the stream pump takes over renewal before the
+startup keeper stops. Every exit before that handoff stops the keeper and
+attempts to close the generation before re-propagating owner cancellation
+([`apps/worker/src/curie_worker/turn_progress.py::mint_capability`](apps/worker/src/curie_worker/turn_progress.py)).
+The runner's platform `progress` tool posts each command to the API with it
+([`runner/src/curie_runner/turn_progress.py::TurnProgress`](runner/src/curie_runner/turn_progress.py)).
+The API verifies the token and renewable active-generation lease, rate limits it, and atomically
+appends the command to the chain's inbox stream and durable pending-inbox index
+([`apps/api/src/curie_api/routers/turn_progress.py::accept_turn_progress`](apps/api/src/curie_api/routers/turn_progress.py)).
+While the kernel consumes the turn, a per-turn pump applies the inbox to the
+chain's durable record. The maintenance loop drains the same pending-inbox
+index after a crash, cancellation, timeout, or transient final read
+([`apps/worker/src/curie_worker/turn_progress.py::ProgressPump`](apps/worker/src/curie_worker/turn_progress.py),
+[`apps/worker/src/curie_worker/progress.py::ProgressStore`](apps/worker/src/curie_worker/progress.py)),
+which owns the ordering, idempotency, terminal and milestone-budget rules.
+Rendering is off: nothing reaches an adapter yet. The worker README's
+[Deliberate progress](apps/worker/README.md#deliberate-progress-adr-0130)
+section holds the rules.
 
 ## Pushing agent versions with git (deploy flow)
 

@@ -88,6 +88,7 @@ class _Workspace:
                 env=dict(kwargs.get("env") or {}),
                 workspace_repo=kwargs.get("repo_full_name"),
                 agent_name=kwargs.get("agent_name"),
+                caller_run=kwargs.get("caller_run"),
             )
             return SimpleNamespace(handle=handoff, prepared=None)
         handle = self.substrate.claim(  # type: ignore[attr-defined]
@@ -95,6 +96,7 @@ class _Workspace:
             env=kwargs.get("env"),
             agent_name=kwargs.get("agent_name"),
             workspace_repo=kwargs.get("repo_full_name"),
+            caller_run=kwargs.get("caller_run"),
         )
         return SimpleNamespace(handle=handle, prepared=None)
 

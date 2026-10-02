@@ -23,6 +23,7 @@ from .. import bundles, crud, deploy, hook_signing
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
+from ..e2e_connector import prepare_connectors
 from ..models import Agent, AgentChannel
 from ..publication_policy import PublicationPolicyConflict
 from ..runner_resources import RunnerResourcesError, quota_refusal
@@ -283,6 +284,9 @@ async def update_agent(
         # follows the plain-None-check siblings below rather than the
         # model_fields_set pair above.
         agent = await crud.update_agent_memory(session, agent, data.memory)
+    if data.memory_writes is not None:
+        # Same plain-None rule as `memory`: omitted (or null) is unchanged.
+        agent = await crud.update_agent_memory_writes(session, agent, data.memory_writes)
     if data.approval_required_tools is not None:
         # Omitted leaves the gates unchanged; an explicit [] clears them (#245).
         agent = await crud.update_agent_approval_tools(session, agent, data.approval_required_tools)
@@ -829,7 +833,9 @@ async def read_version_connectors(
                 name: bundles.gated_tools_for_connector(name, patterns)
                 for name in declared.connectors
             }
+            e2e_install = settings.e2e_install()
             try:
+                declared = prepare_connectors(declared, e2e_install)
                 manifests = bundles.render_connector_manifests(
                     declared,
                     release=release,
@@ -840,6 +846,7 @@ async def read_version_connectors(
                     proxy=proxy,
                     grant_store_url=settings.valkey_dsn() if proxy is not None else "",
                     gated_tools=gated,
+                    e2e=e2e_install,
                 )
             except ValueError as exc:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc

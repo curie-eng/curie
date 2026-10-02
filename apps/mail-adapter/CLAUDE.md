@@ -7,9 +7,10 @@ the enforceable-rule summary.
 ## Load-bearing invariants
 
 - **The adapter holds no platform API key, no queue credential, and no platform
-  database access.** Its only credentials are `CURIE_CHANNEL_TOKEN` (presented as
-  `X-API-Key` on ingress), `CURIE_EGRESS_SECRET` (checked on every inbound POST)
-  and `AGENTMAIL_API_KEY`. Do not add `CURIE_API_KEY`, a Valkey client, or a DB
+  database access.** Its credentials are `CURIE_CHANNEL_TOKEN` (presented as
+  `X-API-Key` on ingress), `CURIE_EGRESS_SECRET` (checked on every inbound POST),
+  `AGENTMAIL_API_KEY`, and the optional `CURIE_ADAPTER_PRINCIPAL` (ADR-0156,
+  presented only on `POST /approvals/{id}/resolve` when carrying an answer). Do not add `CURIE_API_KEY`, a Valkey client, or a DB
   session to the platform here; a capability the adapter does not hold cannot be
   stolen from it, and re-minting an expired `chn` token is an operator step for
   exactly that reason. Its local SQLite file is delivery state, not a platform
@@ -19,6 +20,10 @@ the enforceable-rule summary.
   is only the event's `target.reply_ref`. Never derive a target or accumulated
   text from conversation-global state: two turns in one thread must not clear,
   inherit, or redirect one another's reply.
+- **A progress body is acknowledged and ignored.** `EgressHandler.dispatch`
+  returns 200 for a `reply.update` or `reply.post` carrying `progress` before
+  it reaches `record_text`, so deliberate progress never replaces, clears or
+  appends to the buffered reply. Do not render it into the email.
 - **Nothing is recorded as replied until the provider has accepted the send.**
   A TCP connection refusal during the AgentMail witness or send returns 424
   with the fixed body `{"detail":"provider egress refused"}`. The worker stores
@@ -43,6 +48,19 @@ the enforceable-rule summary.
   an attacker-controlled `From` header. **Never describe the allow-list as
   authenticating a sender** in code, comments, docs or chart values: Curie
   performs no sender authentication.
+- **An approval answer is never a turn, and is carried only on every ADR-0177
+  rule** (README "Approvals by email"): after both inbound checks, a live
+  reference issued in this thread, not sent automatically (missing headers
+  count as automatic), and the decision word on the first line of
+  `extracted_text` only, never the full body. The reference links a reply to
+  its approval; it is not proof of identity, and nothing here authenticates a
+  mailbox. **Who may answer is the platform's decision** (ADR-0177 amendment): the actor
+  is the sender's bare lowercased address, never a display name, and the
+  platform checks the binding's `allowed_callers` and the route's approver
+  `emails`. Do not add a local approver or requester filter. A
+  `caller_not_allowed` refusal gets nothing back. Never respond to an automatic
+  message. A settled card spends its reference.
+- **Reply all only for the approval request and its outcome** (ADR-0177 amendment A5). Every other send stays sender-only, so the resumed answer reaches the requester. Never mail an address that is not already on the thread: the requester copies approvers in. The card's `Approver` fields word the email and decide nothing.
 - **`list_messages` always sends all three `include_*=false`.** They are
   constants in `agentmail.py`, not parameters and not config, so no caller and no
   operator can turn them on. Sending them when they are already the provider's

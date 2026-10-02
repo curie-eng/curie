@@ -297,10 +297,45 @@ type (`reply_wire_version`, `progress_delivery_id`, `progress_not_an_answer`,
 `progress_not_actionable`, `progress_terminal`), so match on the type, not on
 message text.
 
-Nothing on the platform sends a 1.1 body yet. The Discord and mail adapters in
-this repository decode 1.1 through the shared package, but neither handles
-`progress`, so a card edit would reach their answer path. Progress must not be
-routed to either until it does.
+What an adapter that decodes 1.1 must do with progress:
+
+- **Branch on `progress` first**, on both events, before any answer or
+  approval handling. A progress `reply.update` carries no answer fields, so an
+  adapter that reads `text` first sees an empty answer and can blank the
+  message it edits or clear the answer it is buffering.
+- **Post idempotently.** A progress `reply.post` is a create, so key it on
+  `delivery_id`: remember the `ref` you acked for it and answer a repeat with
+  that `ref` instead of posting again. A redelivery after an ambiguous attempt
+  carries the same `delivery_id`, never a new one.
+- **Edit the card, never the answer.** A card `reply.update` names the card
+  through `target.reply_ref`, the `ref` you acked for its first post. Edit that
+  message and nothing else; it is not the placeholder and not the approval card.
+- **Keep the card after completion.** A `terminal` card is rendered closed and
+  left in the conversation. The final answer arrives separately and does not
+  replace it.
+- **Render the summary so it cannot notify anyone.** It is short, model-authored
+  task state. Send it through whatever your channel offers that does not turn
+  text into a mention or a broadcast.
+- **Stay silent if your channel cannot show progress usefully.** A channel that
+  sends one message per turn, as email does, may answer every progress body
+  2xx with no `ref` and render nothing. Silence is conforming; changing the answer
+  is not.
+
+`channel_protocol.progress.progress_text` is the channel-neutral plain-text
+rendering of a card or a milestone, for a channel with no card affordance. A
+card edit carries no `message`, so that function, not a `message.text`, is
+where an adapter gets the text for one; the adapters in this repository use it
+for posts too, so every revision of a card reads alike.
+
+The adapters in this repository handle progress this way. Slack renders the
+card and milestones as Block Kit and maps `delivery_id` to the post's
+`client_msg_id`; its rendering contract is in the
+[worker README](../../apps/worker/README.md#how-the-slack-adapter-renders-progress).
+[`adapters/discord`](../../adapters/discord/) posts and edits the plain-text
+fallback and keeps each `delivery_id` with the message it posted in its SQLite
+state. [`apps/mail-adapter`](../../apps/mail-adapter) is silent: a progress
+body never touches the reply it buffers for the turn's email. Nothing on the
+platform sends a 1.1 body yet.
 
 Answer 2xx with a JSON body. The only field read off it is `ref`, an optional
 adapter-minted handle for what you just posted; a channel with nothing editable

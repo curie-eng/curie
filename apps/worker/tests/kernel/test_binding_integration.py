@@ -74,6 +74,7 @@ class StubBinding:
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+    **_: object,
     ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
@@ -104,6 +105,7 @@ class RealBootEnvBinding(StubBinding):
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+    **_: object,
     ) -> dict[str, str]:
         resolver = BindingResolver.__new__(BindingResolver)
         resolver._config = WorkerConfig()

@@ -131,6 +131,7 @@ class _Workspace:
             env=kwargs.get("env"),
             agent_name=kwargs.get("agent_name"),
             workspace_repo=kwargs.get("repo_full_name"),
+            caller_run=kwargs.get("caller_run"),
         )
         return SimpleNamespace(handle=handle, prepared=None)
 

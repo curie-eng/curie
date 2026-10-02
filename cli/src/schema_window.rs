@@ -445,8 +445,11 @@ mod tests {
         let retained = candidate_window(&candidate.schema_min, &candidate.schema_head)
             .expect("candidate bounds are catalogued and ordered");
         assert_eq!(retained.schema_min, "0070");
-        assert_eq!(retained.schema_head, "0070");
+        assert_eq!(retained.schema_head, "0073");
         assert!(live_in_window("0070", &retained));
+        assert!(live_in_window("0071", &retained));
+        assert!(live_in_window("0072", &retained));
+        assert!(live_in_window("0073", &retained));
         assert!(!live_in_window("0069", &retained));
 
         assert_eq!(window_for("0.10.1").unwrap().schema_head, "0058");
@@ -456,6 +459,9 @@ mod tests {
         let current = window_for("0.10.3").expect("0.10.3 remains catalogued");
         assert_eq!(current.schema_min, "0063");
         assert_eq!(current.schema_head, "0063");
+        let released = window_for("0.11.0").expect("0.11.0 remains catalogued");
+        assert_eq!(released.schema_min, "0070");
+        assert_eq!(released.schema_head, "0070");
     }
 
     #[test]

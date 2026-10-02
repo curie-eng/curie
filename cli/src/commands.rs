@@ -7094,6 +7094,128 @@ pub async fn memory_add(
     })
 }
 
+/// Which guidance operation `<tier> memory <agent>` was asked for (#1461).
+#[derive(Debug, Clone)]
+pub enum MemoryGuidanceAction {
+    /// `--guidance`: read the effective guidance.
+    Show,
+    /// `--guidance-from <file>`: store this file's text as operator guidance.
+    SetFrom(std::path::PathBuf),
+    /// `--reset-guidance`: remove operator guidance.
+    Reset,
+}
+
+/// The result of [`memory_guidance`]: a dry-run plan (emitted through the
+/// memory verb's own `MemoryOutput::DryRun`), or the effective guidance.
+#[derive(Debug)]
+pub enum MemoryGuidanceResult {
+    DryRun(crate::ui::DryRunPlan),
+    Shown(MemoryGuidanceOutput),
+}
+
+/// Output of `<tier> memory <agent> --guidance|--guidance-from|--reset-guidance`:
+/// the guidance the agent gets beside its memory tools after this invocation,
+/// its source (`default` or `operator`), and whether this invocation wrote.
+#[derive(Debug)]
+pub struct MemoryGuidanceOutput {
+    pub agent: String,
+    pub text: String,
+    pub source: String,
+    pub changed: bool,
+}
+
+impl crate::ui::CliOutput for MemoryGuidanceOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "agent": self.agent,
+            "text": self.text,
+            "source": self.source,
+            "changed": self.changed,
+        })
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        let verb = if self.changed { " now" } else { "" };
+        ui.payload(&format!(
+            "{} memory guidance{verb} ({}):",
+            self.agent, self.source
+        ));
+        ui.payload(&self.text);
+    }
+}
+
+/// `<tier> memory <agent> --guidance|--guidance-from <file>|--reset-guidance`.
+///
+/// The file is read, and an empty or whitespace-only one refused, before
+/// anything else, dry run included, so a plan is never printed for a write that
+/// would be refused. The text is sent verbatim. After a write, the result is
+/// the effective guidance the API reports, so the operator sees what the agent
+/// will get rather than what was intended.
+pub async fn memory_guidance(
+    opts: AgentActionOpts,
+    action: MemoryGuidanceAction,
+) -> Result<MemoryGuidanceResult> {
+    let text = match &action {
+        MemoryGuidanceAction::SetFrom(path) => {
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                crate::exit::usage(format!(
+                    "cannot read --guidance-from {}: {e}",
+                    path.display()
+                ))
+            })?;
+            if text.trim().is_empty() {
+                return Err(crate::exit::usage(format!(
+                    "--guidance-from {} is empty. Put the guidance text in the file, \
+                     or pass --reset-guidance to go back to the platform default",
+                    path.display()
+                )));
+            }
+            Some(text)
+        }
+        _ => None,
+    };
+    if opts.dry_run {
+        let url = format!("{}/agents/<id>/memory/guidance", opts.api_url);
+        let line = match (&action, &text) {
+            (MemoryGuidanceAction::SetFrom(path), Some(text)) => format!(
+                "PUT {url}  {{\"text\": <{} bytes from {}>}}  (would resolve agent {:?} first)",
+                text.len(),
+                path.display(),
+                opts.agent
+            ),
+            (MemoryGuidanceAction::Reset, _) => format!(
+                "DELETE {url}  (would resolve agent {:?} first; the platform default applies after)",
+                opts.agent
+            ),
+            _ => format!(
+                "GET {url}  (read-only: would resolve agent {:?} first)",
+                opts.agent
+            ),
+        };
+        return Ok(MemoryGuidanceResult::DryRun(crate::ui::DryRunPlan {
+            lines: vec![line],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let (guidance, changed) = match (&action, text) {
+        (MemoryGuidanceAction::SetFrom(_), Some(text)) => {
+            (client.put_memory_guidance(&agent.id, &text).await?, true)
+        }
+        (MemoryGuidanceAction::Reset, _) => {
+            client.delete_memory_guidance(&agent.id).await?;
+            (client.get_memory_guidance(&agent.id).await?, true)
+        }
+        _ => (client.get_memory_guidance(&agent.id).await?, false),
+    };
+    Ok(MemoryGuidanceResult::Shown(MemoryGuidanceOutput {
+        agent: agent.name,
+        text: guidance.text,
+        source: guidance.source,
+        changed,
+    }))
+}
+
 /// The pending-list / resolve flags for `local approvals` (#506). Defaulted so
 /// the skill/cluster tiers, which keep only the gate view/set surface, pass an
 /// empty value.
@@ -7156,6 +7278,11 @@ static SLACK_USERGROUP_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^S[A-Z0-9]{7,}$").expect("usergroup id re"));
 static SLACK_USER_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^[UW][A-Z0-9]{7,}$").expect("user id re"));
+/// One bare email address, mirroring the API's `_EMAIL_CALLER`: no display name,
+/// list, or wildcard (ADR-0177 amendment approver emails, ADR 0175 callers).
+static BARE_EMAIL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"^[^@\s<>,;"()*]+@[^@\s<>,;"()*]+$"#).expect("bare email re")
+});
 static CHANNEL_KIND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$").expect("channel kind re")
 });
@@ -7224,6 +7351,7 @@ fn parse_route_approvers(value: &str) -> Result<crate::api::ApprovalApprovers> {
             Ok(crate::api::ApprovalApprovers {
                 group: None,
                 users: Some(users),
+                emails: None,
             })
         }
         "group" => {
@@ -7245,6 +7373,7 @@ fn parse_route_approvers(value: &str) -> Result<crate::api::ApprovalApprovers> {
             Ok(crate::api::ApprovalApprovers {
                 group: Some(group),
                 users: None,
+                emails: None,
             })
         }
         other => Err(crate::exit::usage(format!(
@@ -7370,6 +7499,25 @@ fn build_route_bindings(
         }
         if let Some(approvers) = &binding.approvers {
             validate_parsed_approvers(name, approvers)?;
+            // ADR-0177 amendment, mirroring the API: only a requesting_surface route shows
+            // its card in an email thread. On a fixed Slack target an address
+            // can never be verified, so the list could only admit nobody.
+            if approvers.emails.is_some()
+                && matches!(
+                    binding.resolution,
+                    crate::api::ApprovalResolutionWrite::Fixed(_)
+                )
+            {
+                return Err(crate::exit::CliError::usage(format!(
+                    "route {name:?}: approvers emails need a requesting_surface resolution"
+                ))
+                .with_fix(
+                    "write the route's resolution as {\"mode\": \"requesting_surface\"} in \
+                     --routes-from, or list Slack users instead: a fixed target shows its \
+                     card in Slack, where an email address cannot be verified",
+                )
+                .into());
+            }
         }
     }
 
@@ -7525,11 +7673,27 @@ fn validate_route_channel(route: &str, channel: &str) -> Result<()> {
 /// Re-run the flag-path approver checks over a `--routes-from` block, so the two
 /// input forms cannot disagree about what a valid binding is.
 fn validate_parsed_approvers(route: &str, approvers: &crate::api::ApprovalApprovers) -> Result<()> {
-    if approvers.group.is_none() && approvers.users.is_none() {
+    if approvers.group.is_none() && approvers.users.is_none() && approvers.emails.is_none() {
         return Err(crate::exit::usage(format!(
-            "route {route:?}: an approvers block must declare group or users; omit the \
-             block entirely to keep card-channel membership"
+            "route {route:?}: an approvers block must declare group, users or emails; omit \
+             the block entirely to keep card-channel membership"
         )));
+    }
+    if let Some(emails) = &approvers.emails {
+        if emails.is_empty() {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: approvers emails, when present, must contain at least \
+                 one address"
+            )));
+        }
+        for email in emails {
+            if !BARE_EMAIL.is_match(email) {
+                return Err(crate::exit::usage(format!(
+                    "route {route:?}: approvers email {email:?} is not one bare email address \
+                     (e.g. approver@example.com, with no display name or wildcard)"
+                )));
+            }
+        }
     }
     if let Some(group) = &approvers.group {
         if !SLACK_USERGROUP_ID.is_match(group) {
@@ -7924,27 +8088,39 @@ fn describe_approvers(binding: &crate::api::ApprovalRouteBindingResponse) -> Str
                 target.kind, target.address
             ),
             crate::api::ApprovalResolutionResponse::RequestingSurface(_) => {
-                "the asking channel's members in Slack, or only the person who asked on any \
-                 other channel (the default: no approvers block declared)"
+                "the asking channel's members in Slack, and nobody on any other channel \
+                 (the default: no approvers block declared)"
                     .to_string()
             }
         },
-        Some(a) => match (&a.users, &a.group) {
-            // Mirror the API's precedence in the wording rather than hiding it:
-            // `users` wins over `group`, so a binding carrying both must not read
-            // as though the group also decides.
-            (Some(users), Some(group)) => format!(
-                "users {} (an explicit list wins over group {group}; the click channel is ignored)",
-                users.join(", ")
-            ),
-            (Some(users), None) => {
-                format!("users {} (the click channel is ignored)", users.join(", "))
+        Some(a) => {
+            let slack = describe_slack_approvers(a);
+            match &a.emails {
+                Some(emails) => format!("{slack}; on email, {}", emails.join(", ")),
+                None => slack,
             }
-            (None, Some(group)) => {
-                format!("members of Slack user group {group} (the click channel is ignored)")
-            }
-            (None, None) => "unreadable: the block declares neither users nor group".to_string(),
-        },
+        }
+    }
+}
+
+/// The Slack half of an approvers block: who may answer a card shown in Slack.
+fn describe_slack_approvers(a: &crate::api::ApprovalApprovers) -> String {
+    match (&a.users, &a.group) {
+        // Mirror the API's precedence in the wording rather than hiding it:
+        // `users` wins over `group`, so a binding carrying both must not read
+        // as though the group also decides.
+        (Some(users), Some(group)) => format!(
+            "users {} (an explicit list wins over group {group}; the click channel is ignored)",
+            users.join(", ")
+        ),
+        (Some(users), None) => {
+            format!("users {} (the click channel is ignored)", users.join(", "))
+        }
+        (None, Some(group)) => {
+            format!("members of Slack user group {group} (the click channel is ignored)")
+        }
+        (None, None) if a.emails.is_some() => "nobody in Slack".to_string(),
+        (None, None) => "unreadable: the block declares neither users nor group".to_string(),
     }
 }
 
@@ -13363,6 +13539,9 @@ pub fn overrides_patch_body(
 ///   agent: the agent's name.
 ///   model: the stored model override, `None` when the platform default applies.
 ///   thinking: the stored thinking override, same convention.
+///   execution_deadline_seconds: the stored deadline override, same convention.
+///   runner_resources: the stored runner resources override, same convention.
+///   memory_writes: whether the agent's memory tools are on (#1461).
 ///   changed: whether this invocation wrote, as opposed to inspecting.
 ///
 /// Returns:
@@ -13373,6 +13552,7 @@ pub fn overrides_summary(
     thinking: &Option<String>,
     execution_deadline_seconds: &Option<u32>,
     runner_resources: &Option<serde_json::Value>,
+    memory_writes: bool,
     changed: bool,
 ) -> String {
     let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "platform default".to_string());
@@ -13386,8 +13566,9 @@ pub fn overrides_summary(
     // The verb carries its own leading space, so an inspect closes straight
     // onto the colon instead of leaving a gap where a word used to be.
     let verb = if changed { " now" } else { "" };
+    let writes = if memory_writes { "on" } else { "off" };
     format!(
-        "overrides for {agent}{verb}: model {}, thinking {}, execution deadline {deadline}, runner resources {resources}",
+        "overrides for {agent}{verb}: model {}, thinking {}, execution deadline {deadline}, runner resources {resources}, memory writes {writes}",
         show(model),
         show(thinking)
     )
@@ -13401,6 +13582,8 @@ pub fn overrides_summary(
 /// fact the API returns as JSON null: the platform default applies. `changed`
 /// distinguishes an inspect from a write, so an agent consumer can tell "this
 /// is what it is" from "this is what it now is" without diffing.
+/// `memory_writes` is the agent's NOT NULL memory-tools switch (#1461), so it
+/// is always a boolean, never null.
 #[derive(Debug)]
 pub enum OverridesOutput {
     DryRun(crate::ui::DryRunPlan),
@@ -13410,6 +13593,7 @@ pub enum OverridesOutput {
         thinking: Option<String>,
         execution_deadline_seconds: Option<u32>,
         runner_resources: Option<serde_json::Value>,
+        memory_writes: bool,
         changed: bool,
     },
 }
@@ -13424,6 +13608,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 thinking,
                 execution_deadline_seconds,
                 runner_resources,
+                memory_writes,
                 changed,
             } => serde_json::json!({
                 "agent": agent,
@@ -13431,6 +13616,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 "thinking": thinking,
                 "execution_deadline_seconds": execution_deadline_seconds,
                 "runner_resources": runner_resources,
+                "memory_writes": memory_writes,
                 "changed": changed,
             }),
         }
@@ -13445,6 +13631,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 thinking,
                 execution_deadline_seconds,
                 runner_resources,
+                memory_writes,
                 changed,
             } => {
                 ui.payload(&overrides_summary(
@@ -13453,6 +13640,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                     thinking,
                     execution_deadline_seconds,
                     runner_resources,
+                    *memory_writes,
                     *changed,
                 ));
             }
@@ -13488,8 +13676,56 @@ pub async fn overrides(
     execution_deadline: OverrideChange,
     runner_resources: OverrideChange,
 ) -> Result<OverridesOutput> {
+    overrides_with_memory_writes(
+        opts,
+        model,
+        thinking,
+        execution_deadline,
+        runner_resources,
+        None,
+    )
+    .await
+}
+
+/// The `--memory-writes on|off` value as the boolean the API stores, or `None`
+/// when the flag was not passed. Clap has already refused any other value.
+pub fn memory_writes_flag(value: Option<&str>) -> Option<bool> {
+    value.map(|v| v == "on")
+}
+
+/// [`overrides`] plus the `memory_writes` switch (#1461).
+///
+/// `memory_writes` is a NOT NULL boolean rather than a nullable override, so it
+/// has no clear: `Some(b)` sends a JSON boolean under its own key, `None`
+/// leaves the key out of the body. The result reports the switch as the API
+/// stored it, like every other field.
+///
+/// Args:
+///   opts: api url/key, the agent name or id, and the dry-run flag.
+///   model: the intent for the model override.
+///   thinking: the intent for the thinking override.
+///   execution_deadline: the intent for the execution deadline.
+///   runner_resources: the intent for the runner resources override.
+///   memory_writes: the new memory-writes switch, if one was asked for.
+///
+/// Returns:
+///   The stored overrides, or the dry-run plan.
+pub async fn overrides_with_memory_writes(
+    opts: AgentActionOpts,
+    model: OverrideChange,
+    thinking: OverrideChange,
+    execution_deadline: OverrideChange,
+    runner_resources: OverrideChange,
+    memory_writes: Option<bool>,
+) -> Result<OverridesOutput> {
     let ui = crate::ui::ui();
-    let body = overrides_patch_body(&model, &thinking, &execution_deadline, &runner_resources);
+    let mut body = overrides_patch_body(&model, &thinking, &execution_deadline, &runner_resources);
+    if let Some(on) = memory_writes {
+        let map = body.get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if let Some(obj) = map.as_object_mut() {
+            obj.insert("memory_writes".to_string(), serde_json::Value::Bool(on));
+        }
+    }
     if opts.dry_run {
         let plan = match &body {
             Some(b) => format!(
@@ -13516,6 +13752,7 @@ pub async fn overrides(
             thinking: agent.thinking,
             execution_deadline_seconds: agent.execution_deadline_seconds,
             runner_resources: agent.runner_resources,
+            memory_writes: agent.memory_writes,
             changed: false,
         });
     };
@@ -13537,6 +13774,7 @@ pub async fn overrides(
         thinking: saved.thinking,
         execution_deadline_seconds: saved.execution_deadline_seconds,
         runner_resources: saved.runner_resources,
+        memory_writes: saved.memory_writes,
         changed: true,
     })
 }
@@ -13806,11 +14044,18 @@ mod overrides_tests {
     // verb was interpolated as an empty string before the colon.
     #[test]
     fn the_inspect_summary_has_no_gap_where_the_verb_would_be() {
-        let line =
-            super::overrides_summary("a", &Some("kimi-k2".into()), &None, &None, &None, false);
+        let line = super::overrides_summary(
+            "a",
+            &Some("kimi-k2".into()),
+            &None,
+            &None,
+            &None,
+            false,
+            false,
+        );
         assert_eq!(
             line,
-            "overrides for a: model kimi-k2, thinking platform default, execution deadline platform default, runner resources platform default"
+            "overrides for a: model kimi-k2, thinking platform default, execution deadline platform default, runner resources platform default, memory writes off"
         );
         assert!(!line.contains("  "), "no double space anywhere: {line}");
     }
@@ -13818,8 +14063,16 @@ mod overrides_tests {
     #[test]
     fn a_write_summary_says_now_and_names_a_cleared_field_as_the_default() {
         assert_eq!(
-            super::overrides_summary("a", &None, &Some("adaptive".into()), &Some(90), &None, true),
-            "overrides for a now: model platform default, thinking adaptive, execution deadline 90 s, runner resources platform default"
+            super::overrides_summary(
+                "a",
+                &None,
+                &Some("adaptive".into()),
+                &Some(90),
+                &None,
+                true,
+                true
+            ),
+            "overrides for a now: model platform default, thinking adaptive, execution deadline 90 s, runner resources platform default, memory writes on"
         );
     }
 

@@ -127,6 +127,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # WorkerConfig and consumed where the kernel assembles the final reply.
         # It decides what the person is shown, never what a sandbox boots with.
         "CURIE_TURN_RECEIPT",
+        # The temporary deliberate progress rendering switch (ADR 0130), read
+        # from the WORKER's env by WorkerConfig and consumed by the kernel's
+        # progress pump. It decides whether progress reaches an adapter, never
+        # what a sandbox boots with.
+        "CURIE_PROGRESS_RENDER",
         # The per-adapter EGRESS credentials (ADR-0096 D4.2), read from the
         # WORKER's env by ``build_reply_sink`` and presented to a channel
         # adapter as ``X-Curie-Adapter-Secret``. Never a sandbox boot key, and
@@ -146,6 +151,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_WORKER_SUPERVISE_BACKOFF_MAX_S",
         "CURIE_WORKER_SUPERVISE_MAX_CONSECUTIVE_FAILURES",
         "CURIE_WORKER_SUPERVISE_FAILURE_RESET_S",
+        # How many turns one worker runs at once (#760), read from the WORKER's
+        # env by WorkerConfig and consumed by the consumer's in-flight bound.
+        # It sizes the worker's own concurrency; nothing about it reaches a
+        # sandbox.
+        "CURIE_WORKER_MAX_CONCURRENCY",
         # Managed-workspace operator settings, read from the WORKER's env by
         # WorkerConfig and consumed by WorkspacePreparer, WorkspaceObjectStore,
         # and the internal credential client. They govern worker-side clone,
@@ -276,6 +286,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_HOOK_CLAIM_LEASE_S",
         # WorkItem orphan sweep cadence (#3076), read by the worker process only.
         "CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S",
+        # Settled stream retention window and cadence (ADR 0184), read by the
+        # worker process only.
+        "CURIE_STREAM_RETENTION_MIN_AGE_S",
+        "CURIE_STREAM_RETENTION_INTERVAL_S",
         "CURIE_CONNECTOR_APP_NAME",
         "CURIE_RUNNER_IMAGE",
         "CURIE_SANDBOX_SUBSTRATE",
@@ -343,6 +357,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # runner-local false-completion knob; read by the runner from its own env,
         # not a boot contract key.
         "CURIE_FALSE_COMPLETION_CHECK",
+        # ADR 0130 deliberately keeps ACI frozen. This direct worker-to-runner
+        # sandbox boot fact is instead frozen across both declaration sites by
+        # tests/vectors/turn-progress-capability.json.
+        "CURIE_TURN_PROGRESS_ENABLED",
         # One-shot connector grant. The worker writes it beside BootEnv on an
         # approved resume. The runner (connectors.py) reads it and adds the
         # header only when it is set. It is not a BootEnv field: the caller

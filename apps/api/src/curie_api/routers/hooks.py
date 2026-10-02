@@ -288,7 +288,8 @@ def _mint_turn(
     event_id: str,
     body: bytes,
     *,
-    partition: str | None,
+    conversation_id: str,
+    placeholder: str | None,
     outcome: MappingOutcome | None = None,
     tool_access: ToolAccess | None = None,
 ) -> QueuedTurn:
@@ -298,19 +299,17 @@ def _mint_turn(
     request: an upstream that could name its own endpoint would be pointing the
     platform's authenticated egress wherever it liked.
 
-    ``placeholder`` is None because nothing was preposted -- this is precisely the
-    placeholder-less turn ADR-0079's kernel path exists for, so the first reply
-    delivery creates its own message.
+    The caller may supply an existing conversation and a placeholder it already
+    posted there. Otherwise the route supplies ADR-0079's synthetic hook
+    conversation and no placeholder, so the first reply creates its own message.
 
     Args:
         agent: The agent, with its channel binding loaded.
         hook: The validated hook name.
         event_id: This delivery's deterministic event id.
         body: The raw request body.
-        partition: The derived partition value, or None when this hook is
-            unpartitioned. It reaches the conversation id and nothing else: the
-            author stays the hook, since the partition names the thing the
-            delivery is about rather than who sent it.
+        conversation_id: The exact conversation this turn joins.
+        placeholder: The exact preposted reply the worker edits, if any.
 
     Returns:
         The queued turn.
@@ -318,7 +317,7 @@ def _mint_turn(
 
     return QueuedTurn(
         event_id=event_id,
-        conversation_id=hook_conversation_id(agent.id, hook, partition),
+        conversation_id=conversation_id,
         # The author is the platform, not a person: no human sent this, and
         # putting an upstream-supplied identity here would let a hook impersonate
         # one to anything downstream that reads the field.
@@ -329,7 +328,7 @@ def _mint_turn(
         reply_handle=ReplyHandle(
             kind=binding.kind,
             channel=binding.address,
-            placeholder=None,
+            placeholder=placeholder,
             endpoint=binding.endpoint,
             adapter=binding.adapter,
         ),
@@ -347,6 +346,8 @@ async def ingest_hook(
     kind: str | None = None,
     address: str | None = None,
     adapter: str | None = None,
+    conversation_id: str | None = None,
+    placeholder: str | None = None,
     tool_access: ToolAccess | None = None,
     x_curie_signature_256: Annotated[str | None, Header()] = None,
     x_curie_delivery_id: Annotated[str | None, Header()] = None,
@@ -377,9 +378,11 @@ async def ingest_hook(
        empty string, so an absent id is only reported to a caller who could sign;
     5. the delivery id, checked after authentication so an unsigned caller learns
        nothing about what this route wants;
-    6. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),
+    6. the optional explicit reply TARGET, after authentication so malformed
+       coordinates reveal nothing to an unsigned caller;
+    7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),
        after both of those and before anything is claimed;
-    7. routability, then the claim, quota and enqueue.
+    8. routability, then the claim, quota and enqueue.
     """
 
     if not HOOK_NAME.fullmatch(hook):
@@ -417,6 +420,13 @@ async def ingest_hook(
             f"{hook_signing.DELIVERY_HEADER} is required: this ingress is at-least-once, so a "
             "stable upstream id is what keeps a retried delivery from running the "
             "agent twice",
+        )
+
+    target_supplied = conversation_id is not None or placeholder is not None
+    if target_supplied and (not conversation_id or not placeholder):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "an explicit hook reply target requires both conversation_id and placeholder",
         )
 
     # Derived here and nowhere else in the order. After the signature and the
@@ -500,7 +510,7 @@ async def ingest_hook(
             )
         binding = matches[0]
 
-    thread_id = hook_conversation_id(agent.id, hook, partition)
+    thread_id = conversation_id or hook_conversation_id(agent.id, hook, partition)
     if mapping.selects_workspace and mapping.repository is not None:
         existing = await crud.get_thread_workspace(
             session, agent_id=agent.id, conversation_id=thread_id
@@ -582,7 +592,8 @@ async def ingest_hook(
                     hook,
                     event_id,
                     raw,
-                    partition=partition,
+                    conversation_id=thread_id,
+                    placeholder=placeholder,
                     outcome=mapping,
                     tool_access=tool_access,
                 )

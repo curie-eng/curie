@@ -788,6 +788,103 @@ serverFiles:
                 A connector has no available replica, or has been scaled to
                 zero. Its agent still answers, and tells the person it cannot
                 reach the systems it reads from.
+          - alert: SreSlackEmailIntakeNotReady
+            # @spec SRE-EMAIL-3. The code ConfigMap is the durable opt-in
+            # marker: default SRE installs stay quiet, while deleting only the
+            # Deployment pages for as long as the install remains opted in.
+            # The historical term bridges a missing marker scrape for up to
+            # the shipped seven-day retention.
+            expr: |
+              sre_slack_email_intake_ready == 0
+              or
+              kube_deployment_status_replicas_unavailable{
+                deployment="sre-slack-email-intake"
+              } > 0
+              or
+              kube_deployment_spec_replicas{
+                deployment="sre-slack-email-intake"
+              } == 0
+              or
+              (
+                kube_deployment_spec_replicas{
+                  deployment="sre-slack-email-intake"
+                } > 0
+                unless on (namespace)
+                max by (namespace) (
+                  up{
+                    job="kubernetes-pods",
+                    pod=~"sre-slack-email-intake-.*"
+                  }
+                )
+              )
+              or
+              (
+                kube_configmap_info{
+                  configmap="sre-slack-email-intake-code"
+                }
+                unless on (namespace)
+                kube_deployment_spec_replicas{
+                  deployment="sre-slack-email-intake"
+                }
+              )
+              or
+              (
+                max_over_time(
+                  kube_deployment_spec_replicas{
+                    deployment="sre-slack-email-intake"
+                  }[7d]
+                ) > 0
+                unless
+                kube_deployment_spec_replicas{
+                  deployment="sre-slack-email-intake"
+                }
+              )
+            for: 2m
+            labels:
+              severity: page
+              component: sre-slack-email-intake
+            annotations:
+              summary: Slack Email alert intake is not ready
+              description: >-
+                The opt-in Slack Email intake has not completed a scan within
+                two poll intervals, has no ready replica or Prometheus scrape,
+                was scaled to zero, or disappeared after previously being
+                deployed. Alert emails may not be starting SRE turns in their
+                source threads.
+          - alert: SreSlackEmailIntakeRestarted
+            # @spec SRE-EMAIL-3. One restart is enough: all scan and dispatch
+            # failures are fatal by design. The second arm sees the first
+            # sample of a newly exported container counter.
+            expr: |
+              increase(
+                kube_pod_container_status_restarts_total{
+                  container="intake",
+                  pod=~"sre-slack-email-intake-.*"
+                }[15m]
+              ) > 0
+              or
+              (
+                kube_pod_container_status_restarts_total{
+                  container="intake",
+                  pod=~"sre-slack-email-intake-.*"
+                }
+                unless
+                last_over_time(
+                  kube_pod_container_status_restarts_total{
+                    container="intake",
+                    pod=~"sre-slack-email-intake-.*"
+                  }[1h] offset 15m
+                )
+              ) > 0
+            for: 2m
+            labels:
+              severity: page
+              component: sre-slack-email-intake
+            annotations:
+              summary: Slack Email alert intake restarted
+              description: >-
+                The intake process restarted after a configuration, Slack,
+                file-download, hook, routing, or stale-placeholder failure.
           - alert: CurieConnectorToolErrors
             # A connector that is serving but answers its tool calls with
             # errors is invisible to CurieConnectorNotReady: every turn still

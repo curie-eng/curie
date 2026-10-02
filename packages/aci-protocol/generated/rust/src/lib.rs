@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.11";
+pub const PROTOCOL_VERSION: &str = "0.5.14";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -171,6 +171,10 @@ pub struct BootEnv {
     #[serde(default)]
     pub memory_token: Option<String>,
     #[serde(default)]
+    pub channel_memory_ref: Option<String>,
+    #[serde(default)]
+    pub memory_writes: Option<bool>,
+    #[serde(default)]
     pub state_url: Option<String>,
     #[serde(default)]
     pub state_token: Option<String>,
@@ -224,6 +228,8 @@ pub struct BootEnv {
     pub history_max_turns: Option<i64>,
     #[serde(default)]
     pub history_max_bytes: Option<i64>,
+    #[serde(default)]
+    pub memory_max_facts: Option<i64>,
 }
 
 /// Boot-env variable names, generated from aci_protocol.session.BootEnv.
@@ -240,6 +246,7 @@ pub mod env_keys {
     pub const CURIE_BUNDLE_REF: &str = "CURIE_BUNDLE_REF";
     pub const CURIE_BUNDLE_VERSION: &str = "CURIE_BUNDLE_VERSION";
     pub const CURIE_CHANNEL_BOUND: &str = "CURIE_CHANNEL_BOUND";
+    pub const CURIE_CHANNEL_MEMORY_REF: &str = "CURIE_CHANNEL_MEMORY_REF";
     pub const CURIE_CONNECTOR_AGENT: &str = "CURIE_CONNECTOR_AGENT";
     pub const CURIE_CONNECTOR_CALLER_TOKEN: &str = "CURIE_CONNECTOR_CALLER_TOKEN";
     pub const CURIE_CONNECTOR_NAMESPACE: &str = "CURIE_CONNECTOR_NAMESPACE";
@@ -255,8 +262,10 @@ pub mod env_keys {
     pub const CURIE_ISSUE_READ_TOKEN: &str = "CURIE_ISSUE_READ_TOKEN";
     pub const CURIE_ISSUE_READ_URL: &str = "CURIE_ISSUE_READ_URL";
     pub const CURIE_MAX_TURNS: &str = "CURIE_MAX_TURNS";
+    pub const CURIE_MEMORY_MAX_FACTS: &str = "CURIE_MEMORY_MAX_FACTS";
     pub const CURIE_MEMORY_REF: &str = "CURIE_MEMORY_REF";
     pub const CURIE_MEMORY_TOKEN: &str = "CURIE_MEMORY_TOKEN";
+    pub const CURIE_MEMORY_WRITES: &str = "CURIE_MEMORY_WRITES";
     pub const CURIE_MODEL: &str = "CURIE_MODEL";
     pub const CURIE_MODEL_API_BACKEND: &str = "CURIE_MODEL_API_BACKEND";
     pub const CURIE_MODEL_ENV_KEY: &str = "CURIE_MODEL_ENV_KEY";
@@ -417,6 +426,8 @@ pub enum InboundMessage {
         publication_context: Option<PublicationContext>,
         #[serde(default)]
         tool_access: Option<ToolAccess>,
+        #[serde(default)]
+        memory_token: Option<String>,
     },
     #[serde(rename = "interrupt")]
     Interrupt {
@@ -550,6 +561,7 @@ mod tests {
             publication_context: None,
             // TOOL-ACCESS-1: the enum's wire spelling round-trips too.
             tool_access: Some(ToolAccess::ReadOnly),
+            memory_token: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
         assert!(encoded.contains(r#""tool_access":"read-only""#));
@@ -592,13 +604,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.12","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.15","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.11","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.14","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

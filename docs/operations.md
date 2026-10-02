@@ -885,13 +885,27 @@ built artifact without rebuilding.
 
 ### Admitting a labelled GitHub issue
 
-Factory intake uses the same signed `POST /github/webhook` endpoint and is off
-until `api.githubFactoryIngressEnabled` is true (environment
-`GITHUB_FACTORY_INGRESS_ENABLED=true`). The API refuses to start with that gate
-on unless the GitHub App id and private key are set, the webhook secret is not
-the development default, `api.githubFactoryLabel` (`GITHUB_FACTORY_LABEL`) is a
-single label name, `api.githubFactoryMention` (`GITHUB_FACTORY_MENTION`) is one
-GitHub login, and `api.githubRepoAllowlist` is non-empty.
+Factory intake polls GitHub by default. It is off until
+`api.githubFactoryIngressEnabled` is true (environment
+`GITHUB_FACTORY_INGRESS_ENABLED=true`). `api.githubFactoryIntake`
+(`GITHUB_FACTORY_INTAKE`) is `poll` or `webhook`, and `poll` is the default.
+Poll mode accepts a blank webhook secret, which disables signed deliveries.
+A configured secret permits signed deliveries in either intake mode. The
+published development secret is refused whenever factory intake is enabled.
+The API still refuses to start with the gate on unless the GitHub App id and
+private key are set,
+`api.githubFactoryLabel` (`GITHUB_FACTORY_LABEL`) is a single label name,
+`api.githubFactoryMention` (`GITHUB_FACTORY_MENTION`) is one GitHub login, and
+`api.githubRepoAllowlist` is nonempty. Webhook mode keeps the signed
+`POST /github/webhook` path and requires a configured secret that is not blank
+or the development default.
+
+Sealed chart installs generate and retain a real webhook secret unless one is
+explicitly configured. Development chart overlays can set
+`api.githubWebhookSecret` to blank for polling or supply a real secret. The
+development Compose stack substitutes the published development secret when
+`GITHUB_WEBHOOK_SECRET` is unset or blank, so enabling polling there requires
+a real `GITHUB_WEBHOOK_SECRET`.
 
 `curie cluster factory` sets these values for you (see the dark-factory
 example README). It checks the merged config against this boot gate before
@@ -907,19 +921,23 @@ waiting work and requests termination of a running execution. Cancellation
 stays requested until the runtime reports that it stopped. An already linked
 pull request stays linked, and later publication is refused.
 
-GitHub does not retry a label delivery that failed, for example while the API
-was unreachable. The work item reconciler covers that gap: every
-`GITHUB_FACTORY_RECONCILE_INTERVAL_S` (default 300, 0 disables) it lists the
-open issues carrying the factory label on each bound repository and admits any
-that has no work item, once the label is older than
+Polling reads each bound repository every `GITHUB_FACTORY_POLL_INTERVAL_S`
+(default 45 seconds). It admits an open labeled issue with no grace delay,
+admits a mention and review feedback on a factory pull request, and cancels a
+work item whose issue was closed or unlabeled. Those reads do not record a
+webhook delivery. The webhook is optional. In webhook mode the missed-label
+backstop stays: every `GITHUB_FACTORY_RECONCILE_INTERVAL_S` (default 300, 0
+disables) the reconciler lists the open issues carrying the factory label and
+admits any that has no work item, once the label is older than
 `GITHUB_FACTORY_RECONCILE_GRACE_S` (default 300). It applies the same checks as
 a delivery, including the labeling user's current write permission, and it
 never admits an issue that already has a work item, so it does not duplicate a
-delivery that arrived. A manual redelivery of the lost label after the
-reconciler admitted the issue counts as a relabel and starts a second run.
+delivery that arrived. A manual redelivery of the lost label after that
+backstop admitted the issue counts as a relabel and starts a second run.
 
-Subscribe the App webhook to **Issues** and **Issue comments** in addition to
-the review subscriptions when both gates are on. Give the App **Issues: Read and write**
+When intake is webhook, subscribe the App webhook to **Issues** and **Issue
+comments** in addition to the review subscriptions when both gates are on. Give
+the App **Issues: Read and write**
 so Curie can re-read the issue, keep its one status comment, and set the
 `curie-factory:*` state labels. **Metadata: Read** is already implied by repository
 installation discovery.
@@ -967,6 +985,28 @@ api:
       check: "Python (ruff + mypy + pytest)"
       paths: [apps, runner, cli, adapters, packages, examples/tests, tools, release]
       pendingCheckPrefix: "Python pytest (shard "
+```
+
+The branch a factory ticket starts from and targets is set per repository with
+`api.githubFactoryBases` (API env `GITHUB_FACTORY_BASES`, a JSON object, default
+`{}`, checked at boot). Each key is an `owner/name`, matched case-insensitively;
+each value is `{"bases": [...], "default_base": "..."}`. `bases` is a non-empty
+list of unique allowed branches. `default_base` must be one of them and defaults
+to the repository default branch. A repository without an entry may only use its
+default branch. A ticket picks a base with a `base:<branch>` issue label; with no
+label it uses the default. Two `base:` labels, a base outside `bases`, or a base
+that does not exist are refused with an issue comment, and no other branch is
+substituted. The base is frozen when the work item is created: a later label
+change is ignored. The status comment shows it on a `Base:` line, for example
+``Base: `next` (from label `base:next`)``, or `(deployment default)` when no label
+chose it.
+
+```yaml
+api:
+  githubFactoryBases:
+    curie-eng/curie:
+      bases: [main, next]
+      default_base: next
 ```
 
 When a publication request is refused, the issue's `Could not complete:`
@@ -1147,7 +1187,7 @@ first line of the channel reply, `curie-turn-failure: <class>`, so a consumer
 that sees only the delivered text can tell the turn from a successful reply.
 Other escalations use that same first line with their own token
 (`delivery-deadline`, `prior-side-effect`, `approval-route-unbound`,
-`approval-approvers-unverifiable`, `approval-backend-missing`,
+`approval-approvers-unverifiable`, `approval-no-email-approvers`, `approval-backend-missing`,
 `publication-unavailable`, or `approval-create-failed`). A failed run whose cause is `runner_escalated`,
 `sandbox_terminated`, `unclassified`, `max_turns`, or `ci_failed` still shows as needing a person.
 A history capacity result tells the
@@ -1544,6 +1584,124 @@ never retried automatically. It reaches the worker as `CURIE_TURN_RECEIPT`, so
 changing it rolls the workers. The chart refuses any other value at render,
 and the worker refuses one at startup.
 
+### Deliberate progress from a running turn
+
+A long task can report short progress while it runs
+([ADR-0130](adr/0130-deliberate-progress-is-bounded-durable-channel-state.md)).
+Nothing renders it yet: the platform records it and shows nobody, so turning
+it on later changes what people see, not what is stored.
+
+The path, and what an operator can check on each hop:
+
+1. **The capability.** For a person's Slack turn (and the approval resume of
+   one) the worker boots the sandbox with `CURIE_TURN_PROGRESS_ENABLED=1`, then
+   allocates a durable generation and marks it active with a five-second lease
+   on Valkey's server clock. A startup keeper renews it while the worker waits
+   for runner admission and response headers, then hands renewal to the live
+   pump when stream consumption begins. Both renew only that active, unexpired
+   generation; a missed lease cannot be revived. It mints a
+   sandbox token with scope `turn.progress`, bound to
+   `progress_id:generation`. It sends token, URL, and generation to the runner.
+   Jobs, cron and targetless hook turns, factory executions and
+   `curie cluster message` relay turns get neither the boot flag nor the
+   model-visible tool/prompt. The route record persists whether the sandbox
+   booted with the flag, and sandbox reuse compares both directions, so
+   eligibility cannot be inherited from an earlier occupant.
+   A failure between runner response headers and stream consumption stops the
+   startup keeper and closes the generation; worker cancellation still
+   propagates to the delivery owner after that close attempt finishes.
+2. **The ingress.** The runner's `progress` tool POSTs each update to the API
+   at `POST /v1/turn-progress/{progress_id}`, with the token in `X-API-Key`.
+   The API accepts only a `turn.progress` token whose subject matches the path
+   and body generation, and whose generation is still active and unexpired. It rejects a
+   channel adapter's sibling `chn` token before validating the command body;
+   the platform key, another chain's token, an expired token, and a token from
+   a closed, superseded, or deadline-expired turn are also refused 401. A body
+   that is not a `ProgressCommand` plus
+   the worker-issued `generation` and runner-issued `seq` is refused 422. Each
+   token may send one update a second, with a burst of five; past that the API
+   answers 429. An accepted update is atomically appended and indexed for the
+   worker, then answered 202 (queued, not yet semantically applied).
+3. **The record.** While the turn runs, its pump applies each inbox entry to
+   the chain's durable record, which keeps its state, revision and milestone
+   reservations. A maintenance drainer owns the same durable pending-inbox
+   index, so one failed final read or a worker restart cannot orphan a 202.
+
+The fake model is network-free, including when progress headers are present.
+Use a live model or the API/worker integration fixture to exercise the ingress;
+`[fake:progress-demo]` is only a deterministic long turn for steering tests.
+
+With an integration turn, inspect the durable result with:
+
+```bash
+# the record the integration turn wrote (one per chain)
+valkey-cli -p 26379 -a valkeypass --scan --pattern 'curie:worker:progress:*'
+valkey-cli -p 26379 -a valkeypass HGETALL curie:worker:progress:<progress_id>
+```
+
+The record shows `state testing`, `revision 3` and `milestones_used 2`, and the
+Slack stub receives nothing from progress. The worker switch that will turn
+rendering on is `CURIE_PROGRESS_RENDER`; it is off, the chart does not expose
+it, and this release's worker refuses to start with it on.
+
+### Letting the agent remember facts
+
+An agent's memory tools (`remember`, `update` and `forget`, ADR-0167) are off
+by default. Turn them on per agent:
+
+```bash
+curie cluster overrides <agent> --memory-writes on
+```
+
+The setting takes effect at the agent's next sandbox boot. With it on, the
+agent keeps channel memory for each channel it works in, alongside its agent
+memory. It is also shown guidance on what to save. To read that guidance,
+replace it with a file's text, or go back to the platform default:
+
+```bash
+curie cluster memory <agent> --guidance
+curie cluster memory <agent> --guidance-from guidance.md
+curie cluster memory <agent> --reset-guidance
+```
+
+A new thread picks up changed guidance. A live thread keeps what it booted
+with. `--memory-writes off` unmounts the tools and drops the guidance at the
+next boot. It stops saving only: facts already saved, in agent memory and in
+each channel's memory, are still shown to the agent. Instead of the guidance, the
+agent is told that saving is off, so it doesn't claim to have remembered
+anything.
+
+Each memory, the agent memory and each channel's memory, holds at most 200
+facts by default. Every fact is loaded into the agent's prompt at boot, newest
+first. When a memory is full, `remember` is refused and the agent is told to
+update or forget a fact to make room; nothing is dropped silently. To change the
+limit, set `CURIE_MEMORY_MAX_FACTS` on the runner through the chart's
+`agentSandbox.runner.extraEnv` (or `docker run -e` for a local runner):
+
+```yaml
+agentSandbox:
+  runner:
+    extraEnv:
+      - name: CURIE_MEMORY_MAX_FACTS
+        value: "400"
+```
+
+The same number caps saving and loading, so a saved fact is always shown, and
+it applies to both kinds of memory. It takes effect at the next sandbox boot. A
+value that is not a positive integer is ignored and the default applies.
+Raising it costs prompt tokens: every fact is in the prompt on every turn.
+Lowering it below what a memory already holds hides the oldest facts from the
+prompt (boot says how many it left out) and refuses new saves until facts are
+forgotten. Whatever the limit, the state API still caps each memory at 1 MiB
+(`STATE_MAX_NAMESPACE_BYTES` on the API), and a save past that is refused too.
+
+Upgrade runners with or before workers across this change. An older runner
+doesn't understand `CURIE_MEMORY_WRITES`, so behind a newer worker it would
+mount the memory tools even for an agent with writes off. One `helm upgrade`
+moves both together. Don't pin the runner image (`agentSandbox.runner.digest`
+or a per-agent `agentSandbox.runnerImages` layer) separately from the worker
+while you roll this out.
+
 ### Connecting Slack
 
 ```bash
@@ -1806,6 +1964,42 @@ different channel, see [Building a channel adapter](guides/building-a-channel-ad
 A chart upgrade is a **full** upgrade: anything the new chart does not render is
 deleted. For a Deployment that means a restart. For a StatefulSet it means the
 data too.
+
+### Agent memory (0.12.0)
+
+0.12.0 adds agent and channel memory, with writes off by default (see
+[Letting the agent remember facts](#letting-the-agent-remember-facts)). The
+state API holds each sandbox to its own channel's memory
+([ADR-0188](adr/0188-the-sandbox-memory-credential-is-scoped-to-its-own-channel.md)):
+code running in the sandbox, such as a Bash command or a hook, cannot read or
+write another channel's memory and cannot write the memory guidance. A fact's
+author is the sender of the turn the write happened in, while that turn's
+credential is held: code that copies the credential during a turn can write as
+that turn's sender until the turn ends. Then the worker reports the turn ended
+and the API refuses writes with its credential (403, "this conversation's turn
+has ended"), even though it has not expired
+([#3776](https://github.com/curie-eng/curie/issues/3776)). Reads still work. The
+worker sends that report in the background, so a slow API never delays a reply.
+The report is best effort, and expiry is the backstop: if the worker crashes or
+is killed before it reports, the report fails or times out, the API predates
+this, or a steered message hands its credential over after the live turn's
+owner has already reported, the credential is still refused at its expiry,
+which is the turn's stream deadline (its time limit). A message steered into a live turn gets a
+credential for its own sender, which expires no later than the live turn's time
+limit when the same worker opened that turn, and at the message's own time
+limit otherwise. With writes off, the sandbox cannot write memory at all.
+
+Upgrade the worker with or before the API. A sandbox booted by an older worker
+holds a credential without the new claims; the API treats it as read-only on
+agent memory and refuses it on channel memory, logging a warning, until that
+sandbox is replaced (at most 24 hours).
+
+Conversation transcripts are held the same way
+([#3767](https://github.com/curie-eng/curie/issues/3767)): code in the sandbox
+can read and write only its own channel's threads. A sandbox booted by an older
+worker keeps its old transcript reach until it is replaced, so its history is
+not cut off at the upgrade; each such request logs a "legacy sandbox token"
+warning and counts on `curie.state.legacy_token`.
 
 ### Bundles that carry their own stdio MCP servers (0.11.0)
 

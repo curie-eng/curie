@@ -46,6 +46,12 @@ _DESCRIPTION = (
 )
 
 
+def factory_progress_requested(env: Mapping[str, str]) -> bool:
+    """Whether boot carries any factory-progress signal, even an incomplete one."""
+
+    return bool(env.get(PROGRESS_URL_ENV) or env.get(PROGRESS_TOKEN_ENV))
+
+
 def _validate(raw: object) -> dict[str, Any]:
     if not isinstance(raw, dict) or set(raw) - {"phases", "loops", "stages", "reviewer_model"}:
         raise ValueError("phases.json must be an object with phases and optional layout")

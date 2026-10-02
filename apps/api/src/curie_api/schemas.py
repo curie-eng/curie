@@ -683,8 +683,12 @@ class ApprovalApprovers(_StoredWithoutNulls):
 
     Declaring an approvers block is what lets a request sit in a broad channel
     where everyone can see it while only a narrow set may act on it. Omitting it
-    keeps the zero-setup default: the resolution-card channel's members are the
-    approvers. Notification recipients never enter this policy.
+    keeps the zero-setup default in Slack: the resolution-card channel's members
+    are the approvers. Notification recipients never enter this policy.
+
+    ``group`` and ``users`` are Slack's entries; ``emails`` is email's (ADR-0177 amendment).
+    Each surface reads only its own: a Slack card never reads ``emails``, and an
+    email card never reads ``users`` or ``group``.
     """
 
     # A typo in an optional key must not be ignored: silently dropping it would
@@ -700,6 +704,12 @@ class ApprovalApprovers(_StoredWithoutNulls):
     # (issue #420 settles the precedence rather than refusing the combination),
     # and needs no Slack lookup at all.
     users: list[str] | None = None
+    # An explicit list of approver email addresses (ADR-0177 amendment), read only for a
+    # card shown in an email thread. Separate from the binding's
+    # ``allowed_callers``: being allowed to talk to a bot is not being allowed to
+    # approve what it does. Stored lowercase, the form the mail adapter reports a
+    # verified sender in.
+    emails: list[str] | None = None
 
     @field_validator("group")
     @classmethod
@@ -734,14 +744,48 @@ class ApprovalApprovers(_StoredWithoutNulls):
                 )
         return value
 
+    @field_validator("emails")
+    @classmethod
+    def _check_emails(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        if not value:
+            # The same footgun as an empty ``users``: silent config for "nobody",
+            # so every email approval on the route could only ever expire.
+            raise ValueError("approvers emails, when present, must contain at least one address")
+        stored: list[str] = []
+        for address in value:
+            if len(address) > _CALLER_MAX_CHARS or not _EMAIL_CALLER.match(address):
+                raise ValueError(
+                    f"approvers email {address[:_CALLER_MAX_CHARS]!r} is not one bare "
+                    "email address: list exact addresses like approver@example.com, "
+                    "with no display name, no angle brackets and no domain-only or "
+                    "wildcard entries."
+                )
+            normalized = normalize_caller_id(EMAIL_KIND, address)
+            if normalized not in stored:
+                stored.append(normalized)
+        if len(stored) > MAX_ALLOWED_CALLERS:
+            raise ValueError(
+                f"approvers emails holds {len(stored)} distinct addresses; the limit "
+                f"is {MAX_ALLOWED_CALLERS} per route."
+            )
+        return stored
+
     @model_validator(mode="after")
     def _check_not_empty(self) -> "ApprovalApprovers":
-        if self.group is None and self.users is None:
+        if self.group is None and self.users is None and self.emails is None:
             raise ValueError(
-                "approvers must declare at least one of group or users; omit "
-                "the approvers block entirely to keep channel membership"
+                "approvers must declare at least one of group, users or emails; "
+                "omit the approvers block entirely to keep channel membership"
             )
         return self
+
+    @property
+    def slack_declared(self) -> bool:
+        """Whether this block names any Slack approver (``users`` or ``group``)."""
+
+        return self.users is not None or self.group is not None
 
 
 class HookPartitionConfig(BaseModel):
@@ -1218,7 +1262,8 @@ class ApprovalRequestingSurfaceTarget(BaseModel):
     channel, the card goes where the request was asked, exactly as a routeless
     approval's card already does. Who may answer then follows the channel the
     card lands on: Slack keeps its approver sets, and any other channel admits
-    the requester alone (``approvers.RequesterOnly``).
+    only an address on the route's approver ``emails`` (``approvers.EmailApprovers``,
+    ADR-0177 amendment).
 
     Strict on purpose. ``mode`` is the whole object: a stray ``kind`` or
     ``address`` beside it is a mix of the two forms, which the ADR refuses
@@ -1276,6 +1321,23 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
     approvers: ApprovalApprovers | None = None
 
     @model_validator(mode="after")
+    def _emails_need_the_requesting_surface(self) -> "ApprovalRouteBinding":
+        # ADR-0177 amendment A1: only a requesting_surface route shows its card in
+        # an email thread. A fixed target is a Slack channel, where an address
+        # can never be verified, so an email list there could only admit nobody.
+        if (
+            self.approvers is not None
+            and self.approvers.emails is not None
+            and not isinstance(self.resolution, ApprovalRequestingSurfaceTarget)
+        ):
+            raise ValueError(
+                "approvers emails need a requesting_surface resolution: a fixed "
+                "target shows its card in Slack, where an email address cannot be "
+                'verified. Use {"mode": "requesting_surface"}, or list Slack users.'
+            )
+        return self
+
+    @model_validator(mode="after")
     def _targets_must_differ(self) -> "ApprovalRouteBinding":
         if isinstance(self.resolution, ApprovalRequestingSurfaceTarget):
             if self.notification is not None:
@@ -1331,6 +1393,7 @@ class ApprovalApproversOut(BaseModel):
 
     group: str | None = None
     users: list[str] | None = None
+    emails: list[str] | None = None
 
 
 class ApprovalRequestingSurfaceTargetOut(BaseModel):
@@ -1483,6 +1546,10 @@ class AgentUpdate(BaseModel):
     repo_full_name: RepoFullName | None = None
     # Whether this agent's bindings share one workflow-state namespace.
     memory: bool | None = None
+    # Whether the runner mounts its memory tools (#1461). Omitted (None) leaves
+    # it unchanged; the column is NOT NULL, so like `memory` there is no
+    # default for a null to clear back to.
+    memory_writes: bool | None = None
     # Omitted leaves the current publication policy. Explicit null is refused.
     # ``publication_branch_prefix`` null clears the prefix.
     publication_policy: Literal["approve", "auto"] | None = None
@@ -1543,6 +1610,8 @@ class AgentOut(BaseModel):
     # Whether this agent's bindings share one workflow-state namespace (#1525
     # follow-up).
     memory: bool
+    # Whether the runner mounts its remember/update/forget tools (#1461).
+    memory_writes: bool = False
     publication_policy: Literal["approve", "auto"] = "approve"
     publication_policy_version: int = 1
     publication_draft: bool = False
@@ -1791,6 +1860,17 @@ class RepositoryCredentialOut(BaseModel):
     clone_url: str
     authorization_header: str
     revision: str | None = None
+
+
+class WorkspaceCredentialOut(RepositoryCredentialOut):
+    """The workspace clone credential, plus the base a factory WorkItem froze.
+
+    The worker clones ``base_branch`` and pins ``base_commit`` (ADR 0186). Both
+    are None outside the factory and on legacy WorkItems.
+    """
+
+    base_branch: str | None = None
+    base_commit: str | None = None
 
 
 class WorkspaceSelectionRequest(BaseModel):
@@ -2966,6 +3046,16 @@ class StateAppendIn(BaseModel):
     reserve_bytes: int | None = Field(default=None, ge=0)
 
 
+class MemoryTurnClosedIn(BaseModel):
+    """The worker reporting that a turn has ended (#3776): from now on the API
+    refuses memory writes made with that turn's per-turn credential (ADR-0188),
+    even before it expires. ``turn`` is the credential's ``turn`` claim, opaque
+    to the API."""
+
+    agent_id: uuid.UUID
+    turn: str = Field(min_length=1, max_length=512)
+
+
 class StateEntryOut(BaseModel):
     """A durable state entry as returned to the caller."""
 
@@ -3067,6 +3157,34 @@ class MemoryEntryCreate(BaseModel):
         if not stripped:
             raise ValueError("content must not be empty")
         return stripped
+
+
+class MemoryGuidanceIn(BaseModel):
+    """Operator memory guidance for one agent (#1461).
+
+    Stored verbatim at ``memory/guidance`` as ``{"text": ...}``; the runner shows
+    it to the model beside its memory tools in place of the platform default.
+    """
+
+    text: str
+
+    @field_validator("text")
+    @classmethod
+    def _text_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("text must not be empty")
+        return value
+
+
+class MemoryGuidanceOut(BaseModel):
+    """The agent's effective memory guidance and where it comes from (#1461).
+
+    ``source`` is ``operator`` when guidance is stored for the agent, else
+    ``default`` and ``text`` is the platform default.
+    """
+
+    text: str
+    source: Literal["default", "operator"]
 
 
 # --- console sessions (ADR-0083, #1044) -------------------------------------

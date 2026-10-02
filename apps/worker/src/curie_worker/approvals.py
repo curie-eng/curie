@@ -19,6 +19,7 @@ import base64
 import logging
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -325,6 +326,32 @@ def decided_field(resolved_at: datetime) -> MessageField:
 
     instant = resolved_at.replace(tzinfo=UTC) if resolved_at.tzinfo is None else resolved_at
     return MessageField(label=DECIDED_FIELD_LABEL, value=instant.astimezone(UTC).isoformat())
+
+
+# The addresses that may answer an email card (ADR-0177 amendment A5), one field
+# per address, riding the card's ``fields`` for the same reason as
+# ``DECIDED_FIELD_LABEL``: the card's models are decoded strictly out of
+# process. The mail adapter reads them only to word the request email (who can
+# approve, and whether any of them is on the thread). They decide nothing: the
+# platform re-reads the route's list when an answer arrives.
+APPROVER_FIELD_LABEL = "Approver"
+
+
+def approver_fields(emails: Sequence[str]) -> list[MessageField]:
+    """The card fields naming the route's listed approver addresses.
+
+    Args:
+        emails: the route's ``approvers.emails``, as the worker read them.
+
+    Returns:
+        One ``Approver`` field per address, lowercased, in list order, with
+        repeats dropped.
+    """
+
+    seen: dict[str, None] = {}
+    for email in emails:
+        seen.setdefault(email.strip().lower(), None)
+    return [MessageField(label=APPROVER_FIELD_LABEL, value=email) for email in seen if email]
 
 
 def decided_at(message: OutboundMessage) -> datetime | None:

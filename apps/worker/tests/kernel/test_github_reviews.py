@@ -135,6 +135,7 @@ class ReviewBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         assert (kind, address) == ("slack", CHANNEL)
         return {

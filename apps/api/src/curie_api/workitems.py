@@ -11,7 +11,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from curie_telemetry.redact import redact_text
 from sqlalchemy import func, select, update
@@ -33,6 +33,10 @@ from .models import (
     WorkItem,
     new_card_token,
 )
+
+if TYPE_CHECKING:
+    # factory_base reaches this module through factory_notices at import time.
+    from .factory_base import ResolvedBase
 
 RequestStatus = Literal[
     "queued",
@@ -72,7 +76,37 @@ _NO_READMIT: dict[str, Any] = {
     "readmit_request_id": None,
     "readmit_requester": None,
     "readmit_objective": None,
+    "readmit_base_branch": None,
+    "readmit_base_source": None,
+    "readmit_base_commit": None,
 }
+
+
+def _base_values(base: ResolvedBase | None) -> dict[str, Any]:
+    """A freshly resolved base replaces the recorded one, or nothing changes."""
+
+    if base is None:
+        return {}
+    return {
+        "base_branch": base.branch,
+        "base_source": base.source,
+        "base_commit": base.commit,
+        "base_label_ignored": None,
+    }
+
+
+def _pending_readmit_base(work_item: WorkItem) -> ResolvedBase | None:
+    """The base stored beside a deferred relabel, when all three were stored."""
+
+    branch = work_item.readmit_base_branch
+    source = work_item.readmit_base_source
+    commit = work_item.readmit_base_commit
+    if branch is None or source is None or commit is None:
+        return None
+    from .factory_base import ResolvedBase
+
+    # The column check constraint is what limits the source; pass it through.
+    return ResolvedBase(branch, cast(Literal["label", "default"], source), commit)
 
 
 @dataclass(frozen=True)
@@ -418,7 +452,14 @@ async def create_or_get_work_item(
     agent_id: uuid.UUID,
     repo_full_name: str,
     conversation_id: str,
+    base: ResolvedBase | None = None,
 ) -> WorkItemResult:
+    """Insert the WorkItem, or return the existing one for the same issue.
+
+    The base fields (ADR 0186) are written on insert only. A replay does not
+    compare them: the base an existing WorkItem recorded is the one it keeps.
+    """
+
     new_id = uuid.uuid4()
     statement = (
         insert(WorkItem)
@@ -430,6 +471,9 @@ async def create_or_get_work_item(
             agent_id=agent_id,
             repo_full_name=repo_full_name,
             conversation_id=conversation_id,
+            base_branch=None if base is None else base.branch,
+            base_source=None if base is None else base.source,
+            base_commit=None if base is None else base.commit,
             version=1,
             next_sequence=1,
         )
@@ -536,7 +580,9 @@ async def create_execution_request(
         work_item = await _reload_work_item(session, work_item_id)
         existing = await _lock_request_by_id(session, request_id)
         if existing is not None:
-            if existing.work_item_id == work_item_id and existing.wait_deadline == wait_deadline:
+            if existing.work_item_id == work_item_id and (
+                existing.wait_deadline == wait_deadline or existing.status == "waiting"
+            ):
                 return await _outcome(session, work_item, existing, replayed=True)
             return await _conflict(
                 session, "identity_mismatch", work_item=work_item, request=existing
@@ -1509,18 +1555,26 @@ async def readmit(
     wait_deadline: datetime,
     objective: str,
     requester: str,
+    base: ResolvedBase | None = None,
 ) -> WorkItemResult:
     """Start a new run on an existing WorkItem because the label was added again.
 
     A waiting request is superseded in the same transaction. A running request
     is asked to stop, and the relabel is stored on the WorkItem until that
-    request reaches a terminus; the returned request is then the old one.
+    request reaches a terminus; the returned request is then the old one. A
+    freshly resolved base is recorded with the request that runs on it: now,
+    or stored beside the deferred relabel so the stopping run keeps its own.
     """
 
     work_item = await _lock_work_item(session, work_item_id)
     if work_item is None:
         return await _conflict(session, "not_found", work_item_id=work_item_id)
     active = await _lock_active_request(session, work_item_id)
+    # The same timeline event can arrive twice before either caller has
+    # committed its request row. Superseding that row would cancel the run
+    # the other caller just admitted.
+    if active is not None and active.id == request_id:
+        return await _outcome(session, work_item, active, replayed=True)
     now = await _database_now(session)
     if active is not None and active.status in ("running", "cancellation_requested"):
         if active.status == "running":
@@ -1560,6 +1614,9 @@ async def readmit(
                 readmit_request_id=request_id,
                 readmit_requester=requester,
                 readmit_objective=objective,
+                readmit_base_branch=None if base is None else base.branch,
+                readmit_base_source=None if base is None else base.source,
+                readmit_base_commit=None if base is None else base.commit,
                 version=WorkItem.version + 1,
                 updated_at=func.clock_timestamp(),
             )
@@ -1595,6 +1652,7 @@ async def readmit(
         .values(
             cancelled_at=None,
             **_NO_READMIT,
+            **_base_values(base),
             version=WorkItem.version + 1,
             updated_at=func.clock_timestamp(),
         )
@@ -1649,6 +1707,7 @@ async def admit_pending_readmit(
         .values(
             cancelled_at=None,
             **_NO_READMIT,
+            **_base_values(_pending_readmit_base(work_item)),
             version=WorkItem.version + 1,
             updated_at=func.clock_timestamp(),
         )

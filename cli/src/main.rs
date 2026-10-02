@@ -736,6 +736,11 @@ enum Command {
         #[arg(long, global = true, value_name = "NAME")]
         context: Option<String>,
     },
+    /// Bring up Curie and the dark factory without a webhook or a tunnel.
+    Factory {
+        #[command(subcommand)]
+        action: FactoryAction,
+    },
     /// Install a complete first party example workflow.
     Example {
         #[command(subcommand)]
@@ -1041,6 +1046,59 @@ enum Command {
         /// it at the same chart `curie apply --chart` would use.
         #[arg(long)]
         chart: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum FactoryAction {
+    /// Create a cluster when none is targeted, install Curie, register the
+    /// GitHub App, and on the second run deploy the published dark factory.
+    /// Never opens a browser and never runs gh.
+    Quickstart {
+        /// GitHub repository the factory may work in, as owner/name.
+        #[arg(long = "repo", value_name = "OWNER/NAME")]
+        repo: String,
+        /// Numeric GitHub App ID. Pair with --private-key-file. Without both,
+        /// the command prints the registration link and exits after cluster up.
+        #[arg(long, value_name = "ID", requires = "private_key_file")]
+        app_id: Option<String>,
+        /// PEM private key downloaded from the App. The path is passed through;
+        /// the key contents never enter argv.
+        #[arg(long, value_name = "PATH", requires = "app_id")]
+        private_key_file: Option<PathBuf>,
+        /// Kubernetes context. When omitted, the current kubeconfig context is
+        /// used. When neither exists, a kind cluster is created.
+        #[arg(long, value_name = "NAME")]
+        context: Option<String>,
+        /// Kubernetes namespace. Default: curie.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name. Default: curie.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Print the registration link for this GitHub organization instead of
+        /// a personal account.
+        #[arg(long, value_name = "ORG")]
+        org: Option<String>,
+        /// Kind cluster name used only when no kube context is targeted.
+        #[arg(long, default_value = curie::factory_quickstart::DEFAULT_KIND_NAME)]
+        kind_name: String,
+        /// Model id installed by cluster up.
+        #[arg(long, default_value = curie::factory_quickstart::DEFAULT_MODEL)]
+        model: String,
+        /// Per run execution deadline in seconds for the deployed agent.
+        #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_DEADLINE_SECONDS)]
+        execution_deadline: u32,
+        /// Daily USD budget for the deployed agent.
+        #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_BUDGET_USD)]
+        budget: f64,
+        /// Helm chart. Default: the version pinned chart on release builds;
+        /// local charts/curie on dev builds.
+        #[arg(long)]
+        chart: Option<String>,
+        /// Print the steps and exit without creating a cluster or applying anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -2219,13 +2277,17 @@ enum LocalAction {
     },
     /// Show what an agent has learned (its memory log; `GET /agents/{id}/memory`).
     /// `--add <content>` seeds an operator-authored record; a fresh session is
-    /// required before it is injected at boot.
+    /// required before it is injected at boot. `--guidance` shows the guidance
+    /// the agent gets beside its memory tools, `--guidance-from <file>` replaces
+    /// it and `--reset-guidance` restores the platform default.
     Memory {
         #[command(flatten)]
         target: AgentTarget<LocalTier>,
         /// Append this content as an operator-authored memory record.
         #[arg(long, value_name = "CONTENT")]
         add: Option<String>,
+        #[command(flatten)]
+        guidance: MemoryGuidanceArgs,
     },
     /// The human-in-the-loop plane: list and resolve pending approval records,
     /// and view or set the tools whose calls require approval. Which channel an
@@ -2333,6 +2395,11 @@ enum LocalAction {
         /// Clear the runner resource override back to the chart block.
         #[arg(long)]
         clear_runner_resources: bool,
+        /// Turn the agent's remember/update/forget memory tools on or off
+        /// (`memory_writes`, #1461). Off stops saving only: stored agent and
+        /// channel memory stays readable. Takes effect at the next sandbox boot.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        memory_writes: Option<String>,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
@@ -2968,9 +3035,12 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Turn on the GitHub factory intake (label or mention triggers, webhook
-    /// secret, repo allowlist, GitHub API egress) on an existing release.
+    /// Turn on the GitHub factory intake (label or mention triggers, repo
+    /// allowlist, GitHub API egress) on an existing release.
     Factory {
+        /// Select polling or webhook intake. Omit to keep the recorded mode.
+        #[arg(long, value_parser = ["poll", "webhook"])]
+        intake: Option<String>,
         /// Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable.
         /// Sets `api.githubRepoAllowlist`.
         #[arg(long = "repo", value_name = "OWNER/REPO")]
@@ -3365,6 +3435,11 @@ enum ClusterAction {
         /// Clear the runner resource override back to the chart block.
         #[arg(long)]
         clear_runner_resources: bool,
+        /// Turn the agent's remember/update/forget memory tools on or off
+        /// (`memory_writes`, #1461). Off stops saving only: stored agent and
+        /// channel memory stays readable. Takes effect at the next sandbox boot.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        memory_writes: Option<String>,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -3608,13 +3683,17 @@ enum ClusterAction {
     },
     /// Show what an agent has learned (its memory log; `GET /agents/{id}/memory`).
     /// `--add <content>` seeds an operator-authored record; a fresh session is
-    /// required before it is injected at boot.
+    /// required before it is injected at boot. `--guidance` shows the guidance
+    /// the agent gets beside its memory tools, `--guidance-from <file>` replaces
+    /// it and `--reset-guidance` restores the platform default.
     Memory {
         #[command(flatten)]
         target: ClusterAgentTarget,
         /// Append this content as an operator-authored memory record.
         #[arg(long, value_name = "CONTENT")]
         add: Option<String>,
+        #[command(flatten)]
+        guidance: MemoryGuidanceArgs,
     },
     /// The human-in-the-loop plane: list and resolve pending approval records,
     /// and view or set the tools whose calls require approval. Which channel an
@@ -4128,7 +4207,7 @@ fn cluster_connector_bind_values(
             values.insert(name.clone(), value.clone());
         }
     }
-    Ok(values)
+    Ok(curie::cluster_secrets::sandbox_connector_secrets(&values))
 }
 
 async fn bind_cluster_connector_secrets(
@@ -4311,6 +4390,59 @@ async fn main() {
             ui::ui().plumbing(&format!("{err:#}"));
         }
         std::process::exit(class.code());
+    }
+}
+
+/// Run a `<tier> memory --guidance*` action and emit its result: a dry-run
+/// plan through the memory verb's own `MemoryOutput::DryRun`, otherwise the
+/// effective guidance.
+async fn emit_memory_guidance(
+    opts: AgentActionOpts,
+    action: commands::MemoryGuidanceAction,
+) -> Result<()> {
+    match commands::memory_guidance(opts, action).await? {
+        commands::MemoryGuidanceResult::DryRun(plan) => emit(commands::MemoryOutput::DryRun(plan)),
+        commands::MemoryGuidanceResult::Shown(out) => emit(out),
+    }
+}
+
+/// The memory-guidance flags shared by `local memory` and `cluster memory`
+/// (#1461). `--guidance-from` and `--reset-guidance` are two different writes,
+/// and none of them combines with `--add`, which writes the memory log.
+#[derive(clap::Args, Debug, Default, Clone)]
+struct MemoryGuidanceArgs {
+    /// Show the guidance the agent gets beside its memory tools, and whether it
+    /// is the platform default or operator-set
+    /// (`GET /agents/{id}/memory/guidance`).
+    #[arg(long, conflicts_with = "add")]
+    guidance: bool,
+    /// Replace the agent's memory guidance with this file's text
+    /// (`PUT /agents/{id}/memory/guidance`). An empty file is refused.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["reset_guidance", "add"]
+    )]
+    guidance_from: Option<std::path::PathBuf>,
+    /// Remove operator guidance so the platform default applies again
+    /// (`DELETE /agents/{id}/memory/guidance`).
+    #[arg(long, conflicts_with = "add")]
+    reset_guidance: bool,
+}
+
+impl MemoryGuidanceArgs {
+    /// The one guidance action asked for, or `None` for the plain memory verb.
+    /// A write wins over `--guidance`, whose output it already is.
+    fn action(&self) -> Option<commands::MemoryGuidanceAction> {
+        if let Some(path) = &self.guidance_from {
+            Some(commands::MemoryGuidanceAction::SetFrom(path.clone()))
+        } else if self.reset_guidance {
+            Some(commands::MemoryGuidanceAction::Reset)
+        } else if self.guidance {
+            Some(commands::MemoryGuidanceAction::Show)
+        } else {
+            None
+        }
     }
 }
 
@@ -5216,9 +5348,16 @@ async fn run(command: Option<Command>) -> Result<()> {
                     .await?,
                 )
             }
-            LocalAction::Memory { target, add } => match add {
-                None => emit(commands::memory(target.into()).await?),
-                Some(content) => emit(commands::memory_add(target.into(), content, "local").await?),
+            LocalAction::Memory {
+                target,
+                add,
+                guidance,
+            } => match (guidance.action(), add) {
+                (Some(action), _) => emit_memory_guidance(target.into(), action).await,
+                (None, None) => emit(commands::memory(target.into()).await?),
+                (None, Some(content)) => {
+                    emit(commands::memory_add(target.into(), content, "local").await?)
+                }
             },
             LocalAction::Approvals {
                 target,
@@ -5284,11 +5423,12 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_execution_deadline,
                 runner_resources,
                 clear_runner_resources,
+                memory_writes,
                 api_url,
                 api_key,
                 dry_run,
             } => emit(
-                commands::overrides(
+                commands::overrides_with_memory_writes(
                     AgentActionOpts {
                         api_url,
                         api_key,
@@ -5305,6 +5445,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         runner_resources,
                         clear_runner_resources,
                     )?,
+                    commands::memory_writes_flag(memory_writes.as_deref()),
                 )
                 .await?,
             ),
@@ -5452,6 +5593,52 @@ async fn run(command: Option<Command>) -> Result<()> {
                 )
                 .await?,
             ),
+        },
+        Some(Command::Factory { action }) => match action {
+            FactoryAction::Quickstart {
+                repo,
+                app_id,
+                private_key_file,
+                context,
+                namespace,
+                release,
+                org,
+                kind_name,
+                model,
+                execution_deadline,
+                budget,
+                chart,
+                dry_run,
+            } => {
+                let resolved = artifacts::resolve_chart(
+                    chart.as_deref(),
+                    artifacts::Channel::current(),
+                    artifacts::version(),
+                    artifacts::cache_root,
+                    std::path::Path::new("charts/curie").is_dir(),
+                )?;
+                let chart = materialize_artifact(resolved, dry_run, "chart").await?;
+                emit(
+                    curie::factory_quickstart::quickstart(
+                        curie::factory_quickstart::QuickstartOpts {
+                            repo,
+                            app_id,
+                            private_key_file,
+                            context,
+                            namespace,
+                            release,
+                            org,
+                            kind_name,
+                            model,
+                            execution_deadline_seconds: execution_deadline,
+                            budget_usd: budget,
+                            chart,
+                            dry_run,
+                        },
+                    )
+                    .await?,
+                )
+            }
         },
         Some(Command::Cluster { action, context }) => {
             let target = curie::kube_context::pin_for_cluster_command(context.as_deref())?;
@@ -5784,6 +5971,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 )
             }
             ClusterAction::Factory {
+                intake,
                 repos,
                 label,
                 mention,
@@ -5832,6 +6020,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         app_id,
                         private_key_file,
                         org,
+                        intake,
                     })
                     .await?,
                 )
@@ -6510,6 +6699,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear_execution_deadline,
                 runner_resources,
                 clear_runner_resources,
+                memory_writes,
                 conn,
                 dry_run,
             } => {
@@ -6531,7 +6721,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let (api_url, api_key, _cluster_api_pf) =
                     resolve_cluster_conn(conn, dry_run).await?;
                 emit(
-                    commands::overrides(
+                    commands::overrides_with_memory_writes(
                         AgentActionOpts {
                             api_url,
                             api_key,
@@ -6542,6 +6732,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         thinking,
                         execution_deadline,
                         runner_resources,
+                        commands::memory_writes_flag(memory_writes.as_deref()),
                     )
                     .await?,
                 )
@@ -6852,7 +7043,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                     _ => unreachable!(),
                 }
             }
-            ClusterAction::Memory { target, add } => {
+            ClusterAction::Memory {
+                target,
+                add,
+                guidance,
+            } => {
                 let ClusterAgentTarget {
                     agent,
                     conn,
@@ -6866,9 +7061,12 @@ async fn run(command: Option<Command>) -> Result<()> {
                     agent,
                     dry_run,
                 };
-                match add {
-                    None => emit(commands::memory(opts).await?),
-                    Some(content) => emit(commands::memory_add(opts, content, "cluster").await?),
+                match (guidance.action(), add) {
+                    (Some(action), _) => emit_memory_guidance(opts, action).await,
+                    (None, None) => emit(commands::memory(opts).await?),
+                    (None, Some(content)) => {
+                        emit(commands::memory_add(opts, content, "cluster").await?)
+                    }
                 }
             }
             ClusterAction::Approvals {
@@ -8980,7 +9178,7 @@ mod tests {
         .expect("local memory --add should parse");
         match cli.command {
             Some(Command::Local {
-                action: LocalAction::Memory { target, add },
+                action: LocalAction::Memory { target, add, .. },
             }) => {
                 assert_eq!(target.agent, "translation-bot");
                 assert_eq!(add.as_deref(), Some("ask before translating to French"));
@@ -9002,7 +9200,7 @@ mod tests {
         .expect("cluster memory --add should parse");
         match cli.command {
             Some(Command::Cluster {
-                action: ClusterAction::Memory { target, add },
+                action: ClusterAction::Memory { target, add, .. },
                 ..
             }) => {
                 assert_eq!(target.agent, "translation-bot");

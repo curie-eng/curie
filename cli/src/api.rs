@@ -72,6 +72,23 @@ pub(crate) struct ClusterMessageReplyEvent {
     pub(crate) status: Option<String>,
     #[serde(default)]
     pub(crate) outcome: Option<String>,
+    /// Reply wire 1.1's progress payload (ADR-0130), a card or a milestone.
+    /// Present, the event is never the turn's reply.
+    #[serde(default)]
+    pub(crate) progress: Option<ClusterMessageProgress>,
+}
+
+/// The fields of a relayed progress card or milestone the CLI shows as a
+/// status line. Tolerant like the event: a field it does not read is ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ClusterMessageProgress {
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) state: Option<String>,
+    #[serde(default)]
+    pub(crate) milestone: Option<String>,
+    #[serde(default)]
+    pub(crate) summary: String,
 }
 
 /// The channel used when an agent is first created if `--slack-channel` is
@@ -297,6 +314,11 @@ pub struct Agent {
     /// is the separate, explicit toggle for whether those surfaces share
     /// cross-turn state.
     pub memory: bool,
+    /// Whether the runner mounts its remember/update/forget memory tools for
+    /// this agent (#1461). Defaulted so a platform older than the field reads
+    /// as off, which is what it does.
+    #[serde(default)]
+    pub memory_writes: bool,
     /// Who resolves publication approval. Missing responses stay on human approval.
     #[serde(default = "default_publication_policy")]
     pub publication_policy: String,
@@ -414,13 +436,16 @@ pub struct ApprovalNotificationTargetResponse {
 /// Who may resolve a route's approvals, mirroring the committed
 /// `ApprovalApprovers`. The API settles the precedence (`users` wins over
 /// `group`); the CLI never reorders or merges them, it forwards what was asked
-/// for and lets the one authoritative validator answer.
+/// for and lets the one authoritative validator answer. `emails` is read only
+/// for a card shown in an email thread (ADR-0177 amendment), never for a Slack card.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApprovalApprovers {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub users: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emails: Option<Vec<String>>,
 }
 
 // --- The input side of the same contract (#1072) -------------------------------
@@ -541,6 +566,8 @@ pub struct ApproversInput {
     pub group: Option<String>,
     #[serde(default)]
     pub users: Option<Vec<String>>,
+    #[serde(default)]
+    pub emails: Option<Vec<String>>,
 }
 
 impl From<ApproversInput> for ApprovalApprovers {
@@ -548,6 +575,7 @@ impl From<ApproversInput> for ApprovalApprovers {
         ApprovalApprovers {
             group: input.group,
             users: input.users,
+            emails: input.emails,
         }
     }
 }
@@ -727,6 +755,15 @@ pub struct MemoryEntry {
     pub version: u64,
     #[serde(default)]
     pub provenance: MemoryProvenance,
+}
+
+/// An agent's effective memory guidance (`MemoryGuidanceOut`, #1461): the
+/// text the runner shows beside its memory tools, and whether it is the
+/// platform `default` or `operator`-set.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryGuidance {
+    pub text: String,
+    pub source: String,
 }
 
 /// One row returned by `GET /langfuse/traces`.
@@ -3354,6 +3391,65 @@ impl ApiClient {
             .json()
             .await
             .context("decoding created memory entry")
+    }
+
+    /// The agent's effective memory guidance: `GET /agents/{id}/memory/guidance`.
+    pub async fn get_memory_guidance(&self, agent_id: &str) -> Result<MemoryGuidance> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/memory/guidance",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/memory/guidance",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading memory guidance")
+            .await?
+            .json()
+            .await
+            .context("decoding memory guidance")
+    }
+
+    /// Store operator memory guidance: `PUT /agents/{id}/memory/guidance`.
+    /// Returns the effective guidance as the API stored it.
+    pub async fn put_memory_guidance(&self, agent_id: &str, text: &str) -> Result<MemoryGuidance> {
+        let resp = self
+            .send_request(
+                self.http
+                    .put(format!(
+                        "{}/agents/{agent_id}/memory/guidance",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&json!({ "text": text })),
+                "PUT /agents/{id}/memory/guidance",
+            )
+            .await?;
+        Self::expect_ok(resp, "storing memory guidance")
+            .await?
+            .json()
+            .await
+            .context("decoding stored memory guidance")
+    }
+
+    /// Remove operator memory guidance: `DELETE /agents/{id}/memory/guidance`.
+    pub async fn delete_memory_guidance(&self, agent_id: &str) -> Result<()> {
+        let resp = self
+            .send_request(
+                self.http
+                    .delete(format!(
+                        "{}/agents/{agent_id}/memory/guidance",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "DELETE /agents/{id}/memory/guidance",
+            )
+            .await?;
+        Self::expect_ok(resp, "removing memory guidance").await?;
+        Ok(())
     }
 
     /// The server's max page for `GET /work-items` (`limit` maximum 200 in

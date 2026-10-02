@@ -202,6 +202,22 @@ def _fake_model_or_none(raw: str | None) -> bool | None:
     return raw.strip().lower() in ("1", "true", "yes")
 
 
+def _switch_or_none(raw: str | None) -> bool | None:
+    """Parse an explicit on/off switch whose absence means something of its own.
+
+    ``1``/``true`` is on and ``0``/``false`` is off, case-insensitively; absent
+    or blank is ``None`` (unset), which is not the same as off. Any other value
+    reads as off. For ``memory_writes`` that matters: ``None`` means "an older
+    worker", and the runner then treats a present channel ref as writes on, so
+    reading an unknown value as ``None`` would turn writes on. Reading it as off
+    fails closed, so do not change unknown values to ``None``.
+    """
+
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip().lower() in ("1", "true")
+
+
 def _stripped_or_none(raw: str | None) -> str | None:
     """Strip, then treat blank as unset.
 
@@ -245,7 +261,9 @@ def _tolerant_int(raw: str | None) -> int | None:
     history-window knobs: a typo in an operator's ``extraEnv`` must not become a
     boot crash, and a nonpositive window is meaningless (``max_turns=0`` slices
     every turn, a nonpositive byte budget can never be met), so it is rejected
-    like a bad parse. None hands the consumer its own default.
+    like a bad parse. None hands the consumer its own default. The memory fact
+    limit (``CURIE_MEMORY_MAX_FACTS``) uses it for the same reasons: a limit of
+    zero would refuse every save and show no facts at all.
     """
 
     if raw is None or not raw.strip():
@@ -322,6 +340,32 @@ class BootEnv(_AciModel):
     )
     memory_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_MEMORY_TOKEN", "worker")
+    )
+    # This turn's channel memory (#3389, for #1461): the agent's memory
+    # namespace scoped to the turn's channel binding on the same state API
+    # (``.../agents/<id>/state/bindings/<kind>/<address>/memory``), minted from
+    # the runner-facing API base like ``memory_ref`` and read and written with
+    # ``memory_token``. The worker sets it whenever the turn has a binding,
+    # whether or not memory writes are on, so channel facts can be read; it
+    # never sets it for an eval-isolated turn, which carries no memory at all.
+    # ``memory_writes`` below decides whether the memory tools mount. A ref
+    # with no ``memory_writes`` means writes on, because only an older worker
+    # sends one without the other.
+    channel_memory_ref: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_CHANNEL_MEMORY_REF", "worker")
+    )
+    # Whether the agent may write channel memory this turn (#3659, for #3621),
+    # sent by the worker as ``1``/``0``. Three states:
+    # - True: the memory tools mount.
+    # - False: channel memory is still readable, but there are no memory tools
+    #   and no guidance about writing it.
+    # - None: an older worker that predates the flag. The runner then falls
+    #   back to the channel ref: a present ``channel_memory_ref`` means writes
+    #   are on, so a new runner behind an old worker keeps today's behaviour.
+    # An unknown value reads as False, not None: None would fall back to the
+    # channel ref and turn writes on, so False is the fail-closed choice.
+    memory_writes: bool | None = Field(
+        default=None, json_schema_extra=_env("CURIE_MEMORY_WRITES", "worker")
     )
     # The durable state store exposed to bundle code (#249, epic #23). state_url
     # is the agent's state namespace base on the API state router
@@ -440,9 +484,7 @@ class BootEnv(_AciModel):
     #
     # Unset is the pre-#1182 behavior verbatim: the runner sends no thinking
     # configuration and the model's own default stands.
-    thinking: str | None = Field(
-        default=None, json_schema_extra=_env("CURIE_THINKING", "worker")
-    )
+    thinking: str | None = Field(default=None, json_schema_extra=_env("CURIE_THINKING", "worker"))
     # The active deployment's environment (``prod`` or ``dev``, #3166). The
     # runner's telemetry maps it onto the ``deployment.environment.name``
     # resource attribute, which Langfuse stores as the trace ``environment``
@@ -480,6 +522,12 @@ class BootEnv(_AciModel):
     )
     history_max_bytes: int | None = Field(
         default=None, json_schema_extra=_env("CURIE_HISTORY_MAX_BYTES", "operator")
+    )
+    # How many facts each memory (agent memory, and each channel's memory) may
+    # hold and boot shows the agent (#3624). One number for both, so a saved fact
+    # is never left out of the prompt. The runner's default is 200.
+    memory_max_facts: int | None = Field(
+        default=None, json_schema_extra=_env("CURIE_MEMORY_MAX_FACTS", "operator")
     )
 
     @classmethod
@@ -581,6 +629,8 @@ class BootEnv(_AciModel):
         model_env_key: str | None = None,
         history_token: str | None = None,
         memory_token: str | None = None,
+        channel_memory_ref: str | None = None,
+        memory_writes: bool | None = None,
         state_url: str | None = None,
         state_token: str | None = None,
         approval_required_tools: Sequence[str] | None = None,
@@ -647,6 +697,10 @@ class BootEnv(_AciModel):
             env[cls.env_key("history_token")] = history_token
         if memory_token:
             env[cls.env_key("memory_token")] = memory_token
+        if channel_memory_ref:
+            env[cls.env_key("channel_memory_ref")] = channel_memory_ref
+        if memory_writes is not None:
+            env[cls.env_key("memory_writes")] = "1" if memory_writes else "0"
         if state_url:
             env[cls.env_key("state_url")] = state_url
         if state_token:
@@ -693,6 +747,10 @@ class BootEnv(_AciModel):
             env[self.env_key("history_token")] = self.history_token
         if self.memory_token is not None:
             env[self.env_key("memory_token")] = self.memory_token
+        if self.channel_memory_ref is not None:
+            env[self.env_key("channel_memory_ref")] = self.channel_memory_ref
+        if self.memory_writes is not None:
+            env[self.env_key("memory_writes")] = "1" if self.memory_writes else "0"
         if self.connector_release is not None:
             env[self.env_key("connector_release")] = self.connector_release
         if self.connector_agent is not None:
@@ -754,6 +812,8 @@ class BootEnv(_AciModel):
             env[self.env_key("history_max_turns")] = str(self.history_max_turns)
         if self.history_max_bytes is not None:
             env[self.env_key("history_max_bytes")] = str(self.history_max_bytes)
+        if self.memory_max_facts is not None:
+            env[self.env_key("memory_max_facts")] = str(self.memory_max_facts)
         return env
 
     @classmethod
@@ -781,6 +841,8 @@ class BootEnv(_AciModel):
             history_ref=_str_or_none(env.get("CURIE_HISTORY_REF")),
             history_token=_str_or_none(env.get("CURIE_HISTORY_TOKEN")),
             memory_token=_str_or_none(env.get("CURIE_MEMORY_TOKEN")),
+            channel_memory_ref=_str_or_none(env.get("CURIE_CHANNEL_MEMORY_REF")),
+            memory_writes=_switch_or_none(env.get("CURIE_MEMORY_WRITES")),
             state_url=_str_or_none(env.get("CURIE_STATE_URL")),
             state_token=_str_or_none(env.get("CURIE_STATE_TOKEN")),
             progress_url=_str_or_none(env.get("CURIE_PROGRESS_URL")),
@@ -819,4 +881,8 @@ class BootEnv(_AciModel):
             max_turns=_required_int(env.get("CURIE_MAX_TURNS")),
             history_max_turns=_tolerant_int(env.get("CURIE_HISTORY_MAX_TURNS")),
             history_max_bytes=_tolerant_int(env.get("CURIE_HISTORY_MAX_BYTES")),
+            # Tolerant like the history window: a typo, or a limit of zero or
+            # less (which would refuse every save and show nothing), degrades to
+            # the runner's default rather than failing boot.
+            memory_max_facts=_tolerant_int(env.get("CURIE_MEMORY_MAX_FACTS")),
         )

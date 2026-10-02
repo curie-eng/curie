@@ -977,6 +977,41 @@ def test_turns_under_one_access_keep_their_session() -> None:
     assert [s.queries for s in restricted_sessions] == [["probe", "probe again"]]
 
 
+def test_a_refused_progress_demo_call_gets_only_its_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # @spec RUNNER-TOOL-ACCESS-8: the fake answers a denied call with its error
+    # result in place of the scripted one. The progress demo's calls are
+    # answered by the handler, not a scripted result, so a refused call must
+    # skip the handler too or it gets a second, successful result.
+    from claude_agent_sdk import ToolResultBlock, UserMessage
+    from curie_runner.fake import progress_demo_turn
+
+    monkeypatch.setattr("curie_runner.fake.PROGRESS_DEMO_PAUSE_S", 0.0)
+    access = _read_only(_access())
+    session = FakeModelSession(
+        progress_demo_turn, can_use_tool=front_can_use_tool(None, access), tool_access=access
+    )
+
+    async def go() -> list[Any]:
+        await session.connect()
+        await session.query("[fake:progress-demo] go")
+        return [message async for message in session.receive_turn()]
+
+    messages = anyio.run(go)
+    results: dict[str, list[ToolResultBlock]] = {}
+    for message in messages:
+        if isinstance(message, UserMessage) and not isinstance(message.content, str):
+            for block in message.content:
+                if isinstance(block, ToolResultBlock):
+                    results.setdefault(block.tool_use_id, []).append(block)
+
+    assert set(results) == {"p1", "p2", "p3"}
+    for tool_use_id, blocks in results.items():
+        assert len(blocks) == 1, (tool_use_id, blocks)
+        assert blocks[0].is_error, (tool_use_id, blocks)
+
+
 def test_read_only_feedback_uses_plain_action_and_keeps_exact_denied_id() -> None:
     access = _read_only(_access())
     reason = access.refuse("mcp__acme__delete_files", "call-acme-1")

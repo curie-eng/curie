@@ -42,6 +42,13 @@ from plugin_format.deploy_targets import DeployTargetsFile, validate_deploy_targ
 from plugin_format.validate import DEPLOY_FILE
 from plugin_format.yaml_loader import safe_load_unique
 
+from curie_api.e2e_connector import (
+    CONNECTOR_NAME,
+    E2EInstall,
+    pin_server_command,
+    prepare_connectors,
+)
+
 # Re-exported so existing catchers (gitflow.py, routers/bundles.py, tests) keep
 # resolving ``bundles.UnsupportedArchive`` after the extraction logic moved to
 # plugin_format; safe_extract raises this single error for unsafe/unrecognized
@@ -404,6 +411,7 @@ def render_connector_manifests(
     proxy: connector_render.ConnectorProxy | None = None,
     grant_store_url: str = "",
     gated_tools: Mapping[str, tuple[str, ...]] | None = None,
+    e2e: E2EInstall | None = None,
 ) -> list[dict[str, Any]]:
     """Kubernetes objects for a bundle's hosted connectors (ADR-0086, #1063).
 
@@ -415,6 +423,8 @@ def render_connector_manifests(
     authority stays where it already was.
     """
 
+    install = e2e or E2EInstall()
+    connectors = prepare_connectors(connectors, install)
     objects: list[dict[str, Any]] = []
     for name, spec in sorted(connectors.connectors.items()):
         tools = tuple(gated_tools.get(name, ())) if gated_tools is not None else ()
@@ -432,6 +442,8 @@ def render_connector_manifests(
                 grant_store_url=grant_store_url if proxy is not None else "",
             )
         )
+    if install.enabled and CONNECTOR_NAME in connectors.connectors:
+        pin_server_command(objects, install)
     return objects
 
 

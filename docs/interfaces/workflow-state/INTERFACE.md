@@ -87,16 +87,37 @@ Neither path uses the platform key, and neither carries the same reach as the
 runner's own loaders: there are two scoped-token scopes (ADR-0033), minted
 side by side at `apps/worker/src/curie_worker/binding.py::BindingResolver.boot_env`.
 The broad `state` scope backs `CURIE_MEMORY_TOKEN` / `CURIE_HISTORY_TOKEN` and
-reaches every namespace, because the memory and history loaders must read and
-write the reserved ones to rehydrate the agent across a suspend/resume. The narrow
+reaches every namespace, because the memory and history loaders must read the
+reserved ones (and write transcripts) to rehydrate the agent across a
+suspend/resume. On the `memory` namespace its claims narrow it (ADR-0188,
+`apps/api/src/curie_api/routers/state.py::_check_memory_reach`): the `binding`
+claim names the one channel whose memory it reaches, the boot-env token is
+`memory: "read"`, and only the per-turn write credential on `Event.memory_token`
+may write, only fact keys, with the API stamping its `sender` claim as the
+author. A token with no `memory` claim (a pre-ADR-0188 worker's) fails closed
+there. On `transcript` the `binding` claim holds it to its own channel's threads
+(#3767, `apps/api/src/curie_api/routers/state.py::_check_transcript_reach`):
+the API maps a transcript key back to its binding with
+`apps/api/src/curie_api/threadkeys.py::transcript_binding`, ignoring the
+identity segment, and the key's binding (and a binding path's) must be the
+claim's. The unbound credential of a targetless cron reaches only its own
+agent's `@cron` threads, a key no producer builds is refused, and a transcript
+listing is filtered to the reachable threads. A pre-ADR-0188 token keeps its
+transcript reach until it expires, with a "legacy sandbox token" warning and a
+`curie.state.legacy_token` count. General state keeps the broad reach. The narrow
 `state.app` scope backs the bundle-facing `CURIE_STATE_TOKEN` and is refused on
 the reserved namespaces server-side by
 `apps/api/src/curie_api/routers/state.py::forbid_reserved_namespace`, so a skill
 cannot bypass the MCP tool's own client-side refusal by composing
 `CURIE_STATE_URL` itself. `list_namespaces` has no `namespace` path param and so
 cannot be gated that way; it filters the reserved namespaces out of the response
-for an app-scoped caller instead (#856). Which scope authenticated is carried
-through as `apps/api/src/curie_api/routers/state.py::StateCaller`, resolved by
+for an app-scoped caller instead (#856), and drops the `memory` row for a `state`
+caller listing a binding whose memory it may not reach. The `transcript`
+summary row, which counts every channel's threads, is returned to the platform
+key only. Which scope
+authenticated, with its verified claims, is carried through as
+`apps/api/src/curie_api/routers/state.py::StatePrincipal` (its
+`apps/api/src/curie_api/routers/state.py::StateCaller`), resolved by
 `apps/api/src/curie_api/routers/state.py::require_state_access`.
 
 Every completed state delete, shared or binding scoped and including a

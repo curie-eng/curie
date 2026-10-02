@@ -569,6 +569,9 @@ BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 
 
 def _boot_env(monkeypatch, tmp_path: Path, suffix: str) -> dict[str, str]:
+    # These exact-live-tool tests model an eligible human Slack sandbox. The
+    # default-off negative is pinned independently in harness boot wiring.
+    monkeypatch.setenv("CURIE_TURN_PROGRESS_ENABLED", "1")
     monkeypatch.setenv("CURIE_STATE_URL", "http://state.invalid/agents/a/state")
     monkeypatch.setenv("CURIE_STATE_TOKEN", "t")
     return {

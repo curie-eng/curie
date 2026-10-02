@@ -396,6 +396,14 @@ class WorkerConfig(BaseSettings):
     # ledger records or what the no-retry rule reads.
     turn_receipt: TurnReceiptMode = Field(default="all", validation_alias="CURIE_TURN_RECEIPT")
 
+    # Whether deliberate progress (ADR 0130) reaches an adapter. Temporary: it
+    # exists until the rendering change lands, and the chart does not set it.
+    # Off, the kernel's progress pump records each command's state and
+    # milestone reservation and removes the deliveries it enqueued, so nothing
+    # is shown and nothing is left owed. This worker has no progress deliverer,
+    # so ``_progress_render_needs_a_deliverer`` refuses it on.
+    progress_render: Bool = Field(default=False, validation_alias="CURIE_PROGRESS_RENDER")
+
     # Edited onto the placeholder when a delivery's handler RAISED and the entry
     # was left pending for the bounded retry, so the thread is never silent while
     # the redelivery is waited out (#2433).
@@ -456,6 +464,14 @@ class WorkerConfig(BaseSettings):
     # DO NOT CHANGE -- ADR-0039 stands, and weakening the cap is the #505 total
     # stall regression, not a simplification.
     max_delivery: int = Field(default=5, ge=2, validation_alias="CURIE_MAX_DELIVERY")
+    # Turns one worker runs at once on the runs lane (#760): the consumer's
+    # capacity semaphore, and so how many sandboxes one worker can hold busy.
+    # The chart renders it from worker.maxConcurrency; the fleet-wide figure is
+    # worker.replicas times this, which NOTES prints beside the sandbox quota
+    # ceiling. Floor 1, since 0 admits no turn; 256 matches the chart schema.
+    max_concurrency: int = Field(
+        default=16, ge=1, le=256, validation_alias="CURIE_WORKER_MAX_CONCURRENCY"
+    )
     # Empty means "derive ``<stream>:dead``" at the use site; a static Field
     # default cannot reference ``self.stream``. An explicit override equal to
     # ``stream`` is rejected outright -- see ``_reject_self_targeting_graveyard``.
@@ -470,6 +486,22 @@ class WorkerConfig(BaseSettings):
     dead_letter_maxlen: int = Field(
         default=10000, ge=1, validation_alias="CURIE_DEAD_LETTER_MAXLEN"
     )
+
+    @model_validator(mode="after")
+    def _progress_render_needs_a_deliverer(self) -> WorkerConfig:
+        """Refuse to start with progress rendering on (ADR 0130).
+
+        Nothing in this worker delivers progress to an adapter. Accepting the
+        switch would claim a rendering that does not happen, and leaving each
+        owed delivery in the outbox for a later deliverer would replay a
+        backlog of stale cards into old threads the day one exists.
+        """
+        if self.progress_render:
+            raise ValueError(
+                "CURIE_PROGRESS_RENDER=true needs progress rendering, which this worker "
+                "does not include; leave it unset"
+            )
+        return self
 
     @model_validator(mode="after")
     def _reject_self_targeting_graveyard(self) -> WorkerConfig:
@@ -1245,6 +1277,19 @@ class WorkerConfig(BaseSettings):
     work_item_orphan_sweep_interval_s: float = Field(
         default=15.0, gt=0, validation_alias="CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S"
     )
+    # Settled stream entries are trimmed once they are older than this window
+    # (ADR 0184). The floor sits above the three-hour delivery budget ceiling;
+    # the ceiling is the one year shared by the other seconds knobs.
+    stream_retention_min_age_s: int = Field(
+        default=86400,
+        ge=3600,
+        le=31_536_000,
+        validation_alias="CURIE_STREAM_RETENTION_MIN_AGE_S",
+    )
+    # How often the retention pass runs over the consumed streams.
+    stream_retention_interval_s: float = Field(
+        default=60.0, gt=0, validation_alias="CURIE_STREAM_RETENTION_INTERVAL_S"
+    )
     # The reconciler reuses `connector_release` / `connector_namespace` above --
     # deliberately the same two values the runner's connector scope is built
     # from. They must agree: the runner dials a Service by the name those
@@ -1390,6 +1435,14 @@ class WorkerConfig(BaseSettings):
         # would never reach a turn whose stream entry was already acked.
         return f"{self.key_prefix}:completions:pending"
 
+    def memory_steer_turns_key(self, agent_id: str, live_turn: str) -> str:
+        # The memory turn claims steered into one live runner turn (#3776),
+        # which the attempt owning that turn drains and closes when it ends.
+        # Keyed by the live turn, not the thread: the next turn on the thread
+        # can open before this one's owner has drained, and this owner must
+        # not close the steers that joined the next turn.
+        return f"{self.key_prefix}:memory-steer-turns:{agent_id}:{live_turn}"
+
     def progress_key(self, progress_id: str) -> str:
         # One logical turn chain's progress record (ADR 0130); see the worker
         # README's "Deliberate progress" section for its fields and expiry.
@@ -1407,6 +1460,17 @@ class WorkerConfig(BaseSettings):
     def progress_chain_key(self, event_id: str) -> str:
         # The pointer an approval resume event follows back to its chain's record.
         return f"{self.key_prefix}:progress:chain:{event_id}"
+
+    def progress_inbox_key(self, progress_id: str) -> str:
+        # The chain's inbox stream. The API appends to it under the same
+        # KEY_PREFIX (its worker_key_prefix); the shape is frozen in
+        # tests/vectors/turn-progress-capability.json.
+        return f"{self.key_prefix}:progress:inbox:{progress_id}"
+
+    def progress_inbox_pending_key(self) -> str:
+        # Durable discovery for commands accepted after a live pump stops or
+        # while every worker is restarting.
+        return f"{self.key_prefix}:progress:inbox:pending"
 
     def upgrade_quiesce_key(self) -> str:
         # One authoritative "stop taking new work" marker per Helm installation

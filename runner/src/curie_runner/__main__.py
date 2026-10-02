@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -38,6 +38,7 @@ from .approval import (
     build_approval_hook,
     build_approval_server,
     build_can_use_tool,
+    build_memory_tools,
     include_generic_policy_pager,
     policy_disallowed_tools,
     resolve_approval_policy,
@@ -80,14 +81,23 @@ from .mcp_tool_capability import (
     probe_mcp_tool_capability,
     reprobe_connector_failures,
 )
-from .memory import MemoryStore, format_memory_preamble, resolve_memory
+from .memory import MEMORY_TOKEN_ENV, MemoryStore, format_memory_preamble, resolve_memory
+from .memory_facts import (
+    DEFAULT_GUIDANCE,
+    WRITES_OFF_NOTICE,
+    Fact,
+    MemoryTurn,
+    format_facts_preamble,
+    resolve_facts_store,
+)
 from .otel import RunTracer, build_tracer_provider
-from .plugin import bundle_mcp_servers, load_bundle_web_search_enabled
+from .plugin import bundle_mcp_servers, bundle_skill_names, load_bundle_web_search_enabled
 from .progress import (
     PROGRESS_TOKEN_ENV,
     PROGRESS_URL_ENV,
     ProgressActivity,
     build_progress_tool,
+    factory_progress_requested,
     resolve_progress,
 )
 from .publication_precheck import PublicationPrecheck
@@ -99,6 +109,13 @@ from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
 from .subprocess_env import lock_process_environ
 from .tool_access import TurnToolAccess, front_can_use_tool, front_pre_tool_use_hooks
+from .turn_progress import (
+    PROGRESS_PREAMBLE,
+    TurnProgress,
+    build_turn_progress_tool,
+    should_mount_turn_progress,
+    turn_progress_enabled,
+)
 from .usage_report import USAGE_PATH, UsageReporter
 from .verification import KNOWN_BLOCKER_NAMES, preflight_workspace_verification
 from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
@@ -401,8 +418,15 @@ def _compose_system_prompt(
     model: str | None,
     workspace_preamble: str | None = None,
     attachment_preamble: str | None = None,
+    progress_preamble: str | None = None,
+    facts_preamble: str | None = None,
+    guidance_preamble: str | None = None,
 ) -> str | None:
     """Compose durable memory, mounted-workspace facts, bundle instructions, and model identity.
+
+    Memory leads (#1461, ADR-0167): the legacy ``log`` records, then the
+    remembered agent and channel facts, then the memory guidance, all above the
+    bundle prompt so the bundle's own instructions have the last word.
 
     Conversation history is deliberately absent: ADR-0119 requires it to cross
     the harness boundary as ordered messages, never rendered system text.
@@ -410,6 +434,10 @@ def _compose_system_prompt(
     This turn's inbound attachments (#2567) come last, closest to the query they
     belong to. Absent -- the overwhelming majority of turns -- the composed
     prompt is byte-identical to what it was before the lane existed.
+
+    The deliberate progress block (ADR 0130) is a platform block like the
+    workspace one, present whenever the ``progress`` tool is mounted, and sits
+    ahead of the bundle's own instructions.
     """
 
     model_preamble = f"Configured model: {model}" if model else None
@@ -417,7 +445,10 @@ def _compose_system_prompt(
         p
         for p in (
             memory_preamble,
+            facts_preamble,
+            guidance_preamble,
             workspace_preamble,
+            progress_preamble,
             base,
             model_preamble,
             attachment_preamble,
@@ -487,6 +518,8 @@ def build_runner(
     attachments_path: Path | None = None,
     connector_failures: tuple[ConnectorCapabilityFailure, ...] = (),
     history_capacity_exceeded: bool = False,
+    memory_facts_preamble: str | None = None,
+    memory_guidance: str | None = None,
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
 
@@ -498,6 +531,10 @@ def build_runner(
     ``harness`` is the resolved contribution manifest (ADR-0060) whose fields
     drive the read-only tool set and bundle compile; it defaults to the built-in
     Claude harness so existing callers are unaffected.
+
+    ``memory_facts_preamble`` is the rendered remembered-facts block and
+    ``memory_guidance`` the operator's stored guidance text (None falls back to
+    ``DEFAULT_GUIDANCE``), both loaded at boot (#1461).
     """
 
     # Resolve the active harness's contribution (ADR-0060): its manifest is the
@@ -549,12 +586,83 @@ def build_runner(
     # indistinguishable from one that never arrived, and the agent answers "I
     # don't see an attachment" about a message that visibly carries one.
     attachment_paths = _discover_attachments(attachments_path)
+    # The live status card (#3077): a factory execution carries a progress URL
+    # and token, and the bundle declares its phases. A malformed phase file is
+    # logged and mounts no tool; progress never stops a boot.
+    factory_requested = factory_progress_requested(os.environ)
+    try:
+        progress = resolve_progress(os.environ, Path(config.session.plugin_dir))
+    except ValueError as exc:
+        logger.warning("report_progress not mounted: %s", exc)
+        progress = None
+    # Deliberate progress (ADR 0130): only a worker-selected human Slack
+    # sandbox mounts the platform tool and prompt. The boot flag is part of the
+    # sandbox identity; per-turn headers still carry the actual authority.
+    turn_progress = (
+        TurnProgress()
+        if should_mount_turn_progress(
+            eligible=turn_progress_enabled(os.environ),
+            factory_progress_requested=factory_requested,
+            factory_progress_resolved=progress is not None,
+        )
+        else None
+    )
+    # The memory tools (#1461, ADR-0167) mount iff memory writes are on (the
+    # worker's explicit flag, or a bare channel ref from an older worker; see
+    # RunnerConfig.memory_writes_on, #3621), the worker set a channel memory
+    # ref AND a memory token to write with, and only on the real-model path,
+    # which is the only path that mounts platform MCP servers at all. The
+    # toolPolicy exemption below reads this same flag, so the claim matches
+    # the mount. The guidance block rides with the tools and only with them;
+    # the facts block does not, because reading memory needs no switch. With
+    # writes off, a short notice takes the guidance's place so the agent never
+    # claims to have saved anything.
+    memory_token = os.environ.get(MEMORY_TOKEN_ENV) or None
+    channel_facts_store = resolve_facts_store(config.channel_memory_ref, memory_token)
+    channel_memory_readable = channel_facts_store is not None and memory_token is not None
+    if config.channel_memory_ref and config.memory_writes_on:
+        # These point at a broken config, so they fire only when the tools
+        # would otherwise have mounted.
+        if channel_facts_store is None:
+            logger.warning("memory tools not mounted: unsupported channel memory ref scheme")
+        if memory_token is None:
+            logger.warning("memory tools not mounted: no memory token")
+    elif config.channel_memory_ref and not channel_memory_readable:
+        logger.info("channel facts not loaded: no memory token or unsupported ref scheme")
+    memory_tools_mounted = (
+        config.memory_writes_on
+        and channel_facts_store is not None
+        and memory_token is not None
+        and not fake_model
+    )
+    memory_turn = MemoryTurn() if memory_tools_mounted else None
+
+    def turn_write_token() -> str | None:
+        # ADR-0188: the tools write with the turn's own credential, carried on
+        # Event.memory_token into MemoryTurn and never into the env.
+        return memory_turn.write_token if memory_turn is not None else None
+
+    channel_tool_store = resolve_facts_store(
+        config.channel_memory_ref,
+        memory_token,
+        turn_token=turn_write_token,
+        max_facts=config.memory_max_facts,
+    )
     system_prompt = _compose_system_prompt(
         system_prompt,
         memory_preamble,
         model=config.model,
         workspace_preamble=format_workspace_preamble(mounted_workspace, verification),
         attachment_preamble=format_attachment_preamble(attachment_paths),
+        progress_preamble=PROGRESS_PREAMBLE if turn_progress is not None else None,
+        facts_preamble=memory_facts_preamble,
+        guidance_preamble=(
+            (memory_guidance or DEFAULT_GUIDANCE)
+            if memory_tools_mounted
+            else WRITES_OFF_NOTICE
+            if channel_memory_readable and not config.memory_writes_on
+            else None
+        ),
     )
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
     # translated into SDK HookMatcher callbacks. None when the bundle declares none.
@@ -619,16 +727,8 @@ def build_runner(
     # bundle shipping its own server. Absent (fake/local, or an older worker), no
     # state server is mounted and the agent simply sees no state tools.
     state_client = resolve_state_client(os.environ)
-    # The live status card (#3077): a factory execution carries a progress URL
-    # and token, and the bundle declares its phases. A malformed phase file is
-    # logged and mounts no tool; progress never stops a boot.
-    try:
-        progress = resolve_progress(os.environ, Path(config.session.plugin_dir))
-    except ValueError as exc:
-        logger.warning("report_progress not mounted: %s", exc)
-        progress = None
-    # The GitHub factory's issue read (ADR 0187): present only for an execution
-    # with a WorkItem, whose worker injected the route and capability.
+    # The GitHub factory issue read (ADR 0187) is present only for an execution
+    # with a WorkItem whose worker injected the route and capability.
     issue_read = resolve_issue_read(os.environ)
     progress_activity = ProgressActivity()
     progress_activity.model = config.model
@@ -664,6 +764,7 @@ def build_runner(
             or os.environ.get(BootEnv.env_key("progress_url")),
             network_enabled=not fake_model,
         )
+        approval_gate.memory_tools_mounted = memory_tools_mounted
     workspace_cwd = str(mounted_workspace) if mounted_workspace is not None else None
     derived_mcp_servers = derive_mcp_servers(
         config.session.plugin_dir,
@@ -799,9 +900,27 @@ def build_runner(
                     if progress is not None
                     else None
                 ),
-                issue_tool=(
-                    build_issue_tool(*issue_read) if issue_read is not None else None
+                turn_progress_tool=(
+                    build_turn_progress_tool(turn_progress) if turn_progress is not None else None
                 ),
+                memory_tools=(
+                    build_memory_tools(
+                        agent_store=resolve_facts_store(
+                            config.session.memory_ref,
+                            os.environ.get(MEMORY_TOKEN_ENV),
+                            turn_token=turn_write_token,
+                            max_facts=config.memory_max_facts,
+                        ),
+                        channel_store=channel_tool_store,
+                        turn=memory_turn,
+                        session_id=config.session.session_id,
+                    )
+                    if memory_tools_mounted
+                    and channel_tool_store is not None
+                    and memory_turn is not None
+                    else ()
+                ),
+                issue_tool=(build_issue_tool(*issue_read) if issue_read is not None else None),
             ),
             **(
                 {STATE_SERVER_NAME: build_state_server(state_client)}
@@ -840,6 +959,9 @@ def build_runner(
             # 1932-1948), and a skill's allowed-tools frontmatter is exactly
             # such a rule, so the hook is the only layer that sees every call.
             hooks=session_hooks,
+            # Only the bundle's own skills are listed to the model (#3766,
+            # ADR-0189); the CLI's built-in skills stay hidden.
+            skills=bundle_skill_names(config.session.plugin_dir),
             # Platform tools and connectors share the SDK MCP channel. The
             # generic policy pager is present only on an actionable surface;
             # state and publication remain independent platform capabilities.
@@ -889,6 +1011,9 @@ def build_runner(
                 approval_gate=approval_gate,
                 replay_messages=conversation_replay.messages,
                 disallowed_tools=config.disallowed_tools,
+                # The same holder the SDK tool closes over, so the scripted
+                # progress demo runs the real handler (ADR 0130).
+                turn_progress=turn_progress,
                 tool_access=tool_access,
             )
         assert real_options is not None
@@ -946,6 +1071,7 @@ def build_runner(
             false_completion_check=config.false_completion_check,
             history_resumed=conversation_replay.present,
             progress_activity=progress_activity if progress is not None else None,
+            turn_progress=turn_progress,
             usage_reporter=usage_reporter,
             primary_model=config.model,
             connector_failures=connector_failures
@@ -953,6 +1079,7 @@ def build_runner(
             connector_reprobe=connector_reprobe,
             connector_availability=connector_availability,
             history_capacity_exceeded=history_capacity_exceeded,
+            memory_turn=memory_turn,
             tool_access=tool_access,
             attachment_notice=format_attachment_notice(attachment_paths),
         ),
@@ -984,6 +1111,78 @@ async def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
         return store, None
     logger.info("memory loaded session=%s records=%d", config.session.session_id, len(records))
     return store, format_memory_preamble(records)
+
+
+async def _load_memory_facts(config: RunnerConfig) -> tuple[str | None, str | None]:
+    """Load agent and channel facts and the operator guidance at boot (#1461).
+
+    Returns the rendered facts block and the operator's guidance text. Each read
+    degrades on its own to nothing, like ``_load_memory``: an unreachable store
+    boots the agent without that part of its memory, never not at all.
+    """
+
+    token = os.environ.get(MEMORY_TOKEN_ENV)
+    agent_store = resolve_facts_store(config.session.memory_ref, token)
+    channel_store = resolve_facts_store(config.channel_memory_ref, token)
+    agent_facts: list[Fact] = []
+    channel_facts: list[Fact] = []
+    guidance: str | None = None
+
+    async def read(label: str, call: Callable[[], Awaitable[Any]]) -> Any:
+        try:
+            return await call()
+        except Exception as exc:  # noqa: BLE001 - degrade to nothing, never fail boot
+            logger.warning(
+                "memory %s load failed session=%s error_class=%s: %s",
+                label,
+                config.session.session_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    async def load_agent() -> None:
+        nonlocal agent_facts
+        if agent_store is not None:
+            agent_facts = await read("agent facts", agent_store.list) or []
+
+    async def load_channel() -> None:
+        nonlocal channel_facts
+        if channel_store is not None:
+            channel_facts = await read("channel facts", channel_store.list) or []
+
+    # Channel facts load whenever there is a channel store; the guidance is
+    # about the writing tools, so it is read only when writes are on (#3621).
+    writes_on = config.memory_writes_on
+
+    async def load_guidance() -> None:
+        nonlocal guidance
+        if writes_on and agent_store is not None and channel_store is not None:
+            guidance = await read("guidance", agent_store.guidance)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(load_agent)
+        tg.start_soon(load_channel)
+        tg.start_soon(load_guidance)
+    # Counts and the guidance source only: never statements, authors or the
+    # guidance text. Counts are what the prompt shows, after the per-memory cap.
+    # "none" mirrors build_runner's mount rule as far as boot can see it
+    # (writes on, a channel store and a memory token).
+    if not writes_on or channel_store is None or not token:
+        guidance_source = "none"
+    else:
+        guidance_source = "operator" if guidance is not None else "default"
+    logger.info(
+        "memory facts loaded session=%s agent=%d channel=%d guidance=%s",
+        config.session.session_id,
+        min(len(agent_facts), config.memory_max_facts),
+        min(len(channel_facts), config.memory_max_facts),
+        guidance_source,
+    )
+    return (
+        format_facts_preamble(agent_facts, channel_facts, max_facts=config.memory_max_facts),
+        guidance,
+    )
 
 
 # Boot compaction passes (#2927): each is a compare-and-set rewrite of the value
@@ -1111,6 +1310,10 @@ class _BootFetches:
     mcp_capability: McpToolCapabilityProbe | None
     connector_failures: tuple[ConnectorCapabilityFailure, ...] = ()
     history_capacity_exceeded: bool = False
+    # Remembered facts and operator guidance (#1461); field names match the
+    # build_runner parameters they feed.
+    memory_facts_preamble: str | None = None
+    memory_guidance: str | None = None
 
 
 async def _load_boot_fetches(
@@ -1125,6 +1328,7 @@ async def _load_boot_fetches(
 
     memory: tuple[MemoryStore, str | None] | None = None
     history: tuple[TranscriptStore, ConversationReplay, bool] | None = None
+    facts: tuple[str | None, str | None] = (None, None)
     capability: McpToolCapabilityProbe | None = None
     derived = derive_mcp_servers(
         config.session.plugin_dir,
@@ -1148,6 +1352,10 @@ async def _load_boot_fetches(
         nonlocal history
         history = await _load_history(config)
 
+    async def load_facts() -> None:
+        nonlocal facts
+        facts = await _load_memory_facts(config)
+
     async def probe() -> None:
         nonlocal capability
         capability = await probe_mcp_tool_capability(
@@ -1159,6 +1367,7 @@ async def _load_boot_fetches(
     async with anyio.create_task_group() as tg:
         tg.start_soon(load_memory)
         tg.start_soon(load_history)
+        tg.start_soon(load_facts)
         if not fake_model:
             tg.start_soon(probe)
 
@@ -1175,6 +1384,8 @@ async def _load_boot_fetches(
         mcp_capability=capability,
         connector_failures=connector_failures,
         history_capacity_exceeded=history[2],
+        memory_facts_preamble=facts[0],
+        memory_guidance=facts[1],
     )
 
 
@@ -1243,6 +1454,8 @@ def _serve() -> None:
         attachments_path=attachments_path,
         connector_failures=fetches.connector_failures,
         history_capacity_exceeded=fetches.history_capacity_exceeded,
+        memory_facts_preamble=fetches.memory_facts_preamble,
+        memory_guidance=fetches.memory_guidance,
     )
 
     def capture_mounted_workspace() -> WorkspaceSnapshot:

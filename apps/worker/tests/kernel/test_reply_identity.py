@@ -85,6 +85,7 @@ class _TripleBinding:
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+    **_: object,
     ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',

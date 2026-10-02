@@ -115,6 +115,7 @@ class _HistoryBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         del kind, address
         return {
@@ -413,6 +414,7 @@ class _BuiltInCodingBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         return {}
 
@@ -1156,6 +1158,7 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
             *,
             kind: str | None = None,
             address: str | None = None,
+        **_: object,
         ) -> dict[str, str]:
             return {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
 
@@ -1290,6 +1293,7 @@ def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
             *,
             kind: str | None = None,
             address: str | None = None,
+        **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -1947,6 +1951,7 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
             *,
             kind: str | None = None,
             address: str | None = None,
+        **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -2016,6 +2021,7 @@ def _workspace_binding(
             *,
             kind: str | None = None,
             address: str | None = None,
+        **_: object,
         ) -> dict[str, str]:
             return dict(boot_env_override or {"CURIE_RUNNER_TOKEN": "workspace-test-token"})
 
@@ -3458,6 +3464,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
             *,
             kind: str | None = None,
             address: str | None = None,
+        **_: object,
         ) -> dict[str, str]:
             return {
                 "CURIE_HISTORY_REF": f"https://api.example.com/state/transcript/{thread_key}",
@@ -5288,6 +5295,7 @@ class _TokenBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         return {"CURIE_RUNNER_TOKEN": self._token}
 

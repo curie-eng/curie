@@ -38,7 +38,7 @@ from plugin_format.yaml_loader import safe_load_unique
 
 from .adapter import build_options
 from .connectors import derive_mcp_servers
-from .plugin import PluginBundleError, bundle_mcp_servers, load_plugins
+from .plugin import PluginBundleError, bundle_mcp_servers, bundle_skill_names, load_plugins
 
 logger = logging.getLogger(__name__)
 
@@ -655,6 +655,8 @@ async def _connect_and_poll(plugins: list[Any], plugin_dir: str) -> list[dict[st
         max_turns=1,
         max_budget_usd=None,
         resume=None,
+        # Parity with the session entry point (ADR-0189); this check runs no query.
+        skills=bundle_skill_names(plugin_dir),
     )
     client = ClaudeSDKClient(options)
     await client.connect()

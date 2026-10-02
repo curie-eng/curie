@@ -2119,7 +2119,9 @@ def test_terminate_thread_observes_absence_of_labelled_and_sql_names(
     assert isinstance(observation, TerminationObservation)
     assert fake_k8s.get_claim(sql_claim, request_timeout_seconds=1.0) is None
     assert fake_k8s.get_sandbox(sql_sandbox, request_timeout_seconds=1.0) is None
-    assert fake_k8s.get_claim(handle.claim_name, request_timeout_seconds=1.0) is not None
+    # The thread's current claim is deleted with the stored name. A labelled
+    # claim that is not the route is left for the reaper.
+    assert fake_k8s.get_claim(handle.claim_name, request_timeout_seconds=1.0) is None
     assert "extra-labelled-claim" in fake_k8s.claims
     assert sql_claim in str(observation.claims)
     assert sql_sandbox in str(observation.sandboxes)

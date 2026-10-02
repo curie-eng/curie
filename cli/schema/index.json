@@ -232,10 +232,16 @@
       "version": "1.0"
     },
     {
+      "result": "MemoryGuidanceOutput",
+      "kind": "CliOutput",
+      "schema": "memory.schema.json",
+      "version": "2.1"
+    },
+    {
       "result": "MemoryOutput",
       "kind": "CliOutput",
       "schema": "memory.schema.json",
-      "version": "2.0"
+      "version": "2.1"
     },
     {
       "result": "MessageDryRunOutput",
@@ -295,12 +301,18 @@
       "result": "OverridesOutput",
       "kind": "CliOutput",
       "schema": "overrides.schema.json",
-      "version": "1.2"
+      "version": "2.0"
     },
     {
       "result": "PublicationPolicyOutput",
       "kind": "CliOutput",
       "schema": "publication-policy.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "QuickstartOutput",
+      "kind": "CliOutput",
+      "schema": "factory-quickstart.schema.json",
       "version": "1.0"
     },
     {

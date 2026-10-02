@@ -793,6 +793,18 @@ async def update_agent_memory(session: AsyncSession, agent: Agent, memory: bool)
     return agent
 
 
+async def update_agent_memory_writes(
+    session: AsyncSession, agent: Agent, memory_writes: bool
+) -> Agent:
+    """Set whether the runner mounts its memory tools for this agent (#1461).
+    Takes effect at the next sandbox boot; stored facts are untouched."""
+
+    agent.memory_writes = memory_writes
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
 async def update_agent_approval_tools(
     session: AsyncSession, agent: Agent, tools: list[str]
 ) -> Agent:

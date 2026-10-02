@@ -53,9 +53,10 @@ from .delivery_lease import DeliveryLeaseStore
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
-from .kernel import Kernel
+from .kernel import Kernel, drain_pending_memory_closes
 from .killswitch import KillSwitch
 from .markers import Markers
+from .progress import ProgressStore
 from .publication_clients import (
     GitHubPublicationLookup,
     PublicationCredentialClient,
@@ -82,6 +83,7 @@ from .sandbox import (
 )
 from .sibling_turns import build_sibling_limit
 from .slack_tokens import slack_bot_tokens
+from .stream_retention import StreamRetention, build_stream_retention
 from .threadlock import ThreadLock
 from .upgrade_drain import UpgradeDrainGate
 from .workitem_dispatch import WorkItemDispatchClient
@@ -130,6 +132,9 @@ class Runtime:
     publication_loop: PublicationReconcileLoop | None = None
     # None when the worker has no internal token and so no WorkItem client.
     orphan_sweeper: WorkItemOrphanSweeper | None = None
+    # Trims settled entries off the runs and eval streams (ADR 0184). Optional
+    # only so a Runtime constructed elsewhere need not name it.
+    stream_retention: StreamRetention | None = None
 
 
 # 365 days, the ceiling shared by all three operator-tunable seconds knobs
@@ -560,6 +565,9 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         suspended_route_ttl_seconds=sub_config.suspended_route_ttl_seconds,
         work_items=work_items,
         sibling_limit=sibling_limit,
+        # Deliberate progress (ADR 0130): the durable record a person's turn
+        # reports on, the one the maintenance tick sweeps.
+        progress=ProgressStore(async_redis, config),
     )
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
     kernel.attach_killswitch(killswitch)
@@ -666,6 +674,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
             default_max_output_tokens_per_run=config.default_max_output_tokens_per_run,
         ),
         publication_loop=publication_loop,
+        stream_retention=build_stream_retention(config, async_redis),
     )
 
 
@@ -1059,6 +1068,7 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
                 )
             else:
                 logger.exception("work-item orphan boot sweep failed; continuing boot")
+    retention = getattr(rt, "stream_retention", None)
     policy = _supervise_policy(config)
     try:
         # return_exceptions=True + per-task restart: a crash in one consumer must
@@ -1121,9 +1131,24 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
                 if sweeper is not None
                 else []
             ),
+            *(
+                [
+                    _supervise(
+                        "stream-retention",
+                        lambda: retention.run_forever(shutdown),
+                        shutdown,
+                        **policy,
+                    )
+                ]
+                if retention is not None
+                else []
+            ),
             return_exceptions=True,
         )
     finally:
+        # Memory turn closes still in flight get a short grace, then are let
+        # go: an unclosed credential is refused at its expiry anyway (#3776).
+        await drain_pending_memory_closes()
         await rt.runner.close()
         await rt.sink.aclose()
         await rt.eval_http.aclose()

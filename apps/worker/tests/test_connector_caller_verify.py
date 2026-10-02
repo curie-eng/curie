@@ -28,6 +28,8 @@ _OTHER_SEED = {
     "a_stored_name_outside_the_bundle_shape_is_carried_verbatim": (
         "the_same_claims_under_another_seed"
     ),
+    "a_work_item_run": "the_same_claims_under_another_seed",
+    "the_same_work_item_under_another_run": "the_same_claims_under_another_seed",
 }
 
 
@@ -63,7 +65,12 @@ def test_every_frozen_token_is_admitted_before_it_expires(vector: dict[str, obje
     decision = _decide(
         vector, str(vector["minted"]), admits={str(vector["agent"])}, now=_exp(vector) - 1
     )
-    assert decision == caller.Decision(agent=str(vector["agent"]), refusal=None)
+    assert decision == caller.Decision(
+        agent=str(vector["agent"]),
+        refusal=None,
+        run=str(vector["run"]) if "run" in vector else None,
+        work_item=str(vector["work_item"]) if "work_item" in vector else None,
+    )
     assert decision.admitted
 
 
@@ -167,6 +174,35 @@ def _tampered() -> list[tuple[str, str]]:
         ("agent_not_a_string", signed(b'{"agent":7,"exp":1890000000}')),
         ("an_empty_agent", signed(b'{"agent":"","exp":1890000000}')),
         ("an_extra_claim", signed(b'{"agent":"acme-dev","aud":"x","exp":1890000000}')),
+        (
+            "only_run",
+            signed(
+                b'{"agent":"acme-dev","exp":1790000000,'
+                b'"run":"11111111-1111-4111-8111-111111111111"}'
+            ),
+        ),
+        (
+            "only_work_item",
+            signed(
+                b'{"agent":"acme-dev","exp":1790000000,'
+                b'"work_item":"22222222-2222-4222-8222-222222222222"}'
+            ),
+        ),
+        (
+            "an_uppercase_run",
+            signed(
+                b'{"agent":"acme-dev","exp":1790000000,'
+                b'"run":"AAAAAAAA-1111-4111-8111-111111111111",'
+                b'"work_item":"22222222-2222-4222-8222-222222222222"}'
+            ),
+        ),
+        (
+            "a_null_run",
+            signed(
+                b'{"agent":"acme-dev","exp":1790000000,"run":null,'
+                b'"work_item":"22222222-2222-4222-8222-222222222222"}'
+            ),
+        ),
         ("a_missing_claim", signed(b'{"agent":"acme-dev"}')),
         ("not_an_object", signed(b'["acme-dev",1890000000]')),
         ("not_json", signed(b"acme-dev")),

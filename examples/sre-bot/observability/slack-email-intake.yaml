@@ -1,0 +1,140 @@
+# Opt-in Slack Email alert intake (#3527). Create the code ConfigMap and Secret
+# described in docs/SLACK-EMAIL-INTAKE.md before applying this manifest.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sre-slack-email-intake
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: sre-slack-email-intake
+  template:
+    metadata:
+      labels:
+        app: sre-slack-email-intake
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8080"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: intake
+          image: python:3.12-alpine@sha256:d09d15e60962ca365d1cd544a48773bac9d33f2fb1b00f2aa0deec78ade7dc31
+          imagePullPolicy: IfNotPresent
+          command: [python3, -B, /app/server.py]
+          ports:
+            - name: health
+              containerPort: 8080
+          env:
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sre-slack-email-intake
+                  key: SLACK_BOT_TOKEN
+            - name: SLACK_CHANNEL_ID
+              valueFrom:
+                secretKeyRef:
+                  name: sre-slack-email-intake
+                  key: SLACK_CHANNEL_ID
+            - name: SLACK_EMAIL_SOURCE_USER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: sre-slack-email-intake
+                  key: SLACK_EMAIL_SOURCE_USER_ID
+            - name: ALERT_SUBJECT_PREFIXES
+              valueFrom:
+                secretKeyRef:
+                  name: sre-slack-email-intake
+                  key: ALERT_SUBJECT_PREFIXES
+            - name: SLACK_SCAN_NOT_BEFORE
+              valueFrom:
+                secretKeyRef:
+                  name: sre-slack-email-intake
+                  key: SLACK_SCAN_NOT_BEFORE
+            - name: SLACK_CANARY_THREAD_TS
+              valueFrom:
+                secretKeyRef:
+                  name: sre-slack-email-intake
+                  key: SLACK_CANARY_THREAD_TS
+            - name: CURIE_HOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sre-slack-email-intake
+                  key: CURIE_HOOK_URL
+            - name: CURIE_HOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: sre-slack-email-intake
+                  key: CURIE_HOOK_SECRET
+            - name: SLACK_EMAIL_SOURCE_BOT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: sre-slack-email-intake
+                  key: SLACK_EMAIL_SOURCE_BOT_ID
+                  optional: true
+            - name: CURIE_SLACK_ADAPTER
+              valueFrom:
+                secretKeyRef:
+                  name: sre-slack-email-intake
+                  key: CURIE_SLACK_ADAPTER
+                  optional: true
+            - name: POLL_SECONDS
+              valueFrom:
+                secretKeyRef:
+                  name: sre-slack-email-intake
+                  key: POLL_SECONDS
+                  optional: true
+            - name: PLACEHOLDER_STALE_SECONDS
+              valueFrom:
+                secretKeyRef:
+                  name: sre-slack-email-intake
+                  key: PLACEHOLDER_STALE_SECONDS
+                  optional: true
+            - name: HTTP_TIMEOUT_SECONDS
+              valueFrom:
+                secretKeyRef:
+                  name: sre-slack-email-intake
+                  key: HTTP_TIMEOUT_SECONDS
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 10
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: health
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: code
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: code
+          configMap:
+            name: sre-slack-email-intake-code
+            defaultMode: 0444

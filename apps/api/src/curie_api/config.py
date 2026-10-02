@@ -12,7 +12,7 @@ production deployments.
 
 import json
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from aci_protocol import (
@@ -28,6 +28,7 @@ from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .e2e_connector import E2EInstall
 from .workspace_policy import valid_allowlist_entry, valid_repository_name
 
 # Dev-only default secrets. The production boot gate refuses to start when any of
@@ -36,6 +37,18 @@ _DEV_DEFAULT_API_KEY = "curie-dev-key"
 _DEV_DEFAULT_WEBHOOK_SECRET = "dev-webhook-secret"
 _DEV_DEFAULT_INTERNAL_WORKER_TOKEN = "curie-dev-worker-token"
 _DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = "curie-dev-approval-chat-attester"
+
+
+def valid_base_branch(name: Any) -> bool:
+    """A branch name a factory base may use: no whitespace, leading ``-`` or ``..``."""
+
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and not any(char.isspace() for char in name)
+        and not name.startswith("-")
+        and ".." not in name
+    )
 
 
 class Settings(BaseSettings):
@@ -174,6 +187,11 @@ class Settings(BaseSettings):
     # boot rather than surfacing as a mid-reconcile timedelta error (#3709).
     github_factory_reconcile_interval_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
     github_factory_reconcile_grace_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
+    # Polling is the default intake (#3745). Webhook mode is opt-in and keeps
+    # the missed-label backstop. The interval is a positive finite number of
+    # seconds; 45 sits in the 30 to 60 second band.
+    github_factory_intake: Literal["poll", "webhook"] = "poll"
+    github_factory_poll_interval_s: float = Field(default=45, gt=0, allow_inf_nan=False)
     # Public origin GitHub's image proxy fetches the live status card from
     # (#3077), e.g. https://curie.example.com. Empty omits the card image; the
     # status comment still carries the checklist and the result.
@@ -194,6 +212,16 @@ class Settings(BaseSettings):
     github_factory_python_ci: dict[str, dict[str, Any]] = Field(
         default_factory=dict,
         validation_alias="GITHUB_FACTORY_PYTHON_CI",
+    )
+    # Bases a factory ticket may start from and target, per repository
+    # (#3095, ADR 0186), a JSON object keyed by ``owner/name`` (matched
+    # case-insensitively): ``{"bases": [str, ...], "default_base": str | null}``.
+    # A ``base:<branch>`` label picks one; no label picks ``default_base``, or
+    # the repository default branch when that is unset. A repository without
+    # an entry may only use its default branch. Empty by default.
+    github_factory_bases: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        validation_alias="GITHUB_FACTORY_BASES",
     )
     # Public model price list the factory's per-run cost estimate reads
     # (#3223), OpenRouter-shaped. Fetched at most every 6 h; any failure leaves
@@ -678,6 +706,48 @@ class Settings(BaseSettings):
             "CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS", "connector_proxy_image_pull_secrets"
         ),
     )
+    e2e_connector_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("CURIE_E2E_CONNECTOR_ENABLED", "e2e_connector_enabled"),
+    )
+    e2e_connector_image: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_CONNECTOR_IMAGE", "e2e_connector_image"),
+    )
+    e2e_namespace_prefix: str = Field(
+        default="curie-e2e-",
+        validation_alias=AliasChoices("CURIE_E2E_NAMESPACE_PREFIX", "e2e_namespace_prefix"),
+    )
+    e2e_owner_label_key: str = Field(
+        default="curietech.ai/e2e-owner",
+        validation_alias=AliasChoices("CURIE_E2E_OWNER_LABEL_KEY", "e2e_owner_label_key"),
+    )
+    e2e_owner_label_value: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_OWNER_LABEL_VALUE", "e2e_owner_label_value"),
+    )
+    e2e_service_account: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_SERVICE_ACCOUNT", "e2e_service_account"),
+    )
+    e2e_service_account_namespace: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_E2E_SERVICE_ACCOUNT_NAMESPACE", "e2e_service_account_namespace"
+        ),
+    )
+    e2e_worker_cluster_role: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_WORKER_CLUSTER_ROLE", "e2e_worker_cluster_role"),
+    )
+    e2e_ttl_seconds: int = Field(
+        default=3600,
+        validation_alias=AliasChoices("CURIE_E2E_TTL_SECONDS", "e2e_ttl_seconds"),
+    )
+    e2e_pod_security: str = Field(
+        default="baseline",
+        validation_alias=AliasChoices("CURIE_E2E_POD_SECURITY", "e2e_pod_security"),
+    )
 
     def connector_proxy(self) -> ConnectorProxy | None:
         """The proxy each hosted connector renders with, or None for none."""
@@ -695,6 +765,20 @@ class Settings(BaseSettings):
                 for name in self.connector_proxy_image_pull_secrets.split(",")
                 if name.strip()
             ),
+        )
+
+    def e2e_install(self) -> E2EInstall:
+        return E2EInstall(
+            enabled=self.e2e_connector_enabled,
+            image=self.e2e_connector_image.strip(),
+            namespace_prefix=self.e2e_namespace_prefix.strip(),
+            owner_label_key=self.e2e_owner_label_key.strip(),
+            owner_label_value=self.e2e_owner_label_value.strip(),
+            service_account=self.e2e_service_account.strip(),
+            service_account_namespace=self.e2e_service_account_namespace.strip(),
+            worker_cluster_role=self.e2e_worker_cluster_role.strip(),
+            ttl_seconds=self.e2e_ttl_seconds,
+            pod_security=self.e2e_pod_security.strip() or "baseline",
         )
 
     def valkey_dsn(self) -> str:
@@ -761,6 +845,38 @@ class Settings(BaseSettings):
                 )
             policies[repo] = {"check": check, "paths": list(paths), "pendingCheckPrefix": prefix}
         return policies
+
+    @field_validator("github_factory_bases", mode="before")
+    @classmethod
+    def _validate_factory_bases(cls, value: Any) -> dict[str, dict[str, Any]]:
+        if isinstance(value, str):
+            value = json.loads(value) if value.strip() else {}
+        if not isinstance(value, dict):
+            raise ValueError("GITHUB_FACTORY_BASES must be a JSON object")
+        entries: dict[str, dict[str, Any]] = {}
+        for repo, entry in value.items():
+            if not isinstance(repo, str) or not valid_repository_name(repo):
+                raise ValueError(f"GITHUB_FACTORY_BASES key {repo!r} is not owner/name")
+            if not isinstance(entry, dict) or set(entry) - {"bases", "default_base"}:
+                raise ValueError(f"GITHUB_FACTORY_BASES[{repo!r}] has an invalid shape")
+            bases = entry.get("bases")
+            if (
+                not isinstance(bases, list)
+                or not bases
+                or not all(valid_base_branch(base) for base in bases)
+                or len(set(bases)) != len(bases)
+            ):
+                raise ValueError(
+                    f"GITHUB_FACTORY_BASES[{repo!r}].bases must be a non-empty list of"
+                    " unique branch names"
+                )
+            default_base = entry.get("default_base")
+            if default_base is not None and default_base not in bases:
+                raise ValueError(
+                    f"GITHUB_FACTORY_BASES[{repo!r}].default_base must be one of its bases"
+                )
+            entries[repo] = {"bases": list(bases), "default_base": default_base}
+        return entries
 
     @model_validator(mode="after")
     def _validate_connector_proxy(self) -> "Settings":
@@ -837,9 +953,11 @@ class Settings(BaseSettings):
             offenders.append("GITHUB_APP_ID")
         if not self.github_app_private_key.strip():
             offenders.append("GITHUB_APP_PRIVATE_KEY")
-        if (
-            not self.github_webhook_secret.strip()
-            or self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET
+        # Polling may disable signed deliveries with a blank secret, but a
+        # published signing key must never authenticate factory deliveries.
+        if self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET or (
+            self.github_factory_intake == "webhook"
+            and not self.github_webhook_secret.strip()
         ):
             offenders.append("GITHUB_WEBHOOK_SECRET")
         label = self.github_factory_label
@@ -908,7 +1026,14 @@ class Settings(BaseSettings):
         offenders = []
         if self.api_key in ("", _DEV_DEFAULT_API_KEY):
             offenders.append("API_KEY")
-        if self.github_webhook_secret in ("", _DEV_DEFAULT_WEBHOOK_SECRET):
+        empty_poll_secret = (
+            self.github_webhook_secret == ""
+            and self.github_factory_ingress_enabled
+            and self.github_factory_intake == "poll"
+        )
+        if self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET or (
+            self.github_webhook_secret == "" and not empty_poll_secret
+        ):
             offenders.append("GITHUB_WEBHOOK_SECRET")
         if self.internal_worker_token in ("", _DEV_DEFAULT_INTERNAL_WORKER_TOKEN):
             offenders.append("CURIE_INTERNAL_WORKER_TOKEN")

@@ -139,6 +139,7 @@ class PublicationWork:
     owner_running: bool = True
     open_as_draft: bool = False
     branch_prefix: str | None = None
+    base_ref: str | None = None
 
 
 class PublicationStore(Protocol):
@@ -286,6 +287,7 @@ class PublicationGitHub(Protocol):
         expected_head_sha: str,
         authorization_header: str,
         draft: bool = False,
+        base: str | None = None,
     ) -> PublicationPullState | None | Awaitable[PublicationPullState | None]: ...
 
 
@@ -922,6 +924,7 @@ class PublicationReconciler:
             observed_body_sha256=work.observed_body_sha256,
             open_as_draft=work.open_as_draft,
             branch_prefix=work.branch_prefix,
+            base_ref=work.base_ref,
         )
 
     async def _read_stored_pull(
@@ -1205,6 +1208,7 @@ class PublicationReconciler:
                             expected_head_sha=branch_head,
                             authorization_header=credential.authorization_header,
                             draft=work.open_as_draft,
+                            base=work.base_ref,
                         )
                     )
                     if recovered is None:

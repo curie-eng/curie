@@ -27,6 +27,8 @@ from _support import (
     completed,
     free_port,
     post_event,
+    progress_post,
+    progress_update,
     refused_agentmail_connection,
     refused_agentmail_reply,
     reply_post,
@@ -710,7 +712,7 @@ class _RaiseOnceClient(AgentMailClient):
         super().__init__(config)
         self.calls = 0
 
-    def reply(self, message_id: str, text: str) -> tuple[int, Any]:
+    def reply(self, message_id: str, text: str, *, reply_all: bool = False) -> tuple[int, Any]:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("injected")
@@ -835,6 +837,7 @@ def test_version_one_state_migrates_without_losing_admitted_or_delivered_replies
     # Reconstruct the released v1 database shape, preserving real admitted rows.
     with sqlite3.connect(adapter.config.state_path) as connection:
         connection.execute("ALTER TABLE completion_events DROP COLUMN deleted")
+        connection.execute("DROP TABLE approval_refs")
         connection.execute("PRAGMA user_version=1")
     replacement = MailAdapter(adapter.config)
     try:
@@ -892,3 +895,80 @@ def test_a_delivered_completion_with_no_text_still_sends_the_empty_reply_notice(
     assert status == 200
     ((_in_reply_to, text),) = mail.replies
     assert text.startswith(EMPTY_REPLY_TEXT)
+
+
+# --- deliberate progress (reply wire 1.1, ADR-0130) is silent -----------------
+
+
+def test_a_progress_post_never_joins_the_buffered_reply(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    """@spec ADR-0130 d5: progress never becomes a second answer.
+
+    An approval card's text is appended to the email; a progress post's text
+    would put a task-status line into the answer the correspondent reads.
+    """
+    seed(mail, adapter)
+    post_event(egress_url, update("the answer", reply_ref="msg-1"))
+
+    status, body = post_event(
+        egress_url, progress_post("Reading the ledger", reply_ref="msg-1")
+    )
+    post_event(egress_url, progress_post("Found it", reply_ref="msg-1", kind="milestone"))
+    post_event(egress_url, completed("ev-1"))
+
+    assert status == 200
+    assert body == {"ref": None}
+    ((_in_reply_to, text),) = mail.replies
+    assert text.startswith("the answer")
+    assert "Reading the ledger" not in text
+    assert "Found it" not in text
+
+
+def test_a_progress_post_with_no_ref_is_silent_even_when_two_turns_are_live(
+    mail: MailState, ingress: IngressState, adapter: MailAdapter, egress_url: str
+) -> None:
+    """An approval card here is refused 503 as ambiguous; progress owes nothing."""
+    mail.add_inbound("msg-1", "thr-1", subject="First", text="one")
+    mail.add_inbound("msg-2", "thr-1", subject="Second", text="two")
+    adapter.poll_once()
+    assert ingress.delivery_ids() == ["msg-1", "msg-2"]
+
+    status, _ = post_event(egress_url, progress_post("Reading the ledger"))
+
+    assert status == 200
+    assert mail.replies == []
+
+
+def test_a_progress_body_for_an_unadmitted_conversation_is_silent(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    """Silence has no owner to find, so it cannot be a retryable miss either."""
+    seed(mail, adapter)
+
+    post_status, _ = post_event(
+        egress_url, progress_post("Reading", conversation_id="thr-unknown", reply_ref="msg-x")
+    )
+    update_status, _ = post_event(
+        egress_url, progress_update("Testing", conversation_id="thr-unknown", reply_ref="msg-x")
+    )
+
+    assert (post_status, update_status) == (200, 200)
+    assert mail.replies == []
+
+
+def test_a_card_edit_never_replaces_or_clears_the_buffered_reply(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    seed(mail, adapter)
+    post_event(egress_url, update("the answer", reply_ref="msg-1"))
+
+    status, body = post_event(egress_url, progress_update("Running the suite"))
+    post_event(egress_url, progress_update("Done", state="complete", revision=3))
+    post_event(egress_url, completed("ev-1"))
+
+    assert status == 200
+    assert body == {"ref": None}
+    ((_in_reply_to, text),) = mail.replies
+    assert text.startswith("the answer")
+    assert "Running the suite" not in text

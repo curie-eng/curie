@@ -452,3 +452,42 @@ assert_probe_delivery curie curie \
   --set security.gvisor.runtimeClassName=acme-runsc
 
 echo "OK: per-agent connector-secret render assertions passed"
+
+# ADR 0176: the test cluster kubeconfig is a connector secret the sandbox must
+# not receive. A normal connector token still renders beside it.
+withheld="$(helm template curie "$CHART" \
+  --set-string 'agentSandbox.connectorSecrets.acme-a.GITHUB_PERSONAL_ACCESS_TOKEN=agent-a-sentinel' \
+  --set-string 'agentSandbox.connectorSecrets.acme-a.E2E_CLUSTER_KUBECONFIG=kubeconfig-sentinel' \
+  2>/dev/null)"
+withheld_secret="$(require_resource "$withheld" Secret curie-agent-acme-a-connector-secrets)"
+withheld_template="$(require_resource "$withheld" SandboxTemplate curie-agent-acme-a-runner)"
+require_text "$withheld_secret" 'GITHUB_PERSONAL_ACCESS_TOKEN: "agent-a-sentinel"' \
+  "withheld render dropped the ordinary connector secret"
+forbid_text "$withheld_secret" 'E2E_CLUSTER_KUBECONFIG|kubeconfig-sentinel' \
+  "sandbox Secret stored the test cluster kubeconfig"
+forbid_text "$withheld_template" 'E2E_CLUSTER_KUBECONFIG|kubeconfig-sentinel' \
+  "sandbox template referenced the test cluster kubeconfig"
+require_text "$withheld_template" 'name: GITHUB_PERSONAL_ACCESS_TOKEN' \
+  "sandbox template dropped the ordinary connector secret"
+
+stock_api="$(require_resource "$(helm template curie "$CHART" 2>/dev/null)" Deployment curie-api)"
+require_text "$stock_api" 'name: CURIE_E2E_CONNECTOR_ENABLED' \
+  "API lacks CURIE_E2E_CONNECTOR_ENABLED"
+require_text "$(grep -A1 'name: CURIE_E2E_CONNECTOR_ENABLED' <<<"$stock_api")" 'value: "false"' \
+  "e2e connector must be disabled on a stock install"
+
+if helm template curie "$CHART" --set e2eConnector.enabled=true >/dev/null 2>&1; then
+  fail "e2eConnector.enabled without the test cluster identity rendered"
+fi
+
+enabled_api="$(require_resource "$(helm template curie "$CHART" \
+  --set e2eConnector.enabled=true \
+  --set e2eConnector.ownerLabel.value=acme \
+  --set e2eConnector.serviceAccount=curie-e2e-connector \
+  --set e2eConnector.serviceAccountNamespace=test-system \
+  --set e2eConnector.workerClusterRole=curie-e2e-connector-namespace \
+  2>/dev/null)" Deployment curie-api)"
+require_text "$(grep -A1 'name: CURIE_E2E_CONNECTOR_ENABLED' <<<"$enabled_api")" 'value: "true"' \
+  "enabled install did not tell the API the test cluster is configured"
+require_text "$enabled_api" 'value: "acme"' \
+  "enabled install did not pass the owner label value"

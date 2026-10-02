@@ -44,6 +44,7 @@ from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     THREAD_HASH_LABEL,
+    TURN_PROGRESS_ELIGIBILITY_ENV,
     CapacityExhaustedError,
     ClaimTimeoutError,
     NoRouteError,
@@ -192,6 +193,7 @@ class SandboxSubstrate:
         publication_visible_outcome_revision: int = 0,
         fresh_only: bool = False,
         runner_resources: dict[str, Any] | None = None,
+        caller_run: str | None = None,
     ) -> SandboxHandle:
         """Return the thread's live sandbox, claiming a warm one if needed.
 
@@ -245,6 +247,7 @@ class SandboxSubstrate:
                         publication_visible_outcome_revision=(publication_visible_outcome_revision),
                         fresh_only=fresh_only,
                         runner_resources=runner_resources,
+                        caller_run=caller_run,
                     )
                     outcome = "claimed"
             except Exception as exc:
@@ -409,6 +412,7 @@ class SandboxSubstrate:
         agent_name: str | None = None,
         validate_candidate: Callable[[SandboxHandle], None] | None = None,
         runner_resources: dict[str, Any] | None = None,
+        caller_run: str | None = None,
     ) -> SandboxHandle:
         """Cold create a runner, then CAS it over one retained route.
 
@@ -435,6 +439,7 @@ class SandboxSubstrate:
             generation=expected.generation + 1,
             publish=False,
             runner_resources=runner_resources,
+            caller_run=caller_run,
         )
         try:
             if validate_candidate is not None:
@@ -524,6 +529,7 @@ class SandboxSubstrate:
         workspace_materialized_head: str | None = None,
         publication_visible_outcome_revision: int | None = None,
         runner_resources: dict[str, Any] | None = None,
+        caller_run: str | None = None,
     ) -> SandboxHandle:
         """Rehydrate a suspended thread into a fresh claim.
 
@@ -584,6 +590,7 @@ class SandboxSubstrate:
                     ),
                     generation=old.generation + 1,
                     runner_resources=runner_resources,
+                    caller_run=caller_run,
                 )
             except Exception as exc:
                 error = exc
@@ -748,7 +755,10 @@ class SandboxSubstrate:
         if sandbox_name:
             sandbox_names.add(sandbox_name)
         record = self._affinity.get(thread_key)
-        if not claim_names and not sandbox_names and record is not None:
+        # The route may name a replacement claim the SQL row has not heard
+        # about (ADR 0178: a token that would outlive the deadline is handed
+        # off before the turn). That live claim is part of this thread.
+        if record is not None:
             claim_names.add(record.handle.claim_name)
             sandbox_names.add(record.handle.sandbox_name)
         if not claim_names:
@@ -1135,6 +1145,7 @@ class SandboxSubstrate:
         publish: bool = True,
         fresh_only: bool = False,
         runner_resources: dict[str, Any] | None = None,
+        caller_run: str | None = None,
     ) -> SandboxHandle:
         config = self._config
         nonce = uuid.uuid4().hex[:6]
@@ -1199,6 +1210,8 @@ class SandboxSubstrate:
             generation=generation,
             max_turns=(env or {}).get(MAX_TURNS_ENV),
             carries_caller_token=CONNECTOR_CALLER_TOKEN_ENV in (env or {}),
+            carries_turn_progress=TURN_PROGRESS_ELIGIBILITY_ENV in (env or {}),
+            caller_run=caller_run,
         )
         if not publish:
             return handle

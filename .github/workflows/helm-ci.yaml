@@ -166,6 +166,11 @@ jobs:
       - name: Reject chart-owned extraEnv duplicates
         run: bash charts/curie/ci/reserved-env-assertions.sh
 
+      # Prove worker.streamRetention.minAgeSeconds reaches the worker, is
+      # bounded by the schema, and defaults on a release with no such block.
+      - name: helm render assertions (stream retention window)
+        run: bash charts/curie/ci/stream-retention-assertions.sh
+
       # Prove the API Service keeps a stable NodePort when enabled, allows an
       # override, and omits the field for ClusterIP or explicit auto allocation.
       - name: helm render assertions (api service NodePort)
@@ -289,6 +294,16 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/statefulset-metadata-rollout-assertions.sh
+
+      # Prove the compute-plane PodDisruptionBudgets (issue #1574): off by
+      # default, each enabled budget selects exactly its own Deployment's pods
+      # (a selector mutated onto another component fails the checker), an
+      # unacknowledged blocking budget refuses the render, and the dispatcher
+      # accepts only an acknowledged blocking budget.
+      - name: helm render assertions (compute-plane PodDisruptionBudgets)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/compute-pdb-assertions.sh
 
       - name: helm render assertions (otel collector durable delivery)
         run: |
@@ -752,6 +767,15 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/sandbox-capacity-fit-assertions.sh
+
+      # Prove worker.maxConcurrency (issue #760): it reaches the worker env as
+      # CURIE_WORKER_MAX_CONCURRENCY exactly once, the schema holds it to 1
+      # through 256, and NOTES prints replicas x maxConcurrency beside the
+      # sandbox quota ceiling (lookup stubbed to a fixture node).
+      - name: helm render assertions (worker maxConcurrency)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/worker-max-concurrency-assertions.sh
 
       # Prove the in-chart rustfs resource floors (issue #2706). Presence is
       # not the defect; the 512Mi memory ceiling is. The shipped default sat

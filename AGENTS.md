@@ -609,6 +609,13 @@ as a whole; remembered only):
   Python/Rust, so they are frozen together in
   `tests/vectors/approval-action-ids.json`.
   [vector: `tests/vectors/approval-action-ids.json`]
+- worker vs CLI progress block ids -- the Slack progress card and milestone
+  `block_id` prefixes (`PROGRESS_CARD_BLOCK_ID_PREFIX` and
+  `PROGRESS_MILESTONE_BLOCK_ID_PREFIX` in `apps/worker/src/curie_worker/blocks.py`)
+  and the CLI stub's copies (`cli/src/chat.rs`), which tell a progress post or
+  edit from the turn's answer, can't share code across Python/Rust, so they are
+  frozen together in `tests/vectors/progress-blocks.json`.
+  [vector: `tests/vectors/progress-blocks.json`]
 - dispatcher vs API approval-principal tokens -- the dispatcher mint codec
   (`apps/dispatcher/src/curie_dispatcher/approval_principal.py`) and API verifier
   (`apps/api/src/curie_api/approval_principal.py`) are frozen together in
@@ -675,6 +682,13 @@ as a whole; remembered only):
   `caller_refused` reason (`runner/src/curie_runner/mcp_tool_capability.py`)
   ship in different images, so they are frozen together.
   [vector: `tests/vectors/connector-caller-refusal.json`]
+- worker vs runner vs API deliberate progress capability (ADR-0130) -- the
+  runner control headers and `turn.progress` token scope the worker mints
+  (`apps/worker/src/curie_worker/turn_progress.py`), the runner reads
+  (`runner/src/curie_runner/turn_progress.py`) and the API verifies, and the
+  inbox stream the API appends to (`apps/api/src/curie_api/turn_progress.py`)
+  and the worker's pump reads, cross three images, so they are frozen together.
+  [vector: `tests/vectors/turn-progress-capability.json`]
 
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR

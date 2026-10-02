@@ -215,6 +215,11 @@
       "omissions": []
     },
     {
+      "struct": "MemoryGuidance",
+      "schema": "MemoryGuidanceOut",
+      "omissions": []
+    },
+    {
       "struct": "Bundle",
       "schema": "BundleOut",
       "omissions": [
@@ -382,7 +387,11 @@
     },
     {
       "struct": "ClusterMessageReplyEvent",
-      "reason": "ClusterMessageReplyPage.events is intentionally an array of anonymous raw channel-protocol objects in OpenAPI, with no named component schema. The CLI keeps only a tolerant rendering projection of the event discriminator, text, status, and outcome while the API remains the authoritative validator and preserves every raw event field."
+      "reason": "ClusterMessageReplyPage.events is intentionally an array of anonymous raw channel-protocol objects in OpenAPI, with no named component schema. The CLI keeps only a tolerant rendering projection of the event discriminator, text, status, outcome, and reply wire 1.1 progress payload while the API remains the authoritative validator and preserves every raw event field."
+    },
+    {
+      "struct": "ClusterMessageProgress",
+      "reason": "The reply wire 1.1 progress payload (ADR-0130) inside one anonymous ClusterMessageReplyPage.events object, so it has no named OpenAPI component schema either. The CLI reads only kind, state, milestone, and summary to show a status line, and never treats the event as the reply."
     },
     {
       "struct": "TraceListRow",
@@ -410,6 +419,7 @@
         {"field": "execution_deadline_seconds", "why": "Execution deadline belongs to the overrides command."},
         {"field": "runner_resources", "why": "Runner resources belong to the overrides command."},
         {"field": "memory", "why": "The shared memory setting is unrelated to hook configuration."},
+        {"field": "memory_writes", "why": "The memory tools switch belongs to the overrides command."},
         {"field": "publication_policy", "why": "Publication policy has its own operator command."},
         {"field": "publication_policy_version", "why": "Publication policy has its own operator command."},
         {"field": "publication_draft", "why": "Publication policy has its own operator command."},
@@ -454,6 +464,11 @@
           "why": "Human presentation uses this optional API field. The existing machine-readable approvals result retains exact summary and granted_tool, without adding a display-only key; cli/tests/json_contract.rs pins that JSON shape."
         }
       ]
+    },
+    {
+      "output": "MemoryGuidanceOutput",
+      "struct": "MemoryGuidance",
+      "omissions": []
     },
     {
       "output": "OverridesOutput",

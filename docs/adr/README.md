@@ -191,7 +191,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0162 | [WorkItems own durable execution identity](0162-work-items-own-durable-execution-identity.md) | Accepted |
 | 0165 | [The tracker owns dependencies and Curie admits ready work](0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md) | Draft |
 | 0166 | [Tenant boundary and principal identity land together](0166-tenant-boundary-and-principal-identity-land-together.md) | Accepted |
-| 0167 | [Agent and channel memory are written by the agent, guided by editable guidance](0167-agent-and-channel-memory-are-written-by-the-agent-guided-by-editable-guidance.md) | Draft |
+| 0167 | [Agent and channel memory are written by the agent, guided by editable guidance](0167-agent-and-channel-memory-are-written-by-the-agent-guided-by-editable-guidance.md) | Accepted |
 | 0168 | [One installation hosts several bot identities](0168-one-installation-hosts-several-bot-identities.md) | Accepted |
 | 0169 | [A mean tester tests an agent the way a person does, from any installation](0169-a-mean-tester-tests-an-agent-the-way-a-person-does.md) | Accepted |
 | 0170 | [Conversation transcripts live in their own per-thread table](0170-conversation-transcripts-live-in-their-own-per-thread-table.md) | Accepted |
@@ -202,8 +202,14 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0175 | [A bot may limit who can talk to it](0175-a-bot-may-limit-who-can-talk-to-it.md) | Accepted |
 | 0176 | [A factory run may test end to end in a namespace it owns on a separate cluster](0176-a-factory-run-may-test-end-to-end-in-a-namespace-it-owns-on-a-separate-cluster.md) | Accepted |
 | 0177 | [An approval is answered where it was asked, including by email](0177-an-approval-is-answered-where-it-was-asked-including-by-email.md) | Accepted |
-| 0178 | [The connector caller token names the run and work item](0178-the-connector-caller-token-names-the-run-and-work-item.md) | Draft |
+| 0178 | [The connector caller token names the run and work item](0178-the-connector-caller-token-names-the-run-and-work-item.md) | Accepted |
 | 0179 | [A settled approval card is a record of the decision, and the requester's thread reads in order](0179-a-settled-approval-card-is-a-record-and-the-thread-reads-in-order.md) | Accepted |
 | 0180 | [The turn receipt is an install choice](0180-the-turn-receipt-is-an-install-choice.md) | Accepted |
 | 0181 | [Every mean tester probe only reads or asks](0181-every-mean-tester-probe-only-reads-or-asks.md) | Accepted |
+| 0182 | [A signed hook may complete a preposted reply](0182-a-signed-hook-may-complete-a-preposted-reply.md) | Accepted |
+| 0184 | [Settled stream entries are trimmed; receipts live in Postgres; backlog is counted, not rated](0184-settled-stream-entries-are-trimmed-receipts-live-in-postgres-backlog-is-counted.md) | Draft |
+| 0186 | [A factory ticket declares its base branch and keeps it](0186-a-factory-ticket-declares-its-base-and-keeps-it.md) | Accepted |
+| 0187 | [The factory polls GitHub for its work, and the platform reads the issue](0187-the-factory-polls-github-and-the-platform-reads-the-issue.md) | Accepted |
+| 0188 | [The sandbox memory credential is scoped to its own channel](0188-the-sandbox-memory-credential-is-scoped-to-its-own-channel.md) | Accepted |
+| 0189 | [Deployed agents see only their bundle's skills](0189-deployed-agents-see-only-their-bundles-skills.md) | Accepted |
 <!-- END GENERATED: adr-index -->

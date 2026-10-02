@@ -64,7 +64,15 @@ def _derived(url: str) -> dict[str, dict[str, Any]]:
 
 # @spec ADR-0168 d7
 def test_the_refusal_vector_names_the_header_the_runner_sends() -> None:
-    assert set(_REFUSAL) == {"comment", "header", "status", "content_type", "vectors"}
+    assert set(_REFUSAL) == {
+        "comment",
+        "header",
+        "status",
+        "content_type",
+        "unpaired",
+        "vectors",
+    }
+    assert set(_REFUSAL["unpaired"]) == {"why", "token", "refusal"}
     assert _REFUSAL["header"] == CALLER_HEADER
 
 

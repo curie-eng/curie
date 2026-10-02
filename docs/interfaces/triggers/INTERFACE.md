@@ -109,6 +109,10 @@ another handler that mints a `QueuedTurn` with the right `source`. The seven tha
   turn replies through one of the agent's bindings: its only one, or the route
   the `kind`, `address` and optional `adapter` query parameters name (the
   identity for Slack, the adapter slug for any other kind; ADR-0168 decision 3).
+  A trusted intake that already owns a source thread may also pass a nonempty
+  `conversation_id` and `placeholder` pair, so the ordinary worker completes
+  that preposted reply in place. Message coordinates never replace the stored
+  binding's endpoint or adapter route (ADR-0182).
   Optional `tool_access=read-only` narrows this turn under the existing
   [TOOL-ACCESS contract](../aci-producer/INTERFACE.md). Omission retains ordinary
   hooks and approvals; untrusted body text never selects the policy. The receipt's

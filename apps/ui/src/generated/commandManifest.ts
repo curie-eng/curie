@@ -1947,7 +1947,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot",
+          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -1995,6 +1995,38 @@ export const commandManifest = {
               "id": "add",
               "long": "add",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show the guidance the agent gets beside its memory tools, and whether it is the platform default or operator-set (`GET /agents/{id}/memory/guidance`)",
+              "id": "guidance",
+              "long": "guidance",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Replace the agent's memory guidance with this file's text (`PUT /agents/{id}/memory/guidance`). An empty file is refused",
+              "id": "guidance_from",
+              "long": "guidance-from",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove operator guidance so the platform default applies again (`DELETE /agents/{id}/memory/guidance`)",
+              "id": "reset_guidance",
+              "long": "reset-guidance",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             }
           ],
@@ -2495,6 +2527,18 @@ export const commandManifest = {
               "possible_values": [
                 "true",
                 "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Off stops saving only: stored agent and channel memory stays readable. Takes effect at the next sandbox boot",
+              "id": "memory_writes",
+              "long": "memory-writes",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
               ],
               "required": false
             },
@@ -4318,8 +4362,20 @@ export const commandManifest = {
           "name": "github-app"
         },
         {
-          "about": "Turn on the GitHub factory intake (label or mention triggers, webhook secret, repo allowlist, GitHub API egress) on an existing release",
+          "about": "Turn on the GitHub factory intake (label or mention triggers, repo allowlist, GitHub API egress) on an existing release",
           "args": [
+            {
+              "global": false,
+              "help": "Select polling or webhook intake. Omit to keep the recorded mode",
+              "id": "intake",
+              "long": "intake",
+              "positional": false,
+              "possible_values": [
+                "poll",
+                "webhook"
+              ],
+              "required": false
+            },
             {
               "global": false,
               "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`",
@@ -5277,6 +5333,18 @@ export const commandManifest = {
               "possible_values": [
                 "true",
                 "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Off stops saving only: stored agent and channel memory stays readable. Takes effect at the next sandbox boot",
+              "id": "memory_writes",
+              "long": "memory-writes",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
               ],
               "required": false
             },
@@ -6554,7 +6622,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot",
+          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -6621,6 +6689,38 @@ export const commandManifest = {
               "id": "add",
               "long": "add",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show the guidance the agent gets beside its memory tools, and whether it is the platform default or operator-set (`GET /agents/{id}/memory/guidance`)",
+              "id": "guidance",
+              "long": "guidance",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Replace the agent's memory guidance with this file's text (`PUT /agents/{id}/memory/guidance`). An empty file is refused",
+              "id": "guidance_from",
+              "long": "guidance-from",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove operator guidance so the platform default applies again (`DELETE /agents/{id}/memory/guidance`)",
+              "id": "reset_guidance",
+              "long": "reset-guidance",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             }
           ],
@@ -6852,6 +6952,147 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "approvals"
+        }
+      ]
+    },
+    {
+      "about": "Bring up Curie and the dark factory without a webhook or a tunnel",
+      "hidden": false,
+      "name": "factory",
+      "subcommands": [
+        {
+          "about": "Create a cluster when none is targeted, install Curie, register the GitHub App, and on the second run deploy the published dark factory. Never opens a browser and never runs gh",
+          "args": [
+            {
+              "global": false,
+              "help": "GitHub repository the factory may work in, as owner/name",
+              "id": "repo",
+              "long": "repo",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Numeric GitHub App ID. Pair with --private-key-file. Without both, the command prints the registration link and exits after cluster up",
+              "id": "app_id",
+              "long": "app-id",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "PEM private key downloaded from the App. The path is passed through; the key contents never enter argv",
+              "id": "private_key_file",
+              "long": "private-key-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Kubernetes context. When omitted, the current kubeconfig context is used. When neither exists, a kind cluster is created",
+              "id": "context",
+              "long": "context",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the registration link for this GitHub organization instead of a personal account",
+              "id": "org",
+              "long": "org",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-factory"
+              ],
+              "global": false,
+              "help": "Kind cluster name used only when no kube context is targeted",
+              "id": "kind_name",
+              "long": "kind-name",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "z-ai/glm-5.3-flash"
+              ],
+              "global": false,
+              "help": "Model id installed by cluster up",
+              "id": "model",
+              "long": "model",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "3600"
+              ],
+              "global": false,
+              "help": "Per run execution deadline in seconds for the deployed agent",
+              "id": "execution_deadline",
+              "long": "execution-deadline",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "5"
+              ],
+              "global": false,
+              "help": "Daily USD budget for the deployed agent",
+              "id": "budget",
+              "long": "budget",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Helm chart. Default: the version pinned chart on release builds; local charts/curie on dev builds",
+              "id": "chart",
+              "long": "chart",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the steps and exit without creating a cluster or applying anything",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "quickstart"
         }
       ]
     },

@@ -55,6 +55,28 @@ def test_read_only_tool_notes_without_flag() -> None:
     assert [e.type for e in events] == ["tool_note"]
 
 
+def test_the_progress_tool_notes_without_flag() -> None:
+    """ADR 0130: a deliberate progress update acts on nothing, so it is never a
+    side effect and never lands on the turn's receipt."""
+
+    from curie_runner.approval import TURN_PROGRESS_TOOL_NAME
+
+    state = TurnState()
+    msg = AssistantMessage(
+        content=[
+            ToolUseBlock(
+                id="1",
+                name=TURN_PROGRESS_TOOL_NAME,
+                input={"update_id": "u1", "state": "testing", "summary": "Verified it"},
+            )
+        ],
+        model="m",
+    )
+    events = _translate(msg, state)
+    assert [e.type for e in events] == ["tool_note"]
+    assert not state.side_effect_emitted
+
+
 def test_tool_search_notes_without_flag() -> None:
     """#2130: Claude's tool-discovery read is not a receipt mutation."""
 

@@ -216,9 +216,17 @@ The split is the point: Block Kit lives only in the two Slack-side modules named
 above (`blocks.py` and `approval_actions.py`), the numbered selector only in
 `channel.rs`, and the agent authors none of them.
 
-Neither renderer consumes progress yet. The progress models, their JSON Schema
-and the reply-wire corpus exist, and no code produces or renders a
-`ProgressCard` or `ProgressMilestone`.
+The Slack renderer consumes progress; the terminal one does not. A card and a
+milestone become Block Kit in
+`apps/worker/src/curie_worker/blocks.py::progress_card` and
+`apps/worker/src/curie_worker/blocks.py::progress_milestone`, every text element
+`plain_text` so a model-authored summary cannot mention anyone, and
+`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.emit` routes a
+progress body to them before any answer or approval path. The channel-neutral
+text for a channel with nothing richer is
+`packages/channel-protocol/src/channel_protocol/progress.py::progress_text`.
+Nothing produces a progress body yet: the worker's coordinator stores what it
+owes, and no deliverer calls an adapter with it.
 
 ## Known leakage
 
@@ -256,15 +264,19 @@ and the reply-wire corpus exist, and no code produces or renders a
   does hide its compose option. But the field is dropped at the projection rather
   than deliberately declined, so the asymmetry is invisible in the code, and the
   next Slack-side interaction that wants it will find nothing to read.
-- **Progress is modeled but unwired.** No `curie_progress` tool or progress
-  ingress exists, so no model's `ProgressCommand` reaches the platform and
-  nothing resolves a command to its turn's record. The worker coordinator's
-  durable store exists
-  (`apps/worker/src/curie_worker/progress.py::ProgressStore`): it applies the
-  idempotency, ordering, terminal, milestone-budget and delivery-identity rules
-  ADR-0130 places on the coordinator, and keeps the delivery outbox, but no
-  surface reaches it and nothing delivers from it. Its rules are in the
-  worker's [README](../../../apps/worker/README.md#deliberate-progress-adr-0130).
+- **Progress is accepted but not rendered.** The `curie_progress` operation is
+  the runner's platform `progress` tool (`mcp__curie__progress`), and a
+  person's Slack turn carries a per-turn capability for it. The tool posts each
+  `ProgressCommand` to the API's scoped ingress
+  (`apps/api/src/curie_api/routers/turn_progress.py::accept_turn_progress`),
+  which resolves it to the turn chain's record by the token's subject and
+  appends it to that chain's inbox, and a per-turn pump in the kernel applies
+  it to the worker coordinator's durable store
+  (`apps/worker/src/curie_worker/progress.py::ProgressStore`). The store
+  applies the idempotency, ordering, terminal, milestone-budget and
+  delivery-identity rules ADR-0130 places on the coordinator, but with
+  rendering off nothing delivers from it. Its rules are in the worker's
+  [README](../../../apps/worker/README.md#deliberate-progress-adr-0130).
   What the models realize on the wire is the closed shape: a command that names
   a routing, credential, delivery or budget field is refused at validation. The
   terminal mirror in `cli/src/channel.rs` does not model progress either.

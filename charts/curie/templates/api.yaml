@@ -195,6 +195,30 @@ spec:
               value: {{ .Values.worker.image.pullPolicy | quote }}
             - name: CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS
               value: {{ join "," $connectorProxyPullSecrets | quote }}
+            {{- $e2e := .Values.e2eConnector }}
+            {{- if and $e2e.enabled (or (not $e2e.ownerLabel.value) (not $e2e.serviceAccount) (not $e2e.serviceAccountNamespace) (not $e2e.workerClusterRole)) }}
+            {{- fail "e2eConnector.enabled requires ownerLabel.value, serviceAccount, serviceAccountNamespace, and workerClusterRole" }}
+            {{- end }}
+            - name: CURIE_E2E_CONNECTOR_ENABLED
+              value: {{ $e2e.enabled | quote }}
+            - name: CURIE_E2E_CONNECTOR_IMAGE
+              value: {{ include "curie.image" (dict "repository" .Values.worker.image.repository "tag" .Values.worker.image.tag "digest" .Values.worker.image.digest "defaultTag" .Chart.AppVersion) | quote }}
+            - name: CURIE_E2E_NAMESPACE_PREFIX
+              value: {{ $e2e.namespacePrefix | quote }}
+            - name: CURIE_E2E_OWNER_LABEL_KEY
+              value: {{ $e2e.ownerLabel.key | quote }}
+            - name: CURIE_E2E_OWNER_LABEL_VALUE
+              value: {{ $e2e.ownerLabel.value | quote }}
+            - name: CURIE_E2E_SERVICE_ACCOUNT
+              value: {{ $e2e.serviceAccount | quote }}
+            - name: CURIE_E2E_SERVICE_ACCOUNT_NAMESPACE
+              value: {{ $e2e.serviceAccountNamespace | quote }}
+            - name: CURIE_E2E_WORKER_CLUSTER_ROLE
+              value: {{ $e2e.workerClusterRole | quote }}
+            - name: CURIE_E2E_TTL_SECONDS
+              value: {{ $e2e.ttlSeconds | quote }}
+            - name: CURIE_E2E_POD_SECURITY
+              value: {{ $e2e.podSecurity | quote }}
             - name: CURIE_PUBLICATION_PATCH_MAX_BYTES
               value: {{ .Values.worker.publication.patchMaxBytes | quote }}
             - name: CURIE_PUBLICATION_RETENTION_SECONDS
@@ -223,6 +247,10 @@ spec:
               value: {{ .Values.api.githubReviewReconcilerIntervalSeconds | quote }}
             - name: GITHUB_FACTORY_INGRESS_ENABLED
               value: {{ .Values.api.githubFactoryIngressEnabled | quote }}
+            - name: GITHUB_FACTORY_INTAKE
+              value: {{ .Values.api.githubFactoryIntake | quote }}
+            - name: GITHUB_FACTORY_POLL_INTERVAL_S
+              value: {{ .Values.api.githubFactoryPollIntervalSeconds | quote }}
             - name: GITHUB_FACTORY_LABEL
               value: {{ .Values.api.githubFactoryLabel | quote }}
             - name: GITHUB_FACTORY_MENTION
@@ -233,6 +261,8 @@ spec:
               value: {{ .Values.api.githubFactoryCiWaitSeconds | quote }}
             - name: GITHUB_FACTORY_PYTHON_CI
               value: {{ .Values.api.githubFactoryPythonCi | default dict | toJson | quote }}
+            - name: GITHUB_FACTORY_BASES
+              value: {{ .Values.api.githubFactoryBases | default dict | toJson | quote }}
             - name: GITHUB_API_URL
               value: {{ .Values.api.githubApiUrl | quote }}
             # Outbound GitHub credential: the eval commit status AND the

@@ -67,6 +67,7 @@ from .routers import (
     runs,
     schedules,
     state,
+    turn_progress,
     work_item_issue,
     work_item_outcomes,
     work_items,
@@ -415,6 +416,7 @@ def create_app() -> FastAPI:
     app.include_router(schedules.router)
     app.include_router(hook_fire.router)
     app.include_router(state.router)
+    app.include_router(state.internal_router)
     app.include_router(memory.router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise
     # be matched by GET /approvals/{approval_id} and fail as a bad uuid.
@@ -428,6 +430,7 @@ def create_app() -> FastAPI:
     app.include_router(work_item_issue.internal_router)
     app.include_router(work_items.router)
     app.include_router(factory_status.router)
+    app.include_router(turn_progress.router)
     app.include_router(work_item_outcomes.router)
     app.include_router(cluster_message_replies.router)
     app.include_router(cluster_message_replies.internal_router)

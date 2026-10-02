@@ -16,15 +16,19 @@ import json
 import os
 import socket
 from pathlib import Path
-from types import ModuleType
-from typing import Any, NamedTuple
+from types import ModuleType, SimpleNamespace
+from typing import Any, NamedTuple, cast
 
 import pytest
 import yaml
 from curie_worker.attachments import AttachmentLimits
 from curie_worker.config import WorkerConfig
+from curie_worker.consumer import Consumer
+from curie_worker.delivery_lease import DeliveryLeaseStore
+from curie_worker.kernel import Kernel
 from nacl.signing import SigningKey
 from pydantic import AliasChoices, ValidationError
+from redis.asyncio import Redis as AsyncRedis
 
 
 def _clear_all_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -240,6 +244,18 @@ _ENV_TABLE: list[_Row] = [
         1,
         bare="EVAL_MAX_CONCURRENT_CLAIMS",
         bare_raw="7",
+    ),
+    # --- runs-lane turn concurrency per worker (#760) ---
+    # The chart renders worker.maxConcurrency here; before it was wired the
+    # value was a constructor default no deployment could change.
+    _Row(
+        "max_concurrency",
+        "CURIE_WORKER_MAX_CONCURRENCY",
+        "4",
+        4,
+        16,
+        bare="MAX_CONCURRENCY",
+        bare_raw="9",
     ),
     # --- delivery budget and ownership lease (ADR-0131, #1971) ---
     # ADR-0131's stated initial defaults: drifting one silently changes the
@@ -720,6 +736,90 @@ def test_eval_max_concurrent_claims_rejects_zero(
 
     with pytest.raises(ValueError):
         WorkerConfig()
+
+
+# --- Runs-lane turn concurrency (#760) ----------------------------------------
+#
+# ``CURIE_WORKER_MAX_CONCURRENCY`` bounds how many turns one worker runs at once.
+# Default, alias and bare-name coverage lives in _ENV_TABLE; these pin the
+# bounds the chart schema mirrors (1 through 256) and that the value reaches the
+# consumer the way the production entry point builds it.
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "257"])
+def test_max_concurrency_refuses_out_of_range(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    """0 would admit no turn at all; above 256 is outside the chart's bound."""
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_WORKER_MAX_CONCURRENCY", raw)
+
+    with pytest.raises(ValidationError, match="max_concurrency|CURIE_WORKER_MAX_CONCURRENCY"):
+        WorkerConfig()
+
+
+@pytest.mark.parametrize("raw", ["1", "256"])
+def test_max_concurrency_accepts_both_ends_of_its_range(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_WORKER_MAX_CONCURRENCY", raw)
+
+    assert WorkerConfig().max_concurrency == int(raw)
+
+
+def _consumer_as_run_builds_it(config: WorkerConfig) -> Consumer:
+    """Build the runs consumer with exactly the arguments ``run.py`` passes.
+
+    Construction opens no connection, so an unconnected client and a stand-in
+    kernel are enough to observe what the consumer was sized to.
+    """
+    redis = AsyncRedis(host="127.0.0.1", port=1)
+    return Consumer(
+        redis=redis,
+        kernel=cast(Kernel, SimpleNamespace()),
+        config=config,
+        leases=DeliveryLeaseStore(redis, config),
+    )
+
+
+def test_max_concurrency_env_sizes_the_runs_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The env value reaches the consumer that ``run.py`` constructs, which
+    passes no ``max_concurrency`` of its own."""
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_WORKER_MAX_CONCURRENCY", "4")
+
+    consumer = _consumer_as_run_builds_it(WorkerConfig())
+
+    assert consumer._max_concurrency == 4
+    assert consumer._transfer_capacity() == 4
+
+
+def test_runs_consumer_defaults_to_sixteen_turns(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_all_config_env(monkeypatch)
+
+    assert _consumer_as_run_builds_it(WorkerConfig())._max_concurrency == 16
+
+
+def test_explicit_consumer_concurrency_still_wins_over_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kernel tests size a consumer to one slot directly; that must still hold."""
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_WORKER_MAX_CONCURRENCY", "4")
+
+    config = WorkerConfig()
+    redis = AsyncRedis(host="127.0.0.1", port=1)
+    consumer = Consumer(
+        redis=redis,
+        kernel=cast(Kernel, SimpleNamespace()),
+        config=config,
+        leases=DeliveryLeaseStore(redis, config),
+        max_concurrency=1,
+    )
+
+    assert consumer._max_concurrency == 1
+    assert consumer._transfer_capacity() == 1
 
 
 # --- Raw-string ingestion of complex-typed fields -----------------------------

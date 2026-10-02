@@ -417,6 +417,11 @@ spec:
               value: {{ .Values.worker.routeTtlSeconds | quote }}
             - name: CURIE_SUSPENDED_ROUTE_TTL_SECONDS
               value: {{ .Values.worker.suspendedRouteTtlSeconds | quote }}
+            # Settled stream retention window (ADR 0184). Read through dig so
+            # a release whose retained values predate the block, or carry it
+            # as null, still renders the default.
+            - name: CURIE_STREAM_RETENTION_MIN_AGE_S
+              value: {{ dig "streamRetention" "minAgeSeconds" 86400 (.Values.worker | default dict) | quote }}
             # Delivery budget and ownership lease (ADR-0131, #1971). The
             # overall wall-clock deadline for one delivery -- claim, every
             # runner request, every retry backoff, reclaim, and terminal
@@ -449,6 +454,9 @@ spec:
             # runner default.
             - name: CURIE_WORK_ITEM_MAX_TURNS
               value: {{ .Values.worker.workItemMaxTurns | quote }}
+            # Turns this worker runs at once (#760); see worker.maxConcurrency.
+            - name: CURIE_WORKER_MAX_CONCURRENCY
+              value: {{ dig "maxConcurrency" 16 .Values.worker | quote }}
             # Slack assistant-thread "shimmer" (#1182). Rendered on the WORKER
             # only: it both raises the caption and lowers it, so one value
             # governs the feature release-wide and the two halves cannot be

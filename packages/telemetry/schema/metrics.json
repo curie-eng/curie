@@ -1,938 +1,43 @@
 {
-  "schema_version": "v1",
   "metrics": {
-    "curie.turn.accepted": {
-      "type": "counter",
-      "unit": "{turn}",
-      "description": "Turns accepted for processing.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-dispatcher",
-          "curie-worker",
-          "curie-runner"
-        ],
-        "source": [
-          "api",
-          "dispatcher",
-          "worker",
-          "runner",
-          "local",
-          "eval"
-        ],
-        "outcome": [
-          "accepted"
-        ]
-      },
-      "cardinality_bound": 24
-    },
-    "curie.turn.completed": {
-      "type": "counter",
-      "unit": "{turn}",
-      "description": "Turns reaching a terminal result.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-dispatcher",
-          "curie-worker",
-          "curie-runner"
-        ],
-        "source": [
-          "api",
-          "dispatcher",
-          "worker",
-          "runner",
-          "local",
-          "eval"
-        ],
-        "outcome": [
-          "done",
-          "awaiting_approval",
-          "budget_halted",
-          "classified_failure",
-          "side_effect_halted",
-          "idle",
-          "interrupted",
-          "deadline_halted",
-          "capacity_wait_expired"
-        ]
-      },
-      "cardinality_bound": 216
-    },
-    "curie.turn.refused": {
-      "type": "counter",
-      "unit": "{turn}",
-      "description": "Callers refused before a turn by a binding's caller list.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-dispatcher"
-        ],
-        "reason": [
-          "caller_not_allowed",
-          "admission_unavailable"
-        ]
-      },
-      "cardinality_bound": 4
-    },
-    "curie.turn.duration": {
-      "type": "histogram",
-      "unit": "s",
-      "description": "End to end turn duration.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-dispatcher",
-          "curie-worker",
-          "curie-runner"
-        ],
-        "source": [
-          "api",
-          "dispatcher",
-          "worker",
-          "runner",
-          "local",
-          "eval"
-        ],
-        "outcome": [
-          "done",
-          "awaiting_approval",
-          "budget_halted",
-          "classified_failure",
-          "side_effect_halted",
-          "idle",
-          "interrupted",
-          "deadline_halted",
-          "capacity_wait_expired"
-        ]
-      },
-      "cardinality_bound": 216
-    },
     "curie.agent.turn.completed": {
-      "type": "counter",
-      "unit": "{turn}",
-      "description": "Terminal turns for one agent. Each process admits at most 32 distinct slugs; further slugs, non-slugs, and the reserved names other and unbound share other. A turn with no resolved agent is unbound. The cap is per process, so a fleet query can still fold a slug into other on one worker.",
-      "monotonic": true,
       "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "source": [
-          "worker"
-        ],
-        "outcome": [
-          "done",
-          "awaiting_approval",
-          "budget_halted",
-          "classified_failure",
-          "side_effect_halted",
-          "idle",
-          "interrupted",
-          "deadline_halted",
-          "capacity_wait_expired"
-        ],
         "agent": {
-          "kind": "bounded",
           "ceiling": 32,
+          "kind": "bounded",
+          "overflow": "other",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
           "reserved": [
             "other",
             "unbound"
-          ],
-          "overflow": "other",
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$"
-        }
-      },
-      "cardinality_bound": 306
-    },
-    "curie.schedule.fire": {
-      "type": "counter",
-      "unit": "{fire}",
-      "description": "Durably settled hook fires.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "trigger": [
-          "cron",
-          "bind",
-          "webhook",
-          "test"
-        ],
+          ]
+        },
         "outcome": [
-          "ran",
-          "deferred",
-          "skipped",
-          "blocked",
-          "reclaimed",
-          "failed"
-        ]
-      },
-      "cardinality_bound": 24
-    },
-    "curie.history.resume.cache_read": {
-      "type": "histogram",
-      "unit": "{token}",
-      "description": "Provider cache read input tokens on the first turn after structured replay.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-runner"
+          "done",
+          "awaiting_approval",
+          "budget_halted",
+          "classified_failure",
+          "side_effect_halted",
+          "idle",
+          "interrupted",
+          "deadline_halted",
+          "capacity_wait_expired"
         ],
-        "source": [
-          "runner"
-        ],
-        "cache_hit": [
-          "true",
-          "false"
-        ]
-      },
-      "cardinality_bound": 2
-    },
-    "curie.history.persistence.failure": {
-      "type": "counter",
-      "unit": "{failure}",
-      "description": "Transcript persistence failures caused by state capacity limits.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-api"
-        ],
-        "source": [
-          "state-api"
-        ],
-        "outcome": [
-          "capacity"
-        ],
-        "limit": [
-          "value",
-          "namespace"
-        ]
-      },
-      "cardinality_bound": 2
-    },
-    "curie.queue.enqueue": {
-      "type": "counter",
-      "unit": "{message}",
-      "description": "Messages enqueued.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-dispatcher",
-          "curie-worker"
-        ],
-        "source": [
-          "api",
-          "dispatcher",
-          "worker",
-          "local",
-          "eval"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "pending",
-          "ack",
-          "retry",
-          "dead-letter",
-          "queued"
-        ]
-      },
-      "cardinality_bound": 105
-    },
-    "curie.queue.process": {
-      "type": "counter",
-      "unit": "{message}",
-      "description": "Messages processed.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-dispatcher",
-          "curie-worker"
-        ],
-        "source": [
-          "api",
-          "dispatcher",
-          "worker",
-          "local",
-          "eval"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "pending",
-          "ack",
-          "retry",
-          "dead-letter",
-          "queued"
-        ]
-      },
-      "cardinality_bound": 105
-    },
-    "curie.queue.settle": {
-      "type": "counter",
-      "unit": "{message}",
-      "description": "Message settlement outcomes.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-dispatcher",
-          "curie-worker"
-        ],
-        "source": [
-          "api",
-          "dispatcher",
-          "worker",
-          "local",
-          "eval"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "pending",
-          "ack",
-          "retry",
-          "dead-letter",
-          "queued"
-        ]
-      },
-      "cardinality_bound": 105
-    },
-    "curie.queue.retry": {
-      "type": "counter",
-      "unit": "{retry}",
-      "description": "Bounded queue redelivery and in-process turn retries.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "source": [
-          "worker",
-          "eval"
-        ],
-        "retry_class": [
-          "redelivery",
-          "rate-limit",
-          "runner-error",
-          "runner-timeout",
-          "workspace-error",
-          "sandbox-terminated",
-          "sandbox-capacity"
-        ]
-      },
-      "cardinality_bound": 14
-    },
-    "curie.queue.dead_letter": {
-      "type": "counter",
-      "unit": "{message}",
-      "description": "Messages dead lettered.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-dispatcher",
-          "curie-worker"
-        ],
-        "source": [
-          "api",
-          "dispatcher",
-          "worker",
-          "local",
-          "eval"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "pending",
-          "ack",
-          "retry",
-          "dead-letter",
-          "queued"
-        ]
-      },
-      "cardinality_bound": 105
-    },
-    "curie.queue.wait.duration": {
-      "type": "histogram",
-      "unit": "s",
-      "description": "Queue wait duration.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-dispatcher",
-          "curie-worker"
-        ],
-        "source": [
-          "api",
-          "dispatcher",
-          "worker",
-          "local",
-          "eval"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "pending",
-          "ack",
-          "retry",
-          "dead-letter",
-          "queued"
-        ]
-      },
-      "cardinality_bound": 105
-    },
-    "curie.queue.process.duration": {
-      "type": "histogram",
-      "unit": "s",
-      "description": "Queue processing duration.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-dispatcher",
-          "curie-worker"
-        ],
-        "source": [
-          "api",
-          "dispatcher",
-          "worker",
-          "local",
-          "eval"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "pending",
-          "ack",
-          "retry",
-          "dead-letter",
-          "queued"
-        ]
-      },
-      "cardinality_bound": 105
-    },
-    "curie.queue.message.age": {
-      "type": "histogram",
-      "unit": "s",
-      "description": "Message age at processing.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-dispatcher",
-          "curie-worker"
-        ],
-        "source": [
-          "api",
-          "dispatcher",
-          "worker",
-          "local",
-          "eval"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "pending",
-          "ack",
-          "retry",
-          "dead-letter",
-          "queued"
-        ]
-      },
-      "cardinality_bound": 105
-    },
-    "curie.queue.pending": {
-      "type": "gauge",
-      "unit": "{message}",
-      "description": "Pending consumer group messages.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-dispatcher",
-          "curie-worker"
-        ],
-        "source": [
-          "api",
-          "dispatcher",
-          "worker",
-          "local",
-          "eval"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "pending",
-          "ack",
-          "retry",
-          "dead-letter",
-          "queued"
-        ]
-      },
-      "cardinality_bound": 105
-    },
-    "curie.queue.lag": {
-      "type": "gauge",
-      "unit": "{message}",
-      "description": "Consumer group lag.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-dispatcher",
-          "curie-worker"
-        ],
-        "source": [
-          "api",
-          "dispatcher",
-          "worker",
-          "local",
-          "eval"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "pending",
-          "ack",
-          "retry",
-          "dead-letter",
-          "queued"
-        ]
-      },
-      "cardinality_bound": 105
-    },
-    "curie.queue.depth": {
-      "type": "gauge",
-      "unit": "{message}",
-      "description": "Stream depth.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-dispatcher",
-          "curie-worker"
-        ],
-        "source": [
-          "api",
-          "dispatcher",
-          "worker",
-          "local",
-          "eval"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "pending",
-          "ack",
-          "retry",
-          "dead-letter",
-          "queued"
-        ]
-      },
-      "cardinality_bound": 105
-    },
-    "curie.thread.lock.wait.duration": {
-      "type": "histogram",
-      "unit": "s",
-      "description": "Thread lock acquisition duration.",
-      "monotonic": false,
-      "attributes": {
         "service.name": [
           "curie-worker"
         ],
         "source": [
           "worker"
-        ],
-        "outcome": [
-          "acquired",
-          "contended",
-          "timeout",
-          "start",
-          "steer",
-          "finish-race",
-          "observed"
         ]
       },
-      "cardinality_bound": 7
-    },
-    "curie.thread.route": {
-      "type": "counter",
-      "unit": "{decision}",
-      "description": "Thread routing decisions.",
+      "cardinality_bound": 306,
+      "description": "Terminal turns for one agent. Each process admits at most 32 distinct slugs; further slugs, non-slugs, and the reserved names other and unbound share other. A turn with no resolved agent is unbound. The cap is per process, so a fleet query can still fold a slug into other on one worker.",
       "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "source": [
-          "worker"
-        ],
-        "outcome": [
-          "acquired",
-          "contended",
-          "timeout",
-          "start",
-          "steer",
-          "finish-race",
-          "observed"
-        ]
-      },
-      "cardinality_bound": 7
-    },
-    "curie.thread.route.active": {
-      "type": "gauge",
-      "unit": "{route}",
-      "description": "Active thread routes.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "source": [
-          "worker"
-        ],
-        "outcome": [
-          "acquired",
-          "contended",
-          "timeout",
-          "start",
-          "steer",
-          "finish-race",
-          "observed"
-        ]
-      },
-      "cardinality_bound": 7
-    },
-    "curie.sandbox.lifecycle": {
       "type": "counter",
-      "unit": "{operation}",
-      "description": "Sandbox lifecycle outcomes.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "operation": [
-          "claim",
-          "resume",
-          "release",
-          "suspend",
-          "cleanup",
-          "reclaim",
-          "terminate",
-          "thread-reset"
-        ],
-        "outcome": [
-          "claimed",
-          "reused",
-          "resumed",
-          "released",
-          "suspended",
-          "failed",
-          "orphan-cleaned",
-          "observed",
-          "terminated",
-          "expiry-unsupported",
-          "race-lost",
-          "reclaimed",
-          "reclaimed-retry-refused",
-          "refused-invalid-quota",
-          "refused-no-budget",
-          "refused-no-safe-route",
-          "scan-incomplete",
-          "no-route",
-          "timeout"
-        ]
-      },
-      "cardinality_bound": 152
-    },
-    "curie.sandbox.claim.duration": {
-      "type": "histogram",
-      "unit": "s",
-      "description": "Sandbox claim duration.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "operation": [
-          "claim",
-          "resume",
-          "release",
-          "suspend",
-          "cleanup",
-          "reclaim",
-          "terminate",
-          "thread-reset"
-        ],
-        "outcome": [
-          "claimed",
-          "reused",
-          "resumed",
-          "released",
-          "suspended",
-          "failed",
-          "orphan-cleaned",
-          "observed",
-          "terminated",
-          "expiry-unsupported",
-          "race-lost",
-          "reclaimed",
-          "reclaimed-retry-refused",
-          "refused-invalid-quota",
-          "refused-no-budget",
-          "refused-no-safe-route",
-          "scan-incomplete",
-          "no-route",
-          "timeout"
-        ]
-      },
-      "cardinality_bound": 152
-    },
-    "curie.sandbox.resume.duration": {
-      "type": "histogram",
-      "unit": "s",
-      "description": "Sandbox resume duration.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "operation": [
-          "claim",
-          "resume",
-          "release",
-          "suspend",
-          "cleanup",
-          "reclaim",
-          "terminate",
-          "thread-reset"
-        ],
-        "outcome": [
-          "claimed",
-          "reused",
-          "resumed",
-          "released",
-          "suspended",
-          "failed",
-          "orphan-cleaned",
-          "observed",
-          "terminated",
-          "expiry-unsupported",
-          "race-lost",
-          "reclaimed",
-          "reclaimed-retry-refused",
-          "refused-invalid-quota",
-          "refused-no-budget",
-          "refused-no-safe-route",
-          "scan-incomplete",
-          "no-route",
-          "timeout"
-        ]
-      },
-      "cardinality_bound": 152
-    },
-    "curie.sandbox.release.duration": {
-      "type": "histogram",
-      "unit": "s",
-      "description": "Sandbox release duration.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "operation": [
-          "claim",
-          "resume",
-          "release",
-          "suspend",
-          "cleanup",
-          "reclaim",
-          "terminate",
-          "thread-reset"
-        ],
-        "outcome": [
-          "claimed",
-          "reused",
-          "resumed",
-          "released",
-          "suspended",
-          "failed",
-          "orphan-cleaned",
-          "observed",
-          "terminated",
-          "expiry-unsupported",
-          "race-lost",
-          "reclaimed",
-          "reclaimed-retry-refused",
-          "refused-invalid-quota",
-          "refused-no-budget",
-          "refused-no-safe-route",
-          "scan-incomplete",
-          "no-route",
-          "timeout"
-        ]
-      },
-      "cardinality_bound": 152
-    },
-    "curie.sandbox.active": {
-      "type": "gauge",
-      "unit": "{sandbox}",
-      "description": "Active sandboxes.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "operation": [
-          "observe"
-        ],
-        "outcome": [
-          "observed"
-        ]
-      },
-      "cardinality_bound": 1
-    },
-    "curie.sandbox.suspended": {
-      "type": "gauge",
-      "unit": "{sandbox}",
-      "description": "Suspended sandboxes.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "operation": [
-          "observe"
-        ],
-        "outcome": [
-          "observed"
-        ]
-      },
-      "cardinality_bound": 1
-    },
-    "curie.sandbox.cleanup": {
-      "type": "counter",
-      "unit": "{sandbox}",
-      "description": "Failed and orphan sandbox cleanup.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "operation": [
-          "claim",
-          "resume",
-          "release",
-          "suspend",
-          "cleanup",
-          "reclaim",
-          "terminate",
-          "thread-reset"
-        ],
-        "outcome": [
-          "claimed",
-          "reused",
-          "resumed",
-          "released",
-          "suspended",
-          "failed",
-          "orphan-cleaned",
-          "observed",
-          "terminated",
-          "expiry-unsupported",
-          "race-lost",
-          "reclaimed",
-          "reclaimed-retry-refused",
-          "refused-invalid-quota",
-          "refused-no-budget",
-          "refused-no-safe-route",
-          "scan-incomplete",
-          "no-route",
-          "timeout"
-        ]
-      },
-      "cardinality_bound": 152
-    },
-    "curie.runner.rpc.request.duration": {
-      "type": "histogram",
-      "unit": "s",
-      "description": "Runner RPC request duration.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "operation": [
-          "event",
-          "steer",
-          "interrupt",
-          "reset",
-          "status",
-          "timeout",
-          "turn-admit"
-        ],
-        "role": [
-          "client"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "conflict",
-          "timeout"
-        ]
-      },
-      "cardinality_bound": 28
-    },
-    "curie.runner.rpc.result": {
-      "type": "counter",
-      "unit": "{request}",
-      "description": "Runner RPC outcomes.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "operation": [
-          "event",
-          "steer",
-          "interrupt",
-          "reset",
-          "status",
-          "timeout",
-          "turn-admit"
-        ],
-        "role": [
-          "client"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "conflict",
-          "timeout"
-        ]
-      },
-      "cardinality_bound": 28
+      "unit": "{turn}"
     },
     "curie.approval.lifecycle": {
-      "type": "counter",
-      "unit": "{approval}",
-      "description": "Approval lifecycle outcomes.",
-      "monotonic": true,
       "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-worker"
-        ],
         "operation": [
           "request",
           "resolve",
@@ -950,89 +55,106 @@
           "pending",
           "observed",
           "failure"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-worker"
         ]
       },
-      "cardinality_bound": 96
+      "cardinality_bound": 96,
+      "description": "Approval lifecycle outcomes.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{approval}"
     },
     "curie.approval.pending": {
-      "type": "gauge",
-      "unit": "{approval}",
+      "attributes": {
+        "operation": [
+          "observe"
+        ],
+        "outcome": [
+          "pending"
+        ],
+        "service.name": [
+          "curie-api"
+        ]
+      },
+      "cardinality_bound": 1,
       "description": "Pending approvals.",
       "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-api"
-        ],
-        "operation": [
-          "observe"
-        ],
-        "outcome": [
-          "pending"
-        ]
-      },
-      "cardinality_bound": 1
+      "type": "gauge",
+      "unit": "{approval}"
     },
     "curie.approval.pending.age": {
-      "type": "gauge",
-      "unit": "s",
-      "description": "Age of the oldest pending approval.",
-      "monotonic": false,
       "attributes": {
-        "service.name": [
-          "curie-api"
-        ],
         "operation": [
           "observe"
         ],
         "outcome": [
           "pending"
+        ],
+        "service.name": [
+          "curie-api"
         ]
       },
-      "cardinality_bound": 1
-    },
-    "curie.completion.outbox": {
-      "type": "gauge",
-      "unit": "{completion}",
-      "description": "Completion-outbox records by inflight, retry, or terminal-delivery state.",
+      "cardinality_bound": 1,
+      "description": "Age of the oldest pending approval.",
       "monotonic": false,
+      "type": "gauge",
+      "unit": "s"
+    },
+    "curie.background.last_success.age": {
       "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
         "operation": [
-          "observe"
+          "resume-reconciler",
+          "approval-sweeper",
+          "graveyard-watcher",
+          "commit-poller",
+          "connector-reconciler"
+        ],
+        "role": [
+          "background"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 10,
+      "description": "Age of the last successful background pass.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "s"
+    },
+    "curie.background.loop": {
+      "attributes": {
+        "operation": [
+          "resume-reconciler",
+          "approval-sweeper",
+          "graveyard-watcher",
+          "commit-poller",
+          "connector-reconciler"
         ],
         "outcome": [
-          "inflight",
-          "retry",
-          "terminal"
-        ]
-      },
-      "cardinality_bound": 3
-    },
-    "curie.completion.outbox.age": {
-      "type": "gauge",
-      "unit": "s",
-      "description": "Age of the oldest owed completion still retrying delivery.",
-      "monotonic": false,
-      "attributes": {
+          "success",
+          "failure",
+          "observed"
+        ],
+        "role": [
+          "background"
+        ],
         "service.name": [
+          "curie-api",
           "curie-worker"
-        ],
-        "operation": [
-          "observe"
-        ],
-        "outcome": [
-          "retry"
         ]
       },
-      "cardinality_bound": 1
+      "cardinality_bound": 30,
+      "description": "Background loop pass outcomes.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{run}"
     },
     "curie.capacity.wait": {
-      "type": "gauge",
-      "unit": "{turn}",
-      "description": "Interactive turns by persisted capacity wait state.",
-      "monotonic": false,
       "attributes": {
         "service.name": [
           "curie-worker"
@@ -1046,13 +168,1334 @@
           "expired"
         ]
       },
-      "cardinality_bound": 3
+      "cardinality_bound": 3,
+      "description": "Interactive turns by persisted capacity wait state.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "{turn}"
+    },
+    "curie.completion.outbox": {
+      "attributes": {
+        "operation": [
+          "observe"
+        ],
+        "outcome": [
+          "inflight",
+          "retry",
+          "terminal"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 3,
+      "description": "Completion-outbox records by inflight, retry, or terminal-delivery state.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "{completion}"
+    },
+    "curie.completion.outbox.age": {
+      "attributes": {
+        "operation": [
+          "observe"
+        ],
+        "outcome": [
+          "retry"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 1,
+      "description": "Age of the oldest owed completion still retrying delivery.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "s"
+    },
+    "curie.connector.reconcile.skipped_agents": {
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 1,
+      "description": "Agents whose connector applies the reconciler is skipping.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "{agent}"
+    },
+    "curie.eval.process": {
+      "attributes": {
+        "outcome": [
+          "success",
+          "failure",
+          "plumbing"
+        ],
+        "service.name": [
+          "curie-worker"
+        ],
+        "source": [
+          "eval"
+        ]
+      },
+      "cardinality_bound": 3,
+      "description": "Eval processing outcomes.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{job}"
+    },
+    "curie.history.persistence.failure": {
+      "attributes": {
+        "limit": [
+          "value",
+          "namespace"
+        ],
+        "outcome": [
+          "capacity"
+        ],
+        "service.name": [
+          "curie-api"
+        ],
+        "source": [
+          "state-api"
+        ]
+      },
+      "cardinality_bound": 2,
+      "description": "Transcript persistence failures caused by state capacity limits.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{failure}"
+    },
+    "curie.history.resume.cache_read": {
+      "attributes": {
+        "cache_hit": [
+          "true",
+          "false"
+        ],
+        "service.name": [
+          "curie-runner"
+        ],
+        "source": [
+          "runner"
+        ]
+      },
+      "cardinality_bound": 2,
+      "description": "Provider cache read input tokens on the first turn after structured replay.",
+      "monotonic": false,
+      "type": "histogram",
+      "unit": "{token}"
+    },
+    "curie.http.server.active": {
+      "attributes": {
+        "operation": [
+          "/actions",
+          "/actions/{action_id}",
+          "/actions/{action_id}/audit",
+          "/actions/{action_id}/complete",
+          "/actions/{action_id}/undo",
+          "/agents",
+          "/agents/{agent_id}",
+          "/agents/{agent_id}/behavior-packs",
+          "/agents/{agent_id}/budget",
+          "/agents/{agent_id}/channels",
+          "/agents/{agent_id}/channels/callers",
+          "/agents/{agent_id}/cost",
+          "/agents/{agent_id}/hook-secret",
+          "/agents/{agent_id}/kill",
+          "/agents/{agent_id}/memory",
+          "/agents/{agent_id}/memory/guidance",
+          "/agents/{agent_id}/memory/{index}",
+          "/agents/{agent_id}/memory/{index}/provenance",
+          "/agents/{agent_id}/resume",
+          "/agents/{agent_id}/state",
+          "/agents/{agent_id}/state/bindings/{kind}/{address}",
+          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}",
+          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}",
+          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}/append",
+          "/agents/{agent_id}/state/{namespace}",
+          "/agents/{agent_id}/state/{namespace}/{key}",
+          "/agents/{agent_id}/state/{namespace}/{key}/append",
+          "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{name}/fire",
+          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
+          "/agents/{agent_id}/versions",
+          "/agents/{agent_id}/versions/{version_id}/bundle",
+          "/agents/{agent_id}/versions/{version_id}/connectors",
+          "/agents/{agent_id}/versions/{version_id}/files",
+          "/approvals",
+          "/approvals/principals/adapter",
+          "/approvals/principals/adapter/rotate",
+          "/approvals/principals/operator",
+          "/approvals/{approval_id}",
+          "/approvals/{approval_id}/audit",
+          "/approvals/{approval_id}/resolve",
+          "/approvals/identity-report",
+          "/approvals/{approval_id}/recover",
+          "/channels/admission",
+          "/channels/token",
+          "/channels/turns",
+          "/cluster-message-replies/{reply_ref}",
+          "/config",
+          "/console/login-codes",
+          "/console/session",
+          "/deploy-targets/list",
+          "/deploy-targets/resolve",
+          "/deployments",
+          "/deployments/{deployment_id}",
+          "/evals/matrix",
+          "/evals/report",
+          "/evals/trigger",
+          "/git-flow/routing-check",
+          "/github/webhook",
+          "/health",
+          "/ready",
+          "/hooks/{agent_id}/{hook}",
+          "/langfuse/traces",
+          "/langfuse/traces/{trace_id}",
+          "/langfuse/traces/{trace_id}/eval-case",
+          "/openapi.json",
+          "/docs",
+          "/docs/oauth2-redirect",
+          "/redoc",
+          "/observability/metrics/series",
+          "/observability/metrics/summary",
+          "/observability/runners",
+          "/observability/runners/{namespace}/{pod}/logs",
+          "/publications",
+          "/publications/precheck",
+          "/publications/{publication_id}",
+          "/v1/internal/cluster-message-replies/{reply_ref}",
+          "/v1/internal/github/reviews/{event_id}/reserve",
+          "/v1/internal/github/reviews/{event_id}/verify",
+          "/v1/internal/memory/closed-turns",
+          "/v1/internal/publications",
+          "/v1/internal/publications/precheck/context",
+          "/v1/internal/publications/lineage",
+          "/v1/internal/publications/review-reservations",
+          "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
+          "/v1/internal/publications/{publication_id}/lineage",
+          "/v1/internal/publications/{publication_id}/credential",
+          "/v1/internal/workspaces/{deployment_id}/credential",
+          "/v1/internal/workspaces/{deployment_id}/selection",
+          "/v1/internal/work-items/admissions",
+          "/v1/internal/work-items/requests/{request_id}",
+          "/v1/internal/work-items/{work_item_id}/cancel",
+          "/v1/internal/work-items/requests/{request_id}/acquire",
+          "/v1/internal/work-items/requests/{request_id}/defer",
+          "/v1/internal/work-items/requests/{request_id}/start",
+          "/v1/internal/work-items/requests/{request_id}/heartbeat",
+          "/v1/internal/work-items/requests/{request_id}/hold-approval",
+          "/v1/internal/work-items/requests/{request_id}/owner-lost",
+          "/v1/internal/work-items/running",
+          "/v1/internal/work-items/runtime-owners",
+          "/v1/internal/work-items/requests/{request_id}/finish",
+          "/v1/internal/work-items/requests/{request_id}/termination/claim",
+          "/v1/internal/work-items/requests/{request_id}/termination",
+          "/v1/internal/work-items/issue-read/context",
+          "/v1/work-item-progress/{request_id}",
+          "/v1/work-item-progress/{request_id}/usage",
+          "/v1/work-item-progress/{request_id}/verification",
+          "/v1/turn-progress/{progress_id}",
+          "/v1/factory/cards/{token}.svg",
+          "/schedules",
+          "/schedules/{agent}/{name}/pause",
+          "/schedules/{agent}/{name}/resume",
+          "/work-items",
+          "/work-items/issue-read",
+          "/work-items/{work_item_id}",
+          "/work-items/{work_item_id}/usage",
+          "unmatched"
+        ],
+        "role": [
+          "server"
+        ],
+        "service.name": [
+          "curie-api"
+        ],
+        "source": [
+          "GET",
+          "POST",
+          "PUT",
+          "PATCH",
+          "DELETE",
+          "OPTIONS",
+          "HEAD",
+          "OTHER"
+        ]
+      },
+      "cardinality_bound": 936,
+      "description": "Active HTTP server requests.",
+      "monotonic": false,
+      "type": "up_down_counter",
+      "unit": "{request}"
+    },
+    "curie.http.server.request": {
+      "attributes": {
+        "operation": [
+          "/actions",
+          "/actions/{action_id}",
+          "/actions/{action_id}/audit",
+          "/actions/{action_id}/complete",
+          "/actions/{action_id}/undo",
+          "/agents",
+          "/agents/{agent_id}",
+          "/agents/{agent_id}/behavior-packs",
+          "/agents/{agent_id}/budget",
+          "/agents/{agent_id}/channels",
+          "/agents/{agent_id}/channels/callers",
+          "/agents/{agent_id}/cost",
+          "/agents/{agent_id}/hook-secret",
+          "/agents/{agent_id}/kill",
+          "/agents/{agent_id}/memory",
+          "/agents/{agent_id}/memory/guidance",
+          "/agents/{agent_id}/memory/{index}",
+          "/agents/{agent_id}/memory/{index}/provenance",
+          "/agents/{agent_id}/resume",
+          "/agents/{agent_id}/state",
+          "/agents/{agent_id}/state/bindings/{kind}/{address}",
+          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}",
+          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}",
+          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}/append",
+          "/agents/{agent_id}/state/{namespace}",
+          "/agents/{agent_id}/state/{namespace}/{key}",
+          "/agents/{agent_id}/state/{namespace}/{key}/append",
+          "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{name}/fire",
+          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
+          "/agents/{agent_id}/versions",
+          "/agents/{agent_id}/versions/{version_id}/bundle",
+          "/agents/{agent_id}/versions/{version_id}/connectors",
+          "/agents/{agent_id}/versions/{version_id}/files",
+          "/approvals",
+          "/approvals/principals/adapter",
+          "/approvals/principals/adapter/rotate",
+          "/approvals/principals/operator",
+          "/approvals/{approval_id}",
+          "/approvals/{approval_id}/audit",
+          "/approvals/{approval_id}/resolve",
+          "/approvals/identity-report",
+          "/approvals/{approval_id}/recover",
+          "/channels/admission",
+          "/channels/token",
+          "/channels/turns",
+          "/cluster-message-replies/{reply_ref}",
+          "/config",
+          "/console/login-codes",
+          "/console/session",
+          "/deploy-targets/list",
+          "/deploy-targets/resolve",
+          "/deployments",
+          "/deployments/{deployment_id}",
+          "/evals/matrix",
+          "/evals/report",
+          "/evals/trigger",
+          "/git-flow/routing-check",
+          "/github/webhook",
+          "/health",
+          "/ready",
+          "/hooks/{agent_id}/{hook}",
+          "/langfuse/traces",
+          "/langfuse/traces/{trace_id}",
+          "/langfuse/traces/{trace_id}/eval-case",
+          "/openapi.json",
+          "/docs",
+          "/docs/oauth2-redirect",
+          "/redoc",
+          "/observability/metrics/series",
+          "/observability/metrics/summary",
+          "/observability/runners",
+          "/observability/runners/{namespace}/{pod}/logs",
+          "/publications",
+          "/publications/precheck",
+          "/publications/{publication_id}",
+          "/v1/internal/cluster-message-replies/{reply_ref}",
+          "/v1/internal/github/reviews/{event_id}/reserve",
+          "/v1/internal/github/reviews/{event_id}/verify",
+          "/v1/internal/memory/closed-turns",
+          "/v1/internal/publications",
+          "/v1/internal/publications/precheck/context",
+          "/v1/internal/publications/lineage",
+          "/v1/internal/publications/review-reservations",
+          "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
+          "/v1/internal/publications/{publication_id}/lineage",
+          "/v1/internal/publications/{publication_id}/credential",
+          "/v1/internal/workspaces/{deployment_id}/credential",
+          "/v1/internal/workspaces/{deployment_id}/selection",
+          "/v1/internal/work-items/admissions",
+          "/v1/internal/work-items/requests/{request_id}",
+          "/v1/internal/work-items/{work_item_id}/cancel",
+          "/v1/internal/work-items/requests/{request_id}/acquire",
+          "/v1/internal/work-items/requests/{request_id}/defer",
+          "/v1/internal/work-items/requests/{request_id}/start",
+          "/v1/internal/work-items/requests/{request_id}/heartbeat",
+          "/v1/internal/work-items/requests/{request_id}/hold-approval",
+          "/v1/internal/work-items/requests/{request_id}/owner-lost",
+          "/v1/internal/work-items/running",
+          "/v1/internal/work-items/runtime-owners",
+          "/v1/internal/work-items/requests/{request_id}/finish",
+          "/v1/internal/work-items/requests/{request_id}/termination/claim",
+          "/v1/internal/work-items/requests/{request_id}/termination",
+          "/v1/internal/work-items/issue-read/context",
+          "/v1/work-item-progress/{request_id}",
+          "/v1/work-item-progress/{request_id}/usage",
+          "/v1/work-item-progress/{request_id}/verification",
+          "/v1/turn-progress/{progress_id}",
+          "/v1/factory/cards/{token}.svg",
+          "/schedules",
+          "/schedules/{agent}/{name}/pause",
+          "/schedules/{agent}/{name}/resume",
+          "/work-items",
+          "/work-items/issue-read",
+          "/work-items/{work_item_id}",
+          "/work-items/{work_item_id}/usage",
+          "unmatched"
+        ],
+        "outcome": [
+          "1xx",
+          "2xx",
+          "3xx",
+          "4xx",
+          "5xx"
+        ],
+        "role": [
+          "server"
+        ],
+        "service.name": [
+          "curie-api"
+        ],
+        "source": [
+          "GET",
+          "POST",
+          "PUT",
+          "PATCH",
+          "DELETE",
+          "OPTIONS",
+          "HEAD",
+          "OTHER"
+        ]
+      },
+      "cardinality_bound": 4680,
+      "description": "HTTP server requests.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{request}"
+    },
+    "curie.http.server.request.duration": {
+      "attributes": {
+        "operation": [
+          "/actions",
+          "/actions/{action_id}",
+          "/actions/{action_id}/audit",
+          "/actions/{action_id}/complete",
+          "/actions/{action_id}/undo",
+          "/agents",
+          "/agents/{agent_id}",
+          "/agents/{agent_id}/behavior-packs",
+          "/agents/{agent_id}/budget",
+          "/agents/{agent_id}/channels",
+          "/agents/{agent_id}/channels/callers",
+          "/agents/{agent_id}/cost",
+          "/agents/{agent_id}/hook-secret",
+          "/agents/{agent_id}/kill",
+          "/agents/{agent_id}/memory",
+          "/agents/{agent_id}/memory/guidance",
+          "/agents/{agent_id}/memory/{index}",
+          "/agents/{agent_id}/memory/{index}/provenance",
+          "/agents/{agent_id}/resume",
+          "/agents/{agent_id}/state",
+          "/agents/{agent_id}/state/bindings/{kind}/{address}",
+          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}",
+          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}",
+          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}/append",
+          "/agents/{agent_id}/state/{namespace}",
+          "/agents/{agent_id}/state/{namespace}/{key}",
+          "/agents/{agent_id}/state/{namespace}/{key}/append",
+          "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{name}/fire",
+          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
+          "/agents/{agent_id}/versions",
+          "/agents/{agent_id}/versions/{version_id}/bundle",
+          "/agents/{agent_id}/versions/{version_id}/connectors",
+          "/agents/{agent_id}/versions/{version_id}/files",
+          "/approvals",
+          "/approvals/principals/adapter",
+          "/approvals/principals/adapter/rotate",
+          "/approvals/principals/operator",
+          "/approvals/{approval_id}",
+          "/approvals/{approval_id}/audit",
+          "/approvals/{approval_id}/resolve",
+          "/approvals/identity-report",
+          "/approvals/{approval_id}/recover",
+          "/channels/admission",
+          "/channels/token",
+          "/channels/turns",
+          "/cluster-message-replies/{reply_ref}",
+          "/config",
+          "/console/login-codes",
+          "/console/session",
+          "/deploy-targets/list",
+          "/deploy-targets/resolve",
+          "/deployments",
+          "/deployments/{deployment_id}",
+          "/evals/matrix",
+          "/evals/report",
+          "/evals/trigger",
+          "/git-flow/routing-check",
+          "/github/webhook",
+          "/health",
+          "/ready",
+          "/hooks/{agent_id}/{hook}",
+          "/langfuse/traces",
+          "/langfuse/traces/{trace_id}",
+          "/langfuse/traces/{trace_id}/eval-case",
+          "/openapi.json",
+          "/docs",
+          "/docs/oauth2-redirect",
+          "/redoc",
+          "/observability/metrics/series",
+          "/observability/metrics/summary",
+          "/observability/runners",
+          "/observability/runners/{namespace}/{pod}/logs",
+          "/publications",
+          "/publications/precheck",
+          "/publications/{publication_id}",
+          "/v1/internal/cluster-message-replies/{reply_ref}",
+          "/v1/internal/github/reviews/{event_id}/reserve",
+          "/v1/internal/github/reviews/{event_id}/verify",
+          "/v1/internal/memory/closed-turns",
+          "/v1/internal/publications",
+          "/v1/internal/publications/precheck/context",
+          "/v1/internal/publications/lineage",
+          "/v1/internal/publications/review-reservations",
+          "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
+          "/v1/internal/publications/{publication_id}/lineage",
+          "/v1/internal/publications/{publication_id}/credential",
+          "/v1/internal/workspaces/{deployment_id}/credential",
+          "/v1/internal/workspaces/{deployment_id}/selection",
+          "/v1/internal/work-items/admissions",
+          "/v1/internal/work-items/requests/{request_id}",
+          "/v1/internal/work-items/{work_item_id}/cancel",
+          "/v1/internal/work-items/requests/{request_id}/acquire",
+          "/v1/internal/work-items/requests/{request_id}/defer",
+          "/v1/internal/work-items/requests/{request_id}/start",
+          "/v1/internal/work-items/requests/{request_id}/heartbeat",
+          "/v1/internal/work-items/requests/{request_id}/hold-approval",
+          "/v1/internal/work-items/requests/{request_id}/owner-lost",
+          "/v1/internal/work-items/running",
+          "/v1/internal/work-items/runtime-owners",
+          "/v1/internal/work-items/requests/{request_id}/finish",
+          "/v1/internal/work-items/requests/{request_id}/termination/claim",
+          "/v1/internal/work-items/requests/{request_id}/termination",
+          "/v1/internal/work-items/issue-read/context",
+          "/v1/work-item-progress/{request_id}",
+          "/v1/work-item-progress/{request_id}/usage",
+          "/v1/work-item-progress/{request_id}/verification",
+          "/v1/turn-progress/{progress_id}",
+          "/v1/factory/cards/{token}.svg",
+          "/schedules",
+          "/schedules/{agent}/{name}/pause",
+          "/schedules/{agent}/{name}/resume",
+          "/work-items",
+          "/work-items/issue-read",
+          "/work-items/{work_item_id}",
+          "/work-items/{work_item_id}/usage",
+          "unmatched"
+        ],
+        "outcome": [
+          "1xx",
+          "2xx",
+          "3xx",
+          "4xx",
+          "5xx"
+        ],
+        "role": [
+          "server"
+        ],
+        "service.name": [
+          "curie-api"
+        ],
+        "source": [
+          "GET",
+          "POST",
+          "PUT",
+          "PATCH",
+          "DELETE",
+          "OPTIONS",
+          "HEAD",
+          "OTHER"
+        ]
+      },
+      "cardinality_bound": 4680,
+      "description": "HTTP server request duration.",
+      "monotonic": false,
+      "type": "histogram",
+      "unit": "s"
+    },
+    "curie.queue.dead_letter": {
+      "attributes": {
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "ack",
+          "retry",
+          "dead-letter",
+          "queued"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher",
+          "curie-worker"
+        ],
+        "source": [
+          "api",
+          "dispatcher",
+          "worker",
+          "local",
+          "eval"
+        ]
+      },
+      "cardinality_bound": 105,
+      "description": "Messages dead lettered.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{message}"
+    },
+    "curie.queue.depth": {
+      "attributes": {
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "ack",
+          "retry",
+          "dead-letter",
+          "queued"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher",
+          "curie-worker"
+        ],
+        "source": [
+          "api",
+          "dispatcher",
+          "worker",
+          "local",
+          "eval"
+        ]
+      },
+      "cardinality_bound": 105,
+      "description": "Stream depth.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "{message}"
+    },
+    "curie.queue.enqueue": {
+      "attributes": {
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "ack",
+          "retry",
+          "dead-letter",
+          "queued"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher",
+          "curie-worker"
+        ],
+        "source": [
+          "api",
+          "dispatcher",
+          "worker",
+          "local",
+          "eval"
+        ]
+      },
+      "cardinality_bound": 105,
+      "description": "Messages enqueued.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{message}"
+    },
+    "curie.queue.lag": {
+      "attributes": {
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "ack",
+          "retry",
+          "dead-letter",
+          "queued"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher",
+          "curie-worker"
+        ],
+        "source": [
+          "api",
+          "dispatcher",
+          "worker",
+          "local",
+          "eval"
+        ]
+      },
+      "cardinality_bound": 105,
+      "description": "Consumer group lag.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "{message}"
+    },
+    "curie.queue.message.age": {
+      "attributes": {
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "ack",
+          "retry",
+          "dead-letter",
+          "queued"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher",
+          "curie-worker"
+        ],
+        "source": [
+          "api",
+          "dispatcher",
+          "worker",
+          "local",
+          "eval"
+        ]
+      },
+      "cardinality_bound": 105,
+      "description": "Message age at processing.",
+      "monotonic": false,
+      "type": "histogram",
+      "unit": "s"
+    },
+    "curie.queue.pending": {
+      "attributes": {
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "ack",
+          "retry",
+          "dead-letter",
+          "queued"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher",
+          "curie-worker"
+        ],
+        "source": [
+          "api",
+          "dispatcher",
+          "worker",
+          "local",
+          "eval"
+        ]
+      },
+      "cardinality_bound": 105,
+      "description": "Pending consumer group messages.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "{message}"
+    },
+    "curie.queue.process": {
+      "attributes": {
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "ack",
+          "retry",
+          "dead-letter",
+          "queued"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher",
+          "curie-worker"
+        ],
+        "source": [
+          "api",
+          "dispatcher",
+          "worker",
+          "local",
+          "eval"
+        ]
+      },
+      "cardinality_bound": 105,
+      "description": "Messages processed.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{message}"
+    },
+    "curie.queue.process.duration": {
+      "attributes": {
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "ack",
+          "retry",
+          "dead-letter",
+          "queued"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher",
+          "curie-worker"
+        ],
+        "source": [
+          "api",
+          "dispatcher",
+          "worker",
+          "local",
+          "eval"
+        ]
+      },
+      "cardinality_bound": 105,
+      "description": "Queue processing duration.",
+      "monotonic": false,
+      "type": "histogram",
+      "unit": "s"
+    },
+    "curie.queue.retry": {
+      "attributes": {
+        "retry_class": [
+          "redelivery",
+          "rate-limit",
+          "runner-error",
+          "runner-timeout",
+          "workspace-error",
+          "sandbox-terminated",
+          "sandbox-capacity"
+        ],
+        "service.name": [
+          "curie-worker"
+        ],
+        "source": [
+          "worker",
+          "eval"
+        ]
+      },
+      "cardinality_bound": 14,
+      "description": "Bounded queue redelivery and in-process turn retries.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{retry}"
+    },
+    "curie.queue.settle": {
+      "attributes": {
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "ack",
+          "retry",
+          "dead-letter",
+          "queued"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher",
+          "curie-worker"
+        ],
+        "source": [
+          "api",
+          "dispatcher",
+          "worker",
+          "local",
+          "eval"
+        ]
+      },
+      "cardinality_bound": 105,
+      "description": "Message settlement outcomes.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{message}"
+    },
+    "curie.queue.wait.duration": {
+      "attributes": {
+        "outcome": [
+          "success",
+          "failure",
+          "pending",
+          "ack",
+          "retry",
+          "dead-letter",
+          "queued"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher",
+          "curie-worker"
+        ],
+        "source": [
+          "api",
+          "dispatcher",
+          "worker",
+          "local",
+          "eval"
+        ]
+      },
+      "cardinality_bound": 105,
+      "description": "Queue wait duration.",
+      "monotonic": false,
+      "type": "histogram",
+      "unit": "s"
+    },
+    "curie.reply.delivery": {
+      "attributes": {
+        "operation": [
+          "update",
+          "post"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "best-effort",
+          "retry",
+          "rate-limited"
+        ],
+        "role": [
+          "client"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 10,
+      "description": "Reply delivery outcomes.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{reply}"
+    },
+    "curie.reply.post.duration": {
+      "attributes": {
+        "operation": [
+          "update",
+          "post"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "best-effort",
+          "retry",
+          "rate-limited"
+        ],
+        "role": [
+          "client"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 10,
+      "description": "Reply post duration.",
+      "monotonic": false,
+      "type": "histogram",
+      "unit": "s"
+    },
+    "curie.reply.retry": {
+      "attributes": {
+        "operation": [
+          "update",
+          "post"
+        ],
+        "retry_class": [
+          "block-fallback",
+          "rate-limit",
+          "transport-fallback"
+        ],
+        "role": [
+          "client"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 6,
+      "description": "Reply delivery retries.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{retry}"
+    },
+    "curie.reply.update.duration": {
+      "attributes": {
+        "operation": [
+          "update",
+          "post"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "best-effort",
+          "retry",
+          "rate-limited"
+        ],
+        "role": [
+          "client"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 10,
+      "description": "Reply update duration.",
+      "monotonic": false,
+      "type": "histogram",
+      "unit": "s"
+    },
+    "curie.runner.rpc.request.duration": {
+      "attributes": {
+        "operation": [
+          "event",
+          "steer",
+          "interrupt",
+          "reset",
+          "status",
+          "timeout",
+          "turn-admit"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "conflict",
+          "timeout"
+        ],
+        "role": [
+          "client"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 28,
+      "description": "Runner RPC request duration.",
+      "monotonic": false,
+      "type": "histogram",
+      "unit": "s"
+    },
+    "curie.runner.rpc.result": {
+      "attributes": {
+        "operation": [
+          "event",
+          "steer",
+          "interrupt",
+          "reset",
+          "status",
+          "timeout",
+          "turn-admit"
+        ],
+        "outcome": [
+          "success",
+          "failure",
+          "conflict",
+          "timeout"
+        ],
+        "role": [
+          "client"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 28,
+      "description": "Runner RPC outcomes.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{request}"
+    },
+    "curie.sandbox.active": {
+      "attributes": {
+        "operation": [
+          "observe"
+        ],
+        "outcome": [
+          "observed"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 1,
+      "description": "Active sandboxes.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "{sandbox}"
+    },
+    "curie.sandbox.claim.duration": {
+      "attributes": {
+        "operation": [
+          "claim",
+          "resume",
+          "release",
+          "suspend",
+          "cleanup",
+          "reclaim",
+          "terminate",
+          "thread-reset"
+        ],
+        "outcome": [
+          "claimed",
+          "reused",
+          "resumed",
+          "released",
+          "suspended",
+          "failed",
+          "orphan-cleaned",
+          "observed",
+          "terminated",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "no-route",
+          "timeout"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 152,
+      "description": "Sandbox claim duration.",
+      "monotonic": false,
+      "type": "histogram",
+      "unit": "s"
+    },
+    "curie.sandbox.cleanup": {
+      "attributes": {
+        "operation": [
+          "claim",
+          "resume",
+          "release",
+          "suspend",
+          "cleanup",
+          "reclaim",
+          "terminate",
+          "thread-reset"
+        ],
+        "outcome": [
+          "claimed",
+          "reused",
+          "resumed",
+          "released",
+          "suspended",
+          "failed",
+          "orphan-cleaned",
+          "observed",
+          "terminated",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "no-route",
+          "timeout"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 152,
+      "description": "Failed and orphan sandbox cleanup.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{sandbox}"
+    },
+    "curie.sandbox.lifecycle": {
+      "attributes": {
+        "operation": [
+          "claim",
+          "resume",
+          "release",
+          "suspend",
+          "cleanup",
+          "reclaim",
+          "terminate",
+          "thread-reset"
+        ],
+        "outcome": [
+          "claimed",
+          "reused",
+          "resumed",
+          "released",
+          "suspended",
+          "failed",
+          "orphan-cleaned",
+          "observed",
+          "terminated",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "no-route",
+          "timeout"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 152,
+      "description": "Sandbox lifecycle outcomes.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{operation}"
+    },
+    "curie.sandbox.release.duration": {
+      "attributes": {
+        "operation": [
+          "claim",
+          "resume",
+          "release",
+          "suspend",
+          "cleanup",
+          "reclaim",
+          "terminate",
+          "thread-reset"
+        ],
+        "outcome": [
+          "claimed",
+          "reused",
+          "resumed",
+          "released",
+          "suspended",
+          "failed",
+          "orphan-cleaned",
+          "observed",
+          "terminated",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "no-route",
+          "timeout"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 152,
+      "description": "Sandbox release duration.",
+      "monotonic": false,
+      "type": "histogram",
+      "unit": "s"
+    },
+    "curie.sandbox.resume.duration": {
+      "attributes": {
+        "operation": [
+          "claim",
+          "resume",
+          "release",
+          "suspend",
+          "cleanup",
+          "reclaim",
+          "terminate",
+          "thread-reset"
+        ],
+        "outcome": [
+          "claimed",
+          "reused",
+          "resumed",
+          "released",
+          "suspended",
+          "failed",
+          "orphan-cleaned",
+          "observed",
+          "terminated",
+          "expiry-unsupported",
+          "race-lost",
+          "reclaimed",
+          "reclaimed-retry-refused",
+          "refused-invalid-quota",
+          "refused-no-budget",
+          "refused-no-safe-route",
+          "scan-incomplete",
+          "no-route",
+          "timeout"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 152,
+      "description": "Sandbox resume duration.",
+      "monotonic": false,
+      "type": "histogram",
+      "unit": "s"
+    },
+    "curie.sandbox.suspended": {
+      "attributes": {
+        "operation": [
+          "observe"
+        ],
+        "outcome": [
+          "observed"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 1,
+      "description": "Suspended sandboxes.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "{sandbox}"
+    },
+    "curie.schedule.fire": {
+      "attributes": {
+        "outcome": [
+          "ran",
+          "deferred",
+          "skipped",
+          "blocked",
+          "reclaimed",
+          "failed"
+        ],
+        "service.name": [
+          "curie-worker"
+        ],
+        "trigger": [
+          "cron",
+          "bind",
+          "webhook",
+          "test"
+        ]
+      },
+      "cardinality_bound": 24,
+      "description": "Durably settled hook fires.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{fire}"
     },
     "curie.slack.socket.identities": {
-      "type": "gauge",
-      "unit": "{identity}",
-      "description": "Slack identities the dispatcher serves, and those holding a live Socket Mode socket.",
-      "monotonic": false,
       "attributes": {
         "service.name": [
           "curie-dispatcher"
@@ -1062,738 +1505,122 @@
           "connected"
         ]
       },
-      "cardinality_bound": 2
-    },
-    "curie.reply.delivery": {
-      "type": "counter",
-      "unit": "{reply}",
-      "description": "Reply delivery outcomes.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "operation": [
-          "update",
-          "post"
-        ],
-        "role": [
-          "client"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "best-effort",
-          "retry",
-          "rate-limited"
-        ]
-      },
-      "cardinality_bound": 10
-    },
-    "curie.reply.update.duration": {
-      "type": "histogram",
-      "unit": "s",
-      "description": "Reply update duration.",
+      "cardinality_bound": 2,
+      "description": "Slack identities the dispatcher serves, and those holding a live Socket Mode socket.",
       "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "operation": [
-          "update",
-          "post"
-        ],
-        "role": [
-          "client"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "best-effort",
-          "retry",
-          "rate-limited"
-        ]
-      },
-      "cardinality_bound": 10
-    },
-    "curie.reply.post.duration": {
-      "type": "histogram",
-      "unit": "s",
-      "description": "Reply post duration.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "operation": [
-          "update",
-          "post"
-        ],
-        "role": [
-          "client"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "best-effort",
-          "retry",
-          "rate-limited"
-        ]
-      },
-      "cardinality_bound": 10
-    },
-    "curie.reply.retry": {
-      "type": "counter",
-      "unit": "{retry}",
-      "description": "Reply delivery retries.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-worker"
-        ],
-        "operation": [
-          "update",
-          "post"
-        ],
-        "role": [
-          "client"
-        ],
-        "retry_class": [
-          "block-fallback",
-          "rate-limit",
-          "transport-fallback"
-        ]
-      },
-      "cardinality_bound": 6
-    },
-    "curie.http.server.request": {
-      "type": "counter",
-      "unit": "{request}",
-      "description": "HTTP server requests.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-api"
-        ],
-        "operation": [
-          "/actions",
-          "/actions/{action_id}",
-          "/actions/{action_id}/audit",
-          "/actions/{action_id}/complete",
-          "/actions/{action_id}/undo",
-          "/agents",
-          "/agents/{agent_id}",
-          "/agents/{agent_id}/behavior-packs",
-          "/agents/{agent_id}/budget",
-          "/agents/{agent_id}/channels",
-          "/agents/{agent_id}/channels/callers",
-          "/agents/{agent_id}/cost",
-          "/agents/{agent_id}/hook-secret",
-          "/agents/{agent_id}/kill",
-          "/agents/{agent_id}/memory",
-          "/agents/{agent_id}/memory/{index}",
-          "/agents/{agent_id}/memory/{index}/provenance",
-          "/agents/{agent_id}/resume",
-          "/agents/{agent_id}/state",
-          "/agents/{agent_id}/state/bindings/{kind}/{address}",
-          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}",
-          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}",
-          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}/append",
-          "/agents/{agent_id}/state/{namespace}",
-          "/agents/{agent_id}/state/{namespace}/{key}",
-          "/agents/{agent_id}/state/{namespace}/{key}/append",
-          "/agents/{agent_id}/threads/{thread_key}/reset",
-          "/agents/{agent_id}/hooks/{name}/fire",
-          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
-          "/agents/{agent_id}/versions",
-          "/agents/{agent_id}/versions/{version_id}/bundle",
-          "/agents/{agent_id}/versions/{version_id}/connectors",
-          "/agents/{agent_id}/versions/{version_id}/files",
-          "/approvals",
-          "/approvals/principals/adapter",
-          "/approvals/principals/adapter/rotate",
-          "/approvals/principals/operator",
-          "/approvals/{approval_id}",
-          "/approvals/{approval_id}/audit",
-          "/approvals/{approval_id}/resolve",
-          "/approvals/identity-report",
-          "/approvals/{approval_id}/recover",
-          "/channels/admission",
-          "/channels/token",
-          "/channels/turns",
-          "/cluster-message-replies/{reply_ref}",
-          "/config",
-          "/console/login-codes",
-          "/console/session",
-          "/deploy-targets/list",
-          "/deploy-targets/resolve",
-          "/deployments",
-          "/deployments/{deployment_id}",
-          "/evals/matrix",
-          "/evals/report",
-          "/evals/trigger",
-          "/git-flow/routing-check",
-          "/github/webhook",
-          "/health",
-          "/ready",
-          "/hooks/{agent_id}/{hook}",
-          "/langfuse/traces",
-          "/langfuse/traces/{trace_id}",
-          "/langfuse/traces/{trace_id}/eval-case",
-          "/openapi.json",
-          "/docs",
-          "/docs/oauth2-redirect",
-          "/redoc",
-          "/observability/metrics/series",
-          "/observability/metrics/summary",
-          "/observability/runners",
-          "/observability/runners/{namespace}/{pod}/logs",
-          "/publications",
-          "/publications/precheck",
-          "/publications/{publication_id}",
-          "/v1/internal/cluster-message-replies/{reply_ref}",
-          "/v1/internal/github/reviews/{event_id}/reserve",
-          "/v1/internal/github/reviews/{event_id}/verify",
-          "/v1/internal/publications",
-          "/v1/internal/publications/precheck/context",
-          "/v1/internal/publications/lineage",
-          "/v1/internal/publications/review-reservations",
-          "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
-          "/v1/internal/publications/{publication_id}/lineage",
-          "/v1/internal/publications/{publication_id}/credential",
-          "/v1/internal/workspaces/{deployment_id}/credential",
-          "/v1/internal/workspaces/{deployment_id}/selection",
-          "/v1/internal/work-items/admissions",
-          "/v1/internal/work-items/requests/{request_id}",
-          "/v1/internal/work-items/{work_item_id}/cancel",
-          "/v1/internal/work-items/requests/{request_id}/acquire",
-          "/v1/internal/work-items/requests/{request_id}/defer",
-          "/v1/internal/work-items/requests/{request_id}/start",
-          "/v1/internal/work-items/requests/{request_id}/heartbeat",
-          "/v1/internal/work-items/requests/{request_id}/hold-approval",
-          "/v1/internal/work-items/requests/{request_id}/owner-lost",
-          "/v1/internal/work-items/running",
-          "/v1/internal/work-items/runtime-owners",
-          "/v1/internal/work-items/requests/{request_id}/finish",
-          "/v1/internal/work-items/requests/{request_id}/termination/claim",
-          "/v1/internal/work-items/requests/{request_id}/termination",
-          "/v1/internal/work-items/issue-read/context",
-          "/v1/work-item-progress/{request_id}",
-          "/v1/work-item-progress/{request_id}/usage",
-          "/v1/work-item-progress/{request_id}/verification",
-          "/v1/factory/cards/{token}.svg",
-          "/schedules",
-          "/schedules/{agent}/{name}/pause",
-          "/schedules/{agent}/{name}/resume",
-          "/work-items",
-          "/work-items/issue-read",
-          "/work-items/{work_item_id}",
-          "/work-items/{work_item_id}/usage",
-          "unmatched"
-        ],
-        "role": [
-          "server"
-        ],
-        "source": [
-          "GET",
-          "POST",
-          "PUT",
-          "PATCH",
-          "DELETE",
-          "OPTIONS",
-          "HEAD",
-          "OTHER"
-        ],
-        "outcome": [
-          "1xx",
-          "2xx",
-          "3xx",
-          "4xx",
-          "5xx"
-        ]
-      },
-      "cardinality_bound": 4560
-    },
-    "curie.http.server.request.duration": {
-      "type": "histogram",
-      "unit": "s",
-      "description": "HTTP server request duration.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-api"
-        ],
-        "operation": [
-          "/actions",
-          "/actions/{action_id}",
-          "/actions/{action_id}/audit",
-          "/actions/{action_id}/complete",
-          "/actions/{action_id}/undo",
-          "/agents",
-          "/agents/{agent_id}",
-          "/agents/{agent_id}/behavior-packs",
-          "/agents/{agent_id}/budget",
-          "/agents/{agent_id}/channels",
-          "/agents/{agent_id}/channels/callers",
-          "/agents/{agent_id}/cost",
-          "/agents/{agent_id}/hook-secret",
-          "/agents/{agent_id}/kill",
-          "/agents/{agent_id}/memory",
-          "/agents/{agent_id}/memory/{index}",
-          "/agents/{agent_id}/memory/{index}/provenance",
-          "/agents/{agent_id}/resume",
-          "/agents/{agent_id}/state",
-          "/agents/{agent_id}/state/bindings/{kind}/{address}",
-          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}",
-          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}",
-          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}/append",
-          "/agents/{agent_id}/state/{namespace}",
-          "/agents/{agent_id}/state/{namespace}/{key}",
-          "/agents/{agent_id}/state/{namespace}/{key}/append",
-          "/agents/{agent_id}/threads/{thread_key}/reset",
-          "/agents/{agent_id}/hooks/{name}/fire",
-          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
-          "/agents/{agent_id}/versions",
-          "/agents/{agent_id}/versions/{version_id}/bundle",
-          "/agents/{agent_id}/versions/{version_id}/connectors",
-          "/agents/{agent_id}/versions/{version_id}/files",
-          "/approvals",
-          "/approvals/principals/adapter",
-          "/approvals/principals/adapter/rotate",
-          "/approvals/principals/operator",
-          "/approvals/{approval_id}",
-          "/approvals/{approval_id}/audit",
-          "/approvals/{approval_id}/resolve",
-          "/approvals/identity-report",
-          "/approvals/{approval_id}/recover",
-          "/channels/admission",
-          "/channels/token",
-          "/channels/turns",
-          "/cluster-message-replies/{reply_ref}",
-          "/config",
-          "/console/login-codes",
-          "/console/session",
-          "/deploy-targets/list",
-          "/deploy-targets/resolve",
-          "/deployments",
-          "/deployments/{deployment_id}",
-          "/evals/matrix",
-          "/evals/report",
-          "/evals/trigger",
-          "/git-flow/routing-check",
-          "/github/webhook",
-          "/health",
-          "/ready",
-          "/hooks/{agent_id}/{hook}",
-          "/langfuse/traces",
-          "/langfuse/traces/{trace_id}",
-          "/langfuse/traces/{trace_id}/eval-case",
-          "/openapi.json",
-          "/docs",
-          "/docs/oauth2-redirect",
-          "/redoc",
-          "/observability/metrics/series",
-          "/observability/metrics/summary",
-          "/observability/runners",
-          "/observability/runners/{namespace}/{pod}/logs",
-          "/publications",
-          "/publications/precheck",
-          "/publications/{publication_id}",
-          "/v1/internal/cluster-message-replies/{reply_ref}",
-          "/v1/internal/github/reviews/{event_id}/reserve",
-          "/v1/internal/github/reviews/{event_id}/verify",
-          "/v1/internal/publications",
-          "/v1/internal/publications/precheck/context",
-          "/v1/internal/publications/lineage",
-          "/v1/internal/publications/review-reservations",
-          "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
-          "/v1/internal/publications/{publication_id}/lineage",
-          "/v1/internal/publications/{publication_id}/credential",
-          "/v1/internal/workspaces/{deployment_id}/credential",
-          "/v1/internal/workspaces/{deployment_id}/selection",
-          "/v1/internal/work-items/admissions",
-          "/v1/internal/work-items/requests/{request_id}",
-          "/v1/internal/work-items/{work_item_id}/cancel",
-          "/v1/internal/work-items/requests/{request_id}/acquire",
-          "/v1/internal/work-items/requests/{request_id}/defer",
-          "/v1/internal/work-items/requests/{request_id}/start",
-          "/v1/internal/work-items/requests/{request_id}/heartbeat",
-          "/v1/internal/work-items/requests/{request_id}/hold-approval",
-          "/v1/internal/work-items/requests/{request_id}/owner-lost",
-          "/v1/internal/work-items/running",
-          "/v1/internal/work-items/runtime-owners",
-          "/v1/internal/work-items/requests/{request_id}/finish",
-          "/v1/internal/work-items/requests/{request_id}/termination/claim",
-          "/v1/internal/work-items/requests/{request_id}/termination",
-          "/v1/internal/work-items/issue-read/context",
-          "/v1/work-item-progress/{request_id}",
-          "/v1/work-item-progress/{request_id}/usage",
-          "/v1/work-item-progress/{request_id}/verification",
-          "/v1/factory/cards/{token}.svg",
-          "/schedules",
-          "/schedules/{agent}/{name}/pause",
-          "/schedules/{agent}/{name}/resume",
-          "/work-items",
-          "/work-items/issue-read",
-          "/work-items/{work_item_id}",
-          "/work-items/{work_item_id}/usage",
-          "unmatched"
-        ],
-        "role": [
-          "server"
-        ],
-        "source": [
-          "GET",
-          "POST",
-          "PUT",
-          "PATCH",
-          "DELETE",
-          "OPTIONS",
-          "HEAD",
-          "OTHER"
-        ],
-        "outcome": [
-          "1xx",
-          "2xx",
-          "3xx",
-          "4xx",
-          "5xx"
-        ]
-      },
-      "cardinality_bound": 4560
-    },
-    "curie.http.server.active": {
-      "type": "up_down_counter",
-      "unit": "{request}",
-      "description": "Active HTTP server requests.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-api"
-        ],
-        "operation": [
-          "/actions",
-          "/actions/{action_id}",
-          "/actions/{action_id}/audit",
-          "/actions/{action_id}/complete",
-          "/actions/{action_id}/undo",
-          "/agents",
-          "/agents/{agent_id}",
-          "/agents/{agent_id}/behavior-packs",
-          "/agents/{agent_id}/budget",
-          "/agents/{agent_id}/channels",
-          "/agents/{agent_id}/channels/callers",
-          "/agents/{agent_id}/cost",
-          "/agents/{agent_id}/hook-secret",
-          "/agents/{agent_id}/kill",
-          "/agents/{agent_id}/memory",
-          "/agents/{agent_id}/memory/{index}",
-          "/agents/{agent_id}/memory/{index}/provenance",
-          "/agents/{agent_id}/resume",
-          "/agents/{agent_id}/state",
-          "/agents/{agent_id}/state/bindings/{kind}/{address}",
-          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}",
-          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}",
-          "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}/{key}/append",
-          "/agents/{agent_id}/state/{namespace}",
-          "/agents/{agent_id}/state/{namespace}/{key}",
-          "/agents/{agent_id}/state/{namespace}/{key}/append",
-          "/agents/{agent_id}/threads/{thread_key}/reset",
-          "/agents/{agent_id}/hooks/{name}/fire",
-          "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
-          "/agents/{agent_id}/versions",
-          "/agents/{agent_id}/versions/{version_id}/bundle",
-          "/agents/{agent_id}/versions/{version_id}/connectors",
-          "/agents/{agent_id}/versions/{version_id}/files",
-          "/approvals",
-          "/approvals/principals/adapter",
-          "/approvals/principals/adapter/rotate",
-          "/approvals/principals/operator",
-          "/approvals/{approval_id}",
-          "/approvals/{approval_id}/audit",
-          "/approvals/{approval_id}/resolve",
-          "/approvals/identity-report",
-          "/approvals/{approval_id}/recover",
-          "/channels/admission",
-          "/channels/token",
-          "/channels/turns",
-          "/cluster-message-replies/{reply_ref}",
-          "/config",
-          "/console/login-codes",
-          "/console/session",
-          "/deploy-targets/list",
-          "/deploy-targets/resolve",
-          "/deployments",
-          "/deployments/{deployment_id}",
-          "/evals/matrix",
-          "/evals/report",
-          "/evals/trigger",
-          "/git-flow/routing-check",
-          "/github/webhook",
-          "/health",
-          "/ready",
-          "/hooks/{agent_id}/{hook}",
-          "/langfuse/traces",
-          "/langfuse/traces/{trace_id}",
-          "/langfuse/traces/{trace_id}/eval-case",
-          "/openapi.json",
-          "/docs",
-          "/docs/oauth2-redirect",
-          "/redoc",
-          "/observability/metrics/series",
-          "/observability/metrics/summary",
-          "/observability/runners",
-          "/observability/runners/{namespace}/{pod}/logs",
-          "/publications",
-          "/publications/precheck",
-          "/publications/{publication_id}",
-          "/v1/internal/cluster-message-replies/{reply_ref}",
-          "/v1/internal/github/reviews/{event_id}/reserve",
-          "/v1/internal/github/reviews/{event_id}/verify",
-          "/v1/internal/publications",
-          "/v1/internal/publications/precheck/context",
-          "/v1/internal/publications/lineage",
-          "/v1/internal/publications/review-reservations",
-          "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
-          "/v1/internal/publications/{publication_id}/lineage",
-          "/v1/internal/publications/{publication_id}/credential",
-          "/v1/internal/workspaces/{deployment_id}/credential",
-          "/v1/internal/workspaces/{deployment_id}/selection",
-          "/v1/internal/work-items/admissions",
-          "/v1/internal/work-items/requests/{request_id}",
-          "/v1/internal/work-items/{work_item_id}/cancel",
-          "/v1/internal/work-items/requests/{request_id}/acquire",
-          "/v1/internal/work-items/requests/{request_id}/defer",
-          "/v1/internal/work-items/requests/{request_id}/start",
-          "/v1/internal/work-items/requests/{request_id}/heartbeat",
-          "/v1/internal/work-items/requests/{request_id}/hold-approval",
-          "/v1/internal/work-items/requests/{request_id}/owner-lost",
-          "/v1/internal/work-items/running",
-          "/v1/internal/work-items/runtime-owners",
-          "/v1/internal/work-items/requests/{request_id}/finish",
-          "/v1/internal/work-items/requests/{request_id}/termination/claim",
-          "/v1/internal/work-items/requests/{request_id}/termination",
-          "/v1/internal/work-items/issue-read/context",
-          "/v1/work-item-progress/{request_id}",
-          "/v1/work-item-progress/{request_id}/usage",
-          "/v1/work-item-progress/{request_id}/verification",
-          "/v1/factory/cards/{token}.svg",
-          "/schedules",
-          "/schedules/{agent}/{name}/pause",
-          "/schedules/{agent}/{name}/resume",
-          "/work-items",
-          "/work-items/issue-read",
-          "/work-items/{work_item_id}",
-          "/work-items/{work_item_id}/usage",
-          "unmatched"
-        ],
-        "role": [
-          "server"
-        ],
-        "source": [
-          "GET",
-          "POST",
-          "PUT",
-          "PATCH",
-          "DELETE",
-          "OPTIONS",
-          "HEAD",
-          "OTHER"
-        ]
-      },
-      "cardinality_bound": 912
-    },
-    "curie.background.loop": {
-      "type": "counter",
-      "unit": "{run}",
-      "description": "Background loop pass outcomes.",
-      "monotonic": true,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-worker"
-        ],
-        "operation": [
-          "resume-reconciler",
-          "approval-sweeper",
-          "graveyard-watcher",
-          "commit-poller",
-          "connector-reconciler"
-        ],
-        "role": [
-          "background"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "observed"
-        ]
-      },
-      "cardinality_bound": 30
-    },
-    "curie.background.last_success.age": {
       "type": "gauge",
-      "unit": "s",
-      "description": "Age of the last successful background pass.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-api",
-          "curie-worker"
-        ],
-        "operation": [
-          "resume-reconciler",
-          "approval-sweeper",
-          "graveyard-watcher",
-          "commit-poller",
-          "connector-reconciler"
-        ],
-        "role": [
-          "background"
-        ]
-      },
-      "cardinality_bound": 10
+      "unit": "{identity}"
     },
-    "curie.connector.reconcile.skipped_agents": {
-      "type": "gauge",
-      "unit": "{agent}",
-      "description": "Agents whose connector applies the reconciler is skipping.",
-      "monotonic": false,
+    "curie.state.legacy_token": {
       "attributes": {
+        "namespace": [
+          "transcript"
+        ],
         "service.name": [
-          "curie-worker"
+          "curie-api"
         ]
       },
-      "cardinality_bound": 1
+      "cardinality_bound": 1,
+      "description": "State requests allowed for a sandbox token minted before ADR-0188.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{request}"
     },
     "curie.state.mutation": {
-      "type": "counter",
-      "unit": "{mutation}",
-      "description": "Agent state and memory entries removed or rewritten.",
-      "monotonic": true,
       "attributes": {
-        "service.name": [
-          "curie-api"
+        "namespace": [
+          "memory",
+          "transcript",
+          "other"
         ],
         "op": [
           "delete",
           "edit"
         ],
-        "namespace": [
-          "memory",
-          "transcript",
-          "other"
-        ]
-      },
-      "cardinality_bound": 6
-    },
-    "curie.work_item.reconciler.step.failure": {
-      "type": "counter",
-      "unit": "{failure}",
-      "description": "Failed WorkItem reconciler steps.",
-      "monotonic": true,
-      "attributes": {
         "service.name": [
           "curie-api"
-        ],
-        "step": [
-          "settle_publications",
-          "expire_waiting",
-          "request_deadline_cancellations",
-          "request_owner_lost_cancellations",
-          "publish_terminate_wakes",
-          "settle_overdue_cancellations",
-          "readmit_pending",
-          "reconcile_missed_labels",
-          "sync_status_comments",
-          "redispatch_lapsed_acquisitions",
-          "publish_execute_wakes"
         ]
       },
-      "cardinality_bound": 11
-    },
-    "curie.work_item.reconciler.step.consecutive_failures": {
-      "type": "gauge",
-      "unit": "{pass}",
-      "description": "Consecutive failed passes for each WorkItem reconciler step.",
-      "monotonic": false,
-      "attributes": {
-        "service.name": [
-          "curie-api"
-        ],
-        "step": [
-          "settle_publications",
-          "expire_waiting",
-          "request_deadline_cancellations",
-          "request_owner_lost_cancellations",
-          "publish_terminate_wakes",
-          "settle_overdue_cancellations",
-          "readmit_pending",
-          "reconcile_missed_labels",
-          "sync_status_comments",
-          "redispatch_lapsed_acquisitions",
-          "publish_execute_wakes"
-        ]
-      },
-      "cardinality_bound": 11
-    },
-    "curie.eval.process": {
-      "type": "counter",
-      "unit": "{job}",
-      "description": "Eval processing outcomes.",
+      "cardinality_bound": 6,
+      "description": "Agent state and memory entries removed or rewritten.",
       "monotonic": true,
+      "type": "counter",
+      "unit": "{mutation}"
+    },
+    "curie.thread.lock.wait.duration": {
       "attributes": {
+        "outcome": [
+          "acquired",
+          "contended",
+          "timeout",
+          "start",
+          "steer",
+          "finish-race",
+          "observed"
+        ],
         "service.name": [
           "curie-worker"
         ],
         "source": [
-          "eval"
-        ],
-        "outcome": [
-          "success",
-          "failure",
-          "plumbing"
+          "worker"
         ]
       },
-      "cardinality_bound": 3
+      "cardinality_bound": 7,
+      "description": "Thread lock acquisition duration.",
+      "monotonic": false,
+      "type": "histogram",
+      "unit": "s"
     },
-    "curie.worker.supervised.restart": {
-      "type": "counter",
-      "unit": "{restart}",
-      "description": "In-process supervised worker task restarts.",
-      "monotonic": true,
+    "curie.thread.route": {
       "attributes": {
+        "outcome": [
+          "acquired",
+          "contended",
+          "timeout",
+          "start",
+          "steer",
+          "finish-race",
+          "observed"
+        ],
         "service.name": [
           "curie-worker"
         ],
-        "operation": [
-          "runs",
-          "killswitch",
-          "evals",
-          "heartbeat",
-          "connectors",
-          "publications",
-          "other"
-        ],
-        "outcome": [
-          "restart",
-          "give_up"
+        "source": [
+          "worker"
         ]
       },
-      "cardinality_bound": 14
+      "cardinality_bound": 7,
+      "description": "Thread routing decisions.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{decision}"
+    },
+    "curie.thread.route.active": {
+      "attributes": {
+        "outcome": [
+          "acquired",
+          "contended",
+          "timeout",
+          "start",
+          "steer",
+          "finish-race",
+          "observed"
+        ],
+        "service.name": [
+          "curie-worker"
+        ],
+        "source": [
+          "worker"
+        ]
+      },
+      "cardinality_bound": 7,
+      "description": "Active thread routes.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "{route}"
     },
     "curie.tool.result": {
-      "type": "counter",
-      "unit": "{call}",
-      "description": "Tool call results by origin and outcome.",
-      "monotonic": true,
       "attributes": {
-        "service.name": [
-          "curie-runner"
-        ],
-        "source": [
-          "runner"
-        ],
         "origin": [
           "connector",
           "platform",
@@ -1806,9 +1633,206 @@
           "cancelled",
           "refused",
           "unavailable"
+        ],
+        "service.name": [
+          "curie-runner"
+        ],
+        "source": [
+          "runner"
         ]
       },
-      "cardinality_bound": 18
+      "cardinality_bound": 18,
+      "description": "Tool call results by origin and outcome.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{call}"
+    },
+    "curie.turn.accepted": {
+      "attributes": {
+        "outcome": [
+          "accepted"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher",
+          "curie-worker",
+          "curie-runner"
+        ],
+        "source": [
+          "api",
+          "dispatcher",
+          "worker",
+          "runner",
+          "local",
+          "eval"
+        ]
+      },
+      "cardinality_bound": 24,
+      "description": "Turns accepted for processing.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{turn}"
+    },
+    "curie.turn.completed": {
+      "attributes": {
+        "outcome": [
+          "done",
+          "awaiting_approval",
+          "budget_halted",
+          "classified_failure",
+          "side_effect_halted",
+          "idle",
+          "interrupted",
+          "deadline_halted",
+          "capacity_wait_expired"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher",
+          "curie-worker",
+          "curie-runner"
+        ],
+        "source": [
+          "api",
+          "dispatcher",
+          "worker",
+          "runner",
+          "local",
+          "eval"
+        ]
+      },
+      "cardinality_bound": 216,
+      "description": "Turns reaching a terminal result.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{turn}"
+    },
+    "curie.turn.duration": {
+      "attributes": {
+        "outcome": [
+          "done",
+          "awaiting_approval",
+          "budget_halted",
+          "classified_failure",
+          "side_effect_halted",
+          "idle",
+          "interrupted",
+          "deadline_halted",
+          "capacity_wait_expired"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher",
+          "curie-worker",
+          "curie-runner"
+        ],
+        "source": [
+          "api",
+          "dispatcher",
+          "worker",
+          "runner",
+          "local",
+          "eval"
+        ]
+      },
+      "cardinality_bound": 216,
+      "description": "End to end turn duration.",
+      "monotonic": false,
+      "type": "histogram",
+      "unit": "s"
+    },
+    "curie.turn.refused": {
+      "attributes": {
+        "reason": [
+          "caller_not_allowed",
+          "admission_unavailable"
+        ],
+        "service.name": [
+          "curie-api",
+          "curie-dispatcher"
+        ]
+      },
+      "cardinality_bound": 4,
+      "description": "Callers refused before a turn by a binding's caller list.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{turn}"
+    },
+    "curie.work_item.reconciler.step.consecutive_failures": {
+      "attributes": {
+        "service.name": [
+          "curie-api"
+        ],
+        "step": [
+          "settle_publications",
+          "expire_waiting",
+          "request_deadline_cancellations",
+          "request_owner_lost_cancellations",
+          "publish_terminate_wakes",
+          "settle_overdue_cancellations",
+          "readmit_pending",
+          "reconcile_missed_labels",
+          "sync_status_comments",
+          "redispatch_lapsed_acquisitions",
+          "publish_execute_wakes"
+        ]
+      },
+      "cardinality_bound": 11,
+      "description": "Consecutive failed passes for each WorkItem reconciler step.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "{pass}"
+    },
+    "curie.work_item.reconciler.step.failure": {
+      "attributes": {
+        "service.name": [
+          "curie-api"
+        ],
+        "step": [
+          "settle_publications",
+          "expire_waiting",
+          "request_deadline_cancellations",
+          "request_owner_lost_cancellations",
+          "publish_terminate_wakes",
+          "settle_overdue_cancellations",
+          "readmit_pending",
+          "reconcile_missed_labels",
+          "sync_status_comments",
+          "redispatch_lapsed_acquisitions",
+          "publish_execute_wakes"
+        ]
+      },
+      "cardinality_bound": 11,
+      "description": "Failed WorkItem reconciler steps.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{failure}"
+    },
+    "curie.worker.supervised.restart": {
+      "attributes": {
+        "operation": [
+          "runs",
+          "killswitch",
+          "evals",
+          "heartbeat",
+          "connectors",
+          "publications",
+          "other"
+        ],
+        "outcome": [
+          "restart",
+          "give_up"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 14,
+      "description": "In-process supervised worker task restarts.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{restart}"
     }
-  }
+  },
+  "schema_version": "v1"
 }

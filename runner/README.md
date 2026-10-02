@@ -117,6 +117,62 @@ Enforcement is only-when-configured: with the var unset the app is pass-through
 hits `/healthz`); replacement authority comes only from authenticated
 `GET /v1/status`.
 
+## Deliberate progress (ADR 0130)
+
+The runner mounts a `progress` tool on its platform `curie` MCP server, so the
+model sees it as `mcp__curie__progress`. It is ADR 0130's `curie_progress`
+operation. Its input schema is the committed `ProgressCommand` schema
+(`packages/channel-protocol/schema/channel-protocol.schema.json`) without
+`version`, which the runner fills in: `update_id`, `state`, `summary` and an
+optional `milestone`. A factory execution mounts `report_progress` instead and
+never both. When the tool is mounted the system prompt carries a short progress
+block beside the memory and workspace blocks: call it only on long,
+multi-step tasks, at material transitions, and never for a quick answer; a
+milestone (`evidence`, `scope` or `verification`) only when the step is
+material, at most three per task; and never reasoning, raw tool output, secrets
+or a draft answer in the summary. The tool description repeats the rules.
+
+The tool and its progress prompt are mounted only when the worker booted this
+sandbox with `CURIE_TURN_PROGRESS_ENABLED=1`. The worker sets that direct
+runner boot fact only for a human Slack thread and includes it in sandbox reuse
+comparison; jobs, cron, email, relay, targetless and factory sessions retain
+their pre-progress model surface. This leaves the frozen ACI unchanged.
+
+The capability is per turn. The worker first allocates a durable, monotonically
+increasing generation on the chain and marks it active. It sends the capability
+on `POST /v1/event` in three runner control headers, `X-Curie-Progress-Url`,
+`X-Curie-Progress-Token`, and `X-Curie-Progress-Generation`,
+next to `X-Curie-Capacity-Admission`; like the turn epoch they are not ACI
+fields. The token is signed for `progress_id:generation`, and the API also
+checks that the same generation is still active and before its bounded
+server-time lease before it appends anything. The worker renews that five-second
+lease while the stream is open, and cannot revive a missed lease, so a failed
+turn-end clear loses authority promptly rather than leaving a 24-hour token
+usable.
+The runner holds the three values only while that turn is open, sets them when
+the turn starts and clears them when it ends, so a steer uses the turn's
+capability and a closed or superseded turn cannot enqueue. The names are frozen
+with the worker and the API in `tests/vectors/turn-progress-capability.json`.
+
+Each call POSTs the command to the capability URL with the token in
+`X-API-Key`, adding the worker-issued `generation` and a `seq` that counts this
+turn's posts from 1. The generation remains monotonic across runner restarts,
+clock skew, retries, and cold approval resumes; the worker applies a turn's
+commands in order and refuses an older generation after a newer one. HTTP 202
+means `Progress queued.`, because durable application can still refuse it. A call
+without a capability returns "Progress is not shown for this turn." and makes
+no network call. A refusal, a rate limit, a 5xx or a transport failure is a
+soft tool result that tells the model to continue; it never fails the turn. An
+input the schema refuses (an unknown field, a bad state or summary) is an error
+result the model can correct, still without failing the turn. The call is
+platform-owned and idempotent (`PLATFORM_IDEMPOTENT_TOOLS`), so it raises no
+`side_effect_flag` and never lands on the turn's receipt.
+
+The fake model is unconditionally network-free, including when progress headers
+are present. `[fake:progress-demo]` remains a deterministic long-running turn
+for steering tests, but it does not call the ingress. API/worker integration
+tests and live-provider tests exercise the real progress handler instead.
+
 ## Per-turn tool access
 
 The runner is the reference enforcement of TOOL-ACCESS in
@@ -285,6 +341,9 @@ resources and fake provider credentials, with no real model or approval action.
   `CURIE_HISTORY_MAX_TURNS` / `CURIE_HISTORY_MAX_BYTES` (bound the rehydrated
   structured prefix with stable summary boundaries; defaults 40 turns / 16000
   bytes, a nonpositive value falls back to the default),
+  `CURIE_MEMORY_MAX_FACTS` (how many facts each memory may hold and boot
+  loads into the prompt, one number for both; default 200, a nonpositive or
+  unparseable value falls back to the default),
   `CURIE_RUNNER_PORT`, `CURIE_RUNNER_TOKEN` (per-sandbox bearer token gating
   the three ACI POST routes; enforced only when set), `CURIE_FAKE_MODEL`
   (offline smoke; no model call), `CURIE_DISALLOWED_TOOLS` (optional

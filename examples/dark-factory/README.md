@@ -5,8 +5,8 @@ One pull request, or one stated reason, comes out.
 
 Trying it for the first time? The
 [dark factory quickstart](../../docs/guides/dark-factory-quickstart.md) takes
-you from nothing to a pull request this agent opened on a new repository, on a
-laptop kind cluster.
+you from nothing to a pull request on a new repository with
+`curie factory quickstart`, polling intake and a local kind cluster.
 
 One agent does the work with one skill,
 [`skills/implement-issue/SKILL.md`](skills/implement-issue/SKILL.md), and two
@@ -131,10 +131,9 @@ curie cluster overrides dark-factory --execution-deadline 10800
 # Intake. On a release with no GitHub App, the first run prints a prefilled App
 # registration link (add --org <org> for an organization) and four manual
 # steps, and applies nothing. It never opens a browser. Click Create, copy the
-# App ID, generate a private key, install the App on the repositories, and in
-# the App settings turn the webhook on, set its URL and secret, and subscribe
-# to Issues, Issue comment, Pull request review, and Pull request review
-# comment. Then rerun with the App's details.
+# App ID, generate a private key, and install the App on the repositories.
+# Polling is the default and needs no webhook URL or secret. Then rerun with
+# the App's details.
 curie cluster factory
 
 # The rerun confirms the App with GET /app, takes the mention from its slug,
@@ -142,14 +141,13 @@ curie cluster factory
 # is checked against them instead). The label defaults to curie-factory and
 # is created in each repository. The key goes into the Secret
 # curie-github-app (key privateKey) through kubectl stdin; a Secret that
-# holds another App's key is refused. The webhook secret comes from the file
-# (or CURIE_GITHUB_WEBHOOK_SECRET) and is still required until polling intake
-# ships. Before applying anything, the command checks the merged config
+# holds another App's key is refused. Polling does not need a webhook secret.
+# Pass --webhook-secret-file (or CURIE_GITHUB_WEBHOOK_SECRET) only for webhook
+# mode. Before applying anything, the command checks the merged config
 # against the API boot gate and applies nothing if one value is missing. The
 # values survive a later `curie cluster up`.
 curie cluster factory \
-  --app-id <app-id> --private-key-file ./app.pem \
-  --webhook-secret-file ./webhook-secret
+  --app-id <app-id> --private-key-file ./app.pem --intake poll
 
 curie cluster deploy --plugin-dir ./dark-factory \
   --agent dark-factory --env prod --repo acme-corp/acme-bot
@@ -170,19 +168,21 @@ gate requires.
 A kind cluster works for a single operator. It pulls the published runner
 layer from GHCR, so it needs no local registry.
 
-GitHub must reach the API to deliver webhooks. Start a port-forward and a
-cloudflared quick tunnel to it:
+Polling needs no inbound GitHub connection. If you choose webhook mode,
+GitHub must reach the API. Start a port forward and a cloudflared quick tunnel
+to it:
 
 ```bash
 kubectl --context kind-<name> -n curie port-forward svc/curie-api 8000:8000
 cloudflared tunnel --url http://localhost:8000
 ```
 
-Set the App's webhook URL to `<tunnel>/github/webhook`, and pass
-`--card-base-url <tunnel>` to `curie cluster factory` so links in status
-comments resolve. The port-forward and the tunnel both die when the laptop
-sleeps or the api restarts. Restart them, and update the App webhook URL if
-the quick tunnel hostname changed.
+Set the App's webhook URL to `<tunnel>/github/webhook`, enable the webhook,
+and subscribe to Issues, Issue comment, Pull request review, and Pull request
+review comment. Pass `--intake webhook`, `--webhook-secret-file <path>` and
+`--card-base-url <tunnel>` to `curie cluster factory`. The port forward and
+tunnel both die when the laptop sleeps or the API restarts. Restart them and
+update the App webhook URL if the quick tunnel hostname changed.
 
 Before a production factory run resolves dependencies, provide an operator
 controlled registry mirror or terminating proxy. Configure uv, Cargo and pnpm
