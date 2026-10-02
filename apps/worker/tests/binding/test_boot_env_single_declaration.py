@@ -314,6 +314,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # the worker never renders it into a claim, so it is not a session
         # boot key.
         "CURIE_PROC_DUMPABLE_PRELOAD",
+        # Parent-only interpreter binding forced by sdk_shell_env before SDK
+        # connect. The immutable shell launcher consumes it to start isolated
+        # Python; the worker never injects it and RunnerConfig does not read it.
+        # Caller/options values cannot override this platform-owned binding.
+        "CURIE_SHELL_PYTHON",
         # The Claude SDK consumes this background model setting for session
         # titles. The runner passes it to the SDK, outside the BootEnv contract.
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
