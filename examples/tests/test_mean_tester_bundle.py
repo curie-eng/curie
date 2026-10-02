@@ -510,3 +510,27 @@ def test_every_user_finding_has_a_permanent_grading_regression_and_controls():
                      "UNCLEAR") == 1
     content = indexed["validator-F5"]["input"]
     assert len(content) > 1500 and "$2.4M" in content and "$4.4M" in content
+
+
+def test_campaign_reads_spec_and_suite_at_the_commit_resolved_first():
+    start = _section("Starting a campaign")
+    commit = start.index("list_commits")
+    read = start.index("get_file_contents")
+    assert commit < read
+    assert "exact SHA as `ref`" in start
+    assert "never the moving branch" in start
+
+
+def test_answer_check_defers_to_ready_fixed_suite():
+    check = _section("Checking that it answers")
+    assert "READY" in check and "first eligible fixed case" in check
+    assert "MISSING or MALFORMED" in check
+    assert "diagnostic" in check
+
+
+def test_unadmitted_followups_never_replay_dependent_steps_as_roots():
+    run = _section("Running a campaign")
+    assert "only independent steps" in run
+    assert "continuity-dependent steps BLOCKED" in run
+    assert "without claiming original coverage" in run
+    assert "send the remaining plan as root probes" not in run
