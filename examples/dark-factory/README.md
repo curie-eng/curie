@@ -3,6 +3,11 @@
 This is the agent Curie runs for a labelled GitHub issue. One issue goes in.
 One pull request, or one stated reason, comes out.
 
+Trying it for the first time? The
+[dark factory quickstart](../../docs/guides/dark-factory-quickstart.md) takes
+you from nothing to a pull request this agent opened on a new repository, on a
+laptop kind cluster.
+
 One agent does the work with one skill,
 [`skills/implement-issue/SKILL.md`](skills/implement-issue/SKILL.md), and two
 reviewer subagents check it on a stronger model. The skill walks nine phases:
@@ -97,44 +102,71 @@ from other tools. The token scope is the real bound.
 
 ## Deploy it as the factory agent
 
-Enable factory intake first (see "Admitting a labelled GitHub issue" in
-[`docs/operations.md`](../../docs/operations.md)). Then:
+For a laptop trial on a small repository, follow the
+[quickstart](../../docs/guides/dark-factory-quickstart.md) instead; it needs
+none of the long run sizing below. This section is the production recipe for a
+repository the size of Curie itself.
+
+Write the bundle out first. No clone of this repository is needed:
 
 ```bash
-# The skill plans for a 3 hour run. The chart worker budget and runner ceiling
-# already default to 10800. The execution deadline still defaults to 1800, so
-# the required override is:
-#   curie cluster overrides dark-factory --execution-deadline 10800
-# The helm sets below pin those worker values explicitly. The chart raises the
-# worker termination grace with the budget. At this budget, the drain Job
-# publishes a minimum Helm timeout of 21900 seconds in its annotation.
+curie example dark-factory render --out ./dark-factory
+```
+
+Then enable the model and intake. The skill plans for a 3 hour run. The chart
+worker budget and runner ceiling already default to 10800. The execution
+deadline still defaults to 1800, so it needs an override.
+
+```bash
+# The factory's default model: GLM 5.3 Flash through OpenRouter. The
+# credential comes from the environment, never argv.
+export CURIE_CREDENTIALS=<openrouter-api-key>
+curie cluster up --model z-ai/glm-5.3-flash --allow-egress-host openrouter
+
+# The helm sets pin the worker budget explicitly. The chart raises the worker
+# termination grace with the budget. At this budget, the drain Job publishes a
+# minimum Helm timeout of 21900 seconds in its annotation.
 helm upgrade curie <chart> -n curie --reuse-values \
   --timeout 21900s \
   --set worker.deliveryBudgetSeconds=10800 \
   --set worker.runnerTotalTimeoutSeconds=10800
 curie cluster overrides dark-factory --execution-deadline 10800
 
-# The factory's default model: GLM 5.3 Flash through OpenRouter.
-helm upgrade curie <chart> -n curie --reuse-values \
-  --timeout 21900s \
-  --set agentSandbox.runner.fakeModel=false \
-  --set agentSandbox.runner.model=z-ai/glm-5.3-flash \
-  --set agentSandbox.runner.credentials=<openrouter-api-key>
+# Intake. On a release with no GitHub App, the first run prints a prefilled App
+# registration link (add --org <org> for an organization) and four manual
+# steps, and applies nothing. It never opens a browser. Click Create, copy the
+# App ID, generate a private key, install the App on the repositories, and in
+# the App settings subscribe to Issues, Issue comment, Pull request review,
+# and Pull request review comment. A webhook URL and secret are optional.
+# Polling is the default and does not need them. Then rerun with the App's
+# details.
+curie cluster factory
 
-# Runner egress to the GitHub API for the MCP server, one entry per CIDR
-# from the "api" list at https://api.github.com/meta.
-helm upgrade curie <chart> -n curie --reuse-values \
-  --timeout 21900s \
-  --set 'agentSandbox.connectorEgress.dark-factory[0].cidr=<github-api-cidr>' \
-  --set 'agentSandbox.connectorEgress.dark-factory[0].ports[0].port=443' \
-  --set 'agentSandbox.connectorEgress.dark-factory[0].ports[0].protocol=TCP'
+# The rerun confirms the App with GET /app, takes the mention from its slug,
+# and uses its installed repositories as the allowlist (--repo, repeatable,
+# is checked against them instead). The label defaults to curie-factory and
+# is created in each repository. The key goes into the Secret
+# curie-github-app (key privateKey) through kubectl stdin; a Secret that
+# holds another App's key is refused. Polling does not need a webhook secret.
+# Pass --webhook-secret-file (or CURIE_GITHUB_WEBHOOK_SECRET) only for webhook
+# mode. Before applying anything, the command checks the merged config
+# against the API boot gate and applies nothing if one value is missing. The
+# values survive a later `curie cluster up`.
+curie cluster factory \
+  --app-id <app-id> --private-key-file ./app.pem \
+  --repo acme-corp/acme-bot --github-api-egress dark-factory
 
 # Build the runner layer that carries the repository toolchains and GitHub MCP
 # server. It records the layer digest in connectors.lock.yaml for deployment.
-curie build --plugin-dir examples/dark-factory --registry <registry-ref>
+# --platform builds only the named declared platform. The default Docker
+# driver can push one platform. A multi-platform push needs
+# `docker buildx create --driver docker-container --use`. Deploy checks that
+# the registry covers every node architecture.
+curie build --plugin-dir ./dark-factory --registry <registry-ref> \
+  --platform linux/amd64
 
 export GITHUB_PERSONAL_ACCESS_TOKEN=<read-only token>
-curie cluster deploy --plugin-dir examples/dark-factory \
+curie cluster deploy --plugin-dir ./dark-factory \
   --agent dark-factory --env prod --repo acme-corp/acme-bot \
   --secret GITHUB_PERSONAL_ACCESS_TOKEN
 # Illustrative USD cap for a run that can last 3 hours. Tune it for your model.
@@ -144,6 +176,37 @@ curie cluster surfaces dark-factory --add github=acme-corp/acme-bot
 # Optional. Human approval of each pull request stays the default.
 curie cluster publication-policy dark-factory --policy auto
 ```
+
+`curie cluster factory --disable` turns intake off. See "Admitting a labelled
+GitHub issue" in [`docs/operations.md`](../../docs/operations.md) for what the
+gate requires.
+
+### On a laptop (kind)
+
+A kind cluster works for a single operator. Create it with a local registry
+by following kind's upstream recipe at
+<https://kind.sigs.k8s.io/docs/user/local-registry/>, and pass that registry
+as `--registry`. Set `--platform` to the architecture of the kind nodes
+(`linux/arm64` on Apple silicon, `linux/amd64` otherwise).
+
+Polling does not need GitHub to reach the API. Webhook mode is optional.
+For that mode, GitHub must reach the API to deliver webhooks. Start a
+port-forward and a cloudflared quick tunnel to it:
+
+```bash
+kubectl --context kind-<name> -n curie port-forward svc/curie-api 8000:8000
+cloudflared tunnel --url http://localhost:8000
+```
+
+Point the App webhook at `<tunnel>/github/webhook`, and pass
+`--card-base-url <tunnel>` to `curie cluster factory` so links in status
+comments resolve. The port-forward and the tunnel both die when the laptop
+sleeps or the api restarts. Restart them, and update the App webhook URL if
+the quick tunnel hostname changed.
+
+For a long-lived laptop install, make the bundle's
+`GITHUB_PERSONAL_ACCESS_TOKEN` a fine-grained PAT. An App installation token
+expires after an hour, which is too short for a run that can last 3 hours.
 
 Before a production factory run resolves dependencies, provide an operator
 controlled registry mirror or terminating proxy. Configure uv, Cargo and pnpm
@@ -194,8 +257,9 @@ does not bake repository dependencies into the image. After changing the
 toolchain layer or upgrading the platform runner, rebuild and redeploy:
 
 ```bash
-curie build --plugin-dir examples/dark-factory --registry <registry-ref>
-curie cluster deploy --plugin-dir examples/dark-factory \
+curie build --plugin-dir ./dark-factory --registry <registry-ref> \
+  --platform linux/amd64
+curie cluster deploy --plugin-dir ./dark-factory \
   --agent dark-factory --env prod --repo acme-corp/acme-bot \
   --secret GITHUB_PERSONAL_ACCESS_TOKEN
 ```

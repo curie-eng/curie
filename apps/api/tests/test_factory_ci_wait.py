@@ -1010,6 +1010,7 @@ def test_relabel_during_the_ci_wait_cancels_then_readmits(admitted: Any) -> None
     assert _terminal(number) == ("running", None)
 
     github.labels = [LABEL]
+    github.advance_label_event(number)
     again = _post(
         client,
         "issues",
@@ -1053,6 +1054,7 @@ def test_relabel_during_a_fix_turn_waits_for_the_old_request_to_settle(
     assert len(_ci_turns(published["id"])) == 1
 
     github.labels = [LABEL]
+    github.advance_label_event(number)
     again = _post(
         client,
         "issues",

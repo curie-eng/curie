@@ -357,9 +357,9 @@ def test_example_deploys_as_dark_factory_on_the_default_model() -> None:
     assert "--agent dark-factory " in readme
     assert "surfaces dark-factory " in readme
     assert "publication-policy dark-factory " in readme
-    assert "agentSandbox.connectorEgress.dark-factory[" in readme
+    assert "--github-api-egress dark-factory" in readme
     assert "--agent factory " not in readme
-    assert "agentSandbox.runner.model=z-ai/glm-5.3-flash" in readme
+    assert "cluster up --model z-ai/glm-5.3-flash" in readme
     assert "agent `dark-factory`" in operations
     assert "`z-ai/glm-5.3-flash`" in operations
 

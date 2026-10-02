@@ -1260,9 +1260,13 @@ api:
   githubReviewIngressEnabled: false
   githubReviewReconcilerIntervalSeconds: 5
   # Signed factory issue intake is opt-in and separate from review feedback.
-  # When enabled, the API boot gate requires the App id and private key, a
-  # non-default webhook secret, a label, a mention login, and a repo allowlist.
+  # Polling is the default and does not require a webhook secret. Webhook mode
+  # requires a non-default webhook secret and keeps the missed-label backstop.
+  # Either mode still requires the App id and private key, a label, a mention
+  # login, and a repo allowlist.
   githubFactoryIngressEnabled: false
+  githubFactoryIntake: poll
+  githubFactoryPollIntervalSeconds: 45
   githubFactoryLabel: ""
   githubFactoryMention: ""
   # Public https origin GitHub's image proxy fetches the live factory status card

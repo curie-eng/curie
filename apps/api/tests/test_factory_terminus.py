@@ -507,6 +507,9 @@ def comments(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
     monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
     monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "true")
+    # These tests drive signed deliveries. Poll mode would also read this
+    # fixture's GitHub stand-in on every reconciler pass.
+    monkeypatch.setenv("GITHUB_FACTORY_INTAKE", "webhook")
     monkeypatch.setenv("GITHUB_FACTORY_LABEL", LABEL)
     monkeypatch.setenv("GITHUB_FACTORY_MENTION", "curie")
     monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
@@ -518,6 +521,7 @@ def comments(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setenv("INTERNAL_WORKER_TOKEN", "factory-terminus-worker")
     monkeypatch.setenv("RUNS_STREAM", f"test:curie:terminus:{uuid.uuid4().hex}")
     get_settings.cache_clear()
+    _clear_ci_keys()
     monkeypatch.setattr(
         "curie_api.factory_notices.credentials_for",
         lambda _settings: _Credentials(),
@@ -575,6 +579,21 @@ def _rows(statement: str, params: dict[str, Any] | None = None) -> list[dict[str
     return asyncio.run(go())
 
 
+def _clear_ci_keys() -> None:
+    """Drop CI round keys. Label request ids are stable, so a prior test's key
+    would make the next gate think that round is already fixing."""
+
+    import redis
+
+    client = redis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
+    try:
+        keys = list(client.scan_iter("curie:work-item:ci:*"))
+        if keys:
+            client.delete(*keys)
+    finally:
+        client.close()
+
+
 def _request(number: int) -> dict[str, Any]:
     rows = _rows(
         "SELECT r.id, r.status, r.terminal_cause, r.version, w.id AS work_item_id, "
@@ -600,6 +619,7 @@ def _notices(request_id: uuid.UUID) -> list[dict[str, Any]]:
 
 def _label(client: Any, github: GitHubAPI, number: int) -> None:
     github.issue_number = number
+    github.advance_label_event(number)
     response = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "factory_admitted"

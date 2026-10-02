@@ -17,7 +17,6 @@ import hashlib
 import hmac
 import itertools
 import json
-import threading
 import uuid
 from typing import Any
 
@@ -73,6 +72,13 @@ class GitHubAPI:
         self.comment_app: dict[str, Any] | None = None
         self.repository_id = REPO_ID
         self.issue_number = 0
+        self.label_event_ids: dict[int, int] = {}
+
+    def advance_label_event(self, number: int) -> None:
+        """Record a newer labeled timeline event. A relabel webhook reads it."""
+
+        current = self.label_event_ids.get(number, 810000 + number)
+        self.label_event_ids[number] = current + 1
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -98,6 +104,21 @@ class GitHubAPI:
                         f"https://api.github.com/repos/{REPO}/issues/{self.issue_number}"
                     ),
                 },
+            )
+        if path.startswith(f"/repos/{REPO}/issues/") and path.endswith("/events"):
+            number = int(path.split("/")[-2])
+            event_id = self.label_event_ids.get(number, 810000 + number)
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": event_id,
+                        "event": "labeled",
+                        "label": {"name": LABEL},
+                        "actor": {"id": SENDER_ID, "login": SENDER, "type": "User"},
+                        "created_at": "2026-09-01T00:00:00Z",
+                    }
+                ],
             )
         if path.startswith(f"/repos/{REPO}/issues/"):
             number = int(path.rsplit("/", 1)[1])
@@ -660,28 +681,38 @@ def test_concurrent_label_deliveries_leave_one_active_execution(
     number = next(_ISSUES)
     api.issue_number = number
     payload = _issue_event("labeled", number, label={"name": LABEL})
-    responses: list[httpx.Response] = []
-    errors: list[BaseException] = []
+    body = json.dumps(payload).encode()
 
-    def post_once() -> None:
+    async def go() -> list[str]:
+        engine = create_async_engine(get_settings().database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def deliver() -> str:
+            async with maker() as session:
+                result = await handle_factory_delivery(
+                    session,
+                    settings=get_settings(),
+                    client=client.app.state.http_client,
+                    event="issues",
+                    delivery_id=str(uuid.uuid4()),
+                    body=body,
+                    payload=payload,
+                )
+            return result.status
+
         try:
-            responses.append(_post(client, "issues", payload, delivery=str(uuid.uuid4())))
-        except BaseException as exc:
-            errors.append(exc)
+            return list(await asyncio.gather(deliver(), deliver()))
+        finally:
+            await engine.dispose()
 
-    threads = [threading.Thread(target=post_once) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert errors == []
-    assert [response.status_code for response in responses] == [200, 200]
-    statuses = [response.json()["status"] for response in responses]
-    assert statuses == ["factory_admitted", "factory_admitted"]
+    statuses = asyncio.run(go())
+    # Both deliveries name the same timeline event, so they share one request.
+    assert "factory_admitted" in statuses, statuses
+    assert set(statuses) <= {"factory_admitted", "factory_duplicate"}
     rows = _requests(number)
     assert len({row["work_item_id"] for row in rows}) == 1
-    assert [row["status"] for row in rows].count("waiting") == 1
+    assert [row["status"] for row in rows].count("waiting") == 1, (statuses, rows)
+    assert len({row["id"] for row in rows}) == 1
 
 
 def _mark_running(request_id: uuid.UUID) -> None:
