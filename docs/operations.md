@@ -1923,9 +1923,13 @@ data too.
 state API holds each sandbox to its own channel's memory
 ([ADR-0188](adr/0188-the-sandbox-memory-credential-is-scoped-to-its-own-channel.md)):
 code running in the sandbox, such as a Bash command or a hook, cannot read or
-write another channel's memory, cannot write the memory guidance, and cannot
-set the author of a fact. With writes off, the sandbox cannot write memory at
-all.
+write another channel's memory and cannot write the memory guidance. A fact's
+author is the sender of the turn the write happened in, while that turn's
+credential is held: code that copies the credential during a turn can write as
+that turn's sender until it expires at the turn's time limit, even after the
+turn has ended. Refusing a credential once its turn ends is
+[#3776](https://github.com/curie-eng/curie/issues/3776). With writes off, the
+sandbox cannot write memory at all.
 
 Upgrade the worker with or before the API. A sandbox booted by an older worker
 holds a credential without the new claims; the API treats it as read-only on
