@@ -1774,6 +1774,7 @@ def test_live_compound_request_saves_or_does_not_claim_to() -> None:
         held_secrets=frozenset(),
         session_factory=lambda: ClaudeAgentSession(options),
         ceiling=0,
+        max_usd_per_day=1.0,
         tracer=RunTracer(None),
         classifier=SideEffectClassifier(),
         trace_name=session_id,
