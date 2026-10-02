@@ -348,7 +348,7 @@ pub fn release_has_real_model(values: &serde_json::Value) -> bool {
     values.pointer("/agentSandbox/runner/fakeModel") == Some(&serde_json::json!(false))
 }
 
-pub fn plan(input: &PlanInput) -> Result<Planned> {
+pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
     validate_repo(&input.repo)?;
     let finishing = match (&input.app_id, &input.private_key_file) {
         (None, None) => false,
@@ -673,7 +673,7 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     } else {
         release_model_recorded(&opts).await?
     };
-    let planned = plan(&PlanInput {
+    let planned = quickstart_plan(&PlanInput {
         repo: opts.repo.clone(),
         app_id: opts.app_id.clone(),
         private_key_file: opts
@@ -1099,7 +1099,7 @@ mod tests {
 
     #[test]
     fn no_context_creates_kind_with_gvisor_off_and_stops_at_the_link() {
-        let planned = plan(&base()).unwrap();
+        let planned = quickstart_plan(&base()).unwrap();
         let lines = describe(&planned);
         let text = lines.join("\n");
         assert!(
@@ -1125,7 +1125,7 @@ mod tests {
     fn an_existing_kind_cluster_is_not_created_again() {
         let mut input = base();
         input.existing_kind_clusters = vec!["curie-factory".into()];
-        let text = describe(&plan(&input).unwrap()).join("\n");
+        let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
         assert!(!text.contains("kind create"), "{text}");
         assert!(
             text.contains("scale deployment/coredns --replicas=1"),
@@ -1138,7 +1138,7 @@ mod tests {
     fn an_explicit_context_skips_kind_and_does_not_force_gvisor_off() {
         let mut input = base();
         input.explicit_context = Some("remote-cluster".into());
-        let text = describe(&plan(&input).unwrap()).join("\n");
+        let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
         assert!(!text.contains("kind "), "{text}");
         assert!(!text.contains("security.gvisor.mode=off"), "{text}");
         assert!(text.contains("--context remote-cluster"), "{text}");
@@ -1149,7 +1149,7 @@ mod tests {
     fn a_current_context_skips_kind_the_same_way() {
         let mut input = base();
         input.current_context = Some("k8".into());
-        let text = describe(&plan(&input).unwrap()).join("\n");
+        let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
         assert!(!text.contains("kind "), "{text}");
         assert!(text.contains("--context k8"), "{text}");
         assert!(!text.contains("security.gvisor.mode=off"), "{text}");
@@ -1162,7 +1162,7 @@ mod tests {
         input.private_key_file = Some("/keys/app.pem".into());
         input.explicit_context = Some("kind-curie-factory".into());
         input.credential_in_env = true;
-        let planned = plan(&input).unwrap();
+        let planned = quickstart_plan(&input).unwrap();
         assert!(planned.actions.iter().any(|action| matches!(
             action,
             Action::Intake(opts) if opts.intake.as_deref() == Some("poll")
@@ -1215,7 +1215,7 @@ mod tests {
         input.explicit_context = Some("remote-cluster".into());
         input.namespace = "acme".into();
         input.release = "trial".into();
-        let text = describe(&plan(&input).unwrap()).join("\n");
+        let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
         assert!(text.contains(
             "--repo acme/widgets --context remote-cluster --namespace acme --release trial --model z-ai/glm-5.3-flash"
         ), "{text}");
@@ -1253,13 +1253,13 @@ mod tests {
     fn a_malformed_repo_or_half_an_app_pair_is_refused() {
         let mut input = base();
         input.repo = "acme".into();
-        assert!(plan(&input).is_err());
+        assert!(quickstart_plan(&input).is_err());
         input.repo = "acme/widgets".into();
         input.app_id = Some("12".into());
-        assert!(plan(&input).is_err());
+        assert!(quickstart_plan(&input).is_err());
         input.private_key_file = Some("/tmp/app.pem".into());
         input.app_id = Some("nope".into());
-        assert!(plan(&input).is_err());
+        assert!(quickstart_plan(&input).is_err());
     }
 
     #[test]
