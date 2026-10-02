@@ -64,6 +64,7 @@ COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --from=builder --chown=app:app /app/apps/api/alembic /app/alembic
 COPY --from=builder --chown=app:app /app/apps/api/alembic.ini /app/alembic.ini
 ENV PATH="/app/.venv/bin:$PATH"
+ENV FORWARDED_ALLOW_IPS=""
 USER 1000
 EXPOSE 8000
 CMD ["uvicorn", "curie_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
