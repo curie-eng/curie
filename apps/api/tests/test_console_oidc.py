@@ -25,6 +25,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import secrets
+import socket
 import sys
 import urllib.parse
 import uuid
@@ -40,7 +42,8 @@ import httpx
 import pytest
 from curie_api.config import get_settings
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from redis.asyncio import Redis
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -79,6 +82,17 @@ def _sql(statement: str, params: dict[str, Any] | None = None) -> list[dict[str,
             await engine.dispose()
 
     return asyncio.run(run())
+
+
+def _client_address() -> str:
+    """A fresh peer address in the IPv6 documentation range.
+
+    The console routes charge a shared per-address Valkey budget (#3806, #3800),
+    so every app gets its own address and no test can spend another's budget.
+    """
+
+    suffix = secrets.token_hex(8)
+    return "2001:db8::" + ":".join(suffix[index : index + 4] for index in range(0, 16, 4))
 
 
 def _set_cookies(response: httpx.Response) -> dict[str, Any]:
@@ -223,7 +237,10 @@ def oidc_client(
 
 @contextlib.contextmanager
 def _booted_app(
-    env: dict[str, str | None], *, raise_server_exceptions: bool = True
+    env: dict[str, str | None],
+    *,
+    raise_server_exceptions: bool = True,
+    address: str | None = None,
 ) -> Iterator[TestClient]:
     """Boot the app under ``env`` on a clean principal / login-attempt table."""
 
@@ -238,7 +255,9 @@ def _booted_app(
         oidc.reset_caches()
         try:
             with TestClient(
-                create_app(), raise_server_exceptions=raise_server_exceptions
+                create_app(),
+                raise_server_exceptions=raise_server_exceptions,
+                client=(address or _client_address(), 5000),
             ) as client:
                 yield client
         finally:
@@ -1075,7 +1094,7 @@ def disabled_client(_disposable_db: Any) -> Iterator[TestClient]:
     with oidc_env({}):
         from curie_api.main import create_app
 
-        with TestClient(create_app()) as client:
+        with TestClient(create_app(), client=(_client_address(), 5000)) as client:
             yield client
 
 
@@ -1703,7 +1722,7 @@ def _rebooted(env: dict[str, str | None]) -> Iterator[TestClient]:
 
         oidc.reset_caches()
         try:
-            with TestClient(create_app()) as client:
+            with TestClient(create_app(), client=(_client_address(), 5000)) as client:
                 yield client
         finally:
             oidc.reset_caches()
@@ -1758,3 +1777,214 @@ def test_session_is_refused_when_oidc_is_disabled_and_readmitted_on_restore(
     assert row["revoked_at"] is None
     with _rebooted(enabled_env(idp)) as restored:
         assert _principal_status(restored, token).status_code == 200
+
+
+# --- rate limits (#3800) ---------------------------------------------------------
+#
+# The OIDC routes and logout charge the same shared Valkey budget #3806 gave the
+# session routes: one counter per route and socket peer address, enforced across
+# API replicas, refused with 429 before any database work. Forwarded headers are
+# attacker controlled and never pick the bucket.
+
+OIDC_ROUTE_BUDGET = 30
+
+
+@contextlib.contextmanager
+def _observed_sql(client: TestClient) -> Iterator[list[str]]:
+    statements: list[str] = []
+
+    def observed(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
+    engine = client.app.state.engine.sync_engine  # type: ignore[attr-defined]
+    event.listen(engine, "before_cursor_execute", observed)
+    try:
+        yield statements
+    finally:
+        event.remove(engine, "before_cursor_execute", observed)
+
+
+def _assert_rate_limited(response: httpx.Response) -> None:
+    assert response.status_code == 429, response.text
+    assert response.json()["detail"] == "rate limit exceeded"
+    assert int(response.headers["Retry-After"]) > 0
+    assert response.headers["Cache-Control"] == "no-store"
+    assert SESSION_COOKIE not in _set_cookies(response), response.headers
+
+
+def _attempt_rows() -> list[dict[str, Any]]:
+    return _sql("SELECT id, consumed_at FROM curie.oidc_login_attempts")
+
+
+def test_oidc_login_budget_is_shared_across_replicas_and_rejects_before_database(
+    _disposable_db: Any, clean_db: None, runs_stream: str, idp: TestIdP
+) -> None:
+    from curie_api.main import create_app
+
+    address = _client_address()
+    with (
+        _booted_app(enabled_env(idp), address=address) as first,
+        TestClient(create_app(), client=(address, 5001)) as second,
+    ):
+        for index in range(OIDC_ROUTE_BUDGET):
+            replica = first if index % 2 == 0 else second
+            started = replica.get(
+                "/console/oidc/login",
+                follow_redirects=False,
+                headers={"X-Forwarded-For": _client_address()},
+            )
+            assert started.status_code == 302, started.text
+        assert len(_attempt_rows()) == OIDC_ROUTE_BUDGET
+
+        with _observed_sql(second) as statements:
+            refused = second.get(
+                "/console/oidc/login",
+                follow_redirects=False,
+                headers={"X-Forwarded-For": _client_address()},
+            )
+        _assert_rate_limited(refused)
+        assert STATE_COOKIE not in _set_cookies(refused), refused.headers
+        assert not statements, statements
+        assert len(_attempt_rows()) == OIDC_ROUTE_BUDGET
+
+        # Another address still starts a login: the budget is per peer.
+        with TestClient(create_app(), client=(_client_address(), 5002)) as other:
+            assert other.get("/console/oidc/login", follow_redirects=False).status_code == 302
+
+
+def test_oidc_callback_budget_rejects_before_spending_the_attempt(
+    _disposable_db: Any, clean_db: None, runs_stream: str, idp: TestIdP
+) -> None:
+    from curie_api.main import create_app
+
+    address = _client_address()
+    with _booted_app(enabled_env(idp), address=address) as client:
+        # Starting the login charges the login budget, not the callback's.
+        callback = _begin_login(client)
+        for _ in range(OIDC_ROUTE_BUDGET):
+            spent = client.get("/console/oidc/callback?code=x&state=y", follow_redirects=False)
+            _assert_refused(spent)
+        client.cookies.clear()
+
+        with _observed_sql(client) as statements:
+            refused = _finish(client, callback)
+        _assert_rate_limited(refused)
+        assert not statements, statements
+        (attempt,) = _attempt_rows()
+        assert attempt["consumed_at"] is None
+
+        # The refused request left the attempt unspent, so the same callback
+        # still completes from a peer with budget left.
+        with TestClient(create_app(), client=(_client_address(), 5001)) as other:
+            assert _session_token(_finish(other, callback))
+
+
+def test_logout_budget_is_shared_across_replicas_and_rejects_before_revoking(
+    _disposable_db: Any, clean_db: None, runs_stream: str, auth_headers: dict[str, str]
+) -> None:
+    from curie_api.main import create_app
+
+    address = _client_address()
+    with (
+        _booted_app({}, address=address) as first,
+        TestClient(create_app(), client=(address, 5001)) as second,
+    ):
+        token = _login_code_session(first, auth_headers)
+        for index in range(OIDC_ROUTE_BUDGET):
+            replica = first if index % 2 == 0 else second
+            _assert_logged_out(
+                _logout(replica, {"X-Forwarded-For": _client_address()})
+            )
+
+        with _observed_sql(second) as statements:
+            refused = second.post(
+                "/console/logout",
+                headers={
+                    **_cookie_with_origin(SESSION_COOKIE, token),
+                    "X-Forwarded-For": _client_address(),
+                },
+            )
+        second.cookies.clear()
+        _assert_rate_limited(refused)
+        assert not _clears_cookie(refused, SESSION_COOKIE), refused.headers
+        assert not statements, statements
+        assert _sql("SELECT id FROM curie.console_sessions WHERE revoked_at IS NOT NULL") == []
+        live = first.get("/console/session", headers=_cookie(SESSION_COOKIE, token))
+        assert live.status_code == 200, live.text
+
+        with TestClient(create_app(), client=(_client_address(), 5002)) as other:
+            _assert_logged_out(_logout(other, _cookie_with_origin(SESSION_COOKIE, token)))
+        ended = first.get("/console/session", headers=_cookie(SESSION_COOKIE, token))
+        assert ended.status_code == 401, ended.text
+
+
+@pytest.mark.parametrize("route", ["login", "callback", "logout"])
+def test_oidc_route_rate_limit_fails_closed_when_valkey_is_unavailable(
+    _disposable_db: Any, clean_db: None, runs_stream: str, idp: TestIdP, route: str
+) -> None:
+    # A bound socket without a listener guarantees a refused connection.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as unavailable:
+        unavailable.bind(("127.0.0.1", 0))
+        with _booted_app(enabled_env(idp)) as client:
+            original_valkey = client.app.state.valkey  # type: ignore[attr-defined]
+            valkey = Redis(
+                host="127.0.0.1",
+                port=unavailable.getsockname()[1],
+                socket_connect_timeout=1,
+                socket_timeout=1,
+            )
+            client.app.state.valkey = valkey  # type: ignore[attr-defined]
+            try:
+                with _observed_sql(client) as statements:
+                    if route == "login":
+                        refused = client.get("/console/oidc/login", follow_redirects=False)
+                    elif route == "callback":
+                        refused = client.get(
+                            "/console/oidc/callback?code=x&state=y", follow_redirects=False
+                        )
+                    else:
+                        refused = client.post(
+                            "/console/logout",
+                            headers=_cookie_with_origin(SESSION_COOKIE, "not-a-session"),
+                        )
+            finally:
+                client.app.state.valkey = original_valkey  # type: ignore[attr-defined]
+                assert client.portal is not None
+                client.portal.call(valkey.aclose)
+            assert refused.status_code == 503, refused.text
+            assert refused.json()["detail"] == "rate limiter unavailable"
+            assert refused.headers["Cache-Control"] == "no-store"
+            assert not statements, statements
+            assert _attempt_rows() == []
+
+
+def test_oidc_disabled_routes_stay_404_without_charging_the_limiter(
+    disabled_client: TestClient,
+) -> None:
+    """With OIDC off the routes must look absent, even while Valkey is down."""
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as unavailable:
+        unavailable.bind(("127.0.0.1", 0))
+        original_valkey = disabled_client.app.state.valkey  # type: ignore[attr-defined]
+        valkey = Redis(
+            host="127.0.0.1",
+            port=unavailable.getsockname()[1],
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        disabled_client.app.state.valkey = valkey  # type: ignore[attr-defined]
+        try:
+            for path in ("/console/oidc/login", "/console/oidc/callback?code=x&state=y"):
+                response = disabled_client.get(path, follow_redirects=False)
+                assert response.status_code == 404, (path, response.text)
+        finally:
+            disabled_client.app.state.valkey = original_valkey  # type: ignore[attr-defined]
+            assert disabled_client.portal is not None
+            disabled_client.portal.call(valkey.aclose)
