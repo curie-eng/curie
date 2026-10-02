@@ -20,6 +20,7 @@ import hashlib
 import logging
 import re
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, NoReturn
@@ -253,19 +254,32 @@ def _transcript_key_admitted(principal: StatePrincipal, agent_id: uuid.UUID, key
     return key_binding == principal.binding
 
 
+# Agents already warned about a legacy token in this process, oldest first.
+_LEGACY_WARNED_LIMIT = 1024
+_legacy_warned: OrderedDict[uuid.UUID, None] = OrderedDict()
+
+
 def _note_legacy_transcript_use(agent_id: uuid.UUID, path: str) -> None:
     """Log and count a pre-ADR-0188 token's transcript request, which is allowed.
 
     Refusing it would cut off every warm sandbox's history at API deploy; the
     window closes when the last such token expires, at most 24 hours after the
-    worker upgrade. The log names the agent and the path, never the token."""
+    worker upgrade. The log names the agent and the path, never the token.
 
-    logger.warning(
-        "state: allowed legacy sandbox token (no memory claim) for agent %s on %s; "
-        "transcript reach is unscoped until the sandbox is replaced",
-        agent_id,
-        path,
-    )
+    A warm sandbox makes several such requests per turn, so the warning is
+    logged once per agent per process, tracked in a small bounded set that
+    evicts the oldest agent first. The metric still counts every request."""
+
+    if agent_id not in _legacy_warned:
+        _legacy_warned[agent_id] = None
+        if len(_legacy_warned) > _LEGACY_WARNED_LIMIT:
+            _legacy_warned.popitem(last=False)
+        logger.warning(
+            "state: allowed legacy sandbox token (no memory claim) for agent %s on %s; "
+            "transcript reach is unscoped until the sandbox is replaced",
+            agent_id,
+            path,
+        )
     record_metric(
         "curie.state.legacy_token",
         attributes={"service.name": "curie-api", "namespace": TRANSCRIPT_NAMESPACE},
