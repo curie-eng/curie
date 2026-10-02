@@ -40,7 +40,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     stable = {"schema_min": "0076", "schema_head": "0076"}
     # Feature migrations append after the published v0.12.2 head; published
     # application windows remain fixed while the candidate advances.
-    candidate = {"schema_min": "0082", "schema_head": "0099"}
+    candidate = {"schema_min": "0082", "schema_head": "0100"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -49,7 +49,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == candidate
     assert catalog["revisions"][-8:] == [
-        "0092a", "0093a", "0094", "0095", "0096", "0097", "0098", "0099"
+        "0093a", "0094", "0095", "0096", "0097", "0098", "0099", "0100"
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(
