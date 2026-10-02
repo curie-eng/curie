@@ -5939,3 +5939,42 @@ def test_rendered_approval_display_preserves_exact_argument_tokens(make_harness)
             assert h.sink.posts[0][1].interaction.prompt == sentence
 
     asyncio.run(go())
+
+
+def test_missing_display_sentence_boundaries_reach_notice_and_card(make_harness) -> None:
+    """@spec plain-approval-wording: actual fallback notice and card retain grants."""
+    import json
+    from pathlib import Path
+
+    cases = json.loads(
+        (Path(__file__).resolve().parents[4] / "tests/vectors/user-action-wording.json").read_text()
+    )["metadata_references"]
+
+    async def go() -> None:
+        for index, case in enumerate(cases):
+            arguments = {"file_name": case["tool"] + ".json"}
+            approvals = RecordingApprovals()
+            binding = RoutedBinding({"managers": _resolution_route()})
+            async with make_harness(approvals=approvals, binding=binding) as h:
+                script = _awaiting_script_with_display(case["summary"], "")
+                script[-1] = script[-1].model_copy(
+                    update={
+                        "approval_display": None,
+                        "approval_route": "managers",
+                        "approval_granted_tool": case["tool"],
+                        "approval_granted_arguments": arguments,
+                    }
+                )
+                h.runner.default_script = script
+                await h.kernel.process_event(
+                    _qevent("please review", event_id=f"ev-period-display-{index}")
+                )
+                assert approvals.requests[0].summary == case["summary"]
+                assert approvals.requests[0].granted_tool == case["tool"]
+                assert approvals.requests[0].granted_arguments == arguments
+                assert h.sink.last_text is not None and case["display"] in h.sink.last_text
+                assert h.sink.posts[0][1].text == case["display"]
+                assert isinstance(h.sink.posts[0][1].interaction, ConfirmIntent)
+                assert h.sink.posts[0][1].interaction.prompt == case["display"]
+
+    asyncio.run(go())

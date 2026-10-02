@@ -3288,3 +3288,24 @@ def test_mismatch_feedback_uses_action_words(name: str, label: str) -> None:
         assert gate.pending_summary is None
 
     anyio.run(go)
+
+
+def test_declared_gate_summary_sentence_boundaries_preserve_exact_request() -> None:
+    """@spec plain-approval-wording: declared gate summaries share all boundaries."""
+    import json
+    from pathlib import Path
+
+    cases = json.loads(
+        (Path(__file__).resolve().parents[2] / "tests/vectors/user-action-wording.json").read_text()
+    )["metadata_references"]
+    for case in cases:
+        tool = case["tool"]
+        arguments = {"file_name": tool + ".json"}
+        gate = ApprovalGate(
+            required=frozenset({tool}), summary_by_tool={tool: case["summary"]}
+        )
+        gate.block(tool, arguments)
+        assert gate.pending_display == case["display"], case
+        assert gate.pending_summary == summarize_tool_call(tool, arguments)
+        assert gate.pending_granted_tool == tool
+        assert gate.pending_granted_arguments == arguments

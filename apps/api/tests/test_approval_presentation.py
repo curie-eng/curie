@@ -95,3 +95,20 @@ def test_approval_nested_document_keys_are_literal_data_and_grant_stays_exact() 
     assert out["summary"] == summary
     assert out["granted_tool"] == tool
     assert row.granted_arguments == arguments
+
+
+def test_api_approval_metadata_sentence_boundaries_preserve_exact_grant() -> None:
+    """@spec plain-approval-wording: the serialized consumer preserves authority."""
+    from pathlib import Path
+
+    cases = json.loads(
+        (Path(__file__).resolve().parents[3] / "tests/vectors/user-action-wording.json").read_text()
+    )["metadata_references"]
+    for case in cases:
+        arguments = {"file_name": case["tool"] + ".json"}
+        row = approval(case["summary"], case["tool"], arguments)
+        out = ApprovalOut.model_validate(row).model_dump()
+        assert out["display_summary"] == case["display"], case
+        assert out["summary"] == case["summary"]
+        assert out["granted_tool"] == case["tool"]
+        assert row.granted_arguments == arguments

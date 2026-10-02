@@ -85,5 +85,82 @@
       "tool": "WebSearch",
       "label": "search web"
     }
+  ],
+  "metadata_references": [
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.",
+      "display": "Review send message."
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message. Next",
+      "display": "Review send message. Next"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.)",
+      "display": "Review send message.)"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.\"",
+      "display": "Review send message.\""
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.'",
+      "display": "Review send message.'"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.]",
+      "display": "Review send message.]"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.`",
+      "display": "Review send message.`"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.\nNext",
+      "display": "Review send message.\nNext"
+    },
+    {
+      "tool": "mcp__acme__계정조회",
+      "summary": "Review mcp__acme__계정조회.",
+      "display": "Review 계정조회."
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.json",
+      "display": "Review mcp__acme__send_message.json"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review mcp__acme__send_message.backup.txt",
+      "display": "Review mcp__acme__send_message.backup.txt"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review /tmp/mcp__acme__send_message",
+      "display": "Review /tmp/mcp__acme__send_message"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review https://example.com/mcp__acme__send_message",
+      "display": "Review https://example.com/mcp__acme__send_message"
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review prefixmcp__acme__send_message.",
+      "display": "Review prefixmcp__acme__send_message."
+    },
+    {
+      "tool": "mcp__acme__send_message",
+      "summary": "Review 문서mcp__acme__send_message.",
+      "display": "Review 문서mcp__acme__send_message."
+    }
   ]
 }

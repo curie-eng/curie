@@ -32,3 +32,10 @@ describe("plain action presentation", () => {
   });
 
 });
+
+// @spec plain-approval-wording: old API metadata follows the same boundary vector.
+describe("approval metadata sentence boundaries", () => {
+  it.each(vectors.metadata_references)("renders $summary without changing content", ({ summary, display }) => {
+    expect(approvalSummary(summary)).toBe(display);
+  });
+});
