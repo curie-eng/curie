@@ -21,6 +21,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, NoReturn
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
@@ -239,7 +240,9 @@ def _stamp_author(
     path: str,
 ) -> StateEntryPut:
     """ADR-0188: a sandbox fact's author is the per-turn credential's ``sender``
-    claim, whatever the body says. The platform key keeps the body's author."""
+    claim, whatever the body says, and its ``stated_at`` is the server's clock,
+    so a sandbox write cannot backdate a fact. ``session_id`` is kept as sent.
+    The platform key keeps the body as given."""
 
     if principal.caller is not StateCaller.STATE or namespace != MEMORY_NAMESPACE:
         return data
@@ -250,7 +253,10 @@ def _stamp_author(
             422,
             "a memory fact written with a sandbox credential must be a JSON object",
         )
-    return data.model_copy(update={"value": {**data.value, "author": principal.sender}})
+    # The runner's ``memory_facts._now`` format: RFC3339 UTC with a ``Z``.
+    stated_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    stamped = {**data.value, "author": principal.sender, "stated_at": stated_at}
+    return data.model_copy(update={"value": stamped})
 
 
 async def _binding_scope(
