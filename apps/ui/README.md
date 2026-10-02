@@ -20,6 +20,15 @@ pnpm exec playwright test   # E2E, headless; builds + previews automatically
 `pnpm dev` serves the app on http://localhost:5173. `pnpm preview` serves the
 production build on http://localhost:4173 (what Playwright drives).
 
+## Container build inputs
+
+Build from the repository root with `docker build -f apps/ui/Dockerfile .`.
+The build stage retains the repository-relative paths of the generated ACI types
+and `tests/vectors/user-action-wording.json`. TypeScript checks the action wording
+tests against that shared vector during `pnpm build`, so the container context
+must include the same vector as a checkout build. Admit only that vector from the
+root tests directory; other test fixtures stay outside the UI build context.
+
 ## Structure
 
 - `src/tokens.ts` — the `C` design-token block, verbatim from the canon.
