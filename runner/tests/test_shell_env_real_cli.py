@@ -2,10 +2,11 @@
 
 Docker and k8s both inject the boot env into this runner process. The Bash
 tool is a child of the bundled Claude CLI, not a substrate-specific shell.
-Measured on claude-agent-sdk 0.2.159 with bundled CLI 2.1.281: with
-CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 the CLI keeps ANTHROPIC_API_KEY for its
-own messages call and omits it from Bash. Curie tokens are not in that
-scrub list, so the runner must remove them before the CLI is spawned.
+Measured on claude-agent-sdk0.2.159 with bundled CLI2.1.281: the optional
+subprocess scrub mode does not cover this native Bash path. The mandatory
+CLAUDE_CODE_SHELL override launches an isolated trusted interpreter before
+startup or snapshots; model authentication remains in the CLI parent.
+Official override surface: https://code.claude.com/docs/en/env-vars.
 """
 
 from __future__ import annotations

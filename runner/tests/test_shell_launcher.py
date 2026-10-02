@@ -173,3 +173,46 @@ def test_sdk_connect_pins_options_and_fails_closed_before_external_spawn(
             Path(subprocess_env.__file__).with_name("curie_bash.sh")
         )
         assert captured[0]["CURIE_SHELL_PYTHON"] == sys.executable
+
+
+@pytest.mark.parametrize("mode", ["broken", "timeout"])
+def test_executable_but_unusable_shell_fails_closed_before_sdk_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    import time
+
+    import anyio
+    from claude_agent_sdk import ClaudeSDKClient
+    from curie_runner.adapter import ClaudeAgentSession, build_options
+
+    launcher = tmp_path / "unusable-shell"
+    launcher.write_text(
+        "#!/bin/sh\nprintf 'arbitrary-child-sentinel' >&2\nexit 37\n"
+        if mode == "broken"
+        else "#!/bin/sh\nexec sleep 30\n"
+    )
+    launcher.chmod(0o755)
+    monkeypatch.setattr(subprocess_env, "BASH_SHELL_LAUNCHER", launcher)
+    calls: list[bool] = []
+
+    async def connect(client: ClaudeSDKClient) -> None:
+        calls.append(True)
+
+    monkeypatch.setattr(ClaudeSDKClient, "connect", connect)
+    options = build_options(
+        plugins=[],
+        model="claude-sonnet-5",
+        system_prompt="hello",
+        max_turns=1,
+        max_budget_usd=None,
+        resume=None,
+        env={},
+    )
+    started = time.monotonic()
+    with pytest.raises((RuntimeError, OSError)) as failure:
+        anyio.run(ClaudeAgentSession(options).connect)
+    assert time.monotonic() - started < 10, "shell validation must be bounded before SDK spawn"
+    assert not calls, "SDK would silently fall back to an unguarded shell"
+    assert "arbitrary-child-sentinel" not in str(failure.value)
