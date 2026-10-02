@@ -1926,12 +1926,15 @@ code running in the sandbox, such as a Bash command or a hook, cannot read or
 write another channel's memory and cannot write the memory guidance. A fact's
 author is the sender of the turn the write happened in, while that turn's
 credential is held: code that copies the credential during a turn can write as
-that turn's sender until it expires at the turn's time limit, even after the
-turn has ended. A message steered into a live turn gets a credential for its
-own sender, which expires no later than the live turn's time limit when the
-same worker opened that turn, and at the message's own time limit otherwise. Refusing a credential once its turn ends is
-[#3776](https://github.com/curie-eng/curie/issues/3776). With writes off, the
-sandbox cannot write memory at all.
+that turn's sender until the turn ends. Then the worker reports the turn ended
+and the API refuses writes with its credential (403, "this conversation's turn
+has ended"), even though it has not expired
+([#3776](https://github.com/curie-eng/curie/issues/3776)). Reads still work. If
+the worker cannot reach the API, or the API predates this, the credential still
+expires at the turn's time limit. A message steered into a live turn gets a
+credential for its own sender, which expires no later than the live turn's time
+limit when the same worker opened that turn, and at the message's own time
+limit otherwise. With writes off, the sandbox cannot write memory at all.
 
 Upgrade the worker with or before the API. A sandbox booted by an older worker
 holds a credential without the new claims; the API treats it as read-only on
