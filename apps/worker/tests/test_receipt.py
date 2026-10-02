@@ -716,3 +716,18 @@ def test_native_words_in_connector_content_are_not_tool_references() -> None:
     assert render_receipt([action]) == (
         "_What I changed:_\n• Read permissions updated for acme.txt — restore information recorded"
     )
+
+
+@pytest.mark.parametrize("tool,label", [("mcp__acme__send_message", "send message"), ("send_message", "send message")])
+@pytest.mark.parametrize("ending", [".", ". Next action.", ".\nNext action.", '."'])
+def test_connector_tool_reference_before_sentence_period(tool: str, label: str, ending: str) -> None:
+    action = _action(tool=tool, result={"summary": f"Called {tool}{ending}"}, detail=f"Restore {tool}{ending}")
+    assert render_receipt([action]) == f"_What I changed:_\n• Called {label}{ending} — Restore {label}{ending}"
+
+
+@pytest.mark.parametrize("tool", ["mcp__acme__send_message", "send_message"])
+@pytest.mark.parametrize("content", ["{tool}.json", "{tool}.backup.txt", "./{tool}", "/tmp/{tool}.json", "https://example.com/{tool}"])
+def test_connector_tool_identifiers_inside_files_and_paths_stay_content(tool: str, content: str) -> None:
+    summary = content.format(tool=tool)
+    action = _action(tool=tool, result={"summary": summary}, detail=summary)
+    assert render_receipt([action]) == f"_What I changed:_\n• {summary} — {summary}"
