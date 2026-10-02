@@ -493,6 +493,10 @@ cleanup() {
         echo "error: could not remove owned approval seed agent" >&2
         [[ "$code" -ne 0 ]] || code=1
     fi
+    if ! stop_local_model_error_provider; then
+        echo "error: could not remove the owned model failure provider" >&2
+        [[ "$code" -ne 0 ]] || code=1
+    fi
     # The compose worker spawns runner containers as SIBLINGS on the host daemon
     # via the mounted docker socket, so a rung that died before `local down` can
     # strand them. This raw sweep is a BACKSTOP, not duplication: `local down`
@@ -521,10 +525,6 @@ cleanup() {
             # shellcheck disable=SC2086
             docker rm -f $orphans >/dev/null 2>&1
         fi
-    fi
-    if ! stop_local_model_error_provider; then
-        echo "error: could not remove the owned model failure provider" >&2
-        [[ "$code" -ne 0 ]] || code=1
     fi
     stop_local_otel_sink
     # Only the container THIS run created, matched by its exact unique name, so
@@ -4243,7 +4243,7 @@ start_local_model_error_provider() {
 }
 
 local_model_error_provider_health() {
-    docker exec "$LOCAL_MODEL_ERROR_PROVIDER_NAME" python3 -c '
+    docker exec "${LOCAL_MODEL_ERROR_PROVIDER_ID:-$LOCAL_MODEL_ERROR_PROVIDER_NAME}" python3 -c '
 import urllib.request
 with urllib.request.urlopen("http://127.0.0.1:8081/health", timeout=2) as response:
     print(response.read().decode())
