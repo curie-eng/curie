@@ -50,16 +50,14 @@ def test_reply_placeholders_are_required_nullable_strings() -> None:
     assert {variant["type"] for variant in approval_variants} == {"null", "string"}
 
     handle_string = next(variant for variant in handle_variants if variant["type"] == "string")
-    approval_string = next(
-        variant for variant in approval_variants if variant["type"] == "string"
-    )
+    approval_string = next(variant for variant in approval_variants if variant["type"] == "string")
     assert "minLength" not in handle_string
     assert approval_string["minLength"] == 1
 
 
 def test_publication_context_is_an_optional_event_field_with_required_contents() -> None:
     schema = build_schema()
-    assert schema["protocolVersion"] == "0.5.11"
+    assert schema["protocolVersion"] == "0.5.12"
 
     definitions = schema["$defs"]
     event = definitions["Event"]
