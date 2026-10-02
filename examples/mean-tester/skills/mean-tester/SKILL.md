@@ -105,8 +105,12 @@ holding it is only the target's label.
      `"name": "<bundle>" filename:plugin.json repo:<owner>/<repo>`.
    - If several bundles match, ask which one, name them, and stop. If none
      does, say so and stop.
-3. Read the bundle with `mcp__plugin_mean-tester_github__get_file_contents`,
-   on the listed branch:
+3. Resolve the listed branch's latest commit with
+   `mcp__plugin_mean-tester_github__list_commits` (`sha` = the branch,
+   `perPage` = 1), before reading specification or suite files. Record that
+   exact SHA as the source identity.
+   Read the bundle with `mcp__plugin_mean-tester_github__get_file_contents`,
+   passing that exact SHA as `ref` for every file, never the moving branch:
    - `.claude-plugin/plugin.json`;
    - each `skills/*/SKILL.md`;
    - `connectors.yaml`, if there is one;
@@ -114,9 +118,7 @@ holding it is only the target's label.
    - `acceptance/cases.json`, if there is one (the separate fixed target suite);
    - a specification directory, if the request names one.
 
-   Read the branch's latest commit with
-   `mcp__plugin_mean-tester_github__list_commits` (`sha` = the branch,
-   `perPage` = 1). The report names that commit.
+   The report names the exact commit all of those reads used.
 4. From the spec, as far as it says, work out:
    - what the target is for;
    - which tools it has;
@@ -146,10 +148,13 @@ not that the answer is right.
 
 ## Checking that it answers
 
-The first thread's root probe is the answer check: the exact probe the request
-gave, if it gave one, or otherwise the most ordinary thing its users ask every
-day, from its spec, or, without one, what it can help with. If it does not
-answer, report that as a FAIL and stop.
+For a READY validation campaign, the first eligible fixed case is the first
+thread's root probe and answer check; do not invent an earlier probe. An exact
+single-probe request is diagnostic and uses that exact text. With a MISSING or
+MALFORMED suite, exploration uses the most ordinary question from the spec, or,
+without one, what it can help with; it cannot establish fixed-suite coverage.
+If the answer check gets no answer, report FAIL and stop, leaving later cases
+NOT RUN. A suite with no eligible case is BLOCKED, never a suite pass.
 
 ## Fixed acceptance suite
 
@@ -305,8 +310,9 @@ report, with everything not sent as `Next:` lines.
   Compare `date +%s` with its `ts`; never count reads instead.
 - A follow-up that got neither a placeholder nor a reply within 180 seconds,
   in a thread whose root probe was answered, was not admitted by the target's
-  installation. Send no more follow-ups in this campaign, and send the rest of
-  the plan as root probes, within the thread rate.
+  installation. Send no more follow-ups in this campaign. Keep all remaining
+  continuity-dependent steps BLOCKED; only independent steps may be replanned
+  as exploratory root probes, within the thread rate, without claiming original coverage.
 
 Use `mcp__plugin_mean-tester_slack__slack_post_message` only to send probes,
 and `mcp__plugin_mean-tester_slack__slack_reply_to_thread` only to send
