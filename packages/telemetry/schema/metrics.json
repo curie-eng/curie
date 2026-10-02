@@ -1687,6 +1687,21 @@
       },
       "cardinality_bound": 6
     },
+    "curie.state.legacy_token": {
+      "type": "counter",
+      "unit": "{request}",
+      "description": "State requests allowed for a sandbox token minted before ADR-0188.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-api"
+        ],
+        "namespace": [
+          "transcript"
+        ]
+      },
+      "cardinality_bound": 1
+    },
     "curie.work_item.reconciler.step.failure": {
       "type": "counter",
       "unit": "{failure}",

@@ -12,7 +12,7 @@ boot-env pair, so a skill reads and writes state without shipping its own server
 the sandbox authenticates with a scoped ``state`` token (ADR-0033), never the
 platform key. On the ``memory`` namespace a sandbox credential is further held to
 its own channel, to fact keys, and to the sender its per-turn credential names
-(ADR-0188).
+(ADR-0188); on ``transcript`` it is held to its own channel's threads (#3767).
 """
 
 import enum
@@ -24,11 +24,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, NoReturn
 
+from curie_telemetry import record_metric
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy import Text, cast, delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import crud, sandbox_token, state_mutation, transcripts
+from .. import crud, sandbox_token, state_mutation, threadkeys, transcripts
 from ..auth import verify_platform_key
 from ..config import get_settings
 from ..deps import SessionDep
@@ -47,8 +48,9 @@ logger = logging.getLogger(__name__)
 # one channel whose memory it may reach, and ``memory`` says whether it may write
 # (only the per-turn credential the worker puts on the turn's ACI ``Event`` is
 # ``"write"``, and it carries the ``sender`` the API stamps as the fact's
-# author). The NARROW scope is minted for the bundle-facing
-# ``CURIE_STATE_TOKEN`` and is refused on the reserved namespaces by
+# author). On ``transcript`` the ``binding`` claim likewise holds it to its own
+# channel's threads (#3767, ``_check_transcript_reach``). The NARROW scope is
+# minted for the bundle-facing ``CURIE_STATE_TOKEN`` and is refused on the reserved namespaces by
 # ``forbid_reserved_namespace`` below -- so a skill using the mounted state
 # interface (the ``curie-state`` MCP tools or a direct ``CURIE_STATE_URL``
 # call) cannot reach the memory/history ports even by composing the URL itself.
@@ -79,7 +81,8 @@ class StateCaller(enum.Enum):
     """Which credential authorized a state-router request, and thus how far it
     reaches. PLATFORM (the shared key) is unrestricted. STATE (the broad scoped
     token: the runner's loaders and memory tools) reaches every namespace, but
-    on ``memory`` only as far as its claims allow (ADR-0188). APP (the narrow
+    on ``memory`` only as far as its claims allow (ADR-0188), and on
+    ``transcript`` only its own channel's threads (#3767). APP (the narrow
     bundle token) is refused on ``RESERVED_NAMESPACES``."""
 
     PLATFORM = "platform"
@@ -230,6 +233,89 @@ def _check_memory_reach(
         _refuse(
             principal, agent_id, path, "only fact keys are writable with a sandbox credential"
         )
+
+
+def _transcript_key_admitted(principal: StatePrincipal, agent_id: uuid.UUID, key: str) -> bool:
+    """Whether a non-legacy sandbox credential reaches the thread ``key`` (#3767).
+
+    A transcript key is a thread key, mapped back to its binding by
+    ``threadkeys.transcript_binding``. A bound credential reaches its own
+    binding's threads, whatever identity segment the key carries. The unbound
+    credential (a targetless cron's boot env names no binding) reaches only its
+    own agent's ``@cron`` threads. A key no producer builds maps to no binding
+    and is reached by no sandbox credential."""
+
+    key_binding = threadkeys.transcript_binding(key)
+    if key_binding is None:
+        return False
+    if principal.binding is None:
+        return key_binding == f"@cron:{agent_id}"
+    return key_binding == principal.binding
+
+
+def _note_legacy_transcript_use(agent_id: uuid.UUID, path: str) -> None:
+    """Log and count a pre-ADR-0188 token's transcript request, which is allowed.
+
+    Refusing it would cut off every warm sandbox's history at API deploy; the
+    window closes when the last such token expires, at most 24 hours after the
+    worker upgrade. The log names the agent and the path, never the token."""
+
+    logger.warning(
+        "state: allowed legacy sandbox token (no memory claim) for agent %s on %s; "
+        "transcript reach is unscoped until the sandbox is replaced",
+        agent_id,
+        path,
+    )
+    record_metric(
+        "curie.state.legacy_token",
+        attributes={"service.name": "curie-api", "namespace": TRANSCRIPT_NAMESPACE},
+    )
+
+
+def _check_transcript_reach(
+    principal: StatePrincipal,
+    agent_id: uuid.UUID,
+    namespace: str,
+    *,
+    requested_binding: str | None,
+    key: str | None,
+    path: str,
+) -> None:
+    """#3767: what a sandbox (STATE) credential may reach on ``transcript``.
+
+    On a binding path, the path's binding must be the credential's; with a key,
+    the key's binding must be too (``_transcript_key_admitted``), so neither
+    can launder the other. A listing (``key`` None) is filtered afterwards by
+    ``_visible_transcripts``. A legacy token keeps its reach, with a warning and
+    a metric. The platform key is unaffected and the app token is already
+    fenced off by ``forbid_reserved_namespace``. Runs before any database read,
+    so a refused read cannot trigger pre-identity adoption either."""
+
+    if principal.caller is not StateCaller.STATE or namespace != TRANSCRIPT_NAMESPACE:
+        return
+    if principal.legacy:
+        _note_legacy_transcript_use(agent_id, path)
+        return
+    if requested_binding is not None and principal.binding != requested_binding:
+        _refuse(principal, agent_id, path, "credential is scoped to another channel")
+    if key is not None and not _transcript_key_admitted(principal, agent_id, key):
+        _refuse(
+            principal, agent_id, path, "transcript belongs to another channel or no channel"
+        )
+
+
+def _visible_transcripts(
+    principal: StatePrincipal, agent_id: uuid.UUID, namespace: str, rows: list[StateEntryOut]
+) -> list[StateEntryOut]:
+    """A transcript listing narrowed to the threads a sandbox credential reaches."""
+
+    if (
+        principal.caller is not StateCaller.STATE
+        or principal.legacy
+        or namespace != TRANSCRIPT_NAMESPACE
+    ):
+        return rows
+    return [row for row in rows if _transcript_key_admitted(principal, agent_id, row.key)]
 
 
 def _stamp_author(
@@ -644,6 +730,14 @@ async def put_state(
     _check_memory_reach(
         principal, agent_id, namespace, requested_binding=None, key=key, write=True, path=path
     )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=key,
+        path=path,
+    )
     data = _stamp_author(principal, agent_id, namespace, data, path)
     return await _put_state(agent_id, None, namespace, key, data, session)
 
@@ -671,6 +765,14 @@ async def put_state_for_binding(
         requested_binding=f"{kind}:{address}",
         key=key,
         write=True,
+        path=path,
+    )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
         path=path,
     )
     data = _stamp_author(principal, agent_id, namespace, data, path)
@@ -749,6 +851,14 @@ async def append_state(
         append=True,
         path=_state_path(namespace, key),
     )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=key,
+        path=_state_path(namespace, key),
+    )
     return await _append_state(agent_id, None, namespace, key, data, session)
 
 
@@ -775,6 +885,14 @@ async def append_state_for_binding(
         key=key,
         write=True,
         append=True,
+        path=_state_path(namespace, key, kind, address),
+    )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
         path=_state_path(namespace, key, kind, address),
     )
     scope = await _binding_scope(session, agent_id, kind, address)
@@ -834,8 +952,10 @@ async def _list_namespaces(
         and not (hide_memory and row.namespace == MEMORY_NAMESPACE)
     ]
     # Transcripts live in their own table (ADR-0170) but are still listed here
-    # as the reserved namespace the operator's inspector already knows.
-    if caller is not StateCaller.APP:
+    # as the reserved namespace the operator's inspector already knows. Only
+    # the platform key gets that row: its count and write time cover every
+    # channel's threads, which a sandbox credential may not learn (#3767).
+    if caller is StateCaller.PLATFORM:
         threads = await transcripts.summary(session, agent_id, scope)
         if threads is not None:
             listed.append(
@@ -924,6 +1044,14 @@ async def get_state(
         write=False,
         path=_state_path(namespace, key),
     )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=key,
+        path=_state_path(namespace, key),
+    )
     return await _get_state(agent_id, None, namespace, key, session, response)
 
 
@@ -949,6 +1077,14 @@ async def get_state_for_binding(
         requested_binding=f"{kind}:{address}",
         key=key,
         write=False,
+        path=_state_path(namespace, key, kind, address),
+    )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
         path=_state_path(namespace, key, kind, address),
     )
     scope = await _binding_scope(session, agent_id, kind, address)
@@ -993,7 +1129,16 @@ async def list_state(
         write=False,
         path=_state_path(namespace, None),
     )
-    return await _list_state(agent_id, None, namespace, session)
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=None,
+        path=_state_path(namespace, None),
+    )
+    rows = await _list_state(agent_id, None, namespace, session)
+    return _visible_transcripts(principal, agent_id, namespace, rows)
 
 
 @router.get(
@@ -1018,8 +1163,17 @@ async def list_state_for_binding(
         write=False,
         path=_state_path(namespace, None, kind, address),
     )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=None,
+        path=_state_path(namespace, None, kind, address),
+    )
     scope = await _binding_scope(session, agent_id, kind, address)
-    return await _list_state(agent_id, scope, namespace, session)
+    rows = await _list_state(agent_id, scope, namespace, session)
+    return _visible_transcripts(principal, agent_id, namespace, rows)
 
 
 async def _delete_state(
@@ -1109,6 +1263,14 @@ async def delete_state(
         write=True,
         path=_state_path(namespace, key),
     )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=key,
+        path=_state_path(namespace, key),
+    )
     return await _delete_state(
         agent_id, None, namespace, key, expected_version, session, principal.caller
     )
@@ -1136,6 +1298,14 @@ async def delete_state_for_binding(
         requested_binding=f"{kind}:{address}",
         key=key,
         write=True,
+        path=_state_path(namespace, key, kind, address),
+    )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
         path=_state_path(namespace, key, kind, address),
     )
     scope = await _binding_scope(session, agent_id, kind, address)

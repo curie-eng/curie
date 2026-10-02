@@ -421,6 +421,13 @@ _STATE_MUTATION_ATTRIBUTES = {
     "op": ["delete", "edit"],
     "namespace": ["memory", "transcript", "other"],
 }
+# Requests the state API allowed for a pre-ADR-0188 sandbox token (#3767): its
+# transcript reach stays unscoped until the token expires. The agent and path
+# are in the warning line, never on the metric.
+_STATE_LEGACY_TOKEN_ATTRIBUTES = {
+    "service.name": ["curie-api"],
+    "namespace": ["transcript"],
+}
 _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
     "service.name": ["curie-api"],
     "step": [
@@ -668,6 +675,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Agent state and memory entries removed or rewritten.",
         True,
         _STATE_MUTATION_ATTRIBUTES,
+    ),
+    "curie.state.legacy_token": _definition(
+        "counter",
+        "{request}",
+        "State requests allowed for a sandbox token minted before ADR-0188.",
+        True,
+        _STATE_LEGACY_TOKEN_ATTRIBUTES,
     ),
     "curie.work_item.reconciler.step.failure": _definition(
         "counter",

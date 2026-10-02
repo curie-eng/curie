@@ -1938,11 +1938,12 @@ holds a credential without the new claims; the API treats it as read-only on
 agent memory and refuses it on channel memory, logging a warning, until that
 sandbox is replaced (at most 24 hours).
 
-Conversation transcripts are not scoped this way yet: code in an agent's
-sandbox can still read and write the transcripts of the other channels that
-agent serves. So keep sensitive channels and direct messages on an agent of
-their own until
-[#3767](https://github.com/curie-eng/curie/issues/3767) is fixed.
+Conversation transcripts are held the same way
+([#3767](https://github.com/curie-eng/curie/issues/3767)): code in the sandbox
+can read and write only its own channel's threads. A sandbox booted by an older
+worker keeps its old transcript reach until it is replaced, so its history is
+not cut off at the upgrade; each such request logs a "legacy sandbox token"
+warning and counts on `curie.state.legacy_token`.
 
 ### Bundles that carry their own stdio MCP servers (0.11.0)
 
