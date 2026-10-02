@@ -42,6 +42,9 @@ pub struct FactoryIntakeOpts {
     pub private_key_file: Option<std::path::PathBuf>,
     /// Organization whose registration form the printed link opens.
     pub org: Option<String>,
+    /// `api.githubFactoryIntake` when this run must select a mode. `None`
+    /// leaves the recorded value, which is what `cluster factory` does.
+    pub intake: Option<String>,
 }
 
 /// Helm's floor for this command, matching `curie cluster upgrade`'s default.
@@ -223,6 +226,9 @@ pub fn intake_values(opts: &FactoryIntakeOpts, cidrs: &[String]) -> serde_json::
     }
     if let Some(secret) = &opts.webhook_secret {
         api.insert("githubWebhookSecret".into(), serde_json::json!(secret));
+    }
+    if let Some(intake) = &opts.intake {
+        api.insert("githubFactoryIntake".into(), serde_json::json!(intake));
     }
     let mut values = serde_json::json!({ "api": api });
     if !opts.github_api_egress.is_empty() {
@@ -795,6 +801,7 @@ mod tests {
             app_id: None,
             private_key_file: None,
             org: None,
+            intake: None,
         }
     }
 

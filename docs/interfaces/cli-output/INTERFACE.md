@@ -1,7 +1,7 @@
 ---
 seam: CLI output (agent-facing `--json`)
 kind: CLEAN
-impls: 63 outputs behind one trait
+impls: 64 outputs behind one trait
 grade: not separately graded
 epics:
   - "#456"
@@ -13,7 +13,7 @@ order: 18
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 63 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 64 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -65,7 +65,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 
 ## Implementations today
 
-63 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
+64 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 - **`DryRunPlan`** (`cli/src/ui.rs`) — the generic `--dry-run` plan; JSON is
   `{"dry_run":true,"plan":[lines]}` and the human render is the same lines verbatim,
@@ -104,7 +104,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   module is a deliberate leaf and never bypasses `CliOutput`.
 - **One output each** in `cli/src/channel_token.rs` (`ChannelTokenOutput`),
   `cli/src/comms.rs` (`CommsOutput`), `cli/src/doctor.rs`
-  (`DoctorOutput`), `cli/src/factory_intake.rs` (`FactoryIntakeOutput`), `cli/src/factory_app.rs` (`FactoryAppRegistrationOutput`, `FactoryAppSetupOutput`), `cli/src/github_app.rs` (`GithubAppOutput`), `cli/src/guide.rs`
+  (`DoctorOutput`), `cli/src/factory_intake.rs` (`FactoryIntakeOutput`), `cli/src/factory_app.rs` (`FactoryAppRegistrationOutput`, `FactoryAppSetupOutput`), `cli/src/factory_quickstart.rs` (`QuickstartOutput`), `cli/src/github_app.rs` (`GithubAppOutput`), `cli/src/guide.rs`
   (`GuideOutput`), `cli/src/migrate_store.rs` (`MigrateStoreOutput`),
   `cli/src/release_accept.rs` (`ReleaseAcceptOutput`), `cli/src/seal.rs`
   (`SealOutput`), and `cli/src/secrets.rs` (`SecretsListOutput`).

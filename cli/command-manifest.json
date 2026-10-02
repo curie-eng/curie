@@ -6837,6 +6837,147 @@
       ]
     },
     {
+      "about": "Bring up Curie and the dark factory without a webhook or a tunnel",
+      "hidden": false,
+      "name": "factory",
+      "subcommands": [
+        {
+          "about": "Create a cluster when none is targeted, install Curie, register the GitHub App, and on the second run deploy the published dark factory. Never opens a browser and never runs gh",
+          "args": [
+            {
+              "global": false,
+              "help": "GitHub repository the factory may work in, as owner/name",
+              "id": "repo",
+              "long": "repo",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Numeric GitHub App ID. Pair with --private-key-file. Without both, the command prints the registration link and exits after cluster up",
+              "id": "app_id",
+              "long": "app-id",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "PEM private key downloaded from the App. The path is passed through; the key contents never enter argv",
+              "id": "private_key_file",
+              "long": "private-key-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Kubernetes context. When omitted, the current kubeconfig context is used. When neither exists, a kind cluster is created",
+              "id": "context",
+              "long": "context",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the registration link for this GitHub organization instead of a personal account",
+              "id": "org",
+              "long": "org",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-factory"
+              ],
+              "global": false,
+              "help": "Kind cluster name used only when no kube context is targeted",
+              "id": "kind_name",
+              "long": "kind-name",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "z-ai/glm-5.3-flash"
+              ],
+              "global": false,
+              "help": "Model id installed by cluster up",
+              "id": "model",
+              "long": "model",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "3600"
+              ],
+              "global": false,
+              "help": "Per run execution deadline in seconds for the deployed agent",
+              "id": "execution_deadline",
+              "long": "execution-deadline",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "5"
+              ],
+              "global": false,
+              "help": "Daily USD budget for the deployed agent",
+              "id": "budget",
+              "long": "budget",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Helm chart. Default: the version pinned chart on release builds; local charts/curie on dev builds",
+              "id": "chart",
+              "long": "chart",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the steps and exit without creating a cluster or applying anything",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "quickstart"
+        }
+      ]
+    },
+    {
       "about": "Install a complete first party example workflow",
       "args": [
         {
