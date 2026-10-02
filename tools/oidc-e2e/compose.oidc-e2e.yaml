@@ -1,0 +1,55 @@
+# Overlay on compose.dev.yaml for `curie dev oidc-e2e`, run as its own compose
+# project with --profile core so it can sit beside a developer's `curie` stack.
+#
+# - Only the API, the console UI and Dex publish host ports, on the driver's
+#   ports. Postgres, Valkey and RustFS stay on the project network.
+# - The host-networked worker is off: it reaches its stores through host ports
+#   and would otherwise talk to another stack's databases.
+# - The API leaves the fixed-name `curie_runner` network so another stack's
+#   runners never resolve `curie-api` to this one.
+# - Dex runs in the API container's network namespace, so one issuer URL,
+#   http://localhost:$OIDC_E2E_DEX_PORT/dex, works for the driver on the host
+#   and for the API alike, with no /etc/hosts entry.
+#
+# The driver sets every OIDC_E2E_* and CURIE_OIDC_* variable on each compose
+# call; blank CURIE_OIDC_* values turn OIDC off.
+services:
+  curie-worker:
+    profiles: !override ["never"]
+
+  curie-api:
+    networks: !override
+      default: {}
+    ports: !override
+      - "127.0.0.1:${OIDC_E2E_API_PORT}:8000"
+      - "127.0.0.1:${OIDC_E2E_DEX_PORT}:${OIDC_E2E_DEX_PORT}"
+    environment:
+      CURIE_OIDC_ISSUER: ${CURIE_OIDC_ISSUER}
+      CURIE_OIDC_AUDIENCE: ${CURIE_OIDC_AUDIENCE}
+      CURIE_OIDC_JWKS_URL: ${CURIE_OIDC_JWKS_URL}
+      CURIE_OIDC_CLIENT_SECRET: ${CURIE_OIDC_CLIENT_SECRET}
+      CURIE_OIDC_REDIRECT_URI: ${CURIE_OIDC_REDIRECT_URI}
+      CURIE_OIDC_SCOPES: ${CURIE_OIDC_SCOPES}
+      CURIE_OIDC_REQUIRED_CLAIMS: ${CURIE_OIDC_REQUIRED_CLAIMS}
+      CURIE_OIDC_ADMIT_ALL_AUTHENTICATED: ${CURIE_OIDC_ADMIT_ALL_AUTHENTICATED}
+
+  curie-ui:
+    profiles: !override ["core"]
+    ports: !override
+      - "127.0.0.1:${OIDC_E2E_UI_PORT}:8080"
+
+  dex:
+    profiles: ["core"]
+    image: ${OIDC_E2E_DEX_IMAGE}
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    network_mode: "service:curie-api"
+    depends_on: [curie-api]
+    volumes:
+      - ${OIDC_E2E_DEX_CONFIG}:/etc/dex/config.yaml:ro
+
+  postgres:
+    ports: !reset []
+  valkey:
+    ports: !reset []
+  rustfs:
+    ports: !reset []
