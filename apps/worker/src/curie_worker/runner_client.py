@@ -289,6 +289,18 @@ class TurnStream:
             self.close()
 
 
+def _without_memory_token(body: str, event: Event) -> str:
+    """``body`` with the event's memory credential redacted (MEMORY-TOKEN-3).
+
+    An older runner's 400 repeats the rejected frame, ``memory_token``
+    included, and the error this body goes into is logged."""
+
+    token = event.memory_token
+    if not token:
+        return body
+    return body.replace(token, "<redacted>")
+
+
 class RunnerClient:
     """Dials a claimed runner over its base_url. One client serves all threads."""
 
@@ -465,7 +477,7 @@ class RunnerClient:
                     # A validation response can echo the submitted capability.
                     resp.release()
                     raise RunnerError(f"/v1/event -> {resp.status}")
-                body = await resp.text()
+                body = _without_memory_token(await resp.text(), event)
                 resp.release()
                 raise RunnerError(f"/v1/event -> {resp.status}: {body}")
             turn_epoch = resp.headers.get(_TURN_EPOCH_HEADER)
@@ -553,7 +565,7 @@ class RunnerClient:
                 if resp.status != 200:
                     if event.publication_context is not None:
                         raise RunnerError(f"/v1/steer -> {resp.status}")
-                    body = await resp.text()
+                    body = _without_memory_token(await resp.text(), event)
                     raise RunnerError(f"/v1/steer -> {resp.status}: {body}")
                 return True, "success"
 
