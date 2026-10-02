@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import redis
 
@@ -22,8 +23,20 @@ from test_factory_terminus import (  # noqa: E402
     admitted,  # noqa: F401
     comments,  # noqa: F401
 )
+from test_github_factory_ingress import GitHubAPI, REPO  # noqa: E402
 
 pytestmark = pytest.mark.usefixtures("clean_db")
+
+
+def test_independent_factory_fixtures_do_not_share_timeline_event_identity() -> None:
+    """@spec apps/api/README.md#factory-test-isolation"""
+    first, second = GitHubAPI(), GitHubAPI()
+    request = httpx.Request("GET", f"https://api.github.com/repos/{REPO}/issues/9701/events")
+    initial = first.handle(request).json()[0]["id"]
+    assert first.handle(request).json()[0]["id"] == initial
+    assert second.handle(request).json()[0]["id"] != initial
+    first.advance_label_event(9701)
+    assert first.handle(request).json()[0]["id"] > initial
 
 
 def _keys(request_id: str) -> list[str]:
