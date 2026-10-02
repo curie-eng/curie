@@ -84,6 +84,7 @@ from .memory_facts import (
     MemoryFactsError,
     MemoryFactsStore,
     MemoryFull,
+    MemoryRefused,
     MemoryTurn,
 )
 from .publication_precheck import PublicationPrecheck
@@ -606,6 +607,13 @@ def build_memory_tools(
             return _approval_error(f"Refused: {memory} memory is full ({exc}). Nothing was saved.")
         if isinstance(exc, FactNotFound):
             return _approval_error(f"Not found: no fact with id {fact_id!r} in {memory} memory.")
+        if isinstance(exc, MemoryRefused):
+            # ADR-0188: the API refused this credential, which is not an outage.
+            logger.warning("memory tool refused error_class=%s: %s", type(exc).__name__, exc)
+            return _approval_error(
+                "Refused: this memory cannot be written from this conversation. "
+                "Nothing was saved."
+            )
         logger.warning("memory tool failed error_class=%s: %s", type(exc).__name__, exc)
         return _approval_error(f"The {memory} memory could not be reached. Nothing changed.")
 
