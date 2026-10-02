@@ -92,8 +92,10 @@ def test_an_old_api_404_is_logged_once_and_not_raised(caplog: pytest.LogCaptureF
         assert len(seen) == 2
 
     asyncio.run(go())
-    mentions = [r for r in caplog.records if "404" in r.getMessage() or "closed" in r.getMessage()]
-    assert len(mentions) == 1, [r.getMessage() for r in caplog.records]
+    # Only the worker's own lines: the test server's access log also says 404.
+    worker = [r for r in caplog.records if r.name.startswith("curie_worker")]
+    mentions = [r for r in worker if "404" in r.getMessage() or "closed" in r.getMessage()]
+    assert len(mentions) == 1, [(r.name, r.getMessage()) for r in caplog.records]
     assert mentions[0].levelno < logging.ERROR
 
 
