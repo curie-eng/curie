@@ -211,4 +211,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0186 | [A factory ticket declares its base branch and keeps it](0186-a-factory-ticket-declares-its-base-and-keeps-it.md) | Draft |
 | 0187 | [The factory polls GitHub for its work, and the platform reads the issue](0187-the-factory-polls-github-and-the-platform-reads-the-issue.md) | Accepted |
 | 0188 | [The sandbox memory credential is scoped to its own channel](0188-the-sandbox-memory-credential-is-scoped-to-its-own-channel.md) | Draft |
+| 0189 | [Deployed agents see only their bundle's skills](0189-deployed-agents-see-only-their-bundles-skills.md) | Draft |
 <!-- END GENERATED: adr-index -->
