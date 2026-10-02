@@ -7,10 +7,13 @@ runner therefore always passes ``skills`` as the bundle's own list, and an
 explicit ``setting_sources`` so the SDK does not quietly drop ``local``.
 """
 
+import importlib
 import json
 import logging
+import sys
 from dataclasses import replace
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import anyio
@@ -202,3 +205,101 @@ def test_a_skill_folder_the_sdk_rejects_is_skipped_with_a_warning(
     options = replace(_options(plugin_dir, skills=skills), cli_path="claude")
     command = SubprocessCLITransport(prompt="", options=options)._build_command()  # noqa: SLF001
     assert "Skill(probe:greet),Skill(probe:hello)" in command
+
+
+# --- surviving a renamed SDK skill-name validator ------------------------------------
+#
+# ``curie_runner.plugin`` borrows the SDK's private ``_validate_skill_name``. The SDK
+# is pinned only ``>=``, so an upgrade may move or rename it. That must not stop the
+# runner importing: ``plugin`` keeps a local copy of the rule,
+# ``_local_validate_skill_name``, and uses it when the SDK's is gone.
+
+_SDK_VALIDATOR_MODULE = "claude_agent_sdk._internal.transport.subprocess_cli"
+
+
+def _renamed_validator_module() -> ModuleType:
+    """The SDK module as a later release might ship it: validator renamed."""
+    import claude_agent_sdk._internal.transport.subprocess_cli as real
+
+    stub = ModuleType(_SDK_VALIDATOR_MODULE)
+    stub.__dict__.update(
+        {key: value for key, value in vars(real).items() if key != "_validate_skill_name"}
+    )
+    return stub
+
+
+@pytest.fixture
+def plugin_without_sdk_validator(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
+    """Make the SDK validator unimportable and unload ``curie_runner.plugin``.
+
+    The original module goes back into ``sys.modules`` (and onto the package) at
+    teardown, so other tests keep the classes they already imported.
+    """
+    import curie_runner
+
+    monkeypatch.setattr(curie_runner, "plugin", sys.modules["curie_runner.plugin"])
+    monkeypatch.setitem(sys.modules, "curie_runner.plugin", sys.modules["curie_runner.plugin"])
+    if request.param == "module-moved":
+        monkeypatch.setitem(sys.modules, _SDK_VALIDATOR_MODULE, None)
+    else:
+        monkeypatch.setitem(sys.modules, _SDK_VALIDATOR_MODULE, _renamed_validator_module())
+    with pytest.raises(ImportError):
+        exec(f"from {_SDK_VALIDATOR_MODULE} import _validate_skill_name", {})
+    del sys.modules["curie_runner.plugin"]
+
+
+@pytest.mark.parametrize(
+    "plugin_without_sdk_validator", ["module-moved", "function-renamed"], indirect=True
+)
+def test_plugin_imports_and_filters_skills_without_the_sdk_validator(
+    plugin_without_sdk_validator: None, tmp_path: Path
+) -> None:
+    plugin = importlib.import_module("curie_runner.plugin")
+    plugin_dir = _bundle(
+        tmp_path,
+        {"hello": "hello", **{name: "odd" for name in _UNPASSABLE}},
+    )
+
+    assert plugin.bundle_skill_names(plugin_dir) == ["probe:hello"]
+
+
+# Names the CLI can and cannot take in a ``Skill(name)`` rule. ``True`` is valid.
+_SKILL_NAME_SAMPLES = {
+    "probe:hello": True,
+    "greet": True,
+    "probe:my-skill_2": True,
+    "probe:a.b": True,
+    "probe:a,b": False,
+    "probe:a(b)": False,
+    "probe:trailing ": False,
+    " leading": False,
+    "": False,
+    "*": False,
+    "probe:*": False,
+    "/slash": False,
+    "probe:tab\there": False,
+    "probe:back\\\\slash": False,
+    "probe:ends\\": False,
+}
+
+
+def _accepts(validator: Any, name: str) -> bool:
+    try:
+        validator(name)
+    except ValueError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize("name", list(_SKILL_NAME_SAMPLES))
+def test_the_local_skill_name_rule_matches_the_sdk(name: str) -> None:
+    sdk_module = pytest.importorskip(_SDK_VALIDATOR_MODULE)
+    sdk_validator = getattr(sdk_module, "_validate_skill_name", None)
+    if sdk_validator is None:
+        pytest.skip("the SDK no longer ships _validate_skill_name")
+    from curie_runner.plugin import _local_validate_skill_name
+
+    assert _accepts(_local_validate_skill_name, name) is _SKILL_NAME_SAMPLES[name]
+    assert _accepts(_local_validate_skill_name, name) is _accepts(sdk_validator, name), (
+        f"the local skill-name rule and the SDK's disagree on {name!r}"
+    )
