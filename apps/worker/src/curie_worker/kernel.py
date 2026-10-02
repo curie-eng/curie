@@ -957,6 +957,21 @@ class _PressureResult:
     outcome: str
 
 
+@dataclass(frozen=True)
+class TurnMemoryGrant:
+    """What the kernel needs to mint a turn's memory write credential (ADR-0188).
+
+    Built in the routing block from the resolved deployment and the turn's
+    binding, and handed to ``_attempt``, which mints a fresh credential per
+    attempt onto the runner ``Event`` (never the boot env). Absent for a
+    targetless turn and an eval-isolated one."""
+
+    resolved: Any
+    kind: str
+    address: str
+    thread_key: str
+
+
 class ReclaimPreflightUnsafe(RuntimeError):
     """A transferred delivery could not be proven safe to re-execute.
 
@@ -2787,6 +2802,9 @@ class Kernel:
             nav: NavAffordance | None = None
             packs: BehaviorPacks | None = None
             approval_routes: dict[str, Any] | None = None
+            # ADR-0188: a targetless turn names no binding, so it never gets a
+            # memory write credential.
+            memory_grant: TurnMemoryGrant | None = None
             if targetless:
                 # Routed by the hook run's agent, never a channel binding (#2963).
                 # The id is the one the hook row lookup parsed and matched, not
@@ -2983,6 +3001,15 @@ class Kernel:
                 # the stable sandbox/history identity (#1909 + ADR-0096).
                 if qevent.conversation_id.startswith("eval:"):
                     boot_env_kwargs["isolate_memory"] = True
+                else:
+                    # ADR-0188: an eval-isolated turn carries no memory, so no
+                    # write credential either.
+                    memory_grant = TurnMemoryGrant(
+                        resolved=resolved,
+                        kind=handle.kind,
+                        address=handle.channel,
+                        thread_key=thread_key,
+                    )
                 boot_env = self._binding.boot_env(
                     resolved,
                     thread_key,
@@ -3214,6 +3241,7 @@ class Kernel:
                         remaining_s=_remaining_budget(lease),
                         pressure_retried=False,
                         workspace_inference=workspace_inference,
+                        memory_grant=memory_grant,
                     )
                 except _WorkItemDeferred:
                     return
@@ -4837,6 +4865,7 @@ class Kernel:
         remaining_s: float | None = None,
         pressure_retried: bool,
         workspace_inference: _WorkspaceInferenceCarry,
+        memory_grant: TurnMemoryGrant | None = None,
     ) -> TurnOutcome:
         handle = qevent.reply_handle
         thread_key = _thread_key_for(qevent)
@@ -4871,6 +4900,10 @@ class Kernel:
                 logger.warning("booting-state update failed for %s", qevent.event_id)
 
         event = self._to_event(qevent)
+        # ADR-0188: this attempt's memory write credential, minted fresh so a
+        # retry gets its own expiry. A steer reuses this event, so a steering
+        # sender writes under their own name.
+        event = self._with_memory_token(event, qevent, memory_grant, remaining_s)
 
         attachment_intent = self._attachments is not None and bool(qevent.attachments)
 
@@ -5063,6 +5096,7 @@ class Kernel:
                 remaining_s=retry_remaining,
                 pressure_retried=True,
                 workspace_inference=workspace_inference,
+                memory_grant=memory_grant,
             )
         except PendingPublicationError as exc:
             record_reclaimed_retry()
@@ -5318,6 +5352,7 @@ class Kernel:
                         if remaining_s is None
                         else remaining_s - (time.monotonic() - attempt_started)
                     ),
+                    memory_grant=memory_grant,
                 )
             outcome.workspace_inferred_repo = inferred
             if verified_review is not None:
@@ -8157,6 +8192,7 @@ class Kernel:
         *,
         workspace_deployment_id: uuid.UUID | None,
         remaining_s: float | None,
+        memory_grant: TurnMemoryGrant | None = None,
     ) -> TurnOutcome:
         """Re-prompt a factory execute turn that ended without publishing, ONCE.
 
@@ -8190,6 +8226,8 @@ class Kernel:
             "early_stop" if early else "unpublished",
         )
         event = self._to_event(qevent).model_copy(update={"text": prompt})
+        # ADR-0188: the continuation opens a turn too, with its own credential.
+        event = self._with_memory_token(event, qevent, memory_grant, left)
         try:
             event, left = await self._bind_publication_context(
                 event,
@@ -8615,6 +8653,38 @@ class Kernel:
     def _backoff(self, attempt: int) -> float:
         raw: float = self._config.retry_backoff_base_s * (2 ** (attempt - 1))
         return min(self._config.retry_backoff_max_s, raw)
+
+    def _with_memory_token(
+        self,
+        event: Event,
+        qevent: QueuedTurn,
+        grant: TurnMemoryGrant | None,
+        remaining_s: float | None,
+    ) -> Event:
+        """``event`` with this turn's memory write credential (ADR-0188).
+
+        Unchanged when there is no grant, the binding cannot mint (a double
+        without the method), or the resolver declines (writes off, no key).
+        The credential rides the event only (MEMORY-TOKEN-2/3): never the boot
+        env, never a log line."""
+
+        if grant is None or self._binding is None:
+            return event
+        mint = getattr(self._binding, "turn_memory_token", None)
+        if mint is None:
+            return event
+        token = mint(
+            grant.resolved,
+            kind=grant.kind,
+            address=grant.address,
+            thread_key=grant.thread_key,
+            sender=qevent.author or "",
+            turn=qevent.event_id,
+            ttl_s=remaining_s if remaining_s else self._config.delivery_budget_s,
+        )
+        if not token:
+            return event
+        return event.model_copy(update={"memory_token": token})
 
     @staticmethod
     def _to_event(qevent: QueuedTurn) -> Event:
