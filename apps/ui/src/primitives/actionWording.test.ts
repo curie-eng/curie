@@ -5,6 +5,15 @@ describe("plain action presentation", () => {
   it.each(vectors.vectors)("matches the shared label for $tool", ({ tool, label }) => {
     expect(actionLabel(tool)).toBe(label);
   });
+  it.each([
+    ["constructor", "constructor"],
+    ["toString", "to string"],
+    ["hasOwnProperty", "has own property"],
+  ])("returns a string for the unknown native name %s", (name, label) => {
+    expect(actionLabel(name)).toBe(label);
+    expect(typeof actionLabel(name)).toBe("string");
+    expect(approvalSummary(`Tool call awaiting approval: ${name} {}`)).toBe(`Approve ${label}.`);
+  });
   it("keeps approval values when reading an old API response", () => {
     expect(approvalSummary('Tool call awaiting approval: mcp__acme__file_attachment {"file_name":"example.pdf"}')).toBe("Approve file attachment. File name: example.pdf");
   });
