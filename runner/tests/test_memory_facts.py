@@ -859,6 +859,7 @@ def test_the_exemption_set_matches_what_a_memory_boot_publishes(
 ) -> None:
     from curie_runner.approval import (
         APPROVAL_TOOL_NAME,
+        ISSUE_TOOL_NAME,
         PROGRESS_TOOL_NAME,
         TURN_PROGRESS_TOOL_NAME,
         platform_tool_names,
@@ -867,13 +868,14 @@ def test_the_exemption_set_matches_what_a_memory_boot_publishes(
     options, _prompt = _boot_options(monkeypatch, tmp_path, FakeStateApi(), channel=True)
     published = _published(options)
     expected = platform_tool_names(state_server_mounted=False, memory_tools_mounted=True)
-    # The probe boots with no potential write tool and no progress URL, so the
-    # approval and either progress tool are not published; the three memory tools are.
+    # The probe boots with no potential write tool, progress URL or issue reader,
+    # so approval, progress and issue tools are absent; the three memory tools are.
     assert MEMORY_TOOLS <= published
     assert published == expected - {
         PROGRESS_TOOL_NAME,
         TURN_PROGRESS_TOOL_NAME,
         APPROVAL_TOOL_NAME,
+        ISSUE_TOOL_NAME,
     }
 
 
@@ -2330,6 +2332,7 @@ def _bare_runner(session: _HeldSession, memory_turn: Any) -> Any:
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=10_000,
+        max_usd_per_day=1.0,
         tracer=RunTracer(None),
         classifier=SideEffectClassifier(),
         trace_name="t",
