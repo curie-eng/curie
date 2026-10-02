@@ -371,8 +371,12 @@ def _env(
     *,
     channel: bool = True,
     writes: bool | None = None,
+    extra: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    """Boot env; ``writes=None`` sends no CURIE_MEMORY_WRITES, like an older worker."""
+    """Boot env; ``writes=None`` sends no CURIE_MEMORY_WRITES, like an older worker.
+
+    ``extra`` adds operator keys such as ``CURIE_MEMORY_MAX_FACTS``.
+    """
 
     monkeypatch.delenv("CURIE_STATE_URL", raising=False)
     monkeypatch.delenv("CURIE_STATE_TOKEN", raising=False)
@@ -394,6 +398,7 @@ def _env(
         env["CURIE_MEMORY_WRITES"] = "1" if writes else "0"
         monkeypatch.setenv("CURIE_MEMORY_WRITES", env["CURIE_MEMORY_WRITES"])
     monkeypatch.setenv("CURIE_MEMORY_REF", env["CURIE_MEMORY_REF"])
+    env.update(extra or {})
     return env
 
 
@@ -481,6 +486,7 @@ def _boot_options(
     channel: bool,
     token: bool = True,
     writes: bool | None = None,
+    extra: Mapping[str, str] | None = None,
 ) -> tuple[Any, str | None]:
     """Boot against the fake API; return the SDK options and the system prompt."""
 
@@ -488,7 +494,9 @@ def _boot_options(
 
     async def go() -> None:
         async with TestServer(api.app()) as server:
-            env = _env(monkeypatch, tmp_path, server, channel=channel, writes=writes)
+            env = _env(
+                monkeypatch, tmp_path, server, channel=channel, writes=writes, extra=extra
+            )
             if not token:
                 env.pop("CURIE_MEMORY_TOKEN", None)
                 monkeypatch.delenv("CURIE_MEMORY_TOKEN", raising=False)
@@ -509,6 +517,7 @@ def _run_tools(
     script: list[tuple[str, dict[str, Any]]],
     *,
     event: Event | None = None,
+    extra: Mapping[str, str] | None = None,
 ) -> list[mcp_types.CallToolResult]:
     _ScriptedSession.script = script
     _ScriptedSession.results = []
@@ -516,7 +525,7 @@ def _run_tools(
 
     async def go() -> None:
         async with TestServer(api.app()) as server:
-            config = RunnerConfig.from_env(_env(monkeypatch, tmp_path, server))
+            config = RunnerConfig.from_env(_env(monkeypatch, tmp_path, server, extra=extra))
             runner = await _fetch_and_build(config, monkeypatch)
             await runner.start()
             try:
@@ -2414,3 +2423,148 @@ def test_is_fact_id_rejects_non_canonical_keys() -> None:
         "fact-" + "0" * 31 + "A",
     ):
         assert not is_fact_id(key), repr(key)
+
+
+# #3624: the operator can change the limit with CURIE_MEMORY_MAX_FACTS ---------
+#
+# One number serves both the save refusal and the boot load, so a saved fact is
+# never left out of the prompt, whatever the operator sets.
+
+
+def _boot_fact_ids(prompt: str | None, label: str) -> list[str]:
+    """The fact ids boot rendered under ``label``, in the order shown."""
+
+    assert prompt is not None
+    lines = prompt.splitlines()
+    start = lines.index(f"{label}:")
+    ids: list[str] = []
+    for line in lines[start + 1 :]:
+        match = re.match(r"^- \[(fact-[0-9a-f]{32})\] ", line)
+        if not match:
+            break
+        ids.append(match.group(1))
+    return ids
+
+
+def test_store_add_refuses_at_a_configured_limit_and_names_it() -> None:
+    from curie_runner.memory_facts import MemoryFactsStore, MemoryFull
+
+    api = FakeStateApi()
+    _seed_facts(api, AGENT_NS, 3)
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            store = MemoryFactsStore(str(server.make_url(AGENT_NS)), MEMORY_TOKEN, max_facts=3)
+            with pytest.raises(MemoryFull) as caught:
+                await store.add(statement="a fourth", author="U1", session_id="s")
+            assert caught.value.limit == "facts"
+            assert "(3)" in str(caught.value), str(caught.value)
+
+    anyio.run(go)
+    assert api.writes() == []
+
+
+def test_a_configured_limit_refuses_the_fourth_remember(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = FakeStateApi()
+    results = _run_tools(
+        monkeypatch,
+        tmp_path,
+        api,
+        [(REMEMBER, {"memory": "channel", "statement": f"fact number {i}"}) for i in range(4)],
+        extra={"CURIE_MEMORY_MAX_FACTS": "3"},
+    )
+    assert not any(_is_error(r) for r in results[:3]), [_text(r) for r in results]
+    text = _text(results[3])
+    assert _is_error(results[3]), text
+    assert "Refused" in text and "Nothing was saved" in text, text
+    assert "(3)" in text, text
+    assert len(_facts(api, CHANNEL_NS)) == 3
+
+
+def test_a_configured_limit_applies_to_agent_memory_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = FakeStateApi()
+    _seed_facts(api, AGENT_NS, 3)
+    [result] = _run_tools(
+        monkeypatch,
+        tmp_path,
+        api,
+        [(REMEMBER, {"memory": "agent", "statement": "one too many"})],
+        extra={"CURIE_MEMORY_MAX_FACTS": "3"},
+    )
+    assert _is_error(result), _text(result)
+    assert "(3)" in _text(result), _text(result)
+    assert len(_facts(api, AGENT_NS)) == 3
+
+
+def test_boot_shows_exactly_the_configured_number_of_newest_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    api = FakeStateApi()
+    agent_ids = _seed_facts(api, AGENT_NS, 5)
+    channel_ids = [f"fact-{i + 100:032x}" for i in range(4)]
+    for i, fact_id in enumerate(channel_ids):
+        api.seed(CHANNEL_NS, fact_id, _fact_value(f"channel {i}", f"2026-09-0{i + 1}T09:00:00Z"))
+    caplog.set_level(logging.INFO, logger="curie_runner")
+
+    _options, prompt = _boot_options(
+        monkeypatch, tmp_path, api, channel=True, extra={"CURIE_MEMORY_MAX_FACTS": "3"}
+    )
+
+    assert _boot_fact_ids(prompt, "Agent memory") == agent_ids[::-1][:3]
+    assert _boot_fact_ids(prompt, "Channel memory") == channel_ids[::-1][:3]
+    assert prompt is not None
+    assert "(2 older agent memory facts left out.)" in prompt
+    assert "(1 older channel memory facts left out.)" in prompt
+    [line] = _facts_log_lines(caplog)
+    match = _FACTS_LOG.match(line)
+    assert match, line
+    assert (match.group("agent"), match.group("channel")) == ("3", "3")
+
+
+def test_a_raised_limit_saves_the_201st_fact_and_boot_shows_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = FakeStateApi()
+    _seed_facts(api, CHANNEL_NS, 200)
+    [result] = _run_tools(
+        monkeypatch,
+        tmp_path,
+        api,
+        [(REMEMBER, {"memory": "channel", "statement": "the 201st fact"})],
+        extra={"CURIE_MEMORY_MAX_FACTS": "250"},
+    )
+    assert not _is_error(result), _text(result)
+    facts = _facts(api, CHANNEL_NS)
+    assert len(facts) == 201
+    [new_id] = [k for k, v in facts.items() if v["statement"] == "the 201st fact"]
+
+    _options, prompt = _boot_options(
+        monkeypatch, tmp_path / "reboot", api, channel=True, extra={"CURIE_MEMORY_MAX_FACTS": "250"}
+    )
+    shown = _boot_fact_ids(prompt, "Channel memory")
+    assert len(shown) == 201
+    assert shown[0] == new_id
+    assert prompt is not None
+    assert "older channel memory facts left out" not in prompt
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "many", ""])
+def test_an_invalid_limit_falls_back_to_200(
+    raw: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = FakeStateApi()
+    _seed_facts(api, CHANNEL_NS, 200)
+    [result] = _run_tools(
+        monkeypatch,
+        tmp_path,
+        api,
+        [(REMEMBER, {"memory": "channel", "statement": "one too many"})],
+        extra={"CURIE_MEMORY_MAX_FACTS": raw},
+    )
+    assert _is_error(result), _text(result)
+    assert "(200)" in _text(result), _text(result)
+    assert len(_facts(api, CHANNEL_NS)) == 200

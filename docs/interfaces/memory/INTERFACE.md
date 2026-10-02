@@ -92,7 +92,7 @@ credential (see "The memory credential" below):
 
 At boot the runner lists whichever of the two it was given and renders a
 "Remembered facts" block (agent facts, then channel facts, newest first, at
-most 200 per memory, each statement flattened to one line and framed as data,
+most 200 per memory by default, each statement flattened to one line and framed as data,
 not instructions) after the legacy log preamble. Each line reads
 `- [<id>] <author> on <YYYY-MM-DD> stated: <statement>` (or
 `- [<id>] <author> stated: <statement>` without a date; a date that does not
@@ -121,7 +121,12 @@ tool argument. A write the state API refuses at its cap is reported to the model
 as refused, and so is one it refuses for the credential (a 403, `MemoryRefused`:
 "this memory cannot be written from this conversation"). So is a `remember` into a memory that already holds 200 facts, the
 most boot loads, so no fact silently leaves the prompt; `update` and `forget`
-still work there. The tools are exempt from bundle toolPolicy by published
+still work there. The operator can change that limit with
+`CURIE_MEMORY_MAX_FACTS` (`BootEnv.memory_max_facts`, read as
+`RunnerConfig.memory_max_facts`). It is one number for both the save refusal
+and the boot load, and for agent and channel memory alike, so a saved fact is
+always shown. A value that is not a positive integer is ignored and the
+default of 200 applies. The tools are exempt from bundle toolPolicy by published
 name, and the worker leaves them out of change receipts.
 
 ### The memory credential (ADR-0188)

@@ -21,6 +21,7 @@ from typing import Any
 from aci_protocol import BootEnv, SessionConfig
 
 from .harness.registry import DEFAULT_HARNESS
+from .memory_facts import MAX_FACTS_PER_MEMORY
 from .thinking import parse_thinking
 
 
@@ -109,6 +110,10 @@ class RunnerConfig:
     # True or False explicitly alongside a channel ref, None from an older
     # worker that sent no flag and only ever sent the ref with writes on.
     memory_writes: bool | None = None
+    # How many facts each memory may hold and boot shows the agent (#3624),
+    # the operator's CURIE_MEMORY_MAX_FACTS or the default of 200. One number
+    # for both, so a saved fact is never left out of the prompt.
+    memory_max_facts: int = MAX_FACTS_PER_MEMORY
 
     @property
     def memory_writes_on(self) -> bool:
@@ -193,4 +198,9 @@ class RunnerConfig:
             disallowed_tools=disallowed_tools,
             connector_caller_token=boot.connector_caller_token,
             memory_writes=boot.memory_writes,
+            memory_max_facts=(
+                boot.memory_max_facts
+                if boot.memory_max_facts is not None
+                else MAX_FACTS_PER_MEMORY
+            ),
         )

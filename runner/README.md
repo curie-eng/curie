@@ -313,6 +313,9 @@ resources and fake provider credentials, with no real model or approval action.
   `CURIE_HISTORY_MAX_TURNS` / `CURIE_HISTORY_MAX_BYTES` (bound the rehydrated
   structured prefix with stable summary boundaries; defaults 40 turns / 16000
   bytes, a nonpositive value falls back to the default),
+  `CURIE_MEMORY_MAX_FACTS` (how many facts each memory may hold and boot
+  loads into the prompt, one number for both; default 200, a nonpositive or
+  unparseable value falls back to the default),
   `CURIE_RUNNER_PORT`, `CURIE_RUNNER_TOKEN` (per-sandbox bearer token gating
   the three ACI POST routes; enforced only when set), `CURIE_FAKE_MODEL`
   (offline smoke; no model call), `CURIE_DISALLOWED_TOOLS` (optional

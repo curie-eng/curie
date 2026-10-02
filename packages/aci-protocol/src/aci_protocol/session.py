@@ -261,7 +261,9 @@ def _tolerant_int(raw: str | None) -> int | None:
     history-window knobs: a typo in an operator's ``extraEnv`` must not become a
     boot crash, and a nonpositive window is meaningless (``max_turns=0`` slices
     every turn, a nonpositive byte budget can never be met), so it is rejected
-    like a bad parse. None hands the consumer its own default.
+    like a bad parse. None hands the consumer its own default. The memory fact
+    limit (``CURIE_MEMORY_MAX_FACTS``) uses it for the same reasons: a limit of
+    zero would refuse every save and show no facts at all.
     """
 
     if raw is None or not raw.strip():
@@ -505,6 +507,12 @@ class BootEnv(_AciModel):
     )
     history_max_bytes: int | None = Field(
         default=None, json_schema_extra=_env("CURIE_HISTORY_MAX_BYTES", "operator")
+    )
+    # How many facts each memory (agent memory, and each channel's memory) may
+    # hold and boot shows the agent (#3624). One number for both, so a saved fact
+    # is never left out of the prompt. The runner's default is 200.
+    memory_max_facts: int | None = Field(
+        default=None, json_schema_extra=_env("CURIE_MEMORY_MAX_FACTS", "operator")
     )
 
     @classmethod
@@ -780,6 +788,8 @@ class BootEnv(_AciModel):
             env[self.env_key("history_max_turns")] = str(self.history_max_turns)
         if self.history_max_bytes is not None:
             env[self.env_key("history_max_bytes")] = str(self.history_max_bytes)
+        if self.memory_max_facts is not None:
+            env[self.env_key("memory_max_facts")] = str(self.memory_max_facts)
         return env
 
     @classmethod
@@ -844,4 +854,8 @@ class BootEnv(_AciModel):
             max_turns=_required_int(env.get("CURIE_MAX_TURNS")),
             history_max_turns=_tolerant_int(env.get("CURIE_HISTORY_MAX_TURNS")),
             history_max_bytes=_tolerant_int(env.get("CURIE_HISTORY_MAX_BYTES")),
+            # Tolerant like the history window: a typo, or a limit of zero or
+            # less (which would refuse every save and show nothing), degrades to
+            # the runner's default rather than failing boot.
+            memory_max_facts=_tolerant_int(env.get("CURIE_MEMORY_MAX_FACTS")),
         )

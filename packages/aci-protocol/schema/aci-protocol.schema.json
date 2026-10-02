@@ -575,6 +575,22 @@
           ],
           "title": "Max Turns"
         },
+        "memory_max_facts": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_MEMORY_MAX_FACTS",
+          "producer": [
+            "operator"
+          ],
+          "title": "Memory Max Facts"
+        },
         "memory_token": {
           "anyOf": [
             {
@@ -1832,6 +1848,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.12",
-  "title": "ACI Protocol v0.5.12"
+  "protocolVersion": "0.5.13",
+  "title": "ACI Protocol v0.5.13"
 }
