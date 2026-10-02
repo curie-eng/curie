@@ -2,7 +2,10 @@
 
 Date: 2026-10-01
 
-Status: Draft
+Status: Accepted
+
+Accepted by Brian on 2026-10-02 for v0.12.0. The implementation was
+already present in `apps/api/src/curie_api/routers/state.py`.
 
 Tracked in [#3623](https://github.com/curie-eng/curie/issues/3623), which
 widens [#3394](https://github.com/curie-eng/curie/issues/3394).
