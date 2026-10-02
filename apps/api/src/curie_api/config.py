@@ -613,7 +613,7 @@ class Settings(BaseSettings):
     # upstreams can create, and a per-hook counter would let a source multiply
     # its own allowance by inventing hook names.
     hook_backlog_limit: int = 64
-    # Both windows floor `take_backlog_slot`'s time bucket (delivery.py), so 0
+    # Both windows floor `backlog_reservation`'s time bucket (delivery.py), so 0
     # divides by zero -- a 500 on every new delivery AFTER the claim was taken,
     # with the claim unreleased until `channel_delivery_lease_s` lapses -- and
     # a negative window makes the quota script's EXPIRE delete the counter

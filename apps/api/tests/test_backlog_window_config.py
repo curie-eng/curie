@@ -1,6 +1,6 @@
 """The backlog windows must stay strictly positive (#3720).
 
-``take_backlog_slot`` (``delivery.py``) floors ``time.time()`` by the window,
+``backlog_reservation`` (``delivery.py``) floors ``time.time()`` by the window,
 so a window of 0 divides by zero: every new hook delivery (``routers/hooks.py``)
 and channel binding delivery (``routers/channels.py``) then fails with a 500
 AFTER the delivery claim was taken, and the claim is not released on that path,
