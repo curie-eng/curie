@@ -858,6 +858,17 @@ then `cluster message`, a real round trip with no manual port-forward) against
 a pre-installed release. It asserts one bundle identity, one eval suite, and
 one model mode across every rung and fails on divergence.
 
+The local observability failure control uses the actual runner SDK against a
+run-owned HTTP provider on the private runner network. The provider returns a
+synthetic authentication rejection with `x-should-retry: false`, so SDK retries
+cannot consume the delivery budget before the failure is observed. The control
+requires an actual provider request, a new correlated worker/runner ERROR trace
+and log, and a `classified_failure` metric delta, then restores the ordinary
+model configuration and proves a fresh healthy turn. The provider records only
+a request count, never request bodies or headers, and teardown removes it by its
+unique run identity. Delivery budgets and failure/recovery assertions remain
+unchanged.
+
 A `local-release` rung repeats the local rung's exact round trip against the
 generated `compose.release.yaml` instead -- the artifact a release binary's
 `curie local up` actually runs -- so the CI config-only check on that file
