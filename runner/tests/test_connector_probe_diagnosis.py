@@ -77,9 +77,11 @@ def test_vector_cases_match_diagnose_derived_connector_headers() -> None:
         assert list(failure.credential_names) == case["expected_credentials"]
         assert failure.diagnostic_message() == case["expected_message"]
         assert _PLANTED not in failure.caller_message()
+        assert _PLANTED not in failure.diagnostic_message()
         for value in case["env"].values():
             if value.strip():
                 assert value not in failure.caller_message()
+                assert value not in failure.diagnostic_message()
 
 
 def test_empty_expansion_skips_http_probe_for_that_derived_server(
@@ -216,6 +218,7 @@ def test_probe_exception_on_nonempty_expansion_is_probe_failed(
     assert result.has_potential_write_tool
     message = result.connector_failures[0].caller_message()
     assert planted not in message
+    assert planted not in result.connector_failures[0].diagnostic_message()
     assert "github" not in message
     assert "GITHUB_TOKEN" not in message
 

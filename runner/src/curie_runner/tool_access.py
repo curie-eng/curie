@@ -48,7 +48,6 @@ TOOL_ACCESS_UNENFORCED_CLASSIFICATION = "tool-access-unenforced"
 #: is not allowed, a slash command (RUNNER-TOOL-ACCESS-9).
 TOOL_ACCESS_REFUSED_CLASSIFICATION = "tool-access-refused"
 
-_UNNAMED_TOOL = "this tool call"
 _DECISION_FAILED = (
     "This tool call was not run: its tool access could not be decided, so it is "
     "refused. Do not retry it."
