@@ -428,3 +428,297 @@ def test_old_runner_steer_400_does_not_log_the_token(
     assert tokens, f"no steer carried a token: {steers!r}"
     for token in tokens:
         _assert_not_logged(caplog, token)
+
+
+# --------------------------------------------------------------------------- #
+# Re-review of #3623: R1 (the credential's expiry is the stream deadline) and
+# R2 (no part of an old runner's 400 body reaches a log line)
+# --------------------------------------------------------------------------- #
+
+
+class _ShiftedTime:
+    """The ``time`` module with a wall clock the test can move forward.
+
+    Patched into both the kernel and the binding module, so the kernel's view
+    of "now" and the credential's ``exp`` read the same clock."""
+
+    def __init__(self) -> None:
+        self.offset_s = 0.0
+
+    def time(self) -> float:
+        return time.time() + self.offset_s
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+def _shift_clocks(monkeypatch: pytest.MonkeyPatch) -> _ShiftedTime:
+    from curie_worker import kernel as kernel_module
+
+    clock = _ShiftedTime()
+    monkeypatch.setattr(binding_module, "time", clock)
+    monkeypatch.setattr(kernel_module, "time", clock)
+    return clock
+
+
+def _stream_s(h: Any, remaining_s: float | None) -> float:
+    # ``RunnerClient.start_turn``'s own bound on the stream.
+    total = float(h.kernel._runner._total_timeout_s)
+    return total if remaining_s is None else max(0.05, min(total, remaining_s))
+
+
+def _grant(thread_key: str) -> Any:
+    from curie_worker.kernel import TurnMemoryGrant
+
+    resolved = ResolvedDeployment(
+        agent_id=AGENT_ID,
+        agent_name="acme-bot",
+        deployment_id=DEPLOYMENT_ID,
+        version_id=uuid.UUID("33333333-3333-4333-8333-333333333333"),
+        version_label="v1",
+        bundle_ref=None,
+        max_usd_per_day=None,
+        max_output_tokens_per_run=None,
+        memory_writes=True,
+    )
+    return TurnMemoryGrant(resolved=resolved, kind="slack", address=CHANNEL, thread_key=thread_key)
+
+
+@pytest.mark.parametrize("spent", [0.0, -3.0])
+def test_spent_budget_gets_no_turn_token(make_harness, spent: float) -> None:
+    # R1. A spent budget (``remaining_s`` of exactly 0, or below) is not "no
+    # budget". The stream gets only ``_MIN_REQUEST_TIMEOUT_S`` (50 ms) to fail
+    # fast, so there is no turn for a credential to cover: the worker mints
+    # none, and the runner falls back to the read-only boot-env token. An
+    # already-expired token would be the same to the API, but it would still put
+    # a signed credential on the wire for nothing. It must never fall back to
+    # the whole delivery budget, which a falsy ``0.0`` check does.
+    async def go() -> None:
+        binding = _MemoryBinding()
+        async with make_harness(binding=binding) as h:
+            turn = _as(_qevent("late", thread="th-mt-r1a"), "U0ALICE01")
+            event = h.kernel._to_event(turn)
+            out = h.kernel._with_memory_token(event, turn, _grant("th-mt-r1a"), spent)
+            if out.memory_token is not None:
+                exp = _claims(out.memory_token)["exp"]
+                assert exp <= int(time.time()), f"a spent turn's credential lives to {exp}"
+            assert out.memory_token is None, "a spent budget must mint no credential"
+            # No budget in hand at all (None) is the ceiling, not "spent".
+            live = h.kernel._with_memory_token(event, turn, _grant("th-mt-r1a"), None)
+            assert live.memory_token is not None
+
+    asyncio.run(go())
+
+
+def test_turn_token_exp_is_the_stream_deadline_after_a_slow_claim(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R1. The sandbox claim (a cold boot) can take tens of seconds, and nothing
+    # takes that off the ``remaining_s`` passed to ``start_turn``. So the stream
+    # deadline is ``start + bound(remaining)``. A credential minted before the
+    # claim expires that much earlier than the stream, and a memory write near
+    # the end of the turn gets a 403. Its ``exp`` must be the stream deadline,
+    # within ``_CLOCK_SKEW_S`` either way.
+    claim_s = 120.0
+
+    async def go() -> None:
+        binding = _MemoryBinding()
+        clock = _shift_clocks(monkeypatch)
+        async with make_harness(binding=binding, runner_total_timeout_s=300.0) as h:
+            real_claim = h.fake_k8s.create_claim
+
+            def slow_claim(*args: Any, **kwargs: Any) -> Any:
+                clock.offset_s += claim_s
+                return real_claim(*args, **kwargs)
+
+            monkeypatch.setattr(h.fake_k8s, "create_claim", slow_claim)
+            starts: list[tuple[float, float | None]] = []
+            real_start = h.kernel._runner.start_turn
+
+            async def spy(base_url: str, event: Any, **kwargs: Any) -> Any:
+                starts.append((clock.time(), kwargs.get("remaining_s")))
+                return await real_start(base_url, event, **kwargs)
+
+            monkeypatch.setattr(h.kernel._runner, "start_turn", spy)
+            await h.kernel.process_event(_as(_qevent("cold one", thread="th-mt-r1b"), "U0ALICE01"))
+
+            assert h.sink.last_text == "ok"
+            assert clock.offset_s == claim_s, "the turn never claimed a sandbox"
+            started_at, remaining_s = starts[0]
+            deadline = started_at + _stream_s(h, remaining_s)
+            exp = _claims(h.runner.event_bodies[0]["memory_token"])["exp"]
+            assert abs(exp - deadline) <= _CLOCK_SKEW_S, (
+                f"credential exp is {exp - deadline:+.0f}s from the stream deadline"
+            )
+
+    asyncio.run(go())
+
+
+def test_steer_token_does_not_outlive_the_live_turn(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R1. A steer joins the live turn and ends when it ends. Its credential is
+    # minted later than the live turn's, from the steering delivery's own
+    # budget, so left alone it expires after the live turn's stream deadline.
+    # It must be capped at that deadline.
+    later_s = 100.0
+
+    async def go() -> None:
+        binding = _MemoryBinding()
+        clock = _shift_clocks(monkeypatch)
+        async with make_harness(binding=binding, runner_total_timeout_s=300.0) as h:
+            starts: list[tuple[float, float | None]] = []
+            steered: list[Any] = []
+            real_start = h.kernel._runner.start_turn
+            real_steer = h.kernel._runner.steer
+
+            async def start_spy(base_url: str, event: Any, **kwargs: Any) -> Any:
+                starts.append((clock.time(), kwargs.get("remaining_s")))
+                return await real_start(base_url, event, **kwargs)
+
+            async def steer_spy(base_url: str, event: Any, **kwargs: Any) -> Any:
+                steered.append(event)
+                return await real_steer(base_url, event, **kwargs)
+
+            monkeypatch.setattr(h.kernel._runner, "start_turn", start_spy)
+            monkeypatch.setattr(h.kernel._runner, "steer", steer_spy)
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="done", status=SessionStatus.DONE)]
+
+            first = _as(_qevent("first", thread="th-mt-r1c", placeholder="ph-1"), "U0ALICE01")
+            task = asyncio.create_task(h.kernel.process_event(first))
+            try:
+                await _wait_until(lambda: h.runner.turn_active, "the first turn to be live")
+                clock.offset_s += later_s
+                second = _as(
+                    _qevent("and this", thread="th-mt-r1c", placeholder="ph-2"), "U0BOB0001"
+                )
+                await h.kernel.process_event(second)
+            finally:
+                hold.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+            assert h.runner.steers == ["and this"]
+            started_at, remaining_s = starts[0]
+            live_deadline = started_at + _stream_s(h, remaining_s)
+            landed = [e for e in steered if e.text == "and this"]
+            assert len(landed) == 1
+            claims = _claims(landed[0].memory_token)
+            assert claims["sender"] == "U0BOB0001"
+            # ``exp`` is a whole second, rounded up, hence the 1 s.
+            assert claims["exp"] <= live_deadline + 1, (
+                f"steer credential outlives the live turn by {claims['exp'] - live_deadline:.0f}s"
+            )
+
+    asyncio.run(go())
+
+
+_BODY_MARKER = "OLD-RUNNER-400-BODY"
+_FRAGMENT_LEN = 8
+
+
+def _old_runner_truncated_400(frames: list[dict[str, Any]]) -> Any:
+    # A runner from before ``server._frame_error`` answers a bad frame with
+    # ``{"error": f"invalid event frame: {exc}"}``. ``str(ValidationError)``
+    # truncates ``input_value``, so the body never holds the whole token, only
+    # pieces of it. This builds that real message, and adds a prefix and a
+    # suffix of the token so the fixture does not depend on where pydantic cuts.
+    from aci_protocol import Event
+    from aiohttp import web
+    from pydantic import ValidationError
+
+    async def handler(self: Any, request: Any) -> Any:
+        body = await request.json()
+        frames.append(body)
+        if request.path == "/v1/event":
+            self.opened.append(body["text"])
+            self.event_bodies.append(body)
+        elif not self.turn_active:
+            frames.pop()
+            return web.json_response({"error": "no active turn"}, status=409)
+        try:
+            Event.model_validate({**body, "zz_newer_field": 1})
+            exc_text = "validated"
+        except ValidationError as exc:
+            exc_text = str(exc)
+        token = body.get("memory_token") or ""
+        message = (
+            f"{_BODY_MARKER} invalid event frame: {exc_text} "
+            f"[prefix {token[:24]}...] [suffix ...{token[-24:]}]"
+        )
+        return web.json_response({"error": message}, status=400)
+
+    return handler
+
+
+def _assert_no_token_fragment(caplog: pytest.LogCaptureFixture, token: str) -> None:
+    assert caplog.records, "nothing was logged"
+    texts = [caplog.text]
+    for record in caplog.records:
+        texts.append(record.getMessage())
+        if record.exc_info is not None:
+            texts += [repr(record.exc_info[1]), str(record.exc_info[1])]
+    logged = "\n".join(texts)
+    assert _BODY_MARKER not in logged, "the runner's 400 body reached a log line"
+    for i in range(len(token) - _FRAGMENT_LEN + 1):
+        fragment = token[i : i + _FRAGMENT_LEN]
+        assert fragment not in logged, f"token fragment at offset {i} was logged"
+
+
+def test_old_runner_event_truncated_400_logs_no_token_fragment(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # R2 (MEMORY-TOKEN-3): an exact-string replace cannot redact a truncated
+    # echo. The worker logs the status and the body's length, never the body.
+    frames: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        _conftest_runner_class(make_harness), "_event", _old_runner_truncated_400(frames)
+    )
+    caplog.set_level("DEBUG")
+
+    async def go() -> None:
+        binding = _MemoryBinding()
+        async with make_harness(binding=binding, max_attempts=1) as h:
+            await h.kernel.process_event(_as(_qevent("hello", thread="th-mt-r2a"), "U0ALICE01"))
+
+    asyncio.run(go())
+    assert frames, "the runner never got the frame"
+    token = frames[0]["memory_token"]
+    assert _claims(token)["memory"] == "write"
+    _assert_no_token_fragment(caplog, token)
+
+
+def test_old_runner_steer_truncated_400_logs_no_token_fragment(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The same for /v1/steer.
+    steers: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        _conftest_runner_class(make_harness), "_steer", _old_runner_truncated_400(steers)
+    )
+    caplog.set_level("DEBUG")
+
+    async def go() -> None:
+        binding = _MemoryBinding()
+        async with make_harness(binding=binding) as h:
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="done", status=SessionStatus.DONE)]
+            first = _as(_qevent("first", thread="th-mt-r2b", placeholder="ph-1"), "U0ALICE01")
+            task = asyncio.create_task(h.kernel.process_event(first))
+            try:
+                await _wait_until(lambda: h.runner.turn_active, "the first turn to be live")
+                second = _as(_qevent("follow", thread="th-mt-r2b", placeholder="ph-2"), "U0BOB0001")
+                await asyncio.wait_for(h.kernel.process_event(second), timeout=30)
+            finally:
+                hold.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(go())
+    tokens = [s["memory_token"] for s in steers if s.get("memory_token")]
+    assert tokens, f"no steer carried a token: {steers!r}"
+    for token in tokens:
+        _assert_no_token_fragment(caplog, token)
