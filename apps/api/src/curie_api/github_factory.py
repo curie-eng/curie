@@ -329,11 +329,19 @@ async def admit_notice(
         if existing is None:
             raise FactoryRefused("not_admitted")
     facts = _facts(notice, binding, settings)
-    if notice.disposition == "mention":
-        result = await workitem_dispatch.admit_revision(session, facts)
-    else:
-        result = await workitem_dispatch.readmit(session, facts)
-    return _admission_result(result, facts.request_id)
+    # Dispatch helpers commit between WorkItem creation and request creation.
+    # Keep those commits inside savepoints so the caller's issue lock remains
+    # held until admission and delivery settlement commit together.
+    async with AsyncSession(
+        bind=await session.connection(),
+        join_transaction_mode="create_savepoint",
+        expire_on_commit=False,
+    ) as admission:
+        if notice.disposition == "mention":
+            result = await workitem_dispatch.admit_revision(admission, facts)
+        else:
+            result = await workitem_dispatch.readmit(admission, facts)
+        return _admission_result(result, facts.request_id)
 
 
 async def cancel_notice(session: AsyncSession, notice: FactoryNotice) -> WebhookResult:

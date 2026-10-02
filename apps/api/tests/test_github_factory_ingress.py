@@ -17,14 +17,22 @@ import hashlib
 import hmac
 import itertools
 import json
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
 import pytest
 from curie_api.config import get_settings
 from curie_api.github_app import GitHubInstallationRefused
-from curie_api.github_factory import handle_factory_delivery
+from curie_api.github_factory import (
+    _issue_lock_keys,
+    admit_notice,
+    handle_factory_delivery,
+    lock_issue,
+)
+from curie_api.github_factory_events import parse_factory_event
 from curie_api.main import create_app
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from fastapi.testclient import TestClient
@@ -572,10 +580,65 @@ def test_closure_after_the_channel_moves_still_cancels(
     assert _requests(number)[0]["status"] == "cancelled"
 
 
+def test_admission_retains_issue_lock_until_caller_commit(
+    factory_app: tuple[TestClient, GitHubAPI],
+) -> None:
+    number = next(_ISSUES)
+    notice = parse_factory_event(
+        "issues",
+        _issue_event("labeled", number, label={"name": LABEL}),
+        str(uuid.uuid4()),
+        label=LABEL,
+        mention=MENTION,
+    )
+    classid, objid = _issue_lock_keys(REPO_ID, number)
+
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessions() as session, engine.connect() as observer:
+                caller_pid = await session.scalar(text("SELECT pg_backend_pid()"))
+                await lock_issue(session, REPO_ID, number)
+                admitted = await admit_notice(session, notice, get_settings())
+                assert admitted.status == "factory_admitted", admitted
+                assert not await observer.scalar(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM curie.work_items "
+                        "WHERE github_repository_id = :repo AND github_issue_number = :number)"
+                    ),
+                    {"repo": REPO_ID, "number": number},
+                )
+                request_visible = text(
+                    "SELECT EXISTS (SELECT 1 FROM curie.execution_requests WHERE id = :request_id)"
+                )
+                assert not await observer.scalar(request_visible, {"request_id": notice.request_id})
+                assert await observer.scalar(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' "
+                        "AND granted AND pid = :caller_pid AND objsubid = 2 "
+                        "AND classid::bigint = :classid AND objid::bigint = :objid "
+                        "AND database = (SELECT oid FROM pg_database "
+                        "WHERE datname = current_database()))"
+                    ),
+                    {
+                        "caller_pid": caller_pid,
+                        "classid": classid & 0xFFFFFFFF,
+                        "objid": objid & 0xFFFFFFFF,
+                    },
+                )
+                await session.commit()
+                assert await observer.scalar(request_visible, {"request_id": notice.request_id})
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
 class _PermissionGate(httpx.AsyncBaseTransport):
     """Block the first permission read so a closure can arrive mid-admission."""
 
-    def __init__(self, api: GitHubAPI, entered: asyncio.Event, release: asyncio.Event) -> None:
+    def __init__(self, api: GitHubAPI, entered: threading.Event, release: asyncio.Event) -> None:
         self._api = api
         self._entered = entered
         self._release = release
@@ -600,7 +663,7 @@ def test_closure_during_admission_waits_and_then_cancels(
 
     async def go() -> tuple[Any, Any]:
         engine = create_async_engine(get_settings().database_url)
-        entered = asyncio.Event()
+        entered = threading.Event()
         release = asyncio.Event()
         sessions = async_sessionmaker(engine, expire_on_commit=False)
         try:
@@ -608,8 +671,14 @@ def test_closure_during_admission_waits_and_then_cancels(
                 transport=_PermissionGate(api, entered, release),
                 base_url="https://api.github.com",
             ) as http:
-                async with sessions() as admit_session, sessions() as cancel_session:
-                    admit_task = asyncio.create_task(
+                async with (
+                    sessions() as admit_session,
+                    sessions() as cancel_session,
+                    asyncio.TaskGroup() as deliveries,
+                ):
+                    admit_pid = await admit_session.scalar(text("SELECT pg_backend_pid()"))
+                    cancel_pid = await cancel_session.scalar(text("SELECT pg_backend_pid()"))
+                    admit_task = deliveries.create_task(
                         handle_factory_delivery(
                             admit_session,
                             settings=get_settings(),
@@ -622,10 +691,10 @@ def test_closure_during_admission_waits_and_then_cancels(
                             payload=_issue_event("labeled", number, label={"name": LABEL}),
                         )
                     )
-                    await asyncio.wait_for(entered.wait(), timeout=5)
+                    assert await asyncio.to_thread(entered.wait, 5)
                     api.issue_state = "closed"
                     api.labels = []
-                    cancel_task = asyncio.create_task(
+                    cancel_task = deliveries.create_task(
                         handle_factory_delivery(
                             cancel_session,
                             settings=get_settings(),
@@ -636,13 +705,19 @@ def test_closure_during_admission_waits_and_then_cancels(
                             payload=_issue_event("closed", number),
                         )
                     )
-                    done, _pending = await asyncio.wait({cancel_task}, timeout=1)
-                    still_waiting = cancel_task not in done
+                    # Observe the real issue lock, rather than inferring waiting
+                    # from how often the scheduler runs the cancellation task.
+                    async with engine.connect() as observer, asyncio.timeout(5):
+                        while not await observer.scalar(
+                            text("SELECT :admit_pid = ANY(pg_blocking_pids(:cancel_pid))"),
+                            {"admit_pid": admit_pid, "cancel_pid": cancel_pid},
+                        ):
+                            await asyncio.sleep(0.01)
+                    assert not cancel_task.done()
                     release.set()
                     admitted, cancelled = await asyncio.wait_for(
                         asyncio.gather(admit_task, cancel_task), timeout=10
                     )
-                    assert still_waiting
                     return admitted, cancelled
         finally:
             release.set()
@@ -650,8 +725,77 @@ def test_closure_during_admission_waits_and_then_cancels(
 
     admitted, cancelled = asyncio.run(go())
 
-    assert admitted.status == "factory_admitted"
-    assert cancelled.status == "factory_cancelled"
+    assert admitted.status == "factory_admitted", admitted
+    assert cancelled.status == "factory_cancelled", cancelled
+    assert _requests(number)[0]["status"] == "cancelled"
+
+
+def test_signed_closure_during_admission_waits_and_then_cancels(
+    factory_app: tuple[TestClient, GitHubAPI],
+) -> None:
+    client, api = factory_app
+    number = next(_ISSUES)
+    api.issue_number = number
+    entered = threading.Event()
+    release = asyncio.Event()
+    classid, objid = _issue_lock_keys(REPO_ID, number)
+
+    async def observe_cancellation_blocked() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as observer, asyncio.timeout(5):
+                while not await observer.scalar(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks waiting "
+                        "JOIN pg_locks holder ON holder.locktype = waiting.locktype "
+                        "AND holder.database = waiting.database "
+                        "AND holder.classid = waiting.classid "
+                        "AND holder.objid = waiting.objid "
+                        "AND holder.objsubid = waiting.objsubid "
+                        "WHERE waiting.locktype = 'advisory' AND NOT waiting.granted "
+                        "AND holder.granted AND waiting.objsubid = 2 "
+                        "AND waiting.database = (SELECT oid FROM pg_database "
+                        "WHERE datname = current_database()) "
+                        "AND waiting.classid::bigint = :classid "
+                        "AND waiting.objid::bigint = :objid "
+                        "AND holder.pid = ANY(pg_blocking_pids(waiting.pid)))"
+                    ),
+                    {"classid": classid & 0xFFFFFFFF, "objid": objid & 0xFFFFFFFF},
+                ):
+                    await asyncio.sleep(0.01)
+        finally:
+            await engine.dispose()
+
+    previous = client.app.state.http_client
+    github = httpx.AsyncClient(transport=_PermissionGate(api, entered, release))
+    client.app.state.http_client = github
+    try:
+        with ThreadPoolExecutor(max_workers=2) as deliveries:
+            try:
+                admission = deliveries.submit(
+                    _post, client, "issues", _issue_event("labeled", number, label={"name": LABEL})
+                )
+                assert entered.wait(5)
+                api.issue_state = "closed"
+                api.labels = []
+                cancellation = deliveries.submit(
+                    _post, client, "issues", _issue_event("closed", number)
+                )
+                asyncio.run(observe_cancellation_blocked())
+                assert not cancellation.done()
+                client.portal.call(release.set)
+                admitted = admission.result(timeout=10)
+                cancelled = cancellation.result(timeout=10)
+            finally:
+                client.portal.call(release.set)
+    finally:
+        client.app.state.http_client = previous
+        client.portal.call(github.aclose)
+
+    assert admitted.status_code == 200, admitted.text
+    assert admitted.json()["status"] == "factory_admitted", admitted.text
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "factory_cancelled", cancelled.text
     assert _requests(number)[0]["status"] == "cancelled"
 
 
