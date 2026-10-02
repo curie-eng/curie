@@ -5892,7 +5892,12 @@ def test_missing_display_uses_plain_notice_and_card_without_rewriting_record(mak
         async with make_harness(approvals=approvals, binding=binding) as h:
             script = _awaiting_script_with_display(machine, "")
             script[-1] = script[-1].model_copy(
-                update={"approval_display": None, "approval_route": "managers"}
+                update={
+                    "approval_display": None,
+                    "approval_route": "managers",
+                    "approval_granted_tool": tool,
+                    "approval_granted_arguments": {"file_name": "example.pdf"},
+                }
             )
             h.runner.default_script = script
             await h.kernel.process_event(_qevent("please attach", event_id="ev-plain-display"))
