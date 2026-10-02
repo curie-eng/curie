@@ -72,13 +72,55 @@ fn render(out: &Path, channel: Option<&str>, registry: Option<&MockServer>) -> O
         .expect("run curie example dark-factory render")
 }
 
+fn render_schema_validator() -> jsonschema::Validator {
+    let schema: Value =
+        serde_json::from_str(include_str!("../schema/dark-factory-render.schema.json"))
+            .expect("committed render schema parses");
+    jsonschema::validator_for(&schema).expect("committed render schema compiles")
+}
+
 fn receipt(output: &Output) -> Value {
     assert!(
         output.status.success(),
         "render failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    serde_json::from_slice(&output.stdout).expect("JSON render receipt")
+    let receipt: Value = serde_json::from_slice(&output.stdout).expect("JSON render receipt");
+    let validator = render_schema_validator();
+    if let Err(error) = validator.validate(&receipt) {
+        panic!("actual CLI render receipt violates its committed schema: {error}; {receipt}");
+    }
+    receipt
+}
+
+#[test]
+fn the_render_receipt_schema_rejects_an_unknown_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("factory");
+    let mut receipt = receipt(&render(&out, None, None));
+    receipt["unknown_field"] = Value::Bool(true);
+
+    assert!(
+        render_schema_validator().validate(&receipt).is_err(),
+        "the render schema must reject undeclared receipt fields"
+    );
+}
+
+#[test]
+fn the_render_receipt_schema_rejects_malformed_nullable_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("factory");
+    let receipt = receipt(&render(&out, None, None));
+    let validator = render_schema_validator();
+
+    for field in ["runner_image", "runner_note"] {
+        let mut malformed = receipt.clone();
+        malformed[field] = serde_json::json!({"invalid": true});
+        assert!(
+            validator.validate(&malformed).is_err(),
+            "{field} must accept only a string or null"
+        );
+    }
 }
 
 #[test]

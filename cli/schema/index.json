@@ -109,7 +109,7 @@
       "result": "DarkFactoryRenderOutput",
       "kind": "CliOutput",
       "schema": "dark-factory-render.schema.json",
-      "version": "1.0"
+      "version": "2.0"
     },
     {
       "result": "DeleteOutput",
