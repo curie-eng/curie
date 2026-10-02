@@ -534,3 +534,11 @@ def test_unadmitted_followups_never_replay_dependent_steps_as_roots():
     assert "continuity-dependent steps BLOCKED" in run
     assert "without claiming original coverage" in run
     assert "send the remaining plan as root probes" not in run
+
+
+def test_rerun_never_infers_pass_for_unlisted_or_incomplete_cases():
+    rerun = _section('"rerun"')
+    assert "every other probe passed" not in rerun
+    for phrase in ("explicit per-case and repeat status", "UNCLEAR", "BLOCKED", "NOT RUN",
+                   "unknown prior status", "known PASS or FAIL"):
+        assert phrase in rerun, phrase
