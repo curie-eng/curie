@@ -69,6 +69,13 @@ between chunks. Clean text streams normally; overlapping matches may remain
 buffered until the overlap ends or the turn completes. Recognition of unknown
 token patterns does not guarantee protection for fragments split across chunks.
 
+The SDK parent retains its model authentication. Its Bash tool uses a mandatory
+image owned launcher that removes platform credentials before Bash reads user
+startup files or SDK snapshots. The launcher isolates Python imports from the
+workspace and preserves the shell arguments, exit status and signals. Missing or
+nonexecutable launchers reject session startup instead of selecting another shell.
+Declared connector secrets remain available to bundle tools.
+
 Each `text_delta` the runner emits is one whole assistant text block, and a
 consumer joins deltas as they come. The same boundary therefore starts a later
 block of the turn on its own paragraph (a blank line), unless the model already

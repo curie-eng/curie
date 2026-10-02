@@ -3,8 +3,8 @@
 The runner process keeps platform credentials for its own clients and for the
 Claude CLI parent, which needs the model key to call the provider. Hook
 commands and other runner subprocesses receive a copy without those
-credentials. The Bash tool inherits the CLI process, so a ``BASH_ENV`` prelude
-unsets the same names before the command runs.
+credentials. The Bash tool uses an isolated launcher that removes the same names
+before the shell reads startup files or the SDK's shell snapshot.
 
 The runner process locks its environ, and the CLI parent env loads the
 constructor library because exec clears the lock. The prelude unsets names
@@ -17,7 +17,9 @@ Declared connector secrets are not platform credentials. ADR-0009 remote
 from __future__ import annotations
 
 import ctypes
+import os
 import subprocess
+import sys
 import tempfile
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
@@ -31,12 +33,48 @@ from .sdk_auth import (
     resolve_credential_env_keys,
 )
 
-# Names the Claude CLI parent reads. Hooks never receive them. The Bash tool
-# drops them by sourcing BASH_CREDENTIAL_PRELUDE before the command. That
-# file ships in the image, which is root owned, so the sandbox user cannot
-# replace it. CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is not used: it also forces a
+# Names the Claude CLI parent reads. Hooks never receive them. The isolated
+# shell launcher removes them before Bash runs any user code. Its executable
+# ships root owned in the image. CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is not used: it also forces a
 # sandbox this runner does not ship, and Bash then fails closed.
 BASH_CREDENTIAL_PRELUDE = Path(__file__).with_name("bash_credential_prelude.sh")
+BASH_SHELL_LAUNCHER = Path(__file__).with_name("curie_bash.sh")
+_SHELL_LAUNCH_TIMEOUT_SECONDS = 5.0
+
+
+def sdk_shell_env() -> dict[str, str]:
+    """Pin the SDK shell before it can fall back to an unsanitized shell.
+
+    The pinned CLI accepts this executable through its supported shell override.
+    The interpreter binding is also platform owned; the launcher uses Python -I
+    so workspace packages and PYTHONPATH cannot run before credential removal.
+    """
+
+    if not BASH_SHELL_LAUNCHER.is_file():
+        raise FileNotFoundError(BASH_SHELL_LAUNCHER)
+    if not os.access(BASH_SHELL_LAUNCHER, os.X_OK):
+        raise PermissionError(BASH_SHELL_LAUNCHER)
+    pinned = {
+        "CLAUDE_CODE_SHELL": str(BASH_SHELL_LAUNCHER),
+        "CURIE_SHELL_PYTHON": sys.executable,
+    }
+    # The SDK silently falls back when its shell override cannot run --version.
+    # Check without credentials before connecting, so a broken installation
+    # cannot turn that provider fallback into an unsanitized shell.
+    try:
+        result = subprocess.run(
+            [str(BASH_SHELL_LAUNCHER), "--version"],
+            env={**shell_and_hook_env(os.environ), **pinned},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_SHELL_LAUNCH_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError("The runner shell is unavailable.") from None
+    if result.returncode != 0:
+        raise RuntimeError("The runner shell is unavailable.")
+    return pinned
 
 CLI_PARENT_MODEL_KEYS = frozenset(
     {
@@ -145,7 +183,8 @@ def cli_parent_env(source: Mapping[str, str]) -> dict[str, str]:
     """Env to install for the moment the CLI is spawned.
 
     Same as the shell env, plus model SDK variables that were already set, plus
-    ``BASH_ENV`` pointing at the credential prelude. ``LD_PRELOAD`` loads the
+    the mandatory isolated shell launcher. ``BASH_ENV`` remains defense for
+    native nested Bash commands. ``LD_PRELOAD`` loads the
     constructor library because exec clears the environ lock. Callers restore
     the previous process env after spawn. The CLI copies this mapping at start.
     """
@@ -160,4 +199,5 @@ def cli_parent_env(source: Mapping[str, str]) -> dict[str, str]:
     existing = source.get("LD_PRELOAD", "")
     kept = [entry for entry in existing.split(":") if entry and entry != library]
     parent["LD_PRELOAD"] = ":".join([library, *kept])
+    parent.update(sdk_shell_env())
     return parent
