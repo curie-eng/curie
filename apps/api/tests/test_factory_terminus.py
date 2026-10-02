@@ -518,49 +518,56 @@ class _CommentServer(ThreadingHTTPServer):
 
 
 @pytest.fixture
-def comments(monkeypatch: pytest.MonkeyPatch) -> Any:
+def comments(monkeypatch: pytest.MonkeyPatch, clean_db: None) -> Any:
+    """@spec apps/api/README.md#factory-test-isolation"""
     server = _CommentServer()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    host, port = server.server_address
-    monkeypatch.setenv("GITHUB_API_URL", f"http://{host}:{port}")
-    monkeypatch.setenv("CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS", "30")
-    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
-    monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
-    monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
-    monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
-    monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "true")
-    # These tests drive signed deliveries. Poll mode would also read this
-    # fixture's GitHub stand-in on every reconciler pass.
-    monkeypatch.setenv("GITHUB_FACTORY_INTAKE", "webhook")
-    monkeypatch.setenv("GITHUB_FACTORY_LABEL", LABEL)
-    monkeypatch.setenv("GITHUB_FACTORY_MENTION", "curie")
-    monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
-    monkeypatch.setenv("GITHUB_APP_ID", "51")
-    monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", "example-private-key")
-    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "example-factory-hmac-secret")
-    monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
-    monkeypatch.setenv("GITHUB_TOKEN", "")
-    monkeypatch.setenv("INTERNAL_WORKER_TOKEN", "factory-terminus-worker")
-    monkeypatch.setenv("RUNS_STREAM", f"test:curie:terminus:{uuid.uuid4().hex}")
-    get_settings.cache_clear()
-    _clear_ci_keys()
-    monkeypatch.setattr(
-        "curie_api.factory_notices.credentials_for",
-        lambda _settings: _Credentials(),
-    )
-    monkeypatch.setattr(
-        "curie_api.github_factory.credentials_for",
-        lambda _settings: _Credentials(),
-    )
-    monkeypatch.setattr(
-        "curie_api.workitem_outcomes.credentials_for",
-        lambda _settings: _Credentials(),
-    )
-    yield server
-    server.shutdown()
-    thread.join(timeout=5)
-    get_settings.cache_clear()
+    try:
+        host, port = server.server_address
+        monkeypatch.setenv("GITHUB_API_URL", f"http://{host}:{port}")
+        monkeypatch.setenv("CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS", "30")
+        monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
+        monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
+        monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
+        monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
+        monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "true")
+        # These tests drive signed deliveries. Poll mode would also read this
+        # fixture's GitHub stand-in on every reconciler pass.
+        monkeypatch.setenv("GITHUB_FACTORY_INTAKE", "webhook")
+        monkeypatch.setenv("GITHUB_FACTORY_LABEL", LABEL)
+        monkeypatch.setenv("GITHUB_FACTORY_MENTION", "curie")
+        monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
+        monkeypatch.setenv("GITHUB_APP_ID", "51")
+        monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", "example-private-key")
+        monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "example-factory-hmac-secret")
+        monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
+        monkeypatch.setenv("GITHUB_TOKEN", "")
+        monkeypatch.setenv("INTERNAL_WORKER_TOKEN", "factory-terminus-worker")
+        monkeypatch.setenv("RUNS_STREAM", f"test:curie:terminus:{uuid.uuid4().hex}")
+        get_settings.cache_clear()
+        monkeypatch.setattr(
+            "curie_api.factory_notices.credentials_for",
+            lambda _settings: _Credentials(),
+        )
+        monkeypatch.setattr(
+            "curie_api.github_factory.credentials_for",
+            lambda _settings: _Credentials(),
+        )
+        monkeypatch.setattr(
+            "curie_api.workitem_outcomes.credentials_for",
+            lambda _settings: _Credentials(),
+        )
+        yield server
+    finally:
+        try:
+            _clear_ci_keys()
+        finally:
+            try:
+                server.shutdown()
+                thread.join(timeout=5)
+            finally:
+                get_settings.cache_clear()
 
 
 @pytest.fixture
@@ -603,16 +610,24 @@ def _rows(statement: str, params: dict[str, Any] | None = None) -> list[dict[str
 
 
 def _clear_ci_keys() -> None:
-    """Drop CI round keys. Label request ids are stable, so a prior test's key
-    would make the next gate think that round is already fixing."""
+    """@spec apps/api/README.md#factory-test-isolation
+
+    The disposable database records this fixture's requests. Other workers
+    share Valkey, so only these exact request namespaces belong to cleanup.
+    """
 
     import redis
 
+    request_ids = [str(row["id"]) for row in _rows("SELECT id FROM curie.execution_requests")]
+    if not request_ids:
+        return
     client = redis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
     try:
-        keys = list(client.scan_iter("curie:work-item:ci:*"))
-        if keys:
-            client.delete(*keys)
+        for request_id in request_ids:
+            for prefix in ("curie:work-item:ci", "curie:work-item:ci-rerun"):
+                keys = list(client.scan_iter(f"{prefix}:{request_id}:*"))
+                if keys:
+                    client.delete(*keys)
     finally:
         client.close()
 
