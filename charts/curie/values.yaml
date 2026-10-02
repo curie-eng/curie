@@ -1260,8 +1260,11 @@ api:
   githubReviewIngressEnabled: false
   githubReviewReconcilerIntervalSeconds: 5
   # Signed factory issue intake is opt-in and separate from review feedback.
-  # Polling is the default and does not require a webhook secret. Webhook mode
-  # requires a non-default webhook secret and keeps the missed-label backstop.
+  # Polling is the default. A blank webhook secret disables signed deliveries.
+  # A configured secret permits signed deliveries in either mode. The published
+  # development secret is refused whenever factory intake is enabled.
+  # Sealed installs generate and retain a real secret unless one is configured.
+  # Webhook mode requires a real secret and keeps the missed label backstop.
   # Either mode still requires the App id and private key, a label, a mention
   # login, and a repo allowlist.
   githubFactoryIngressEnabled: false

@@ -889,14 +889,23 @@ Factory intake polls GitHub by default. It is off until
 `api.githubFactoryIngressEnabled` is true (environment
 `GITHUB_FACTORY_INGRESS_ENABLED=true`). `api.githubFactoryIntake`
 (`GITHUB_FACTORY_INTAKE`) is `poll` or `webhook`, and `poll` is the default.
-Poll mode does not require a webhook secret. The API still refuses to start
-with the gate on unless the GitHub App id and private key are set,
+Poll mode accepts a blank webhook secret, which disables signed deliveries.
+A configured secret permits signed deliveries in either intake mode. The
+published development secret is refused whenever factory intake is enabled.
+The API still refuses to start with the gate on unless the GitHub App id and
+private key are set,
 `api.githubFactoryLabel` (`GITHUB_FACTORY_LABEL`) is a single label name,
 `api.githubFactoryMention` (`GITHUB_FACTORY_MENTION`) is one GitHub login, and
-`api.githubRepoAllowlist` is non-empty. Webhook mode keeps the signed
-`POST /github/webhook` path and requires a webhook secret that is not the
-development default. An empty webhook secret is not a signing key, so a
-delivery signed with a blank secret is rejected.
+`api.githubRepoAllowlist` is nonempty. Webhook mode keeps the signed
+`POST /github/webhook` path and requires a configured secret that is not blank
+or the development default.
+
+Sealed chart installs generate and retain a real webhook secret unless one is
+explicitly configured. Development chart overlays can set
+`api.githubWebhookSecret` to blank for polling or supply a real secret. The
+development Compose stack substitutes the published development secret when
+`GITHUB_WEBHOOK_SECRET` is unset or blank, so enabling polling there requires
+a real `GITHUB_WEBHOOK_SECRET`.
 
 `curie cluster factory` sets these values for you (see the dark-factory
 example README). It checks the merged config against this boot gate before

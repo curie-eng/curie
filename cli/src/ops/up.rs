@@ -369,7 +369,7 @@ fn lookup_dotted(values: &serde_json::Value, dotted: &str) -> Option<String> {
 /// This cannot reuse [`lookup_dotted`]: helm records `--set KEY=true` as a JSON
 /// *boolean*, and `lookup_dotted` ends in `as_str()`, so it returns `None` for
 /// exactly the shape this key normally has.
-fn lookup_dotted_flag(values: &serde_json::Value, dotted: &str) -> bool {
+pub(crate) fn lookup_dotted_flag(values: &serde_json::Value, dotted: &str) -> bool {
     let mut cursor = values;
     for part in dotted.split('.') {
         let Some(next) = cursor.get(part) else {

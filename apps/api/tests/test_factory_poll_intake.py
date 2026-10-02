@@ -67,6 +67,7 @@ from test_github_factory_review import (  # noqa: E402
     HEAD,
     _branch,
     _complete,
+    _execute,
     _own_pull_request,
 )
 
@@ -139,6 +140,9 @@ class PollGitHub:
     calls: list[httpx.Request] = field(default_factory=list)
     saw_304: bool = False
     failures: dict[str, int] = field(default_factory=dict)
+    permission_failures: set[int] = field(default_factory=set)
+    failed_permissions: list[int] = field(default_factory=list)
+    _permission_issue: int | None = None
     issues: dict[int, _PlantedIssue] = field(default_factory=dict)
     comments: dict[int, dict[str, Any]] = field(default_factory=dict)
     review_comments: dict[int, dict[str, Any]] = field(default_factory=dict)
@@ -463,6 +467,7 @@ class PollGitHub:
             issue = self.issues.get(number)
             if issue is None:
                 return httpx.Response(404, json={"message": "missing fixture"})
+            self._permission_issue = number
             body = self._issue_body(issue)
             etag = f'"{hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()}"'
             if request.headers.get("if-none-match") == etag:
@@ -470,6 +475,11 @@ class PollGitHub:
                 return httpx.Response(304, headers={"ETag": etag})
             return httpx.Response(200, json=body, headers={"ETag": etag})
         if path == f"{root}/collaborators/{SENDER}/permission":
+            number, self._permission_issue = self._permission_issue, None
+            if number in self.permission_failures:
+                assert number is not None
+                self.failed_permissions.append(number)
+                return httpx.Response(500, json={"message": "Permission unavailable"})
             return httpx.Response(
                 200,
                 json={"permission": self.permission, "user": {"id": SENDER_ID, "login": SENDER}},
@@ -892,6 +902,130 @@ def test_poll_retries_a_new_label_after_event_read_failure_without_blocking_othe
     assert recovered[0]["id"] == _label_request_id(unavailable, github.issues[unavailable].event_id)
     assert [row["id"] for row in _requests(healthy)] == [row["id"] for row in healthy_rows]
     assert [row["id"] for row in _requests(mentioned)] == [row["id"] for row in mentioned_rows]
+
+
+@pytest.mark.parametrize("lane", ["labeled", "stale"])
+def test_poll_retries_permission_failure_after_events_and_continues_other_intake(
+    poll_factory: tuple[TestClient, PollGitHub], lane: str
+) -> None:
+    client, github = poll_factory
+    mentioned, _mentioned_request = _admit_label(client, github)
+    reviewed, reviewed_request = _admit_label(client, github)
+    if lane == "labeled":
+        unavailable = github.plant_issue()
+    else:
+        unavailable, _unavailable_request = _admit_label(client, github)
+        github.close_issue(unavailable)
+    healthy = github.plant_issue()
+    github.permission_failures.add(unavailable)
+    comment_id, review_id = 73503, 74503
+    github.add_issue_comment(mentioned, comment_id, f"@{MENTION} please revise the helper")
+    pull = github.plant_pull()
+    _own_pull_request(reviewed_request["work_item_id"], pull)
+    _complete(reviewed_request["id"])
+    github.add_review(pull, review_id, f"@{MENTION} please rename the helper")
+    github.calls.clear()
+
+    _run_once(github)
+
+    assert unavailable in github.failed_permissions
+    events_path = f"/repos/{REPO}/issues/{unavailable}/events"
+    event_index = next(
+        index for index, request in enumerate(github.calls) if request.url.path == events_path
+    )
+    assert any(
+        request.url.path == f"/repos/{REPO}/collaborators/{SENDER}/permission"
+        for request in github.calls[event_index + 1 :]
+    )
+    unavailable_rows = _requests(unavailable)
+    if lane == "labeled":
+        assert unavailable_rows == []
+    else:
+        assert len(unavailable_rows) == 1
+        assert unavailable_rows[0]["cancelled_at"] is None
+        assert unavailable_rows[0]["status"] != "cancelled"
+    healthy_rows = _requests(healthy)
+    assert len(healthy_rows) == 1
+    assert healthy_rows[0]["id"] == _label_request_id(healthy, github.issues[healthy].event_id)
+    mentioned_rows = _requests(mentioned)
+    reviewed_rows = _requests(reviewed)
+    assert _mention_request_id(comment_id) in {row["id"] for row in mentioned_rows}
+    assert _feedback_request_id("pull_request_review", review_id) in {
+        row["id"] for row in reviewed_rows
+    }
+    github.permission_failures.remove(unavailable)
+
+    _run_once(github)
+    _run_once(github)
+
+    recovered = _requests(unavailable)
+    assert len(recovered) == 1
+    if lane == "labeled":
+        assert recovered[0]["id"] == _label_request_id(
+            unavailable, github.issues[unavailable].event_id
+        )
+    else:
+        assert recovered[0]["cancelled_at"] is not None
+        assert recovered[0]["terminal_cause"] == "issue_cancelled"
+    assert [row["id"] for row in _requests(healthy)] == [row["id"] for row in healthy_rows]
+    assert [row["id"] for row in _requests(mentioned)] == [row["id"] for row in mentioned_rows]
+    assert [row["id"] for row in _requests(reviewed)] == [row["id"] for row in reviewed_rows]
+
+
+def test_poll_prunes_persisted_etags_for_cancelled_issues_and_closed_lineages(
+    poll_factory: tuple[TestClient, PollGitHub],
+) -> None:
+    client, github = poll_factory
+    cancelled, _cancelled_request = _admit_label(client, github)
+    retired, retired_request = _admit_label(client, github)
+    healthy, healthy_request = _admit_label(client, github)
+    retired_pull, healthy_pull = github.plant_pull(), github.plant_pull()
+    retired_lineage = _own_pull_request(retired_request["work_item_id"], retired_pull)
+    _own_pull_request(healthy_request["work_item_id"], healthy_pull)
+    _complete(healthy_request["id"])
+    _run_once(github)
+    before = _rows(
+        "SELECT etags FROM curie.factory_poll_cursors WHERE repo_full_name = :repo",
+        {"repo": REPO},
+    )
+    assert len(before) == 1
+    cancelled_key = f"issue:{cancelled}:{LABEL}"
+    retired_key, healthy_key = f"reviews:{retired_pull}", f"reviews:{healthy_pull}"
+    assert cancelled_key in before[0]["etags"]
+    assert retired_key in before[0]["etags"]
+    assert healthy_key in before[0]["etags"]
+    github.close_issue(cancelled)
+    github.pulls[retired_pull]["state"] = "closed"
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET status = 'closed', "
+        "version = version + 1 WHERE id = :id",
+        {"id": retired_lineage},
+    )
+    comment_id, review_id = 73504, 74504
+    github.add_issue_comment(healthy, comment_id, f"@{MENTION} please revise the helper")
+    github.add_review(healthy_pull, review_id, f"@{MENTION} please rename the helper")
+    github._etags["issue-comments"] = '"healthy-mention-after-etag-pruning"'
+    github._etags["reviews"] = '"healthy-review-after-etag-pruning"'
+
+    _run_once(github)
+    _run_once(github)
+
+    assert _requests(cancelled)[0]["cancelled_at"] is not None
+    after = _rows(
+        "SELECT etags FROM curie.factory_poll_cursors WHERE repo_full_name = :repo",
+        {"repo": REPO},
+    )
+    assert len(after) == 1
+    assert cancelled_key not in after[0]["etags"]
+    assert retired_key not in after[0]["etags"]
+    assert after[0]["etags"][healthy_key] == github._etags["reviews"]
+    assert f"issue:{healthy}:{LABEL}" in after[0]["etags"]
+    healthy_rows = _requests(healthy)
+    assert len(healthy_rows) == 3
+    assert _mention_request_id(comment_id) in {row["id"] for row in healthy_rows}
+    assert _feedback_request_id("pull_request_review", review_id) in {
+        row["id"] for row in healthy_rows
+    }
 
 
 def test_stale_issue_conditional_read_still_cancels_after_an_issue_changes(
