@@ -308,6 +308,7 @@ def _run_turn(
                 },
             )
             runner = SessionRunner(
+                max_usd_per_day=None,
                 held_secrets=frozenset(),
                 session_factory=lambda: ClaudeAgentSession(options),
                 ceiling=0,

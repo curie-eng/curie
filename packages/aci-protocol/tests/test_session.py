@@ -179,6 +179,8 @@ def _full_boot_env() -> BootEnv:
         state_token="st-state-token",
         progress_url="http://api:8000/v1/work-item-progress/wi-full",
         progress_token="sbx-progress-token",
+        issue_read_url="http://api:8000/work-items/issue-read",
+        issue_read_token="wir-issue-read-capability",
         approval_required_tools=["Bash", "mcp__github__create_pr"],
         approval_grant_tool="Bash",
         approval_grant_arguments={"command": "printf ok"},
@@ -194,6 +196,7 @@ def _full_boot_env() -> BootEnv:
         api_backend="messages",
         thinking="disabled",
         deployment_environment="prod",
+        channel_bound=True,
         model_env_key="MY_PROVIDER_KEY",
         metrics_temporality_preference="delta",
         max_turns=50,
@@ -561,6 +564,7 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         bundle_version="abc123def456",
         channel_memory_ref=_CHANNEL_MEMORY_REF,
         memory_writes=True,
+        channel_bound=True,
     )
     worker_owned = set(BootEnv.env_keys(producer="worker"))
     assert set(maximal) <= worker_owned
@@ -578,6 +582,7 @@ def test_the_kernel_owns_exactly_these_resume_overlay_keys() -> None:
     producer map is what pins the overlay's exact extent. ADR-0076/#889 added
     ``CURIE_APPROVAL_DECISION`` alongside the original two, and #3077 added the
     request-bound progress URL/token the resume overlay mints per work item.
+    ADR 0187 added the issue read URL/capability the API mints at boot.
     """
     assert set(BootEnv.env_keys(producer="kernel")) == {
         "CURIE_APPROVAL_GRANT_TOOL",
@@ -586,6 +591,8 @@ def test_the_kernel_owns_exactly_these_resume_overlay_keys() -> None:
         "CURIE_APPROVAL_DECISION",
         "CURIE_PROGRESS_URL",
         "CURIE_PROGRESS_TOKEN",
+        "CURIE_ISSUE_READ_URL",
+        "CURIE_ISSUE_READ_TOKEN",
     }
 
 
@@ -830,6 +837,8 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_STATE_TOKEN",
         "CURIE_PROGRESS_URL",
         "CURIE_PROGRESS_TOKEN",
+        "CURIE_ISSUE_READ_URL",
+        "CURIE_ISSUE_READ_TOKEN",
         "CURIE_APPROVAL_REQUIRED_TOOLS",
         "CURIE_APPROVAL_GRANT_TOOL",
         "CURIE_APPROVAL_GRANT_ARGUMENTS",
@@ -845,6 +854,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_MODEL_API_BACKEND",
         "CURIE_THINKING",
         "CURIE_DEPLOYMENT_ENVIRONMENT",
+        "CURIE_CHANNEL_BOUND",
         "CURIE_MODEL_ENV_KEY",
         "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
         "CURIE_MAX_TURNS",
@@ -1181,3 +1191,30 @@ def test_from_env_reads_an_absent_or_empty_memory_writes_flag_as_unset() -> None
 def test_memory_writes_is_a_worker_only_env_key() -> None:
     assert BootEnv.env_key("memory_writes") == "CURIE_MEMORY_WRITES"
     assert _producers_of("CURIE_MEMORY_WRITES") == {"worker"}
+
+
+def test_render_worker_omits_channel_bound_by_default() -> None:
+    assert "CURIE_CHANNEL_BOUND" not in _worker_env()
+
+
+def test_render_worker_emits_channel_bound_when_the_turn_is_bound() -> None:
+    assert _worker_env(channel_bound=True)["CURIE_CHANNEL_BOUND"] == "1"
+
+
+def test_from_env_leaves_channel_bound_unset_when_absent_or_blank() -> None:
+    env = _worker_env() | _SUBSTRATE_ENV
+    assert "CURIE_CHANNEL_BOUND" not in env
+    assert BootEnv.from_env(env).channel_bound is None
+    for blank in ("", " "):
+        parsed = BootEnv.from_env(env | {"CURIE_CHANNEL_BOUND": blank})
+        assert parsed.channel_bound is None
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "True", "yes", "YES"])
+def test_from_env_reads_channel_bound_with_the_fake_model_truthy_set(raw: str) -> None:
+    env = _worker_env() | _SUBSTRATE_ENV | {"CURIE_CHANNEL_BOUND": raw}
+    assert BootEnv.from_env(env).channel_bound is True
+
+
+def test_channel_bound_is_not_a_session_config_field() -> None:
+    assert "channel_bound" not in SessionConfig.model_fields

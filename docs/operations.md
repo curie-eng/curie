@@ -1015,19 +1015,22 @@ one is feasible, implements, runs the repository's own checks, reviews its diff
 against every criterion, and ends in one pull request or a stated reason. Any
 other bundle can take its place; the platform does not require this one.
 
-The bundle reads the issue through the GitHub MCP server installed by
-`examples/dark-factory/runner.Dockerfile` in a runner layer the bundle
-declares in `connectors.yaml` (ADR-0173), with its own
-`GITHUB_PERSONAL_ACCESS_TOKEN` bound at deploy
-(`curie cluster deploy --secret GITHUB_PERSONAL_ACCESS_TOKEN`). The platform
-runner does not contain that server, so run
-`curie build --plugin-dir examples/dark-factory --registry <ref>` before the
-deploy; the deploy refuses the bundle until its lock records the layer. Give it a token
-limited to **Issues: Read and write**. Its `toolPolicy` allows `github/get_issue`
-and `github/add_issue_comment`, and the bundle's review gate hook allows that
-comment only once, to post unresolved findings after a failed or capped review,
-so the runner denies every other GitHub write tool. Open runner egress to the GitHub API
-CIDRs (`agentSandbox.connectorEgress.<agent>`). The chart now ships
+The bundle reads the issue through the platform tool `mcp__curie__get_issue`,
+mounted for executions that have a WorkItem. The tool presents an execution
+scoped capability the API minted for that execution; the API checks it names
+this execution and the WorkItem's issue, reads the issue and its comments with
+the GitHub App installation token (minted fresh per read), and returns them
+verbatim without storing anything. The sandbox holds no GitHub credential, so
+the bundle needs no token or runner egress to the GitHub API. The bundle's
+runner layer still carries the uv, Rust and pnpm toolchains. Each release
+publishes it as `ghcr.io/curie-eng/curie-dark-factory-runner:<version>`, and
+`curie example dark-factory render --out <dir>` from a release CLI records its
+digest in the bundle's lock. A source built CLI has no published layer, says
+so, and names `curie build --plugin-dir <dir> --registry <ref>` instead; the
+deploy refuses the bundle until its lock records the layer. After a
+failed or capped review the agent ends its reply with `Could not complete:` and
+the unresolved findings, and the factory status comment on the issue carries
+that result. The chart now ships
 `worker.deliveryBudgetSeconds` and `worker.runnerTotalTimeoutSeconds` at 10800,
 matching the factory maximum execution deadline, so a stock install does not
 cut a factory run at 600 seconds. The agent execution deadline still defaults

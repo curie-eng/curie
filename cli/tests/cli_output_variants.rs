@@ -305,7 +305,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         "BudgetOutput",
         samples![
             "DryRun" => BudgetOutput::DryRun(plan()),
-            "Done" => BudgetOutput::Done { agent: "a".to_string(), max_usd_per_day: Some(1.5) },
+            "Done" => BudgetOutput::Done { agent: "a".to_string(), max_usd_per_day: Some(1.5), max_output_tokens_per_run: Some(64000) },
         ],
     );
     m.insert(

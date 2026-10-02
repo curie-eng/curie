@@ -91,6 +91,7 @@ from pydantic import ValidationError
 from . import caller_token, sandbox_token
 from .actions import ActionBackendError, ActionRecorder
 from .approval_cards import ApprovalCardStore
+from .approval_wording import approval_display
 from .approvals import (
     ApprovalBackendError,
     ApprovalCreator,
@@ -127,6 +128,8 @@ from .binding import (
     EVAL_ISOLATE_THREAD_PREFIX,
     GRANT_ARGUMENTS_ENV,
     GRANT_TOOL_ENV,
+    ISSUE_READ_TOKEN_ENV,
+    ISSUE_READ_URL_ENV,
     MAX_TURNS_ENV,
     PROGRESS_TOKEN_ENV,
     PROGRESS_URL_ENV,
@@ -800,6 +803,17 @@ def _escalation_text(
 # guaranteed to be cut off mid-flight -- it buys nothing and spends the last of
 # the deadline that the escalation and the terminal settle still need.
 _MIN_ATTEMPT_BUDGET_S = 5.0
+
+# Start-refusal codes that mean the work item settled terminally, so the
+# execution is over and the delivering worker is the only one that can release
+# the sandbox claim it just made (#3208). ``not_dispatchable`` is excluded on
+# purpose: it also covers a lapsed acquire lease, where a replacement consumer
+# re-acquires the same generation and adopts this thread's route, so the claim
+# must survive the refusal. The passthrough set is defined by the API's
+# ``_map_start_conflict``; keep the two in sync.
+_WORK_ITEM_TERMINAL_START_REFUSALS = frozenset(
+    {"work_item_cancelled", "waiting_deadline_elapsed", "not_found"}
+)
 
 # A factory execute turn that ends done or idle without calling publish_changes
 # is re-prompted once in the same session (#3128). The progress tool's canonical
@@ -3227,6 +3241,31 @@ class Kernel:
                         scope="work_item.progress",
                         exp=int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS,
                     )
+                # The bundle reads its issue through the platform (ADR 0187):
+                # the API mints a capability naming this execution and its
+                # WorkItem's issue, and the runner mounts get_issue only when
+                # it is present. A refused or failed mint leaves the tool off
+                # and never stops the boot; the bundle states the gap.
+                if owned_work_item_id is not None and self._work_items is not None:
+                    try:
+                        issue, capability = await self._work_items.issue_read_context(
+                            owned_work_item_id
+                        )
+                    except (WorkItemConflict, WorkItemTransportError) as exc:
+                        logger.warning(
+                            "issue read capability unavailable for %s: %s",
+                            owned_work_item_id,
+                            type(exc).__name__,
+                        )
+                    else:
+                        base = self._config.runner_facing_api_base_url.rstrip("/")
+                        boot_env[ISSUE_READ_URL_ENV] = f"{base}/work-items/issue-read"
+                        boot_env[ISSUE_READ_TOKEN_ENV] = capability
+                        logger.info(
+                            "issue read capability bound for %s to %s",
+                            owned_work_item_id,
+                            issue,
+                        )
                 # Decision A2 marker (#544): an authority-free FACT carrying the
                 # resumed approval's gate kind (the actual gate_kind column value,
                 # e.g. 'policy' or 'permission'). After the approved-only gate in
@@ -3410,6 +3449,25 @@ class Kernel:
                         event_id,
                         exc.code,
                     )
+                    if exc.code in _WORK_ITEM_TERMINAL_START_REFUSALS:
+                        # #3208: the request settled before a turn opened, so
+                        # this delivery is the only one that can release the
+                        # claim it made. A request cancelled from ``waiting``
+                        # gets no terminate wake and carries no teardown flag,
+                        # so without this the claim holds quota until the
+                        # route TTL lapses. Marking the run finished hands the
+                        # release to the existing finally block.
+                        # ``not_dispatchable`` is deliberately excluded: it can
+                        # mean a lapsed acquire lease, where a replacement
+                        # re-acquires the same generation and adopts this
+                        # thread's route, so the claim must stay standing.
+                        run = (
+                            self._work_item_runs.get(owned_work_item_id)
+                            if owned_work_item_id is not None
+                            else None
+                        )
+                        if run is not None:
+                            run.finished = True
                     return
                 except ThreadBusyError as busy:
                     run = (
@@ -4519,6 +4577,13 @@ class Kernel:
                     qevent.event_id,
                     exc.code,
                 )
+                if exc.code == "work_item_cancelled":
+                    # #3208: the request is already settled as cancelled, so
+                    # nothing will ever accept a marker or a finish. Count the
+                    # run as settled locally so this delivery releases its
+                    # sandbox claim now instead of holding quota until the
+                    # terminate-wake backstop catches up.
+                    run.finished = True
                 return
         elif run is not None and not run.started:
             try:
@@ -7884,7 +7949,13 @@ class Kernel:
         thread = qevent.conversation_id
         thread_key = _thread_key_for(qevent)
         summary = outcome.approval_summary or outcome.text or "Approval requested"
-        display_summary = outcome.approval_display or summary
+        display_summary = (
+            outcome.approval_display
+            if outcome.approval_display
+            else approval_display(
+                summary, outcome.approval_granted_tool, outcome.approval_granted_arguments
+            )
+        )
 
         # Resolve the manifest route NAME (#247) to its workspace channel. A named
         # route that resolves to no binding escalates instead of widening (#544).

@@ -20,7 +20,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import crud
 from .config import Settings
-from .delivery import enqueue_owned, take_backlog_slot
+from .delivery import backlog_reservation, enqueue_owned, take_backlog_slot
 from .factory_notices import _find_marker
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_review_audit import settle_review_delivery
@@ -589,9 +589,11 @@ class GitHubReviewReconciler:
                         if not row.quota_taken:
                             if not await take_backlog_slot(
                                 self._valkey,
-                                key_prefix=f"curie:github-review:backlog:{row.binding_id}",
+                                reservation=backlog_reservation(
+                                    key_prefix=f"curie:github-review:backlog:{row.binding_id}",
+                                    window_s=self._settings.channel_binding_backlog_window_s,
+                                ),
                                 limit=self._settings.channel_binding_backlog_limit,
-                                window_s=self._settings.channel_binding_backlog_window_s,
                             ):
                                 row.status, row.error_code = "refused", "binding_backlog_quota"
                                 row.version += 1

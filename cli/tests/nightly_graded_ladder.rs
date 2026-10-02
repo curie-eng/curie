@@ -5425,3 +5425,96 @@ fn cluster_product_observability_preserves_the_fake_approval_path() {
     assert_eq!(evidence["otelcol_exporter_sent_spans"], 5.0);
     assert_eq!(evidence["langfuse_observation_membership"], true);
 }
+
+#[test]
+fn local_otel_sink_uses_configured_network_and_reaps_only_its_owned_network() {
+    for (configured, existing) in [
+        (None, false),
+        (Some("acme-private_runner"), false),
+        (Some("acme-borrowed_runner"), true),
+    ] {
+        let work = tempfile::tempdir().unwrap();
+        let log = work.path().join("docker-argv.log");
+        let source = format!(
+            r#"set -u
+WORKDIR="$TEST_WORKDIR"
+REPO_ROOT="$TEST_REPO_ROOT"
+COMPOSE_PROJECT=acme-private
+LOCAL_OTEL_SINK_NAME=acme-private-sink
+LOCAL_OTEL_SINK_OWNED=0
+LOCAL_OTEL_NETWORK_OWNED=0
+LOCAL_OTEL_NETWORK=""
+docker() {{
+    printf '%s\n' "$*" >> "$TEST_DOCKER_LOG"
+    if [[ "$1 $2" == 'network inspect' ]]; then
+        [[ "$TEST_NETWORK_EXISTS" == 1 ]]
+    elif [[ "$1" == run ]]; then
+        echo 'intentional command-capture boundary; no container is started' >&2
+        return 64
+    else
+        return 0
+    fi
+}}
+{}
+{}
+if start_local_otel_sink; then
+    echo 'capture control must stop before starting any container' >&2
+    exit 2
+fi
+# Cleanup must retain the network selected at startup, even if the env changes.
+export CURIE_DOCKER_NETWORK=acme-other_runner
+stop_local_otel_sink
+"#,
+            ladder_function("start_local_otel_sink"),
+            ladder_function("stop_local_otel_sink")
+        );
+        let mut command = Command::new("bash");
+        command
+            .args(["-c", &source])
+            .env("TEST_WORKDIR", work.path())
+            .env("TEST_REPO_ROOT", repo_root())
+            .env("TEST_DOCKER_LOG", &log)
+            .env("TEST_NETWORK_EXISTS", if existing { "1" } else { "0" })
+            .env_remove("STUB_STATE")
+            .env_remove("CURIE_DOCKER_NETWORK");
+        if let Some(network) = configured {
+            command.env("CURIE_DOCKER_NETWORK", network);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}", transcript(&output));
+        let calls = fs::read_to_string(log).unwrap();
+        let expected = configured.unwrap_or("curie_runner");
+        assert!(
+            calls.contains(&format!("network inspect {expected}\n")),
+            "{calls}"
+        );
+        assert!(
+            calls
+                .lines()
+                .any(|line| line.starts_with("run ")
+                    && line.contains(&format!("--network {expected} "))),
+            "{calls}"
+        );
+        if existing {
+            assert!(
+                !calls
+                    .lines()
+                    .any(|line| line.starts_with("network create ")
+                        || line.starts_with("network rm ")),
+                "borrowed network must survive: {calls}"
+            );
+        } else {
+            assert!(
+                calls
+                    .lines()
+                    .any(|line| line.starts_with("network create ") && line.ends_with(expected)),
+                "{calls}"
+            );
+            assert!(
+                calls.contains(&format!("network rm {expected}\n")),
+                "{calls}"
+            );
+            assert!(!calls.contains("network rm acme-other_runner"), "{calls}");
+        }
+    }
+}

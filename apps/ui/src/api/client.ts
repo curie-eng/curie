@@ -901,6 +901,7 @@ export interface ApprovalOut {
   conversation_id: string;
   author: string;
   summary: string;
+  display_summary?: string | null;
   reply_channel: string;
   reply_placeholder: string | null;
   reply_endpoint: string | null;

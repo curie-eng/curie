@@ -396,7 +396,10 @@ class Settings(BaseSettings):
     # guarantee needs a worker-side in-flight lease (follow-up); 900s covers the
     # common single-attempt case with margin.
     resume_reconciler_enabled: bool = True
-    resume_reconciler_interval_seconds: int = 30
+    # A zero or negative interval turns run_forever into a busy spin (a
+    # graveyard scan plus a Postgres query per iteration, back to back), so
+    # boot refuses it (#3725). enabled is the off-switch, not this field.
+    resume_reconciler_interval_seconds: int = Field(default=30, gt=0)
     resume_reconciler_grace_seconds: int = 900
     resume_reconciler_batch_limit: int = 100
 
@@ -633,9 +636,16 @@ class Settings(BaseSettings):
     # upstreams can create, and a per-hook counter would let a source multiply
     # its own allowance by inventing hook names.
     hook_backlog_limit: int = 64
-    hook_backlog_window_s: int = 60
+    # Both windows floor `backlog_reservation`'s time bucket (delivery.py), so 0
+    # divides by zero -- a 500 on every new delivery AFTER the claim was taken,
+    # with the claim unreleased until `channel_delivery_lease_s` lapses -- and
+    # a negative window makes the quota script's EXPIRE delete the counter
+    # immediately, silently disabling the quota. Bounded at construction the
+    # same way as GITHUB_FACTORY_RECONCILE_INTERVAL_S (#3709): refused at boot
+    # rather than surfacing mid-delivery (#3720).
+    hook_backlog_window_s: int = Field(default=60, gt=0)
     channel_binding_backlog_limit: int = 64
-    channel_binding_backlog_window_s: int = 60
+    channel_binding_backlog_window_s: int = Field(default=60, gt=0)
     # Sandbox ResourceQuota hard limits (#3209). The chart sets all four when
     # the quota object renders, and leaves all four unset otherwise. A partial
     # set is a broken install: the agent write refuses rather than skipping the
@@ -943,9 +953,11 @@ class Settings(BaseSettings):
             offenders.append("GITHUB_APP_ID")
         if not self.github_app_private_key.strip():
             offenders.append("GITHUB_APP_PRIVATE_KEY")
-        if self.github_factory_intake == "webhook" and (
-            not self.github_webhook_secret.strip()
-            or self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET
+        # Polling may disable signed deliveries with a blank secret, but a
+        # published signing key must never authenticate factory deliveries.
+        if self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET or (
+            self.github_factory_intake == "webhook"
+            and not self.github_webhook_secret.strip()
         ):
             offenders.append("GITHUB_WEBHOOK_SECRET")
         label = self.github_factory_label

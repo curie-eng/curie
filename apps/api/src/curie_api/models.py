@@ -35,6 +35,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
+from .approval_wording import approval_display
 from .db import SCHEMA, Base
 from .repo_full_name import normalize_repo_full_name
 
@@ -470,6 +471,11 @@ class Approval(Base):
     # The human-readable statement of what needs approval, from the run's
     # approval request (the ACI final's approval_summary).
     summary: Mapped[str]
+    @property
+    def display_summary(self) -> str:
+        """Computed presentation; grants still bind to the stored exact fields."""
+        return approval_display(self.summary, self.granted_tool, self.granted_arguments)
+
     # The reply handle of the requesting turn, replayed onto the resume turn so
     # the resumed run streams into the same placeholder message.
     #

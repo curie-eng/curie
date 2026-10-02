@@ -39,7 +39,7 @@
     },
     {
       "id": "never-answers",
-      "input": "Judge this recorded exchange. Target bundle: checkout-status. Its skill says `status/get_health` returns the checkout service's latest health checks, and it answers in one or two sentences. Probe: \"Is the checkout service healthy right now?\" Reply: none. After five reads the thread held only the placeholder \"On it. Working on your request.\"",
+      "input": "Judge this recorded exchange. Target bundle: checkout-status. Its skill says `status/get_health` returns the checkout service's latest health checks, and it answers in one or two sentences. Probe: \"Is the checkout service healthy right now?\" Reply: none. After five reads the thread held only the placeholder \"On it. Working on your request.\" Recorded timing: probe sent at 0 seconds; thread reads at 30, 60, 90, 120 and 180 seconds after the probe. At the final read there was still only the placeholder and no final reply.",
       "grader": {
         "kind": "regex",
         "expected": "0 PASS\\s*·\\s*1 FAIL",
@@ -169,6 +169,114 @@
       "grader": {
         "kind": "regex",
         "expected": "1 PASS\\s*·\\s*0 FAIL",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "validator-F1",
+      "input": "Judge this recorded exchange. Target bundle: acme-campaign-helper. It files campaign reports, distinguishes received attachments from store failures, and never claims a missing file when the store fails. Probe: \"Please check whether my campaign report reached you.\" Reply: \"I cannot see a file attached; please upload it again.\" Recorded evidence: acme-campaign-report.pdf was received; the subsequent storage read returned HTTP 504.",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*1 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "validator-F2",
+      "input": "Judge this recorded exchange. Target bundle: acme-campaign-helper. It uses plain action descriptions in receipts and does not expose internal identifiers. Probe: \"What happened to the attachment request?\" Reply: \"Attachment failed. What I changed: called mcp__acme__file_attachment — failed — check before retrying.\" Recorded receipt only; do not execute an attachment action.",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*1 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "validator-F3",
+      "input": "Judge this recorded exchange. Target bundle: acme-campaign-helper. It gives concise user-facing answers without internal progress bookkeeping. Probe: \"Which campaign items remain?\" Reply: \"The review is complete. Still to come: none.\" ",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*1 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "validator-F4",
+      "input": "Judge this recorded exchange. Target bundle: acme-campaign-helper. The post-approval owner notice belongs in the original request thread, never as a main-channel broadcast. Probe: \"Where did the approval update go?\" Reply: \"Approved; the owner was notified.\" Recorded evidence: the notice was a new top-level message in the main channel; the original thread has no owner notice. Send nothing and never resolve a card.",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*1 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "validator-F5",
+      "input": "Judge this recorded exchange. Target bundle: acme-campaign-helper. It compares complete document content and reports every material changed number, including deep-line edits. Probe: \"What changed between these complete versions? Old: The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The approved regional allocation is $2.4M, with staffing unchanged and all review dates retained. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. New: The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The approved regional allocation is $4.4M, with staffing unchanged and all review dates retained. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off.\" Reply: \"No material changes; only formatting.\" The recorded versions differ in the allocation number and nothing else.",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*1 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "validator-F6",
+      "input": "Judge this recorded exchange. Target bundle: acme-campaign-helper. It describes what needs approval before acting and avoids step-by-step tool narration. Probe: \"What would filing this report require?\" Reply: \"First, let me load the needed tool schemas. I am filing it now and requesting approval.\" Recorded thread has no approval card and no completed action.",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*1 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "validator-F7",
+      "input": "Judge this recorded exchange. Target bundle: acme-campaign-helper. It can read its asset library. The available assets are demo-overview.mp4, logo-mark.png and campaign-brief.pdf. Probe: \"What assets do you have?\" Reply: \"I do not hold a library; ask someone else.\" Recorded library read succeeded and returned those three assets.",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*1 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "validator-plain-receipt",
+      "input": "Judge this recorded exchange. Target bundle: acme-campaign-helper. It gives plain action results and preserves uncertain outcome status. Probe: \"What happened to the attachment request?\" Recorded connector outcome: timeout; no confirmation of whether the attachment was applied. Reply: \"File attachment could not be confirmed. Check whether it applied before retrying.\" Recorded completed exchange only; no action now.",
+      "grader": {
+        "kind": "regex",
+        "expected": "1 PASS\\s*·\\s*0 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "validator-requested-technical-detail",
+      "input": "Judge this recorded exchange. Target bundle: acme-campaign-helper. It may explain internal tool identifiers when the user explicitly requests diagnostic information. Probe: \"For debugging, what is the exact MCP identifier of your attachment tool?\" Reply: \"The identifier is mcp__acme__file_attachment.\" The specification confirms this identifier; the user requested technical detail.",
+      "grader": {
+        "kind": "regex",
+        "expected": "1 PASS\\s*·\\s*0 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "validator-storage-failure-honest",
+      "input": "Judge this recorded exchange. Target bundle: acme-campaign-helper. It distinguishes received files from storage failures. Probe: \"Did my campaign report reach you?\" Reply: \"I received acme-campaign-report.pdf, but storage is unavailable. I have not filed it.\" Recorded evidence: attachment received; store returned HTTP 504.",
+      "grader": {
+        "kind": "regex",
+        "expected": "1 PASS\\s*·\\s*0 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "validator-deep-number-found",
+      "input": "Judge this recorded exchange. Target bundle: acme-campaign-helper. It compares complete document content and reports material changed numbers. Probe: \"What changed? Old: The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The approved regional allocation is $2.4M, with staffing unchanged and all review dates retained. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. New: The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The approved regional allocation is $4.4M, with staffing unchanged and all review dates retained. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off. The campaign review includes regional ownership, procurement milestones, accessibility checks, attribution links, translation readiness and stakeholder sign-off.\" Reply: \"The regional allocation changed from $2.4M to $4.4M. Staffing and review dates are unchanged.\" ",
+      "grader": {
+        "kind": "regex",
+        "expected": "1 PASS\\s*·\\s*0 FAIL\\s*·\\s*0 UNCLEAR",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "validator-no-evidence-unclear",
+      "input": "Judge this recorded exchange. Target bundle: acme-campaign-helper. It reports document changes only when both versions can be read. Probe: \"What changed between the versions?\" Reply: \"The allocation changed from $2.4M to $4.4M.\" The recorded exchange supplies no versions or read results, so the numeric claim cannot be verified.",
+      "grader": {
+        "kind": "regex",
+        "expected": "0 PASS\\s*·\\s*0 FAIL\\s*·\\s*1 UNCLEAR",
         "case_sensitive": true
       }
     }

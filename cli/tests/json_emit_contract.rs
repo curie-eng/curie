@@ -133,6 +133,11 @@ fn dry_run_verbs() -> Vec<(Vec<String>, Vec<String>)> {
                 if path.join(" ") == "example sre-bot install" {
                     required.push("--observability-only".to_string());
                 }
+                // Budget requires either limit flag, a conditional requirement
+                // the manifest does not encode. Supply a valid token limit.
+                if matches!(path.join(" ").as_str(), "local budget" | "cluster budget") {
+                    required.extend(["--output-tokens".to_string(), "64000".to_string()]);
+                }
                 out.push((path, required));
             }
         }
@@ -193,6 +198,14 @@ fn every_dry_run_verb_emits_json_object() {
             "`curie {}` under --json must emit a JSON object, got: {stdout}",
             argv.join(" ")
         );
+        if matches!(path.join(" ").as_str(), "local budget" | "cluster budget") {
+            assert!(
+                output.status.success(),
+                "budget dry run must succeed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(parsed["dry_run"], true, "budget must emit its dry run plan");
+        }
         if path.join(" ") == "example sre-bot install" {
             assert!(
                 output.status.success(),
@@ -805,6 +818,7 @@ fn approvals_pending_and_resolved_json_shapes_are_pinned() {
         status: "pending".to_string(),
         conversation_id: "C1-thread-9".to_string(),
         summary: "Deploy the thing".to_string(),
+        display_summary: None,
         expires_at: Some("2026-07-16T00:00:00Z".to_string()),
         resolved_by: None,
         // #1078: the persisted card location for a route-bound approval.
@@ -1011,9 +1025,10 @@ fn budget_output_json_shape_is_pinned() {
         BudgetOutput::Done {
             agent: "weather".to_string(),
             max_usd_per_day: Some(12.5),
+            max_output_tokens_per_run: Some(64000),
         }
         .to_json(),
-        json!({"agent": "weather", "max_usd_per_day": 12.5})
+        json!({"agent": "weather", "max_usd_per_day": 12.5, "max_output_tokens_per_run": 64000})
     );
     // `None` means "platform default" and must serialize as an explicit null --
     // omitting the key would read to an agent as "no budget field at all".
@@ -1021,10 +1036,22 @@ fn budget_output_json_shape_is_pinned() {
         BudgetOutput::Done {
             agent: "weather".to_string(),
             max_usd_per_day: None,
+            max_output_tokens_per_run: None,
         }
         .to_json(),
-        json!({"agent": "weather", "max_usd_per_day": null})
+        json!({"agent": "weather", "max_usd_per_day": null, "max_output_tokens_per_run": null})
     );
+    for (usd, tokens) in [(Some(12.5), None), (None, Some(64000))] {
+        assert_eq!(
+            BudgetOutput::Done {
+                agent: "weather".to_string(),
+                max_usd_per_day: usd,
+                max_output_tokens_per_run: tokens,
+            }
+            .to_json(),
+            json!({"agent": "weather", "max_usd_per_day": usd, "max_output_tokens_per_run": tokens})
+        );
+    }
 }
 
 #[test]

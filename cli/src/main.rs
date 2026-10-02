@@ -2493,13 +2493,16 @@ enum LocalAction {
         #[arg(long)]
         clear: bool,
     },
-    /// Set an agent's daily budget (`PUT /agents/{id}/budget`).
+    /// Update an agent's budget, preserving unspecified limits.
     Budget {
         /// Agent name or id.
         agent: String,
         /// Daily spend cap in USD. Must be > 0.
-        #[arg(long)]
-        limit: f64,
+        #[arg(long, required_unless_present = "output_tokens")]
+        limit: Option<f64>,
+        /// Output token cap for each run. Must be > 0.
+        #[arg(long, required_unless_present = "limit")]
+        output_tokens: Option<u64>,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
@@ -3032,9 +3035,12 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Turn on the GitHub factory intake (label or mention triggers, webhook
-    /// secret, repo allowlist, GitHub API egress) on an existing release.
+    /// Turn on the GitHub factory intake (label or mention triggers, repo
+    /// allowlist, GitHub API egress) on an existing release.
     Factory {
+        /// Select polling or webhook intake. Omit to keep the recorded mode.
+        #[arg(long, value_parser = ["poll", "webhook"])]
+        intake: Option<String>,
         /// Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable.
         /// Sets `api.githubRepoAllowlist`.
         #[arg(long = "repo", value_name = "OWNER/REPO")]
@@ -3563,13 +3569,17 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Set an agent's budget via the platform API (`PUT /agents/{id}/budget`).
+    /// Update an agent's budget, preserving unspecified limits.
     Budget {
         /// Agent name or id.
         agent: String,
         /// Daily spend cap in USD (BudgetConfig.max_usd_per_day). Must be > 0.
-        #[arg(long)]
-        limit: f64,
+        #[arg(long, required_unless_present = "output_tokens")]
+        limit: Option<f64>,
+        /// Output token cap for each run (BudgetConfig.max_output_tokens_per_run).
+        /// Must be > 0.
+        #[arg(long, required_unless_present = "limit")]
+        output_tokens: Option<u64>,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -5496,6 +5506,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             LocalAction::Budget {
                 agent,
                 limit,
+                output_tokens,
                 api_url,
                 api_key,
                 dry_run,
@@ -5508,6 +5519,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         dry_run,
                     },
                     limit,
+                    output_tokens,
                 )
                 .await?,
             ),
@@ -5959,6 +5971,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 )
             }
             ClusterAction::Factory {
+                intake,
                 repos,
                 label,
                 mention,
@@ -6007,7 +6020,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         app_id,
                         private_key_file,
                         org,
-                        intake: None,
+                        intake,
                     })
                     .await?,
                 )
@@ -6842,6 +6855,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             ClusterAction::Budget {
                 agent,
                 limit,
+                output_tokens,
                 conn,
                 dry_run,
             } => {
@@ -6856,6 +6870,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             dry_run,
                         },
                         limit,
+                        output_tokens,
                     )
                     .await?,
                 )
@@ -9032,11 +9047,18 @@ mod tests {
             .expect("cluster budget should parse");
         match cli.command {
             Some(Command::Cluster {
-                action: ClusterAction::Budget { agent, limit, .. },
+                action:
+                    ClusterAction::Budget {
+                        agent,
+                        limit,
+                        output_tokens,
+                        ..
+                    },
                 ..
             }) => {
                 assert_eq!(agent, "a");
-                assert_eq!(limit, 12.5);
+                assert_eq!(limit, Some(12.5));
+                assert_eq!(output_tokens, None);
             }
             _ => panic!("expected cluster budget command"),
         }
@@ -9379,10 +9401,54 @@ mod tests {
     }
 
     #[test]
-    fn cluster_budget_requires_limit() {
-        // `--limit` has no default, so omitting it is a parse error (not a silent
-        // zero-budget request).
-        assert!(try_parse_from(["curie", "cluster", "budget", "a"]).is_err());
+    fn budget_requires_limit_or_output_tokens_on_both_tiers() {
+        for tier in ["local", "cluster"] {
+            assert!(try_parse_from(["curie", tier, "budget", "a"]).is_err());
+        }
+    }
+
+    #[test]
+    fn budget_parses_selected_limits_on_both_tiers() {
+        for tier in ["local", "cluster"] {
+            for (flags, expected_limit, expected_tokens) in [
+                (vec!["--limit", "12.5"], Some(12.5), None),
+                (vec!["--output-tokens", "96000"], None, Some(96000)),
+                (
+                    vec!["--limit", "12.5", "--output-tokens", "96000"],
+                    Some(12.5),
+                    Some(96000),
+                ),
+            ] {
+                let mut args = vec!["curie", tier, "budget", "a"];
+                args.extend(flags);
+                let cli = try_parse_from(args).expect("selected budget limits should parse");
+                let (agent, limit, output_tokens) = match cli.command {
+                    Some(Command::Local {
+                        action:
+                            LocalAction::Budget {
+                                agent,
+                                limit,
+                                output_tokens,
+                                ..
+                            },
+                    })
+                    | Some(Command::Cluster {
+                        action:
+                            ClusterAction::Budget {
+                                agent,
+                                limit,
+                                output_tokens,
+                                ..
+                            },
+                        ..
+                    }) => (agent, limit, output_tokens),
+                    _ => panic!("expected budget command"),
+                };
+                assert_eq!(agent, "a");
+                assert_eq!(limit, expected_limit);
+                assert_eq!(output_tokens, expected_tokens);
+            }
+        }
     }
 
     #[test]

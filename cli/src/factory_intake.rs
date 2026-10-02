@@ -43,7 +43,7 @@ pub struct FactoryIntakeOpts {
     /// Organization whose registration form the printed link opens.
     pub org: Option<String>,
     /// `api.githubFactoryIntake` when this run must select a mode. `None`
-    /// leaves the recorded value, which is what `cluster factory` does.
+    /// leaves the recorded value unchanged.
     pub intake: Option<String>,
 }
 
@@ -356,7 +356,7 @@ pub fn intake_gate_offenders(
     }
     let intake = api_str(&api, "githubFactoryIntake");
     let secret = api_str(&api, "githubWebhookSecret");
-    if intake == "webhook" && (secret.is_empty() || secret == "dev-webhook-secret") {
+    if secret == "dev-webhook-secret" || (intake == "webhook" && secret.trim().is_empty()) {
         bad.push("GITHUB_WEBHOOK_SECRET");
     }
     let label = api_str(&api, "githubFactoryLabel");
@@ -955,7 +955,7 @@ mod tests {
 
     #[test]
     fn gate_dev_default_secret_and_at_mention_are_offenders() {
-        // The secret is an offender only when intake is explicitly webhook.
+        // Webhook intake refuses both blank and published signing keys.
         for secret in ["dev-webhook-secret", ""] {
             let planned = serde_json::json!({"api": {
                 "githubFactoryIntake": "webhook",
@@ -972,7 +972,7 @@ mod tests {
 
     #[test]
     fn gate_poll_or_absent_intake_does_not_require_a_webhook_secret() {
-        let secrets = ["", "dev-webhook-secret"];
+        let secrets = ["", "configured-webhook-secret"];
         let intakes = [Some("poll"), None];
         for secret in secrets {
             for intake in intakes {
@@ -988,6 +988,26 @@ mod tests {
                     "intake {intake:?} secret {secret:?} offenders {offenders:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn gate_published_webhook_secret_is_refused_in_every_intake_mode() {
+        for intake in [Some("poll"), Some("webhook"), None] {
+            let mut recorded = full();
+            let api = recorded["api"].as_object_mut().unwrap();
+            api.insert(
+                "githubWebhookSecret".to_string(),
+                serde_json::json!("dev-webhook-secret"),
+            );
+            if let Some(value) = intake {
+                api.insert("githubFactoryIntake".to_string(), serde_json::json!(value));
+            }
+            assert_eq!(
+                intake_gate_offenders(&recorded, &serde_json::json!({})),
+                vec!["GITHUB_WEBHOOK_SECRET"],
+                "intake {intake:?}"
+            );
         }
     }
 

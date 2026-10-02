@@ -383,6 +383,8 @@ fn happy_argv(fx: &Fixture) -> Vec<String> {
     vec![
         "cluster".into(),
         "factory".into(),
+        "--intake".into(),
+        "webhook".into(),
         "--app-id".into(),
         APP_ID.into(),
         "--private-key-file".into(),
@@ -607,6 +609,76 @@ fn app_id_and_key_infer_mention_allowlist_label_and_store_the_key_in_a_secret() 
         !log.contains(WEBHOOK_SECRET),
         "webhook secret leaked into argv: {log}"
     );
+}
+
+#[test]
+fn printed_poll_completion_configures_intake_without_a_webhook_secret() {
+    let fx = Fixture::installed();
+    let output = fx.run(&[
+        "cluster",
+        "factory",
+        "--intake",
+        "poll",
+        "--app-id",
+        APP_ID,
+        "--private-key-file",
+        &fx.path("app.pem"),
+        "--chart",
+        "charts/curie",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "output: {}",
+        combined(&output)
+    );
+    let values: serde_json::Value = serde_json::from_str(&fx.values_file()).expect("helm values");
+    assert_eq!(
+        values.pointer("/api/githubFactoryIntake"),
+        Some(&serde_json::json!("poll"))
+    );
+    assert!(values.pointer("/api/githubWebhookSecret").is_none());
+    assert!(fx.log().contains("helm upgrade"));
+    assert!(!fx.applied().is_empty());
+}
+
+#[test]
+fn webhook_completion_without_a_secret_is_refused_before_any_mutation() {
+    let fx = Fixture::installed();
+    let output = fx.run(&[
+        "cluster",
+        "factory",
+        "--intake",
+        "webhook",
+        "--app-id",
+        APP_ID,
+        "--private-key-file",
+        &fx.path("app.pem"),
+        "--chart",
+        "charts/curie",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(USAGE_EXIT),
+        "output: {}",
+        combined(&output)
+    );
+    assert!(combined(&output).contains("GITHUB_WEBHOOK_SECRET"));
+    fx.assert_no_mutation();
+}
+
+#[test]
+fn unsupported_intake_is_a_usage_error_before_any_external_call() {
+    let fx = Fixture::installed();
+    let output = fx.run(&["cluster", "factory", "--intake", "push"]);
+    assert_eq!(
+        output.status.code(),
+        Some(USAGE_EXIT),
+        "output: {}",
+        combined(&output)
+    );
+    fx.assert_no_mutation();
+    assert!(fx.github.recorded().is_empty());
 }
 
 #[test]

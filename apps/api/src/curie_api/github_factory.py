@@ -440,11 +440,19 @@ async def admit_notice(
         # once for a fresh admission, or when a stopping run's replacement is
         # admitted (ADR 0186 decision 5).
         facts = replace(facts, base=await _fresh_base(notice, verified, settings, client))
-    if notice.disposition == "mention":
-        result = await workitem_dispatch.admit_revision(session, facts)
-    else:
-        result = await workitem_dispatch.readmit(session, facts)
-    return _admission_result(result, facts.request_id)
+    # Dispatch helpers commit between WorkItem creation and request creation.
+    # Keep those commits inside savepoints so the caller's issue lock remains
+    # held until admission and delivery settlement commit together.
+    async with AsyncSession(
+        bind=await session.connection(),
+        join_transaction_mode="create_savepoint",
+        expire_on_commit=False,
+    ) as admission:
+        if notice.disposition == "mention":
+            result = await workitem_dispatch.admit_revision(admission, facts)
+        else:
+            result = await workitem_dispatch.readmit(admission, facts)
+        return _admission_result(result, facts.request_id)
 
 
 async def record_base_label_notice(

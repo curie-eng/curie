@@ -815,3 +815,72 @@ def test_a_post_that_is_not_a_tools_call_is_forwarded_without_a_grant() -> None:
             assert [seen["body"] for seen in upstream.seen] == [body]
 
     _run(go)
+
+
+def test_a_batched_gated_tools_call_without_a_grant_never_reaches_the_server() -> None:
+    # The gated call is the second array element.
+    body = (
+        b'[{"jsonrpc":"2.0","id":1,"method":"tools/list"},'
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+        b'"params":{"name":"merge_pull_request","arguments":{"n":1}}}]'
+    )
+
+    async def go() -> None:
+        async with _gated(grant_store=MemoryGrantStore()) as (upstream, proxy):
+            status, content_type, payload = await _post(proxy, body, _caller_headers())
+            assert status == _REFUSAL["status"]
+            assert content_type == _REFUSAL["content_type"]
+            assert payload == _grant_required_body()
+            assert upstream.seen == []
+
+    _run(go)
+
+
+def test_a_batched_gated_tools_call_forwards_once_when_the_grant_matches() -> None:
+    # The gated call is the second array element.
+    body = (
+        b'[{"jsonrpc":"2.0","id":1,"method":"tools/list"},'
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+        b'"params":{"name":"merge_pull_request","arguments":{"n":1}}}]'
+    )
+    grant = _mint_grant("merge_pull_request", {"n": 1}, jti="jti-batch")
+    headers = _caller_headers(grant)
+
+    async def go() -> None:
+        async with _gated(grant_store=MemoryGrantStore()) as (upstream, proxy):
+            status, _content_type, _payload = await _post(proxy, body, headers)
+            assert status == 201
+            assert [seen["body"] for seen in upstream.seen] == [body]
+            assert caller.HEADER not in upstream.seen[0]["headers"]
+            assert server.GRANT_HEADER not in upstream.seen[0]["headers"]
+            status, content_type, payload = await _post(proxy, body, headers)
+            assert status == _REFUSAL["status"]
+            assert content_type == _REFUSAL["content_type"]
+            assert payload == _grant_required_body()
+            assert len(upstream.seen) == 1
+
+    _run(go)
+
+
+def test_two_gated_calls_in_one_batch_are_refused_without_spending_the_grant() -> None:
+    body = (
+        b'[{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+        b'"params":{"name":"merge_pull_request","arguments":{"n":1}}},'
+        b'{"jsonrpc":"2.0","id":2,"method":"tools/call",'
+        b'"params":{"name":"merge_pull_request","arguments":{"n":1}}}]'
+    )
+    grant = _mint_grant("merge_pull_request", {"n": 1}, jti="jti-two")
+    headers = _caller_headers(grant)
+
+    async def go() -> None:
+        async with _gated(grant_store=MemoryGrantStore()) as (upstream, proxy):
+            status, content_type, payload = await _post(proxy, body, headers)
+            assert status == _REFUSAL["status"]
+            assert content_type == _REFUSAL["content_type"]
+            assert payload == _grant_required_body()
+            assert upstream.seen == []
+            status, _content_type, _payload = await _post(proxy, _MERGE_CALL, headers)
+            assert status == 201
+            assert [seen["body"] for seen in upstream.seen] == [_MERGE_CALL]
+
+    _run(go)

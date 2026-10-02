@@ -263,6 +263,7 @@ async def _poll_repository(
         sessionmaker,
         settings,
         client,
+        cursor,
         api=api,
         token=token,
         repo=repo,
@@ -303,7 +304,6 @@ async def _poll_repository(
         settings,
         client,
         cursor,
-        now=now,
         api=api,
         token=token,
         repo=repo,
@@ -398,40 +398,47 @@ async def _admit_labeled(
     )
     if listed is None:
         return
+    deferred = False
     for issue in listed:
         if not isinstance(issue, dict) or "pull_request" in issue:
             continue
         number = issue.get("number")
         if type(number) is not int or number <= 0:
             continue
-        events = await _events(client, api=api, token=token, repo_path=repo_path, number=number)
-        event = _last_label_event(events, label)
-        if event is None or type(event.get("id")) is not int:
-            continue
-        sender = _human_actor(event)
-        if sender is None:
-            continue
-        sender_id, sender_login = sender
-        notice = FactoryNotice(
-            uuid.uuid4(),
-            "issues",
-            "labeled",
-            "admit",
-            installation_id,
-            repository_id,
-            repo,
-            number,
-            sender_id,
-            sender_login,
-            label=label,
-            label_event_id=event["id"],
-        )
-        if await _label_already_admitted(sessionmaker, repository_id, number, event):
-            # Later base labels only report disagreement with the frozen base.
-            # Reusing the admission here would cancel or replace the live run.
-            notice = replace(notice, disposition="base_label")
-        await _apply_notice(sessionmaker, settings, client, notice)
-    if etag:
+        try:
+            events = await _events(
+                client, api=api, token=token, repo_path=repo_path, number=number
+            )
+            event = _last_label_event(events, label)
+            if event is None or type(event.get("id")) is not int:
+                continue
+            sender = _human_actor(event)
+            if sender is None:
+                continue
+            sender_id, sender_login = sender
+            notice = FactoryNotice(
+                uuid.uuid4(),
+                "issues",
+                "labeled",
+                "admit",
+                installation_id,
+                repository_id,
+                repo,
+                number,
+                sender_id,
+                sender_login,
+                label=label,
+                label_event_id=event["id"],
+            )
+            if await _label_already_admitted(sessionmaker, repository_id, number, event):
+                # Later base labels only report disagreement with the frozen base.
+                # Reusing the admission here would cancel or replace the live run.
+                notice = replace(notice, disposition="base_label")
+            await _apply_notice(sessionmaker, settings, client, notice)
+        except (_Unavailable, FeedbackUnavailable, FeedbackIgnored):
+            deferred = True
+            logger.info("factory labeled issue poll for %s issue %s deferred", repo, number)
+    if etag and not deferred:
         cursor.etags["issues"] = etag
 
 
@@ -439,6 +446,7 @@ async def _cancel_stale(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
     client: httpx.AsyncClient,
+    cursor: _Cursor,
     *,
     api: str,
     token: str,
@@ -457,49 +465,103 @@ async def _cancel_stale(
                 )
             )
         )
-        numbers = [item.github_issue_number for item in items if item.github_issue_number]
+        numbers = sorted(
+            {item.github_issue_number for item in items if item.github_issue_number}
+        )
     label = settings.github_factory_label
+    keys = {f"issue:{number}:{label}" for number in numbers}
+    for key in list(cursor.etags):
+        if key.startswith("issue:") and key not in keys:
+            del cursor.etags[key]
     for number in numbers:
-        issue = await get_github_json(
-            client,
-            api=api,
-            token=token,
-            path=f"{repo_path}/issues/{number}",
-            refusal="issue_unavailable",
+        key = f"issue:{number}:{label}"
+        try:
+            issue, etag = await _conditional_issue(
+                client,
+                api=api,
+                token=token,
+                path=f"{repo_path}/issues/{number}",
+                etag=cursor.etags.get(key),
+            )
+            if issue is None or "pull_request" in issue:
+                continue
+            names = _label_names(issue)
+            if names is None or issue.get("state") not in {"open", "closed"}:
+                raise _Unavailable(f"{repo_path}/issues/{number}")
+            if issue.get("state") == "closed":
+                action, kind = "closed", "closed"
+            elif label not in names:
+                action, kind = "unlabeled", "unlabeled"
+            else:
+                if etag:
+                    cursor.etags[key] = etag
+                continue
+            # Retry cancellation authority on every pass until it succeeds.
+            # A cached issue must not hide a later permission or event repair.
+            cursor.etags.pop(key, None)
+            events = await _events(
+                client, api=api, token=token, repo_path=repo_path, number=number
+            )
+            event = _last_kind(events, kind, label=label if kind == "unlabeled" else None)
+            if event is None:
+                continue
+            sender = _human_actor(event)
+            if sender is None:
+                continue
+            sender_id, sender_login = sender
+            notice = FactoryNotice(
+                uuid.uuid4(),
+                "issues",
+                action,
+                "cancel",
+                installation_id,
+                repository_id,
+                repo,
+                number,
+                sender_id,
+                sender_login,
+                label=label,
+            )
+            await _apply_notice(sessionmaker, settings, client, notice)
+        except (_Unavailable, FeedbackUnavailable, FeedbackIgnored):
+            logger.info("factory stale issue poll for %s issue %s deferred", repo, number)
+
+
+async def _conditional_issue(
+    client: httpx.AsyncClient,
+    *,
+    api: str,
+    token: str,
+    path: str,
+    etag: str | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read current state, without charging unchanged issues to the rate budget.
+
+    Authenticated conditional requests returning 304 do not count against the
+    primary rate limit. A cached value is used only for an open labeled issue.
+    https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#use-conditional-requests-if-appropriate
+    """
+
+    headers = github_headers(token)
+    if etag:
+        headers["If-None-Match"] = etag
+    try:
+        response = await client.get(
+            f"{api}{path}", headers=headers, follow_redirects=False
         )
-        if "pull_request" in issue:
-            continue
-        names = _label_names(issue)
-        if names is None:
-            raise _Unavailable(f"{repo_path}/issues/{number}")
-        if issue.get("state") == "closed":
-            action, kind = "closed", "closed"
-        elif label not in names:
-            action, kind = "unlabeled", "unlabeled"
-        else:
-            continue
-        events = await _events(client, api=api, token=token, repo_path=repo_path, number=number)
-        event = _last_kind(events, kind, label=label if kind == "unlabeled" else None)
-        if event is None:
-            continue
-        sender = _human_actor(event)
-        if sender is None:
-            continue
-        sender_id, sender_login = sender
-        notice = FactoryNotice(
-            uuid.uuid4(),
-            "issues",
-            action,
-            "cancel",
-            installation_id,
-            repository_id,
-            repo,
-            number,
-            sender_id,
-            sender_login,
-            label=label,
-        )
-        await _apply_notice(sessionmaker, settings, client, notice)
+    except httpx.HTTPError:
+        raise _Unavailable(path) from None
+    if response.status_code == 304 and etag:
+        return None, response.headers.get("etag") or etag
+    if response.status_code != 200:
+        raise _Unavailable(path)
+    try:
+        issue = response.json()
+    except ValueError:
+        raise _Unavailable(path) from None
+    if not isinstance(issue, dict):
+        raise _Unavailable(path)
+    return issue, response.headers.get("etag")
 
 
 async def _issue_numbers(
@@ -747,7 +809,6 @@ async def _admit_reviews(
     client: httpx.AsyncClient,
     cursor: _Cursor,
     *,
-    now: datetime,
     api: str,
     token: str,
     repo: str,
@@ -756,8 +817,10 @@ async def _admit_reviews(
     installation_id: int,
     owned: list[int],
 ) -> None:
-    since = _since_param(cursor.reviews_since, now)
-    collected: list[Any] = []
+    keys = {f"reviews:{number}" for number in owned}
+    for key in list(cursor.etags):
+        if key.startswith("reviews:") and key not in keys:
+            del cursor.etags[key]
     for number in owned:
         key = f"reviews:{number}"
         listed, etag = await _list(
@@ -765,7 +828,7 @@ async def _admit_reviews(
             api=api,
             token=token,
             path=f"{repo_path}/pulls/{number}/reviews",
-            params={"since": since},
+            params={},
             etag=cursor.etags.get(key),
         )
         if listed is None:
@@ -790,10 +853,8 @@ async def _admit_reviews(
                     "review": review,
                 },
             )
-        collected.extend(listed)
         if etag:
             cursor.etags[key] = etag
-    cursor.reviews_since = _advance(cursor.reviews_since, collected, "submitted_at")
 
 
 async def _apply_notice(

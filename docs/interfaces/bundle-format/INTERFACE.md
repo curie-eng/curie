@@ -313,15 +313,21 @@ nothing `plugin-format` ships applies a policy, which is why that handshake exis
 gap that no in-package mechanism can close: a platform built before this package version does not
 model the key at all, and the lenient models accept and silently ignore it.
 
-The two Curie-only root files degrade **more quietly still**, and they belong on the same list. A
+The three Curie-only root files degrade **more quietly still**, and they belong on the same list. A
 manifest extension at least draws a warning: `claude plugin validate examples/compat-fixture` (the
 fixture at `examples/compat-fixture/.claude-plugin/plugin.json`, which exists to carry all six)
 reports one `Unknown field ... Claude Code ignores it at load time` warning per extension.
-`connectors.yaml` and `deploy.yaml` are not manifest fields at all, so Claude Code neither loads them
-nor mentions them: validating `examples/weather` (which carries `examples/weather/connectors.yaml`)
+`connectors.yaml`, `connectors.lock.yaml`, and `deploy.yaml` are not manifest fields at all, so
+Claude Code neither loads them nor mentions them: validating `examples/weather` (which carries `examples/weather/connectors.yaml`)
 warns only about the manifest's `starterPrompts` and says nothing about the connector file. A bundle
 whose tool surface is declared through `connectors.yaml` therefore loads in Claude Code with those
-servers simply absent, and with no signal at all that anything was dropped. `deploy.yaml` degrades
+servers simply absent, and with no signal at all that anything was dropped. `connectors.lock.yaml`
+loses something Curie treats as authoritative: the pinned connector identity. On Curie, the lock's
+resolved image digest is the only identity a `build:` connector deploys or starts under
+(`packages/plugin-format/src/plugin_format/connector_lock.py::apply_lock`), together with its
+delivery mode, platforms, and source digest. A Claude Code consumer ignores the file, so even a
+consumer that wired the connectors up by hand would get no digest pin and no guarantee it runs the
+image the bundle version was built and deployed with. `deploy.yaml` degrades
 harmlessly by comparison, since routing is Curie's concern and Claude Code has nothing to route.
 
 The outbound gate covers this unevenly, and the gap is worth naming.
@@ -332,8 +338,8 @@ happens to carry one. `examples/sre-bot` carries a `deploy.yaml`, so the outboun
 bundle directory containing that file and proves Claude Code tolerates it. The separate
 `examples/tests/test_sre_bot_hygiene.py` suite also requires that file and validates its Curie
 semantics, so removing it does fail coverage. The remaining unevenness is that the generic plugin
-compatibility coverage pins manifest fields only: neither Curie-only root file belongs to Claude
-Code's manifest model, and this gate does not prove their presence or semantics across bundles.
+compatibility coverage pins manifest fields only: none of the three Curie-only root files belongs to
+Claude Code's manifest model, and this gate does not prove their presence or semantics across bundles.
 
 The `hooks`
 field is no longer dead: as of #272 it is validated at deploy time (`HookMatcherConfig` /

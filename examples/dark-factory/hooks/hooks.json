@@ -9,7 +9,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Agent|Task|Bash|.*publish_changes|.*add_issue_comment",
+        "matcher": "Agent|Task|Bash|.*publish_changes",
         "hooks": [
           {"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/review_gate.py", "timeout": 10}
         ]
@@ -17,7 +17,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Agent|Task|.*add_issue_comment",
+        "matcher": "Agent|Task",
         "hooks": [
           {"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/review_gate.py", "timeout": 10}
         ]

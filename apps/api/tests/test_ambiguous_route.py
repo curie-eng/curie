@@ -175,7 +175,12 @@ def test_a_hook_reply_surface_with_two_routes_on_the_pair_is_a_conflict(
     secret = hook_signing.derive(get_settings().api_key, agent_id=agent_id, generation=0)
     timestamp = str(int(time.time()))
     signature = hook_signing.sign(
-        secret, timestamp=timestamp, delivery_id="two-routes-1", body=body
+        secret,
+        timestamp=timestamp,
+        delivery_id="two-routes-1",
+        hook="issues",
+        tool_access=None,
+        body=body,
     )
 
     resp = hooks_client.post(

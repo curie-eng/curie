@@ -13,7 +13,7 @@ use clap::ValueEnum;
 use curie_aci_protocol::{Budget, EventType, OutboundEvent, SessionStatus};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{ApiClient, BudgetConfig, ChannelOutcome, RoutingCheck};
+use crate::api::{ApiClient, ChannelOutcome, RoutingCheck};
 use crate::bundle::{git_status_is_clean_for_pack, pack_tar_gz};
 use crate::docker::{self, CheckSpec, StartSpec};
 use crate::evals::{
@@ -6452,14 +6452,15 @@ pub async fn resume(opts: AgentActionOpts) -> Result<ResumeOutput> {
 }
 
 /// Output of `<tier> budget <agent>`: the dry-run plan, or the saved budget.
-/// `max_usd_per_day` is `None` when the platform default applies. Owns its data
-/// so it outlives the `ApiClient`.
+/// Each limit is `None` when the platform default applies. Owns its data so it
+/// outlives the `ApiClient`.
 #[derive(Debug)]
 pub enum BudgetOutput {
     DryRun(crate::ui::DryRunPlan),
     Done {
         agent: String,
         max_usd_per_day: Option<f64>,
+        max_output_tokens_per_run: Option<u64>,
     },
 }
 
@@ -6470,7 +6471,12 @@ impl crate::ui::CliOutput for BudgetOutput {
             BudgetOutput::Done {
                 agent,
                 max_usd_per_day,
-            } => serde_json::json!({"agent": agent, "max_usd_per_day": max_usd_per_day}),
+                max_output_tokens_per_run,
+            } => serde_json::json!({
+                "agent": agent,
+                "max_usd_per_day": max_usd_per_day,
+                "max_output_tokens_per_run": max_output_tokens_per_run,
+            }),
         }
     }
 
@@ -6480,42 +6486,87 @@ impl crate::ui::CliOutput for BudgetOutput {
             BudgetOutput::Done {
                 agent,
                 max_usd_per_day,
+                max_output_tokens_per_run,
             } => {
                 let usd = max_usd_per_day
                     .map(|v| format!("${v}/day"))
                     .unwrap_or_else(|| "platform default".to_string());
-                ui.payload(&format!("budget for {agent} set: max $/day {usd}"));
+                let tokens = max_output_tokens_per_run
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "platform default".to_string());
+                ui.payload(&format!(
+                    "budget for {agent} set: max output tokens/run {tokens}, max $/day {usd}"
+                ));
             }
         }
     }
 }
 
-/// `curie cluster budget <agent> --limit <n>`: set the agent budget
-/// (`PUT /agents/{id}/budget`). `--limit` sets the daily spend cap
-/// (`max_usd_per_day`, the primary `BudgetConfig` field the console surfaces as
-/// "Max $/day"); the per-run token cap is left at the platform default.
+/// Update the agent budget through `GET /agents/{id}/budget` followed by
+/// `PUT /agents/{id}/budget`. `--limit` sets `max_usd_per_day` and
+/// `--output-tokens` sets `max_output_tokens_per_run`. At least one is required;
+/// the current value of each unspecified field is preserved.
 /// `--dry-run` returns the plan and makes no request.
-pub async fn budget(opts: AgentActionOpts, limit: f64) -> Result<BudgetOutput> {
+pub async fn budget(
+    opts: AgentActionOpts,
+    limit: Option<f64>,
+    output_tokens: Option<u64>,
+) -> Result<BudgetOutput> {
     let ui = crate::ui::ui();
+    // Validated before the dry-run early return (#3710): a dry run shows what
+    // the real command would do, so it must refuse a --limit the real command
+    // would refuse instead of printing a plan for it.
+    if limit.is_none() && output_tokens.is_none() {
+        return Err(crate::exit::usage(
+            "at least one of --limit or --output-tokens is required",
+        ));
+    }
+    if let Some(limit) = limit {
+        if !limit.is_finite() || limit <= 0.0 {
+            return Err(crate::exit::usage(format!(
+                "--limit must be a finite value greater than 0 (got {limit})"
+            )));
+        }
+    }
+    if output_tokens == Some(0) {
+        return Err(crate::exit::usage(
+            "--output-tokens must be greater than 0 (got 0)",
+        ));
+    }
     if opts.dry_run {
+        let mut selected = serde_json::Map::new();
+        if let Some(limit) = limit {
+            selected.insert("max_usd_per_day".to_string(), serde_json::json!(limit));
+        }
+        if let Some(output_tokens) = output_tokens {
+            selected.insert(
+                "max_output_tokens_per_run".to_string(),
+                serde_json::json!(output_tokens),
+            );
+        }
         return Ok(BudgetOutput::DryRun(crate::ui::DryRunPlan {
-            lines: vec![format!(
-                "PUT {}/agents/<id>/budget  {{\"max_usd_per_day\":{limit}}}  (would resolve agent {:?} first)",
-                opts.api_url, opts.agent
-            )],
+            lines: vec![
+                format!(
+                    "GET {}/agents/<id>/budget  (would resolve agent {:?} first; read current fields to preserve unspecified limits)",
+                    opts.api_url, opts.agent
+                ),
+                format!(
+                    "PUT {}/agents/<id>/budget  {}  (update selected fields and preserve all unspecified current values, including platform defaults)",
+                    opts.api_url,
+                    serde_json::Value::Object(selected)
+                ),
+            ],
         }));
     }
-    if !limit.is_finite() || limit <= 0.0 {
-        return Err(crate::exit::usage(format!(
-            "--limit must be a finite value greater than 0 (got {limit})"
-        )));
-    }
-    let cfg = BudgetConfig {
-        max_output_tokens_per_run: None,
-        max_usd_per_day: Some(limit),
-    };
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
+    let mut cfg = client.get_budget(&agent.id).await?;
+    if let Some(limit) = limit {
+        cfg.max_usd_per_day = Some(limit);
+    }
+    if let Some(output_tokens) = output_tokens {
+        cfg.max_output_tokens_per_run = Some(output_tokens);
+    }
     let cl = ui.checklist();
     let step = cl.step(&format!("setting budget for {}", agent.name));
     let saved = match client.set_budget(&agent.id, &cfg).await {
@@ -6531,6 +6582,7 @@ pub async fn budget(opts: AgentActionOpts, limit: f64) -> Result<BudgetOutput> {
     Ok(BudgetOutput::Done {
         agent: agent.name,
         max_usd_per_day: saved.max_usd_per_day,
+        max_output_tokens_per_run: saved.max_output_tokens_per_run,
     })
 }
 
@@ -7858,7 +7910,9 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                 } else {
                     ui.payload(&format!("{agent} — {} pending approval(s):", records.len()));
                     for r in records {
-                        let tool = r.granted_tool.as_deref().unwrap_or("-");
+                        let tool =
+                            crate::render::action_label(r.granted_tool.as_deref().unwrap_or(""));
+                        let display = crate::approval_wording::approval_display(r);
                         let route = r.route.as_deref().unwrap_or("(requesting channel)");
                         // A null card_channel means an older row or a direct API
                         // write that omitted the field, for which the requesting
@@ -7889,8 +7943,8 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                         ui.kv(
                             &r.id,
                             &format!(
-                                "{}: {} [tool: {tool}, route: {route}, channel: {card}, current route approvers: {approvers}, by: {}]",
-                                r.summary, r.conversation_id, r.author
+                                "{}: {} [action: {tool}, route: {route}, channel: {card}, current route approvers: {approvers}, by: {}]",
+                                display, r.conversation_id, r.author
                             ),
                         );
                     }
@@ -9736,7 +9790,9 @@ impl crate::ui::CliOutput for HookFireOutput {
 }
 
 fn hook_fire_path(agent: &str, name: &str) -> String {
-    format!("/agents/{agent}/hooks/{name}/fire")
+    // Delegate to the same builder `fire_hook` encodes its request with, so the
+    // dry-run plan cannot drift from the path the real request uses (#3731).
+    crate::api::hook_fire_path(agent, name)
 }
 
 /// `<tier> hook fire`: run the hook now and print the record once it settles.

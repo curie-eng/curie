@@ -74,6 +74,8 @@ from plugin_format import (
     resolve_manifest,
 )
 
+from .approval_wording import describe_approval, presentation_text
+from .caller_feedback import action_label
 from .memory_facts import (
     FORGET_TOOL,
     MAX_STATEMENT_CHARS,
@@ -246,6 +248,9 @@ PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__report_progress"
 # Deliberate progress (ADR 0130's ``curie_progress``), mounted on the same server
 # whenever ``report_progress`` is not; see ``turn_progress.py``.
 TURN_PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TURN_PROGRESS_TOOL}"
+# The GitHub factory's platform issue read (ADR 0187), mounted on the same
+# server only when the worker injected the issue read route and capability.
+ISSUE_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__get_issue"
 
 # Curie's own platform-owned MCP servers are ``curie`` and ``curie-state``
 # (#2286). The runner mounts both itself and a bundle cannot declare either:
@@ -276,15 +281,16 @@ TURN_PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TURN_PROGRESS_TOOL}"
 # exempting its name costs nothing, and making the exemption depend on the
 # pager decision would add a second way for the two to disagree. The same
 # reasoning covers ``report_progress`` (#3077), mounted only for a factory
-# execution: it reports a phase and never acts, so it is never gated. And it
-# covers ``progress`` (ADR 0130), mounted only for eligible human turns: it
-# reports task state and never acts either.
+# execution: it reports a phase and never acts, so it is never gated.
+# This also covers ``progress`` (ADR 0130), mounted only for eligible human
+# turns, and ``get_issue`` (ADR 0187), which reads only the execution's own issue.
 _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
     {
         APPROVAL_TOOL_NAME,
         PLATFORM_PUBLISH_TOOL_NAME,
         PROGRESS_TOOL_NAME,
         TURN_PROGRESS_TOOL_NAME,
+        ISSUE_TOOL_NAME,
     }
 )
 
@@ -453,6 +459,7 @@ def build_approval_server(
     progress_tool: SdkMcpTool[Any] | None = None,
     turn_progress_tool: SdkMcpTool[Any] | None = None,
     memory_tools: Sequence[SdkMcpTool[Any]] = (),
+    issue_tool: SdkMcpTool[Any] | None = None,
 ) -> McpSdkServerConfig:
     """Build the in-process MCP server carrying applicable approval tools.
 
@@ -481,6 +488,9 @@ def build_approval_server(
 
     ``memory_tools`` (#1461) are ``remember``/``update``/``forget``, passed only
     when the worker set a channel memory ref.
+
+    ``issue_tool`` (ADR 0187) is the ``get_issue`` tool, appended only for an
+    execution with a WorkItem, when the worker injected its read capability.
     """
 
     @tool(_TOOL_NAME, _TOOL_DESCRIPTION, _TOOL_SCHEMA)
@@ -514,6 +524,8 @@ def build_approval_server(
     elif turn_progress_tool is not None:
         tools.append(turn_progress_tool)
     tools.extend(memory_tools)
+    if issue_tool is not None:
+        tools.append(issue_tool)
 
     return create_sdk_mcp_server(
         name=APPROVAL_SERVER_NAME,
@@ -1113,8 +1125,10 @@ class ApprovalGate:
         self.pending_summary = summarize_tool_call(tool_name, tool_input)
         template = self.summary_by_tool.get(tool_name)
         self.pending_display = (
-            render_gate_summary(template, tool_input) if template else None
-        )
+            render_gate_summary(presentation_text(template, tool_name), tool_input)
+            if template
+            else None
+        ) or describe_approval(tool_name, tool_input)
         self.pending_route = self.route_by_tool.get(tool_name)
         # Provenance for the permission gate (#544, Decision C): the tool
         # name here is the value ``can_use_tool`` itself denied -- the
@@ -1349,10 +1363,9 @@ def _canonical_arguments(arguments: dict[str, Any]) -> str:
 
 def _grant_mismatch_refusal(tool_name: str) -> str:
     return (
-        f"The approval for {tool_name} covers only the exact arguments the approver "
-        "saw, and this call's arguments differ. It was not run. Retry with exactly "
-        "the approved arguments, or tell the user what changed so they can approve "
-        "the new call."
+        f"The approval for {action_label(tool_name)} covers only the approved details, "
+        "and this request has different details. It was not run. Use the approved "
+        "details, or tell the user what changed so they can approve the new request."
     )
 
 
@@ -1387,9 +1400,9 @@ async def _decide_gate(
             blocked=False,
             ungated=False,
             refusal=(
-                f"{tool_name} is denied by this agent's tool policy. This is not an "
-                "approval you can request -- the policy forbids the call. Do not retry "
-                "it; say what you were trying to do and stop."
+                f"The {action_label(tool_name)} action is not permitted for this agent. "
+                "Approval cannot authorize it. It was not run. Do not retry; "
+                "explain what you were trying to do and stop."
             ),
         )
     # Policy gates are additive to legacy/operator gates. A policy allow never

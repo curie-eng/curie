@@ -380,14 +380,32 @@ def test_sandbox_termination_comment_shows_kubernetes_reason(admitted: Any) -> N
 
 
 @pytest.mark.parametrize(
-    ("number", "detail"),
+    ("number", "detail", "field", "value", "remedy"),
     [
-        (9916, "run failed"),
-        (9917, "The run reached its output token limit"),
+        (
+            9916,
+            "output token budget exceeded (max_output_tokens_per_run=64000)",
+            "max_output_tokens_per_run",
+            "64000",
+            "curie cluster budget <agent> --output-tokens <tokens>",
+        ),
+        (
+            9917,
+            "USD budget exceeded (max_usd_per_day=6.5)",
+            "max_usd_per_day",
+            "6.5",
+            "curie cluster budget <agent> --limit <usd>",
+        ),
+        (9923, "run failed", None, None, None),
     ],
 )
-def test_budget_failure_comment_names_both_limits_and_the_usd_command(
-    admitted: Any, number: int, detail: str  # noqa: F811
+def test_budget_failure_comment_identifies_the_limit_or_admits_it_is_unknown(
+    admitted: Any,  # noqa: F811
+    number: int,
+    detail: str,
+    field: str | None,
+    value: str | None,
+    remedy: str | None,
 ) -> None:
     client, github, sink = admitted
     request_id = _admit(client, github, sink, number)
@@ -407,16 +425,24 @@ def test_budget_failure_comment_names_both_limits_and_the_usd_command(
     body = comment["body"]
     headline = body.splitlines()[0]
     assert headline.startswith("Could not complete:")
-    assert "USD cap" in headline
-    assert "daily" not in headline
-    assert "output token limit" in headline
-    assert "`curie cluster budget <agent> --limit <usd>`" in headline
+    if field is None:
+        assert "cannot identify" in headline.lower()
+        assert "curie cluster budget" not in body
+        assert "--limit" not in body
+        assert "--output-tokens" not in body
+    else:
+        assert field in headline
+        assert value is not None and value in headline
+        assert f"`{remedy}`" in headline
+        other_remedy = "--limit" if field == "max_output_tokens_per_run" else "--output-tokens"
+        assert other_remedy not in body
     assert f"Provider message: {detail}" in body
     assert "Cause: budget_exceeded" in body
     assert "Status: FAILED" in body
     assert FINAL_MARKER in body
     assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
     assert sink.posts == 1
+    assert len(_marked(sink, request_id)) == 1
 
 
 def test_history_capacity_failure_notice_explains_retry(admitted: Any) -> None:  # noqa: F811

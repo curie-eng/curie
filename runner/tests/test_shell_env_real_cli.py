@@ -2,10 +2,11 @@
 
 Docker and k8s both inject the boot env into this runner process. The Bash
 tool is a child of the bundled Claude CLI, not a substrate-specific shell.
-Measured on claude-agent-sdk 0.2.159 with bundled CLI 2.1.281: with
-CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 the CLI keeps ANTHROPIC_API_KEY for its
-own messages call and omits it from Bash. Curie tokens are not in that
-scrub list, so the runner must remove them before the CLI is spawned.
+Measured on claude-agent-sdk0.2.159 with bundled CLI2.1.281: the optional
+subprocess scrub mode does not cover this native Bash path. The mandatory
+CLAUDE_CODE_SHELL override launches an isolated trusted interpreter before
+startup or snapshots; model authentication remains in the CLI parent.
+Official override surface: https://code.claude.com/docs/en/env-vars.
 """
 
 from __future__ import annotations
@@ -83,7 +84,10 @@ async def _messages(request: web.Request) -> web.StreamResponse:
         delta = {
             "type": "input_json_delta",
             "partial_json": json.dumps(
-                {"command": "env", "description": "print the shell environment"}
+                {
+                    "command": request.app["command"],
+                    "description": "print outer and nested shell environments",
+                }
             ),
         }
     events = [
@@ -124,14 +128,26 @@ def test_bash_env_omits_platform_credentials_while_the_model_call_keeps_its_key(
     monkeypatch.setenv("CURIE_CONNECTOR_CALLER_TOKEN", "cct.example-caller")
     monkeypatch.setenv("ANTHROPIC_API_KEY", _MODEL_KEY)
     monkeypatch.setenv("CURIE_MODEL", "claude-sonnet-5")
+    monkeypatch.setenv("STDIO_TOKEN", "connector-sentinel")
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     cwd = tmp_path / "workspace"
     cwd.mkdir()
+    startup = cwd / "startup.sh"
+    startup.write_text(
+        'if [ -n "${ANTHROPIC_API_KEY-}" ]; then printf bad > "$ACME_STARTUP_CAPTURE"; fi\n'
+        "export CURIE_TEST_SHELL=boundary-kept\n"
+    )
+    untrusted = cwd / "untrusted-shell"
+    untrusted.write_text('#!/bin/sh\nenv > "$ACME_UNTRUSTED_CAPTURE"\nexec /bin/bash "$@"\n')
+    untrusted.chmod(0o755)
+    capture = cwd / "startup-capture"
+    untrusted_capture = cwd / "untrusted-capture"
 
     async def scenario() -> tuple[list[str], list[dict[str, Any]], list[str]]:
         app = web.Application()
         app["bodies"] = []
         app["api_keys"] = []
+        app["command"] = f"source {startup}; env; bash -c env"
         app.router.add_post("/v1/messages", _messages)
         app.router.add_route("*", "/{tail:.*}", _anything_else)
         async with TestServer(app, host="127.0.0.1") as server:
@@ -148,9 +164,14 @@ def test_bash_env_omits_platform_credentials_while_the_model_call_keeps_its_key(
                     "ANTHROPIC_BASE_URL": str(server.make_url("")).rstrip("/"),
                     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
                     "DISABLE_TELEMETRY": "1",
+                    "CLAUDE_CODE_SHELL": str(untrusted),
+                    "CURIE_SHELL_PYTHON": "/workspace/untrusted-python",
+                    "ACME_STARTUP_CAPTURE": str(capture),
+                    "ACME_UNTRUSTED_CAPTURE": str(untrusted_capture),
                 },
             )
             runner = SessionRunner(
+                max_usd_per_day=None,
                 held_secrets=frozenset(),
                 session_factory=lambda: ClaudeAgentSession(options),
                 ceiling=0,
@@ -177,6 +198,11 @@ def test_bash_env_omits_platform_credentials_while_the_model_call_keeps_its_key(
     assert len(finals) == 1, lines
     rendered = "\n".join(_tool_result_text(body) for body in bodies)
     assert "CURIE_MODEL=claude-sonnet-5" in rendered
+    assert "STDIO_TOKEN=connector-sentinel" in rendered
+    assert "CURIE_TEST_SHELL=boundary-kept" in rendered
+    assert not capture.exists(), "startup observed a model credential before command cleanup"
+    assert not untrusted_capture.exists(), "SDK options replaced the trusted shell launcher"
+    assert rendered.count("CURIE_MODEL=claude-sonnet-5") >= 2
     for sentinel in _SENTINELS:
         assert sentinel not in rendered, sentinel
     assert _MODEL_KEY in api_keys

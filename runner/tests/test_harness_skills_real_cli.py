@@ -229,6 +229,7 @@ def _run_turn(
                 held_secrets=frozenset(),
                 session_factory=lambda: ClaudeAgentSession(options),
                 ceiling=0,
+                max_usd_per_day=1.0,
                 tracer=RunTracer(None),
                 classifier=SideEffectClassifier(),
                 trace_name="curie-run:acme-skills",

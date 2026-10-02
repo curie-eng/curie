@@ -633,12 +633,13 @@ class ClaudeAgentSession:
         # The SDK copies os.environ into the CLI at spawn. Install the parent
         # env (model key kept, platform tokens removed) for that copy, then
         # restore the process env so in-process clients keep what they captured.
-        # BASH_ENV points at an unset prelude so the Bash tool drops the model
-        # key before the command runs. The CLI parent still has the key.
+        # The mandatory shell launcher drops the model key before user startup
+        # files and SDK snapshots run. The CLI parent still authenticates.
         from .subprocess_env import (
             CLI_PARENT_MODEL_KEYS,
             cli_parent_env,
             platform_credential_names,
+            sdk_shell_env,
         )
 
         snapshot = dict(os.environ)
@@ -646,6 +647,9 @@ class ClaudeAgentSession:
         for key in list(self._options.env):
             if key in denied and key not in CLI_PARENT_MODEL_KEYS:
                 self._options.env.pop(key, None)
+        # SDK options override inherited env at spawn. Pin authority last in
+        # both maps so options cannot select an unsanitized shell/interpreter.
+        self._options.env.update(sdk_shell_env())
         try:
             os.environ.clear()
             os.environ.update(cli_parent_env(snapshot))

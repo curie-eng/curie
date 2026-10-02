@@ -826,10 +826,6 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/dark-factory/README.md"),
     ),
     (
-        ".mcp.json",
-        include_bytes!("../../examples/dark-factory/.mcp.json"),
-    ),
-    (
         ".gitignore",
         include_bytes!("../../examples/dark-factory/.gitignore"),
     ),

@@ -16,6 +16,8 @@ _FACTORY_ENV = (
     "GITHUB_APP_PRIVATE_KEY",
     "GITHUB_WEBHOOK_SECRET",
     "GITHUB_REPO_ALLOWLIST",
+    "GITHUB_FACTORY_RECONCILE_INTERVAL_S",
+    "GITHUB_FACTORY_RECONCILE_GRACE_S",
 )
 
 
@@ -73,6 +75,20 @@ def test_poll_intake_accepts_an_empty_webhook_secret() -> None:
 
     assert settings.github_webhook_secret == ""
     assert settings.github_factory_intake == "poll"
+
+
+def test_poll_intake_accepts_a_configured_webhook_secret() -> None:
+    settings = _enabled(github_factory_intake="poll")
+
+    assert settings.github_webhook_secret == "example-factory-hmac-secret"
+    assert settings.github_factory_intake == "poll"
+
+
+def test_poll_intake_refuses_the_published_webhook_secret() -> None:
+    with pytest.raises(ValidationError) as exc:
+        _enabled(github_factory_intake="poll", github_webhook_secret="dev-webhook-secret")
+
+    assert "GITHUB_WEBHOOK_SECRET" in str(exc.value)
 
 
 _RECONCILE_SETTINGS = (

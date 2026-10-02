@@ -126,7 +126,8 @@ def test_read_only_allows_exactly_the_classified_tools() -> None:
     ):
         reason = access.refusal(tool)
         assert reason is not None, tool
-        assert tool in reason
+        assert "mcp__" not in reason
+        assert "was not run" in reason
         assert "read-only" in reason
 
 
@@ -368,6 +369,7 @@ def _fake_runner(
         tool_access=access,
     )
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=10_000,
@@ -874,6 +876,7 @@ def test_the_steer_route_refuses_a_different_access_with_409() -> None:
     access = _access()
     session = _Held(default_turn, tool_access=access)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=10_000,
@@ -929,6 +932,7 @@ def _counting_runner(access: TurnToolAccess) -> tuple[SessionRunner, list[FakeMo
         return session
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=factory,
         ceiling=10_000,
@@ -1006,3 +1010,13 @@ def test_a_refused_progress_demo_call_gets_only_its_refusal(
     for tool_use_id, blocks in results.items():
         assert len(blocks) == 1, (tool_use_id, blocks)
         assert blocks[0].is_error, (tool_use_id, blocks)
+
+
+def test_read_only_feedback_uses_plain_action_and_keeps_exact_denied_id() -> None:
+    access = _read_only(_access())
+    reason = access.refuse("mcp__acme__delete_files", "call-acme-1")
+    assert reason is not None
+    assert "delete files" in reason
+    assert "mcp__" not in reason
+    assert "call-acme-1" in access.refused_call_ids
+    assert access.refusal(_READ_ONLY_MCP) is None

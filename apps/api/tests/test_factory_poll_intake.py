@@ -138,6 +138,7 @@ class PollGitHub:
 
     calls: list[httpx.Request] = field(default_factory=list)
     saw_304: bool = False
+    failures: dict[str, int] = field(default_factory=dict)
     issues: dict[int, _PlantedIssue] = field(default_factory=dict)
     comments: dict[int, dict[str, Any]] = field(default_factory=dict)
     review_comments: dict[int, dict[str, Any]] = field(default_factory=dict)
@@ -332,6 +333,8 @@ class PollGitHub:
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(request)
         path = request.url.path
+        if path in self.failures:
+            return httpx.Response(self.failures[path], json={"message": "Unavailable fixture"})
         root = f"/repos/{REPO}"
         if path == root:
             return httpx.Response(
@@ -417,6 +420,9 @@ class PollGitHub:
             pr_text, _, review_tail = tail.partition("/reviews")
             pr = int(pr_text)
             if review_tail in ("", "/"):
+                # GitHub lists reviews with pagination and no since filter:
+                # https://docs.github.com/en/rest/pulls/reviews#list-reviews-for-a-pull-request
+                assert "since" not in request.url.params
                 owned = [
                     _public_review(review)
                     for review in self.reviews.values()
@@ -457,7 +463,12 @@ class PollGitHub:
             issue = self.issues.get(number)
             if issue is None:
                 return httpx.Response(404, json={"message": "missing fixture"})
-            return httpx.Response(200, json=self._issue_body(issue))
+            body = self._issue_body(issue)
+            etag = f'"{hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()}"'
+            if request.headers.get("if-none-match") == etag:
+                self.saw_304 = True
+                return httpx.Response(304, headers={"ETag": etag})
+            return httpx.Response(200, json=body, headers={"ETag": etag})
         if path == f"{root}/collaborators/{SENDER}/permission":
             return httpx.Response(
                 200,
@@ -787,6 +798,162 @@ def test_poll_cancels_a_closed_labeled_issue(
     assert rows[0]["cancelled_at"] is not None
     assert rows[0]["status"] == "cancelled"
     assert rows[0]["terminal_cause"] == "issue_cancelled"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "status"),
+    [("issue", 404), ("issue", 301), ("events", 500), ("events", 301)],
+)
+def test_poll_defers_one_unreadable_issue_and_continues_other_intake(
+    poll_factory: tuple[TestClient, PollGitHub], endpoint: str, status: int
+) -> None:
+    client, github = poll_factory
+    unavailable, unavailable_request = _admit_label(client, github)
+    closed, _closed_request = _admit_label(client, github)
+    mentioned, _mentioned_request = _admit_label(client, github)
+    reviewed, reviewed_request = _admit_label(client, github)
+    _run_once(github)
+
+    # A GitHub 404 can conceal permissions; it cannot prove an issue was closed.
+    # https://docs.github.com/en/rest/issues/issues#get-an-issue
+    # https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api#404-not-found-for-an-existing-resource
+    path = f"/repos/{REPO}/issues/{unavailable}"
+    if endpoint == "events":
+        github.close_issue(unavailable)
+        path += "/events"
+    github.failures[path] = status
+    github.close_issue(closed)
+    comment_id, review_id = 73501, 74501
+    github.add_issue_comment(mentioned, comment_id, f"@{MENTION} please revise the helper")
+    github._etags["issue-comments"] = '"healthy-mention-after-unavailable-issue"'
+    pull = github.plant_pull()
+    _own_pull_request(reviewed_request["work_item_id"], pull)
+    _complete(reviewed_request["id"])
+    github.add_review(pull, review_id, f"@{MENTION} please rename the helper")
+    github.calls.clear()
+
+    _run_once(github)
+
+    assert any(request.url.path == path for request in github.calls)
+    unreadable = _requests(unavailable)
+    assert len(unreadable) == 1
+    assert unreadable[0]["id"] == unavailable_request["id"]
+    assert unreadable[0]["cancelled_at"] is None
+    assert unreadable[0]["status"] != "cancelled"
+    cancelled = _requests(closed)
+    assert cancelled[0]["cancelled_at"] is not None
+    assert cancelled[0]["terminal_cause"] == "issue_cancelled"
+    assert _mention_request_id(comment_id) in {row["id"] for row in _requests(mentioned)}
+    assert _feedback_request_id("pull_request_review", review_id) in {
+        row["id"] for row in _requests(reviewed)
+    }
+    del github.failures[path]
+    github.close_issue(unavailable)
+
+    _run_once(github)
+
+    recovered = _requests(unavailable)
+    assert recovered[0]["cancelled_at"] is not None
+    assert recovered[0]["terminal_cause"] == "issue_cancelled"
+
+
+def test_poll_retries_a_new_label_after_event_read_failure_without_blocking_other_intake(
+    poll_factory: tuple[TestClient, PollGitHub],
+) -> None:
+    client, github = poll_factory
+    mentioned, _mentioned_request = _admit_label(client, github)
+    unavailable = github.plant_issue()
+    healthy = github.plant_issue()
+    path = f"/repos/{REPO}/issues/{unavailable}/events"
+    github.failures[path] = 500
+    comment_id = 73502
+    github.add_issue_comment(mentioned, comment_id, f"@{MENTION} please revise the helper")
+
+    _run_once(github)
+
+    assert _requests(unavailable) == []
+    healthy_rows = _requests(healthy)
+    assert len(healthy_rows) == 1
+    assert healthy_rows[0]["id"] == _label_request_id(healthy, github.issues[healthy].event_id)
+    mentioned_rows = _requests(mentioned)
+    assert _mention_request_id(comment_id) in {row["id"] for row in mentioned_rows}
+    del github.failures[path]
+    github.calls.clear()
+
+    _run_once(github)
+
+    listings = [
+        request for request in github.calls if request.url.path == f"/repos/{REPO}/issues"
+    ]
+    assert len(listings) == 1
+    assert "if-none-match" not in listings[0].headers
+    recovered = _requests(unavailable)
+    assert len(recovered) == 1
+    assert recovered[0]["id"] == _label_request_id(unavailable, github.issues[unavailable].event_id)
+    assert [row["id"] for row in _requests(healthy)] == [row["id"] for row in healthy_rows]
+    assert [row["id"] for row in _requests(mentioned)] == [row["id"] for row in mentioned_rows]
+
+
+def test_stale_issue_conditional_read_still_cancels_after_an_issue_changes(
+    poll_factory: tuple[TestClient, PollGitHub],
+) -> None:
+    client, github = poll_factory
+    number, _row = _admit_label(client, github)
+    _run_once(github)
+    body = github._issue_body(github.issues[number])
+    etag = f'"{hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()}"'
+    github.calls.clear()
+    github.saw_304 = False
+
+    _run_once(github)
+
+    reads = [
+        request for request in github.calls if request.url.path == f"/repos/{REPO}/issues/{number}"
+    ]
+    # Current authority and status title reads may use the same issue route.
+    # The stale scan itself must make exactly one authenticated conditional read.
+    conditional = [request for request in reads if "if-none-match" in request.headers]
+    assert len(conditional) == 1
+    assert conditional[0].headers.get("authorization") == "Bearer fixture-installation-token"
+    assert conditional[0].headers.get("if-none-match") == etag
+    assert github.saw_304
+    assert _requests(number)[0]["cancelled_at"] is None
+    github.close_issue(number)
+    github.calls.clear()
+
+    _run_once(github)
+
+    reads = [
+        request for request in github.calls if request.url.path == f"/repos/{REPO}/issues/{number}"
+    ]
+    conditional = [request for request in reads if "if-none-match" in request.headers]
+    assert len(conditional) == 1
+    assert conditional[0].headers.get("if-none-match") == etag
+    rows = _requests(number)
+    assert rows[0]["cancelled_at"] is not None
+    assert rows[0]["terminal_cause"] == "issue_cancelled"
+
+
+def test_stale_issue_cache_does_not_cross_a_configured_label_change(
+    poll_factory: tuple[TestClient, PollGitHub], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, github = poll_factory
+    number, _row = _admit_label(client, github)
+    _run_once(github)
+    monkeypatch.setenv("GITHUB_FACTORY_LABEL", f"{LABEL}-changed")
+    get_settings.cache_clear()
+    github.calls.clear()
+
+    _run_once(github)
+
+    reads = [
+        request for request in github.calls if request.url.path == f"/repos/{REPO}/issues/{number}"
+    ]
+    assert reads
+    assert all("if-none-match" not in request.headers for request in reads)
+    # The changed label has no authoritative unlabeled event, so a fresh read
+    # alone must not infer cancellation.
+    assert _requests(number)[0]["cancelled_at"] is None
 
 
 def test_poll_admits_a_mention_once(poll_factory: tuple[TestClient, PollGitHub]) -> None:

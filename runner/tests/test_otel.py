@@ -135,6 +135,7 @@ def _export_turn(
             SimpleSpanProcessor(HttpOTLPSpanExporter(endpoint=collector_endpoint))
         )
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=session_factory,
         ceiling=0,
@@ -582,6 +583,7 @@ def test_steer_during_provider_wait_preserves_generation_and_ttft(
     async def go() -> tuple[list[object], BlockingSteerSession]:
         session = BlockingSteerSession()
         runner = SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=0,
@@ -1060,6 +1062,7 @@ def test_run_emits_agent_generation_and_tool_spans() -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,  # default_turn: text + Bash tool + result usage
         ceiling=0,
@@ -1100,6 +1103,7 @@ def test_generation_model_backfilled_from_sdk_when_unconfigured() -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
@@ -1136,6 +1140,7 @@ def test_run_stamps_langfuse_session_and_user_ids() -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
@@ -1166,6 +1171,7 @@ def test_run_omits_langfuse_user_id_when_event_user_empty() -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
@@ -1197,6 +1203,7 @@ def test_run_stamps_approval_decision_when_resuming_a_resolved_approval() -> Non
     provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
@@ -1226,6 +1233,7 @@ def test_run_omits_approval_decision_on_an_ordinary_turn() -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
@@ -1380,6 +1388,7 @@ def test_run_span_uses_explicit_parent_instead_of_ambient_context() -> None:
     parent, parent_span_context = _remote_parent()
     ambient_tracer = TracerProvider().get_tracer("ambient")
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
@@ -1586,6 +1595,7 @@ def test_approval_halt_abort_is_a_paused_non_error_terminal() -> None:
         can_use_tool=record_gate,
     )
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
@@ -1639,6 +1649,7 @@ def test_interrupt_requested_wins_over_error_result_and_sdk_abort_reason() -> No
     ]
     fake = FakeModelSession(lambda: script, truncate_on_interrupt=False)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
@@ -1751,6 +1762,7 @@ def test_abandoned_turn_reports_interrupted_not_stale_prior_success(
 
     monkeypatch.setattr(session_module, "record_metric", capture)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
