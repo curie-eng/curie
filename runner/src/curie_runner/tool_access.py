@@ -35,6 +35,8 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 
+from .caller_feedback import action_label
+
 #: The ``ToolAccess`` values this runner enforces, advertised on ``/status``.
 ENFORCED_TOOL_ACCESS: tuple[ToolAccess, ...] = (ToolAccess.READ_ONLY,)
 
@@ -96,7 +98,7 @@ class TurnToolAccess:
         ):
             return None
         return (
-            f"{tool_name or _UNNAMED_TOOL} was not run: this turn is read-only. Only "
+            f"The {action_label(tool_name)} action was not run: this turn is read-only. Only "
             "tools classified read-only may run on it, and it cannot request an "
             "approval. Do not retry the call; answer with what you can read."
         )

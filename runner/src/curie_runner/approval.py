@@ -75,6 +75,7 @@ from plugin_format import (
 )
 
 from .approval_wording import describe_approval, presentation_text
+from .caller_feedback import action_label
 from .publication_precheck import PublicationPrecheck
 from .state import STATE_TOOL_NAMES
 
@@ -1141,10 +1142,9 @@ def _canonical_arguments(arguments: dict[str, Any]) -> str:
 
 def _grant_mismatch_refusal(tool_name: str) -> str:
     return (
-        f"The approval for {tool_name} covers only the exact arguments the approver "
-        "saw, and this call's arguments differ. It was not run. Retry with exactly "
-        "the approved arguments, or tell the user what changed so they can approve "
-        "the new call."
+        f"The approval for {action_label(tool_name)} covers only the approved details, "
+        "and this request has different details. It was not run. Use the approved "
+        "details, or tell the user what changed so they can approve the new request."
     )
 
 
@@ -1179,9 +1179,9 @@ async def _decide_gate(
             blocked=False,
             ungated=False,
             refusal=(
-                f"{tool_name} is denied by this agent's tool policy. This is not an "
-                "approval you can request -- the policy forbids the call. Do not retry "
-                "it; say what you were trying to do and stop."
+                f"The {action_label(tool_name)} action is not permitted for this agent. "
+                "Approval cannot authorize it. It was not run. Do not retry; "
+                "explain what you were trying to do and stop."
             ),
         )
     # Policy gates are additive to legacy/operator gates. A policy allow never

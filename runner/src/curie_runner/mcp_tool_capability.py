@@ -133,9 +133,10 @@ def _probe_error_leaves(exc: BaseException) -> tuple[BaseException, ...]:
 
 @dataclass(frozen=True)
 class ConnectorCapabilityFailure:
-    """A declared-connector capability/auth failure safe to show a caller (#2519).
+    """A declared-connector capability/auth failure with two representations (#2519).
 
-    Names the connector and the credential env var. Never carries a secret
+    Diagnostic text names the connector and credential env var; caller text
+    explains the unavailable service without internal identifiers. Never carries a secret
     value: diagnosis keys on placeholder presence versus env emptiness, and
     probe exceptions are mapped to ``probe_failed`` without ``str(exc)``.
 
@@ -153,7 +154,33 @@ class ConnectorCapabilityFailure:
     refusal: str | None = None
 
     def caller_message(self) -> str:
-        """The exact sentence the message caller sees. Values never appear."""
+        """Plain feedback based only on the observed failure category."""
+
+        if self.reason == "caller_refused":
+            return (
+                "Connected service access was refused. Ask an administrator to "
+                "check access permissions before trying again."
+            )
+        if self.reason in ("empty_expansion", "missing_credential"):
+            return (
+                "Connected service features are unavailable because sign-in settings "
+                "are missing or empty. Ask an administrator to check the connection settings."
+            )
+        if self.reason == "probe_misconfigured":
+            return (
+                "Connected service features are unavailable because the connection "
+                "settings or supported actions are invalid. Ask an administrator to "
+                "check the connection settings."
+            )
+        attempts = f" after {self.attempts} attempts" if self.attempts > 1 else ""
+        return (
+            "Connected service features are unavailable: "
+            f"the service could not be reached{attempts}. "
+            "Try again later. If this continues, ask an administrator to check the connection."
+        )
+
+    def diagnostic_message(self) -> str:
+        """Technical diagnosis for logs; credential values never appear."""
 
         names = ", ".join(self.credential_names)
         if self.reason == "caller_refused":
