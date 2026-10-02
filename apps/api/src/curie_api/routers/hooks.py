@@ -76,10 +76,11 @@ from sqlalchemy.orm import selectinload
 from .. import crud, hook_signing
 from ..config import get_settings
 from ..delivery import (
+    backlog_reservation,
     claim_delivery,
     duplicate_stream_id,
     enqueue_owned,
-    release_claim,
+    settle_failed_delivery,
     sha16,
     take_backlog_slot,
 )
@@ -532,141 +533,157 @@ async def ingest_hook(
     owner = f"pending:{pysecrets.token_hex(16)}"
     client: redis.Redis = request.app.state.valkey
 
+    reservation = backlog_reservation(
+        key_prefix=f"{_CLAIM_PREFIX}:backlog:{agent.id}",
+        window_s=settings.hook_backlog_window_s,
+    )
+    preserve_quota = False
+
     # Two attempts, not a loop: the second exists only for the narrow case where
     # the claim key expired between our failed `SET NX` and the `GET` that would
     # have named its owner.
     for _attempt in range(2):
         if await claim_delivery(client, key, owner, settings.channel_delivery_lease_s):
-            if not await take_backlog_slot(
-                client,
-                key_prefix=f"{_CLAIM_PREFIX}:backlog:{agent.id}",
-                limit=settings.hook_backlog_limit,
-                window_s=settings.hook_backlog_window_s,
-            ):
-                # Metered per AGENT, not per hook: the thing worth bounding is how
-                # much work one agent's upstreams can create, and per-hook quotas
-                # would let a source multiply its allowance by inventing names.
-                await release_claim(client, key, owner)
-                logger.warning(
-                    "hook ingress refused event_id=%s: agent backlog quota of %d per %ds exceeded",
-                    event_id,
-                    settings.hook_backlog_limit,
-                    settings.hook_backlog_window_s,
-                )
-                raise HTTPException(
-                    status.HTTP_429_TOO_MANY_REQUESTS,
-                    "too many new hook deliveries for this agent; retry later",
-                    headers={"Retry-After": str(settings.hook_backlog_window_s)},
-                )
-            if mapping.selects_workspace and mapping.repository is not None:
-                await crud.select_thread_workspace(
-                    session,
-                    agent_id=agent.id,
-                    deployment_id=None,
-                    conversation_id=thread_id,
-                    repo_full_name=mapping.repository,
-                    selected_by=f"hook:{hook}",
-                    revision=mapping.revision,
-                )
-            turn = _mint_turn(
-                agent,
-                binding,
-                hook,
-                event_id,
-                raw,
-                partition=partition,
-                outcome=mapping,
-                tool_access=tool_access,
-            )
-            carrier: dict[str, str] = {}
-            enqueue_error: Exception | None = None
-            enqueue_result: tuple[bool, str] | None = None
-            with operation_span(
-                "curie.queue.enqueue",
-                kind=SpanKind.PRODUCER,
-                attributes={"service.name": "curie-api", "source": "api"},
-            ) as span:
-                inject_trace_context(carrier)
-                try:
-                    enqueue_result = await enqueue_owned(
-                        client,
-                        key=key,
-                        stream=settings.runs_stream,
-                        owner=owner,
-                        payload=turn.model_dump_json(),
-                        payload_field=STREAM_PAYLOAD_FIELD,
-                        lease_s=settings.channel_delivery_lease_s,
-                        transport_field=(
-                            TRACEPARENT_STREAM_FIELD
-                            if TRACEPARENT_STREAM_FIELD in carrier
-                            else None
-                        ),
-                        transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+            try:
+                if not await take_backlog_slot(
+                    client,
+                    reservation=reservation,
+                    limit=settings.hook_backlog_limit,
+                ):
+                    # Metered per AGENT, not per hook: the thing worth bounding is how
+                    # much work one agent's upstreams can create, and per-hook quotas
+                    # would let a source multiply its allowance by inventing names.
+                    preserve_quota = True
+                    logger.warning(
+                        "hook ingress refused event_id=%s: agent backlog quota "
+                        "of %d per %ds exceeded",
+                        event_id,
+                        settings.hook_backlog_limit,
+                        settings.hook_backlog_window_s,
                     )
-                except Exception as exc:
-                    enqueue_error = exc
-                    span.set_status(StatusCode.ERROR)
-                    span.add_event("queue.enqueue.failed", {"outcome": "failure"})
-                else:
-                    assert enqueue_result is not None
-                    span.add_event(
-                        "queue.enqueued" if enqueue_result[0] else "queue.duplicate",
-                        {"outcome": "success" if enqueue_result[0] else "pending"},
+                    raise HTTPException(
+                        status.HTTP_429_TOO_MANY_REQUESTS,
+                        "too many new hook deliveries for this agent; retry later",
+                        headers={"Retry-After": str(settings.hook_backlog_window_s)},
                     )
-            if enqueue_error is not None:
-                record_metric(
-                    "curie.queue.enqueue",
-                    attributes={
-                        "service.name": "curie-api",
-                        "source": "api",
-                        "outcome": "failure",
-                    },
-                )
-                raise enqueue_error
-            assert enqueue_result is not None
-            enqueued, current = enqueue_result
-            if enqueued:
-                record_metric(
-                    "curie.queue.enqueue",
-                    attributes={
-                        "service.name": "curie-api",
-                        "source": "api",
-                        "outcome": "success",
-                    },
-                )
-                record_metric(
-                    "curie.turn.accepted",
-                    attributes={
-                        "service.name": "curie-api",
-                        "source": "api",
-                        "outcome": "accepted",
-                    },
-                )
-                # The conversation id is here because it is the operator's only
-                # server-side record of which thread a delivery landed on. There
-                # is no verb that resets every partition of one hook, so a
-                # partition is reset by its full id, and this line plus the
-                # receipt are the two places that id is shown.
-                logger.info(
-                    "hook ingress enqueued event_id=%s stream_id=%s hook=%s conversation_id=%s",
-                    event_id,
-                    current,
+                if mapping.selects_workspace and mapping.repository is not None:
+                    await crud.select_thread_workspace(
+                        session,
+                        agent_id=agent.id,
+                        deployment_id=None,
+                        conversation_id=thread_id,
+                        repo_full_name=mapping.repository,
+                        selected_by=f"hook:{hook}",
+                        revision=mapping.revision,
+                    )
+                turn = _mint_turn(
+                    agent,
+                    binding,
                     hook,
-                    turn.conversation_id,
+                    event_id,
+                    raw,
+                    partition=partition,
+                    outcome=mapping,
+                    tool_access=tool_access,
                 )
-                return HookAccepted(
-                    event_id=event_id,
-                    stream_id=current,
-                    duplicate=False,
-                    conversation_id=turn.conversation_id,
-                    tool_access=turn.tool_access,
+                carrier: dict[str, str] = {}
+                enqueue_error: Exception | None = None
+                enqueue_result: tuple[bool, str] | None = None
+                with operation_span(
+                    "curie.queue.enqueue",
+                    kind=SpanKind.PRODUCER,
+                    attributes={"service.name": "curie-api", "source": "api"},
+                ) as span:
+                    inject_trace_context(carrier)
+                    try:
+                        enqueue_result = await enqueue_owned(
+                            client,
+                            key=key,
+                            stream=settings.runs_stream,
+                            owner=owner,
+                            payload=turn.model_dump_json(),
+                            payload_field=STREAM_PAYLOAD_FIELD,
+                            lease_s=settings.channel_delivery_lease_s,
+                            transport_field=(
+                                TRACEPARENT_STREAM_FIELD
+                                if TRACEPARENT_STREAM_FIELD in carrier
+                                else None
+                            ),
+                            transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+                        )
+                    except Exception as exc:
+                        enqueue_error = exc
+                        span.set_status(StatusCode.ERROR)
+                        span.add_event("queue.enqueue.failed", {"outcome": "failure"})
+                    else:
+                        assert enqueue_result is not None
+                        span.add_event(
+                            "queue.enqueued" if enqueue_result[0] else "queue.duplicate",
+                            {"outcome": "success" if enqueue_result[0] else "pending"},
+                        )
+                if enqueue_error is not None:
+                    record_metric(
+                        "curie.queue.enqueue",
+                        attributes={
+                            "service.name": "curie-api",
+                            "source": "api",
+                            "outcome": "failure",
+                        },
+                    )
+                    raise enqueue_error
+                assert enqueue_result is not None
+                enqueued, current = enqueue_result
+                if enqueued:
+                    record_metric(
+                        "curie.queue.enqueue",
+                        attributes={
+                            "service.name": "curie-api",
+                            "source": "api",
+                            "outcome": "success",
+                        },
+                    )
+                    record_metric(
+                        "curie.turn.accepted",
+                        attributes={
+                            "service.name": "curie-api",
+                            "source": "api",
+                            "outcome": "accepted",
+                        },
+                    )
+                    # The conversation id is here because it is the operator's only
+                    # server-side record of which thread a delivery landed on. There
+                    # is no verb that resets every partition of one hook, so a
+                    # partition is reset by its full id, and this line plus the
+                    # receipt are the two places that id is shown.
+                    logger.info(
+                        "hook ingress enqueued event_id=%s stream_id=%s hook=%s conversation_id=%s",
+                        event_id,
+                        current,
+                        hook,
+                        turn.conversation_id,
+                    )
+                    return HookAccepted(
+                        event_id=event_id,
+                        stream_id=current,
+                        duplicate=False,
+                        conversation_id=turn.conversation_id,
+                        tool_access=turn.tool_access,
+                    )
+                # Not `turn.conversation_id`: this request enqueued nothing, so the thread
+                # the delivery landed on is the one the WINNING turn named, whatever
+                # partition this body derives.
+                return await _duplicate_receipt(
+                    client, settings.runs_stream, current, response, event_id, tool_access
                 )
-            # Not `turn.conversation_id`: this request enqueued nothing, so the thread
-            # the delivery landed on is the one the WINNING turn named, whatever
-            # partition this body derives.
-            return await _duplicate_receipt(
-                client, settings.runs_stream, current, response, event_id, tool_access
-            )
+            except BaseException:
+                await settle_failed_delivery(
+                    client,
+                    key=key,
+                    owner=owner,
+                    reservation=reservation,
+                    preserve_quota=preserve_quota,
+                )
+                raise
         held = await client.get(key)
         if held is not None:
             current = _text(held)
