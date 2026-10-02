@@ -148,8 +148,10 @@ class _EnvSnapshotSession:
 
     snapshots: list[dict[str, str]] = []
 
-    def __init__(self) -> None:
+    def __init__(self, memory_turn: object = None) -> None:
         self.bash_env: str = ""
+        self.memory_turn = memory_turn
+        self.write_token_during_turn: str | None = None
 
     async def connect(self) -> None:
         return None
@@ -157,6 +159,8 @@ class _EnvSnapshotSession:
     async def query(self, _text: str) -> None:
         from curie_runner.subprocess_env import cli_parent_env
 
+        if self.memory_turn is not None:
+            self.write_token_during_turn = self.memory_turn.write_token  # type: ignore[attr-defined]
         type(self).snapshots = [
             dict(os.environ),
             shell_and_hook_env(os.environ, extra={"CLAUDE_PLUGIN_ROOT": "/bundle"}),
@@ -190,8 +194,8 @@ def test_turn_memory_token_never_reaches_env_hooks_or_bash() -> None:
     from curie_runner.session import SessionRunner
 
     token = "sbx.turn-memory-sentinel.sig"
-    session = _EnvSnapshotSession()
     memory_turn = MemoryTurn()
+    session = _EnvSnapshotSession(memory_turn)
     runner = SessionRunner(
         held_secrets=frozenset(),
         session_factory=lambda: session,
@@ -201,7 +205,6 @@ def test_turn_memory_token_never_reaches_env_hooks_or_bash() -> None:
         trace_name="t",
         memory_turn=memory_turn,
     )
-    seen: dict[str, object] = {}
 
     async def go() -> None:
         await runner.start()
@@ -209,15 +212,16 @@ def test_turn_memory_token_never_reaches_env_hooks_or_bash() -> None:
             event = Event(type="message", text="hi", user="U123", ts="1", memory_token=token)
             async for _line in runner.run_turn(event):
                 pass
-            seen["write_token"] = memory_turn.write_token
         finally:
             await runner.close()
 
     anyio.run(go)
 
-    # The runner did take the credential for its tools...
-    assert seen["write_token"] == token
-    # ...and no subprocess-facing env carries it, under any name.
+    # While the turn ran, the runner held the credential for its tools (so the
+    # checks below are not vacuous)...
+    assert session.write_token_during_turn == token
+    # ...and no env a subprocess spawned at that moment would get carries it,
+    # under any name.
     assert len(_EnvSnapshotSession.snapshots) == 3
     for env in _EnvSnapshotSession.snapshots:
         assert token not in "\n".join(f"{k}={v}" for k, v in env.items())
