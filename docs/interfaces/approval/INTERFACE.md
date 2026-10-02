@@ -50,6 +50,19 @@ in code now:
   a past-SLA record flips to expired (410) and now also enqueues the expiry resume turn
   (#412, below) so the late resolver's dead end no longer strands the session. Creation is
   idempotent on `dedupe_key` (the triggering event id).
+- **Break-glass recovery, off by default (landed, #2753).** A second, separately
+  mounted surface (`apps/api/src/curie_api/routers/approval_recovery.py::recover_approval`,
+  `POST /approvals/{id}/recover`) settles a stranded approval as `rejected`. A session
+  approval then wakes its session on the ordinary resume path. A publication approval
+  wakes nothing: recovery settles its publication as denied instead. It is not the resolve path: it never calls the
+  authorizer or consults route membership. It authenticates with the platform key, takes
+  the operator principal only to name the actor, and refuses with 403 unless
+  `approval_recovery_enabled` (`CURIE_APPROVAL_RECOVERY_ENABLED`,
+  `api.approvalRecovery.enabled`) is set. When enabled, any platform-key holder can reject
+  any pending approval installation-wide, including ones the ordinary path could resolve.
+  The status change and its audit row commit in one transaction, and a retry with the same
+  `recovery_key` returns the recorded outcome without enqueueing again. The read-only
+  `GET /approvals/identity-report` sits on the same router and needs only the platform key.
 - **No re-raise after a rejection (landed, #2885).** `POST /approvals` refuses, with 409
   code `approval.rejected_in_thread` (frozen with the worker in
   `tests/vectors/approval-reraise-refusal.json`), a request for an approval a person
@@ -551,8 +564,10 @@ An approval with a NULL `agent_id` that nonetheless names a route falls under th
 rule and is refused too — `get_approval_route_binding` returns a bare None for every miss,
 and the split is on whether the approval named a route, not on why the binding is missing.
 An approval that names NO route never had a narrower set to lose and keeps channel
-membership. The recovery from a stuck approval is to restore the binding, after which it
-resolves normally; nothing is lost.
+membership. The ordinary recovery from a stuck approval is to restore the binding, after
+which it resolves normally; nothing is lost. When the binding cannot be restored, an
+operator on an installation with `approval_recovery_enabled` can reject the approval
+through break-glass recovery (Current contract), which is audited and only ever rejects.
 
 ### The three ports
 
@@ -629,7 +644,13 @@ tool call under any asserted identity. ADR-0033 (#410) closed the sandbox-key ga
 minting a scoped, agent-bound `state` token that only the state router accepts. ADR-0106
 closes the remaining caller-assertion gap: the resolve endpoint now accepts only a
 dispatcher-attested `chat` token, a live subject-bound Console session, or a signed
-subject-bound `operator` token. The platform key alone resolves nothing. A
+subject-bound `operator` token. On the ordinary resolve path the platform key alone
+resolves nothing. Break-glass recovery is the exception: when an operator enables
+`approval_recovery_enabled`, the platform key plus any operator principal for attribution
+can reject any pending approval installation-wide, bypassing the authorizer. That blast
+radius is accepted rather than fenced, so the setting stays off by default and every use
+lands in the audit trail in the same transaction as its effect. Recovery cannot approve,
+and the sandbox's scoped token cannot reach it. A
 notification transport credential likewise confers no resolution capability: the
 notification contains no interaction, and this contract exposes no second-channel resolver.
 The runtime `PreToolUse` hook (`build_approval_hook`, #1852) is the first interceptor
