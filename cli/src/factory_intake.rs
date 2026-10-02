@@ -366,10 +366,9 @@ pub fn intake_gate_offenders(
     let secret_is_missing = api
         .get("githubWebhookSecret")
         .is_none_or(serde_json::Value::is_null);
-    let generated_secret = secret_is_missing && !allow_dev_defaults;
     let published_secret =
         secret == "dev-webhook-secret" || (secret_is_missing && allow_dev_defaults);
-    if published_secret || (intake == "webhook" && !generated_secret && secret.trim().is_empty()) {
+    if published_secret || (intake == "webhook" && secret.trim().is_empty()) {
         bad.push("GITHUB_WEBHOOK_SECRET");
     }
     let label = api_str(&api, "githubFactoryLabel");
@@ -1046,10 +1045,18 @@ mod tests {
                         vec!["GITHUB_WEBHOOK_SECRET"]
                     );
 
+                    let sealed_offenders = if intake == Some("webhook") {
+                        vec!["GITHUB_WEBHOOK_SECRET"]
+                    } else {
+                        vec![]
+                    };
                     let planned = serde_json::json!({"security": {"allowDevDefaults": false}});
-                    assert!(intake_gate_offenders(&recorded, &planned).is_empty());
+                    assert_eq!(intake_gate_offenders(&recorded, &planned), sealed_offenders);
                     recorded["security"]["allowDevDefaults"] = serde_json::json!(false);
-                    assert!(intake_gate_offenders(&recorded, &serde_json::json!({})).is_empty());
+                    assert_eq!(
+                        intake_gate_offenders(&recorded, &serde_json::json!({})),
+                        sealed_offenders
+                    );
                     let planned = serde_json::json!({"security": {"allowDevDefaults": true}});
                     assert_eq!(
                         intake_gate_offenders(&recorded, &planned),
