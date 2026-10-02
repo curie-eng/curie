@@ -482,8 +482,8 @@ the exact messages that found the defect.
 4. Find the campaign's report by its id, as "continue" does, and read each
    explicit per-case and repeat status. Preserve prior UNCLEAR, BLOCKED and
    NOT RUN; an unlisted case has unknown prior status, never an inferred PASS.
-   If the report or its exact case evidence is missing, say so and report each
-   new verdict with unknown prior status. Only a known PASS or FAIL may use the
+   When the report cannot be found, or its exact case evidence is missing,
+   say so and report each new verdict with unknown prior status. Only a known PASS or FAIL may use the
    comparisons below; other statuses show their old and new values directly.
    Report each probe with known prior PASS/FAIL as one of:
    - newly failing: it passed before and fails now;
