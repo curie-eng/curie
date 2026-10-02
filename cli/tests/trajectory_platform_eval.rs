@@ -295,6 +295,13 @@ fn run_platform_eval_against(tier: &str, server: support::MockServer) -> (Output
     };
 
     let output = command.output().expect("run platform trajectory eval");
+    if tier == "cluster" {
+        assert!(
+            parsed_output(&output)["cases"].is_array(),
+            "cluster proxy must start and deliver structured cases: {}",
+            output_text(&output)
+        );
+    }
     (output, server.recorded())
 }
 
