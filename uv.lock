@@ -15,6 +15,7 @@ members = [
     "curie-discord-adapter",
     "curie-dispatcher",
     "curie-doclint",
+    "curie-e2e-connector",
     "curie-mail-adapter",
     "curie-runner",
     "curie-telemetry",
@@ -822,6 +823,23 @@ requires-dist = [
 ]
 
 [[package]]
+name = "curie-e2e-connector"
+version = "0.0.0"
+source = { editable = "apps/e2e-connector" }
+dependencies = [
+    { name = "httpx" },
+    { name = "mcp" },
+    { name = "pyyaml" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.28" },
+    { name = "mcp", specifier = ">=1.28.1" },
+    { name = "pyyaml", specifier = ">=6" },
+]
+
+[[package]]
 name = "curie-mail-adapter"
 version = "0.0.0"
 source = { editable = "apps/mail-adapter" }
@@ -931,6 +949,7 @@ dependencies = [
     { name = "cronsim" },
     { name = "curie-channel-protocol" },
     { name = "curie-dispatcher" },
+    { name = "curie-e2e-connector" },
     { name = "curie-telemetry" },
     { name = "httpx" },
     { name = "kubernetes" },
@@ -951,6 +970,7 @@ requires-dist = [
     { name = "cronsim", specifier = "==2.7" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-dispatcher", editable = "apps/dispatcher" },
+    { name = "curie-e2e-connector", editable = "apps/e2e-connector" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "kubernetes", specifier = ">=36.0.3" },
@@ -972,6 +992,7 @@ dependencies = [
     { name = "curie-channel-protocol" },
     { name = "curie-discord-adapter" },
     { name = "curie-dispatcher" },
+    { name = "curie-e2e-connector" },
     { name = "curie-mail-adapter" },
     { name = "curie-runner" },
     { name = "curie-telemetry" },
@@ -1004,6 +1025,7 @@ requires-dist = [
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-discord-adapter", editable = "adapters/discord" },
     { name = "curie-dispatcher", editable = "apps/dispatcher" },
+    { name = "curie-e2e-connector", editable = "apps/e2e-connector" },
     { name = "curie-mail-adapter", editable = "apps/mail-adapter" },
     { name = "curie-runner", editable = "runner" },
     { name = "curie-telemetry", editable = "packages/telemetry" },

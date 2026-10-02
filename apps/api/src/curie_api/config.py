@@ -28,6 +28,7 @@ from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .e2e_connector import E2EInstall
 from .workspace_policy import valid_allowlist_entry, valid_repository_name
 
 # Dev-only default secrets. The production boot gate refuses to start when any of
@@ -688,6 +689,48 @@ class Settings(BaseSettings):
             "CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS", "connector_proxy_image_pull_secrets"
         ),
     )
+    e2e_connector_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("CURIE_E2E_CONNECTOR_ENABLED", "e2e_connector_enabled"),
+    )
+    e2e_connector_image: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_CONNECTOR_IMAGE", "e2e_connector_image"),
+    )
+    e2e_namespace_prefix: str = Field(
+        default="curie-e2e-",
+        validation_alias=AliasChoices("CURIE_E2E_NAMESPACE_PREFIX", "e2e_namespace_prefix"),
+    )
+    e2e_owner_label_key: str = Field(
+        default="curietech.ai/e2e-owner",
+        validation_alias=AliasChoices("CURIE_E2E_OWNER_LABEL_KEY", "e2e_owner_label_key"),
+    )
+    e2e_owner_label_value: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_OWNER_LABEL_VALUE", "e2e_owner_label_value"),
+    )
+    e2e_service_account: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_SERVICE_ACCOUNT", "e2e_service_account"),
+    )
+    e2e_service_account_namespace: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_E2E_SERVICE_ACCOUNT_NAMESPACE", "e2e_service_account_namespace"
+        ),
+    )
+    e2e_worker_cluster_role: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_WORKER_CLUSTER_ROLE", "e2e_worker_cluster_role"),
+    )
+    e2e_ttl_seconds: int = Field(
+        default=3600,
+        validation_alias=AliasChoices("CURIE_E2E_TTL_SECONDS", "e2e_ttl_seconds"),
+    )
+    e2e_pod_security: str = Field(
+        default="baseline",
+        validation_alias=AliasChoices("CURIE_E2E_POD_SECURITY", "e2e_pod_security"),
+    )
 
     def connector_proxy(self) -> ConnectorProxy | None:
         """The proxy each hosted connector renders with, or None for none."""
@@ -705,6 +748,20 @@ class Settings(BaseSettings):
                 for name in self.connector_proxy_image_pull_secrets.split(",")
                 if name.strip()
             ),
+        )
+
+    def e2e_install(self) -> E2EInstall:
+        return E2EInstall(
+            enabled=self.e2e_connector_enabled,
+            image=self.e2e_connector_image.strip(),
+            namespace_prefix=self.e2e_namespace_prefix.strip(),
+            owner_label_key=self.e2e_owner_label_key.strip(),
+            owner_label_value=self.e2e_owner_label_value.strip(),
+            service_account=self.e2e_service_account.strip(),
+            service_account_namespace=self.e2e_service_account_namespace.strip(),
+            worker_cluster_role=self.e2e_worker_cluster_role.strip(),
+            ttl_seconds=self.e2e_ttl_seconds,
+            pod_security=self.e2e_pod_security.strip() or "baseline",
         )
 
     def valkey_dsn(self) -> str:

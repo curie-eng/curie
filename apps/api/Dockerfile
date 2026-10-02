@@ -37,6 +37,7 @@ COPY apps/api/pyproject.toml apps/api/
 COPY apps/dispatcher/pyproject.toml apps/dispatcher/
 COPY adapters/discord/pyproject.toml adapters/discord/
 COPY apps/mail-adapter/pyproject.toml apps/mail-adapter/
+COPY apps/e2e-connector/pyproject.toml apps/e2e-connector/
 COPY apps/worker/pyproject.toml apps/worker/
 COPY runner/pyproject.toml runner/
 COPY tools/doclint/pyproject.toml tools/doclint/

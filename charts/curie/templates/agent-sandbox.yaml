@@ -710,12 +710,15 @@ spec:
             {{- if $agent }}
             {{- $secretName := printf "%s-agent-%s-connector-secrets" (include "curie.fullname" .) $agent }}
             {{- range $name := keys $secrets | sortAlpha }}
+            {{- /* ADR 0176: the test cluster kubeconfig stays on the connector. */}}
+            {{- if ne $name "E2E_CLUSTER_KUBECONFIG" }}
             - name: {{ $name }}
               valueFrom:
                 secretKeyRef:
                   name: {{ $secretName }}
                   key: {{ $name }}
                   optional: false
+            {{- end }}
             {{- end }}
             {{- end }}
             {{- if and $runner.fakeModel (not .Values.inference.deploy) }}

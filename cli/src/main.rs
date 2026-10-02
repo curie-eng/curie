@@ -4046,7 +4046,7 @@ fn cluster_connector_bind_values(
             values.insert(name.clone(), value.clone());
         }
     }
-    Ok(values)
+    Ok(curie::cluster_secrets::sandbox_connector_secrets(&values))
 }
 
 async fn bind_cluster_connector_secrets(
