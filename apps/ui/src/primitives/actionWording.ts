@@ -8,13 +8,13 @@ export function actionLabel(value: unknown): string {
     const parts = name.split("__");
     if (parts.length < 3 || parts.some(p => !p)) return "action";
     name = parts[parts.length - 1];
-  } else if (native[name]) return native[name];
+  } else if (Object.prototype.hasOwnProperty.call(native, name)) return native[name];
   return name.replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2").replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ").toLowerCase().trim() || "action";
 }
 function displayValue(value: unknown): string {
   if (value === null) return "none";
-  if (Array.isArray(value)) return value.map(displayValue).join(", ") || "(empty)";
-  if (typeof value === "object") return Object.entries(value as Record<string, unknown>).map(([k, v]) => `${caption(k)}: ${displayValue(v)}`).join("; ") || "(empty)";
+  // Nested property names and JSON types are requested data.
+  if (typeof value === "object") return JSON.stringify(value);
   if (typeof value === "boolean") return value ? "yes" : "no";
   return String(value) || "(empty)";
 }

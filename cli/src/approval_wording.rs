@@ -28,30 +28,8 @@ fn display_value(value: &Value) -> String {
                 s.clone()
             }
         }
-        Value::Array(items) => {
-            let s = items
-                .iter()
-                .map(display_value)
-                .collect::<Vec<_>>()
-                .join(", ");
-            if s.is_empty() {
-                "(empty)".into()
-            } else {
-                s
-            }
-        }
-        Value::Object(items) => {
-            let s = items
-                .iter()
-                .map(|(k, v)| format!("{}: {}", caption(k), display_value(v)))
-                .collect::<Vec<_>>()
-                .join("; ");
-            if s.is_empty() {
-                "(empty)".into()
-            } else {
-                s
-            }
-        }
+        // Nested keys and types are requested data, not schema captions.
+        Value::Array(_) | Value::Object(_) => value.to_string(),
         _ => value.to_string(),
     }
 }
@@ -69,7 +47,13 @@ pub fn approval_display(record: &ApprovalRecord) -> String {
         if let Ok(Value::Object(args)) = serde_json::from_str::<Value>(payload) {
             if !args.is_empty() {
                 text.push(' ');
-                text.push_str(&display_value(&Value::Object(args)));
+                text.push_str(
+                    &args
+                        .iter()
+                        .map(|(key, value)| format!("{}: {}", caption(key), display_value(value)))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                );
             }
         } else {
             text.push_str(" Details are incomplete; review the original request before approving.");

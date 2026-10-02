@@ -58,13 +58,9 @@ _DISPLAY_LIMIT = 2400
 
 
 def _value(value: Any) -> str:
-    if isinstance(value, dict):
-        return (
-            "; ".join(f"{action_label(str(k)).capitalize()}: {_value(v)}" for k, v in value.items())
-            or "(empty)"
-        )
-    if isinstance(value, list):
-        return ", ".join(_value(item) for item in value) or "(empty)"
+    if isinstance(value, (dict, list)):
+        # Nested keys and JSON types are requested content, not action metadata.
+        return json.dumps(value, ensure_ascii=False)
     if value is None:
         return "none"
     if isinstance(value, bool):
