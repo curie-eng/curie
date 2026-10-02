@@ -917,6 +917,63 @@ fn shell_tokens(line: &str) -> Vec<String> {
     tokens
 }
 
+fn template_semantics(line: &str, captured: &Path) -> (Vec<String>, Vec<Value>) {
+    let mut tokens = shell_tokens(line);
+    let mut values = Vec::new();
+    for index in 1..tokens.len() {
+        if tokens[index - 1] != "-f" {
+            continue;
+        }
+        let path = Path::new(&tokens[index]);
+        let name = path.file_name().expect("values file name");
+        if name.to_string_lossy().starts_with("curie-helm-values-") {
+            let content = fs::read_to_string(captured.join(name)).expect("captured Helm values");
+            values.push(serde_json::from_str(&content).expect("valid generated JSON values"));
+            tokens[index] = "<generated-values-file>".to_string();
+        }
+    }
+    (tokens, values)
+}
+
+#[test]
+fn template_comparison_preserves_values_and_nonincidental_argv() {
+    let captured = tempfile::tempdir().unwrap();
+    fs::write(
+        captured.path().join("curie-helm-values-a.yaml"),
+        r#"{"rustfs":{"deploy":false}}"#,
+    )
+    .unwrap();
+    fs::write(
+        captured.path().join("curie-helm-values-b.yaml"),
+        r#"{ "rustfs": { "deploy": false } }"#,
+    )
+    .unwrap();
+    let first = "HELM_CALL: template parity charts/curie -f /tmp/curie-helm-values-a.yaml --set-string config.schemaVersion=0.9.0";
+    let second = "HELM_CALL: template parity charts/curie -f /private/custom-temp/curie-helm-values-b.yaml --set-string config.schemaVersion=0.9.0";
+    assert_eq!(
+        template_semantics(first, captured.path()),
+        template_semantics(second, captured.path())
+    );
+    fs::write(
+        captured.path().join("curie-helm-values-b.yaml"),
+        r#"{"rustfs":{"deploy":true}}"#,
+    )
+    .unwrap();
+    assert_ne!(
+        template_semantics(first, captured.path()),
+        template_semantics(second, captured.path())
+    );
+    fs::write(
+        captured.path().join("curie-helm-values-b.yaml"),
+        r#"{ "rustfs": { "deploy": false } }"#,
+    )
+    .unwrap();
+    assert_ne!(
+        template_semantics(first, captured.path()),
+        template_semantics(&second.replace("0.9.0", "0.8.0"), captured.path())
+    );
+}
+
 fn helm_values(plan: &str) -> BTreeMap<String, String> {
     let helm = plan
         .lines()
@@ -3919,9 +3976,17 @@ fn migrate_store_refuses_a_values_file_that_turns_the_store_off() {
     );
     let live_before = live_minio_statefulset();
 
+    let capture_dir = fixture.temp.path().join("helm-value-captures");
+    fs::create_dir(&capture_dir).expect("create Helm value capture directory");
     let output = fixture.apply(
         &["--migrate-store"],
-        &[("CURIE_TEST_KUBECTL_STS", live_before.as_str())],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live_before.as_str()),
+            (
+                "CURIE_TEST_CAPTURE_VALUES_DIR",
+                capture_dir.to_str().unwrap(),
+            ),
+        ],
     );
 
     let calls = fixture.calls();
@@ -3948,32 +4013,13 @@ fn migrate_store_refuses_a_values_file_that_turns_the_store_off() {
         reported.contains("renders no known object store"),
         "the refusal must say the target chart has no store to migrate into; stdout:\n{reported}"
     );
-    // The direct AC2 assertion (#1501): the guard and the export must render
-    // the chart with the SAME values. Pinning one `--set-string` would survive
-    // a mutation that threads only that value and drops the rest of the plan,
-    // and a real chart could then again disagree about which StatefulSets
-    // exist. Both halves build the command identically -- `helm template
-    // <release> <chart> -n <namespace> <value-plan args>` -- so the two
-    // full-chart renders must be byte-identical. `--show-only` renders are the
-    // priorityclass/preflight probes, not stateful-component detection. The one
-    // provably incidental difference is the per-call temp values file, whose
-    // name carries a fresh uuid, so that token alone is normalised.
-    let full_chart_renders: Vec<String> = calls
+    // UUID file names and the host TMPDIR are incidental. Compare every
+    // remaining argv token AND the captured YAML, so dropped values still fail.
+    let full_chart_renders: Vec<_> = calls
         .lines()
         .filter(|line| line.starts_with("HELM_CALL: template "))
         .filter(|line| !line.contains("--show-only"))
-        .map(|line| {
-            line.split_whitespace()
-                .map(|token| {
-                    if token.starts_with("/tmp/curie-helm-values-") {
-                        "<values-file>"
-                    } else {
-                        token
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
+        .map(|line| template_semantics(line, &capture_dir))
         .collect();
     assert!(
         full_chart_renders.len() >= 2,
