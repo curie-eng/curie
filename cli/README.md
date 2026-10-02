@@ -926,3 +926,8 @@ warning details receive the same treatment. Answer text, error diagnostics,
 wire events, JSON results and eval trajectories keep their original content.
 A possible-change warning does not claim that a call succeeded or that its
 result was committed. Quiet mode continues to suppress progress notes.
+
+Receipt and CLI progress metadata use the same reference-boundary vector as
+approval displays. Closing code quotes end a sentence reference just as closing
+parentheses, brackets and ordinary quotes do; requested filenames and paths stay
+literal. This wording changes neither answers nor stored actions.

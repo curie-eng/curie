@@ -974,3 +974,8 @@ followed by a sentence-ending period (including whitespace or closing punctuatio
 uses its plain action label. Filenames, extensions, paths, URLs and identifiers
 embedded within another word remain literal data, including Unicode text. The
 stored summary, exact grant target, arguments and nested content remain unchanged.
+
+Receipt and CLI progress metadata use the same reference-boundary vector as
+approval displays. Closing code quotes end a sentence reference just as closing
+parentheses, brackets and ordinary quotes do; requested filenames and paths stay
+literal. This wording changes neither answers nor stored actions.
