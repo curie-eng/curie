@@ -77,8 +77,10 @@ Memory
 
 Saving memory is turned off for this agent. What is said here will not be kept for later conversations. Never say that you saved, noted or will remember something."""  # noqa: E501
 
-# The longest statement the tools accept (#1461 review F4), and how many facts
-# per memory boot puts in the prompt, newest first.
+# The longest statement the tools accept (#1461 review F4), and the default for
+# how many facts each memory may hold and boot puts in the prompt, newest first.
+# The operator can change the second with CURIE_MEMORY_MAX_FACTS (#3624); the
+# runner reads it as RunnerConfig.memory_max_facts.
 MAX_STATEMENT_CHARS = 500
 MAX_FACTS_PER_MEMORY = 200
 
@@ -118,8 +120,8 @@ class MemoryFull(MemoryFactsError):
 
     ``limit`` says which: ``"value"`` when this one fact is over the state API's
     per-value cap, ``"namespace"`` when the memory as a whole is at the state
-    API's cap (both a 413), and ``"facts"`` when the memory already holds
-    ``MAX_FACTS_PER_MEMORY`` facts, the most boot shows the agent (#3624).
+    API's cap (both a 413), and ``"facts"`` when the memory already holds as
+    many facts as boot shows the agent (#3624).
     """
 
     def __init__(self, detail: str, *, limit: str | None = None) -> None:
@@ -199,6 +201,9 @@ class MemoryFactsStore:
     returns one, every request presents it; otherwise the env token is the
     fallback, which keeps an older worker working against an older API and is
     refused for writes by a newer one.
+
+    ``max_facts`` is how many facts ``add`` lets the memory hold, the same
+    number boot shows (``RunnerConfig.memory_max_facts``).
     """
 
     def __init__(
@@ -207,10 +212,12 @@ class MemoryFactsStore:
         token: str | None,
         *,
         turn_token: Callable[[], str | None] | None = None,
+        max_facts: int = MAX_FACTS_PER_MEMORY,
     ) -> None:
         self._base = url.rstrip("/")
         self._token = token
         self._turn_token = turn_token
+        self._max_facts = max_facts
 
     def _headers(self) -> dict[str, str]:
         token = (self._turn_token() if self._turn_token is not None else None) or self._token
@@ -302,7 +309,7 @@ class MemoryFactsStore:
 
         Never replaces a fact: every call mints its own ``fact-<uuid4>`` key.
         Refused with ``MemoryFull`` (``limit == "facts"``), writing nothing, when
-        the memory already holds ``MAX_FACTS_PER_MEMORY`` facts: boot shows the
+        the memory already holds ``max_facts`` facts: boot shows the
         agent only that many, so one more would silently push the oldest out of
         the prompt (#3624). Only facts boot would show count, which is what
         ``list()`` returns: ``log``, ``guidance`` and malformed ``fact-*``
@@ -310,15 +317,15 @@ class MemoryFactsStore:
 
         This check takes no lock. Any number of saves that run concurrently can
         each pass it below the limit and all land, so a memory can go over the
-        limit. Boot then shows the newest ``MAX_FACTS_PER_MEMORY`` facts and says
+        limit. Boot then shows the newest ``max_facts`` facts and says
         how many it left out. That is a known, accepted limit.
         """
 
         held = len(await self.list())
-        if held >= MAX_FACTS_PER_MEMORY:
+        if held >= self._max_facts:
             raise MemoryFull(
                 f"it holds {held} facts, the most the agent can be shown "
-                f"({MAX_FACTS_PER_MEMORY}); update or forget an existing fact to make room",
+                f"({self._max_facts}); update or forget an existing fact to make room",
                 limit="facts",
             )
         fact_id = f"{FACT_KEY_PREFIX}{uuid.uuid4().hex}"
@@ -368,15 +375,17 @@ def resolve_facts_store(
     token: str | None,
     *,
     turn_token: Callable[[], str | None] | None = None,
+    max_facts: int = MAX_FACTS_PER_MEMORY,
 ) -> MemoryFactsStore | None:
     """A store for an ``http(s)://`` memory ref, or None when there is none.
 
     ``turn_token`` is for the tools' stores only (see ``MemoryFactsStore``);
-    boot reads use the env token alone."""
+    boot reads use the env token alone. ``max_facts`` is the memory's fact
+    limit, which only ``add`` uses."""
 
     if not ref or not ref.startswith(("http://", "https://")):
         return None
-    return MemoryFactsStore(ref, token, turn_token=turn_token)
+    return MemoryFactsStore(ref, token, turn_token=turn_token, max_facts=max_facts)
 
 
 # --- Boot composition --------------------------------------------------------
@@ -447,11 +456,16 @@ def _fact_line(fact: Fact) -> str:
     return f"- [{fact.id}] {attribution} {statement}"
 
 
-def format_facts_preamble(agent_facts: list[Fact], channel_facts: list[Fact]) -> str | None:
+def format_facts_preamble(
+    agent_facts: list[Fact],
+    channel_facts: list[Fact],
+    *,
+    max_facts: int = MAX_FACTS_PER_MEMORY,
+) -> str | None:
     """Render agent then channel facts, newest first, or None when both are empty.
 
-    At most ``MAX_FACTS_PER_MEMORY`` facts per memory are shown; the block says
-    how many older ones were left out.
+    At most ``max_facts`` facts per memory are shown (the same limit ``add``
+    refuses at); the block says how many older ones were left out.
     """
 
     if not agent_facts and not channel_facts:
@@ -462,8 +476,8 @@ def format_facts_preamble(agent_facts: list[Fact], channel_facts: list[Fact]) ->
             continue
         lines.extend(["", f"{label}:"])
         ordered = sorted(facts, key=_stated_at_sort_key, reverse=True)
-        lines.extend(_fact_line(fact) for fact in ordered[:MAX_FACTS_PER_MEMORY])
-        omitted = len(ordered) - MAX_FACTS_PER_MEMORY
+        lines.extend(_fact_line(fact) for fact in ordered[:max_facts])
+        omitted = len(ordered) - max_facts
         if omitted > 0:
             lines.append(f"({omitted} older {label.lower()} facts left out.)")
     return "\n".join(lines)

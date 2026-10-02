@@ -83,7 +83,6 @@ from .mcp_tool_capability import (
 from .memory import MEMORY_TOKEN_ENV, MemoryStore, format_memory_preamble, resolve_memory
 from .memory_facts import (
     DEFAULT_GUIDANCE,
-    MAX_FACTS_PER_MEMORY,
     WRITES_OFF_NOTICE,
     Fact,
     MemoryTurn,
@@ -642,7 +641,10 @@ def build_runner(
         return memory_turn.write_token if memory_turn is not None else None
 
     channel_tool_store = resolve_facts_store(
-        config.channel_memory_ref, memory_token, turn_token=turn_write_token
+        config.channel_memory_ref,
+        memory_token,
+        turn_token=turn_write_token,
+        max_facts=config.memory_max_facts,
     )
     system_prompt = _compose_system_prompt(
         system_prompt,
@@ -902,6 +904,7 @@ def build_runner(
                             config.session.memory_ref,
                             os.environ.get(MEMORY_TOKEN_ENV),
                             turn_token=turn_write_token,
+                            max_facts=config.memory_max_facts,
                         ),
                         channel_store=channel_tool_store,
                         turn=memory_turn,
@@ -1165,11 +1168,14 @@ async def _load_memory_facts(config: RunnerConfig) -> tuple[str | None, str | No
     logger.info(
         "memory facts loaded session=%s agent=%d channel=%d guidance=%s",
         config.session.session_id,
-        min(len(agent_facts), MAX_FACTS_PER_MEMORY),
-        min(len(channel_facts), MAX_FACTS_PER_MEMORY),
+        min(len(agent_facts), config.memory_max_facts),
+        min(len(channel_facts), config.memory_max_facts),
         guidance_source,
     )
-    return format_facts_preamble(agent_facts, channel_facts), guidance
+    return (
+        format_facts_preamble(agent_facts, channel_facts, max_facts=config.memory_max_facts),
+        guidance,
+    )
 
 
 # Boot compaction passes (#2927): each is a compare-and-set rewrite of the value
