@@ -6716,50 +6716,38 @@ class Kernel:
                 if remaining_s is None
                 else min(remaining_s, started.remaining_s)
             )
-            token = (boot_env or {}).get(CONNECTOR_CALLER_TOKEN_ENV)
-            signed_exp = _caller_token_exp(token) if isinstance(token, str) else None
-            deadline_unix = int(started.execution_deadline.timestamp())
-            if (
-                signed_exp is not None
-                and signed_exp > deadline_unix
-                and self._config.connector_caller_signing_key.strip()
-                and isinstance(agent_name, str)
-                and agent_name
-            ):
-                # The provisional ceiling was longer than the deadline start
-                # committed. Replace the runner before the model turn so the
-                # token the connectors see does not outlive the run.
-                corrected = dict(boot_env or {})
-                corrected[CONNECTOR_CALLER_TOKEN_ENV] = caller_token.mint(
-                    self._config.connector_caller_signing_key,
-                    agent=agent_name,
-                    exp=min(int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS, deadline_unix),
-                    run=str(run.request_id),
-                    work_item=str(run.work_item_id),
-                )
-                handle = await self._claim_or_resume(
-                    thread_key,
-                    corrected,
-                    workspace_deployment_id=(
-                        workspace_deployment_id if workspace_repo is not None else None
-                    ),
-                    workspace_repo=workspace_repo,
-                    replace_handle=handle,
-                    lineage_branch=lineage_branch,
-                    lineage_head=lineage_head,
-                    lineage_base_sha=lineage_base_sha,
-                    publication_visible_outcome_revision=(
-                        publication_visible_outcome_revision or 0
-                    ),
-                    agent_name=agent_name,
-                    runner_resources=runner_resources,
-                    remaining_s=remaining_s,
-                    caller_run=str(run.request_id),
-                )
-                run.claim_name = handle.claim_name
-                run.sandbox_name = handle.sandbox_name
+            handle = await self._cap_caller_token_to_deadline(
+                thread_key,
+                boot_env,
+                handle,
+                run,
+                agent_name=agent_name,
+                workspace_deployment_id=workspace_deployment_id,
+                workspace_repo=workspace_repo,
+                lineage_branch=lineage_branch,
+                lineage_head=lineage_head,
+                lineage_base_sha=lineage_base_sha,
+                publication_visible_outcome_revision=publication_visible_outcome_revision,
+                runner_resources=runner_resources,
+                remaining_s=remaining_s,
+            )
         elif run is not None:
             remaining_s = run.bound_remaining_s(remaining_s)
+            handle = await self._cap_caller_token_to_deadline(
+                thread_key,
+                boot_env,
+                handle,
+                run,
+                agent_name=agent_name,
+                workspace_deployment_id=workspace_deployment_id,
+                workspace_repo=workspace_repo,
+                lineage_branch=lineage_branch,
+                lineage_head=lineage_head,
+                lineage_base_sha=lineage_base_sha,
+                publication_visible_outcome_revision=publication_visible_outcome_revision,
+                runner_resources=runner_resources,
+                remaining_s=remaining_s,
+            )
         if run is not None and agent_id is not None:
             # Lets a kill find this run if it later parks for approval (#3564).
             run.agent_id = agent_id
@@ -7268,6 +7256,69 @@ class Kernel:
             and status.get("history_durable") is True
             and status.get("status") == SessionStatus.IDLE_AWAITING_INPUT.value
         )
+
+    async def _cap_caller_token_to_deadline(
+        self,
+        thread_key: str,
+        boot_env: dict[str, str] | None,
+        handle: SandboxHandle,
+        run: WorkItemRun,
+        *,
+        agent_name: str | None,
+        workspace_deployment_id: uuid.UUID | None,
+        workspace_repo: str | None,
+        lineage_branch: str | None,
+        lineage_head: str | None,
+        lineage_base_sha: str | None,
+        publication_visible_outcome_revision: int | None,
+        runner_resources: dict[str, Any] | None,
+        remaining_s: float | None,
+    ) -> SandboxHandle:
+        """Replace a runner whose caller token outlives the committed deadline.
+
+        Writes the corrected token back onto ``boot_env`` so a later claim of
+        this same env, including a retry after the request has already started,
+        does not restore the provisional expiry.
+        """
+
+        if boot_env is None or run.execution_deadline is None:
+            return handle
+        if not self._config.connector_caller_signing_key.strip():
+            return handle
+        if not isinstance(agent_name, str) or not agent_name:
+            return handle
+        token = boot_env.get(CONNECTOR_CALLER_TOKEN_ENV)
+        signed_exp = _caller_token_exp(token) if isinstance(token, str) else None
+        deadline_unix = int(run.execution_deadline.timestamp())
+        if signed_exp is None or signed_exp <= deadline_unix:
+            return handle
+        boot_env[CONNECTOR_CALLER_TOKEN_ENV] = caller_token.mint(
+            self._config.connector_caller_signing_key,
+            agent=agent_name,
+            exp=min(int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS, deadline_unix),
+            run=str(run.request_id),
+            work_item=str(run.work_item_id),
+        )
+        replaced = await self._claim_or_resume(
+            thread_key,
+            boot_env,
+            workspace_deployment_id=(
+                workspace_deployment_id if workspace_repo is not None else None
+            ),
+            workspace_repo=workspace_repo,
+            replace_handle=handle,
+            lineage_branch=lineage_branch,
+            lineage_head=lineage_head,
+            lineage_base_sha=lineage_base_sha,
+            publication_visible_outcome_revision=(publication_visible_outcome_revision or 0),
+            agent_name=agent_name,
+            runner_resources=runner_resources,
+            remaining_s=remaining_s,
+            caller_run=str(run.request_id),
+        )
+        run.claim_name = replaced.claim_name
+        run.sandbox_name = replaced.sandbox_name
+        return replaced
 
     async def _claim_or_resume(
         self,
