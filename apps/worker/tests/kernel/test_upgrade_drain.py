@@ -107,9 +107,7 @@ async def _stop(task: asyncio.Task[None], consumer: Consumer | None = None) -> N
         await task
 
 
-async def _pending_row(
-    h, *, stream: str, group: str, entry_id: str
-) -> dict[str, Any]:  # noqa: ANN001
+async def _pending_row(h, *, stream: str, group: str, entry_id: str) -> dict[str, Any]:  # noqa: ANN001
     rows = await h.async_redis.xpending_range(
         stream,
         group,
@@ -341,9 +339,7 @@ def test_the_pre_upgrade_gate_refuses_the_roll_and_the_turn_completes_once(make_
                     to_stream_fields(_qevent("send the mail", thread=thread, event_id=event_id)),
                 )
                 await asyncio.sleep(1.0)
-                assert len(h.runner.opened) == 1, (
-                    "a redelivery re-ran the side-effecting turn"
-                )
+                assert len(h.runner.opened) == 1, "a redelivery re-ran the side-effecting turn"
             finally:
                 hold.set()
                 await _stop(old_task, old)
@@ -506,9 +502,7 @@ def test_current_marker_pauses_eval_new_reads_until_owned_release(
             await consumer.ensure_group()
             await gate.request_quiesce()
             task = asyncio.create_task(consumer._read_loop())
-            entry_id = await h.async_redis.xadd(
-                eval_config.eval_stream, {"payload": payload}
-            )
+            entry_id = await h.async_redis.xadd(eval_config.eval_stream, {"payload": payload})
             try:
                 await asyncio.sleep(0.6)
                 assert seen == []
@@ -572,9 +566,7 @@ def test_current_marker_pauses_runs_prompt_reclaim_without_charging_delivery(
             h.runner.tail = [Final(text="prompt handled", status=DONE)]
             store = DeliveryLeaseStore(h.async_redis, h.config)
             gate = UpgradeDrainGate(h.async_redis, h.config)
-            consumer_config = h.config.model_copy(
-                update={"consumer_name": "runs-replacement"}
-            )
+            consumer_config = h.config.model_copy(update={"consumer_name": "runs-replacement"})
             consumer = Consumer(
                 redis=h.async_redis,
                 kernel=h.kernel,
@@ -611,9 +603,7 @@ def test_current_marker_pauses_runs_prompt_reclaim_without_charging_delivery(
             await gate.request_quiesce()
             try:
                 assert await consumer._prompt_reclaim_once() == 0
-                await asyncio.sleep(
-                    h.config.consumer_heartbeat_ttl_ms / 1000 + 0.02
-                )
+                await asyncio.sleep(h.config.consumer_heartbeat_ttl_ms / 1000 + 0.02)
                 assert await consumer._prompt_reclaim_once() == 0
                 paused = await _pending_row(
                     h,
@@ -627,9 +617,7 @@ def test_current_marker_pauses_runs_prompt_reclaim_without_charging_delivery(
 
                 await gate.clear_quiesce()
                 assert await consumer._prompt_reclaim_once() == 0
-                await asyncio.sleep(
-                    h.config.consumer_heartbeat_ttl_ms / 1000 + 0.02
-                )
+                await asyncio.sleep(h.config.consumer_heartbeat_ttl_ms / 1000 + 0.02)
                 assert await consumer._prompt_reclaim_once() == 1
                 await _wait_until(lambda: h.runner.turn_active, timeout=5.0)
                 transferred = await _pending_row(
@@ -683,9 +671,7 @@ def test_current_marker_pauses_eval_prompt_reclaim_until_owned_release(
             seen: list[tuple[str, dict[str, str]]] = []
             consumer = _recording_eval_consumer(h, eval_config, gate, seen)
             await consumer.ensure_group()
-            entry_id = await h.async_redis.xadd(
-                eval_config.eval_stream, {"payload": "prompt-eval"}
-            )
+            entry_id = await h.async_redis.xadd(eval_config.eval_stream, {"payload": "prompt-eval"})
             assert await h.async_redis.xreadgroup(
                 eval_config.eval_consumer_group,
                 "eval-departed",
@@ -704,9 +690,7 @@ def test_current_marker_pauses_eval_prompt_reclaim_until_owned_release(
             await gate.request_quiesce()
             try:
                 assert await consumer._prompt_reclaim_once() == 0
-                await asyncio.sleep(
-                    eval_config.consumer_heartbeat_ttl_ms / 1000 + 0.02
-                )
+                await asyncio.sleep(eval_config.consumer_heartbeat_ttl_ms / 1000 + 0.02)
                 assert await consumer._prompt_reclaim_once() == 0
                 paused = await _pending_row(
                     h,
@@ -720,9 +704,7 @@ def test_current_marker_pauses_eval_prompt_reclaim_until_owned_release(
 
                 await gate.clear_quiesce()
                 assert await consumer._prompt_reclaim_once() == 0
-                await asyncio.sleep(
-                    eval_config.consumer_heartbeat_ttl_ms / 1000 + 0.02
-                )
+                await asyncio.sleep(eval_config.consumer_heartbeat_ttl_ms / 1000 + 0.02)
                 assert await consumer._prompt_reclaim_once() == 1
                 assert seen == [(entry_id, {"payload": "prompt-eval"})]
                 transferred = await _pending_row(
@@ -773,9 +755,7 @@ def test_current_marker_pauses_eval_heavy_reclaim_before_pending_selection(
             seen: list[tuple[str, dict[str, str]]] = []
             consumer = _recording_eval_consumer(h, eval_config, gate, seen)
             await consumer.ensure_group()
-            entry_id = await h.async_redis.xadd(
-                eval_config.eval_stream, {"payload": "heavy-eval"}
-            )
+            entry_id = await h.async_redis.xadd(eval_config.eval_stream, {"payload": "heavy-eval"})
             assert await h.async_redis.xreadgroup(
                 eval_config.eval_consumer_group,
                 "eval-old-owner",
@@ -915,7 +895,7 @@ def test_mixed_version_refusal_allows_a_pre_fix_consumer_to_claim_again(
 
 
 def test_a_quiesced_consumer_claims_nothing_and_resumes_when_released(make_harness) -> None:  # noqa: ANN001
-    """"...while preventing new claims during the drain."
+    """ "...while preventing new claims during the drain."
 
     A wait that kept admitting work could never terminate under load, and a
     replacement Pod that comes up mid-roll must not reclaim the delivery a

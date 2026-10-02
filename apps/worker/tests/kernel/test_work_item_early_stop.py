@@ -467,13 +467,9 @@ def test_failed_publication_approval_finishes_factory_request_immediately(
             h.kernel._work_items = items
             _patch_snapshot(h, monkeypatch)
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
             assert len(publications.creates) == 1
-            assert [finish["cause"] for finish in items.finishes] == [
-                "approval_create_failed"
-            ]
+            assert [finish["cause"] for finish in items.finishes] == ["approval_create_failed"]
             assert "hold_for_approval" not in items.calls
 
     asyncio.run(exercise())
@@ -507,9 +503,7 @@ def test_a_coded_publication_refusal_names_its_cause_on_the_factory_run(
             h.kernel._work_items = items
             _patch_snapshot(h, monkeypatch)
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
             assert len(items.finishes) == 1
             finish = items.finishes[0]
             assert finish["cause"] == "approval_create_failed"
@@ -546,9 +540,7 @@ def test_a_thread_refusal_code_keeps_its_message_on_the_factory_run(
             h.kernel._work_items = items
             _patch_snapshot(h, monkeypatch)
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
             assert len(items.finishes) == 1
             finish = items.finishes[0]
             assert finish["cause"] == "approval_create_failed"
@@ -583,9 +575,7 @@ def test_a_string_api_refusal_keeps_its_message_on_the_factory_run(
             h.kernel._work_items = items
             _patch_snapshot(h, monkeypatch)
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
             finish = items.finishes[0]
             assert finish["cause"] == "approval_create_failed"
             assert isinstance(finish["detail"], str)
@@ -809,9 +799,7 @@ def test_a_continuation_the_runner_refuses_keeps_the_runner_failure(make_harness
 
             h.kernel._runner.start_turn = start_turn  # type: ignore[method-assign]
 
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
 
             assert len(opened) >= 2, "the continuation must have been attempted"
             assert "publish_changes" in opened[1]

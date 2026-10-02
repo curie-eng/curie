@@ -74,6 +74,7 @@ class StubBinding:
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+        **_: object,
     ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
@@ -104,6 +105,7 @@ class RealBootEnvBinding(StubBinding):
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+        **_: object,
     ) -> dict[str, str]:
         resolver = BindingResolver.__new__(BindingResolver)
         resolver._config = WorkerConfig()
@@ -286,9 +288,7 @@ def test_eval_isolate_turn_claims_without_ambient_memory(make_harness) -> None:
             assert "CURIE_HISTORY_REF" in eval_env
             assert "CURIE_HISTORY_TOKEN" in eval_env
 
-            await h.kernel.process_event(
-                _qevent("hi again", channel="C-bound", thread="thread-1")
-            )
+            await h.kernel.process_event(_qevent("hi again", channel="C-bound", thread="thread-1"))
             plain_env = h.fake_k8s.claim_envs[-1]
             assert plain_env is not None
             assert "CURIE_MEMORY_REF" in plain_env
@@ -359,8 +359,7 @@ def test_kill_interrupts_a_live_turn(make_harness) -> None:
             ev = _qevent("hi", channel="C-bound", thread="tK")
             t1 = asyncio.create_task(h.kernel.process_event(ev))
             await _wait_until(
-                lambda: h.runner.turn_active
-                and bool(h.kernel._active_by_agent.get(agent_id))
+                lambda: h.runner.turn_active and bool(h.kernel._active_by_agent.get(agent_id))
             )
 
             # Killing the agent interrupts its registered live turn.
@@ -471,9 +470,7 @@ def test_the_generic_caption_is_set_when_the_agent_has_no_load_or_tips(
         ) as h:
             h.runner.default_script = [Final(text="done", status=DONE)]
             await h.kernel.process_event(_qevent("hi", channel="C-bound", thread="tG"))
-            assert h.sink.status_sets == [
-                ("C-bound", "tG", "is working on your request...")
-            ]
+            assert h.sink.status_sets == [("C-bound", "tG", "is working on your request...")]
 
     asyncio.run(go())
 
@@ -510,9 +507,7 @@ def test_the_caption_is_raised_before_it_is_lowered_even_on_a_fast_turn(
 
     async def go() -> None:
         binding = StubBinding({("slack", "C-bound"): _resolved_with_packs({})})
-        async with make_harness(
-            binding=binding, shimmer=True, status_text="is working..."
-        ) as h:
+        async with make_harness(binding=binding, shimmer=True, status_text="is working...") as h:
             # Terminal on the first frame: the fastest turn this harness can run.
             h.runner.default_script = [Final(text="done", status=DONE)]
             await h.kernel.process_event(_qevent("hi", channel="C-bound", thread="tR"))
@@ -564,9 +559,7 @@ def test_shimmer_off_never_sets_a_caption(make_harness) -> None:
 
 # A structured reply with buttons, none of which links to the hub command.
 _REPLY_WITH_BUTTONS = (
-    "```curie-reply\n"
-    '{"text": "here you go", "buttons": [["Details", "details"]]}\n'
-    "```"
+    '```curie-reply\n{"text": "here you go", "buttons": [["Details", "details"]]}\n```'
 )
 
 
@@ -599,12 +592,7 @@ def test_bound_agent_with_enabled_nav_gets_hub_button_on_final_reply(make_harnes
                 ),
             )
             assert blocks is not None
-            ids = [
-                e["action_id"]
-                for b in blocks
-                if b["type"] == "actions"
-                for e in b["elements"]
-            ]
+            ids = [e["action_id"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
             assert "help" in ids
 
     asyncio.run(go())
@@ -653,12 +641,7 @@ def test_bound_agent_without_nav_gets_no_hub_button(make_harness) -> None:
             assert h.sink.last_text is not None
             _text, blocks = render(h.sink.last_text, nav=h.sink.last_nav)
             assert blocks is not None
-            ids = [
-                e["action_id"]
-                for b in blocks
-                if b["type"] == "actions"
-                for e in b["elements"]
-            ]
+            ids = [e["action_id"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
             assert "help" not in ids
 
     asyncio.run(go())

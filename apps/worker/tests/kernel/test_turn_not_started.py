@@ -100,9 +100,7 @@ async def _read_one(h: Any, consumer_name: str) -> tuple[str, dict[str, str]]:
     return entry_id, dict(fields)
 
 
-async def _deliver_one(
-    h: Any, consumer: Consumer, qevent: QueuedTurn
-) -> str:
+async def _deliver_one(h: Any, consumer: Consumer, qevent: QueuedTurn) -> str:
     """XADD, read into this consumer's PEL, dispatch, and drain. Returns the entry id."""
     await h.async_redis.xadd(h.config.stream, to_stream_fields(qevent))
     entry_id, fields = await _read_one(h, h.config.consumer_name)
@@ -497,9 +495,7 @@ def test_an_answer_delivered_before_a_failed_settle_is_not_overwritten(
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="the answer", status=DONE)]
 
@@ -556,9 +552,7 @@ def test_a_terminal_send_that_lands_then_raises_is_treated_as_delivered(
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="the answer", status=DONE)]
 
@@ -627,9 +621,7 @@ def test_a_polite_drop_is_not_overwritten_by_the_notice(make_harness) -> None:
     async def go() -> None:
         async with make_harness(binding=_UnmappedBinding(), **_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
 
             async def refuse(*args: Any, **kwargs: Any) -> str | None:
@@ -673,9 +665,7 @@ def test_a_partially_streamed_turn_still_gets_the_notice(make_harness) -> None:
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
             h.runner.default_script = [
                 TextDelta(text="partial "),
@@ -727,9 +717,7 @@ def test_a_notice_is_skipped_when_this_owner_lost_the_fence(
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
 
             async def fenced_out(qevent: QueuedTurn, *, lease: Any = None) -> None:
@@ -775,9 +763,7 @@ def test_a_notice_is_skipped_when_the_lease_is_lost_during_the_terminality_read(
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
 
             held: list[Any] = []

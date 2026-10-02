@@ -111,9 +111,7 @@ async def _seed_deployments(
         "decoy": f"bundles/{token}/decoy.zip",
     }
 
-    async def add(
-        conn: object, owner: uuid.UUID, label: str, env: str, at: datetime
-    ) -> None:
+    async def add(conn: object, owner: uuid.UUID, label: str, env: str, at: datetime) -> None:
         version_id = uuid.uuid4()
         deployment_id = uuid.uuid4()
         version_ids.append(version_id)
@@ -183,9 +181,7 @@ async def _seed_deployments(
                     text("DELETE FROM curie.agent_versions WHERE id = :id"),
                     {"id": version_id},
                 )
-            await conn.execute(
-                text("DELETE FROM curie.agents WHERE id = :id"), {"id": decoy_agent}
-            )
+            await conn.execute(text("DELETE FROM curie.agents WHERE id = :id"), {"id": decoy_agent})
 
 
 def _resolver_factory(engine: AsyncEngine):  # type: ignore[no-untyped-def]
@@ -216,12 +212,14 @@ def test_targetless_cron_runs_on_the_hook_agents_winning_deployment(
     make_harness, make_hook_run
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, _seed_deployments(
-            run.engine, run.agent_id
-        ) as seeded, make_harness(
-            hook_runs=run.recorder(),
-            binding_factory=_resolver_factory(run.engine),
-        ) as h:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id) as seeded,
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+            ) as h,
+        ):
             h.runner.default_script = [Final(text="report done", status=SessionStatus.DONE)]
             event = _targetless(run.ref)
 
@@ -255,14 +253,15 @@ def test_targetless_cron_runs_on_the_hook_agents_winning_deployment(
 # --- 2. unknown agent ---------------------------------------------------------
 
 
-def test_targetless_cron_for_an_unknown_agent_is_dropped(
-    make_harness, make_hook_run
-) -> None:
+def test_targetless_cron_for_an_unknown_agent_is_dropped(make_harness, make_hook_run) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(
-            hook_runs=run.recorder(),
-            binding_factory=_resolver_factory(run.engine),
-        ) as h:
+        async with (
+            make_hook_run() as run,
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+            ) as h,
+        ):
             unknown = HookRunRef(
                 agent_id=str(uuid.uuid4()),
                 name=run.ref.name,
@@ -289,10 +288,13 @@ def test_targetless_cron_without_an_active_deployment_fails_the_hook_run(
     make_harness, make_hook_run
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(
-            hook_runs=run.recorder(),
-            binding_factory=_resolver_factory(run.engine),
-        ) as h:
+        async with (
+            make_hook_run() as run,
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+            ) as h,
+        ):
             event = _targetless(run.ref)
 
             await h.kernel.process_event(event)
@@ -316,12 +318,14 @@ def test_targetless_cron_with_a_non_uuid_agent_is_dropped_without_effects(
     make_harness, make_hook_run
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, _seed_deployments(
-            run.engine, run.agent_id
-        ), make_harness(
-            hook_runs=run.recorder(),
-            binding_factory=_resolver_factory(run.engine),
-        ) as h:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id),
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+            ) as h,
+        ):
             invalid = HookRunRef.model_construct(
                 agent_id="not-a-uuid",
                 name=run.ref.name,
@@ -350,12 +354,14 @@ def test_targetless_shape_violation_is_rejected_before_any_effect(
     make_harness, make_hook_run, source: TurnSource, with_hook_run: bool
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, _seed_deployments(
-            run.engine, run.agent_id
-        ), make_harness(
-            hook_runs=run.recorder(),
-            binding_factory=_resolver_factory(run.engine),
-        ) as h:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id),
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+            ) as h,
+        ):
             event = _targetless(run.ref if with_hook_run else None, source=source)
             before = await _owned_keys(h)
 
@@ -383,13 +389,15 @@ def test_targetless_runner_failure_fails_the_hook_run_silently(
     make_harness, make_hook_run, failure: str
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, _seed_deployments(
-            run.engine, run.agent_id
-        ), make_harness(
-            hook_runs=run.recorder(),
-            binding_factory=_resolver_factory(run.engine),
-            max_attempts=2,
-        ) as h:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id),
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+                max_attempts=2,
+            ) as h,
+        ):
             if failure == "classified":
                 h.runner.turn_scripts = [
                     [
@@ -434,13 +442,15 @@ def test_targetless_approval_gate_is_not_bypassed_and_fails_the_hook_run(
 
     async def go() -> None:
         approvals = RecordingApprovals()
-        async with make_hook_run() as run, _seed_deployments(
-            run.engine, run.agent_id
-        ), make_harness(
-            hook_runs=run.recorder(),
-            binding_factory=_resolver_factory(run.engine),
-            approvals=approvals,
-        ) as h:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id),
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+                approvals=approvals,
+            ) as h,
+        ):
             h.runner.default_script = [
                 Final(
                     text="Requesting sign off",
@@ -468,17 +478,17 @@ def test_targetless_approval_gate_is_not_bypassed_and_fails_the_hook_run(
 # --- 7. kill switch ------------------------------------------------------------
 
 
-def test_targetless_cron_for_a_killed_agent_records_blocked(
-    make_harness, make_hook_run
-) -> None:
+def test_targetless_cron_for_a_killed_agent_records_blocked(make_harness, make_hook_run) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, _seed_deployments(
-            run.engine, run.agent_id
-        ), make_harness(
-            hook_runs=run.recorder(),
-            binding_factory=_resolver_factory(run.engine),
-            with_killswitch=True,
-        ) as h:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id),
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+                with_killswitch=True,
+            ) as h,
+        ):
             key = kill_key(run.agent_id)
             await h.async_redis.set(key, "1")
             try:
@@ -522,12 +532,14 @@ def test_targetless_turn_with_a_resume_event_id_gets_no_authority(
     """A reserved event id on a targetless turn is refused before any effect."""
 
     async def go() -> None:
-        async with make_hook_run() as run, _seed_deployments(
-            run.engine, run.agent_id
-        ), make_harness(
-            hook_runs=run.recorder(),
-            binding_factory=_resolver_factory(run.engine),
-        ) as h:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id),
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+            ) as h,
+        ):
             h.runner.default_script = [Final(text="must not run", status=SessionStatus.DONE)]
             event = _targetless(run.ref, event_id=_reserved_event_id(kind))
             before = await _owned_keys(h)
@@ -568,12 +580,14 @@ def test_targetless_turn_does_not_touch_an_active_matching_work_item_run(
     make_harness, make_hook_run, kind: str
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, _seed_deployments(
-            run.engine, run.agent_id
-        ), make_harness(
-            hook_runs=run.recorder(),
-            binding_factory=_resolver_factory(run.engine),
-        ) as h:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id),
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+            ) as h,
+        ):
             h.runner.default_script = [Final(text="must not run", status=SessionStatus.DONE)]
             request_id = uuid.uuid4()
             execute_id = _reserved_event_id("work-item-execute", request_id)
@@ -637,9 +651,7 @@ def test_targetless_turn_does_not_touch_an_active_matching_work_item_run(
 async def _owned_lease(h: object):  # type: ignore[no-untyped-def]
     redis = h.async_redis  # type: ignore[attr-defined]
     config = h.config  # type: ignore[attr-defined]
-    await redis.xgroup_create(
-        config.stream, config.consumer_group, id="0", mkstream=True
-    )
+    await redis.xgroup_create(config.stream, config.consumer_group, id="0", mkstream=True)
     entry_id = await redis.xadd(config.stream, {"payload": "owned"})
     await redis.xreadgroup(
         config.consumer_group,
@@ -661,12 +673,14 @@ def test_targetless_run_under_a_valid_lease_settles_done_without_outbox(
     make_harness, make_hook_run
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, _seed_deployments(
-            run.engine, run.agent_id
-        ), make_harness(
-            hook_runs=run.recorder(),
-            binding_factory=_resolver_factory(run.engine),
-        ) as h:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id),
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+            ) as h,
+        ):
             _store, _entry_id, lease = await _owned_lease(h)
             h.runner.default_script = [Final(text="done", status=SessionStatus.DONE)]
             event = _targetless(run.ref)
@@ -695,12 +709,14 @@ def test_targetless_settlement_refuses_an_owner_fenced_out_mid_turn(
     """
 
     async def go() -> None:
-        async with make_hook_run() as run, _seed_deployments(
-            run.engine, run.agent_id
-        ), make_harness(
-            hook_runs=run.recorder(),
-            binding_factory=_resolver_factory(run.engine),
-        ) as h:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id),
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+            ) as h,
+        ):
             _store, entry_id, lease = await _owned_lease(h)
             hold = asyncio.Event()
             h.runner.hold = hold
@@ -713,17 +729,13 @@ def test_targetless_settlement_refuses_an_owner_fenced_out_mid_turn(
             config = h.config
             if fence == "token":
                 await h.async_redis.set(
-                    config.delivery_lease_key(
-                        config.stream, config.consumer_group, entry_id
-                    ),
+                    config.delivery_lease_key(config.stream, config.consumer_group, entry_id),
                     "another-owner",
                     keepttl=True,
                 )
             else:
                 await h.async_redis.hset(
-                    config.delivery_state_key(
-                        config.stream, config.consumer_group, entry_id
-                    ),
+                    config.delivery_state_key(config.stream, config.consumer_group, entry_id),
                     "gen",
                     str(lease.generation + 1),
                 )
@@ -744,12 +756,14 @@ def test_targetless_run_under_a_lost_lease_writes_no_done_marker(
     make_harness, make_hook_run
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, _seed_deployments(
-            run.engine, run.agent_id
-        ), make_harness(
-            hook_runs=run.recorder(),
-            binding_factory=_resolver_factory(run.engine),
-        ) as h:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id),
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+            ) as h,
+        ):
             store, entry_id, lease = await _owned_lease(h)
             await store.release(
                 h.config.stream,
@@ -771,7 +785,6 @@ def test_targetless_run_under_a_lost_lease_writes_no_done_marker(
     asyncio.run(go())
 
 
-
 # --- 10. refused before the runner starts ------------------------------------
 
 
@@ -787,13 +800,15 @@ def test_targetless_turn_refused_before_runner_start_fails_the_hook_run(
     """
 
     async def go() -> None:
-        async with make_hook_run() as run, _seed_deployments(
-            run.engine, run.agent_id
-        ), make_harness(
-            hook_runs=run.recorder(),
-            binding_factory=_resolver_factory(run.engine),
-            claim_timeout_seconds=0.05,
-        ) as h:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id),
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+                claim_timeout_seconds=0.05,
+            ) as h,
+        ):
             if refusal == "capacity":
                 h.fake_k8s.quota_rejection = QuotaRejection(
                     quota_name="curie-sandbox-quota",

@@ -310,9 +310,7 @@ def test_unparseable_entry_is_dead_lettered_not_silently_dropped(
             await consumer.ensure_group()
 
             token = uuid.uuid4().hex[:8]
-            entry_id = await h.async_redis.xadd(
-                h.config.stream, {"garbage": "x", "trace": token}
-            )
+            entry_id = await h.async_redis.xadd(h.config.stream, {"garbage": "x", "trace": token})
 
             try:
                 assert await _deliver_new(consumer, h) == 1
@@ -489,9 +487,9 @@ def test_a_failing_dead_letter_does_not_kill_the_rest_of_the_tick(
                     await h.kernel.reap_orphans()
 
                 # The failure is loud, and names the entry and the cause.
-                assert any(
-                    bad_id in r.getMessage() and r.exc_info for r in caplog.records
-                ), "the failed dead-letter was not logged with the entry id"
+                assert any(bad_id in r.getMessage() and r.exc_info for r in caplog.records), (
+                    "the failed dead-letter was not logged with the entry id"
+                )
 
                 # The OTHER entry was still cap-checked and dead-lettered.
                 rows = await _dead_rows(h)
@@ -569,9 +567,7 @@ def test_graveyard_is_bounded_by_dead_letter_maxlen(
 
                 # The bound must not cost the ack: every entry is still off the
                 # group, even the ones whose graveyard row was evicted.
-                summary = await h.async_redis.xpending(
-                    h.config.stream, h.config.consumer_group
-                )
+                summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
                 assert summary["pending"] == 0
             finally:
                 await h.async_redis.delete(_dead_stream(h.config))
@@ -820,14 +816,9 @@ def test_dead_letter_is_logged_loudly_with_the_operational_facts(
                 # line has to be able to act on it, not correlate across lines.
                 # (The per-delivery "left pending" ERRORs are also captured here;
                 # none of them is this record.)
-                messages = [
-                    r.getMessage() for r in caplog.records if r.levelno == logging.ERROR
-                ]
+                messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
                 assert any(
-                    entry_id in m
-                    and "2" in m
-                    and "max-delivery-exceeded" in m
-                    and dead in m
+                    entry_id in m and "2" in m and "max-delivery-exceeded" in m and dead in m
                     for m in messages
                 ), (
                     "no single ERROR log carried the entry id, delivery count, "
@@ -1008,9 +999,7 @@ def test_dead_letter_stream_equal_to_source_stream_is_rejected() -> None:
     assert WorkerConfig(stream="curie:runs").dead_letter_stream == ""
     # ...and so does any genuinely distinct override.
     assert (
-        WorkerConfig(
-            stream="curie:runs", dead_letter_stream="curie:runs:dead"
-        ).dead_letter_stream
+        WorkerConfig(stream="curie:runs", dead_letter_stream="curie:runs:dead").dead_letter_stream
         == "curie:runs:dead"
     )
 
@@ -1056,9 +1045,7 @@ def test_a_live_lease_holds_off_the_cap_and_releasing_it_dead_letters_normally(
             runner_total_timeout_s=30.0,
         ) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
 
             qe = _qevent("healthy long turn", thread="tcap", event_id="cap-live")
@@ -1093,7 +1080,10 @@ def test_a_live_lease_holds_off_the_cap_and_releasing_it_dead_letters_normally(
             # count, dead-letters on the next pass.
             assert (
                 await store.release(
-                    h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner,
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry_id,
+                    owner=lease.owner,
                     resume_event_id=None,
                 )
                 is True
@@ -1187,9 +1177,7 @@ def test_the_maintenance_scan_refuses_to_dead_letter_once_another_owner_acquires
     async def go() -> None:
         async with make_harness(**_FENCE_CONFIG) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
 
             try:
@@ -1248,9 +1236,7 @@ def test_the_maintenance_scan_dead_letters_normally_when_nobody_owns_the_entry(
     async def go() -> None:
         async with make_harness(**_FENCE_CONFIG) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
 
             try:
@@ -1264,7 +1250,10 @@ def test_the_maintenance_scan_dead_letters_normally_when_nobody_owns_the_entry(
                 )
                 assert (
                     await store.release(
-                        h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner,
+                        h.config.stream,
+                        h.config.consumer_group,
+                        entry_id,
+                        owner=lease.owner,
                         resume_event_id=None,
                     )
                     is True
@@ -1352,9 +1341,7 @@ def test_a_failed_settle_makes_the_dead_letter_report_failure_not_a_clean_row(
     async def go() -> None:
         async with make_harness(**_FENCE_CONFIG) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
 
             try:
@@ -1368,7 +1355,10 @@ def test_a_failed_settle_makes_the_dead_letter_report_failure_not_a_clean_row(
                     h.config.stream, h.config.consumer_group, entry_id, consumer="peer-worker"
                 )
                 await store.release(
-                    h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner,
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry_id,
+                    owner=lease.owner,
                     resume_event_id=None,
                 )
                 assert await h.async_redis.exists(state_key) == 1
@@ -1380,9 +1370,7 @@ def test_a_failed_settle_makes_the_dead_letter_report_failure_not_a_clean_row(
                     raise boom
 
                 monkeypatch.setattr(store, "settle", exploding_settle)
-                monkeypatch.setattr(
-                    stream_consumer_module, "record_metric", recording_metric
-                )
+                monkeypatch.setattr(stream_consumer_module, "record_metric", recording_metric)
 
                 delivered = (await _pending_rows(h))[entry_id]
                 with pytest.raises(RuntimeError) as raised:
@@ -1398,8 +1386,7 @@ def test_a_failed_settle_makes_the_dead_letter_report_failure_not_a_clean_row(
 
                 # Reported as a FAILED dead-letter, not a successful one.
                 assert outcomes("curie.queue.dead_letter") == ["failure"], (
-                    "a dead-letter whose settle failed was recorded as clean: "
-                    f"{points}"
+                    f"a dead-letter whose settle failed was recorded as clean: {points}"
                 )
                 assert outcomes("curie.queue.settle") == ["pending"]
 
@@ -1450,9 +1437,7 @@ def test_a_failed_settle_after_the_ack_is_warned_about_and_the_turn_still_succee
         async with make_harness(**_FENCE_CONFIG) as h:
             h.runner.default_script = [Final(text="answered", status=DONE)]
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
 
             async def exploding_settle(*_args: object, **_kwargs: object) -> None:
@@ -1626,9 +1611,7 @@ def test_the_maintenance_scan_fails_closed_when_lease_liveness_is_unreadable(
                 host="127.0.0.1", port=1, socket_connect_timeout=0.5, decode_responses=True
             )
             store = DeliveryLeaseStore(unreachable, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
 
             try:
@@ -1680,9 +1663,7 @@ def test_a_handler_that_lost_its_lease_mid_flight_may_not_dead_letter(
     async def go() -> None:
         async with make_harness(**_FENCE_CONFIG) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
 
             try:
@@ -1742,9 +1723,7 @@ def test_a_handler_holding_a_healthy_lease_dead_letters_normally(
     async def go() -> None:
         async with make_harness(**_FENCE_CONFIG) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
 
             try:
@@ -1807,9 +1786,7 @@ def test_the_graveyard_write_precedes_the_ack_so_a_failed_write_leaves_it_pendin
     async def go() -> None:
         async with make_harness(**_FENCE_CONFIG) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
             dead = _dead_stream(h.config)
 
@@ -1822,7 +1799,10 @@ def test_the_graveyard_write_precedes_the_ack_so_a_failed_write_leaves_it_pendin
                     h.config.stream, h.config.consumer_group, entry_id, consumer="peer-worker"
                 )
                 await store.release(
-                    h.config.stream, h.config.consumer_group, entry_id, owner=lease.owner,
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry_id,
+                    owner=lease.owner,
                     resume_event_id=None,
                 )
 

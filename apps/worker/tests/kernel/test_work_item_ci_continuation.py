@@ -342,9 +342,7 @@ def test_a_fix_publication_carries_the_adopted_request_and_epoch(
             self.creates: list[object] = []
             self.contexts: list[PublicationContext] = []
 
-        async def get_publication_precheck_context(
-            self, **kwargs: object
-        ) -> PublicationContext:
+        async def get_publication_precheck_context(self, **kwargs: object) -> PublicationContext:
             context = await super().get_publication_precheck_context(**kwargs)
             self.contexts.append(context)
             return context

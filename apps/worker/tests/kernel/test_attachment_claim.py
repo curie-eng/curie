@@ -80,6 +80,7 @@ def _qevent(
         event_id=event_id or f"ev-{thread}-{len(text)}-{len(attachments)}",
     )
 
+
 DONE = SessionStatus.DONE
 ATTACHMENTS_REF_ENV = "CURIE_ATTACHMENTS_REF"
 REF_VALUE = "opaque-presigned-attachment-reference"
@@ -234,6 +235,7 @@ class _WorkspaceBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+        **_: object,
     ) -> dict[str, str]:
         return {
             "CURIE_SESSION_ID": f"session:{thread_key}",
@@ -252,6 +254,7 @@ class _HistoryBinding(_WorkspaceBinding):
         *,
         kind: str | None = None,
         address: str | None = None,
+        **_: object,
     ) -> dict[str, str]:
         return {
             **super().boot_env(
@@ -630,9 +633,7 @@ def test_repository_named_on_a_generic_retained_file_turn_is_refused_before_reso
             assert lane.discard_calls == []
             assert h.runner.opened == ["first"]
             assert len(workspace.select_calls) == 2
-            file_updates = [
-                text for _channel, ref, text in h.sink.updates if ref == "p-file"
-            ]
+            file_updates = [text for _channel, ref, text in h.sink.updates if ref == "p-file"]
             assert file_updates[-1] == REPOSITORY_FILE_REPLY
             assert await h.async_redis.exists(h.config.done_key(file_event.event_id))
 
@@ -675,9 +676,7 @@ def test_repository_named_with_workspace_coordinator_off_keeps_main_refusal(
             assert lane.resolve_calls == []
             assert lane.discard_calls == []
             assert h.runner.opened == []
-            file_updates = [
-                text for _channel, ref, text in h.sink.updates if ref == "p-file"
-            ]
+            file_updates = [text for _channel, ref, text in h.sink.updates if ref == "p-file"]
             assert file_updates[-1] == WORKSPACES_OFF_REPLY
             assert await h.async_redis.exists(h.config.done_key(file_event.event_id))
             completions = [
@@ -724,9 +723,7 @@ def test_bare_slash_pair_on_a_retained_file_turn_with_workspaces_off_hands_off_t
 
             await h.kernel.process_event(file_event)
 
-            file_updates = [
-                text for _channel, ref, text in h.sink.updates if ref == "p-file"
-            ]
+            file_updates = [text for _channel, ref, text in h.sink.updates if ref == "p-file"]
             assert WORKSPACES_OFF_REPLY not in file_updates
             second = h.substrate.lookup(_thread_key("tSlashPairFile"))
             assert second is not None and second.workspace_repo is None
@@ -781,9 +778,7 @@ def test_sticky_repository_on_generic_retained_route_refuses_before_resolve(
             assert h.runner.opened == []
             assert len(workspace.select_calls) == 1
             assert workspace.select_calls[0]["repo_full_name"] is None
-            file_updates = [
-                text for _channel, ref, text in h.sink.updates if ref == "p-file"
-            ]
+            file_updates = [text for _channel, ref, text in h.sink.updates if ref == "p-file"]
             assert file_updates[-1] == REPOSITORY_FILE_REPLY
             assert await h.async_redis.exists(h.config.done_key(file_event.event_id))
 
@@ -853,9 +848,7 @@ def test_a_file_on_a_nonidle_retained_thread_is_terminal_without_resolving(
                 with caplog.at_level("INFO", logger="curie_worker.kernel"):
                     await h.kernel.process_event(file_event)
 
-                file_updates = [
-                    text for _channel, ref, text in h.sink.updates if ref == "p-file"
-                ]
+                file_updates = [text for _channel, ref, text in h.sink.updates if ref == "p-file"]
                 expected_reply = (
                     ACTIVE_FILE_REPLY if runner_state == "active" else UNSAFE_FILE_REPLY
                 )
@@ -934,9 +927,7 @@ def test_a_route_created_during_resolve_discards_the_exact_prepared_set(
                 }
             ]
             assert all(runner.opened != ["read this"] for runner in h.runners.values())
-            file_updates = [
-                text for _channel, ref, text in h.sink.updates if ref == "p-file"
-            ]
+            file_updates = [text for _channel, ref, text in h.sink.updates if ref == "p-file"]
             assert file_updates[-1] == CHANGED_FILE_REPLY
             assert await h.async_redis.exists(h.config.done_key(file_event.event_id))
 
@@ -1037,9 +1028,7 @@ def test_second_handoff_probe_failure_discards_prepared_and_keeps_old_route(
                     "prepared": lane.prepared,
                 }
             ]
-            file_updates = [
-                text for _channel, ref, text in h.sink.updates if ref == "p-file"
-            ]
+            file_updates = [text for _channel, ref, text in h.sink.updates if ref == "p-file"]
             assert file_updates[-1] == UNSAFE_FILE_REPLY
 
     asyncio.run(go())
@@ -1107,15 +1096,11 @@ def test_cancellation_waits_for_a_successful_handoff_before_cleanup(
             bind_gate = threading.Event()
             real_get_claim = h.fake_k8s.get_claim
 
-            def pause_candidate_bind(
-                claim_name: str, *, request_timeout_seconds: float
-            ) -> Any:
+            def pause_candidate_bind(claim_name: str, *, request_timeout_seconds: float) -> Any:
                 if claim_name != old.claim_name and not bind_gate.is_set():
                     bind_entered.set()
                     assert bind_gate.wait(timeout=5.0), "candidate bind gate timed out"
-                return real_get_claim(
-                    claim_name, request_timeout_seconds=request_timeout_seconds
-                )
+                return real_get_claim(claim_name, request_timeout_seconds=request_timeout_seconds)
 
             monkeypatch.setattr(h.fake_k8s, "get_claim", pause_candidate_bind)
             qevent = _qevent(
@@ -1184,15 +1169,11 @@ def test_cancellation_discards_after_a_definitively_failed_handoff(
             bind_gate = threading.Event()
             real_get_claim = h.fake_k8s.get_claim
 
-            def pause_candidate_bind(
-                claim_name: str, *, request_timeout_seconds: float
-            ) -> Any:
+            def pause_candidate_bind(claim_name: str, *, request_timeout_seconds: float) -> Any:
                 if claim_name != old.claim_name and not bind_gate.is_set():
                     bind_entered.set()
                     assert bind_gate.wait(timeout=5.0), "candidate bind gate timed out"
-                return real_get_claim(
-                    claim_name, request_timeout_seconds=request_timeout_seconds
-                )
+                return real_get_claim(claim_name, request_timeout_seconds=request_timeout_seconds)
 
             monkeypatch.setattr(h.fake_k8s, "get_claim", pause_candidate_bind)
             qevent = _qevent(
@@ -1203,9 +1184,7 @@ def test_cancellation_discards_after_a_definitively_failed_handoff(
             loop = asyncio.get_running_loop()
             previous_exception_handler = loop.get_exception_handler()
             exception_contexts: list[dict[str, Any]] = []
-            loop.set_exception_handler(
-                lambda _loop, context: exception_contexts.append(context)
-            )
+            loop.set_exception_handler(lambda _loop, context: exception_contexts.append(context))
             try:
                 route_task = asyncio.create_task(
                     h.kernel._route_attachment_and_start(  # noqa: SLF001
@@ -1487,9 +1466,7 @@ def test_approval_resume_with_a_file_carries_the_reference_to_the_new_claim(
                 _qevent(
                     "continue with this file",
                     thread="tApprovalFile",
-                    event_id=(
-                        "approval-00000000-0000-4000-8000-000000000001-resolved"
-                    ),
+                    event_id=("approval-00000000-0000-4000-8000-000000000001-resolved"),
                     attachments=[Attachment(id="F7", name="approved.txt")],
                 )
             )
@@ -1642,9 +1619,7 @@ def test_retained_workspace_file_turn_refuses_without_mutating_any_owned_state(
             assert lane.resolve_calls == []
             assert lane.discard_calls == []
             assert h.runner.opened == ["first"]
-            file_updates = [
-                text for _channel, ref, text in h.sink.updates if ref == "p-file"
-            ]
+            file_updates = [text for _channel, ref, text in h.sink.updates if ref == "p-file"]
             assert file_updates[-1] == WORKSPACE_FILE_REPLY
             assert await h.async_redis.exists(h.config.done_key(file_event.event_id))
             assert not await store.is_live(
@@ -1917,9 +1892,7 @@ def _hide_sandboxes(h: Any, monkeypatch: Any) -> set[str]:
     def get_sandbox(name: str, *, request_timeout_seconds: float) -> Any:
         if name in hidden:
             return None
-        return real_get_sandbox(
-            name, request_timeout_seconds=request_timeout_seconds
-        )
+        return real_get_sandbox(name, request_timeout_seconds=request_timeout_seconds)
 
     monkeypatch.setattr(h.fake_k8s, "get_sandbox", get_sandbox)
     return hidden
@@ -2007,9 +1980,9 @@ async def _assert_refused_race(
     file_updates = [text for _channel, ref, text in h.sink.updates if ref == "p-file"]
     assert file_updates and file_updates[-1] == CHANGED_FILE_REPLY
     assert await h.async_redis.exists(h.config.done_key(file_event.event_id))
-    assert all(
-        ATTACHMENTS_REF_ENV not in (env or {}) for env in h.fake_k8s.claim_envs
-    ), "a claim env carried the refused attachment"
+    assert all(ATTACHMENTS_REF_ENV not in (env or {}) for env in h.fake_k8s.claim_envs), (
+        "a claim env carried the refused attachment"
+    )
     assert len(h.fake_k8s.claim_envs) == 1
     assert h.substrate.lookup(thread_key) == old
 
@@ -2188,17 +2161,11 @@ def test_workspace_route_live_again_at_adopt_refuses_the_file_turn(
 
             assert adopt_calls, "the race never reached substrate.adopt"
             assert h.runner.opened == ["first"]
-            assert lane.discard_calls == [
-                {"thread_key": thread_key, "prepared": lane.prepared}
-            ]
-            file_updates = [
-                text for _channel, ref, text in h.sink.updates if ref == "p-file"
-            ]
+            assert lane.discard_calls == [{"thread_key": thread_key, "prepared": lane.prepared}]
+            file_updates = [text for _channel, ref, text in h.sink.updates if ref == "p-file"]
             assert file_updates and file_updates[-1] == CHANGED_FILE_REPLY
             assert await h.async_redis.exists(h.config.done_key(file_event.event_id))
-            assert all(
-                ATTACHMENTS_REF_ENV not in (env or {}) for env in h.fake_k8s.claim_envs
-            )
+            assert all(ATTACHMENTS_REF_ENV not in (env or {}) for env in h.fake_k8s.claim_envs)
             assert h.substrate.lookup(thread_key) == old
 
     asyncio.run(go())

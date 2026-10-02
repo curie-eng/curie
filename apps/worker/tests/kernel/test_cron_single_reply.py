@@ -26,9 +26,7 @@ from queue_fixtures import qevent as _qevent  # noqa: E402
 DONE = SessionStatus.DONE
 
 
-def test_targeted_cron_turn_posts_the_final_reply_once(
-    make_harness, make_hook_run
-) -> None:
+def test_targeted_cron_turn_posts_the_final_reply_once(make_harness, make_hook_run) -> None:
     """One post, the final reply, and no booting caption or partial edit."""
 
     async def go() -> None:

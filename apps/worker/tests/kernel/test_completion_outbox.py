@@ -153,9 +153,7 @@ def test_a_retryable_failure_emits_no_completion_and_leaves_the_entry_pending(
             summary: dict[str, object] = {}
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
-                summary = await h.async_redis.xpending(
-                    h.config.stream, h.config.consumer_group
-                )
+                summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
                 if summary["pending"]:
                     break
                 await asyncio.sleep(0.01)
@@ -566,9 +564,7 @@ def test_a_failed_terminal_send_recovers_to_exactly_one_user_visible_effect(
             shimmer=False, completion_sweep_grace_s=0.0, **_R6_LEASE_KNOBS
         ) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="answer", status=DONE)]
 
@@ -649,9 +645,7 @@ def test_a_stale_generation_owner_writes_no_marker_clears_nothing_and_emits_noth
     async def go() -> None:
         async with make_harness(shimmer=False, **_R6_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="answer", status=DONE)]
 
@@ -667,7 +661,10 @@ def test_a_stale_generation_owner_writes_no_marker_clears_nothing_and_emits_noth
             )
             assert (
                 await store.release(
-                    h.config.stream, h.config.consumer_group, entry_id, owner=stale.owner,
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry_id,
+                    owner=stale.owner,
                     resume_event_id=None,
                 )
                 is True
@@ -685,9 +682,7 @@ def test_a_stale_generation_owner_writes_no_marker_clears_nothing_and_emits_noth
             await Markers(h.async_redis, h.config).mark_completion_pending(
                 "r6-stale", _record("r6-stale", thread="tR6s", done=False)
             )
-            assert await h.async_redis.smembers(h.config.completions_pending_key()) == {
-                "r6-stale"
-            }
+            assert await h.async_redis.smembers(h.config.completions_pending_key()) == {"r6-stale"}
 
             await h.kernel.process_event(qe, lease=stale)
 
@@ -698,15 +693,13 @@ def test_a_stale_generation_owner_writes_no_marker_clears_nothing_and_emits_noth
             assert await h.async_redis.exists(h.config.completion_key("r6-stale")), (
                 "a fenced-out owner cleared an outbox record it does not own"
             )
-            assert (
-                await h.async_redis.hget(h.config.completion_key("r6-stale"), "done") == "0"
-            ), "a fenced-out owner flagged another writer's record done"
+            assert await h.async_redis.hget(h.config.completion_key("r6-stale"), "done") == "0", (
+                "a fenced-out owner flagged another writer's record done"
+            )
 
             # POSITIVE CONTROL: the current owner settles and emits, so the
             # refusal above is the generation check and not a dead settle path.
-            await h.kernel.process_event(
-                _qevent(thread="tR6s", event_id="r6-stale"), lease=current
-            )
+            await h.kernel.process_event(_qevent(thread="tR6s", event_id="r6-stale"), lease=current)
             assert [c.event_id for c in h.sink.completions] == ["r6-stale"]
             assert await h.async_redis.exists(h.config.done_key("r6-stale"))
             assert await h.async_redis.exists(h.config.completion_key("r6-stale")) == 0

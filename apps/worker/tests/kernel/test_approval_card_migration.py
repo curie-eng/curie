@@ -60,9 +60,7 @@ def test_legacy_thread_keyed_ref_is_rekeyed_onto_its_approval_id(make_harness) -
     async def go() -> None:
         async with make_harness() as h:
             legacy_key = f"{h.config.key_prefix}:approval-card:th-rolled"
-            await h.async_redis.set(
-                legacy_key, _legacy_payload("appr-legacy-1"), ex=3600
-            )
+            await h.async_redis.set(legacy_key, _legacy_payload("appr-legacy-1"), ex=3600)
 
             result = await h.card_store.migrate_legacy_thread_keyed_refs()
             assert (result.scanned, result.migrated, result.skipped) == (1, 1, 0)
@@ -143,9 +141,7 @@ def test_pre_1199_legacy_entry_is_left_untouched(make_harness) -> None:
         async with make_harness() as h:
             absent = f"{h.config.key_prefix}:approval-card:th-pre-1199"
             empty = f"{h.config.key_prefix}:approval-card:th-empty-id"
-            no_id = json.dumps(
-                {"channel": "C3", "ts": "1.1", "summary": "Old card"}
-            )
+            no_id = json.dumps({"channel": "C3", "ts": "1.1", "summary": "Old card"})
             blank_id = _legacy_payload("", channel="C4")
             await h.async_redis.set(absent, no_id, ex=3600)
             await h.async_redis.set(empty, blank_id, ex=3600)
@@ -216,9 +212,7 @@ def test_a_corrupt_entry_does_not_stop_the_pass(make_harness) -> None:
             legacy_key = f"{h.config.key_prefix}:approval-card:th-good"
             await h.async_redis.set(garbage, "{not json at all", ex=3600)
             await h.async_redis.set(not_a_dict, json.dumps(["nope"]), ex=3600)
-            await h.async_redis.set(
-                legacy_key, _legacy_payload("appr-after-garbage"), ex=3600
-            )
+            await h.async_redis.set(legacy_key, _legacy_payload("appr-after-garbage"), ex=3600)
 
             result = await h.card_store.migrate_legacy_thread_keyed_refs()
             assert result.scanned == 3
@@ -243,9 +237,7 @@ def test_the_migration_is_idempotent(make_harness) -> None:
     async def go() -> None:
         async with make_harness() as h:
             legacy_key = f"{h.config.key_prefix}:approval-card:th-twice"
-            await h.async_redis.set(
-                legacy_key, _legacy_payload("appr-twice"), ex=3600
-            )
+            await h.async_redis.set(legacy_key, _legacy_payload("appr-twice"), ex=3600)
 
             first = await h.card_store.migrate_legacy_thread_keyed_refs()
             assert first.migrated == 1
@@ -331,9 +323,7 @@ def test_a_source_that_vanishes_before_the_pttl_is_not_resurrected(
     async def go() -> None:
         async with make_harness() as h:
             legacy_key = f"{h.config.key_prefix}:approval-card:th-vanishes"
-            await h.async_redis.set(
-                legacy_key, _legacy_payload("appr-vanished"), ex=3600
-            )
+            await h.async_redis.set(legacy_key, _legacy_payload("appr-vanished"), ex=3600)
             racing = ApprovalCardStore(
                 _DeletesSourceOnPttl(h.async_redis, legacy_key),  # type: ignore[arg-type]
                 h.config,
@@ -342,9 +332,9 @@ def test_a_source_that_vanishes_before_the_pttl_is_not_resurrected(
             result = await racing.migrate_legacy_thread_keyed_refs()
             assert (result.scanned, result.migrated, result.skipped) == (1, 0, 1)
 
-            assert not await h.async_redis.exists(
-                h.config.approval_card_key("appr-vanished")
-            ), "a ref that had already gone must not come back with a fresh TTL"
+            assert not await h.async_redis.exists(h.config.approval_card_key("appr-vanished")), (
+                "a ref that had already gone must not come back with a fresh TTL"
+            )
             assert await h.card_store.read("appr-vanished") is None
 
     asyncio.run(go())

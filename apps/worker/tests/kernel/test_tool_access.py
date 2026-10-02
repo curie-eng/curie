@@ -49,8 +49,7 @@ _REFUSAL = (
     "this turn, so the turn was not run."
 )
 _APPROVAL_REFUSAL = (
-    "This read-only turn asked for an approval, which it may not do. "
-    "No approval was created."
+    "This read-only turn asked for an approval, which it may not do. No approval was created."
 )
 _qevent = functools.partial(qevent, received_at="2026-09-30T00:00:00+00:00")
 
@@ -278,9 +277,10 @@ def _refused_builtin_calls(reader: InMemoryMetricReader) -> float:
                     continue
                 for point in getattr(metric.data, "data_points", ()):
                     attributes = dict(point.attributes)
-                    if attributes.get("outcome") == "refused" and attributes.get(
-                        "origin"
-                    ) == "builtin":
+                    if (
+                        attributes.get("outcome") == "refused"
+                        and attributes.get("origin") == "builtin"
+                    ):
                         total += point.value
     return total
 
