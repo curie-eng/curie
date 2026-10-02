@@ -1983,3 +1983,36 @@ class PrincipalTeam(Base):
     synced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class FactoryPollCursor(Base):
+    """One repository's factory poll cursors and conditional-request tags (#3745)."""
+
+    __tablename__ = "factory_poll_cursors"
+    __table_args__ = (
+        CheckConstraint(
+            "repository_id IS NULL OR repository_id > 0",
+            name="factory_poll_cursors_repository_id_ck",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(etags) = 'object'",
+            name="factory_poll_cursors_etags_object_ck",
+        ),
+    )
+
+    repo_full_name: Mapped[str] = mapped_column(Text, primary_key=True)
+    repository_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    comments_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    review_comments_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    reviews_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    etags: Mapped[dict[str, Any]] = mapped_column(JSONB,
+        nullable=False, server_default=text("'{}'::jsonb"), default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

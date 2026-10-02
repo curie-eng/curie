@@ -348,10 +348,9 @@ pub fn intake_gate_offenders(
     {
         bad.push("GITHUB_APP_PRIVATE_KEY");
     }
-    // The webhook secret stays required until polling intake ships a chart
-    // value; ADR 0187 is where this requirement drops for poll mode.
+    let intake = api_str(&api, "githubFactoryIntake");
     let secret = api_str(&api, "githubWebhookSecret");
-    if secret.is_empty() || secret == "dev-webhook-secret" {
+    if intake == "webhook" && (secret.is_empty() || secret == "dev-webhook-secret") {
         bad.push("GITHUB_WEBHOOK_SECRET");
     }
     let label = api_str(&api, "githubFactoryLabel");
@@ -949,12 +948,40 @@ mod tests {
 
     #[test]
     fn gate_dev_default_secret_and_at_mention_are_offenders() {
-        let planned = serde_json::json!({"api": {
-            "githubWebhookSecret": "dev-webhook-secret", "githubFactoryMention": "@x"}});
-        assert_eq!(
-            intake_gate_offenders(&full(), &planned),
-            vec!["GITHUB_WEBHOOK_SECRET", "GITHUB_FACTORY_MENTION"]
-        );
+        // The secret is an offender only when intake is explicitly webhook.
+        for secret in ["dev-webhook-secret", ""] {
+            let planned = serde_json::json!({"api": {
+                "githubFactoryIntake": "webhook",
+                "githubWebhookSecret": secret,
+                "githubFactoryMention": "@x"
+            }});
+            assert_eq!(
+                intake_gate_offenders(&full(), &planned),
+                vec!["GITHUB_WEBHOOK_SECRET", "GITHUB_FACTORY_MENTION"],
+                "{secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_poll_or_absent_intake_does_not_require_a_webhook_secret() {
+        let secrets = ["", "dev-webhook-secret"];
+        let intakes = [Some("poll"), None];
+        for secret in secrets {
+            for intake in intakes {
+                let mut recorded = full();
+                let api = recorded["api"].as_object_mut().unwrap();
+                api.insert("githubWebhookSecret".to_string(), serde_json::json!(secret));
+                if let Some(value) = intake {
+                    api.insert("githubFactoryIntake".to_string(), serde_json::json!(value));
+                }
+                let offenders = intake_gate_offenders(&recorded, &serde_json::json!({}));
+                assert!(
+                    offenders.is_empty(),
+                    "intake {intake:?} secret {secret:?} offenders {offenders:?}"
+                );
+            }
+        }
     }
 
     #[test]

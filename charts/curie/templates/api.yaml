@@ -223,6 +223,10 @@ spec:
               value: {{ .Values.api.githubReviewReconcilerIntervalSeconds | quote }}
             - name: GITHUB_FACTORY_INGRESS_ENABLED
               value: {{ .Values.api.githubFactoryIngressEnabled | quote }}
+            - name: GITHUB_FACTORY_INTAKE
+              value: {{ .Values.api.githubFactoryIntake | quote }}
+            - name: GITHUB_FACTORY_POLL_INTERVAL_S
+              value: {{ .Values.api.githubFactoryPollIntervalSeconds | quote }}
             - name: GITHUB_FACTORY_LABEL
               value: {{ .Values.api.githubFactoryLabel | quote }}
             - name: GITHUB_FACTORY_MENTION
