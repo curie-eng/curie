@@ -47,3 +47,34 @@ fn truncated_approval_requires_review_instead_of_hiding_missing_details() {
     .unwrap();
     assert_eq!(approval_display(&record), "Approve file attachment. Details are incomplete; review the original request before approving.");
 }
+
+#[test]
+fn nested_document_keys_are_data_and_granted_tool_remains_exact() {
+    let tool = "mcp__acme__file_attachment";
+    let nested = json!({ "mcp__acme__file_attachment": "draft", "example.pdf": "literal", "customer_id": "keep" });
+    let summary = format!(
+        "Tool call awaiting approval: {tool} {}",
+        json!({"file_contents": nested})
+    );
+    let record: ApprovalRecord = serde_json::from_value(json!({
+        "id":"approval-example", "author":"U0EXAMPLE1", "status":"pending",
+        "conversation_id":"thread-example", "granted_tool":tool,
+        "summary":summary
+    }))
+    .unwrap();
+    let display = approval_display(&record);
+    assert!(
+        display.starts_with("Approve file attachment. File contents: "),
+        "{display}"
+    );
+    for (key, value) in nested.as_object().unwrap() {
+        assert!(
+            display.contains(key),
+            "missing literal key {key}: {display}"
+        );
+        assert!(display.contains(value.as_str().unwrap()), "{display}");
+    }
+    assert!(!display.contains("Customer id: keep"), "{display}");
+    assert_eq!(record.granted_tool.as_deref(), Some(tool));
+    assert_eq!(record.summary, summary);
+}

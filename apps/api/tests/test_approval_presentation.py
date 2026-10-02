@@ -69,3 +69,25 @@ def test_approval_label_siblings_follow_the_shared_presentation_vector() -> None
         assert api_label(case["tool"]) == case["label"]
         assert runner_label(case["tool"]) == case["label"]
         assert worker_label(case["tool"]) == case["label"]
+
+
+def test_approval_nested_document_keys_are_literal_data_and_grant_stays_exact() -> None:
+    tool = "mcp__acme__file_attachment"
+    nested = {
+        "mcp__acme__file_attachment": "draft",
+        "example.pdf": "literal",
+        "customer_id": "keep",
+    }
+    arguments = {"file_contents": nested}
+    summary = "Tool call awaiting approval: " + tool + " " + json.dumps(arguments)
+    row = approval(summary, tool, arguments)
+    out = ApprovalOut.model_validate(row).model_dump()
+    display = out["display_summary"]
+    assert display.startswith("Approve file attachment. File contents: ")
+    for key, value in nested.items():
+        assert key in display
+        assert value in display
+    assert "Customer id: keep" not in display
+    assert out["summary"] == summary
+    assert out["granted_tool"] == tool
+    assert row.granted_arguments == arguments
