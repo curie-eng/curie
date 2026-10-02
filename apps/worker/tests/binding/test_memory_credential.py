@@ -35,6 +35,8 @@ from curie_worker.sandbox_token import verify
 _AGENT = uuid.UUID("11111111-1111-4111-8111-111111111111")
 _KEY = "curie-dev-key"
 _THREAD = "thread-1"
+# The most a turn credential may outlive the turn's own deadline: clock skew only.
+_CLOCK_SKEW_S = 5
 
 
 def _resolved(**overrides: object) -> ResolvedDeployment:
@@ -143,9 +145,6 @@ def test_turn_token_only_with_writes_and_binding() -> None:
 
 
 def test_turn_token_claims_and_bounded_expiry() -> None:
-    from curie_worker.binding import MEMORY_TURN_TOKEN_GRACE_S
-
-    assert MEMORY_TURN_TOKEN_GRACE_S == 60
     before = int(time.time())
     token = _turn_token(sender="U0SENDER1", turn="evt-0001", ttl_s=300.4)
     after = int(time.time())
@@ -158,9 +157,11 @@ def test_turn_token_claims_and_bounded_expiry() -> None:
     assert claims["sender"] == "U0SENDER1"
     assert claims["turn"] == "evt-0001"
     assert set(claims) == {"agent", "scope", "exp", "binding", "memory", "sender", "turn"}
-    # exp = now + ceil(ttl_s) + grace.
+    # Review M2: the credential ends with the turn. exp is at most now plus the
+    # turn's remaining budget (rounded up to a whole second), with no grace
+    # beyond the turn's own deadline; ``_CLOCK_SKEW_S`` allows only for skew.
     ttl = math.ceil(300.4)
-    assert before + ttl + 60 <= claims["exp"] <= after + ttl + 60
+    assert before + 300 <= claims["exp"] <= after + ttl + _CLOCK_SKEW_S
 
     # A turn limit longer than the long-lived token's lifetime is capped at it.
     before = int(time.time())
@@ -168,13 +169,28 @@ def test_turn_token_claims_and_bounded_expiry() -> None:
     after = int(time.time())
     assert long is not None
     exp = _claims(long)["exp"]
-    assert before + SANDBOX_TOKEN_TTL_SECONDS + 60 <= exp <= after + SANDBOX_TOKEN_TTL_SECONDS + 60
+    assert before + SANDBOX_TOKEN_TTL_SECONDS <= exp <= after + SANDBOX_TOKEN_TTL_SECONDS + 5
 
     # And it is distinct from the long-lived boot-env credential.
     env = _resolver().boot_env(
         _resolved(memory_writes=True), _THREAD, kind="slack", address="C0123"
     )
     assert token != env["CURIE_MEMORY_TOKEN"]
+
+
+def test_short_turn_token_expires_with_the_turn() -> None:
+    # Review M2: a 20-second turn's credential is dead seconds after the turn,
+    # not a minute (or a whole delivery budget) later.
+    for ttl_s in (20.0, 1.0):
+        before = int(time.time())
+        token = _turn_token(ttl_s=ttl_s)
+        after = int(time.time())
+        assert token is not None
+        exp = _claims(token)["exp"]
+        assert before + int(ttl_s) <= exp <= after + int(ttl_s) + _CLOCK_SKEW_S, (
+            ttl_s,
+            exp - after,
+        )
 
 
 def test_blank_author_is_no_person() -> None:

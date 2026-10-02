@@ -488,3 +488,80 @@ def test_general_state_reach_unchanged(
         # And guidance/log keys are free outside the memory namespace.
         g = client.put(f"/agents/{aid}/state/notes/guidance", json={"value": 1}, headers=headers)
         assert g.status_code == 200, g.text
+
+
+def test_sandbox_credential_cannot_write_a_non_canonical_fact_key(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # Review L1: the key must be exactly fact- + 32 lowercase hex. A trailing
+    # newline (sent URL-encoded as %0A) slipped past a ``$``-anchored match. A
+    # trailing space and uppercase hex are refused too.
+    aid = _agent_with_two_channels(client, auth_headers)
+    writer = _writer(aid)
+    encoded_keys = (
+        FACT + "%0A",
+        FACT + "%20",
+        "fact-" + "0123456789ABCDEF" * 2,
+        "fact-" + "0" * 31 + "A",
+    )
+    for base in (_agent_memory(aid), _channel(aid, CHANNEL_A)):
+        for key in encoded_keys:
+            put = client.put(f"{base}/{key}", json={"value": _fact_value()}, headers=writer)
+            assert put.status_code == 403, f"{base}/{key}: {put.status_code} {put.text}"
+            assert FACT_KEYS_ONLY in _detail(put)
+        listed = client.get(base, headers=auth_headers)
+        stored = [] if listed.status_code == 404 else [e["key"] for e in listed.json()]
+        assert stored == [], stored
+
+
+def _stamped_at(value: dict[str, Any]) -> Any:
+    from datetime import datetime
+
+    return datetime.fromisoformat(str(value["stated_at"]).replace("Z", "+00:00"))
+
+
+def test_sandbox_write_stamps_stated_at_from_the_server_clock(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # Review L3: a sandbox write cannot backdate a fact. The server stamps
+    # ``stated_at`` from its own clock; ``session_id`` stays the body's value.
+    from datetime import UTC, datetime, timedelta
+
+    aid = _agent_with_two_channels(client, auth_headers)
+    url = f"{_channel(aid, CHANNEL_A)}/{FACT}"
+    body = {**_fact_value(), "stated_at": "1999-01-01T00:00:00+00:00", "session_id": "s-body"}
+    skew = timedelta(seconds=5)
+
+    before = datetime.now(UTC)
+    put = client.put(url, json={"value": body}, headers=_writer(aid))
+    after = datetime.now(UTC)
+    assert put.status_code == 200, put.text
+    stored = client.get(url, headers=auth_headers).json()["value"]
+    stamped = _stamped_at(stored)
+    assert stamped.tzinfo is not None, stored
+    assert before - skew <= stamped <= after + skew, stored
+    assert stored["session_id"] == "s-body"
+
+    # An update (with expected_version) is stamped the same way.
+    again = {**body, "statement": "changed", "stated_at": "2000-01-01T00:00:00+00:00"}
+    before = datetime.now(UTC)
+    upd = client.put(url, json={"value": again, "expected_version": 1}, headers=_writer(aid))
+    after = datetime.now(UTC)
+    assert upd.status_code == 200, upd.text
+    stored = client.get(url, headers=auth_headers).json()["value"]
+    assert before - skew <= _stamped_at(stored) <= after + skew, stored
+    assert stored["session_id"] == "s-body"
+
+
+def test_platform_key_keeps_body_stated_at(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # The platform key (``curie cluster memory``) writes the body as given.
+    aid = _agent_with_two_channels(client, auth_headers)
+    url = f"{_channel(aid, CHANNEL_A)}/{FACT}"
+    body = {**_fact_value(), "stated_at": "1999-01-01T00:00:00+00:00", "session_id": "s-op"}
+    put = client.put(url, json={"value": body}, headers=auth_headers)
+    assert put.status_code == 200, put.text
+    stored = client.get(url, headers=auth_headers).json()["value"]
+    assert stored["stated_at"] == "1999-01-01T00:00:00+00:00"
+    assert stored["session_id"] == "s-op"

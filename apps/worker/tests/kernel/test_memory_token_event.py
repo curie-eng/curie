@@ -290,3 +290,141 @@ def test_retry_mints_fresh_expiry(make_harness, monkeypatch: pytest.MonkeyPatch)
             assert len(binding.turn_token_calls) >= 2
 
     asyncio.run(go())
+
+
+# --------------------------------------------------------------------------- #
+# Security review of #3623
+# --------------------------------------------------------------------------- #
+
+# The most a turn credential may outlive the turn's own deadline: clock skew only.
+_CLOCK_SKEW_S = 5
+
+
+@pytest.mark.parametrize("runner_total_timeout_s", [30.0, 120.0])
+def test_turn_token_expires_by_the_turn_deadline(
+    make_harness, monkeypatch: pytest.MonkeyPatch, runner_total_timeout_s: float
+) -> None:
+    # Review M2: the turn's deadline is the runner request's stream timeout,
+    # ``min(runner_total_timeout_s, remaining delivery budget)`` (RunnerClient
+    # ``start_turn``). The credential must be dead by then, give or take clock
+    # skew: no extra grace, and not the whole delivery budget.
+    async def go() -> None:
+        binding = _MemoryBinding()
+        async with make_harness(
+            binding=binding, runner_total_timeout_s=runner_total_timeout_s
+        ) as h:
+            starts: list[tuple[float, float | None]] = []
+            real_start = h.kernel._runner.start_turn
+
+            async def spy(base_url: str, event: Any, **kwargs: Any) -> Any:
+                starts.append((time.time(), kwargs.get("remaining_s")))
+                return await real_start(base_url, event, **kwargs)
+
+            monkeypatch.setattr(h.kernel._runner, "start_turn", spy)
+            await h.kernel.process_event(_as(_qevent("short one", thread="th-mt-7"), "U0ALICE01"))
+
+            assert h.sink.last_text == "ok"
+            assert starts, "the turn never started"
+            started_at, remaining_s = starts[0]
+            stream_s = h.kernel._runner._total_timeout_s
+            if remaining_s is not None:
+                stream_s = min(stream_s, remaining_s)
+            deadline = started_at + stream_s
+            exp = _claims(h.runner.event_bodies[0]["memory_token"])["exp"]
+            assert exp <= deadline + _CLOCK_SKEW_S, (
+                f"credential outlives the turn by {exp - deadline:.0f}s "
+                f"(stream timeout {stream_s:.0f}s)"
+            )
+
+    asyncio.run(go())
+
+
+def _conftest_runner_class(make_harness: Any) -> Any:
+    # The harness's FakeRunner, from the conftest module pytest loaded (an
+    # ``import conftest`` here would load a second copy under importlib mode).
+    return make_harness.__globals__["FakeRunner"]
+
+
+def _old_runner_400(frames: list[dict[str, Any]]) -> Any:
+    # A runner from before ``server._frame_error``: pydantic's default 400
+    # repeats the rejected input, which for a model-level error is the frame.
+    from aiohttp import web
+
+    async def handler(self: Any, request: Any) -> Any:
+        body = await request.json()
+        frames.append(body)
+        if request.path == "/v1/event":
+            self.opened.append(body["text"])
+            self.event_bodies.append(body)
+        elif not self.turn_active:
+            # A steer with no live turn is refused as before, so the kernel
+            # opens the first turn normally.
+            frames.pop()
+            return web.json_response({"error": "no active turn"}, status=409)
+        detail = [{"type": "value_error", "loc": ["body"], "msg": "bad frame", "input": body}]
+        return web.json_response({"detail": detail}, status=400)
+
+    return handler
+
+
+def _assert_not_logged(caplog: pytest.LogCaptureFixture, token: str) -> None:
+    assert caplog.records, "nothing was logged"
+    assert token not in caplog.text
+    for record in caplog.records:
+        assert token not in record.getMessage(), record.name
+        if record.exc_info is not None:
+            assert token not in repr(record.exc_info[1]), record.name
+            assert token not in str(record.exc_info[1]), record.name
+
+
+def test_old_runner_event_400_does_not_log_the_token(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Review L2 (MEMORY-TOKEN-3): an older runner's 400 body echoes the frame,
+    # memory_token included. The worker must not put that body in a log line.
+    frames: list[dict[str, Any]] = []
+    monkeypatch.setattr(_conftest_runner_class(make_harness), "_event", _old_runner_400(frames))
+    caplog.set_level("DEBUG")
+
+    async def go() -> None:
+        binding = _MemoryBinding()
+        async with make_harness(binding=binding, max_attempts=1) as h:
+            await h.kernel.process_event(_as(_qevent("hello", thread="th-mt-8"), "U0ALICE01"))
+
+    asyncio.run(go())
+    assert frames, "the runner never got the frame"
+    token = frames[0]["memory_token"]
+    assert _claims(token)["memory"] == "write"
+    _assert_not_logged(caplog, token)
+
+
+def test_old_runner_steer_400_does_not_log_the_token(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The same for /v1/steer: a follow-up steered into a live turn.
+    steers: list[dict[str, Any]] = []
+    monkeypatch.setattr(_conftest_runner_class(make_harness), "_steer", _old_runner_400(steers))
+    caplog.set_level("DEBUG")
+
+    async def go() -> None:
+        binding = _MemoryBinding()
+        async with make_harness(binding=binding) as h:
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="done", status=SessionStatus.DONE)]
+            first = _as(_qevent("first", thread="th-mt-9", placeholder="ph-1"), "U0ALICE01")
+            task = asyncio.create_task(h.kernel.process_event(first))
+            try:
+                await _wait_until(lambda: h.runner.turn_active, "the first turn to be live")
+                second = _as(_qevent("follow", thread="th-mt-9", placeholder="ph-2"), "U0BOB0001")
+                await asyncio.wait_for(h.kernel.process_event(second), timeout=30)
+            finally:
+                hold.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(go())
+    tokens = [s["memory_token"] for s in steers if s.get("memory_token")]
+    assert tokens, f"no steer carried a token: {steers!r}"
+    for token in tokens:
+        _assert_not_logged(caplog, token)

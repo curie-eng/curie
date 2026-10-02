@@ -2154,3 +2154,263 @@ def test_403_reported_as_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert REFUSED_TEXT in text, text
     assert "could not be reached" not in text, text
     assert _facts(tool_api, CHANNEL_NS) == {}
+
+
+# --------------------------------------------------------------------------- #
+# Security review of #3623
+#
+# M2: a turn's write credential must not outlive the turn in the runner. When a
+# turn ends, however it ends, ``MemoryTurn.write_token`` is cleared, so a later
+# memory write falls back to the read-only env token and is refused.
+# L1: a fact id is exactly fact- + 32 lowercase hex, with nothing after it.
+# --------------------------------------------------------------------------- #
+
+READ_ONLY_DETAIL = "memory credential is read-only"
+
+
+class _EnvTokenReadOnlyApi(FakeStateApi):
+    """Refuses writes presented with the long-lived env token, as the real API
+    does for a ``memory: "read"`` credential (ADR-0188)."""
+
+    def app(self) -> web.Application:
+        app = super().app()
+
+        @web.middleware
+        async def refuse(request: web.Request, handler: Any) -> web.StreamResponse:
+            token = request.headers.get("X-API-Key")
+            if request.method in ("PUT", "DELETE", "POST") and token == MEMORY_TOKEN:
+                self.requests.append((request.method, request.path, token))
+                return web.json_response({"detail": READ_ONLY_DETAIL}, status=403)
+            return await handler(request)
+
+        app.middlewares.append(refuse)
+        return app
+
+
+class _KeptSession(_ScriptedSession):
+    """A scripted session that remembers itself, so a test can reach the
+    platform tool server after the turn has ended."""
+
+    last: _KeptSession | None = None
+
+    def __init__(self, options: Any) -> None:
+        super().__init__(options)
+        type(self).last = self
+
+
+async def _call_tool(session: _ScriptedSession, live_name: str, arguments: dict[str, Any]) -> Any:
+    server = session.options.mcp_servers[APPROVAL_SERVER_NAME]["instance"]
+    entry = server.get_request_handler("tools/call")
+    assert entry is not None
+    name = live_name.removeprefix(f"mcp__{APPROVAL_SERVER_NAME}__")
+    return await entry.handler(
+        None, mcp_types.CallToolRequestParams(name=name, arguments=arguments)
+    )
+
+
+def test_tool_call_after_the_turn_uses_the_env_token_and_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = _EnvTokenReadOnlyApi()
+    _KeptSession.script = []
+    _KeptSession.results = []
+    _KeptSession.last = None
+    after: dict[str, Any] = {}
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            config = RunnerConfig.from_env(_env(monkeypatch, tmp_path, server))
+            runner = await _fetch_and_build(config, monkeypatch, session_class=_KeptSession)
+            await runner.start()
+            try:
+                event = Event(
+                    type="message", text="hi", user="U0ALICE01", ts="1", memory_token=TURN_TOKEN
+                )
+                async for _line in runner.run_turn(event):
+                    pass
+                session = _KeptSession.last
+                assert session is not None
+                # The turn is over. A memory tool call now (sandbox code that
+                # kept the tool handle, or a late call) must not write as Alice.
+                after["result"] = await _call_tool(
+                    session, REMEMBER, {"memory": "channel", "statement": "planted"}
+                )
+            finally:
+                await runner.close()
+
+    anyio.run(go)
+    result = after["result"]
+    puts = [t for m, _p, t in api.requests if m == "PUT"]
+    assert puts == [MEMORY_TOKEN], api.requests
+    assert TURN_TOKEN not in {t for _m, _p, t in api.requests}, api.requests
+    assert _is_error(result), _text(result)
+    assert REFUSED_TEXT in _text(result), _text(result)
+    assert _facts(api, CHANNEL_NS) == {}
+
+
+def test_next_turn_without_a_token_writes_with_the_env_token_and_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = _EnvTokenReadOnlyApi()
+    _KeptSession.results = []
+    results: list[Any] = []
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            config = RunnerConfig.from_env(_env(monkeypatch, tmp_path, server))
+            runner = await _fetch_and_build(config, monkeypatch, session_class=_KeptSession)
+            await runner.start()
+            try:
+                _KeptSession.script = []
+                first = Event(
+                    type="message", text="hi", user="U0ALICE01", ts="1", memory_token=TURN_TOKEN
+                )
+                async for _line in runner.run_turn(first):
+                    pass
+                _KeptSession.script = [(REMEMBER, {"memory": "channel", "statement": "x"})]
+                second = Event(type="message", text="again", user="U0BOB0001", ts="2")
+                async for _line in runner.run_turn(second):
+                    pass
+                results.extend(_KeptSession.results)
+            finally:
+                await runner.close()
+
+    anyio.run(go)
+    [result] = results
+    puts = [t for m, _p, t in api.requests if m == "PUT"]
+    assert puts == [MEMORY_TOKEN], api.requests
+    assert _is_error(result), _text(result)
+    assert REFUSED_TEXT in _text(result), _text(result)
+    assert _facts(api, CHANNEL_NS) == {}
+
+
+class _HeldSession:
+    """A bare SDK session whose turn stays live until ``release`` is set, or
+    whose stream fails when ``fail`` is set."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.queried = anyio.Event()
+        self.release = anyio.Event()
+
+    async def connect(self) -> None:
+        return None
+
+    async def query(self, _text: str) -> None:
+        self.queried.set()
+
+    async def receive_turn(self):  # type: ignore[no-untyped-def]
+        if self.fail:
+            raise RuntimeError("stream broke")
+        await self.release.wait()
+        if False:  # pragma: no cover - retain the async-generator shape
+            yield None
+
+    async def interrupt(self) -> None:
+        self.release.set()
+
+    async def close(self) -> None:
+        self.release.set()
+
+
+def _bare_runner(session: _HeldSession, memory_turn: Any) -> Any:
+    from curie_runner import RunTracer, SideEffectClassifier
+    from curie_runner.session import SessionRunner
+
+    return SessionRunner(
+        held_secrets=frozenset(),
+        session_factory=lambda: session,
+        ceiling=10_000,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+        memory_turn=memory_turn,
+    )
+
+
+@pytest.mark.parametrize("ending", ["finish", "error", "cancel"])
+def test_turn_end_clears_the_write_token(ending: str) -> None:
+    from curie_runner.memory_facts import MemoryTurn
+
+    session = _HeldSession(fail=ending == "error")
+    memory_turn = MemoryTurn()
+    runner = _bare_runner(session, memory_turn)
+    seen: dict[str, Any] = {}
+    event = Event(type="message", text="hi", user="U0ALICE01", ts="1", memory_token=TURN_TOKEN)
+
+    async def consume() -> None:
+        async for _line in runner.run_turn(event):
+            pass
+
+    async def go() -> None:
+        await runner.start()
+        try:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(consume)
+                if ending != "error":
+                    with anyio.fail_after(5):
+                        await session.queried.wait()
+                    seen["live"] = memory_turn.write_token
+                    if ending == "finish":
+                        session.release.set()
+                    else:
+                        tg.cancel_scope.cancel()
+            seen["after"] = memory_turn.write_token
+        finally:
+            await runner.close()
+
+    anyio.run(go)
+    if ending != "error":
+        # The live turn did hold the credential...
+        assert seen["live"] == TURN_TOKEN
+    # ...and it is gone once the turn has ended.
+    assert seen["after"] is None, ending
+
+
+def test_steer_from_another_sender_replaces_the_write_token() -> None:
+    from curie_runner.memory_facts import MemoryTurn
+
+    session = _HeldSession()
+    memory_turn = MemoryTurn()
+    runner = _bare_runner(session, memory_turn)
+    seen: dict[str, Any] = {}
+    alice = Event(type="message", text="hi", user="U0ALICE01", ts="1", memory_token=TURN_TOKEN)
+    bob = Event(type="message", text="and", user="U0BOB0001", ts="2", memory_token="sbx.bob")
+
+    async def consume() -> None:
+        async for _line in runner.run_turn(alice):
+            pass
+
+    async def go() -> None:
+        await runner.start()
+        try:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(consume)
+                with anyio.fail_after(5):
+                    await session.queried.wait()
+                assert memory_turn.write_token == TURN_TOKEN
+                seen["steered"] = await runner.steer(bob.text, event=bob)
+                seen["token"] = memory_turn.write_token
+                seen["author"] = memory_turn.author
+                session.release.set()
+        finally:
+            await runner.close()
+
+    anyio.run(go)
+    assert seen["steered"] is True
+    assert seen["token"] == "sbx.bob"
+    assert seen["author"] == "U0BOB0001"
+
+
+def test_is_fact_id_rejects_non_canonical_keys() -> None:
+    from curie_runner.memory_facts import is_fact_id
+
+    fact = "fact-" + "0123456789abcdef" * 2
+    assert is_fact_id(fact)
+    for key in (
+        fact + "\n",
+        fact + " ",
+        "fact-" + "0123456789ABCDEF" * 2,
+        "fact-" + "0" * 31 + "A",
+    ):
+        assert not is_fact_id(key), repr(key)
