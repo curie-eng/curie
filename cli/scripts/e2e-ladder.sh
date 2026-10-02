@@ -4217,6 +4217,10 @@ reap_local_runner_sandboxes() {
 start_local_model_error_provider() {
     local network="${CURIE_DOCKER_NETWORK:-curie_runner}"
     local image="${CURIE_RUNNER_IMAGE:-${CURIE_E2E_IMAGE:-$RUNNER_IMAGE}}"
+    if docker inspect "$LOCAL_MODEL_ERROR_PROVIDER_NAME" >/dev/null 2>&1; then
+        echo "local: model failure provider name is already owned; refusing to replace it" >&2
+        return 1
+    fi
     LOCAL_MODEL_ERROR_PROVIDER_OWNED=1
     docker run -d --name "$LOCAL_MODEL_ERROR_PROVIDER_NAME" \
         --label "curietech.ai/e2e-owner=$LOCAL_OTEL_SINK_NAME" \
@@ -4245,6 +4249,16 @@ with urllib.request.urlopen("http://127.0.0.1:8081/health", timeout=2) as respon
 
 stop_local_model_error_provider() {
     if (( LOCAL_MODEL_ERROR_PROVIDER_OWNED )); then
+        local owner
+        if ! owner="$(docker inspect "$LOCAL_MODEL_ERROR_PROVIDER_NAME" \
+            --format '{{index .Config.Labels "curietech.ai/e2e-owner"}}' 2>/dev/null)"; then
+            LOCAL_MODEL_ERROR_PROVIDER_OWNED=0
+            return 0
+        fi
+        if [[ "$owner" != "$LOCAL_OTEL_SINK_NAME" ]]; then
+            echo "local: model failure provider ownership changed; refusing to remove it" >&2
+            return 1
+        fi
         docker rm -f "$LOCAL_MODEL_ERROR_PROVIDER_NAME" >/dev/null || return 1
         LOCAL_MODEL_ERROR_PROVIDER_OWNED=0
     fi
