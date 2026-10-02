@@ -136,3 +136,91 @@ def test_a_declared_provider_credential_name_is_not_a_shell_variable() -> None:
     assert "provider-sentinel" not in "\n".join(child.values())
     assert child["CURIE_MODEL_ENV_KEY"] == "ACME_PROVIDER_KEY"
     assert child["PATH"] == "/usr/bin"
+
+
+class _EnvSnapshotSession:
+    """An SDK session stand-in that records what a hook, a shell and Bash would see.
+
+    ``query`` runs while the turn is live, after the runner has taken the
+    turn's memory credential, so its snapshots are the env any subprocess
+    spawned during that turn would inherit.
+    """
+
+    snapshots: list[dict[str, str]] = []
+
+    def __init__(self) -> None:
+        self.bash_env: str = ""
+
+    async def connect(self) -> None:
+        return None
+
+    async def query(self, _text: str) -> None:
+        from curie_runner.subprocess_env import cli_parent_env
+
+        type(self).snapshots = [
+            dict(os.environ),
+            shell_and_hook_env(os.environ, extra={"CLAUDE_PLUGIN_ROOT": "/bundle"}),
+            cli_parent_env(os.environ),
+        ]
+        env = cli_parent_env(os.environ)
+        completed = subprocess.run(
+            ["bash", "-c", "env"], check=True, capture_output=True, text=True, env=env
+        )
+        self.bash_env = completed.stdout
+
+    async def receive_turn(self):  # type: ignore[no-untyped-def]
+        if False:  # pragma: no cover - retain the async-generator shape
+            yield None
+
+    async def interrupt(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+def test_turn_memory_token_never_reaches_env_hooks_or_bash() -> None:
+    # ADR-0188 decision 5 / MEMORY-TOKEN-3: the per-turn memory credential
+    # rides the ACI Event into the runner's MemoryTurn and nowhere else -- not
+    # os.environ, not the hook/shell env, not the CLI parent env, not Bash.
+    import anyio
+    from aci_protocol import Event
+    from curie_runner import RunTracer, SideEffectClassifier
+    from curie_runner.memory_facts import MemoryTurn
+    from curie_runner.session import SessionRunner
+
+    token = "sbx.turn-memory-sentinel.sig"
+    session = _EnvSnapshotSession()
+    memory_turn = MemoryTurn()
+    runner = SessionRunner(
+        held_secrets=frozenset(),
+        session_factory=lambda: session,
+        ceiling=10_000,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+        memory_turn=memory_turn,
+    )
+    seen: dict[str, object] = {}
+
+    async def go() -> None:
+        await runner.start()
+        try:
+            event = Event(type="message", text="hi", user="U123", ts="1", memory_token=token)
+            async for _line in runner.run_turn(event):
+                pass
+            seen["write_token"] = memory_turn.write_token
+        finally:
+            await runner.close()
+
+    anyio.run(go)
+
+    # The runner did take the credential for its tools...
+    assert seen["write_token"] == token
+    # ...and no subprocess-facing env carries it, under any name.
+    assert len(_EnvSnapshotSession.snapshots) == 3
+    for env in _EnvSnapshotSession.snapshots:
+        assert token not in "\n".join(f"{k}={v}" for k, v in env.items())
+    assert session.bash_env, "bash never ran"
+    assert token not in session.bash_env
+    assert token not in "\n".join(f"{k}={v}" for k, v in os.environ.items())

@@ -1,6 +1,7 @@
 """The aiohttp ACI channel: health, status, event stream, interrupt, steer."""
 
 import json
+import logging
 from pathlib import Path
 
 import anyio
@@ -739,3 +740,81 @@ def test_probe_endpoints_never_gated(path: str) -> None:
             assert resp.status == 200
 
     anyio.run(go)
+
+
+# ADR-0188 / MEMORY-TOKEN-3: the per-turn memory credential on Event.memory_token
+# is a secret. A rejected frame's error body must not echo it, and nothing the
+# runner logs while serving a turn may carry it.
+
+_MEMORY_TOKEN = "sbx.eyJtZW1vcnkiOiJ3cml0ZSJ9.turn-memory-sentinel"
+
+
+def test_bad_event_error_does_not_echo_memory_token() -> None:
+    runner, _ = _runner()
+    bad_frames = [
+        # Missing the required text field: a whole-object validation error.
+        {"kind": "event", "type": "message", "user": "U", "ts": "1", "memory_token": _MEMORY_TOKEN},
+        # A wrong-typed sibling field.
+        {
+            "kind": "event",
+            "type": "message",
+            "text": {"not": "a string"},
+            "user": "U",
+            "ts": "1",
+            "memory_token": _MEMORY_TOKEN,
+        },
+        # An unknown event type.
+        {"kind": "event", "type": "nope", "text": "hi", "ts": "1", "memory_token": _MEMORY_TOKEN},
+    ]
+
+    async def go() -> None:
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner))) as client:
+            for frame in bad_frames:
+                for path in ("/v1/event", "/v1/steer"):
+                    resp = await client.post(path, json=frame)
+                    body = await resp.text()
+                    assert resp.status == 400, (path, resp.status, body)
+                    assert _MEMORY_TOKEN not in body, (path, body)
+                    assert "turn-memory-sentinel" not in body, (path, body)
+
+    anyio.run(go)
+
+
+def test_memory_token_absent_from_logs(caplog: pytest.LogCaptureFixture) -> None:
+    runner, _ = _runner()
+
+    async def go() -> None:
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner))) as client:
+            frame = {
+                "kind": "event",
+                "type": "message",
+                "text": "hi",
+                "user": "U",
+                "ts": "1",
+                "memory_token": _MEMORY_TOKEN,
+            }
+            resp = await client.post("/v1/event", json=frame)
+            assert resp.status == 200
+            events = parse_ndjson(await resp.text())
+            assert events[-1].type == "final"
+            steer = await client.post("/v1/steer", json=frame)
+            assert steer.status == 409
+            bad = dict(frame)
+            del bad["text"]
+            assert (await client.post("/v1/event", json=bad)).status == 400
+
+    with caplog.at_level(logging.DEBUG):
+        anyio.run(go)
+
+    assert caplog.records, "nothing was logged; the test would prove nothing"
+    for record in caplog.records:
+        rendered = record.getMessage()
+        assert "turn-memory-sentinel" not in rendered, (record.name, rendered)
+        assert "turn-memory-sentinel" not in repr(record.args), record.name
+        if record.exc_info is not None:
+            import traceback
+
+            text = "".join(traceback.format_exception(*record.exc_info))
+            assert "turn-memory-sentinel" not in text, record.name

@@ -73,6 +73,9 @@ class FakeStateApi:
         # at 7 so a store that hard-codes version 1 is caught.
         self.versions: dict[str, int] = {}
         self.put_bodies: list[tuple[str, dict[str, Any]]] = []
+        # When set, every write answers 403 with this detail, as the real API
+        # refuses a credential outside its reach (ADR-0188).
+        self.forbidden_detail: str | None = None
 
     def seed(self, ns: str, key: str, value: Any) -> None:
         self.data[ns][key] = value
@@ -111,6 +114,8 @@ class FakeStateApi:
                     self.versions[f"{ns}/{key}"] = self.versions.get(f"{ns}/{key}", 0) + 1
                     return web.json_response(self._entry(ns, key, entries[key]))
                 key = rest
+                if self.forbidden_detail is not None and request.method in ("PUT", "DELETE"):
+                    return web.json_response({"detail": self.forbidden_detail}, status=403)
                 if request.method == "GET":
                     if key not in entries:
                         return web.json_response({"detail": "not found"}, status=404)
@@ -2020,3 +2025,132 @@ def test_update_and_forget_still_work_at_the_boot_limit(
     assert dropped not in facts
     assert len(facts) == MAX_FACTS_PER_MEMORY
     assert "now it fits" in {v["statement"] for v in facts.values()}
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0188 (#3623): the tools write with the turn's own credential
+#
+# The worker sends a per-turn write credential on ``Event.memory_token``. The
+# runner keeps it on ``MemoryTurn.write_token`` (never in the env), and the
+# tool stores present it for every request they make; boot reads keep the
+# long-lived env token. A 403 from the API is a refusal, not an outage.
+# --------------------------------------------------------------------------- #
+
+TURN_TOKEN = "sbx.turn-credential.sig"
+REFUSED_TEXT = "Refused: this memory cannot be written from this conversation. Nothing was saved."
+
+
+def test_memory_turn_takes_write_token_from_event() -> None:
+    from curie_runner.memory_facts import NO_PERSON, MemoryTurn
+
+    turn = MemoryTurn()
+    assert turn.write_token is None
+    turn.begin(Event(type="message", text="hi", user="UA", ts="1", memory_token=TURN_TOKEN))
+    assert turn.write_token == TURN_TOKEN
+    assert turn.author == "UA"
+    # The next turn's credential replaces the previous one, including with none.
+    turn.begin(Event(type="message", text="again", user="UB", ts="2", memory_token="sbx.next"))
+    assert turn.write_token == "sbx.next"
+    turn.begin(Event(type="job", text="nightly", user="UC", ts="3"))
+    assert turn.write_token is None
+    assert turn.author == NO_PERSON
+
+
+def test_tools_write_with_turn_token_not_env_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = FakeStateApi()
+    api.seed(CHANNEL_NS, SEEDED, _fact_value("old", "2026-09-01T00:00:00Z"))
+    other = "fact-" + "d" * 32
+    api.seed(AGENT_NS, other, _fact_value("drop", "2026-09-01T00:00:00Z"))
+    results = _run_tools(
+        monkeypatch,
+        tmp_path,
+        api,
+        [
+            (REMEMBER, {"memory": "channel", "statement": "C1 is prod"}),
+            (UPDATE, {"memory": "channel", "id": SEEDED, "statement": "new"}),
+            (FORGET, {"memory": "agent", "id": other}),
+        ],
+        event=Event(type="message", text="hi", user="U123", ts="1", memory_token=TURN_TOKEN),
+    )
+    assert not any(_is_error(r) for r in results), [_text(r) for r in results]
+    writes = [(m, p, t) for m, p, t in api.requests if m in ("PUT", "DELETE", "POST")]
+    assert {m for m, _p, _t in writes} == {"PUT", "DELETE"}, writes
+    # Every write carries the turn's credential, never the env token.
+    assert {t for _m, _p, t in writes} == {TURN_TOKEN}, writes
+    # Boot reads (before the turn) keep the long-lived env token.
+    boot = [t for m, _p, t in api.requests if m == "GET" and t == MEMORY_TOKEN]
+    assert boot, api.requests
+    # Once the turn has a credential, the tool stores present it for their reads too.
+    first_write = api.requests.index(writes[0])
+    tool_reads = [t for m, _p, t in api.requests[first_write:] if m == "GET"]
+    assert tool_reads and set(tool_reads) == {TURN_TOKEN}, api.requests
+
+
+def test_falls_back_to_env_token_without_event_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_runner.memory_facts import MemoryFactsStore
+
+    # The store keeps the env token as the fallback when the turn has none.
+    api = FakeStateApi()
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            store = MemoryFactsStore(
+                str(server.make_url(AGENT_NS)), MEMORY_TOKEN, turn_token=lambda: None
+            )
+            await store.add(statement="y", author="U1", session_id="s")
+            turned = MemoryFactsStore(
+                str(server.make_url(AGENT_NS)), MEMORY_TOKEN, turn_token=lambda: TURN_TOKEN
+            )
+            await turned.add(statement="z", author="U1", session_id="s")
+
+    anyio.run(go)
+    puts = [t for m, _p, t in api.requests if m == "PUT"]
+    assert puts == [MEMORY_TOKEN, TURN_TOKEN], api.requests
+
+    # And through the real tools: an older worker sends no event token.
+    tool_api = FakeStateApi()
+    [result] = _run_tools(
+        monkeypatch,
+        tmp_path,
+        tool_api,
+        [(REMEMBER, {"memory": "channel", "statement": "x"})],
+        event=Event(type="message", text="hi", user="U123", ts="1"),
+    )
+    assert not _is_error(result), _text(result)
+    assert {t for m, _p, t in tool_api.requests if m == "PUT"} == {MEMORY_TOKEN}
+
+
+def test_403_reported_as_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from curie_runner.memory_facts import MemoryFactsError, MemoryFactsStore, MemoryRefused
+
+    assert issubclass(MemoryRefused, MemoryFactsError)
+    api = FakeStateApi()
+    api.forbidden_detail = "memory credential is read-only"
+
+    async def go() -> None:
+        async with TestServer(api.app()) as server:
+            store = MemoryFactsStore(str(server.make_url(CHANNEL_NS)), MEMORY_TOKEN)
+            with pytest.raises(MemoryRefused) as refused:
+                await store.add(statement="y", author="U1", session_id="s")
+            assert "memory credential is read-only" in str(refused.value)
+
+    anyio.run(go)
+
+    tool_api = FakeStateApi()
+    tool_api.forbidden_detail = "credential is scoped to another channel"
+    [result] = _run_tools(
+        monkeypatch,
+        tmp_path,
+        tool_api,
+        [(REMEMBER, {"memory": "channel", "statement": "x"})],
+        event=Event(type="message", text="hi", user="U123", ts="1", memory_token=TURN_TOKEN),
+    )
+    text = _text(result)
+    assert _is_error(result), text
+    assert REFUSED_TEXT in text, text
+    assert "could not be reached" not in text, text
+    assert _facts(tool_api, CHANNEL_NS) == {}

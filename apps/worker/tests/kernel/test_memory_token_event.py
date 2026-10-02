@@ -1,0 +1,292 @@
+"""ADR-0188 (#3623): each turn carries its own memory write credential on the Event.
+
+For an agent with memory writes on, the worker mints a short-lived ``state``
+credential per turn (``BindingResolver.turn_memory_token``) and sends it as
+``Event.memory_token`` on the runner POST, never in the boot env. These tests
+drive the real ``Kernel.process_event`` against real Valkey and the scriptable
+HTTP runner in ``conftest.py``; the binding double resolves a real
+``ResolvedDeployment`` and delegates ``boot_env`` and ``turn_memory_token`` to
+the real resolver, so the credentials under test are the ones the worker would
+really mint.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import functools
+import json
+import sys
+import time
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from aci_protocol import Final, OutboundEvent, QueuedTurn, SessionStatus, TextDelta, ToolNote
+from curie_worker import binding as binding_module
+from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.binding import BindingResolver, ResolvedDeployment
+from curie_worker.config import WorkerConfig
+from curie_worker.sandbox_token import verify
+
+# importlib import mode does not add the test root to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from queue_fixtures import qevent  # noqa: E402
+from queue_fixtures import wait_until as _wait_until  # noqa: E402
+from test_work_item_early_stop import (  # noqa: E402
+    ISSUE_PROMPT,
+    _PublicationApi,
+    _WorkItems,
+    _Workspace,
+)
+from test_work_item_early_stop import _turn as _work_item_turn  # noqa: E402
+
+AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
+DEPLOYMENT_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
+CHANNEL = "C0EXAMPLE1"
+_qevent = functools.partial(qevent, channel=CHANNEL, received_at="2026-10-01T00:00:00+00:00")
+
+
+class _MemoryBinding:
+    """Resolves one agent with memory writes on; real boot env and real mints."""
+
+    def __init__(self, *, memory_writes: bool = True) -> None:
+        self.memory_writes = memory_writes
+        self.envs: list[dict[str, str]] = []
+        self.turn_token_calls: list[dict[str, Any]] = []
+        self._real = BindingResolver.__new__(BindingResolver)
+        self._real._config = WorkerConfig()  # type: ignore[attr-defined]
+
+    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
+        return ResolvedDeployment(
+            agent_id=AGENT_ID,
+            agent_name="acme-bot",
+            deployment_id=DEPLOYMENT_ID,
+            version_id=uuid.UUID("33333333-3333-4333-8333-333333333333"),
+            version_label="v1",
+            bundle_ref=None,
+            max_usd_per_day=None,
+            max_output_tokens_per_run=None,
+        )
+
+    async def memory_writes_for(self, _agent_id: uuid.UUID) -> bool:
+        return self.memory_writes
+
+    def boot_env(self, resolved: Any, thread_key: str, **kwargs: Any) -> dict[str, str]:
+        env = self._real.boot_env(resolved, thread_key, **kwargs)
+        self.envs.append(dict(env))
+        return env
+
+    def turn_memory_token(self, resolved: Any, **kwargs: Any) -> str | None:
+        self.turn_token_calls.append(dict(kwargs))
+        return self._real.turn_memory_token(resolved, **kwargs)  # type: ignore[attr-defined]
+
+    def packs_for(self, _resolved: object) -> BehaviorPacks:
+        return BehaviorPacks()
+
+
+def _claims(token: object) -> dict[str, Any]:
+    assert isinstance(token, str) and token, f"no memory_token on the event: {token!r}"
+    assert verify(token, WorkerConfig().api_key, agent=str(AGENT_ID), scope="state") is True
+    seg = token.split(".")[1]
+    payload = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _as(turn: QueuedTurn, author: str) -> QueuedTurn:
+    return turn.model_copy(update={"author": author})
+
+
+def test_runner_event_carries_turn_token(make_harness) -> None:
+    async def go() -> None:
+        binding = _MemoryBinding()
+        async with make_harness(binding=binding) as h:
+            turn = _as(_qevent("remember the deploy window", thread="th-mt-1"), "U0ALICE01")
+
+            await h.kernel.process_event(turn)
+
+            assert h.sink.last_text == "ok"
+            body = h.runner.event_bodies[0]
+            claims = _claims(body["memory_token"])
+            assert claims["agent"] == str(AGENT_ID)
+            assert claims["scope"] == "state"
+            assert claims["memory"] == "write"
+            assert claims["binding"] == f"slack:{CHANNEL}"
+            assert claims["sender"] == "U0ALICE01"
+            # The run identity: the queued event id.
+            assert claims["turn"] == turn.event_id
+
+    asyncio.run(go())
+
+
+def test_writes_off_turn_carries_no_token(make_harness) -> None:
+    async def go() -> None:
+        binding = _MemoryBinding(memory_writes=False)
+        async with make_harness(binding=binding) as h:
+            await h.kernel.process_event(_qevent("hello", thread="th-mt-2"))
+
+            assert h.runner.event_bodies[0]["memory_token"] is None
+            # The boot env still carries the long-lived read credential.
+            claims = _claims(binding.envs[0]["CURIE_MEMORY_TOKEN"])
+            assert claims["memory"] == "read"
+
+    asyncio.run(go())
+
+
+def test_steer_carries_steering_senders_token(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A steer reuses the event built for the steering turn, so the steering
+    # sender writes under their own name, not the live turn's sender.
+    async def go() -> None:
+        binding = _MemoryBinding()
+        async with make_harness(binding=binding) as h:
+            steered: list[Any] = []
+            real_steer = h.kernel._runner.steer
+
+            async def spy(base_url: str, event: Any, **kwargs: Any) -> Any:
+                steered.append(event)
+                return await real_steer(base_url, event, **kwargs)
+
+            monkeypatch.setattr(h.kernel._runner, "steer", spy)
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [Final(text="done", status=SessionStatus.DONE)]
+
+            first = _as(
+                _qevent("first question", thread="th-mt-3", placeholder="ph-1"), "U0ALICE01"
+            )
+            task = asyncio.create_task(h.kernel.process_event(first))
+            try:
+                await _wait_until(lambda: h.runner.turn_active, "the first turn to be live")
+                second = _as(
+                    _qevent("and also this", thread="th-mt-3", placeholder="ph-2"), "U0BOB0001"
+                )
+                await h.kernel.process_event(second)
+            finally:
+                hold.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+            assert h.runner.steers == ["and also this"]
+            # Only the follow-up's steer landed (a steer the kernel tries
+            # before the first turn is live is refused by the runner).
+            steered = [e for e in steered if e.text == "and also this"]
+            assert len(steered) == 1
+            first_claims = _claims(h.runner.event_bodies[0]["memory_token"])
+            assert first_claims["sender"] == "U0ALICE01"
+            assert first_claims["turn"] == first.event_id
+            steer_claims = _claims(steered[0].memory_token)
+            assert steer_claims["sender"] == "U0BOB0001"
+            assert steer_claims["turn"] == second.event_id
+            assert steer_claims["binding"] == f"slack:{CHANNEL}"
+
+    asyncio.run(go())
+
+
+def _tool(name: str) -> ToolNote:
+    return ToolNote(text=f"running tool {name}", tool=name)
+
+
+def test_work_item_continuation_carries_token(make_harness) -> None:
+    # A factory execute turn that ends without publishing is re-prompted once
+    # in the same session; that continuation opens a turn too, so it carries a
+    # write credential minted for it.
+    async def go() -> None:
+        binding = _MemoryBinding()
+        scripts: list[list[OutboundEvent]] = [
+            [
+                _tool("mcp__github__get_issue"),
+                TextDelta(text="I read the issue."),
+                Final(text="I read the issue.", status=SessionStatus.DONE),
+            ],
+            [Final(text="I will not continue.", status=SessionStatus.DONE)],
+        ]
+        async with make_harness(
+            binding=binding, workspace_factory=_Workspace, publication_creator=_PublicationApi()
+        ) as h:
+            h.kernel._work_items = _WorkItems()
+            h.runner.turn_scripts = [list(s) for s in scripts]
+            h.runner.default_script = [Final(text="unexpected", status=SessionStatus.DONE)]
+            turn = _work_item_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(turn)
+
+            assert len(h.runner.event_bodies) == 2, h.runner.opened
+            assert h.runner.opened[0] == ISSUE_PROMPT
+            for body in h.runner.event_bodies:
+                claims = _claims(body["memory_token"])
+                assert claims["memory"] == "write"
+                assert claims["sender"] == turn.author
+                assert claims["turn"] == turn.event_id
+                assert claims["binding"] == f"slack:{turn.reply_handle.channel}"
+
+    asyncio.run(go())
+
+
+def test_turn_token_never_in_boot_env(make_harness) -> None:
+    # MEMORY-TOKEN-3 / ADR-0188 decision 5: the per-turn credential rides the
+    # event only. No boot-env value is it, and no boot-env token can write.
+    async def go() -> None:
+        binding = _MemoryBinding()
+        async with make_harness(binding=binding) as h:
+            await h.kernel.process_event(_as(_qevent("hi there", thread="th-mt-5"), "U0ALICE01"))
+
+            token = h.runner.event_bodies[0]["memory_token"]
+            assert _claims(token)["memory"] == "write"
+            envs = [dict(env or {}) for env in h.fake_k8s.claim_envs] + binding.envs
+            assert envs, "the turn must claim a sandbox"
+            for env in envs:
+                assert token not in env.values()
+                assert all(not (isinstance(v, str) and token in v) for v in env.values())
+                for name in ("CURIE_MEMORY_TOKEN", "CURIE_HISTORY_TOKEN"):
+                    if name in env:
+                        assert _claims(env[name])["memory"] == "read", name
+            # Not in the runner request headers either.
+            for headers in h.runner.event_headers:
+                assert token not in " ".join(headers.values())
+
+    asyncio.run(go())
+
+
+def test_retry_mints_fresh_expiry(make_harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each attempt mints its own credential: a retried turn does not reuse the
+    # first attempt's expiry. The binding module's clock is advanced between
+    # mints so two mints in the same wall-clock second still differ.
+    async def go() -> None:
+        binding = _MemoryBinding()
+        offset = {"s": 0}
+        real_time = time.time
+
+        def clock() -> float:
+            return real_time() + offset["s"]
+
+        monkeypatch.setattr(
+            binding_module, "time", SimpleNamespace(time=clock, monotonic=time.monotonic)
+        )
+        real_mint = binding.turn_memory_token
+
+        def advancing(resolved: Any, **kwargs: Any) -> str | None:
+            offset["s"] += 1000
+            return real_mint(resolved, **kwargs)
+
+        binding.turn_memory_token = advancing  # type: ignore[method-assign]
+        async with make_harness(binding=binding, max_attempts=3) as h:
+            h.runner.event_fail_times = 1
+
+            await h.kernel.process_event(_as(_qevent("retry me", thread="th-mt-6"), "U0ALICE01"))
+
+            assert len(h.runner.event_bodies) == 2, h.runner.opened
+            first, second = (_claims(b["memory_token"]) for b in h.runner.event_bodies)
+            assert second["exp"] >= first["exp"] + 1000
+            assert (
+                h.runner.event_bodies[0]["memory_token"] != h.runner.event_bodies[1]["memory_token"]
+            )
+            assert len(binding.turn_token_calls) >= 2
+
+    asyncio.run(go())
