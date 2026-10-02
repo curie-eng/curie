@@ -6,16 +6,16 @@
 
 use curie_aci_protocol::{OutboundEvent, SessionStatus};
 
-/// A bounded display label; exact tool identities remain in the wire event.
+/// A display label; exact tool identities remain in the wire event.
 pub fn action_label(tool: &str) -> String {
+    if tool.is_empty()
+        || !tool
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        return "action".into();
+    }
     let name = if tool.starts_with("mcp__") {
-        if tool.len() > 256
-            || !tool
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            return "action".into();
-        }
         let Some((prefix, suffix)) = tool.rsplit_once("__") else {
             return "action".into();
         };
@@ -29,18 +29,19 @@ pub fn action_label(tool: &str) -> String {
             "Skill" => return "instruction request".into(),
             "Read" => return "read file".into(),
             "Write" => return "write file".into(),
-            "Edit" | "MultiEdit" => return "edit file".into(),
-            "Glob" | "Grep" => return "search files".into(),
-            "WebFetch" => return "fetch page".into(),
+            "Edit" => return "edit file".into(),
+            "MultiEdit" => return "edit files".into(),
+            "Glob" => return "find files".into(),
+            "Grep" => return "search files".into(),
+            "WebFetch" => return "fetch web page".into(),
             "WebSearch" => return "search web".into(),
             _ => tool,
         }
     };
     if name.is_empty()
-        || name.len() > 80
         || !name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
     {
         return "action".into();
     }
@@ -89,13 +90,25 @@ pub fn action_text(text: &str) -> String {
     }
     let mut rendered = String::new();
     let mut remaining = text;
+    let is_content_boundary = |c: char| c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-');
     while let Some(start) = remaining.find("mcp__") {
         rendered.push_str(&remaining[..start]);
         let token = &remaining[start..];
         let end = token
-            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.')
+            .char_indices()
+            .find(|(_, c)| !c.is_alphanumeric() && *c != '_' && *c != '-')
+            .map(|(i, _)| i)
             .unwrap_or(token.len());
-        rendered.push_str(&action_label(&token[..end]));
+        let in_content = remaining[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_content_boundary)
+            || token[end..].chars().next().is_some_and(is_content_boundary);
+        if in_content {
+            rendered.push_str(&token[..end]);
+        } else {
+            rendered.push_str(&action_label(&token[..end]));
+        }
         remaining = &token[end..];
     }
     rendered.push_str(remaining);
@@ -358,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn action_labels_are_bounded_and_fail_closed_for_malformed_names() {
+    fn action_labels_fail_closed_for_malformed_names() {
         for (name, expected) in [
             ("mcp__files__fileAttachment", "file attachment"),
             ("mcp__one__two__HTTPDownload", "http download"),
@@ -373,10 +386,7 @@ mod tests {
         ] {
             assert_eq!(action_label(name), expected, "{name}");
         }
-        assert_eq!(
-            action_label(&format!("mcp__a__{}", "x".repeat(81))),
-            "action"
-        );
+
         assert_eq!(
             action_text("mcp__a__save_item failed; retry?"),
             "save item failed; retry?"
@@ -392,6 +402,26 @@ mod tests {
         assert_eq!(
             action_text("User requested Bash examples"),
             "User requested Bash examples"
+        );
+    }
+
+    #[test]
+    fn shared_action_wording_vectors_match_receipts() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/vectors/user-action-wording.json"))
+                .unwrap();
+        for vector in vectors["vectors"].as_array().unwrap() {
+            assert_eq!(
+                action_label(vector["tool"].as_str().unwrap_or_default()),
+                vector["label"].as_str().unwrap()
+            );
+        }
+        assert_eq!(action_label("mcp__acme__파일_첨부"), "파일 첨부");
+        assert_eq!(
+            action_text(
+                "Save /tmp/mcp__a__save_item and mcp__a__save_item.txt; call `mcp__a__save_item`"
+            ),
+            "Save /tmp/mcp__a__save_item and mcp__a__save_item.txt; call `save item`"
         );
     }
 
