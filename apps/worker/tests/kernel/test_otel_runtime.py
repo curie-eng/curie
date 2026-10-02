@@ -287,7 +287,7 @@ def test_a_resolved_agent_labels_only_the_agent_turn_counter(
             *,
             kind: str | None = None,
             address: str | None = None,
-            **_: object,
+        **_: object,
         ) -> dict[str, str]:
             del kind, address
             return {

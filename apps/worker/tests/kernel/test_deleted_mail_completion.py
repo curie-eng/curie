@@ -210,10 +210,9 @@ def test_refused_provider_connection_persists_completion_cause(
                         assert await h.async_redis.smembers(h.config.completions_pending_key()) == {
                             qe.event_id
                         }
-                        assert (
-                            await h.async_redis.hget(h.config.completion_key(qe.event_id), "cause")
-                            == "provider egress refused"
-                        )
+                        assert await h.async_redis.hget(
+                            h.config.completion_key(qe.event_id), "cause"
+                        ) == "provider egress refused"
                         assert await Markers(h.async_redis, h.config).read_completion(qe.event_id)
                         assert await h.async_redis.xrange(h.config.dead_letter_stream_name()) == []
                         assert mail.replies == []
@@ -256,11 +255,16 @@ def test_egress_refusal_cause_refuses_stale_generation(make_harness) -> None:
             record = _record("stale-refusal", done=True)
             stale = await markers.mark_completion_pending(record.event_id, record)
             current = await markers.mark_completion_pending(record.event_id, record)
-            assert not await markers.note_provider_egress_refusal(record.event_id, generation=stale)
-            assert (
-                await h.async_redis.hget(h.config.completion_key(record.event_id), "cause") is None
+            assert not await markers.note_provider_egress_refusal(
+                record.event_id, generation=stale
             )
-            assert await markers.note_provider_egress_refusal(record.event_id, generation=current)
+            assert (
+                await h.async_redis.hget(h.config.completion_key(record.event_id), "cause")
+                is None
+            )
+            assert await markers.note_provider_egress_refusal(
+                record.event_id, generation=current
+            )
             stored = await markers.read_completion(record.event_id)
             assert stored is not None
             assert stored.cause == "provider egress refused"
@@ -281,7 +285,9 @@ def test_fenced_settle_clears_cause_only_for_current_owner(make_harness) -> None
             await consumer.ensure_group()
 
             event_id = "fenced-refusal"
-            await h.async_redis.xadd(h.config.stream, to_stream_fields(_qevent(event_id=event_id)))
+            await h.async_redis.xadd(
+                h.config.stream, to_stream_fields(_qevent(event_id=event_id))
+            )
             entry_id, _fields = await _read_one(h, h.config.consumer_name)
             stale = await leases.acquire(
                 h.config.stream,
@@ -290,10 +296,7 @@ def test_fenced_settle_clears_cause_only_for_current_owner(make_harness) -> None
                 consumer=h.config.consumer_name,
             )
             assert await leases.release(
-                h.config.stream,
-                h.config.consumer_group,
-                entry_id,
-                owner=stale.owner,
+                h.config.stream, h.config.consumer_group, entry_id, owner=stale.owner,
                 resume_event_id=None,
             )
             current = await leases.acquire(
@@ -306,21 +309,20 @@ def test_fenced_settle_clears_cause_only_for_current_owner(make_harness) -> None
             first_generation = await markers.mark_completion_pending(
                 event_id, _record(event_id, done=False)
             )
-            assert await markers.note_provider_egress_refusal(event_id, generation=first_generation)
-            replacement = _record(event_id, done=True)
-            assert (
-                await markers.settle_fenced(
-                    event_id,
-                    replacement,
-                    stream=h.config.stream,
-                    group=h.config.consumer_group,
-                    entry_id=entry_id,
-                    owner=stale.owner,
-                    generation=stale.generation,
-                    marker_value="1",
-                )
-                is None
+            assert await markers.note_provider_egress_refusal(
+                event_id, generation=first_generation
             )
+            replacement = _record(event_id, done=True)
+            assert await markers.settle_fenced(
+                event_id,
+                replacement,
+                stream=h.config.stream,
+                group=h.config.consumer_group,
+                entry_id=entry_id,
+                owner=stale.owner,
+                generation=stale.generation,
+                marker_value="1",
+            ) is None
             stored = await markers.read_completion(event_id)
             assert stored is not None
             assert stored.generation == first_generation

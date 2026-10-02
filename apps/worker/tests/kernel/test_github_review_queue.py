@@ -58,28 +58,7 @@ def test_busy_verified_review_delivery_stays_pending_then_runs_once_idle(
             await consumer._dispatch(entry_id, dict(fields))
             await _wait_until(lambda: entry_id not in consumer._inflight_ids)
 
-            assert (
-                len(
-                    await h.async_redis.xpending_range(
-                        h.config.stream,
-                        h.config.consumer_group,
-                        entry_id,
-                        entry_id,
-                        1,
-                    )
-                )
-                == 1
-            )
-            assert api.reserve_calls == []
-            assert h.runner.steer_headers == []
-            assert h.runner.event_headers == []
-
-            h.runner.turn_active = False
-            h.runner.default_script = [Final(text="review complete", status=SessionStatus.DONE)]
-            await consumer._dispatch(entry_id, dict(fields))
-            await _wait_until(lambda: entry_id not in consumer._inflight_ids)
-
-            assert (
+            assert len(
                 await h.async_redis.xpending_range(
                     h.config.stream,
                     h.config.consumer_group,
@@ -87,8 +66,25 @@ def test_busy_verified_review_delivery_stays_pending_then_runs_once_idle(
                     entry_id,
                     1,
                 )
-                == []
-            )
+            ) == 1
+            assert api.reserve_calls == []
+            assert h.runner.steer_headers == []
+            assert h.runner.event_headers == []
+
+            h.runner.turn_active = False
+            h.runner.default_script = [
+                Final(text="review complete", status=SessionStatus.DONE)
+            ]
+            await consumer._dispatch(entry_id, dict(fields))
+            await _wait_until(lambda: entry_id not in consumer._inflight_ids)
+
+            assert await h.async_redis.xpending_range(
+                h.config.stream,
+                h.config.consumer_group,
+                entry_id,
+                entry_id,
+                1,
+            ) == []
             assert len(api.verify_calls) == 2
             assert len(api.reserve_calls) == 1
             assert h.runner.steer_headers == []
@@ -196,26 +192,31 @@ def test_review_terminal_observer_requires_exact_current_fenced_completion(
                 )
 
             assert await settle(stale) is None
-            assert await worker_event_terminal_outcome(h.async_redis, settings, event_id) is None
-            assert await settle(current) is not None
             assert (
-                await worker_event_terminal_outcome(h.async_redis, settings, event_id) == "complete"
-            )
-            assert (
-                await worker_event_terminal_outcome(
-                    h.async_redis,
-                    settings,
-                    event_id + "-other",
-                )
+                await worker_event_terminal_outcome(h.async_redis, settings, event_id)
                 is None
             )
+            assert await settle(current) is not None
+            assert (
+                await worker_event_terminal_outcome(h.async_redis, settings, event_id)
+                == "complete"
+            )
+            assert await worker_event_terminal_outcome(
+                h.async_redis,
+                settings,
+                event_id + "-other",
+            ) is None
             # The completion outbox remains independently terminal after the
             # shorter ordinary done marker has gone away.
             await h.async_redis.delete(h.config.done_key(event_id))
             assert (
-                await worker_event_terminal_outcome(h.async_redis, settings, event_id) == "complete"
+                await worker_event_terminal_outcome(h.async_redis, settings, event_id)
+                == "complete"
             )
             await h.async_redis.hset(h.config.completion_key(event_id), "done", "0")
-            assert await worker_event_terminal_outcome(h.async_redis, settings, event_id) is None
+            assert (
+                await worker_event_terminal_outcome(h.async_redis, settings, event_id)
+                is None
+            )
 
     asyncio.run(exercise())

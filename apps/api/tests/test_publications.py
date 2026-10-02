@@ -2024,7 +2024,9 @@ def test_publication_resolved_before_card_registration_settles_the_card_once(
     events, remaining, waited = asyncio.run(exercise())
     assert waited == [False, True, False]
     settled = [
-        event for event in events if isinstance(event, ReplyUpdate) and event.settled is not None
+        event
+        for event in events
+        if isinstance(event, ReplyUpdate) and event.settled is not None
     ]
     assert len(settled) == 1
     assert settled[0].target.reply_ref == card_ts
@@ -2088,10 +2090,8 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
             sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
             async with sessionmaker() as session:
                 data = PublicationCreate.model_validate(request.to_json())
-
                 async def metadata_check() -> None:
                     return
-
                 publication, _ = await crud.create_publication(
                     session, data, patch=data.decoded_patch(), metadata_check=metadata_check
                 )
@@ -2122,7 +2122,7 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
             *,
             kind: str | None = None,
             address: str | None = None,
-            **_: object,
+        **_: object,
         ) -> dict[str, str]:
             return {"CURIE_SESSION_ID": f"session-{thread}"}
 
@@ -2832,7 +2832,7 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
             *,
             kind: str | None = None,
             address: str | None = None,
-            **_: object,
+        **_: object,
         ) -> dict[str, str]:
             env = self._resolver.boot_env(
                 resolved,
@@ -5608,17 +5608,20 @@ def test_enterprise_publication_advances_and_refreshes_the_same_lineage(
         "base_ref": "main",
     }
 
-    truth["authorization"] = (
-        "Basic " + base64.b64encode(b"x-access-token:fixture-publication-app-token").decode()
-    )
+    truth["authorization"] = "Basic " + base64.b64encode(
+        b"x-access-token:fixture-publication-app-token"
+    ).decode()
 
-    refreshed = _get_lineage(client, deployment_id=deployment["id"], conversation_id=conversation)
+    refreshed = _get_lineage(
+        client, deployment_id=deployment["id"], conversation_id=conversation
+    )
     assert refreshed.status_code == 200, refreshed.text
     assert refreshed.json()["pr_url"] == ENTERPRISE_PR_URL
     assert refreshed.json()["version"] == 2
     assert truth["requests"]
     assert all(
-        request.url.host == "github.example.com" and request.url.path.startswith("/forge/api/v3/")
+        request.url.host == "github.example.com"
+        and request.url.path.startswith("/forge/api/v3/")
         for request in truth["requests"]
     )
     assert any(
@@ -5633,9 +5636,7 @@ def test_enterprise_publication_advances_and_refreshes_the_same_lineage(
     [{"api_url": ENTERPRISE_API_URL, "html_base": ENTERPRISE_HTML_BASE}],
     indirect=True,
 )
-@pytest.mark.parametrize(
-    "wrong_url", [PR_URL, f"https://other.example.com/{REPO}/pull/{PR_NUMBER}"]
-)
+@pytest.mark.parametrize("wrong_url", [PR_URL, f"https://other.example.com/{REPO}/pull/{PR_NUMBER}"])
 def test_enterprise_publication_refuses_wrong_host_outcomes_before_provider_access(
     review_lineage_app: tuple[TestClient, dict[str, Any], str],
     auth_headers: dict[str, str],
@@ -5685,9 +5686,9 @@ def test_enterprise_publication_refuses_public_github_provider_truth(
             client, truth, auth_headers, conversation="enterprise-refused-refresh"
         )
         truth["pr_url"] = PR_URL
-        truth["authorization"] = (
-            "Basic " + base64.b64encode(b"x-access-token:fixture-publication-app-token").decode()
-        )
+        truth["authorization"] = "Basic " + base64.b64encode(
+            b"x-access-token:fixture-publication-app-token"
+        ).decode()
         before = _lineage_identity(publication["lineage_id"])
         refused = _get_lineage(
             client,
@@ -6541,7 +6542,9 @@ def test_stale_worker_lease_refuses_before_terminal_provider_and_leaves_rows_unc
 
     async def claim() -> Any:
         engine = create_async_engine(get_settings().database_url)
-        store = PostgresPublicationStore(engine, schema="curie", lease_owner="stale-lineage-worker")
+        store = PostgresPublicationStore(
+            engine, schema="curie", lease_owner="stale-lineage-worker"
+        )
         try:
             work = await store.claim_next()
             assert work is not None
@@ -6698,8 +6701,7 @@ def test_a_replay_matches_a_row_an_older_writer_stored_as_null(
 
 @pytest.fixture
 def _factory_publication_case(
-    clean_db: None,
-    admitted: Any,  # noqa: F811
+    clean_db: None, admitted: Any  # noqa: F811
 ) -> Iterator[tuple[TestClient, uuid.UUID, dict[str, Any]]]:
     """Build a live factory request and its deployment for publication API tests."""
 
@@ -6710,7 +6712,8 @@ def _factory_publication_case(
     request_id = request["id"]
     runtime_epoch = _start_factory_request(request_id)
     work_item = _factory_rows(
-        "SELECT w.agent_id, w.conversation_id FROM curie.work_items w WHERE w.id = :id",
+        "SELECT w.agent_id, w.conversation_id FROM curie.work_items w "
+        "WHERE w.id = :id",
         {"id": request["work_item_id"]},
     )[0]
 
@@ -6774,7 +6777,9 @@ CURIE_PYTHON_CI_POLICY = {
 }
 
 
-def _configure_python_ci(monkeypatch: pytest.MonkeyPatch, policies: Mapping[str, Any]) -> None:
+def _configure_python_ci(
+    monkeypatch: pytest.MonkeyPatch, policies: Mapping[str, Any]
+) -> None:
     """Set GITHUB_FACTORY_PYTHON_CI as an operator would (#3617)."""
 
     monkeypatch.setenv("GITHUB_FACTORY_PYTHON_CI", json.dumps(dict(policies)))
@@ -6830,7 +6835,9 @@ def _record_factory_verification(
     )
 
 
-def _post_factory_publication(client: TestClient, payload: dict[str, Any]) -> Any:
+def _post_factory_publication(
+    client: TestClient, payload: dict[str, Any]
+) -> Any:
     selected = client.post(
         f"/v1/internal/workspaces/{payload['deployment_id']}/selection",
         json={
@@ -6982,13 +6989,10 @@ def test_factory_python_publication_refuses_a_failed_python_check_beside_a_passe
 
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.verification_preflight_failed"
-    assert (
-        _factory_rows(
-            "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
-            {"id": request_id},
-        )[0]["n"]
-        == 0
-    )
+    assert _factory_rows(
+        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["n"] == 0
 
 
 def test_factory_python_publication_refuses_any_failed_declared_check(
@@ -7043,13 +7047,10 @@ def test_factory_python_publication_refuses_a_missing_preflight_observation(
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.verification_preflight_missing"
     assert "preflight" in refused.json()["detail"]["message"].casefold()
-    assert (
-        _factory_rows(
-            "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
-            {"id": request_id},
-        )[0]["n"]
-        == 0
-    )
+    assert _factory_rows(
+        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["n"] == 0
 
 
 def test_factory_python_publication_refuses_a_failed_preflight_observation(
@@ -7064,13 +7065,10 @@ def test_factory_python_publication_refuses_a_failed_preflight_observation(
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.verification_preflight_failed"
     assert "rerun" in refused.json()["detail"]["message"].casefold()
-    assert (
-        _factory_rows(
-            "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
-            {"id": request_id},
-        )[0]["n"]
-        == 0
-    )
+    assert _factory_rows(
+        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["n"] == 0
 
 
 def test_factory_python_publication_refuses_when_ci_does_not_select_the_path(
@@ -7212,7 +7210,9 @@ def test_custom_policy_refuses_a_path_outside_its_selection(
     monkeypatch: pytest.MonkeyPatch,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
-    _configure_python_ci(monkeypatch, {FACTORY_REPO: {"check": "Unit tests", "paths": ["src"]}})
+    _configure_python_ci(
+        monkeypatch, {FACTORY_REPO: {"check": "Unit tests", "paths": ["src"]}}
+    )
     client, request_id, payload = _factory_publication_case
     # Selected by Curie's layout, not by this repository's.
     payload["changed_paths"] = ["apps/api/src/example.py"]

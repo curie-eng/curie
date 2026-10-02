@@ -261,7 +261,9 @@ def test_factory_turn_receives_only_authoritative_publication_context(
             def __init__(self) -> None:
                 self.mint_calls: list[dict[str, object]] = []
 
-            async def get_publication_lineage(self, *_args: object) -> PublicationLineage | None:
+            async def get_publication_lineage(
+                self, *_args: object
+            ) -> PublicationLineage | None:
                 if mint_mode == "absent":
                     return None
                 return PublicationLineage(
@@ -345,8 +347,8 @@ def test_work_item_approval_resume_emits_no_requesting_turn_reply(
             binding=_Binding(),
             workspace_factory=_Workspace,
             approvals=_Approvals(),
-            publication_creator=_NoExistingPublication(),
-        ) as h:
+
+        publication_creator=_NoExistingPublication(),) as h:
             work_items = _WorkItems()
             h.kernel._work_items = work_items
             request_id = uuid.uuid4()
@@ -403,8 +405,8 @@ def test_github_work_item_reaches_the_model_without_chat_replies(make_harness) -
                 binding=_Binding(),
                 workspace_factory=_Workspace,
                 sink=sink,
-                publication_creator=_NoExistingPublication(),
-            ) as h:
+
+            publication_creator=_NoExistingPublication(),) as h:
                 work_items = _WorkItems()
                 h.kernel._work_items = work_items
                 h.runner.default_script = [
@@ -581,11 +583,8 @@ def test_approval_hold_keeps_its_sandbox_claim(make_harness) -> None:
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(),
-            workspace_factory=_Workspace,
-            approvals=_Approvals(),
-            publication_creator=_NoExistingPublication(),
-        ) as h:
+            binding=_Binding(), workspace_factory=_Workspace, approvals=_Approvals()
+        , publication_creator=_NoExistingPublication()) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [
                 Final(
@@ -614,11 +613,8 @@ def test_cancelled_work_item_deletes_its_suspended_sandbox_claim(make_harness, p
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(),
-            workspace_factory=_Workspace,
-            approvals=_Approvals(),
-            publication_creator=_NoExistingPublication(),
-        ) as h:
+            binding=_Binding(), workspace_factory=_Workspace, approvals=_Approvals()
+        , publication_creator=_NoExistingPublication()) as h:
             work_items = _WorkItems()
             h.kernel._work_items = work_items
             h.runner.default_script = [
@@ -667,11 +663,8 @@ def test_work_item_boot_env_carries_the_configured_turn_budget(make_harness) -> 
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(),
-            workspace_factory=_Workspace,
-            work_item_max_turns=5,
-            publication_creator=_NoExistingPublication(),
-        ) as h:
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        , publication_creator=_NoExistingPublication()) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
             request_id = uuid.uuid4()
@@ -693,11 +686,8 @@ def test_ordinary_chat_boot_env_carries_no_turn_budget(make_harness) -> None:
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(),
-            workspace_factory=_Workspace,
-            work_item_max_turns=5,
-            publication_creator=_NoExistingPublication(),
-        ) as h:
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        , publication_creator=_NoExistingPublication()) as h:
             h.runner.default_script = [Final(text="Noted.", status=SessionStatus.DONE)]
 
             await h.kernel.process_event(
@@ -728,11 +718,8 @@ def test_work_item_max_turns_escalation_names_the_work_item_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(),
-            workspace_factory=_Workspace,
-            work_item_max_turns=5,
-            publication_creator=_NoExistingPublication(),
-        ) as h:
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        , publication_creator=_NoExistingPublication()) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = _max_turns_script()
             request_id = uuid.uuid4()
@@ -759,11 +746,8 @@ def test_chat_max_turns_escalation_names_the_runner_budget(make_harness) -> None
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(),
-            workspace_factory=_Workspace,
-            work_item_max_turns=5,
-            publication_creator=_NoExistingPublication(),
-        ) as h:
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        , publication_creator=_NoExistingPublication()) as h:
             h.runner.default_script = _max_turns_script()
 
             await h.kernel.process_event(
@@ -788,11 +772,8 @@ def test_work_item_replaces_a_chat_sandbox_booted_without_its_turn_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(),
-            workspace_factory=_Workspace,
-            work_item_max_turns=5,
-            publication_creator=_NoExistingPublication(),
-        ) as h:
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        , publication_creator=_NoExistingPublication()) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
 
@@ -817,11 +798,8 @@ def test_chat_replaces_a_work_item_sandbox_booted_with_the_factory_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(),
-            workspace_factory=_Workspace,
-            work_item_max_turns=5,
-            publication_creator=_NoExistingPublication(),
-        ) as h:
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        , publication_creator=_NoExistingPublication()) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
 
@@ -862,11 +840,8 @@ def test_consecutive_work_items_replace_the_sandbox_even_with_the_same_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(),
-            workspace_factory=_Workspace,
-            work_item_max_turns=5,
-            publication_creator=_NoExistingPublication(),
-        ) as h:
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        , publication_creator=_NoExistingPublication()) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
             _fail_settled_release(h)
@@ -895,11 +870,8 @@ def test_chat_steers_a_live_work_item_turn_instead_of_replacing_it(make_harness)
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(),
-            workspace_factory=_Workspace,
-            work_item_max_turns=5,
-            publication_creator=_NoExistingPublication(),
-        ) as h:
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        , publication_creator=_NoExistingPublication()) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
             _fail_settled_release(h)
@@ -926,11 +898,8 @@ def test_chat_never_opens_a_turn_on_a_runner_with_the_factory_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(),
-            workspace_factory=_Workspace,
-            work_item_max_turns=5,
-            publication_creator=_NoExistingPublication(),
-        ) as h:
+            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
+        , publication_creator=_NoExistingPublication()) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
             _fail_settled_release(h)
@@ -1033,11 +1002,8 @@ def test_terminate_wake_for_an_orphan_tears_down_its_stored_claim(make_harness) 
 def test_owns_work_item_tracks_live_and_held_runs(make_harness) -> None:
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(),
-            workspace_factory=_Workspace,
-            approvals=_Approvals(),
-            publication_creator=_NoExistingPublication(),
-        ) as h:
+            binding=_Binding(), workspace_factory=_Workspace, approvals=_Approvals()
+        , publication_creator=_NoExistingPublication()) as h:
             work_items = _WorkItems()
             h.kernel._work_items = work_items
             running = uuid.uuid4()

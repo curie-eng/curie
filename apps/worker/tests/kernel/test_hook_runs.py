@@ -37,7 +37,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 def _capture_fire_metrics(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
     recorded: list[dict[str, str]] = []
 
-    def capture(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
+    def capture(
+        name: str, value: float = 1, *, attributes: dict[str, str] | None = None
+    ) -> None:
         record_metric(name, value, attributes=attributes)
         if name == "curie.schedule.fire":
             assert value == 1
@@ -105,8 +107,15 @@ async def _reject_hook_run_outcome(
         yield
     finally:
         async with engine.begin() as conn:
-            await conn.execute(text(f"DROP TRIGGER IF EXISTS {trigger_name} ON curie.hook_runs"))
-            await conn.execute(text(f"DROP FUNCTION IF EXISTS curie.{function_name}()"))
+            await conn.execute(
+                text(
+                    f"DROP TRIGGER IF EXISTS {trigger_name} "
+                    "ON curie.hook_runs"
+                )
+            )
+            await conn.execute(
+                text(f"DROP FUNCTION IF EXISTS curie.{function_name}()")
+            )
 
 
 async def _wait_for_blocked_hook_run_update(
@@ -174,7 +183,9 @@ def test_completed_cron_turn_closes_the_run_as_ran(
     fires = _capture_fire_metrics(monkeypatch)
 
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             h.runner.default_script = [Final(text="complete", status=status)]
 
             event = _event(hook_run=run.ref)
@@ -201,11 +212,15 @@ def test_cron_turn_on_a_thread_with_a_live_session_records_deferred(
     fires = _capture_fire_metrics(monkeypatch)
 
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             hold = asyncio.Event()
             h.runner.hold = hold
             conversation = f"thread-{uuid.uuid4().hex}"
-            live = _event(source=TurnSource.SLACK, hook_run=None, conversation_id=conversation)
+            live = _event(
+                source=TurnSource.SLACK, hook_run=None, conversation_id=conversation
+            )
             first = asyncio.create_task(h.kernel.process_event(live))
             try:
                 async with asyncio.timeout(5):
@@ -238,7 +253,9 @@ def test_cron_retry_past_its_catch_up_bound_records_skipped(
     from curie_worker.hook_runs import retry_event_id
 
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             expired = datetime.now(UTC) - timedelta(seconds=1)
             event = _event(
                 hook_run=run.ref,
@@ -262,7 +279,9 @@ def test_queued_cron_fire_is_rejected_after_operator_pause(
     fires = _capture_fire_metrics(monkeypatch)
 
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             async with run.engine.begin() as conn:
                 await conn.execute(
                     text(
@@ -319,7 +338,9 @@ def test_pause_during_claim_rejects_the_cron_turn_before_runner_start(
     """A pause after the entry read still prevents the pending runner start."""
 
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             entered = asyncio.Event()
             release = asyncio.Event()
             original = h.kernel._claim_or_resume
@@ -363,7 +384,9 @@ def test_cron_retry_whose_bound_runs_out_during_the_claim_records_skipped(
     from curie_worker.hook_runs import retry_event_id
 
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             original = h.kernel._claim_or_resume
 
             async def slow_claim(*args: object, **kwargs: object) -> object:
@@ -398,7 +421,9 @@ def test_cron_retry_inside_its_catch_up_bound_runs(
     fires = _capture_fire_metrics(monkeypatch)
 
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             await HookRunRecorder(run.engine, "curie").close(run.ref, "deferred")
             deferred, ended_at = await run.state() or (None, None)
             assert deferred == "deferred"
@@ -439,10 +464,9 @@ def test_classified_cron_failure_closes_failed_without_retry(
     fires = _capture_fire_metrics(monkeypatch)
 
     async def go() -> None:
-        async with (
-            make_hook_run() as run,
-            make_harness(hook_runs=run.recorder(), max_attempts=3) as h,
-        ):
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder(), max_attempts=3
+        ) as h:
             h.runner.turn_scripts = [
                 [
                     ErrorEvent(message="retryable", classification="runner-error"),
@@ -467,7 +491,9 @@ def test_prior_side_effect_recovery_closes_failed_without_running(
     make_hook_run,
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             event = _event(hook_run=run.ref)
             await h.async_redis.set(h.config.side_effect_key(event.event_id), "1")
 
@@ -487,12 +513,16 @@ def test_exception_after_cron_start_closes_failed_and_propagates(
     make_hook_run,
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             h.runner.default_script = [Final(text="complete", status=SessionStatus.DONE)]
             h.sink.fail_events.add("reply.update")
             event = _event(hook_run=run.ref)
 
-            with pytest.raises(RuntimeError, match="injected reply.update delivery failure"):
+            with pytest.raises(
+                RuntimeError, match="injected reply.update delivery failure"
+            ):
                 await h.kernel.process_event(event)
 
             assert h.runner.opened == ["run the scheduled hook"]
@@ -509,13 +539,17 @@ def test_original_exception_survives_failed_failure_close(
     make_hook_run,
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             h.runner.default_script = [Final(text="complete", status=SessionStatus.DONE)]
             h.sink.fail_events.add("reply.update")
             event = _event(hook_run=run.ref)
 
             async with _reject_hook_run_outcome(run.engine, run.run_id, "failed"):
-                with pytest.raises(RuntimeError, match="injected reply.update delivery failure"):
+                with pytest.raises(
+                    RuntimeError, match="injected reply.update delivery failure"
+                ):
                     await h.kernel.process_event(event)
 
             assert h.runner.opened == ["run the scheduled hook"]
@@ -530,14 +564,11 @@ def test_delivery_deadline_after_cron_start_closes_failed(
     make_hook_run,
 ) -> None:
     async def go() -> None:
-        async with (
-            make_hook_run() as run,
-            make_harness(
-                hook_runs=run.recorder(),
-                delivery_budget_s=60.0,
-                runner_total_timeout_s=30.0,
-            ) as h,
-        ):
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder(),
+            delivery_budget_s=60.0,
+            runner_total_timeout_s=30.0,
+        ) as h:
             await h.async_redis.xgroup_create(
                 h.config.stream,
                 h.config.consumer_group,
@@ -570,7 +601,9 @@ def test_delivery_deadline_after_cron_start_closes_failed(
             now_ms = int(seconds) * 1000 + int(microseconds) // 1000
             deadline_ms = now_ms + 100
             await h.async_redis.hset(
-                h.config.delivery_state_key(h.config.stream, h.config.consumer_group, entry_id),
+                h.config.delivery_state_key(
+                    h.config.stream, h.config.consumer_group, entry_id
+                ),
                 mapping={"deadline_ms": str(deadline_ms)},
             )
             lease.budget = DeliveryBudget(
@@ -602,8 +635,12 @@ def test_noncron_turn_never_writes_a_supplied_hook_run(
     fires = _capture_fire_metrics(monkeypatch)
 
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
-            h.runner.default_script = [Final(text="complete", status=SessionStatus.DONE)]
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
+            h.runner.default_script = [
+                Final(text="complete", status=SessionStatus.DONE)
+            ]
 
             await h.kernel.process_event(_event(source=source, hook_run=run.ref))
 
@@ -618,7 +655,9 @@ def test_cron_without_a_run_ref_refuses_before_runner_start(
     make_hook_run,
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             await h.kernel.process_event(_event(hook_run=None))
 
             assert h.runner.opened == []
@@ -633,7 +672,9 @@ def test_cron_with_no_matching_row_refuses_before_runner_start(
     make_hook_run,
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             missing = HookRunRef(
                 agent_id=str(run.agent_id),
                 name="missing_hook",
@@ -657,10 +698,9 @@ def test_terminal_hook_run_redelivery_never_starts_or_overwrites(
     fires = _capture_fire_metrics(monkeypatch)
 
     async def go() -> None:
-        async with (
-            make_hook_run(outcome="failed") as run,
-            make_harness(hook_runs=run.recorder()) as h,
-        ):
+        async with make_hook_run(outcome="failed") as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             before = await run.state()
 
             await h.kernel.process_event(_event(hook_run=run.ref))
@@ -712,7 +752,9 @@ def test_metric_failure_after_close_does_not_abort_kernel_completion(
     monkeypatch.setattr(hook_runs_module, "record_metric", fail_metric)
 
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             h.runner.default_script = [Final(text="complete", status=SessionStatus.DONE)]
             event = _event(hook_run=run.ref)
 
@@ -741,7 +783,9 @@ def test_hook_run_database_failure_precedes_done_marker(
     fires = _capture_fire_metrics(monkeypatch)
 
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             event = _event(hook_run=run.ref)
             async with _reject_hook_run_outcome(run.engine, run.run_id, "ran"):
                 with pytest.raises(HookRunRecorderError):
@@ -761,12 +805,18 @@ def test_malformed_cron_ref_refuses_before_runner_start(
     invalid_part: str,
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             invalid = HookRunRef(
-                agent_id=("not-a-uuid" if invalid_part == "agent_id" else run.ref.agent_id),
+                agent_id=(
+                    "not-a-uuid" if invalid_part == "agent_id" else run.ref.agent_id
+                ),
                 name=run.ref.name,
                 slot_utc=(
-                    "2026-09-22T04:00:00+01:00" if invalid_part == "slot_utc" else run.ref.slot_utc
+                    "2026-09-22T04:00:00+01:00"
+                    if invalid_part == "slot_utc"
+                    else run.ref.slot_utc
                 ),
             )
 
@@ -783,10 +833,9 @@ def test_quota_refusal_before_cron_start_leaves_run_open(
     make_hook_run,
 ) -> None:
     async def go() -> None:
-        async with (
-            make_hook_run() as run,
-            make_harness(hook_runs=run.recorder(), claim_timeout_seconds=0.05) as h,
-        ):
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder(), claim_timeout_seconds=0.05
+        ) as h:
             h.fake_k8s.quota_rejection = QuotaRejection(
                 quota_name="curie-sandbox-quota",
                 requested={"limits.cpu": "2"},
@@ -816,10 +865,9 @@ def test_approval_pause_closes_cron_run_as_ran(
 
     async def go() -> None:
         approvals = RecordingApprovals()
-        async with (
-            make_hook_run() as run,
-            make_harness(hook_runs=run.recorder(), approvals=approvals) as h,
-        ):
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder(), approvals=approvals
+        ) as h:
             h.runner.default_script = [
                 Final(
                     text="Requesting sign off",
@@ -843,7 +891,9 @@ def test_cancellation_after_cron_start_closes_failed_and_propagates(
     make_hook_run,
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             hold = asyncio.Event()
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="started")]
@@ -875,7 +925,9 @@ def test_cancellation_survives_second_cancel_and_failed_failure_close(
     make_hook_run,
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             hold = asyncio.Event()
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="started")]
@@ -885,7 +937,9 @@ def test_cancellation_survives_second_cancel_and_failed_failure_close(
             try:
                 await asyncio.wait_for(started.wait(), timeout=2.0)
 
-                async with _reject_hook_run_outcome(run.engine, run.run_id, "failed"):
+                async with _reject_hook_run_outcome(
+                    run.engine, run.run_id, "failed"
+                ):
                     lock_connection = await run.engine.connect()
                     lock_transaction = await lock_connection.begin()
                     try:
@@ -893,12 +947,17 @@ def test_cancellation_survives_second_cancel_and_failed_failure_close(
                             await lock_connection.execute(text("SELECT pg_backend_pid()"))
                         ).scalar_one()
                         await lock_connection.execute(
-                            text("SELECT id FROM curie.hook_runs WHERE id = :run_id FOR UPDATE"),
+                            text(
+                                "SELECT id FROM curie.hook_runs "
+                                "WHERE id = :run_id FOR UPDATE"
+                            ),
                             {"run_id": run.run_id},
                         )
 
                         task.cancel()
-                        await _wait_for_blocked_hook_run_update(run.engine, blocker_pid)
+                        await _wait_for_blocked_hook_run_update(
+                            run.engine, blocker_pid
+                        )
                         assert task.cancel()
                         await asyncio.sleep(0)
                         assert not task.done()
@@ -927,7 +986,9 @@ def test_lost_lease_after_cron_start_leaves_run_open(
     make_hook_run,
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder()
+        ) as h:
             await h.async_redis.xgroup_create(
                 h.config.stream,
                 h.config.consumer_group,
@@ -992,7 +1053,10 @@ def test_bound_agent_mismatch_refuses_cron_before_runner_start(
             channel_id = uuid.uuid4()
             async with run.engine.begin() as conn:
                 await conn.execute(
-                    text("INSERT INTO curie.agents (id, name) VALUES (:id, :name)"),
+                    text(
+                        "INSERT INTO curie.agents (id, name) "
+                        "VALUES (:id, :name)"
+                    ),
                     {"id": agent_id, "name": f"other_agent_{uuid.uuid4().hex}"},
                 )
                 await conn.execute(
@@ -1027,7 +1091,9 @@ def test_bound_agent_mismatch_refuses_cron_before_runner_start(
             try:
                 async with make_harness(
                     hook_runs=run.recorder(),
-                    binding_factory=lambda config: BindingResolver(run.engine, config),
+                    binding_factory=lambda config: BindingResolver(
+                        run.engine, config
+                    ),
                 ) as h:
                     await h.kernel.process_event(_event(hook_run=run.ref))
 
@@ -1049,10 +1115,9 @@ def test_starting_a_cron_turn_renews_its_claim_lease(make_harness, make_hook_run
     the turn, so queue time never lets the next fire reclaim a live run (#2931)."""
 
     async def go() -> None:
-        async with (
-            make_hook_run() as run,
-            make_harness(hook_runs=run.recorder(), delivery_budget_s=600.0) as h,
-        ):
+        async with make_hook_run() as run, make_harness(
+            hook_runs=run.recorder(), delivery_budget_s=600.0
+        ) as h:
             h.runner.default_script = [Final(text="complete", status=SessionStatus.DONE)]
             assert await run.lease_expires_at() is None
             before = time.time()
@@ -1112,7 +1177,10 @@ def test_recorder_reads_and_writes_the_configured_schema() -> None:
                 await conn.execute(text(f'CREATE SCHEMA "{schema}"'))
                 for table in ("hook_runs", "schedule_controls"):
                     await conn.execute(
-                        text(f"CREATE TABLE {schema}.{table} (LIKE curie.{table} INCLUDING ALL)")
+                        text(
+                            f"CREATE TABLE {schema}.{table} "
+                            f"(LIKE curie.{table} INCLUDING ALL)"
+                        )
                     )
                 await conn.execute(
                     text(

@@ -4076,7 +4076,7 @@ def _workspace_binding(deployment_id: uuid.UUID) -> object:
             *,
             kind: str | None = None,
             address: str | None = None,
-            **_: object,
+        **_: object,
         ) -> dict[str, str]:
             return {}
 

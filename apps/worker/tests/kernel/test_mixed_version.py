@@ -56,7 +56,8 @@ DONE = SessionStatus.DONE
 # generated, so this keeps testing the old contract hop after PROTOCOL_VERSION
 # moves again.
 FRAME_0_2_9 = (
-    '{"version":"0.2.9","type":"final","text":"an answer from an old runner","status":"done"}'
+    '{"version":"0.2.9","type":"final","text":"an answer from an old runner",'
+    '"status":"done"}'
 )
 
 
@@ -138,13 +139,17 @@ def test_an_old_runner_leaves_the_entry_pending_and_completes_nothing(
             consumer.request_stop()
             await task
 
-            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+            summary = await h.async_redis.xpending(
+                h.config.stream, h.config.consumer_group
+            )
             assert summary["pending"] == 1, "a version refusal must not ack the entry"
             assert h.sink.completions == [], (
                 "a turn that never decoded must not tell the adapter it completed"
             )
             assert await h.async_redis.exists(h.config.done_key("mix-1")) == 0
-            assert await h.async_redis.smembers(h.config.completions_pending_key()) == set()
+            assert (
+                await h.async_redis.smembers(h.config.completions_pending_key()) == set()
+            )
 
     asyncio.run(go())
 

@@ -85,7 +85,7 @@ class _TripleBinding:
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
-        **_: object,
+    **_: object,
     ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
@@ -475,10 +475,16 @@ def test_a_settled_card_uses_the_identity_that_posted_it(
                     )
                 )
 
-                assert not await h.async_redis.exists(h.config.approval_card_key("appr-legacy"))
+                assert not await h.async_redis.exists(
+                    h.config.approval_card_key("appr-legacy")
+                )
 
-            assert capture.update_tokens_for(_POLICY_CHANNEL) == [f"Bearer {expected_card_token}"]
-            assert set(capture.update_tokens_for(_CHANNEL)) == {f"Bearer {expected_reply_token}"}
+            assert capture.update_tokens_for(_POLICY_CHANNEL) == [
+                f"Bearer {expected_card_token}"
+            ]
+            assert set(capture.update_tokens_for(_CHANNEL)) == {
+                f"Bearer {expected_reply_token}"
+            }
         finally:
             await server.close()
 

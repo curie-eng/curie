@@ -1496,7 +1496,6 @@ def test_publication_notice_keeps_the_announcement_above_it(
     """The demo path: the publication notice keeps the announcement as its own block."""
 
     from curie_worker.approvals import CreatedPublication
-
     deployment_id = uuid.UUID("11111111-1111-4111-8111-111111112659")
 
     class Binding(GrantBinding):
@@ -1524,7 +1523,9 @@ def test_publication_notice_keeps_the_announcement_above_it(
         ) -> None:
             return None
 
-        async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+        async def create_publication(
+            self, request: PublicationCreateRequest
+        ) -> CreatedPublication:
             self.creates.append(request)
             return CreatedPublication(
                 id="publication-example",
@@ -1555,7 +1556,6 @@ def test_publication_notice_keeps_the_announcement_above_it(
 
         def touch(self, _thread_identity: str, *, ttl_seconds: int) -> None:
             del ttl_seconds
-
     async def go() -> None:
         async with _publication_run(
             make_harness,
@@ -2008,7 +2008,9 @@ def _refusal_publication_request() -> PublicationCreateRequest:
 async def _create_publication_error(response: httpx.Response) -> Any:
     from curie_worker.approvals import ApprovalBackendError
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: response)) as http:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: response)
+    ) as http:
         client = ApprovalClient(
             api_base_url="https://api.example.test",
             api_key="",
@@ -2068,7 +2070,9 @@ def test_an_uncoded_publication_failure_has_no_refusal(response: httpx.Response)
 def test_a_string_detail_api_refusal_is_carried_as_the_refusal() -> None:
     message = "publication patch exceeds the 1048576-byte limit"
 
-    error = asyncio.run(_create_publication_error(httpx.Response(413, json={"detail": message})))
+    error = asyncio.run(
+        _create_publication_error(httpx.Response(413, json={"detail": message}))
+    )
 
     assert error.refusal == message
 
@@ -3912,7 +3916,9 @@ def test_a_placeholderless_resume_answers_below_the_card(make_harness) -> None:
     """
 
     async def go() -> None:
-        async with make_harness(approvals=RecordingApprovals(), slack_no_edit_streaming=True) as h:
+        async with make_harness(
+            approvals=RecordingApprovals(), slack_no_edit_streaming=True
+        ) as h:
             h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
             thread = "th_no_edit_in_thread"
             await h.kernel.process_event(
@@ -3998,7 +4004,9 @@ def test_a_card_acknowledged_without_a_ref_keeps_todays_reply(make_harness) -> N
             h.sink.emit = refless_card
             h.runner.default_script = _awaiting_script("Refund order 42")
             await h.kernel.process_event(_qevent("refund?", thread=thread))
-            assert not await h.async_redis.exists(h.config.approval_reply_below_card_key("appr-1"))
+            assert not await h.async_redis.exists(
+                h.config.approval_reply_below_card_key("appr-1")
+            )
             reader.resolve("appr-1")
 
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
@@ -4496,7 +4504,9 @@ def test_a_hanging_approval_read_does_not_hold_the_same_thread_order_lock_for_30
 
 # --- A verdict that lands before the card is registered (#3637) ----------------
 
-_REJECTED = SettledApproval(status="rejected", resolved_by="U9", resolution_note="not this quarter")
+_REJECTED = SettledApproval(
+    status="rejected", resolved_by="U9", resolution_note="not this quarter"
+)
 _EXPIRED = SettledApproval(status="expired", resolved_by=None, resolution_note=None)
 
 
@@ -5062,7 +5072,6 @@ def test_publication_with_bound_route_is_created_and_does_not_escalate_unexpecte
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from curie_worker.approvals import CreatedPublication
-
     deployment_id = uuid.UUID("11111111-1111-4111-8111-111111112705")
 
     class Binding(GrantBinding):
@@ -5096,7 +5105,9 @@ def test_publication_with_bound_route_is_created_and_does_not_escalate_unexpecte
         ) -> None:
             return None
 
-        async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+        async def create_publication(
+            self, request: PublicationCreateRequest
+        ) -> CreatedPublication:
             self.creates.append(request)
             return CreatedPublication(
                 id="publication-example",
@@ -5127,7 +5138,6 @@ def test_publication_with_bound_route_is_created_and_does_not_escalate_unexpecte
 
         def touch(self, _thread_identity: str, *, ttl_seconds: int) -> None:
             del ttl_seconds
-
     async def go() -> None:
         async with _publication_run(
             make_harness,
@@ -5162,7 +5172,6 @@ def test_publication_with_named_unbound_route_escalates_and_creates_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from curie_worker.approvals import CreatedPublication
-
     deployment_id = uuid.UUID("22222222-2222-4222-8222-222222222705")
 
     class Binding(GrantBinding):
@@ -5191,7 +5200,9 @@ def test_publication_with_named_unbound_route_escalates_and_creates_nothing(
         ) -> None:
             return None
 
-        async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+        async def create_publication(
+            self, request: PublicationCreateRequest
+        ) -> CreatedPublication:
             self.creates.append(request)
             return CreatedPublication(
                 id="publication-example",
@@ -5222,7 +5233,6 @@ def test_publication_with_named_unbound_route_escalates_and_creates_nothing(
 
         def touch(self, _thread_identity: str, *, ttl_seconds: int) -> None:
             del ttl_seconds
-
     async def go() -> None:
         async with _publication_run(
             make_harness,
@@ -5285,7 +5295,7 @@ class _WorkspacelessBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
-        **_: object,
+    **_: object,
     ) -> dict[str, str]:
         return {}
 
@@ -5667,9 +5677,8 @@ def test_a_settled_email_card_is_sent_to_the_thread_with_its_outcome(make_harnes
             assert (address, ref, endpoint) == (_MAIL_INBOX, "posted-1", _MAIL_ENDPOINT)
             assert settled is not None and settled.decision == "approved"
             update = next(
-                event
-                for event, _route, _ in h.sink.events
-                if event.event == "reply.update" and getattr(event, "settled", None) is not None
+                event for event, _route, _ in h.sink.events if event.event == "reply.update"
+                and getattr(event, "settled", None) is not None
             )
             assert update.target.kind == "email"
             assert update.target.conversation_id == "th-mail-settle"
@@ -5807,9 +5816,7 @@ def test_approval_create_decoder_distinguishes_unavailable_from_older_api(
         async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
             client = ApprovalClient(
                 api_base_url="https://api.example.com",
-                api_key="test-key",
-                client=http,
-                read_timeout_s=1.0,
+                api_key="test-key", client=http, read_timeout_s=1.0
             )
             created = await client.create(
                 ApprovalRequest(

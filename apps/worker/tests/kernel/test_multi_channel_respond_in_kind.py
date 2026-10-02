@@ -112,7 +112,7 @@ class OneAgentTwoBindings:
         *,
         kind: str | None = None,
         address: str | None = None,
-        **_: object,
+    **_: object,
     ) -> dict[str, str]:
         return {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',

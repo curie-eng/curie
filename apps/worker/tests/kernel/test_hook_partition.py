@@ -94,7 +94,9 @@ def _hook_event(
         conversation_id=_conversation_id(hook, partition),
         author=f"hook:{hook}",
         text=text,
-        reply_handle=ReplyHandle(kind="slack", channel=CHANNEL, placeholder=None, endpoint=None),
+        reply_handle=ReplyHandle(
+            kind="slack", channel=CHANNEL, placeholder=None, endpoint=None
+        ),
         received_at="2026-08-29T00:00:00+00:00",
         source=TurnSource.WEBHOOK,
     )
@@ -139,7 +141,9 @@ def test_three_partitions_of_one_hook_run_concurrently(make_harness) -> None:
             # Differing only in the partition segment is the whole premise: if
             # the ids agreed, one thread key would serialize them.
             assert len({e.conversation_id for e in events}) == 3
-            assert {e.conversation_id.rsplit(":", 1)[0] for e in events} == {_conversation_id()}
+            assert {e.conversation_id.rsplit(":", 1)[0] for e in events} == {
+                _conversation_id()
+            }
 
             tasks = [asyncio.create_task(h.kernel.process_event(e)) for e in events]
             try:
@@ -163,7 +167,9 @@ def test_three_partitions_of_one_hook_run_concurrently(make_harness) -> None:
             # THE load-bearing assertion. Three distinct ports is the only
             # observable difference between real fan-out and the shared-runner
             # trap described in the module docstring.
-            assert len(set(assigned.values())) == 3, f"partitions shared a runner port: {assigned}"
+            assert len(set(assigned.values())) == 3, (
+                f"partitions shared a runner port: {assigned}"
+            )
             assert live == set(assigned.values()), (
                 f"live turns {live} did not match the assigned ports {assigned}"
             )
@@ -171,7 +177,9 @@ def test_three_partitions_of_one_hook_run_concurrently(make_harness) -> None:
             assert all(len(v) == 1 for v in opened.values()), (
                 f"a runner served more than one partition: {opened}"
             )
-            assert all(v == [] for v in steers.values()), f"a job steered a live session: {steers}"
+            assert all(v == [] for v in steers.values()), (
+                f"a job steered a live session: {steers}"
+            )
             # The fleet-wide runner is on a port no sandbox was given, and with
             # per-sandbox runners the fallback port is closed: anything reaching
             # it would mean the per-sandbox port was ignored.
@@ -199,7 +207,9 @@ def test_two_deliveries_on_one_partition_serialize(make_harness) -> None:
             try:
                 await _wait_until(lambda: len(_live_ports(h)) == 1)
                 with pytest.raises(ThreadBusyError):
-                    await h.kernel.process_event(_hook_event("pr 41 second", partition="41"))
+                    await h.kernel.process_event(
+                        _hook_event("pr 41 second", partition="41")
+                    )
                 claims = set(h.fake_k8s.claims)
                 opened = _opened_total(h)
                 steers = {port: list(r.steers) for port, r in h.runners.items()}
@@ -209,7 +219,9 @@ def test_two_deliveries_on_one_partition_serialize(make_harness) -> None:
 
             assert len(claims) == 1, f"one partition claimed more than one sandbox: {claims}"
             assert opened == 1, "the deferred delivery opened a turn beside the live one"
-            assert all(v == [] for v in steers.values()), f"a job steered a live session: {steers}"
+            assert all(v == [] for v in steers.values()), (
+                f"a job steered a live session: {steers}"
+            )
 
     asyncio.run(go())
 
@@ -228,12 +240,15 @@ def test_concurrent_deliveries_on_one_partition_serialize(make_harness) -> None:
             _park_every_runner(h, hold)
 
             tasks = [
-                asyncio.create_task(h.kernel.process_event(_hook_event(text, partition="41")))
+                asyncio.create_task(
+                    h.kernel.process_event(_hook_event(text, partition="41"))
+                )
                 for text in ("pr 41 a", "pr 41 b")
             ]
             try:
                 await _wait_until(
-                    lambda: len(_live_ports(h)) == 1 and sum(t.done() for t in tasks) == 1
+                    lambda: len(_live_ports(h)) == 1
+                    and sum(t.done() for t in tasks) == 1
                 )
                 claims = set(h.fake_k8s.claims)
                 opened = _opened_total(h)
@@ -252,7 +267,9 @@ def test_concurrent_deliveries_on_one_partition_serialize(make_harness) -> None:
             assert len(busy) == 1, f"expected exactly one deferral, got {outcomes}"
             assert len(claims) == 1, f"one partition claimed more than one sandbox: {claims}"
             assert opened == 1
-            assert all(v == [] for v in steers.values()), f"a job steered a live session: {steers}"
+            assert all(v == [] for v in steers.values()), (
+                f"a job steered a live session: {steers}"
+            )
 
     asyncio.run(go())
 
@@ -294,6 +311,8 @@ def test_an_unpartitioned_hook_still_shares_one_thread(make_harness) -> None:
             assert len(claims) == 1, f"an unpartitioned hook fanned out: {claims}"
             assert len(assigned) == 1, f"an unpartitioned hook fanned out: {assigned}"
             assert opened == 1
-            assert all(v == [] for v in steers.values()), f"a job steered a live session: {steers}"
+            assert all(v == [] for v in steers.values()), (
+                f"a job steered a live session: {steers}"
+            )
 
     asyncio.run(go())

@@ -115,7 +115,7 @@ class _TripleBinding:
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
-        **_: object,
+    **_: object,
     ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
@@ -270,12 +270,9 @@ async def _warm_slack_identities(h: Any, *authors: str) -> None:
 def test_only_the_slack_adapter_edits_in_place() -> None:
     router = _mail_sink()
     assert router.edits_in_place("slack", TargetRoute()) is True
-    assert (
-        router.edits_in_place(
-            "email", TargetRoute(endpoint="http://127.0.0.1:1/mail-a/", adapter="mail-a")
-        )
-        is False
-    )
+    assert router.edits_in_place(
+        "email", TargetRoute(endpoint="http://127.0.0.1:1/mail-a/", adapter="mail-a")
+    ) is False
     assert router.edits_in_place("slack", TargetRoute(adapter=CLUSTER_MESSAGE_ADAPTER)) is False
     assert ObservedReplySink(router).edits_in_place("slack", TargetRoute()) is True
     assert ObservedReplySink(_EmitOnly()).edits_in_place("slack", TargetRoute()) is False
@@ -315,10 +312,7 @@ def test_two_slack_identities_answering_each_other_in_one_thread_stop_at_the_lim
 
                 # A person in the same thread is never limited.
                 person = _slack_turn(
-                    "a person asks",
-                    adapter="ops-bot",
-                    author=_PERSON,
-                    thread=thread,
+                    "a person asks", adapter="ops-bot", author=_PERSON, thread=thread,
                     ref="1720000000.000999",
                 )
                 assert await _ran(h, person)
@@ -365,10 +359,7 @@ def test_one_slack_identity_opening_conversation_after_conversation_stops_at_the
                 assert ran == [True] * SIBLING_OPEN_LIMIT + [False, False]
                 # The other direction is its own pair.
                 back = _slack_turn(
-                    "back",
-                    adapter=None,
-                    author=_OPS_USER,
-                    thread="1720000200.000001",
+                    "back", adapter=None, author=_OPS_USER, thread="1720000200.000001",
                     ref="1720000200.000001",
                 )
                 assert await _ran(h, back)
@@ -446,24 +437,16 @@ def test_one_inbox_opening_conversation_after_conversation_stops_at_the_limit(
                 h.runner.default_script = [Final(text="answer", status=DONE)]
                 turns = [
                     _mail_turn(
-                        f"new thread {n}",
-                        to=_B,
-                        adapter="mail-b",
-                        author=_A,
-                        thread=f"thr-{n}",
-                        port=port,
+                        f"new thread {n}", to=_B, adapter="mail-b", author=_A,
+                        thread=f"thr-{n}", port=port,
                     )
                     for n in range(SIBLING_OPEN_LIMIT + 2)
                 ]
                 ran = [await _ran(h, ev) for ev in turns]
                 assert ran == [True] * SIBLING_OPEN_LIMIT + [False, False]
                 person = _mail_turn(
-                    "a person writes",
-                    to=_B,
-                    adapter="mail-b",
-                    author="c@example.com",
-                    thread="thr-person",
-                    port=port,
+                    "a person writes", to=_B, adapter="mail-b", author="c@example.com",
+                    thread="thr-person", port=port,
                 )
                 assert await _ran(h, person)
         finally:

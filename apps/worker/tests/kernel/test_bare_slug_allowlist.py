@@ -97,7 +97,9 @@ def _run(make_harness, text: str, thread: str) -> tuple[_AllowlistWorkspace, obj
 def test_bare_english_pair_outside_allowlist_proceeds_without_workspace(
     make_harness,
 ) -> None:
-    workspace, h = _run(make_harness, "What was profit/loss for the quarter?", "tBarePair2947")
+    workspace, h = _run(
+        make_harness, "What was profit/loss for the quarter?", "tBarePair2947"
+    )
 
     assert workspace.selections == ["profit/loss", None]
     assert h.sink.last_text is not None

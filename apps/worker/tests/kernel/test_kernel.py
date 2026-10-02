@@ -115,7 +115,7 @@ class _HistoryBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
-        **_: object,
+    **_: object,
     ) -> dict[str, str]:
         del kind, address
         return {
@@ -414,7 +414,7 @@ class _BuiltInCodingBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
-        **_: object,
+    **_: object,
     ) -> dict[str, str]:
         return {}
 
@@ -1158,7 +1158,7 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
             *,
             kind: str | None = None,
             address: str | None = None,
-            **_: object,
+        **_: object,
         ) -> dict[str, str]:
             return {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
 
@@ -1293,7 +1293,7 @@ def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
             *,
             kind: str | None = None,
             address: str | None = None,
-            **_: object,
+        **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -1951,7 +1951,7 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
             *,
             kind: str | None = None,
             address: str | None = None,
-            **_: object,
+        **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -2021,7 +2021,7 @@ def _workspace_binding(
             *,
             kind: str | None = None,
             address: str | None = None,
-            **_: object,
+        **_: object,
         ) -> dict[str, str]:
             return dict(boot_env_override or {"CURIE_RUNNER_TOKEN": "workspace-test-token"})
 
@@ -3464,7 +3464,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
             *,
             kind: str | None = None,
             address: str | None = None,
-            **_: object,
+        **_: object,
         ) -> dict[str, str]:
             return {
                 "CURIE_HISTORY_REF": f"https://api.example.com/state/transcript/{thread_key}",
@@ -3676,7 +3676,9 @@ def test_is_eval_thread_key_reads_the_isolate_prefix_from_the_scoped_key() -> No
     is_eval = kernel_module._is_eval_thread_key  # noqa: SLF001
 
     assert is_eval(scoped_conversation_id("slack", "C1", "eval:1720000000.000100"))
-    assert is_eval(scoped_conversation_id("slack", "C1", "eval:1720000000.000100", identity="ops"))
+    assert is_eval(
+        scoped_conversation_id("slack", "C1", "eval:1720000000.000100", identity="ops")
+    )
     assert not is_eval(scoped_conversation_id("slack", "C1", "1720000000.000100"))
     assert not is_eval(scoped_conversation_id("slack", "C1", "eval-1720000000.000100"))
     assert not is_eval(scoped_conversation_id("slack", "eval:C1", "1720000000.000100"))
@@ -5293,7 +5295,7 @@ class _TokenBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
-        **_: object,
+    **_: object,
     ) -> dict[str, str]:
         return {"CURIE_RUNNER_TOKEN": self._token}
 
@@ -6519,8 +6521,12 @@ def test_history_persistence_error_has_dedicated_factory_cause() -> None:
 
 
 def test_max_turns_and_unclassified_have_their_own_factory_causes() -> None:
-    max_turns = kernel_module.TurnOutcome(terminal_ok=False, classification="max-turns")
-    unclassified = kernel_module.TurnOutcome(terminal_ok=False, classification="unclassified")
+    max_turns = kernel_module.TurnOutcome(
+        terminal_ok=False, classification="max-turns"
+    )
+    unclassified = kernel_module.TurnOutcome(
+        terminal_ok=False, classification="unclassified"
+    )
 
     assert kernel_module._escalation_cause(max_turns) == "max_turns"
     assert kernel_module._escalation_cause(unclassified) == "unclassified"

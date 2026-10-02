@@ -283,7 +283,9 @@ def _entries(sync_redis: redis.Redis, stream: str) -> list[QueuedTurn]:
 def _capture_fire_metrics(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, str]]:
     recorded: list[dict[str, str]] = []
 
-    def capture(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
+    def capture(
+        name: str, value: float = 1, *, attributes: dict[str, str] | None = None
+    ) -> None:
         record_metric(name, value, attributes=attributes)
         if name == "curie.schedule.fire":
             assert value == 1
@@ -416,7 +418,6 @@ def test_killed_agent_records_blocked_and_enqueues_nothing(
     sync_redis: redis.Redis, names: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fires = _capture_fire_metrics(monkeypatch)
-
     async def killed(_agent_id: uuid.UUID) -> bool:
         return True
 
@@ -673,7 +674,6 @@ def test_target_not_bound_to_the_agent_records_failed(
     sync_redis: redis.Redis, names: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fires = _capture_fire_metrics(monkeypatch)
-
     async def body() -> None:
         async with _seed() as seed:
             unbound = f"C{uuid.uuid4().hex[:10].upper()}"
@@ -796,7 +796,9 @@ def test_a_target_bound_under_several_identities_none_default_records_failed(
     asyncio.run(body())
 
 
-async def _extra_binding(seed: Any, kind: str, adapter: str | None) -> uuid.UUID:
+async def _extra_binding(
+    seed: Any, kind: str, adapter: str | None
+) -> uuid.UUID:
     extra = uuid.uuid4()
     async with seed.engine.begin() as conn:
         await conn.execute(
@@ -1209,7 +1211,9 @@ def test_paused_trigger_does_not_fire_while_another_hook_keeps_running(
 
             assert await seed.runs(HOOK) == []
             other_rows = await seed.runs("independent")
-            assert [(row.slot_utc, row.outcome) for row in other_rows] == [(seed.slot, None)]
+            assert [(row.slot_utc, row.outcome) for row in other_rows] == [
+                (seed.slot, None)
+            ]
             entries = _entries(sync_redis, names["stream"])
             assert len(entries) == 1
             assert entries[0].hook_run is not None
@@ -1239,7 +1243,9 @@ def test_resumed_hook_catches_up_one_slot_after_a_worker_restart(
                 started_at=seed.slot - timedelta(seconds=10),
             )
 
-            assert [(row.slot_utc, row.outcome) for row in await seed.runs(HOOK)] == [
+            assert [
+                (row.slot_utc, row.outcome) for row in await seed.runs(HOOK)
+            ] == [
                 (seed.slot - timedelta(hours=3), "skipped"),
                 (seed.slot - timedelta(hours=2), "skipped"),
                 (seed.slot - timedelta(hours=1), "skipped"),
@@ -1273,8 +1279,8 @@ def test_old_pass_cannot_clear_a_newer_resume_gap() -> None:
                 await conn.execute(
                     text(
                         "UPDATE curie.schedule_controls "
-                        "SET generation = generation + 2 "
-                        "WHERE agent_id = :agent_id AND name = :name"
+                            "SET generation = generation + 2 "
+                            "WHERE agent_id = :agent_id AND name = :name"
                     ),
                     {"agent_id": seed.agent_id, "name": HOOK},
                 )
@@ -1343,13 +1349,17 @@ def test_paused_queued_slot_retries_once_after_resume(
                 HOOK, paused_at=seed.slot + timedelta(seconds=1), resume_from=None
             )
             trigger = _trigger(seed)
-            await _later_pass(seed, names["stream"], trigger, seed.slot + timedelta(seconds=20))
+            await _later_pass(
+                seed, names["stream"], trigger, seed.slot + timedelta(seconds=20)
+            )
             assert (await seed.runs())[0].outcome == "deferred"
 
             await seed.set_control(
                 HOOK, paused_at=None, resume_from=seed.slot + timedelta(seconds=1)
             )
-            await _later_pass(seed, names["stream"], trigger, seed.slot + timedelta(seconds=30))
+            await _later_pass(
+                seed, names["stream"], trigger, seed.slot + timedelta(seconds=30)
+            )
             assert (await seed.runs())[0].outcome is None
             entries = _entries(sync_redis, names["stream"])
             assert len(entries) == 1
@@ -1373,7 +1383,9 @@ def test_resume_slot_waits_for_a_pre_pause_fire_to_finish(
                 HOOK, paused_at=None, resume_from=seed.slot - timedelta(minutes=30)
             )
             trigger = _trigger(seed, schedule=f"{seed.slot.minute} * * * *")
-            await _later_pass(seed, names["stream"], trigger, seed.slot + timedelta(seconds=30))
+            await _later_pass(
+                seed, names["stream"], trigger, seed.slot + timedelta(seconds=30)
+            )
             assert [(row.slot_utc, row.outcome) for row in await seed.runs()] == [
                 (earlier, None),
                 (seed.slot, "deferred"),
@@ -1384,7 +1396,9 @@ def test_resume_slot_waits_for_a_pre_pause_fire_to_finish(
                     text("UPDATE curie.hook_runs SET outcome = 'ran' WHERE id = :id"),
                     {"id": earlier_id},
                 )
-            await _later_pass(seed, names["stream"], trigger, seed.slot + timedelta(seconds=40))
+            await _later_pass(
+                seed, names["stream"], trigger, seed.slot + timedelta(seconds=40)
+            )
             assert (await seed.runs())[-1].outcome is None
             assert len(_entries(sync_redis, names["stream"])) == 1
             assert fires == [_fire_labels("deferred")]
