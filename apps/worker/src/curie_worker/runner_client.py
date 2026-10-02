@@ -289,16 +289,17 @@ class TurnStream:
             self.close()
 
 
-def _without_memory_token(body: str, event: Event) -> str:
-    """``body`` with the event's memory credential redacted (MEMORY-TOKEN-3).
+def _rejected_frame(endpoint: str, status: int, body: str) -> RunnerError:
+    """The error for a runner that refused a turn-opening frame.
 
-    An older runner's 400 repeats the rejected frame, ``memory_token``
-    included, and the error this body goes into is logged."""
+    Only the status and the body's length, never the body (MEMORY-TOKEN-3). A
+    runner's validation response can repeat the frame it rejected, and the frame
+    carries the turn's memory credential and its publication capability. An
+    older runner repeats it as pydantic's ``str(ValidationError)``, which cuts
+    the input in the middle, so no string replace of the whole credential can
+    redact what is left of it. This error is logged."""
 
-    token = event.memory_token
-    if not token:
-        return body
-    return body.replace(token, "<redacted>")
+    return RunnerError(f"{endpoint} -> {status} (body: {len(body)} chars, not logged)")
 
 
 class RunnerClient:
@@ -473,13 +474,11 @@ class RunnerClient:
                 timeout=request_timeout,
             )
             if resp.status != 200:
-                if event.publication_context is not None:
-                    # A validation response can echo the submitted capability.
+                try:
+                    body = await resp.text()
+                finally:
                     resp.release()
-                    raise RunnerError(f"/v1/event -> {resp.status}")
-                body = _without_memory_token(await resp.text(), event)
-                resp.release()
-                raise RunnerError(f"/v1/event -> {resp.status}: {body}")
+                raise _rejected_frame("/v1/event", resp.status, body)
             turn_epoch = resp.headers.get(_TURN_EPOCH_HEADER)
             if capacity_admission and not _valid_turn_epoch(turn_epoch):
                 resp.release()
@@ -563,10 +562,7 @@ class RunnerClient:
                 if resp.status == 409:
                     return False, "conflict"
                 if resp.status != 200:
-                    if event.publication_context is not None:
-                        raise RunnerError(f"/v1/steer -> {resp.status}")
-                    body = _without_memory_token(await resp.text(), event)
-                    raise RunnerError(f"/v1/steer -> {resp.status}: {body}")
+                    raise _rejected_frame("/v1/steer", resp.status, await resp.text())
                 return True, "success"
 
         return await self._rpc("steer", token, request)

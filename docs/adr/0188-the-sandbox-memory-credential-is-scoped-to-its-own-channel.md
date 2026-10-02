@@ -120,9 +120,14 @@ them, since the runner loads them at boot.
 For each turn on an agent with memory writes on, the worker mints a second,
 short-lived credential: `memory` scope `write`, with claims `agent`, `binding`,
 `sender` (the turn's `event.user`, or `<no person>` for a job or eval) and
-`turn` (the run id). It expires at the turn's time limit. The worker
-sends it with the turn on the ACI `Event`, as a new optional field, not in the
-sandbox env. The runner's memory tools present it for writes.
+`turn` (the run id). The worker mints it just before the runner request that
+opens the turn, so it expires when that request's stream times out: the turn's
+time limit. A message steered into a live turn gets its own credential, naming
+its own sender, which expires no later than the live turn's time limit when
+the same worker opened that turn. If another worker opened it, the steering
+message's own time limit applies. A turn with no time left gets no credential.
+The worker sends it with the turn on the ACI `Event`, as a new optional field,
+not in the sandbox env. The runner's memory tools present it for writes.
 
 On a write, the API ignores any `author` in the body and stores the `sender`
 claim instead. Writes with the platform key keep the body's author, since the
@@ -138,8 +143,9 @@ What this proves, and what it doesn't: a stored author is the sender of the
 turn the write happened in, while that turn's credential is held. It does not
 prove that person said the fact. Code in the sandbox that gets hold of a turn's
 credential can write a fact attributed to that turn's real sender until the
-credential expires at the turn's time limit, which can be after the turn has
-ended and during a later sender's turn. It cannot name anyone else, write to
+credential expires at the turn's time limit (for a steered message, the live
+turn's, or the message's own when another worker opened that turn), which can
+be after the turn has ended and during a later sender's turn. It cannot name anyone else, write to
 another channel, or write after the credential expires. Refusing a credential
 once its turn ends is [#3776](https://github.com/curie-eng/curie/issues/3776).
 

@@ -1927,7 +1927,9 @@ write another channel's memory and cannot write the memory guidance. A fact's
 author is the sender of the turn the write happened in, while that turn's
 credential is held: code that copies the credential during a turn can write as
 that turn's sender until it expires at the turn's time limit, even after the
-turn has ended. Refusing a credential once its turn ends is
+turn has ended. A message steered into a live turn gets a credential for its
+own sender, which expires no later than the live turn's time limit when the
+same worker opened that turn, and at the message's own time limit otherwise. Refusing a credential once its turn ends is
 [#3776](https://github.com/curie-eng/curie/issues/3776). With writes off, the
 sandbox cannot write memory at all.
 
