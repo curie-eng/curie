@@ -755,3 +755,18 @@ def test_connector_tool_identifiers_inside_files_and_paths_stay_content(
     summary = content.format(tool=tool)
     action = _action(tool=tool, result={"summary": summary}, detail=summary, undoable=False)
     assert render_receipt([action]) == f"_What I changed:_\n• {summary} — {summary}"
+
+
+def test_receipt_metadata_uses_all_approval_reference_boundaries() -> None:
+    """@spec WORKER-RECEIPT-1: metadata sibling boundaries preserve ledger data."""
+    cases = json.loads(
+        (Path(__file__).resolve().parents[3] / "tests/vectors/user-action-wording.json").read_text()
+    )["metadata_references"]
+    for case in cases:
+        action = _action(tool=case["tool"], result={"summary": case["summary"]})
+        before = deepcopy(action)
+        display = " ".join(case["display"].split())
+        assert render_receipt([action]) == (
+            f"_What I changed:_\n• {display} — restore information recorded"
+        ), case
+        assert action == before

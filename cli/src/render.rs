@@ -463,6 +463,21 @@ mod tests {
         }
     }
 
+    // @spec plain-action-wording: all metadata consumers share content boundaries.
+    #[test]
+    fn shared_metadata_references_preserve_content_boundaries() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/vectors/user-action-wording.json"))
+                .unwrap();
+        for vector in vectors["metadata_references"].as_array().unwrap() {
+            assert_eq!(
+                action_text(vector["summary"].as_str().unwrap()),
+                vector["display"].as_str().unwrap(),
+                "{vector}"
+            );
+        }
+    }
+
     #[test]
     fn missing_tool_and_failed_side_effect_keep_warning_information() {
         let mut printer = TurnPrinter::default();
