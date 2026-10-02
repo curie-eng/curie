@@ -26,13 +26,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import math
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -1467,6 +1468,92 @@ class _MemoryMint:
 
 
 _MEMORY_MINT: ContextVar[_MemoryMint | None] = ContextVar("curie_worker_memory_mint", default=None)
+
+
+@dataclass
+class _AttemptMemoryTurns:
+    """The memory write credentials one ``_attempt`` minted (#3776).
+
+    ``_with_memory_token`` records each turn claim here, so the attempt can tell
+    the API those turns are over when it ends. ``steered`` means the attempt
+    folded into another attempt's live turn, which keeps using the credential;
+    ``steered_into`` names that live turn (``_live_memory_turn``), or is None
+    when the runner did not say which turn it was. ``live_turns`` are the
+    runner turns this attempt opened, so it also closes the steers that joined
+    each of them."""
+
+    agent_id: uuid.UUID | None = None
+    minted: list[tuple[uuid.UUID, str]] = field(default_factory=list)
+    steered: bool = False
+    steered_into: str | None = None
+    live_turns: list[str] = field(default_factory=list)
+
+
+# Per attempt, like the carries above; set and reset by ``Kernel._attempt``.
+_MEMORY_TURNS: ContextVar[_AttemptMemoryTurns | None] = ContextVar(
+    "curie_worker_memory_turns", default=None
+)
+# Strong references to in-flight closes, so a close scheduled in the background
+# is not garbage collected before it finishes.
+_PENDING_MEMORY_CLOSES: set[asyncio.Task[None]] = set()
+# The bound on one close call, so a hung API cannot keep a close task (and the
+# shutdown grace below) waiting. The binding client's own timeout is 5 s.
+_MEMORY_CLOSE_TIMEOUT_S = 6.0
+# How long shutdown waits for closes still in flight.
+_MEMORY_CLOSE_SHUTDOWN_GRACE_S = 2.0
+
+
+def _live_memory_turn(epoch: object) -> str | None:
+    """The name a steer and its live turn's owner both use for that turn (#3776).
+
+    The runner's turn epoch, which the owner gets when it opens the turn and a
+    steer reads from the pre-steer status. Hashed, because the epoch is the
+    turn's private timeout credential and this name goes into a Valkey key."""
+
+    if not isinstance(epoch, str) or not epoch:
+        return None
+    return hashlib.sha256(epoch.encode()).hexdigest()[:32]
+
+
+def _note_live_memory_turn(turn: object) -> None:
+    """Record a runner turn the current attempt opened, for its steers' close."""
+
+    record = _MEMORY_TURNS.get()
+    live = _live_memory_turn(getattr(turn, "turn_epoch", None))
+    if record is not None and live is not None:
+        record.live_turns.append(live)
+
+
+async def _close_memory_turn(
+    close: Callable[[uuid.UUID, str], Awaitable[None]], agent: uuid.UUID, turn: str
+) -> None:
+    """One close call, bounded and logged; it never raises."""
+
+    try:
+        async with asyncio.timeout(_MEMORY_CLOSE_TIMEOUT_S):
+            await close(agent, turn)
+    except TimeoutError:
+        logger.warning("memory turn close timed out for %s", turn)
+    except Exception as exc:  # noqa: BLE001 -- a close never fails the turn
+        logger.warning("memory turn close failed for %s: %s", turn, type(exc).__name__)
+
+
+def _settled_memory_close(task: asyncio.Task[None]) -> None:
+    _PENDING_MEMORY_CLOSES.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning("memory turn close failed: %s", type(task.exception()).__name__)
+
+
+async def drain_pending_memory_closes(grace_s: float = _MEMORY_CLOSE_SHUTDOWN_GRACE_S) -> None:
+    """On worker shutdown, give the closes still in flight a short grace (#3776).
+
+    Then let them go: a close that does not finish leaves its credential to
+    expire at the turn's stream deadline, which is the backstop anyway, so
+    shutdown is not held up waiting for a slow API."""
+
+    pending = [task for task in _PENDING_MEMORY_CLOSES if not task.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=grace_s)
 
 
 def _hook_success_outcome() -> HookRunOutcome | None:
@@ -4889,6 +4976,58 @@ class Kernel:
         workspace_inference: _WorkspaceInferenceCarry,
         memory_grant: TurnMemoryGrant | None = None,
     ) -> TurnOutcome:
+        """One attempt at a turn, then close its memory write credentials (#3776).
+
+        Every turn claim the attempt minted is reported closed to the API when
+        the attempt ends, on every outcome (success, runner error, start
+        failure, cancellation), so a credential copied out of the sandbox stops
+        writing then rather than at its expiry. A steered attempt hands its
+        claim to the live turn it joined instead (``_close_memory_turns``).
+        The closes run in the background, so the attempt's end never waits on
+        the API (``_settle_memory_turns``)."""
+
+        record = _AttemptMemoryTurns(agent_id=agent_id)
+        reset = _MEMORY_TURNS.set(record)
+        try:
+            return await self._attempt_turn(
+                qevent,
+                route,
+                release_order,
+                boot_env,
+                agent_id,
+                nav,
+                packs,
+                workspace_deployment_id,
+                agent_name,
+                runner_resources=runner_resources,
+                remaining_s=remaining_s,
+                pressure_retried=pressure_retried,
+                workspace_inference=workspace_inference,
+                memory_grant=memory_grant,
+            )
+        finally:
+            _MEMORY_TURNS.reset(reset)
+            if record.minted or record.live_turns:
+                self._settle_memory_turns(record)
+
+    async def _attempt_turn(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        release_order: Callable[[], None],
+        boot_env: dict[str, str] | None = None,
+        agent_id: uuid.UUID | None = None,
+        nav: NavAffordance | None = None,
+        packs: BehaviorPacks | None = None,
+        workspace_deployment_id: uuid.UUID | None = None,
+        agent_name: str | None = None,
+        *,
+        runner_resources: dict[str, Any] | None = None,
+        remaining_s: float | None = None,
+        pressure_retried: bool,
+        workspace_inference: _WorkspaceInferenceCarry,
+        memory_grant: TurnMemoryGrant | None = None,
+    ) -> TurnOutcome:
         handle = qevent.reply_handle
         thread_key = _thread_key_for(qevent)
         attempt_started = time.monotonic()
@@ -5329,6 +5468,10 @@ class Kernel:
             # steer folded into a since-failed turn is not itself replayed. This is
             # the accepted MVP semantic; durable per-steer replay is a deliberate
             # follow-up, flagged to the orchestrator rather than silently assumed.
+            memory_turns = _MEMORY_TURNS.get()
+            if memory_turns is not None:
+                # The live turn now holds this attempt's credential (#3776).
+                memory_turns.steered = True
             await self._reply_for(qevent, route, "Folded into the in-progress reply above.")
             return TurnOutcome(terminal_ok=True, steered=True)
 
@@ -5486,6 +5629,7 @@ class Kernel:
                     raise
                 if mint is not None:
                     self._record_turn_deadline(mint.grant, remaining_s)
+                _note_live_memory_turn(turn)
                 return turn
         try:
             turn = await self._runner.start_turn(
@@ -5501,6 +5645,8 @@ class Kernel:
             raise
         if mint is not None:
             self._record_turn_deadline(mint.grant, remaining_s)
+        # This attempt owns the turn, so it closes the steers that join it.
+        _note_live_memory_turn(turn)
         return turn
 
     async def _route_attachment_and_start(
@@ -6382,6 +6528,7 @@ class Kernel:
                 )
         else:
             active_before_steer = False
+            live_turn_before_steer: str | None = None
             if retained_live_route:
                 try:
                     # NOT given ``remaining_s``: see the note above _turn_active.
@@ -6406,13 +6553,20 @@ class Kernel:
                             "runner pre-steer status carried no usable turn_active: %r",
                             status,
                         )
+                    # The live turn this steer would join (#3776). The read and
+                    # the steer both run under the per-thread lock, so no other
+                    # attempt can open a turn on this thread between them.
+                    live_turn_before_steer = _live_memory_turn(status.get("turn_epoch"))
             steer_event = event
             mint = _MEMORY_MINT.get()
-            if mint is not None:
+            if mint is not None and retained_live_route and active_before_steer:
                 # ADR-0188: a steer ends when the live turn ends, so its
                 # credential never outlives that turn's stream deadline. A turn
                 # another worker opened has no recorded deadline here; the
-                # steer's own bound applies.
+                # steer's own bound applies. Minted only when the retained
+                # sandbox reports a live turn to fold into: a fresh, replacement
+                # or idle runner refuses the probe, and a credential minted for
+                # it would be one more claim to close (#3776).
                 steer_event = self._with_memory_token(
                     event,
                     mint.qevent,
@@ -6424,6 +6578,9 @@ class Kernel:
                 handle.base_url, steer_event, token=handle.token or None, remaining_s=remaining_s
             )
             if steered:
+                memory_turns = _MEMORY_TURNS.get()
+                if memory_turns is not None:
+                    memory_turns.steered_into = live_turn_before_steer
                 _record_route("steer")
                 _lifecycle_event("runner.turn.steered", "steer")
                 return _RouteResult(steered=True)
@@ -8300,6 +8457,7 @@ class Kernel:
             )
             if memory_grant is not None:
                 self._record_turn_deadline(memory_grant, left)
+            _note_live_memory_turn(turn)
         except ToolAccessUnenforced as exc:
             logger.warning("work-item continuation refused for %s: %s", qevent.event_id, exc)
             return TurnOutcome(
@@ -8749,17 +8907,25 @@ class Kernel:
             ttl_s = min(ttl_s, math.floor(cap_at - time.time()))
             if ttl_s <= 0:
                 return unminted
+        # Unique per mint (#3776): the attempt closes its turn when it ends, so a
+        # retry or a continuation needs its own claim, or the close would refuse
+        # it. It still starts with the event id, for the API's refusal log.
+        turn = f"{qevent.event_id}#{uuid.uuid4().hex[:8]}"
         token = mint(
             grant.resolved,
             kind=grant.kind,
             address=grant.address,
             thread_key=grant.thread_key,
             sender=qevent.author or "",
-            turn=qevent.event_id,
+            turn=turn,
             ttl_s=ttl_s,
         )
         if not token:
             return unminted
+        record = _MEMORY_TURNS.get()
+        agent = getattr(grant.resolved, "agent_id", None)
+        if record is not None and isinstance(agent, uuid.UUID):
+            record.minted.append((agent, turn))
         return event.model_copy(update={"memory_token": token})
 
     def _record_turn_deadline(self, grant: TurnMemoryGrant, remaining_s: float | None) -> None:
@@ -8769,6 +8935,69 @@ class Kernel:
         for key in [k for k, at in self._turn_deadlines.items() if at <= now]:
             del self._turn_deadlines[key]
         self._turn_deadlines[grant.thread_key] = now + self._runner.turn_deadline_s(remaining_s)
+
+    def _settle_memory_turns(self, record: _AttemptMemoryTurns) -> None:
+        """Close the turns an attempt minted, in the background (#3776).
+
+        The attempt's end does not wait on the API: the closes run as their own
+        task, kept in ``_PENDING_MEMORY_CLOSES`` so it is not garbage collected,
+        and a cancelled attempt still closes its credential. A failed or timed
+        out close never fails the turn: the credential then expires at the
+        turn's stream deadline, as before."""
+
+        task = asyncio.ensure_future(self._close_memory_turns(record))
+        _PENDING_MEMORY_CLOSES.add(task)
+        task.add_done_callback(_settled_memory_close)
+
+    async def _close_memory_turns(self, record: _AttemptMemoryTurns) -> None:
+        close = getattr(self._binding, "close_turn_memory", None)
+        if close is None:
+            return
+        turns: list[tuple[uuid.UUID, str]] = []
+        if record.steered:
+            # The live turn this attempt joined holds the steering credential
+            # (the runner's ``MemoryTurn.begin`` on steer) until it ends, so the
+            # attempt that owns that turn closes it. A list in Valkey keyed by
+            # that live turn, so the owner can be on another worker, and the
+            # owner of an earlier turn on the thread never takes it.
+            push = getattr(self._markers, "push_steer_memory_turns", None)
+            if push is not None and record.minted and record.steered_into is not None:
+                by_agent: dict[uuid.UUID, list[tuple[uuid.UUID, str]]] = {}
+                for agent, turn in record.minted:
+                    by_agent.setdefault(agent, []).append((agent, turn))
+                for agent, claims in by_agent.items():
+                    try:
+                        await push(agent, record.steered_into, claims)
+                    except Exception as exc:  # noqa: BLE001 -- falls back to expiry
+                        logger.warning(
+                            "could not hand a steer's memory turn to its live turn: %s",
+                            type(exc).__name__,
+                        )
+            elif record.minted:
+                # The runner did not name its live turn (an older runner, or one
+                # booted without a token), so no owner can find this claim. It is
+                # refused at its expiry instead.
+                logger.info("steer's memory turn left to expire: the live turn was not named")
+        else:
+            turns.extend(record.minted)
+        drain = getattr(self._markers, "drain_steer_memory_turns", None)
+        if record.live_turns and drain is not None:
+            agents = {agent for agent, _turn in record.minted}
+            if record.agent_id is not None:
+                agents.add(record.agent_id)
+            for agent in agents:
+                for live_turn in record.live_turns:
+                    try:
+                        turns.extend(await drain(agent, live_turn))
+                    except Exception as exc:  # noqa: BLE001 -- falls back to expiry
+                        logger.warning(
+                            "could not read the steers that joined a turn: %s",
+                            type(exc).__name__,
+                        )
+        if turns:
+            # Concurrently, each under its own bound, so one slow close does not
+            # hold up the others.
+            await asyncio.gather(*(_close_memory_turn(close, agent, turn) for agent, turn in turns))
 
     @staticmethod
     def _to_event(qevent: QueuedTurn) -> Event:

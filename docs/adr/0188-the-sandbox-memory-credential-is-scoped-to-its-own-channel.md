@@ -120,14 +120,16 @@ them, since the runner loads them at boot.
 For each turn on an agent with memory writes on, the worker mints a second,
 short-lived credential: `memory` scope `write`, with claims `agent`, `binding`,
 `sender` (the turn's `event.user`, or `<no person>` for a job or eval) and
-`turn` (the run id). The worker mints it just before the runner request that
-opens the turn, so it expires when that request's stream times out: the turn's
-time limit. A message steered into a live turn gets its own credential, naming
-its own sender, which expires no later than the live turn's time limit when
-the same worker opened that turn. If another worker opened it, the steering
-message's own time limit applies. A turn with no time left gets no credential.
-The worker sends it with the turn on the ACI `Event`, as a new optional field,
-not in the sandbox env. The runner's memory tools present it for writes.
+`turn` (the run id, one per attempt: the event id plus a suffix). The worker
+mints it just before the runner request that opens the turn, so it expires
+when that request's stream times out: the turn's time limit. A message steered
+into a live turn gets its own credential, naming its own sender, which expires
+no later than the live turn's time limit when the same worker opened that
+turn. If another worker opened it, the steering message's own time limit
+applies. A turn with no time left gets no credential. The credential is
+refused once its turn ends (#3776). The worker sends it with the turn on the
+ACI `Event`, as a new optional field, not in the sandbox env. The runner's
+memory tools present it for writes.
 
 On a write, the API ignores any `author` in the body and stores the `sender`
 claim instead. Writes with the platform key keep the body's author, since the
@@ -142,12 +144,23 @@ frozen contract, which gets its own issue before code, as ADR-0167 did for
 What this proves, and what it doesn't: a stored author is the sender of the
 turn the write happened in, while that turn's credential is held. It does not
 prove that person said the fact. Code in the sandbox that gets hold of a turn's
-credential can write a fact attributed to that turn's real sender until the
-credential expires at the turn's time limit (for a steered message, the live
-turn's, or the message's own when another worker opened that turn), which can
-be after the turn has ended and during a later sender's turn. It cannot name anyone else, write to
-another channel, or write after the credential expires. Refusing a credential
-once its turn ends is [#3776](https://github.com/curie-eng/curie/issues/3776).
+credential can write a fact attributed to that turn's real sender while the
+turn lasts. It cannot name anyone else, write to another channel, or write
+after the turn ends: when an attempt at a turn ends, on any outcome, the worker
+reports its turn to the API (`POST /v1/internal/memory/closed-turns`, worker
+token), and the API refuses writes with that turn's credential from then on,
+before it expires ([#3776](https://github.com/curie-eng/curie/issues/3776)).
+Reads with it still work. A steer's credential is closed when the live runner
+turn it joined ends, by the attempt that opened that turn; it is matched to that
+turn, not to the thread, so closing one turn never closes a steer into the next.
+The worker reports in the background, concurrently and with a timeout per call,
+so an attempt's end never waits on the API. The report is best effort and expiry
+is the backstop: if the worker crashes or is killed before it reports, the
+report fails or times out, the API predates it, or a steer hands its credential
+over after the live turn's owner has already reported, the credential is still
+refused at its expiry, which is the turn's stream deadline (for a steered
+message, the live turn's, or the message's own when another worker opened that
+turn).
 
 ### 5. Keep the credential out of Bash and hooks, as defense in depth
 

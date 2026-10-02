@@ -118,8 +118,9 @@ def test_runner_event_carries_turn_token(make_harness) -> None:
             assert claims["memory"] == "write"
             assert claims["binding"] == f"slack:{CHANNEL}"
             assert claims["sender"] == "U0ALICE01"
-            # The run identity: the queued event id.
-            assert claims["turn"] == turn.event_id
+            # The run identity: the queued event id, plus a per-attempt suffix
+            # so closing one attempt's credential cannot refuse a retry's (#3776).
+            assert claims["turn"].startswith(f"{turn.event_id}#"), claims["turn"]
 
     asyncio.run(go())
 
@@ -180,10 +181,10 @@ def test_steer_carries_steering_senders_token(
             assert len(steered) == 1
             first_claims = _claims(h.runner.event_bodies[0]["memory_token"])
             assert first_claims["sender"] == "U0ALICE01"
-            assert first_claims["turn"] == first.event_id
+            assert first_claims["turn"].startswith(f"{first.event_id}#")
             steer_claims = _claims(steered[0].memory_token)
             assert steer_claims["sender"] == "U0BOB0001"
-            assert steer_claims["turn"] == second.event_id
+            assert steer_claims["turn"].startswith(f"{second.event_id}#")
             assert steer_claims["binding"] == f"slack:{CHANNEL}"
 
     asyncio.run(go())
@@ -223,7 +224,7 @@ def test_work_item_continuation_carries_token(make_harness) -> None:
                 claims = _claims(body["memory_token"])
                 assert claims["memory"] == "write"
                 assert claims["sender"] == turn.author
-                assert claims["turn"] == turn.event_id
+                assert claims["turn"].startswith(f"{turn.event_id}#")
                 assert claims["binding"] == f"slack:{turn.reply_handle.channel}"
 
     asyncio.run(go())
@@ -284,6 +285,8 @@ def test_retry_mints_fresh_expiry(make_harness, monkeypatch: pytest.MonkeyPatch)
             assert len(h.runner.event_bodies) == 2, h.runner.opened
             first, second = (_claims(b["memory_token"]) for b in h.runner.event_bodies)
             assert second["exp"] >= first["exp"] + 1000
+            # Each attempt is its own turn for the closed-turn check (#3776).
+            assert second["turn"] != first["turn"]
             assert (
                 h.runner.event_bodies[0]["memory_token"] != h.runner.event_bodies[1]["memory_token"]
             )

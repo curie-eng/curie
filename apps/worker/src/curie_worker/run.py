@@ -53,7 +53,7 @@ from .delivery_lease import DeliveryLeaseStore
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
-from .kernel import Kernel
+from .kernel import Kernel, drain_pending_memory_closes
 from .killswitch import KillSwitch
 from .markers import Markers
 from .progress import ProgressStore
@@ -1146,6 +1146,9 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
             return_exceptions=True,
         )
     finally:
+        # Memory turn closes still in flight get a short grace, then are let
+        # go: an unclosed credential is refused at its expiry anyway (#3776).
+        await drain_pending_memory_closes()
         await rt.runner.close()
         await rt.sink.aclose()
         await rt.eval_http.aclose()

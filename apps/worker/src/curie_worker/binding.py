@@ -69,6 +69,7 @@ from collections.abc import Sequence
 from typing import Any
 from urllib.parse import quote
 
+import aiohttp
 from aci_protocol import BootEnv, Budget
 from aci_protocol.slack_identities import IDENTITY_NAME_MAX_LENGTH, IDENTITY_NAME_PATTERN
 from aci_protocol.turn import (
@@ -175,6 +176,11 @@ DECISION_ENV = BootEnv.env_key("approval_decision")
 FALSE_COMPLETION_CHECK_ENV = "CURIE_FALSE_COMPLETION_CHECK"
 # the worker re-mints every turn; this only bounds a leaked-token window (ADR-0033)
 SANDBOX_TOKEN_TTL_SECONDS = 24 * 60 * 60
+# #3776: the API route a turn's end is reported on, and how long that call may
+# take. Short: it runs as each attempt ends, and failing it only leaves the
+# credential to expire as it did before.
+CLOSED_TURNS_PATH = "/v1/internal/memory/closed-turns"
+_CLOSE_TURN_TIMEOUT = aiohttp.ClientTimeout(total=5)
 # ADR-0188: the ``sender`` claim of a turn with no person behind it (a job, an
 # eval). The runner renders the same string as "no author"
 # (``memory_facts.NO_PERSON``); ``tests/test_memory_fact_key_parity.py`` pins
@@ -1243,6 +1249,44 @@ class BindingResolver:
                 "turn": turn,
             },
         )
+
+    async def close_turn_memory(self, agent_id: uuid.UUID, turn: str) -> None:
+        """Tell the API a turn has ended, so its memory write credential is
+        refused from now on rather than at its expiry (#3776).
+
+        The resolver mints the credential (``turn_memory_token``), so it retires
+        it, on the internal route with the worker token every other
+        ``/v1/internal`` call uses. Never raises: a failed close leaves the
+        credential to expire at the turn's deadline, as before. An older API
+        without the route answers 404, which is logged once, not as an error.
+        """
+
+        url = f"{self._config.api_base_url.rstrip('/')}{CLOSED_TURNS_PATH}"
+        try:
+            async with (
+                aiohttp.ClientSession(timeout=_CLOSE_TURN_TIMEOUT) as session,
+                session.post(
+                    url,
+                    json={"agent_id": str(agent_id), "turn": turn},
+                    headers={"X-Curie-Worker-Token": self._config.internal_worker_token},
+                ) as response,
+            ):
+                status = response.status
+        except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+            logger.warning(
+                "could not report memory turn %s as ended: %s", turn, type(exc).__name__
+            )
+            return
+        if status == 404:
+            if not getattr(self, "_closed_turns_route_missing", False):
+                self._closed_turns_route_missing = True
+                logger.info(
+                    "the API has no closed-turns route (404); memory credentials "
+                    "stay usable until they expire"
+                )
+            return
+        if not 200 <= status < 300:
+            logger.warning("the API refused to end memory turn %s: HTTP %s", turn, status)
 
 
 def _binding_claim(kind: str | None, address: str | None) -> str | None:
