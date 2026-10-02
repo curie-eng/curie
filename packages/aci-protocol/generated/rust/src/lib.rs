@@ -549,6 +549,7 @@ mod tests {
             publication_context: None,
             // TOOL-ACCESS-1: the enum's wire spelling round-trips too.
             tool_access: Some(ToolAccess::ReadOnly),
+            memory_token: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
         assert!(encoded.contains(r#""tool_access":"read-only""#));
