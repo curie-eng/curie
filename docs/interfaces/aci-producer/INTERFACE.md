@@ -121,6 +121,21 @@ ordinary turns on the same install are untouched.
   comparing consumer models, so a field that grants authority must be modelled
   by that consumer before any worker acts on it.
 
+### Per-turn memory credential (MEMORY-TOKEN)
+
+The worker mints a short-lived write credential for each turn and carries it to
+the runner on the `Event`, so the runner's memory tools can present it without
+the credential ever entering the sandbox.
+
+- **MEMORY-TOKEN-1:** `Event` carries an optional `memory_token`, a string or
+  null, defaulting to null. Null means the turn carries no memory write
+  credential. It is never a `BootEnv` key or an env var.
+- **MEMORY-TOKEN-2:** A producer sends `memory_token` only on the runner POST,
+  `POST /v1/event` and `POST /v1/steer`.
+- **MEMORY-TOKEN-3:** A consumer must not place `memory_token` in env, logs,
+  hook or subprocess input, or persisted state. The reference model declares it
+  with `repr=False`, so `repr(event)` and a log's `%r` never show it.
+
 ## Implementations today
 
 The reference runner enforces and advertises `read-only` (RUNNER-TOOL-ACCESS
