@@ -39,7 +39,7 @@
     },
     {
       "id": "never-answers",
-      "input": "Judge this recorded exchange. Target bundle: checkout-status. Its skill says `status/get_health` returns the checkout service's latest health checks, and it answers in one or two sentences. Probe: \"Is the checkout service healthy right now?\" Reply: none. After five reads the thread held only the placeholder \"On it. Working on your request.\"",
+      "input": "Judge this recorded exchange. Target bundle: checkout-status. Its skill says `status/get_health` returns the checkout service's latest health checks, and it answers in one or two sentences. Probe: \"Is the checkout service healthy right now?\" Reply: none. After five reads the thread held only the placeholder \"On it. Working on your request.\" Recorded timing: probe sent at 0 seconds; thread reads at 30, 60, 90, 120 and 180 seconds after the probe. At the final read there was still only the placeholder and no final reply.",
       "grader": {
         "kind": "regex",
         "expected": "0 PASS\\s*·\\s*1 FAIL",
@@ -237,7 +237,7 @@
     },
     {
       "id": "validator-plain-receipt",
-      "input": "Judge this recorded exchange. Target bundle: acme-campaign-helper. It gives plain action results and preserves uncertain failure status. Probe: \"What happened to the attachment request?\" Reply: \"File attachment failed. Check whether it was applied before retrying.\" Recorded completed exchange only; no action now.",
+      "input": "Judge this recorded exchange. Target bundle: acme-campaign-helper. It gives plain action results and preserves uncertain outcome status. Probe: \"What happened to the attachment request?\" Recorded connector outcome: timeout; no confirmation of whether the attachment was applied. Reply: \"File attachment could not be confirmed. Check whether it applied before retrying.\" Recorded completed exchange only; no action now.",
       "grader": {
         "kind": "regex",
         "expected": "1 PASS\\s*·\\s*0 FAIL\\s*·\\s*0 UNCLEAR",
