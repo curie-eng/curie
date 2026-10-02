@@ -610,7 +610,8 @@ def test_native_request_groups_keep_counts_rows_and_distinct_request_kinds() -> 
 @pytest.mark.parametrize("tool", ["mcp__acme__Skill", "mcp__acme__Bash"])
 def test_third_party_native_like_name_is_plain_but_not_hidden_or_native(tool: str) -> None:
     assert render_receipt([_action(tool=tool, result=None, undoable=False)]) == (
-        f"_What I changed:_\n• {tool.rsplit('__', 1)[-1].lower()} — cannot be undone: nothing reported a prior state"
+        f"_What I changed:_\n• {tool.rsplit('__', 1)[-1].lower()} — "
+        "cannot be undone: nothing reported a prior state"
     )
 
 

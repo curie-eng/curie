@@ -366,7 +366,7 @@ def test_all_mode_replies_exactly_as_the_default_install_does(make_harness) -> N
         assert replies[0] == (
             "done\n\n"
             "_What I changed:_\n"
-            "• called `scale_deployment` — restore information recorded\n"
+            "• scale deployment — restore information recorded\n"
             "• filed acme-invoice.pdf — failed — check before retrying"
         )
 
