@@ -89,6 +89,18 @@ async def limit_current_session(request: Request) -> None:
     await require_rate_limit(request, route="console_session_get", limit=120, window_seconds=60)
 
 
+async def limit_logout(request: Request) -> None:
+    await require_rate_limit(request, route="console_logout", limit=30, window_seconds=60)
+
+
+async def limit_oidc(request: Request, *, route: str) -> None:
+    # Login and callback write (an attempt row; an IdP exchange and a session),
+    # so they get the write budget although both are GETs. Called after the
+    # OIDC-enabled check, not as a dependency, so a disabled install keeps its
+    # plain 404 and never reaches Valkey.
+    await require_rate_limit(request, route=route, limit=30, window_seconds=60)
+
+
 @router.post(
     "/login-codes",
     response_model=ConsoleLoginCodeOut,
@@ -173,7 +185,12 @@ async def current_session(
     )
 
 
-@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+@router.post(
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    dependencies=[Depends(limit_logout)],
+)
 async def logout(
     request: Request,
     session: SessionDep,
@@ -256,13 +273,14 @@ def _refuse_callback(reason: str) -> JSONResponse:
 
 
 @router.get("/oidc/login", status_code=status.HTTP_302_FOUND, response_class=RedirectResponse)
-async def oidc_login(session: SessionDep) -> RedirectResponse:
+async def oidc_login(request: Request, session: SessionDep) -> RedirectResponse:
     """Start an OIDC login: persist an attempt and redirect to the IdP.
 
     Discovery runs first so a misconfigured or mixed-up IdP fails here, before
     an attempt row exists and before the browser is sent anywhere.
     """
     _require_oidc_enabled()
+    await limit_oidc(request, route="console_oidc_login")
     try:
         metadata = await oidc.discover()
     except oidc.OidcError as exc:
@@ -311,6 +329,7 @@ async def oidc_login(session: SessionDep) -> RedirectResponse:
     responses={401: {"description": "The login was refused"}},
 )
 async def oidc_callback(
+    request: Request,
     session: SessionDep,
     code: str | None = None,
     state: str | None = None,
@@ -329,13 +348,16 @@ async def oidc_callback(
     stored PKCE verifier. The ID token is validated against the attempt's
     nonce, the principal is resolved and must be active in an active tenant,
     and only then does a session exist. Every terminal response clears the
-    state cookie, and every refusal looks the same.
+    state cookie, and every refusal looks the same. A rate-limited 429 is not
+    terminal: it comes before the attempt is touched and keeps the cookie, so
+    the same callback can complete after ``Retry-After``.
 
     The ``code`` and ``state`` in the query may land in access logs. That is
     tolerated: the code is useless without the verifier that never left the
     server, and the state is single-use and cookie-bound.
     """
     _require_oidc_enabled()
+    await limit_oidc(request, route="console_oidc_callback")
     if not state or not state_cookie or not hmac.compare_digest(
         state.encode("utf-8"), state_cookie.encode("utf-8")
     ):
