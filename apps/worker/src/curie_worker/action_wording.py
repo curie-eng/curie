@@ -19,7 +19,7 @@ _NATIVE = {
 _IDENTIFIER = re.compile(r"[\w-]+", re.UNICODE)
 # A filename or path containing an identifier is content, not a tool reference.
 # A period followed by whitespace, closing punctuation or end is sentence prose.
-_REFERENCE_END = r"(?![\w/-]|\.(?=[^\s\)\]\}\"\']))"
+_REFERENCE_END = r"(?![\w/-]|\.(?=[^\s\)\]\}\"'`]))"
 _MCP_REFERENCE = re.compile(r"(?<![\w./-])mcp__[\w-]+" + _REFERENCE_END, re.UNICODE)
 
 

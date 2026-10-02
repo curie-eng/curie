@@ -24,7 +24,7 @@ function caption(key: string): string {
 }
 export function approvalSummary(summary: string): string {
   const prefix = "Tool call awaiting approval: ";
-  if (!summary.startsWith(prefix)) return summary.replace(/(?<![\w./-])mcp__[\w-]+(?![\w./-])/g, actionLabel);
+  if (!summary.startsWith(prefix)) return summary.replace(/(?<![\p{L}\p{N}_./-])mcp__[\p{L}\p{N}_-]+(?![\p{L}\p{N}_/-]|\.(?=[^\s)\]}"'`]))/gu, actionLabel);
   const rest = summary.slice(prefix.length);
   const boundary = rest.indexOf(" ");
   const tool = boundary < 0 ? rest : rest.slice(0, boundary);

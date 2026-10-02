@@ -102,9 +102,9 @@ pub fn action_text(text: &str) -> String {
         // A terminal period is sentence prose; an extension remains content.
         let mut suffix = token[end..].chars();
         let in_suffix = match suffix.next() {
-            Some('.') => suffix
-                .next()
-                .is_some_and(|c| !c.is_whitespace() && !matches!(c, ')' | ']' | '}' | '"' | '\'')),
+            Some('.') => suffix.next().is_some_and(|c| {
+                !c.is_whitespace() && !matches!(c, ')' | ']' | '}' | '"' | '\'' | '`')
+            }),
             Some(c) => is_content_boundary(c),
             None => false,
         };
