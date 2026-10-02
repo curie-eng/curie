@@ -451,6 +451,12 @@ class BootEnv(_AciModel):
     deployment_environment: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_DEPLOYMENT_ENVIRONMENT", "worker")
     )
+    # Whether the current boot is a channel-bound turn (#3336). The worker
+    # binding sets it only when the turn has both a channel kind and an
+    # address. Absent means not channel-bound. It is not part of SessionConfig.
+    channel_bound: bool | None = Field(
+        default=None, json_schema_extra=_env("CURIE_CHANNEL_BOUND", "worker")
+    )
     # Which env var(s) carry the model credential (#514): a bare name or a JSON
     # array of them, walked in order. Unset, the runner falls back to
     # CURIE_CREDENTIALS, which is today's behavior.
@@ -582,6 +588,7 @@ class BootEnv(_AciModel):
         connector_agent: str | None = None,
         connector_namespace: str | None = None,
         connector_caller_token: str | None = None,
+        channel_bound: bool | None = None,
     ) -> dict[str, str]:
         """Render the worker binding's boot-env subset.
 
@@ -653,6 +660,8 @@ class BootEnv(_AciModel):
             env[cls.env_key("connector_namespace")] = connector_namespace
             if connector_caller_token:
                 env[cls.env_key("connector_caller_token")] = connector_caller_token
+        if channel_bound:
+            env[cls.env_key("channel_bound")] = "1"
         return env
 
     def to_env(self) -> dict[str, str]:
@@ -731,6 +740,8 @@ class BootEnv(_AciModel):
             env[self.env_key("thinking")] = self.thinking
         if self.deployment_environment is not None:
             env[self.env_key("deployment_environment")] = self.deployment_environment
+        if self.channel_bound is not None:
+            env[self.env_key("channel_bound")] = "1" if self.channel_bound else "0"
         if self.model_env_key is not None:
             env[self.env_key("model_env_key")] = self.model_env_key
         if self.metrics_temporality_preference is not None:
@@ -800,6 +811,7 @@ class BootEnv(_AciModel):
             # runner sending no thinking configuration at all (ADR-0098).
             thinking=_str_or_none(env.get("CURIE_THINKING")),
             deployment_environment=_str_or_none(env.get("CURIE_DEPLOYMENT_ENVIRONMENT")),
+            channel_bound=_fake_model_or_none(env.get("CURIE_CHANNEL_BOUND")),
             model_env_key=_str_or_none(env.get("CURIE_MODEL_ENV_KEY")),
             metrics_temporality_preference=_str_or_none(
                 env.get("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE")

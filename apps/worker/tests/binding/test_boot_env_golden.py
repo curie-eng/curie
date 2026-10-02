@@ -429,3 +429,39 @@ def test_an_unscoped_boot_carries_no_caller_token_even_with_a_key() -> None:
     # No scope mounts no hosted connector, so there is nobody to present it to.
     env = _boot_env(WorkerConfig(connector_caller_signing_key=_caller_seed()), _resolved())
     assert "CURIE_CONNECTOR_CALLER_TOKEN" not in env
+
+
+def _boot_env_with_channel(
+    config: WorkerConfig,
+    resolved: ResolvedDeployment,
+    *,
+    kind: str | None,
+    address: str | None,
+) -> dict[str, str]:
+    resolver = BindingResolver.__new__(BindingResolver)
+    resolver._config = config  # type: ignore[attr-defined]
+    return resolver.boot_env(resolved, _THREAD, kind=kind, address=address)
+
+
+def test_boot_env_omits_channel_bound_without_kind_or_address() -> None:
+    env = _boot_env(WorkerConfig(), _resolved())
+    assert "CURIE_CHANNEL_BOUND" not in env
+
+
+def test_boot_env_marks_a_turn_bound_to_a_channel() -> None:
+    env = _boot_env_with_channel(
+        WorkerConfig(), _resolved(), kind="slack", address="C0EXAMPLE1"
+    )
+    assert env["CURIE_CHANNEL_BOUND"] == "1"
+
+
+def test_boot_env_omits_channel_bound_when_the_address_is_blank() -> None:
+    env = _boot_env_with_channel(WorkerConfig(), _resolved(), kind="slack", address="")
+    assert "CURIE_CHANNEL_BOUND" not in env
+
+
+def test_boot_env_omits_channel_bound_when_the_kind_is_blank() -> None:
+    env = _boot_env_with_channel(
+        WorkerConfig(), _resolved(), kind="", address="C0EXAMPLE1"
+    )
+    assert "CURIE_CHANNEL_BOUND" not in env
