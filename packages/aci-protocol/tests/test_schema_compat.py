@@ -50,7 +50,9 @@ def test_reply_placeholders_are_required_nullable_strings() -> None:
     assert {variant["type"] for variant in approval_variants} == {"null", "string"}
 
     handle_string = next(variant for variant in handle_variants if variant["type"] == "string")
-    approval_string = next(variant for variant in approval_variants if variant["type"] == "string")
+    approval_string = next(
+        variant for variant in approval_variants if variant["type"] == "string"
+    )
     assert "minLength" not in handle_string
     assert approval_string["minLength"] == 1
 
