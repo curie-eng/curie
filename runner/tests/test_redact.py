@@ -235,6 +235,7 @@ def _span_attributes(vector: str) -> dict[str, dict[str, object]]:
         ]
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: FakeModelSession(script_factory=script),
         ceiling=0,

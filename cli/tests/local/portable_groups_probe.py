@@ -85,6 +85,7 @@ async def capture():
         raise RuntimeError("actual MCP discovery did not confirm read-only fixture")
     store = Store()
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: ObservedSession(options(resume)),
         ceiling=0,

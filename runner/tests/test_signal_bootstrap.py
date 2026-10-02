@@ -210,6 +210,7 @@ def test_runner_turn_records_declared_metrics_through_configured_provider() -> N
     provider = MeterProvider(metric_readers=[reader], shutdown_on_exit=False)
     configure_meter_provider(provider)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,

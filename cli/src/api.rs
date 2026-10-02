@@ -1301,14 +1301,12 @@ pub struct EvalMatrix {
 }
 
 /// The per-agent budget (`BudgetConfig` in openapi.json): the request and
-/// response body of `PUT /agents/{id}/budget`. Both fields are optional; an
-/// omitted field means "platform default" server-side, so we only serialize the
-/// ones the caller set.
+/// response body of `GET /agents/{id}/budget` and `PUT /agents/{id}/budget`.
+/// A null field means "platform default". Serialize both fields so a budget
+/// update sends the complete configuration, including preserved defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BudgetConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens_per_run: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_usd_per_day: Option<f64>,
 }
 
@@ -2990,6 +2988,23 @@ impl ApiClient {
             .push(thread_key)
             .push("reset");
         Ok(url)
+    }
+
+    /// Read the agent budget: `GET /agents/{id}/budget`.
+    pub async fn get_budget(&self, agent_id: &str) -> Result<BudgetConfig> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/agents/{agent_id}/budget", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/budget",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading the budget")
+            .await?
+            .json()
+            .await
+            .context("decoding budget")
     }
 
     /// Set the agent budget: `PUT /agents/{id}/budget` with a `BudgetConfig` body.

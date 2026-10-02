@@ -119,6 +119,7 @@ def _runner(
 ) -> tuple[SessionRunner, FakeModelSession]:
     fake = FakeModelSession(script_factory)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=ceiling,
@@ -205,6 +206,7 @@ def _runner_with_history(
     fake = session or FakeModelSession(script_factory)
     return (
         SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: fake,
             ceiling=0,
@@ -636,6 +638,7 @@ def test_first_resumed_turn_records_cache_read_metric_once(monkeypatch) -> None:
         ]
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: FakeModelSession(turn),
         ceiling=0,
@@ -686,6 +689,7 @@ def test_interrupting_a_stalled_phase_preserves_phase_and_cancels_cleanly(
         release = anyio.Event()
         session = session_type(entered, release)
         runner = SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=0,
@@ -747,6 +751,7 @@ def test_interrupt_precedes_iterator_exception_and_preserves_cancelled_terminal(
         release = anyio.Event()
         session = session_type(entered, release)
         runner = SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=0,
@@ -805,6 +810,7 @@ def test_timeout_terminalizes_before_generator_close_and_emits_one_metric(
     fake = FakeModelSession()
     store = _RecordingTranscriptStore()
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
@@ -950,6 +956,7 @@ def test_timeout_during_abandonment_cleanup_cannot_own_next_turn_stop() -> None:
 
     session = CleanupRaceSession()
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=0,
@@ -1077,6 +1084,7 @@ def test_next_turn_waits_for_timeout_interrupt_to_settle() -> None:
 
     session = SlowTimeoutInterruptSession()
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=0,
@@ -1246,6 +1254,7 @@ def _exercise_timeout_interrupt_failure(
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=0,
@@ -1416,6 +1425,7 @@ def test_timeout_precedes_an_operator_interrupt_on_the_same_turn() -> None:
     ]
     fake = FakeModelSession(lambda: script, truncate_on_interrupt=False)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
@@ -1470,6 +1480,7 @@ def test_abandoning_a_stalled_phase_is_error_not_intentional_cancellation(
         release = anyio.Event()
         session = session_type(entered, release)
         runner = SessionRunner(
+            max_usd_per_day=None,
             held_secrets=frozenset(),
             session_factory=lambda: session,
             ceiling=0,
@@ -1547,6 +1558,7 @@ def test_no_tool_turn_start_log_carries_its_agent_run_trace(
         ]
     )
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
@@ -1622,6 +1634,7 @@ def test_interrupt_reclassifies_error_result_to_idle() -> None:
     ]
     fake = FakeModelSession(lambda: script, truncate_on_interrupt=False)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake, ceiling=0, tracer=RunTracer(None),
         classifier=SideEffectClassifier(), trace_name="t",
@@ -1657,6 +1670,7 @@ def test_sdk_exception_still_terminates_in_final() -> None:
         async def close(self) -> None: ...
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=RaisingSession, ceiling=0, tracer=RunTracer(None),
         classifier=SideEffectClassifier(), trace_name="t",
@@ -1684,6 +1698,7 @@ def test_sdk_exception_logs_turn_failure(caplog) -> None:
         async def close(self) -> None: ...
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=RaisingSession,
         ceiling=0,
@@ -1762,6 +1777,7 @@ def test_auth_fast_fail_survives_a_wedged_interrupt(caplog) -> None:
     script = [AssistantMessage(content=[], model="m", error="authentication_failed")]
     fake = WedgedInterruptSession(lambda: script)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
@@ -1833,6 +1849,165 @@ def test_rejected_rate_limit_without_result_ends_in_classified_failure() -> None
     assert events[0].classification == "rate-limit"
     assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
     assert runner.status == SessionStatus.CLASSIFIED_FAILURE
+
+
+@pytest.mark.parametrize("ceiling", [10, 64000])
+@pytest.mark.parametrize("terminal_usage_only", [False, True])
+def test_output_token_budget_failure_names_the_configured_limit(
+    ceiling: int, terminal_usage_only: bool
+) -> None:
+    output_tokens = ceiling + 1
+    script = [
+        AssistantMessage(
+            content=[TextBlock(text="working")],
+            model="fake",
+            usage=None if terminal_usage_only else {"output_tokens": output_tokens},
+        ),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result="done",
+            usage={"output_tokens": output_tokens},
+        ),
+    ]
+    runner, fake = _runner(lambda: script, ceiling=ceiling)
+
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(errors) == 1
+    assert errors[0].classification == "budget-exceeded"
+    assert errors[0].message == (
+        f"output token budget exceeded (max_output_tokens_per_run={ceiling})"
+    )
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert fake.interrupts == (0 if terminal_usage_only else 1)
+
+
+@pytest.mark.parametrize("max_usd_per_day", [6.5, 17.25])
+def test_sdk_usd_budget_failure_names_the_configured_limit(max_usd_per_day: float) -> None:
+    # The provider documents this ResultMessage subtype in its SDK example:
+    # https://github.com/anthropics/claude-agent-sdk-python/blob/main/examples/max_budget_usd.py
+    fake = FakeModelSession(
+        lambda: [
+            ResultMessage(
+                subtype="error_max_budget_usd",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=True,
+                num_turns=5,
+                session_id="s",
+                result=None,
+            )
+        ]
+    )
+    runner = SessionRunner(
+        held_secrets=frozenset(),
+        session_factory=lambda: fake,
+        ceiling=64000,
+        max_usd_per_day=max_usd_per_day,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+    )
+
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    assert [event.type for event in events] == ["error", "final"]
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].classification == "budget-exceeded"
+    assert events[0].message == (
+        f"USD budget exceeded (max_usd_per_day={max_usd_per_day})"
+    )
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert fake.interrupts == 0
+
+
+def test_output_token_limit_takes_precedence_when_the_sdk_also_reports_a_usd_limit() -> None:
+    # The provider documents this ResultMessage subtype in its SDK example:
+    # https://github.com/anthropics/claude-agent-sdk-python/blob/main/examples/max_budget_usd.py
+    fake = FakeModelSession(
+        lambda: [
+            ResultMessage(
+                subtype="error_max_budget_usd",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=True,
+                num_turns=5,
+                session_id="s",
+                result=None,
+                usage={"output_tokens": 64001},
+            )
+        ]
+    )
+    runner = SessionRunner(
+        held_secrets=frozenset(),
+        session_factory=lambda: fake,
+        ceiling=64000,
+        max_usd_per_day=6.5,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+    )
+
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert errors
+    assert errors[-1].classification == "budget-exceeded"
+    assert errors[-1].message == (
+        "output token budget exceeded (max_output_tokens_per_run=64000)"
+    )
+    assert not any("USD budget exceeded" in error.message for error in errors)
+    assert isinstance(events[-1], Final)
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_sdk_usd_limit_retains_an_earlier_specific_provider_error() -> None:
+    # The provider documents this ResultMessage subtype in its SDK example:
+    # https://github.com/anthropics/claude-agent-sdk-python/blob/main/examples/max_budget_usd.py
+    fake = FakeModelSession(
+        lambda: [
+            RateLimitEvent(
+                rate_limit_info=RateLimitInfo(status="rejected"),
+                uuid="u",
+                session_id="s",
+            ),
+            ResultMessage(
+                subtype="error_max_budget_usd",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=True,
+                num_turns=5,
+                session_id="s",
+                result="provider stopped the run",
+            ),
+        ]
+    )
+    runner = SessionRunner(
+        held_secrets=frozenset(),
+        session_factory=lambda: fake,
+        ceiling=64000,
+        max_usd_per_day=6.5,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
+    )
+
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    assert [event.type for event in events] == ["error", "final"]
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].classification == "rate-limit"
+    assert events[0].message == "model rate limit reached"
+    assert isinstance(events[-1], Final)
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert events[-1].text == "provider stopped the run"
+    assert fake.interrupts == 0
 
 
 def test_budget_halt_logged(caplog) -> None:
@@ -2058,6 +2233,7 @@ def _connector_runner(
 ) -> tuple[SessionRunner, FakeModelSession]:
     fake = FakeModelSession(default_turn)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,
@@ -2211,6 +2387,7 @@ def _reconnect_runner(
         return failures if len(reprobes) == 1 else ()
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=0,
@@ -2442,6 +2619,7 @@ def test_slow_session_confirmation_is_not_cancelled_by_the_budget(
         return ()
 
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=0,
@@ -2503,6 +2681,7 @@ def test_failed_model_turn_with_failed_connector_is_not_prefixed() -> None:
 
     fake = FakeModelSession(failing_turn)
     runner = SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=0,

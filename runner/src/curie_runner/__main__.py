@@ -929,6 +929,7 @@ def build_runner(
         SessionRunner(
             session_factory=factory,
             ceiling=config.ceiling,
+            max_usd_per_day=config.max_usd_per_day,
             tracer=RunTracer(provider),
             classifier=SideEffectClassifier(
                 readonly_tools=_readonly_tools(harness, observed_readonly_tools, approval_gate)

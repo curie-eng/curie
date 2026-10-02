@@ -282,6 +282,7 @@ class SessionRunner:
         *,
         session_factory: SessionFactory,
         ceiling: int,
+        max_usd_per_day: float | None,
         tracer: RunTracer,
         classifier: SideEffectClassifier,
         trace_name: str,
@@ -333,6 +334,7 @@ class SessionRunner:
         # no progress tool is mounted.
         self._progress_activity = progress_activity
         self._ceiling = ceiling
+        self._max_usd_per_day = max_usd_per_day
         self._tracer = tracer
         self._classifier = classifier
         self._trace_name = trace_name
@@ -1555,6 +1557,21 @@ class SessionRunner:
                 )
 
             for outbound in events:
+                if (
+                    isinstance(message, ResultMessage)
+                    and message.subtype == "error_max_budget_usd"
+                    and not budget_hit
+                    and isinstance(outbound, ErrorEvent)
+                    and outbound.classification == BUDGET_CLASSIFICATION
+                ):
+                    outbound = outbound.model_copy(
+                        update={
+                            "message": (
+                                "USD budget exceeded "
+                                f"(max_usd_per_day={self._max_usd_per_day})"
+                            )
+                        }
+                    )
                 if isinstance(outbound, ToolNote):
                     logger.info("tool call session=%s tool=%s", self._session_id, outbound.tool)
                 if isinstance(outbound, ErrorEvent):
@@ -2187,7 +2204,10 @@ class SessionRunner:
         return [
             to_ndjson_line(
                 ErrorEvent(
-                    message="output token budget exceeded",
+                    message=(
+                        "output token budget exceeded "
+                        f"(max_output_tokens_per_run={self._ceiling})"
+                    ),
                     classification=BUDGET_CLASSIFICATION,
                 )
             ),

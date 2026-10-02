@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 import uuid
 from dataclasses import dataclass
@@ -90,10 +91,7 @@ _CAUSE_TEXT = {
         "the provider limit."
     ),
     "model_error": "the model provider returned an error the run could not recover from.",
-    "budget_exceeded": (
-        "the run reached its output token limit or USD cap before it finished. "
-        "To raise the USD cap, run `curie cluster budget <agent> --limit <usd>`, then retry."
-    ),
+    "budget_exceeded": "the run reached a budget limit before it finished.",
     "runner_timeout": "the run took longer than its time limit.",
     "sandbox_terminated": (
         "the sandbox terminated before the run finished. Check the Kubernetes "
@@ -183,6 +181,12 @@ _FAILURE_CLASS_BY_CAUSE = {
     "workspace_error": "workspace-error",
 }
 _BACKTICK_RUN = re.compile(r"`+")
+_OUTPUT_TOKEN_BUDGET_DETAIL = re.compile(
+    r"output token budget exceeded \(max_output_tokens_per_run=([1-9][0-9]{0,19})\)"
+)
+_USD_BUDGET_DETAIL = re.compile(
+    r"USD budget exceeded \(max_usd_per_day=([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)\)"
+)
 
 
 def cause_text(cause: str) -> str:
@@ -274,7 +278,36 @@ def result_section(
             f"Cause: {cause}\n"
         )
     else:
-        text = f"Could not complete: {cause_text(cause)}\n"
+        sentence = cause_text(cause)
+        if cause == "budget_exceeded":
+            token_budget = _OUTPUT_TOKEN_BUDGET_DETAIL.fullmatch(detail or "")
+            usd_budget = _USD_BUDGET_DETAIL.fullmatch(detail or "")
+            if token_budget is not None:
+                sentence = (
+                    "the run reached its output token limit per run "
+                    f"(max_output_tokens_per_run={token_budget[1]}) before it finished. "
+                    "To raise the output token limit, run "
+                    "`curie cluster budget <agent> --output-tokens <tokens>`, then retry."
+                )
+            elif (
+                usd_budget is not None
+                and len(usd_budget[1]) <= 32
+                and math.isfinite(usd := float(usd_budget[1]))
+                and usd > 0
+            ):
+                sentence = (
+                    "the run reached its USD cap "
+                    f"(max_usd_per_day={usd_budget[1]}) before it finished. "
+                    "To raise the USD cap, run "
+                    "`curie cluster budget <agent> --limit <usd>`, then retry."
+                )
+            else:
+                sentence = (
+                    "the run reached a budget limit before it finished, but Curie "
+                    "cannot identify which limit from the reported detail. "
+                    "Check the agent's configured budget, then retry."
+                )
+        text = f"Could not complete: {sentence}\n"
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
             text += _agent_message_block(detail.strip())
         elif cause == "approval_create_failed" and detail is not None and detail.strip():

@@ -93,11 +93,13 @@ async fn set_budget_puts_the_limit_as_max_usd_per_day() {
     assert_eq!(rec[0].path, format!("/agents/{AGENT_ID}/budget"));
     let body = String::from_utf8_lossy(&rec[0].body);
     assert!(body.contains("\"max_usd_per_day\":7.5"), "body: {body}");
-    // The unset token cap is skipped, not sent as null, so the server keeps its
-    // platform default.
-    assert!(
-        !body.contains("max_output_tokens_per_run"),
-        "unset field must be omitted: {body}"
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&rec[0].body).unwrap(),
+        serde_json::json!({
+            "max_usd_per_day": 7.5,
+            "max_output_tokens_per_run": null,
+        }),
+        "PUT sends the complete budget including platform defaults"
     );
 }
 
@@ -351,25 +353,101 @@ async fn kill_handler_resolves_by_name_then_kills() {
 }
 
 #[tokio::test]
-async fn budget_handler_resolves_then_puts_the_limit() {
-    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/agents") => agent_list(),
-        ("PUT", p) if *p == format!("/agents/{AGENT_ID}/budget") => Response::json(
-            200,
-            r#"{"max_output_tokens_per_run":null,"max_usd_per_day":9.0}"#,
+async fn budget_handler_reads_then_merges_the_selected_fields() {
+    for (current, limit, output_tokens, expected) in [
+        (
+            serde_json::json!({"max_output_tokens_per_run": 32000, "max_usd_per_day": 5.0}),
+            Some(9.0),
+            None,
+            serde_json::json!({"max_output_tokens_per_run": 32000, "max_usd_per_day": 9.0}),
         ),
-        other => panic!("unexpected request: {other:?}"),
-    });
-    commands::budget(opts(&server.base_url, "deal-desk", false), 9.0)
+        (
+            serde_json::json!({"max_output_tokens_per_run": null, "max_usd_per_day": 5.0}),
+            Some(9.0),
+            None,
+            serde_json::json!({"max_output_tokens_per_run": null, "max_usd_per_day": 9.0}),
+        ),
+        (
+            serde_json::json!({"max_output_tokens_per_run": 64000, "max_usd_per_day": 6.5}),
+            None,
+            Some(96000),
+            serde_json::json!({"max_output_tokens_per_run": 96000, "max_usd_per_day": 6.5}),
+        ),
+        (
+            serde_json::json!({"max_output_tokens_per_run": 64000, "max_usd_per_day": null}),
+            None,
+            Some(96000),
+            serde_json::json!({"max_output_tokens_per_run": 96000, "max_usd_per_day": null}),
+        ),
+        (
+            serde_json::json!({"max_output_tokens_per_run": 64000, "max_usd_per_day": 6.5}),
+            Some(9.0),
+            Some(96000),
+            serde_json::json!({"max_output_tokens_per_run": 96000, "max_usd_per_day": 9.0}),
+        ),
+    ] {
+        let current_body = current.to_string();
+        let expected_body = expected.to_string();
+        let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/agents") => agent_list(),
+            ("GET", p) if *p == format!("/agents/{AGENT_ID}/budget") => {
+                Response::json(200, &current_body)
+            }
+            ("PUT", p) if *p == format!("/agents/{AGENT_ID}/budget") => {
+                Response::json(200, &expected_body)
+            }
+            other => panic!("unexpected request: {other:?}"),
+        });
+        let saved = commands::budget(
+            opts(&server.base_url, "deal-desk", false),
+            limit,
+            output_tokens,
+        )
         .await
         .unwrap();
 
+        let rec = server.recorded();
+        assert_eq!(rec.len(), 3, "{current} -> {expected}");
+        assert_eq!(rec[0].method, "GET");
+        assert_eq!(rec[0].path, "/agents");
+        assert_eq!(rec[1].method, "GET");
+        assert_eq!(rec[1].path, format!("/agents/{AGENT_ID}/budget"));
+        assert_eq!(rec[2].method, "PUT");
+        assert_eq!(rec[2].path, format!("/agents/{AGENT_ID}/budget"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&rec[2].body).unwrap(),
+            expected,
+            "preserve the unselected field, including an explicit null"
+        );
+        assert_eq!(
+            curie::ui::CliOutput::to_json(&saved),
+            serde_json::json!({
+                "agent": "deal-desk",
+                "max_usd_per_day": expected["max_usd_per_day"],
+                "max_output_tokens_per_run": expected["max_output_tokens_per_run"],
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn budget_handler_does_not_put_after_the_current_budget_read_fails() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list(),
+        ("GET", p) if *p == format!("/agents/{AGENT_ID}/budget") => {
+            Response::json(503, r#"{"detail":"budget unavailable"}"#)
+        }
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let err = commands::budget(opts(&server.base_url, "deal-desk", false), Some(9.0), None)
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("503"), "{err}");
     let rec = server.recorded();
     assert_eq!(rec.len(), 2);
-    assert_eq!(rec[1].method, "PUT");
-    assert_eq!(rec[1].path, format!("/agents/{AGENT_ID}/budget"));
-    let body = String::from_utf8_lossy(&rec[1].body);
-    assert!(body.contains("\"max_usd_per_day\":9.0"), "body: {body}");
+    assert!(rec.iter().all(|request| request.method == "GET"));
 }
 
 #[tokio::test]
@@ -380,8 +458,14 @@ async fn budget_dry_run_refuses_a_limit_the_real_command_refuses() {
     // never reaches the plan, dry run or not.
     let server = serve(|req| panic!("budget must not request, got {} {}", req.method, req.path));
     let base = &server.base_url;
-    for (limit, shown) in [(-5.0, "-5"), (0.0, "0"), (f64::NAN, "NaN")] {
-        let err = commands::budget(opts(base, "deal-desk", true), limit)
+    for (limit, shown) in [
+        (-5.0, "-5"),
+        (0.0, "0"),
+        (f64::NAN, "NaN"),
+        (f64::INFINITY, "inf"),
+        (f64::NEG_INFINITY, "-inf"),
+    ] {
+        let err = commands::budget(opts(base, "deal-desk", true), Some(limit), None)
             .await
             .unwrap_err();
         assert!(
@@ -397,7 +481,7 @@ async fn budget_dry_run_refuses_a_limit_the_real_command_refuses() {
         );
     }
     // Without --dry-run the refusal is the same error and the same class.
-    let err = commands::budget(opts(base, "deal-desk", false), -5.0)
+    let err = commands::budget(opts(base, "deal-desk", false), Some(-5.0), None)
         .await
         .unwrap_err();
     assert!(
@@ -413,23 +497,56 @@ async fn budget_dry_run_refuses_a_limit_the_real_command_refuses() {
 }
 
 #[tokio::test]
-async fn budget_dry_run_valid_limit_keeps_the_plan() {
-    // #3710: a valid --limit under --dry-run prints the same plan line as
-    // before the fix -- the validation must not change the plan text.
+async fn budget_requires_a_selected_positive_limit_before_any_http() {
+    let server = serve(|req| panic!("budget must not request, got {} {}", req.method, req.path));
+    for dry_run in [false, true] {
+        for (limit, output_tokens) in [(None, None), (None, Some(0)), (Some(5.0), Some(0))] {
+            let err = commands::budget(
+                opts(&server.base_url, "deal-desk", dry_run),
+                limit,
+                output_tokens,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(curie::exit::classify(&err).0, curie::exit::ExitClass::Usage);
+            assert!(err.to_string().contains("--output-tokens"), "{err}");
+            if output_tokens.is_none() {
+                assert!(err.to_string().contains("--limit"), "{err}");
+            }
+        }
+    }
+    assert!(server.recorded().is_empty());
+}
+
+#[tokio::test]
+async fn budget_dry_run_plans_to_read_and_preserve_before_the_selected_updates() {
     let server = serve(|req| panic!("dry-run must not request, got {} {}", req.method, req.path));
     let base = &server.base_url;
-    let out = commands::budget(opts(base, "deal-desk", true), 5.0)
-        .await
-        .unwrap();
-    match out {
-        commands::BudgetOutput::DryRun(plan) => assert_eq!(
-            plan.lines,
-            vec![format!(
-                "PUT {}/agents/<id>/budget  {{\"max_usd_per_day\":5}}  (would resolve agent {:?} first)",
-                base, "deal-desk"
-            )]
-        ),
-        other => panic!("expected dry run plan, got {other:?}"),
+    for (limit, output_tokens) in [
+        (Some(5.0), None),
+        (None, Some(64000)),
+        (Some(5.0), Some(64000)),
+    ] {
+        let out = commands::budget(opts(base, "deal-desk", true), limit, output_tokens)
+            .await
+            .unwrap();
+        match out {
+            commands::BudgetOutput::DryRun(plan) => {
+                assert_eq!(plan.lines.len(), 2, "{plan:?}");
+                assert!(plan.lines[0].contains(&format!("GET {base}/agents/<id>/budget")));
+                assert!(plan.lines[0].to_lowercase().contains("preserv"));
+                assert!(plan.lines[1].contains(&format!("PUT {base}/agents/<id>/budget")));
+                if limit.is_some() {
+                    assert!(plan.lines[1].contains("max_usd_per_day"));
+                    assert!(plan.lines[1].contains('5'));
+                }
+                if output_tokens.is_some() {
+                    assert!(plan.lines[1].contains("max_output_tokens_per_run"));
+                    assert!(plan.lines[1].contains("64000"));
+                }
+            }
+            other => panic!("expected dry run plan, got {other:?}"),
+        }
     }
     assert!(
         server.recorded().is_empty(),
@@ -811,7 +928,9 @@ async fn dry_run_makes_no_request_for_any_verb() {
     let base = &server.base_url;
     commands::kill(opts(base, "a", true), false).await.unwrap();
     commands::resume(opts(base, "a", true)).await.unwrap();
-    commands::budget(opts(base, "a", true), 5.0).await.unwrap();
+    commands::budget(opts(base, "a", true), Some(5.0), None)
+        .await
+        .unwrap();
     commands::delete(opts(base, "a", true), false)
         .await
         .unwrap();

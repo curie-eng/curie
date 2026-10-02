@@ -220,6 +220,7 @@ def _runner(
     from curie_runner.session import SessionRunner
 
     return SessionRunner(
+        max_usd_per_day=None,
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=0,

@@ -2805,7 +2805,7 @@ export const commandManifest = {
           "name": "callers"
         },
         {
-          "about": "Set an agent's daily budget (`PUT /agents/{id}/budget`)",
+          "about": "Update an agent's budget, preserving unspecified limits",
           "args": [
             {
               "global": false,
@@ -2820,7 +2820,15 @@ export const commandManifest = {
               "id": "limit",
               "long": "limit",
               "positional": false,
-              "required": true
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Output token cap for each run. Must be > 0",
+              "id": "output_tokens",
+              "long": "output-tokens",
+              "positional": false,
+              "required": false
             },
             {
               "default_values": [
@@ -5766,7 +5774,7 @@ export const commandManifest = {
           "name": "channel-token"
         },
         {
-          "about": "Set an agent's budget via the platform API (`PUT /agents/{id}/budget`)",
+          "about": "Update an agent's budget, preserving unspecified limits",
           "args": [
             {
               "global": false,
@@ -5781,7 +5789,15 @@ export const commandManifest = {
               "id": "limit",
               "long": "limit",
               "positional": false,
-              "required": true
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Output token cap for each run (BudgetConfig.max_output_tokens_per_run). Must be > 0",
+              "id": "output_tokens",
+              "long": "output-tokens",
+              "positional": false,
+              "required": false
             },
             {
               "env": "CURIE_API_URL",
