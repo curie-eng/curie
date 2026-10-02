@@ -5972,7 +5972,9 @@ def test_missing_display_sentence_boundaries_reach_notice_and_card(make_harness)
                 assert approvals.requests[0].summary == case["summary"]
                 assert approvals.requests[0].granted_tool == case["tool"]
                 assert approvals.requests[0].granted_arguments == arguments
-                assert h.sink.last_text is not None and case["display"] in h.sink.last_text
+                # The notice control string compacts whitespace (#817); the card stays literal.
+                notice = " ".join(case["display"].split())
+                assert h.sink.last_text is not None and notice in h.sink.last_text
                 assert h.sink.posts[0][1].text == case["display"]
                 assert isinstance(h.sink.posts[0][1].interaction, ConfirmIntent)
                 assert h.sink.posts[0][1].interaction.prompt == case["display"]
