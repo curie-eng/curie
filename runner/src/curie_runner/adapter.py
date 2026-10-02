@@ -52,6 +52,7 @@ from claude_agent_sdk.types import (
     SessionKey,
     SessionStore,
     SessionStoreEntry,
+    SettingSource,
 )
 
 from .history import (
@@ -159,6 +160,9 @@ def _recover_assistant_groups(
 # Claude or otherwise -- ever sees one.
 _SDK_ATTRIBUTION_OFF_SETTINGS = json.dumps({"attribution": {"commit": "", "pr": ""}})
 _SDK_TITLE_MODEL_ENV = "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+# The settings the CLI loads, passed explicitly (#3766, ADR-0189). Today's
+# loading, kept on purpose: ``[]`` would also stop a workspace ``CLAUDE.md``.
+_SETTING_SOURCES: tuple[SettingSource, ...] = ("user", "project", "local")
 _SDK_DISABLE_TERMINAL_TITLE_ENV = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
 
 
@@ -504,6 +508,7 @@ def build_options(
     web_search_enabled: bool = True,
     policy_disallowed_tools: Iterable[str] = (),
     disallowed_tools: list[str] | tuple[str, ...] | None = None,
+    skills: list[str] | None = None,
 ) -> ClaudeAgentOptions:
     """Assemble ClaudeAgentOptions for the session.
 
@@ -517,6 +522,11 @@ def build_options(
     ``task_budget`` so the model self-paces (ACI section 6b, a soft hint, not a
     ceiling); and the hard per-run output-token ceiling is enforced by the runner
     itself (see budget.py).
+
+    ``skills`` is the bundle's own skill list (``plugin.bundle_skill_names``).
+    It is always passed to the SDK as a list, ``[]`` when there are none:
+    leaving it unset would keep every built-in Claude Code CLI skill in the
+    model's listing (#3766, ADR-0189).
     """
 
     task_budget = TaskBudget(total=task_budget_hint) if task_budget_hint else None
@@ -569,6 +579,14 @@ def build_options(
         # https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
         # https://github.com/anthropics/claude-agent-sdk-python#using-tools
         disallowed_tools=disallowed_tools,
+        # Only the bundle's own skills reach the model's listing (#3766,
+        # ADR-0189). ``None`` would mean "every skill the CLI has", built-ins
+        # such as ``update-config`` included, so it is never passed.
+        skills=list(skills or []),
+        # Explicit, because with ``skills`` set the SDK otherwise fills in
+        # ``["user", "project"]`` and quietly drops ``local``. This keeps the
+        # settings loading the runner had before ``skills`` was passed.
+        setting_sources=list(_SETTING_SOURCES),
         **thinking_option,
         **cwd_option,
         system_prompt=system_prompt,

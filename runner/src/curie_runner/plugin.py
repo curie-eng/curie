@@ -270,6 +270,36 @@ def bundle_mcp_servers(plugin_dir: str | None) -> dict[str, Any]:
     return servers
 
 
+def bundle_skill_names(plugin_dir: str | None) -> list[str]:
+    """The bundle's own skills, named as the CLI names plugin skills (#3766).
+
+    The runner passes this list as the SDK ``skills`` option so the model's
+    skill listing holds only the bundle's skills, not the Claude Code CLI's
+    built-in ones (ADR-0189). The CLI names a plugin skill
+    ``<manifest name>:<dir>`` after its directory, not its frontmatter
+    ``name``, and loads only ``skills/<dir>/SKILL.md`` one level down, so the
+    list follows the same rule (verified on CLI 2.1.281). Sorted, so the list
+    is deterministic. No bundle, or a bundle without skills, gives ``[]``. Call
+    only after ``load_plugins`` has validated the bundle.
+    """
+
+    if not plugin_dir:
+        return []
+    root = Path(plugin_dir)
+    manifest_path = resolve_manifest(root)
+    if manifest_path is None:
+        return []
+    manifest = PluginManifest.model_validate(json.loads(manifest_path.read_text(encoding="utf-8")))
+    skills_dir = root / "skills"
+    if not skills_dir.is_dir():
+        return []
+    return [
+        f"{manifest.name}:{entry.name}"
+        for entry in sorted(skills_dir.iterdir(), key=lambda path: path.name)
+        if entry.is_dir() and (entry / "SKILL.md").is_file()
+    ]
+
+
 def _substitute_plugin_root(value: object, plugin_root: str) -> object:
     if isinstance(value, str):
         return value.replace(_PLUGIN_ROOT_PLACEHOLDER, plugin_root)

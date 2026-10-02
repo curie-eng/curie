@@ -91,7 +91,7 @@ from .memory_facts import (
     resolve_facts_store,
 )
 from .otel import RunTracer, build_tracer_provider
-from .plugin import bundle_mcp_servers, load_bundle_web_search_enabled
+from .plugin import bundle_mcp_servers, bundle_skill_names, load_bundle_web_search_enabled
 from .progress import (
     PROGRESS_TOKEN_ENV,
     PROGRESS_URL_ENV,
@@ -939,6 +939,9 @@ def build_runner(
             # 1932-1948), and a skill's allowed-tools frontmatter is exactly
             # such a rule, so the hook is the only layer that sees every call.
             hooks=session_hooks,
+            # Only the bundle's own skills are listed to the model (#3766,
+            # ADR-0189); the CLI's built-in skills stay hidden.
+            skills=bundle_skill_names(config.session.plugin_dir),
             # Platform tools and connectors share the SDK MCP channel. The
             # generic policy pager is present only on an actionable surface;
             # state and publication remain independent platform capabilities.
