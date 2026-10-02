@@ -163,11 +163,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # deployment, and a route that declares an approvers group then fails
     # closed at resolve time rather than silently widening.
     app.state.approver_sets = build_approver_set_selector(http_client, settings)
-    # Today's static Slack app as one provider installation (#2909), behind the
-    # same token gate: a Slack-free install gets no row. Never fails boot; if
-    # this image started below this migration it keeps retrying in the
-    # background. identities.py still reads CURIE_SLACK_IDENTITIES directly
-    # (ADR-0168) until it is wired to this table.
+    # Every configured Slack identity as one provider installation (#2909, ADR
+    # 0168 decision 1): the legacy default plus every CURIE_SLACK_IDENTITIES
+    # entry with a non-blank bot token, each behind its own token gate, so a
+    # Slack-free install gets no row. Never fails boot; if this image started
+    # below this migration it keeps retrying in the background. identities.py
+    # still reads CURIE_SLACK_IDENTITIES directly to validate a binding's
+    # declared name, not from this table, pending #2911.
     app.state.static_slack_bootstrap_task = await start_static_slack_bootstrap(
         app.state.sessionmaker, settings
     )

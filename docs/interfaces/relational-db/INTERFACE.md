@@ -84,7 +84,9 @@ is a judgement call, not something derivable from the tree.
    workload-to-allowlisted-repository map for inbound hooks (#2572). The review-feedback
    outbox likewise stores a normalized `feedback` object and credential-free serialized
    `turn` as JSONB. `scopes` is `apps/api/src/curie_api/models.py::ProviderInstallation.scopes`,
-   the list of provider scopes granted to a connected external account (#2909).
+   the list of provider scopes granted to one channel identity (#2909); `attributes` is
+   the same class's `attributes`, provider-specific identity details that don't fit a
+   fixed column, such as a Slack identity's extra token reference (ADR-0168 decision 1).
 4. **Raw dialect-specific SQL outside the ORM** — `DISTINCT ON`, which is Postgres-only,
    is written by hand in `apps/api/src/curie_api/commitpoller.py::_DEPLOYED_SQL` (executed
    through `text(...)` in `apps/api/src/curie_api/commitpoller.py::CommitPoller.poll_once`)
