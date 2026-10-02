@@ -422,3 +422,48 @@ def test_legacy_token_transcript_allowed_with_warning(
     assert any(aid in m and "transcript" in m for m in legacy_lines), legacy_lines
     assert not any(legacy["X-API-Key"] in m for m in warnings), "the token was logged"
     assert any(name == "curie.state.legacy_token" for name, _ in probe.points), probe.points
+
+
+def test_legacy_token_warning_logged_once_per_agent(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A warm legacy sandbox makes several transcript requests per turn for up
+    # to 24h. The warning names the agent once per API process; the metric
+    # still counts every request, so the window stays visible.
+    import curie_telemetry
+    from curie_api import state_mutation
+    from curie_api.routers import state as state_router
+
+    probe = _MetricProbe()
+    monkeypatch.setattr(curie_telemetry, "record_metric", probe.record_metric)
+    for module in (state_router, state_mutation):
+        monkeypatch.setattr(module, "record_metric", probe.record_metric, raising=False)
+
+    first = _agent_with_two_channels(client, auth_headers)
+    second = _agent(client, auth_headers, {"kind": "slack", "address": "C0EXAMPLE8"})
+    requests = 0
+    with caplog.at_level(logging.WARNING):
+        for aid in (first, second):
+            legacy = _legacy(aid)
+            url = _url(aid, _slack_key(CHANNEL_A if aid == first else "C0EXAMPLE8"))
+            for _ in range(3):
+                _assert_full_reach(client, url, legacy)
+                requests += 3
+            listed = client.get(f"/agents/{aid}/state/transcript", headers=legacy)
+            assert listed.status_code == 200, listed.text
+            requests += 1
+
+    legacy_lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "legacy sandbox token" in r.getMessage()
+    ]
+    assert len(legacy_lines) == 2, legacy_lines
+    assert sum(first in m for m in legacy_lines) == 1, legacy_lines
+    assert sum(second in m for m in legacy_lines) == 1, legacy_lines
+    counted = [name for name, _ in probe.points if name == "curie.state.legacy_token"]
+    assert len(counted) == requests, (len(counted), requests)
