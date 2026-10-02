@@ -427,6 +427,34 @@ mod tests {
     }
 
     #[test]
+    fn action_references_before_sentence_periods_keep_content_boundaries() {
+        for ending in [
+            ".",
+            ". Next action.",
+            ".\nNext action.",
+            ".\"",
+            ".)",
+            ".]",
+            ".}",
+            ".'",
+        ] {
+            assert_eq!(
+                action_text(&format!("Called mcp__acme__send_message{ending}")),
+                format!("Called send message{ending}")
+            );
+        }
+        for content in [
+            "mcp__acme__send_message.json",
+            "mcp__acme__send_message.backup.txt",
+            "./mcp__acme__send_message",
+            "/tmp/mcp__acme__send_message.json",
+            "https://example.com/mcp__acme__send_message",
+        ] {
+            assert_eq!(action_text(content), content);
+        }
+    }
+
+    #[test]
     fn missing_tool_and_failed_side_effect_keep_warning_information() {
         let mut printer = TurnPrinter::default();
         let event = OutboundEvent::SideEffectFlag {

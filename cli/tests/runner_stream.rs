@@ -219,3 +219,49 @@ fn human_progress_uses_plain_actions_without_changing_answers_or_json() {
         }
     }
 }
+
+#[test]
+fn progress_sentence_periods_normalize_metadata_and_preserve_reply_content() {
+    let server = serve(|request| match request.path.as_str() {
+        "/v1/reset" => Response::json(200, "{}"),
+        "/v1/event" => Response::ndjson(&[
+            frame(
+                serde_json::json!({"type":"tool_note", "version":PROTOCOL_VERSION,
+                "tool":"mcp__acme__send_message", "text":"Called mcp__acme__send_message."}),
+            ),
+            frame(
+                serde_json::json!({"type":"side_effect_flag", "version":PROTOCOL_VERSION,
+                "tool":"mcp__acme__send_message", "detail":"Check mcp__acme__send_message. Outcome unknown.", "failed":true}),
+            ),
+            frame(
+                serde_json::json!({"type":"final", "version":PROTOCOL_VERSION,
+                "text":"File mcp__acme__send_message.json", "status":"done"}),
+            ),
+        ]),
+        path => panic!("unexpected request: {path}"),
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_curie"))
+        .args([
+            "--color",
+            "never",
+            "skill",
+            "message",
+            "hi",
+            "--url",
+            &server.base_url,
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Called send message."), "{stderr}");
+    assert!(
+        stderr.contains("Check send message. Outcome unknown."),
+        "{stderr}"
+    );
+    assert!(stderr.contains("possible change"), "{stderr}");
+    assert!(!stderr.contains("mcp__"), "{stderr}");
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("File mcp__acme__send_message.json"));
+}
