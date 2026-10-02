@@ -8680,7 +8680,11 @@ class Kernel:
             thread_key=grant.thread_key,
             sender=qevent.author or "",
             turn=qevent.event_id,
-            ttl_s=remaining_s if remaining_s else self._config.delivery_budget_s,
+            # The turn's own stream deadline, so the credential dies with the
+            # turn rather than with the whole delivery budget.
+            ttl_s=self._runner.turn_deadline_s(
+                remaining_s if remaining_s else self._config.delivery_budget_s
+            ),
         )
         if not token:
             return event

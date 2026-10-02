@@ -333,6 +333,16 @@ class RunnerClient:
             4 * ((snapshot_patch_max_bytes + 2) // 3) + 131_072
         )
 
+    def turn_deadline_s(self, remaining_s: float | None) -> float:
+        """How long a turn opened now may stream: ``_request_timeout``'s bound.
+
+        ``min(total_timeout_s, remaining_s)``, or the ceiling when there is no
+        budget in hand. ADR-0188's per-turn memory credential expires with it.
+        """
+        if remaining_s is None:
+            return self._total_timeout_s
+        return max(_MIN_REQUEST_TIMEOUT_S, min(self._total_timeout_s, remaining_s))
+
     def _request_timeout(self, remaining_s: float | None) -> aiohttp.ClientTimeout | Any:
         """The per-request timeout for a delivery with ``remaining_s`` of budget.
 

@@ -175,10 +175,6 @@ DECISION_ENV = BootEnv.env_key("approval_decision")
 FALSE_COMPLETION_CHECK_ENV = "CURIE_FALSE_COMPLETION_CHECK"
 # the worker re-mints every turn; this only bounds a leaked-token window (ADR-0033)
 SANDBOX_TOKEN_TTL_SECONDS = 24 * 60 * 60
-# ADR-0188: the per-turn memory write credential outlives the turn's delivery
-# budget by this much, so a write the model makes at the very end of a turn
-# is not refused by a clock edge.
-MEMORY_TURN_TOKEN_GRACE_S = 60
 # ADR-0188: the ``sender`` claim of a turn with no person behind it (a job, an
 # eval). The runner renders the same string as "no author"
 # (``memory_facts.NO_PERSON``); ``tests/test_memory_fact_key_parity.py`` pins
@@ -1224,8 +1220,8 @@ class BindingResolver:
 
         None unless there is a key to sign with, the agent has memory writes on,
         the turn names a binding, and the thread is not eval-isolated (#1909).
-        The expiry is the turn's remaining budget, capped at the boot token's
-        lifetime, plus ``MEMORY_TURN_TOKEN_GRACE_S``.
+        The expiry is ``ttl_s``, the turn's own deadline, capped at the boot
+        token's lifetime, with no grace: the credential ends with the turn.
         """
 
         if not self._config.api_key or not resolved.memory_writes:
@@ -1234,7 +1230,7 @@ class BindingResolver:
         if binding is None or is_eval_isolate_thread(thread_key):
             return None
         lifetime = min(math.ceil(max(0.0, ttl_s)), SANDBOX_TOKEN_TTL_SECONDS)
-        exp = int(time.time()) + lifetime + MEMORY_TURN_TOKEN_GRACE_S
+        exp = int(time.time()) + lifetime
         return sandbox_token.mint(
             self._config.api_key,
             agent=str(resolved.agent_id),
