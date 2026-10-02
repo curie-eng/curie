@@ -3248,7 +3248,9 @@ def test_permission_display_keeps_values_without_showing_internal_identifiers() 
     arguments = {"file_name": "example.pdf", "destination": "Approved"}
     gate = ApprovalGate(required=frozenset({tool}))
     gate.block(tool, arguments)
-    assert gate.pending_display == "Approve file attachment. Destination: Approved; File name: example.pdf"
+    assert gate.pending_display == (
+        "Approve file attachment. Destination: Approved; File name: example.pdf"
+    )
     assert gate.pending_summary == summarize_tool_call(tool, arguments)
     assert gate.pending_granted_tool == tool
     assert gate.pending_granted_arguments == arguments
