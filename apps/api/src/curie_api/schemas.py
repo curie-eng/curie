@@ -2472,6 +2472,7 @@ class ApprovalOut(BaseModel):
     conversation_id: str
     author: str
     summary: str
+    display_summary: str | None = None
     reply_channel: str
     reply_placeholder: str | None
     reply_endpoint: str | None

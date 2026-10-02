@@ -74,6 +74,7 @@ from plugin_format import (
     resolve_manifest,
 )
 
+from .approval_wording import describe_approval, presentation_text
 from .publication_precheck import PublicationPrecheck
 from .state import STATE_TOOL_NAMES
 
@@ -918,8 +919,10 @@ class ApprovalGate:
         self.pending_summary = summarize_tool_call(tool_name, tool_input)
         template = self.summary_by_tool.get(tool_name)
         self.pending_display = (
-            render_gate_summary(template, tool_input) if template else None
-        )
+            render_gate_summary(presentation_text(template, tool_name), tool_input)
+            if template
+            else None
+        ) or describe_approval(tool_name, tool_input)
         self.pending_route = self.route_by_tool.get(tool_name)
         # Provenance for the permission gate (#544, Decision C): the tool
         # name here is the value ``can_use_tool`` itself denied -- the

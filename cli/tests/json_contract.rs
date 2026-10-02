@@ -2337,6 +2337,7 @@ fn approval_record() -> ApprovalRecord {
         status: "pending".to_string(),
         conversation_id: "C1".to_string(),
         summary: "run tests".to_string(),
+        display_summary: None,
         expires_at: Some("2026-01-01T00:00:00Z".to_string()),
         resolved_by: None,
         // #1078: the persisted card location for a route-bound approval.

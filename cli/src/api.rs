@@ -578,6 +578,8 @@ pub struct ApprovalRecord {
     pub conversation_id: String,
     pub summary: String,
     #[serde(default)]
+    pub display_summary: Option<String>,
+    #[serde(default)]
     pub expires_at: Option<String>,
     #[serde(default)]
     pub resolved_by: Option<String>,

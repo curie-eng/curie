@@ -7697,7 +7697,9 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                 } else {
                     ui.payload(&format!("{agent} — {} pending approval(s):", records.len()));
                     for r in records {
-                        let tool = r.granted_tool.as_deref().unwrap_or("-");
+                        let tool =
+                            crate::render::action_label(r.granted_tool.as_deref().unwrap_or(""));
+                        let display = crate::approval_wording::approval_display(r);
                         let route = r.route.as_deref().unwrap_or("(requesting channel)");
                         // A null card_channel means an older row or a direct API
                         // write that omitted the field, for which the requesting
@@ -7728,8 +7730,8 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                         ui.kv(
                             &r.id,
                             &format!(
-                                "{}: {} [tool: {tool}, route: {route}, channel: {card}, current route approvers: {approvers}, by: {}]",
-                                r.summary, r.conversation_id, r.author
+                                "{}: {} [action: {tool}, route: {route}, channel: {card}, current route approvers: {approvers}, by: {}]",
+                                display, r.conversation_id, r.author
                             ),
                         );
                     }

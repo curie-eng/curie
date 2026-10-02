@@ -12,8 +12,14 @@ fn approval_displays_keep_exact_records_and_requested_values() {
         "display_summary":"Approve file attachment. File name: example.pdf"
     });
     let record: ApprovalRecord = serde_json::from_value(value).unwrap();
-    assert_eq!(approval_display(&record), "Approve file attachment. File name: example.pdf");
-    assert_eq!(record.granted_tool.as_deref(), Some("mcp__acme__file_attachment"));
+    assert_eq!(
+        approval_display(&record),
+        "Approve file attachment. File name: example.pdf"
+    );
+    assert_eq!(
+        record.granted_tool.as_deref(),
+        Some("mcp__acme__file_attachment")
+    );
     assert!(record.summary.contains("mcp__acme__file_attachment"));
 }
 
@@ -24,7 +30,10 @@ fn legacy_approval_values_remain_visible_without_raw_tool_names() {
         "conversation_id":"thread-example",
         "summary":"Tool call awaiting approval: mcp__acme__file_attachment {\"file_name\":\"example.pdf\"}"
     })).unwrap();
-    assert_eq!(approval_display(&record), "Approve file attachment. File name: example.pdf");
+    assert_eq!(
+        approval_display(&record),
+        "Approve file attachment. File name: example.pdf"
+    );
     assert!(record.granted_tool.is_none());
 }
 
@@ -34,6 +43,7 @@ fn truncated_approval_requires_review_instead_of_hiding_missing_details() {
         "id":"approval-example", "author":"U0EXAMPLE1", "status":"pending",
         "conversation_id":"thread-example",
         "summary":"Tool call awaiting approval: mcp__acme__file_attachment {\"file_name\":"
-    })).unwrap();
+    }))
+    .unwrap();
     assert_eq!(approval_display(&record), "Approve file attachment. Details are incomplete; review the original request before approving.");
 }
