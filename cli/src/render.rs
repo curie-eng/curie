@@ -6,6 +6,102 @@
 
 use curie_aci_protocol::{OutboundEvent, SessionStatus};
 
+/// A bounded display label; exact tool identities remain in the wire event.
+pub fn action_label(tool: &str) -> String {
+    let name = if tool.starts_with("mcp__") {
+        if tool.len() > 256
+            || !tool
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return "action".into();
+        }
+        let Some((prefix, suffix)) = tool.rsplit_once("__") else {
+            return "action".into();
+        };
+        if prefix == "mcp" || prefix.split("__").any(str::is_empty) {
+            return "action".into();
+        }
+        suffix
+    } else {
+        match tool {
+            "Bash" => return "shell request".into(),
+            "Skill" => return "instruction request".into(),
+            "Read" => return "read file".into(),
+            "Write" => return "write file".into(),
+            "Edit" | "MultiEdit" => return "edit file".into(),
+            "Glob" | "Grep" => return "search files".into(),
+            "WebFetch" => return "fetch page".into(),
+            "WebSearch" => return "search web".into(),
+            _ => tool,
+        }
+    };
+    if name.is_empty()
+        || name.len() > 80
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return "action".into();
+    }
+    let chars: Vec<char> = name.chars().collect();
+    let mut label = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '_' || c == '-' {
+            if !label.ends_with(' ') {
+                label.push(' ');
+            }
+        } else {
+            if c.is_ascii_uppercase()
+                && i > 0
+                && (chars[i - 1].is_ascii_lowercase()
+                    || chars[i - 1].is_ascii_digit()
+                    || (chars[i - 1].is_ascii_uppercase()
+                        && chars.get(i + 1).is_some_and(char::is_ascii_lowercase)))
+                && !label.ends_with(' ')
+            {
+                label.push(' ');
+            }
+            label.push(c.to_ascii_lowercase());
+        }
+    }
+    let label = label.trim();
+    if label.is_empty() {
+        "action".into()
+    } else {
+        label.into()
+    }
+}
+
+/// Transform generated MCP tokens in progress metadata, never answer text.
+pub fn action_text(text: &str) -> String {
+    match text {
+        "non-idempotent tool executed" => {
+            return "request started; check the outcome before retrying".into()
+        }
+        "non-idempotent tool completed" => {
+            return "request finished; check the outcome before retrying".into()
+        }
+        "tool result too large to record" => {
+            return "result too large to record; check the outcome before retrying".into()
+        }
+        _ => {}
+    }
+    let mut rendered = String::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find("mcp__") {
+        rendered.push_str(&remaining[..start]);
+        let token = &remaining[start..];
+        let end = token
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.')
+            .unwrap_or(token.len());
+        rendered.push_str(&action_label(&token[..end]));
+        remaining = &token[end..];
+    }
+    rendered.push_str(remaining);
+    rendered
+}
+
 /// Human-readable session status, matching the wire vocabulary.
 pub fn status_str(status: &SessionStatus) -> &'static str {
     match status {
@@ -48,18 +144,24 @@ impl TurnPrinter {
                 self.streamed_text = true;
                 Some(TurnPart::Token(text.clone()))
             }
-            OutboundEvent::ToolNote { text, tool, .. } => match tool {
-                Some(tool) => Some(TurnPart::Note(format!("  -> [{tool}] {text}"))),
-                None => Some(TurnPart::Note(format!("  -> {text}"))),
-            },
+            OutboundEvent::ToolNote { text, tool, .. } => {
+                let text = match text.strip_prefix("running tool ") {
+                    Some(name) => format!("running {}", action_label(name)),
+                    None => action_text(text),
+                };
+                Some(TurnPart::Note(match tool {
+                    Some(tool) => format!("  -> [{}] {text}", action_label(tool)),
+                    None => format!("  -> {text}"),
+                }))
+            }
             OutboundEvent::SideEffectFlag { tool, detail, .. } => {
-                let tool = tool.as_deref().unwrap_or("unknown tool");
+                let tool = action_label(tool.as_deref().unwrap_or_default());
                 let detail = detail
                     .as_deref()
-                    .map(|d| format!(": {d}"))
+                    .map(|d| format!(": {}", action_text(d)))
                     .unwrap_or_default();
                 Some(TurnPart::Note(format!(
-                    "  !  side effect via {tool}{detail}"
+                    "  !  possible change via {tool}{detail}"
                 )))
             }
             OutboundEvent::ErrorEvent {
@@ -261,24 +363,55 @@ mod tests {
             ("mcp__files__fileAttachment", "file attachment"),
             ("mcp__one__two__HTTPDownload", "http download"),
             ("mcp__store__save-item", "save item"),
-            ("mcp__store__", "action"), ("mcp__", "action"),
-            ("mcp__a__bad.name", "action"), ("", "action"),
-            ("Skill", "instruction request"), ("Bash", "shell request"),
+            ("mcp__store__", "action"),
+            ("mcp__", "action"),
+            ("mcp__a__bad.name", "action"),
+            ("", "action"),
+            ("Skill", "instruction request"),
+            ("Bash", "shell request"),
             ("Read", "read file"),
-        ] { assert_eq!(action_label(name), expected, "{name}"); }
-        assert_eq!(action_label(&format!("mcp__a__{}", "x".repeat(81))), "action");
-        assert_eq!(action_text("mcp__a__save_item failed; retry?"), "save item failed; retry?");
-        assert_eq!(action_text("User requested Bash examples"), "User requested Bash examples");
+        ] {
+            assert_eq!(action_label(name), expected, "{name}");
+        }
+        assert_eq!(
+            action_label(&format!("mcp__a__{}", "x".repeat(81))),
+            "action"
+        );
+        assert_eq!(
+            action_text("mcp__a__save_item failed; retry?"),
+            "save item failed; retry?"
+        );
+        assert_eq!(
+            action_text("non-idempotent tool executed"),
+            "request started; check the outcome before retrying"
+        );
+        assert_eq!(
+            action_text("non-idempotent tool completed"),
+            "request finished; check the outcome before retrying"
+        );
+        assert_eq!(
+            action_text("User requested Bash examples"),
+            "User requested Bash examples"
+        );
     }
 
     #[test]
     fn missing_tool_and_failed_side_effect_keep_warning_information() {
         let mut printer = TurnPrinter::default();
         let event = OutboundEvent::SideEffectFlag {
-            version: v(), tool: None, detail: Some("check before retry".into()),
-            call_id: None, arguments: None, result: None, failed: Some(true), redacted: None,
+            version: v(),
+            tool: None,
+            detail: Some("check before retry".into()),
+            call_id: None,
+            arguments: None,
+            result: None,
+            failed: Some(true),
+            redacted: None,
         };
-        assert_eq!(part_text(printer.part_for(&event)), "  !  possible change via action: check before retry");
+        assert_eq!(
+            part_text(printer.part_for(&event)),
+            "  !  possible change via action: check before retry"
+        );
     }
 
     #[test]

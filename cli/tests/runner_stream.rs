@@ -175,30 +175,47 @@ fn human_progress_uses_plain_actions_without_changing_answers_or_json() {
         let server = serve(|request| match request.path.as_str() {
             "/v1/reset" => Response::json(200, "{}"),
             "/v1/event" => Response::ndjson(&[
-                frame(serde_json::json!({"type":"tool_note", "version":PROTOCOL_VERSION,
-                    "tool":"mcp__files__fileAttachment", "text":"running tool mcp__files__fileAttachment"})),
-                frame(serde_json::json!({"type":"side_effect_flag", "version":PROTOCOL_VERSION,
-                    "tool":"mcp__files__fileAttachment", "detail":"mcp__files__fileAttachment failed; check before retry", "failed":true})),
-                frame(serde_json::json!({"type":"final", "version":PROTOCOL_VERSION,
-                    "text":"Technical answer: mcp__files__fileAttachment", "status":"done"}))
+                frame(
+                    serde_json::json!({"type":"tool_note", "version":PROTOCOL_VERSION,
+                    "tool":"mcp__files__fileAttachment", "text":"running tool mcp__files__fileAttachment"}),
+                ),
+                frame(
+                    serde_json::json!({"type":"side_effect_flag", "version":PROTOCOL_VERSION,
+                    "tool":"mcp__files__fileAttachment", "detail":"mcp__files__fileAttachment failed; check before retry", "failed":true}),
+                ),
+                frame(
+                    serde_json::json!({"type":"final", "version":PROTOCOL_VERSION,
+                    "text":"Technical answer: mcp__files__fileAttachment", "status":"done"}),
+                ),
             ]),
             path => panic!("unexpected request: {path}"),
         });
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_curie"));
         cmd.args(["--color", "never"]);
-        if mode == "quiet" { cmd.arg("--quiet"); }
-        if mode == "json" { cmd.arg("--json"); }
-        let output = cmd.args(["skill", "message", "hi", "--url", &server.base_url]).output().unwrap();
+        if mode == "quiet" {
+            cmd.arg("--quiet");
+        }
+        if mode == "json" {
+            cmd.arg("--json");
+        }
+        let output = cmd
+            .args(["skill", "message", "hi", "--url", &server.base_url])
+            .output()
+            .unwrap();
         assert!(output.status.success());
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(!stderr.contains("mcp__"), "{mode}: {stderr}");
-        if mode == "human" {
+        if mode != "quiet" {
             assert!(stderr.contains("file attachment"), "{stderr}");
             assert!(stderr.contains("failed; check before retry"), "{stderr}");
             assert!(stderr.contains("possible change"), "{stderr}");
-        } else { assert!(!stderr.contains("file attachment"), "{mode}: {stderr}"); }
+        } else {
+            assert!(!stderr.contains("file attachment"), "{mode}: {stderr}");
+        }
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains("Technical answer: mcp__files__fileAttachment"));
-        if mode == "json" { let _: serde_json::Value = serde_json::from_str(&stdout).unwrap(); }
+        if mode == "json" {
+            let _: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        }
     }
 }
