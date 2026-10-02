@@ -1271,6 +1271,20 @@ enum DevAction {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Drive generic OIDC console login end to end against a real Dex IdP
+    /// (#2908, #3800, `python3 tools/oidc-e2e/oidc_e2e.py`). Boots this
+    /// checkout's API and console UI as an isolated compose project beside Dex,
+    /// logs in through the console's /api proxy, and asserts PKCE and cookie
+    /// flags, callback binding and replay, logout's Origin check, required
+    /// claims, issuer binding, the rate limit, and that the login-code console
+    /// login still resolves an approval with OIDC off. Removes everything on
+    /// exit and writes JSON evidence. Needs Docker; no credentials.
+    OidcE2e {
+        /// Driver flags (`--build`, `--keep`, `--evidence <path>`); see
+        /// `curie dev oidc-e2e -- --help`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Select the end to end tiers CI would run for paths or revisions.
     E2eCiSelection {
         /// Changed path. Repeat for every path in the candidate change.
@@ -4680,6 +4694,10 @@ async fn run(command: Option<Command>) -> Result<()> {
             DevAction::FactoryE2e { args } => {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 commands::dev_script("cli/scripts/factory-e2e.sh", &args).await
+            }
+            DevAction::OidcE2e { args } => {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                commands::dev_script("cli/scripts/oidc-e2e.sh", &args).await
             }
             DevAction::E2eCiSelection {
                 path,
@@ -8277,6 +8295,29 @@ mod tests {
             _ => panic!("dev factory-e2e parsed as another command"),
         }
         assert!(try_parse_from(["curie", "dev", "factory-e2e"]).is_err());
+        for (argv, expected) in [
+            (vec!["curie", "dev", "oidc-e2e"], vec![]),
+            (
+                vec![
+                    "curie",
+                    "dev",
+                    "oidc-e2e",
+                    "--build",
+                    "--evidence",
+                    "out.json",
+                ],
+                vec!["--build", "--evidence", "out.json"],
+            ),
+        ] {
+            let cli =
+                try_parse_from(argv).expect("dev oidc-e2e should parse with or without flags");
+            match cli.command {
+                Some(Command::Dev {
+                    action: DevAction::OidcE2e { args },
+                }) => assert_eq!(args, expected),
+                _ => panic!("dev oidc-e2e parsed as another command"),
+            }
+        }
         let cli = try_parse_from(["curie", "dev", "chart-runtime-e2e"])
             .expect("dev chart-runtime-e2e should parse");
         assert!(matches!(
