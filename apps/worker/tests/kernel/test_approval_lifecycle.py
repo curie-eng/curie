@@ -5904,3 +5904,33 @@ def test_missing_display_uses_plain_notice_and_card_without_rewriting_record(mak
             assert h.sink.posts[0][1].interaction.prompt == sentence
 
     asyncio.run(go())
+
+
+def test_rendered_approval_display_preserves_exact_argument_tokens(make_harness) -> None:
+    tool = "mcp__plugin_acme_files__file_attachment"
+    filename = "mcp__acme__file_attachment"
+    sentence = f"Attach {filename}"
+    machine = f'Tool call awaiting approval: {tool} {{"filename": "{filename}"}}'
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"managers": _resolution_route()})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            script = _awaiting_script_with_display(machine, sentence)
+            script[-1] = script[-1].model_copy(
+                update={
+                    "approval_route": "managers",
+                    "approval_granted_tool": tool,
+                    "approval_granted_arguments": {"filename": filename},
+                }
+            )
+            h.runner.default_script = script
+            await h.kernel.process_event(_qevent("please attach", event_id="ev-exact-display"))
+            assert approvals.requests[0].summary == machine
+            assert approvals.requests[0].granted_arguments == {"filename": filename}
+            assert h.sink.last_text is not None and sentence in h.sink.last_text
+            assert h.sink.posts[0][1].text == sentence
+            assert isinstance(h.sink.posts[0][1].interaction, ConfirmIntent)
+            assert h.sink.posts[0][1].interaction.prompt == sentence
+
+    asyncio.run(go())
