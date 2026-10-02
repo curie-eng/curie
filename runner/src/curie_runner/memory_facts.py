@@ -483,7 +483,9 @@ class MemoryTurn:
     model cannot attribute a fact to someone else. ``write_token`` is the
     turn's memory write credential (``Event.memory_token``, ADR-0188), which the
     tool stores present; it lives only here, never in the env or a log
-    (MEMORY-TOKEN-3), and each turn replaces the last one's.
+    (MEMORY-TOKEN-3). A steer replaces it with the steering event's, and
+    ``end`` drops it when the turn ends, so a write after the turn falls back to
+    the read-only env token and is refused.
     """
 
     def __init__(self) -> None:
@@ -497,3 +499,7 @@ class MemoryTurn:
         user = (event.user or "").strip()
         self.author = user if event.type == "message" and user else NO_PERSON
         self.write_token = event.memory_token or None
+
+    def end(self) -> None:
+        """Drop the turn's write credential: the turn is over."""
+        self.write_token = None
