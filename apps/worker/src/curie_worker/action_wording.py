@@ -18,7 +18,9 @@ _NATIVE = {
 }
 _IDENTIFIER = re.compile(r"[\w-]+", re.UNICODE)
 # A filename or path containing an identifier is content, not a tool reference.
-_MCP_REFERENCE = re.compile(r"(?<![\w./-])mcp__[\w-]+(?![\w./-])", re.UNICODE)
+# A period followed by whitespace, closing punctuation or end is sentence prose.
+_REFERENCE_END = r"(?![\w/-]|\.(?=[^\s\)\]\}\"\']))"
+_MCP_REFERENCE = re.compile(r"(?<![\w./-])mcp__[\w-]+" + _REFERENCE_END, re.UNICODE)
 
 
 def action_label(tool: object) -> str:
@@ -46,6 +48,6 @@ def presentation_text(text: str, tool: object) -> str:
         # A native word ("Read permissions") is ordinary prose unless code quoted.
         return text.replace(f"`{tool}`", f"`{action_label(tool)}`")
     if isinstance(tool, str) and tool and not tool.startswith("mcp__"):
-        reference = re.compile(r"(?<![\w./-])" + re.escape(tool) + r"(?![\w./-])")
+        reference = re.compile(r"(?<![\w./-])" + re.escape(tool) + _REFERENCE_END)
         text = reference.sub(lambda _: action_label(tool), text)
     return text
