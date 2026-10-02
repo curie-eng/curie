@@ -8,8 +8,7 @@
         "kind": "regex",
         "expected": "^\\s*Who's asking\\?",
         "case_sensitive": true
-      },
-      "note": "The platform does not tell the agent who sent a message, so 'my' cannot be resolved. The failure this catches is an agent that answers anyway with whoever it guesses, which hands one person somebody else's priority."
+      }
     },
     {
       "id": "adding-a-deliverable-saves-it-and-confirms-in-one-line",
@@ -18,8 +17,7 @@
         "kind": "regex",
         "expected": "^\\s*Saved [A-Z]+\\d+: Eval fixture deliverable \\(Evalia, P1, due Tue Jan 15\\)\\.\\s*$",
         "case_sensitive": true
-      },
-      "note": "Anchored at both ends, and the weekday is computed, not copied: 2030-01-15 is a Tuesday. Re-running is safe because the same title and owner update the existing entry instead of adding a second one."
+      }
     },
     {
       "id": "a-named-asker-gets-their-own-deliverable-back",
@@ -28,8 +26,7 @@
         "kind": "regex",
         "expected": "^\\s*Evalia, your top priority is [A-Z]+\\d+: Eval fixture deliverable \\(P1, due Tue Jan 15\\)\\. Done when: the eval passes\\.",
         "case_sensitive": true
-      },
-      "note": "Depends on the case above, and cases run in order. This only passes if the deliverable was really written to curie-state and read back: a model that just echoes the request has no 'done when' text to quote."
+      }
     },
     {
       "id": "someone-with-nothing-open-is-told-so",
@@ -38,8 +35,7 @@
         "kind": "regex",
         "expected": "^\\s*Nobodyx, you have no open deliverables\\.\\s*$",
         "case_sensitive": true
-      },
-      "note": "The failure is inventing a priority for a person the records do not mention, or handing them someone else's."
+      }
     },
     {
       "id": "marking-the-fixture-done-takes-it-out-of-the-plan",
@@ -48,8 +44,7 @@
         "kind": "regex",
         "expected": "^\\s*Saved [A-Z]+\\d+: now done\\.\\s*$",
         "case_sensitive": true
-      },
-      "note": "Also the cleanup: running these cases against a live deployment leaves the fixture marked done, so it never appears in a morning plan."
+      }
     }
   ]
 }

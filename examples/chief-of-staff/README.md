@@ -83,6 +83,14 @@ last marks it done, so running them against a live deployment leaves nothing
 in the morning plan. Each case is anchored at both ends. A reply that is right
 but adds "anything else?" fails.
 
+| Case | The failure it catches |
+| --- | --- |
+| an unnamed asker is asked who they are | answering "my top priority" for a guessed person, which hands one person somebody else's work |
+| adding a deliverable confirms in one line | a chatty reply, or a weekday copied instead of computed (2030-01-15 is a Tuesday) |
+| a named asker gets their own deliverable | a reply that echoes the request without having saved it: only a real read back can quote the "done when" text |
+| someone with nothing open is told so | inventing a priority for a person the records do not mention |
+| marking the fixture done | a status change that is not saved, and it is the cleanup for the cases above |
+
 ## What it cannot do yet
 
 [#2881](https://github.com/curie-eng/curie/issues/2881) asks for more than the
