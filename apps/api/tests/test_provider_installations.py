@@ -1,6 +1,6 @@
 """Provider installations: table, admin CRUD and the static Slack bootstrap (#2909).
 
-Migration 0073 adds ``provider_installations``: one row per channel identity --
+Migration 0074 adds ``provider_installations``: one row per channel identity --
 one bot speaking through one connected account -- not one connected account
 (ADR 0168 decision 1). ``name`` is unique with ``(tenant_id, provider)``, so
 two rows can share one ``external_account_id`` (e.g. one Slack workspace, two
