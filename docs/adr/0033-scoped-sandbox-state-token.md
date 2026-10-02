@@ -4,9 +4,6 @@ Date: 2026-07-15
 
 Status: Accepted
 
-**Superseded in part by [ADR-0188](0188-the-sandbox-memory-credential-is-scoped-to-its-own-channel.md) (memory namespace)**
-(back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)).
-
 Implements [#410](https://github.com/curie-eng/curie/issues/410).
 
 ## Context
