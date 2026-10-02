@@ -72,6 +72,9 @@ def test_approval_label_siblings_follow_the_shared_presentation_vector() -> None
 
 
 def test_approval_nested_document_keys_are_literal_data_and_grant_stays_exact() -> None:
+    from curie_runner.approval_wording import describe_approval as runner_describe
+    from curie_worker.approval_wording import describe_approval as worker_describe
+
     tool = "mcp__acme__file_attachment"
     nested = {
         "mcp__acme__file_attachment": "draft",
@@ -87,6 +90,8 @@ def test_approval_nested_document_keys_are_literal_data_and_grant_stays_exact() 
     prefix = "Approve file attachment. File contents: "
     assert display == prefix + json.dumps(nested, ensure_ascii=False)
     assert json.loads(display.removeprefix(prefix)) == nested
+    assert runner_describe(tool, arguments) == display
+    assert worker_describe(tool, arguments) == display
     assert out["summary"] == summary
     assert out["granted_tool"] == tool
     assert row.granted_arguments == arguments
