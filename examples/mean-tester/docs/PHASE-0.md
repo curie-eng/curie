@@ -37,8 +37,8 @@ Relevant existing integration selectors are
 `apps/api/tests/test_approval_authenticated_principals.py::test_operator_principals_are_explicit_user_only_even_if_group_members`
 and
 `apps/api/tests/test_approval_authenticated_principals.py::test_authorized_solo_requester_can_self_confirm_but_membership_still_denies`.
-Execution evidence is recorded separately when the isolated backing stack is
-available. Source assertions alone are not a completed integration measurement.
+The isolated integration run below confirms these positive and denied API
+paths; it does not prove a live Slack principal issuance path for this tester.
 
 ## Attachment without a name: local mechanism confirmed, external cause open
 
@@ -94,10 +94,38 @@ Relevant integration selectors:
 - `apps/api/tests/test_approvals.py::test_clearing_a_bound_route_makes_a_pending_approval_unresolvable_not_wider`
 
 These can prove the real Postgres/Valkey resolver and secondary paths with Slack
-membership simulated, not a real Slack click. Fresh-binding source plus the
-existing assertions support the design; isolated execution is still needed to
-close the local measurement. A live narrow-and-restore approver experiment
+membership simulated, not a real Slack click. The isolated run below closes these local API assertions, including a pending
+route whose binding is cleared before resolve. This does not establish a live
+Slack click or an explicit-user-list narrowing-and-restoration experiment. A live narrow-and-restore approver experiment
 would alter a target installation and is outside this slice's authorization.
+
+## Isolated resolver execution
+
+On 2026-10-01 the independent platform worktree at candidate `ac6cbec50`
+executed the following exact test set against its private real Postgres and
+Valkey, with the API/worker environment pointing to those isolated endpoints.
+Slack membership and the model remained external-service fakes. The source
+paths under test match the phase 0 platform authorization contract; the validator
+bundle itself did not resolve anything.
+
+```bash
+uv run pytest -q \
+  apps/worker/tests/kernel/test_approval_lifecycle.py \
+  apps/api/tests/test_approval_authenticated_principals.py::test_authorized_solo_requester_can_self_confirm_but_membership_still_denies \
+  apps/api/tests/test_approval_authenticated_principals.py::test_operator_principals_are_explicit_user_only_even_if_group_members \
+  apps/api/tests/test_approvals.py::test_audit_log_records_attempts_with_authorizer_snapshots \
+  apps/api/tests/test_approvals.py::test_user_list_bound_route_denies_an_unlisted_actor_without_calling_slack \
+  apps/api/tests/test_approvals.py::test_user_list_bound_route_resolves_for_a_listed_actor \
+  apps/api/tests/test_approvals.py::test_clearing_a_bound_route_makes_a_pending_approval_unresolvable_not_wider
+```
+
+Observed: `166 passed, 1 warning in 8.68s`. The passing assertions prove operator
+explicit-list acceptance and group refusal before provider lookup; HTTP 403 and
+`authorized: false` denied audit snapshots; listed-user success; and a cleared
+binding refusing resolution while preserving the pending approval. They also
+exercise worker approval lifecycle. This is local API evidence, not live Slack
+provider evidence. Project cleanup is owned by the platform verifier and recorded
+with its full baseline; no test here modifies an existing target installation.
 
 ## Decision record
 
