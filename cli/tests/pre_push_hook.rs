@@ -135,10 +135,11 @@ fn new_branch_checks_only_python_and_cli_rust_touched_by_pushed_commits() {
         String::from_utf8_lossy(&output.stderr)
     );
     let calls = fixture.calls();
-    assert!(calls.contains(&format!(
-        "cargo|{}/cli|fmt --check",
-        fixture.dir().display()
-    )));
+    let expected = format!("cargo|{}/cli|fmt --check", fixture.dir().display());
+    assert!(
+        calls.contains(&expected),
+        "expected {expected}; observed calls:\n{calls}"
+    );
     assert!(calls.contains("uv|"));
     assert!(calls.contains("run ruff format --force-exclude --check ./space name.py"));
     assert!(calls.contains("run ruff check --force-exclude ./space name.py"));
