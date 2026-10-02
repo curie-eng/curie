@@ -525,6 +525,23 @@ def test_missing_state_cookie_is_refused(oidc_client: TestClient, idp: TestIdP) 
     assert _principal_rows() == []
 
 
+def test_missing_state_cookie_refusal_leaves_the_attempt_usable(
+    oidc_client: TestClient, idp: TestIdP
+) -> None:
+    """The cookie check runs before the attempt is spent, so a request without the
+    cookie (another browser, or an attacker holding only the URL) cannot burn the
+    real browser's login."""
+
+    callback = _begin_login(oidc_client)
+    _assert_refused(_finish(oidc_client, callback, state_cookie=None))
+    (attempt,) = _sql("SELECT consumed_at FROM curie.oidc_login_attempts")
+    assert attempt["consumed_at"] is None
+
+    _session_token(_finish(oidc_client, callback))
+    (attempt,) = _sql("SELECT consumed_at FROM curie.oidc_login_attempts")
+    assert attempt["consumed_at"] is not None
+
+
 def test_legacy_state_cookie_name_is_not_accepted(
     oidc_client: TestClient, idp: TestIdP
 ) -> None:
@@ -938,6 +955,23 @@ def test_inactive_principal_is_refused_at_login_and_on_existing_sessions(
     assert row["status"] == status
 
 
+def test_reactivated_principal_readmits_its_existing_session(oidc_client: TestClient) -> None:
+    """Disabling a principal is checked on every request, not a revocation, so
+    restoring ``active`` readmits the sessions it already had."""
+
+    token = _session_token(_login(oidc_client))
+    headers = _cookie(SESSION_COOKIE, token)
+
+    _sql("UPDATE curie.principals SET status = 'disabled'")
+    assert oidc_client.get("/console/principal", headers=headers).status_code == 401
+    assert _sql("SELECT id FROM curie.console_sessions WHERE revoked_at IS NOT NULL") == []
+
+    _sql("UPDATE curie.principals SET status = 'active'")
+    restored = oidc_client.get("/console/principal", headers=headers)
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["status"] == "active"
+
+
 def test_suspended_tenant_is_refused(oidc_client: TestClient) -> None:
     token = _session_token(_login(oidc_client))
     headers = _cookie(SESSION_COOKIE, token)
@@ -981,6 +1015,38 @@ def test_login_code_session_has_no_principal(
     response = oidc_client.get("/console/principal", headers=_cookie(SESSION_COOKIE, token))
     assert response.status_code == 401, response.text
     assert response.headers.get("cache-control") == "no-store"
+
+
+@pytest.mark.parametrize("login", ["oidc", "login_code"])
+def test_a_console_session_is_not_a_machine_credential(
+    oidc_client: TestClient, auth_headers: dict[str, str], login: str
+) -> None:
+    """Neither kind of console session opens a route guarded by the platform key:
+    logging a person in must not widen any machine-credential dependency."""
+
+    if login == "oidc":
+        token = _session_token(_login(oidc_client))
+    else:
+        minted = oidc_client.post(
+            "/console/login-codes", json={"subject": "U0EXAMPLE1"}, headers=auth_headers
+        )
+        exchanged = oidc_client.post("/console/session", json={"code": minted.json()["code"]})
+        token = str(_set_cookies(exchanged)[SESSION_COOKIE].value)
+        oidc_client.cookies.clear()
+
+    # require_api_key (/agents) and the immutable require_platform_key boundary
+    # (minting a console login code). Each control shows the route answers the
+    # platform key, so the 401 is about the credential, not a missing route.
+    session = _cookie(SESSION_COOKIE, token)
+    refused = oidc_client.get("/agents", headers=session)
+    assert refused.status_code == 401, refused.text
+    assert oidc_client.get("/agents", headers=auth_headers).status_code == 200
+
+    mint = {"subject": "U0EXAMPLE9"}
+    refused = oidc_client.post("/console/login-codes", json=mint, headers=session)
+    assert refused.status_code == 401, refused.text
+    minted = oidc_client.post("/console/login-codes", json=mint, headers=auth_headers)
+    assert minted.status_code == 201, minted.text
 
 
 @pytest.mark.parametrize(
