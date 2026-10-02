@@ -95,7 +95,7 @@ def test_installed_launcher_scrubs_before_startup_and_ignores_python_injection(
         [
             launch["CLAUDE_CODE_SHELL"],
             "-c",
-            'printf "%s\\n" "$ACME_STARTUP_MARKER" "$1"; env; bash -c env',
+            'printf "%s\\n" "$ACME_STARTUP_MARKER" "$0" "$1"; env; bash -c env',
             "acme",
             "argument with spaces",
         ],
@@ -106,7 +106,7 @@ def test_installed_launcher_scrubs_before_startup_and_ignores_python_injection(
         timeout=15,
     )
     assert result.returncode == 0, result.stderr
-    assert "read-before-command\nargument with spaces\n" in result.stdout
+    assert "read-before-command\nacme\nargument with spaces\n" in result.stdout
     assert "STDIO_TOKEN=connector-sentinel" in result.stdout
     startup_text = (tmp_path / "startup.log").read_text()
     assert "STDIO_TOKEN=connector-sentinel" in startup_text
@@ -129,25 +129,6 @@ def test_installed_launcher_scrubs_before_startup_and_ignores_python_injection(
         timeout=15,
     )
     assert signal_result.returncode == -signal.SIGTERM
-
-
-def test_shell_launcher_execs_exact_bash_arguments_with_sanitized_environment(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from curie_runner import shell_launcher
-
-    calls: list[tuple[str, list[str], dict[str, str]]] = []
-    monkeypatch.setattr(sys, "argv", ["launcher", "-c", "printf '%s' \"$1\"", "acme", "a b"])
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-PLACEHOLDER")
-    monkeypatch.setenv("STDIO_TOKEN", "connector-sentinel")
-    monkeypatch.setattr(os, "execve", lambda path, args, env: calls.append((path, args, env)))
-    shell_launcher.main()
-    assert len(calls) == 1
-    path, args, env = calls[0]
-    assert path == "/bin/bash"
-    assert args == ["/bin/bash", "-c", "printf '%s' \"$1\"", "acme", "a b"]
-    assert "ANTHROPIC_API_KEY" not in env
-    assert env["STDIO_TOKEN"] == "connector-sentinel"
 
 
 @pytest.mark.parametrize("missing", [False, True])
