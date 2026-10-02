@@ -71,12 +71,16 @@ class GitHubAPI:
         self.comment_app: dict[str, Any] | None = None
         self.repository_id = REPO_ID
         self.issue_number = 0
+        # @spec apps/api/README.md#factory-test-isolation
+        # Timeline events retain identity inside this stand-in while independent
+        # fixtures cannot address each other's request-derived Valkey keys.
+        self.label_event_base = uuid.uuid4().int >> 80
         self.label_event_ids: dict[int, int] = {}
 
     def advance_label_event(self, number: int) -> None:
         """Record a newer labeled timeline event. A relabel webhook reads it."""
 
-        current = self.label_event_ids.get(number, 810000 + number)
+        current = self.label_event_ids.get(number, self.label_event_base + number)
         self.label_event_ids[number] = current + 1
 
     def handle(self, request: httpx.Request) -> httpx.Response:
@@ -99,7 +103,7 @@ class GitHubAPI:
             )
         if path.startswith(f"/repos/{REPO}/issues/") and path.endswith("/events"):
             number = int(path.split("/")[-2])
-            event_id = self.label_event_ids.get(number, 810000 + number)
+            event_id = self.label_event_ids.get(number, self.label_event_base + number)
             return httpx.Response(
                 200,
                 json=[
