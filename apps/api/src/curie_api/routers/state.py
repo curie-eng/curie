@@ -25,17 +25,24 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, NoReturn
 
+import redis.asyncio as redis
 from curie_telemetry import record_metric
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from sqlalchemy import Text, cast, delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import crud, sandbox_token, state_mutation, threadkeys, transcripts
-from ..auth import verify_platform_key
+from ..auth import require_internal_worker_token, verify_platform_key
 from ..config import get_settings
 from ..deps import SessionDep
 from ..models import ThreadTranscript, WorkflowStateEntry
-from ..schemas import StateAppendIn, StateEntryOut, StateEntryPut, StateNamespaceOut
+from ..schemas import (
+    MemoryTurnClosedIn,
+    StateAppendIn,
+    StateEntryOut,
+    StateEntryPut,
+    StateNamespaceOut,
+)
 from ..transcripts import TRANSCRIPT_NAMESPACE
 from ..transcripts import json_size as _json_size
 
@@ -76,6 +83,13 @@ RESERVED_NAMESPACES = frozenset({MEMORY_NAMESPACE, TRANSCRIPT_NAMESPACE})
 # and the legacy ``log`` are written with the platform key only. ``\Z``, not
 # ``$``: ``$`` also matches before a trailing newline.
 _FACT_KEY = re.compile(r"^fact-[0-9a-f]{32}\Z")
+
+# How long the API remembers that a turn ended (#3776): the longest a per-turn
+# memory credential can live, the worker's ``binding.SANDBOX_TOKEN_TTL_SECONDS``
+# (duplicated, since neither service imports the other's package). The record
+# only has to outlive the credential it refuses.
+MEMORY_TURN_CLOSED_TTL_S = 24 * 60 * 60
+TURN_ENDED = "this conversation's turn has ended"
 
 
 class StateCaller(enum.Enum):
@@ -330,6 +344,45 @@ def _visible_transcripts(
     ):
         return rows
     return [row for row in rows if _transcript_key_admitted(principal, agent_id, row.key)]
+
+
+def _closed_turn_key(agent_id: uuid.UUID, turn: str) -> str:
+    """The Valkey record that ``turn`` of ``agent_id`` has ended (#3776). Keyed
+    by agent too, so one agent closing a turn id cannot refuse another's."""
+
+    return f"{get_settings().worker_key_prefix}:memory-turn-closed:{agent_id}:{turn}"
+
+
+async def _check_turn_open(
+    principal: StatePrincipal,
+    agent_id: uuid.UUID,
+    namespace: str,
+    request: Request,
+    path: str,
+) -> None:
+    """#3776: refuse a memory write made with a turn credential whose turn the
+    worker has reported ended, even though the credential has not expired.
+
+    Runs after ``_check_memory_reach`` on every write route. Reads are not
+    checked, and the platform key (no turn claim) is unaffected. A Valkey
+    failure is a 503, never a silently accepted write."""
+
+    if (
+        principal.caller is not StateCaller.STATE
+        or namespace != MEMORY_NAMESPACE
+        or principal.turn is None
+    ):
+        return
+    client: redis.Redis = request.app.state.valkey
+    try:
+        closed = await client.exists(_closed_turn_key(agent_id, principal.turn))
+    except (redis.RedisError, OSError) as exc:
+        logger.warning("state: could not check memory turn %s: %r", principal.turn, exc)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "could not check this credential's turn"
+        ) from exc
+    if closed:
+        _refuse(principal, agent_id, path, TURN_ENDED)
 
 
 def _stamp_author(
@@ -738,6 +791,7 @@ async def put_state(
     key: str,
     data: StateEntryPut,
     session: SessionDep,
+    request: Request,
     principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
     path = _state_path(namespace, key)
@@ -752,6 +806,7 @@ async def put_state(
         key=key,
         path=path,
     )
+    await _check_turn_open(principal, agent_id, namespace, request, path)
     data = _stamp_author(principal, agent_id, namespace, data, path)
     return await _put_state(agent_id, None, namespace, key, data, session)
 
@@ -769,6 +824,7 @@ async def put_state_for_binding(
     key: str,
     data: StateEntryPut,
     session: SessionDep,
+    request: Request,
     principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
     path = _state_path(namespace, key, kind, address)
@@ -789,6 +845,7 @@ async def put_state_for_binding(
         key=key,
         path=path,
     )
+    await _check_turn_open(principal, agent_id, namespace, request, path)
     data = _stamp_author(principal, agent_id, namespace, data, path)
     scope = await _binding_scope(session, agent_id, kind, address)
     return await _put_state(agent_id, scope, namespace, key, data, session)
@@ -1265,9 +1322,11 @@ async def delete_state(
     namespace: str,
     key: str,
     session: SessionDep,
+    request: Request,
     principal: Annotated[StatePrincipal, Depends(require_state_access)],
     expected_version: int | None = None,
 ) -> Response:
+    path = _state_path(namespace, key)
     _check_memory_reach(
         principal,
         agent_id,
@@ -1275,7 +1334,7 @@ async def delete_state(
         requested_binding=None,
         key=key,
         write=True,
-        path=_state_path(namespace, key),
+        path=path,
     )
     _check_transcript_reach(
         principal,
@@ -1285,6 +1344,7 @@ async def delete_state(
         key=key,
         path=_state_path(namespace, key),
     )
+    await _check_turn_open(principal, agent_id, namespace, request, path)
     return await _delete_state(
         agent_id, None, namespace, key, expected_version, session, principal.caller
     )
@@ -1302,9 +1362,11 @@ async def delete_state_for_binding(
     namespace: str,
     key: str,
     session: SessionDep,
+    request: Request,
     principal: Annotated[StatePrincipal, Depends(require_state_access)],
     expected_version: int | None = None,
 ) -> Response:
+    path = _state_path(namespace, key, kind, address)
     _check_memory_reach(
         principal,
         agent_id,
@@ -1312,7 +1374,7 @@ async def delete_state_for_binding(
         requested_binding=f"{kind}:{address}",
         key=key,
         write=True,
-        path=_state_path(namespace, key, kind, address),
+        path=path,
     )
     _check_transcript_reach(
         principal,
@@ -1322,7 +1384,39 @@ async def delete_state_for_binding(
         key=key,
         path=_state_path(namespace, key, kind, address),
     )
+    await _check_turn_open(principal, agent_id, namespace, request, path)
     scope = await _binding_scope(session, agent_id, kind, address)
     return await _delete_state(
         agent_id, scope, namespace, key, expected_version, session, principal.caller
     )
+
+
+# Worker-to-API (#3776): the worker reports a turn ended, so its per-turn memory
+# credential is refused from then on. The same worker-token auth as the other
+# ``/v1/internal`` routes; neither the platform key nor a sandbox token may call
+# it. The turn rides the body, not the path: a turn claim is an event id plus a
+# suffix and need not be a clean path segment.
+internal_router = APIRouter(
+    prefix="/v1/internal/memory",
+    tags=["internal-memory"],
+    dependencies=[Depends(require_internal_worker_token)],
+)
+
+
+@internal_router.post("/closed-turns", status_code=status.HTTP_204_NO_CONTENT)
+async def close_memory_turn(data: MemoryTurnClosedIn, request: Request) -> Response:
+    """Record that a turn has ended; idempotent. The record expires once no
+    credential for the turn could still be valid (``MEMORY_TURN_CLOSED_TTL_S``)."""
+
+    client: redis.Redis = request.app.state.valkey
+    try:
+        await client.set(
+            _closed_turn_key(data.agent_id, data.turn), "1", ex=MEMORY_TURN_CLOSED_TTL_S
+        )
+    except (redis.RedisError, OSError) as exc:
+        logger.warning("state: could not record memory turn %s as ended: %r", data.turn, exc)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "could not record the turn as ended"
+        ) from exc
+    logger.info("state: memory turn %s ended for agent %s", data.turn, data.agent_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

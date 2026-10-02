@@ -2999,6 +2999,16 @@ class StateAppendIn(BaseModel):
     reserve_bytes: int | None = Field(default=None, ge=0)
 
 
+class MemoryTurnClosedIn(BaseModel):
+    """The worker reporting that a turn has ended (#3776): from now on the API
+    refuses memory writes made with that turn's per-turn credential (ADR-0188),
+    even before it expires. ``turn`` is the credential's ``turn`` claim, opaque
+    to the API."""
+
+    agent_id: uuid.UUID
+    turn: str = Field(min_length=1, max_length=512)
+
+
 class StateEntryOut(BaseModel):
     """A durable state entry as returned to the caller."""
 

@@ -4674,6 +4674,28 @@
         "title": "MemoryTraceBackOut",
         "type": "object"
       },
+      "MemoryTurnClosedIn": {
+        "description": "The worker reporting that a turn has ended (#3776): from now on the API\nrefuses memory writes made with that turn's per-turn credential (ADR-0188),\neven before it expires. ``turn`` is the credential's ``turn`` claim, opaque\nto the API.",
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "turn": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Turn",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "turn"
+        ],
+        "title": "MemoryTurnClosedIn",
+        "type": "object"
+      },
       "MetricPoint": {
         "properties": {
           "ts": {
@@ -15962,6 +15984,59 @@
         "summary": "Verify Review",
         "tags": [
           "internal-github-reviews"
+        ]
+      }
+    },
+    "/v1/internal/memory/closed-turns": {
+      "post": {
+        "description": "Record that a turn has ended; idempotent. The record expires once no\ncredential for the turn could still be valid (``MEMORY_TURN_CLOSED_TTL_S``).",
+        "operationId": "close_memory_turn_v1_internal_memory_closed_turns_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryTurnClosedIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Close Memory Turn",
+        "tags": [
+          "internal-memory"
         ]
       }
     },
