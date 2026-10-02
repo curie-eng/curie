@@ -25,6 +25,8 @@ reclaimed event that already finished is skipped.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import hashlib
 import json
@@ -86,7 +88,7 @@ from opentelemetry.trace import SpanKind, StatusCode
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 from pydantic import ValidationError
 
-from . import sandbox_token
+from . import caller_token, sandbox_token
 from .actions import ActionBackendError, ActionRecorder
 from .approval_cards import ApprovalCardStore
 from .approvals import (
@@ -121,6 +123,7 @@ from .behaviorpacks import (
 from .binding import (
     CONNECTOR_CALLER_TOKEN_ENV,
     DECISION_ENV,
+    DEFAULT_EXECUTION_DEADLINE_SECONDS,
     EVAL_ISOLATE_THREAD_PREFIX,
     GRANT_ARGUMENTS_ENV,
     GRANT_TOOL_ENV,
@@ -1360,8 +1363,7 @@ class ToolAccessUnenforced(Exception):
 #: The escalation a read-only turn gets when its runner nonetheless ends it
 #: awaiting approval (WORKER-TOOL-ACCESS-4).
 _READ_ONLY_APPROVAL_REFUSAL = (
-    "This read-only turn asked for an approval, which it may not do. "
-    "No approval was created."
+    "This read-only turn asked for an approval, which it may not do. No approval was created."
 )
 
 
@@ -1766,13 +1768,18 @@ class _ThrottledReply:
                 self._on_ref(ack.ref)
 
 
-def _boots_differently(handle: SandboxHandle, boot_env: Mapping[str, str] | None) -> bool:
+def _boots_differently(
+    handle: SandboxHandle,
+    boot_env: Mapping[str, str] | None,
+    *,
+    caller_run: str | None = None,
+) -> bool:
     """Whether a live runner booted with facts this delivery must not inherit.
 
-    Two are read once at boot. ``CURIE_MAX_TURNS`` (#3071), and the connector
-    caller token (ADR-0168 decision 7): a runner claimed before the install
-    had a caller key carries none, and every hosted connector's proxy refuses
-    it, so the next turn on its thread gets a fresh runner instead.
+    Read once at boot: ``CURIE_MAX_TURNS`` (#3071), the connector caller token
+    (ADR-0168 decision 7), and the run that token names (ADR 0178). A runner
+    claimed before the install had a caller key, or booted for a different
+    run, is replaced on the next new turn.
     """
 
     env = boot_env or {}
@@ -1780,7 +1787,26 @@ def _boots_differently(handle: SandboxHandle, boot_env: Mapping[str, str] | None
         return True
     if (ELIGIBILITY_ENV in env) != handle.carries_turn_progress:
         return True
+    if handle.caller_run != caller_run:
+        return True
     return CONNECTOR_CALLER_TOKEN_ENV in env and not handle.carries_caller_token
+
+
+def _caller_token_exp(token: str) -> int | None:
+    """The ``exp`` claim of a caller token, or None when the token is unreadable."""
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+    except (ValueError, binascii.Error):
+        return None
+    exp = payload.get("exp") if isinstance(payload, dict) else None
+    if type(exp) is not int:
+        return None
+    return exp
 
 
 def _connector_tool_grant(
@@ -3119,6 +3145,30 @@ class Kernel:
                         address=handle.channel,
                         thread_key=thread_key,
                     )
+                caller_for_boot = (
+                    self._work_item_runs.get(owned_work_item_id)
+                    if owned_work_item_id is not None
+                    else None
+                )
+                if caller_for_boot is not None:
+                    if caller_for_boot.execution_deadline is not None:
+                        caller_ceiling = int(caller_for_boot.execution_deadline.timestamp())
+                    else:
+                        seconds = DEFAULT_EXECUTION_DEADLINE_SECONDS
+                        reader = getattr(self._binding, "execution_deadline_seconds_for", None)
+                        if reader is not None and agent_id is not None:
+                            try:
+                                seconds = int(await reader(agent_id))
+                            except Exception:  # noqa: BLE001 - a missing column still boots
+                                logger.warning(
+                                    "execution deadline read failed agent=%s; using the default",
+                                    agent_id,
+                                )
+                                seconds = DEFAULT_EXECUTION_DEADLINE_SECONDS
+                        caller_ceiling = int(time.time()) + seconds
+                    boot_env_kwargs["caller_run"] = str(caller_for_boot.request_id)
+                    boot_env_kwargs["caller_work_item"] = str(caller_for_boot.work_item_id)
+                    boot_env_kwargs["caller_exp_ceiling"] = caller_ceiling
                 boot_env = self._binding.boot_env(
                     resolved,
                     thread_key,
@@ -3564,9 +3614,9 @@ class Kernel:
                         # Keep the final attempt's classification truthful while
                         # carrying the earlier confirmed pod cause into both
                         # terminal surfaces.
-                        outcome.error_message = (
-                            f"Earlier attempt: {termination_detail}"
-                        )[:_ESCALATION_DETAIL_MAX]
+                        outcome.error_message = (f"Earlier attempt: {termination_detail}")[
+                            :_ESCALATION_DETAIL_MAX
+                        ]
                     token = _display_error_classification(outcome.classification)
                     await self._escalate(
                         qevent,
@@ -5828,6 +5878,7 @@ class Kernel:
                                         workspace_repo=None,
                                         agent_name=agent_name,
                                         runner_resources=runner_resources,
+                                        caller_run=current_handle.caller_run,
                                     ),
                                     None,
                                 )
@@ -6048,6 +6099,9 @@ class Kernel:
         # repository it attached (#2659); None when no selection ran.
         repo_fact: str | None = None
         workspace_repo: str | None = None
+        owned_run_id = _OWNED_WORK_ITEM.get()
+        owned_run = self._work_item_runs.get(owned_run_id) if owned_run_id is not None else None
+        caller_run = str(owned_run.request_id) if owned_run is not None else None
         lineage: PublicationLineage | None = None
         if workspace_deployment_id is not None:
             # The API already bound a verified review to its persisted thread
@@ -6255,7 +6309,7 @@ class Kernel:
         # rule instead: it adopts and steers, and the replacement applies
         # from the next new turn.
         turn_budget_replacement = existing_handle is not None and _boots_differently(
-            existing_handle, boot_env
+            existing_handle, boot_env, caller_run=caller_run
         )
         if (
             turn_budget_replacement
@@ -6322,6 +6376,7 @@ class Kernel:
             runner_resources=runner_resources,
             remaining_s=remaining_s,
             attachment_fresh_only=attachment_fresh_only,
+            caller_run=caller_run,
         )
         wait = current_wait()
 
@@ -6599,7 +6654,7 @@ class Kernel:
             # caller token both bind at boot, so a new turn must not open on
             # this runner. Retry: the redelivery finds the turn idle and
             # takes the replacement path above.
-            if _boots_differently(handle, boot_env):
+            if _boots_differently(handle, boot_env, caller_run=caller_run):
                 raise ThreadBusyError(
                     f"thread {thread_key} turn ended before its steer; "
                     "retrying to replace the runner's turn budget or caller token"
@@ -6661,6 +6716,48 @@ class Kernel:
                 if remaining_s is None
                 else min(remaining_s, started.remaining_s)
             )
+            token = (boot_env or {}).get(CONNECTOR_CALLER_TOKEN_ENV)
+            signed_exp = _caller_token_exp(token) if isinstance(token, str) else None
+            deadline_unix = int(started.execution_deadline.timestamp())
+            if (
+                signed_exp is not None
+                and signed_exp > deadline_unix
+                and self._config.connector_caller_signing_key.strip()
+                and isinstance(agent_name, str)
+                and agent_name
+            ):
+                # The provisional ceiling was longer than the deadline start
+                # committed. Replace the runner before the model turn so the
+                # token the connectors see does not outlive the run.
+                corrected = dict(boot_env or {})
+                corrected[CONNECTOR_CALLER_TOKEN_ENV] = caller_token.mint(
+                    self._config.connector_caller_signing_key,
+                    agent=agent_name,
+                    exp=min(int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS, deadline_unix),
+                    run=str(run.request_id),
+                    work_item=str(run.work_item_id),
+                )
+                handle = await self._claim_or_resume(
+                    thread_key,
+                    corrected,
+                    workspace_deployment_id=(
+                        workspace_deployment_id if workspace_repo is not None else None
+                    ),
+                    workspace_repo=workspace_repo,
+                    replace_handle=handle,
+                    lineage_branch=lineage_branch,
+                    lineage_head=lineage_head,
+                    lineage_base_sha=lineage_base_sha,
+                    publication_visible_outcome_revision=(
+                        publication_visible_outcome_revision or 0
+                    ),
+                    agent_name=agent_name,
+                    runner_resources=runner_resources,
+                    remaining_s=remaining_s,
+                    caller_run=str(run.request_id),
+                )
+                run.claim_name = handle.claim_name
+                run.sandbox_name = handle.sandbox_name
         elif run is not None:
             remaining_s = run.bound_remaining_s(remaining_s)
         if run is not None and agent_id is not None:
@@ -7190,6 +7287,7 @@ class Kernel:
         runner_resources: dict[str, Any] | None = None,
         remaining_s: float | None = None,
         attachment_fresh_only: bool = False,
+        caller_run: str | None = None,
     ) -> SandboxHandle:
         wait = current_wait()
         previous_handle: SandboxHandle | None = None
@@ -7353,6 +7451,7 @@ class Kernel:
                 lineage_base_sha=lineage_base_sha,
                 publication_visible_outcome_revision=(publication_visible_outcome_revision),
                 fresh_only=attachment_fresh_only,
+                caller_run=caller_run,
             )
             if not isinstance(workspace_claim.handle, SandboxHandle):
                 raise WorkspacePreparationError(
@@ -7371,6 +7470,7 @@ class Kernel:
                 workspace_repo=None,
                 agent_name=agent_name,
                 runner_resources=runner_resources,
+                caller_run=caller_run,
             )
             return await validate_wait_claim(handle)
         try:
@@ -7381,6 +7481,7 @@ class Kernel:
                 agent_name=agent_name,
                 runner_resources=runner_resources,
                 fresh_only=attachment_fresh_only,
+                caller_run=caller_run,
             )
             return await validate_wait_claim(handle)
         except SuspendedThreadError:
@@ -7394,6 +7495,7 @@ class Kernel:
                 env=boot_env,
                 agent_name=agent_name,
                 runner_resources=runner_resources,
+                caller_run=caller_run,
             )
             return await validate_wait_claim(handle)
 

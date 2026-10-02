@@ -142,9 +142,7 @@ def test_state_refs_are_minted_from_the_runner_facing_base() -> None:
     )
     env = _boot_env(config, _resolved())
 
-    assert env["CURIE_MEMORY_REF"] == (
-        f"http://curie-api:8000/agents/{_AGENT}/state/memory"
-    )
+    assert env["CURIE_MEMORY_REF"] == (f"http://curie-api:8000/agents/{_AGENT}/state/memory")
     assert env["CURIE_HISTORY_REF"] == (
         f"http://curie-api:8000/agents/{_AGENT}/state/transcript/{_THREAD}"
     )
@@ -158,9 +156,7 @@ def test_state_refs_fall_back_to_the_self_dial_base_when_undivided() -> None:
     own URL (k8s in-cluster, single-host local), so the refs are unchanged."""
     env = _boot_env(WorkerConfig(api_base_url="http://in-cluster-api:8000"), _resolved())
 
-    assert env["CURIE_MEMORY_REF"] == (
-        f"http://in-cluster-api:8000/agents/{_AGENT}/state/memory"
-    )
+    assert env["CURIE_MEMORY_REF"] == (f"http://in-cluster-api:8000/agents/{_AGENT}/state/memory")
     assert env["CURIE_HISTORY_REF"] == (
         f"http://in-cluster-api:8000/agents/{_AGENT}/state/transcript/{_THREAD}"
     )
@@ -406,9 +402,10 @@ def test_the_caller_token_expires_with_the_state_tokens() -> None:
     env = _boot_env(
         WorkerConfig(connector_caller_signing_key=_caller_seed(), **_SCOPED), _resolved()
     )
-    assert _claims(env["CURIE_CONNECTOR_CALLER_TOKEN"])["exp"] == _claims(
-        env["CURIE_STATE_TOKEN"]
-    )["exp"]
+    assert (
+        _claims(env["CURIE_CONNECTOR_CALLER_TOKEN"])["exp"]
+        == _claims(env["CURIE_STATE_TOKEN"])["exp"]
+    )
 
 
 def test_without_a_signing_key_a_scoped_boot_is_unchanged() -> None:
@@ -429,3 +426,25 @@ def test_an_unscoped_boot_carries_no_caller_token_even_with_a_key() -> None:
     # No scope mounts no hosted connector, so there is nobody to present it to.
     env = _boot_env(WorkerConfig(connector_caller_signing_key=_caller_seed()), _resolved())
     assert "CURIE_CONNECTOR_CALLER_TOKEN" not in env
+
+
+def test_a_work_item_boot_signs_the_run_pair_and_caps_exp() -> None:
+    seed = _caller_seed()
+    run = "11111111-1111-4111-8111-111111111111"
+    work_item = "22222222-2222-4222-8222-222222222222"
+    ceiling = int(time.time()) + 90
+    resolver = BindingResolver.__new__(BindingResolver)
+    resolver._config = WorkerConfig(connector_caller_signing_key=seed, **_SCOPED)  # type: ignore[attr-defined]
+    env = resolver.boot_env(
+        _resolved(),
+        _THREAD,
+        caller_run=run,
+        caller_work_item=work_item,
+        caller_exp_ceiling=ceiling,
+    )
+    claims = _claims(env["CURIE_CONNECTOR_CALLER_TOKEN"])
+    assert claims["run"] == run
+    assert claims["work_item"] == work_item
+    assert claims["exp"] == ceiling
+    plain = _boot_env(WorkerConfig(connector_caller_signing_key=seed, **_SCOPED), _resolved())
+    assert "run" not in _claims(plain["CURIE_CONNECTOR_CALLER_TOKEN"])

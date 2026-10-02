@@ -193,7 +193,17 @@ def _run(body: Callable[[], Coroutine[Any, Any, None]]) -> None:
 
 # @spec ADR-0168 d7
 def test_the_refusal_vector_carries_only_known_keys() -> None:
-    assert set(_REFUSAL) == {"comment", "header", "status", "content_type", "vectors"}
+    assert set(_REFUSAL) == {
+        "comment",
+        "header",
+        "status",
+        "content_type",
+        "unpaired",
+        "vectors",
+    }
+    unpaired = _REFUSAL["unpaired"]
+    assert set(unpaired) == {"why", "token", "refusal"}
+    assert unpaired["refusal"] == caller.INVALID
     assert [v["refusal"] for v in _REFUSAL["vectors"]] == list(caller.REFUSALS)
     assert caller.REFUSALS[-1] == caller.GRANT_REQUIRED == "grant_required"
     assert server.GRANT_HEADER == "X-Curie-Connector-Grant"
@@ -269,11 +279,62 @@ def test_an_admitted_request_reaches_the_server_unchanged_except_the_token() -> 
             assert seen["path_qs"] == "/mcp?x=1&y=a%20b%26c"
             assert seen["body"] == b'{"jsonrpc":"2.0","id":1,"method":"initialize"}'
             assert caller.HEADER not in seen["headers"]
+            assert seen["headers"][caller.AGENT_HEADER] == "acme-dev"
+            assert caller.RUN_HEADER not in seen["headers"]
+            assert caller.WORK_ITEM_HEADER not in seen["headers"]
             assert seen["headers"]["Authorization"] == "Bearer example-connector-credential"
             assert seen["headers"]["Mcp-Session-Id"] == "session-0"
             # The Host the sandbox dialled, which is what a server's
             # allowed-hosts list names; never the loopback address.
             assert seen["headers"]["Host"] == f"{proxy.host}:{proxy.port}"
+
+    _run(go)
+
+
+# @spec ADR-0178 d5
+def test_a_run_token_sets_identity_headers_and_drops_forged_ones() -> None:
+    run_vector = next(v for v in _TOKENS["vectors"] if v["name"] == "a_work_item_run")
+
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            async with aiohttp.ClientSession() as client:
+                async with client.post(
+                    proxy.make_url("/mcp"),
+                    data=b"{}",
+                    headers={
+                        caller.HEADER: str(run_vector["minted"]),
+                        caller.RUN_HEADER: "forged-run",
+                        caller.WORK_ITEM_HEADER: "forged-item",
+                        caller.AGENT_HEADER: "forged-agent",
+                    },
+                ) as answer:
+                    assert answer.status == 201
+            [seen] = upstream.seen
+            assert seen["headers"][caller.AGENT_HEADER] == "acme-dev"
+            assert seen["headers"][caller.RUN_HEADER] == run_vector["run"]
+            assert seen["headers"][caller.WORK_ITEM_HEADER] == run_vector["work_item"]
+            assert caller.HEADER not in seen["headers"]
+            assert "forged-run" not in seen["headers"].values()
+
+    _run(go)
+
+
+# @spec ADR-0178 d1
+def test_an_unpaired_run_claim_is_the_invalid_refusal() -> None:
+    unpaired = _REFUSAL["unpaired"]
+    invalid = next(v["body"] for v in _REFUSAL["vectors"] if v["refusal"] == caller.INVALID)
+
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            async with aiohttp.ClientSession() as client:
+                async with client.post(
+                    proxy.make_url("/mcp"),
+                    data=b"{}",
+                    headers={caller.HEADER: str(unpaired["token"])},
+                ) as answer:
+                    assert answer.status == _REFUSAL["status"]
+                    assert await answer.json() == invalid
+            assert upstream.seen == []
 
     _run(go)
 

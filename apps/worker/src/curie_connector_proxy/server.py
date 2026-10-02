@@ -64,6 +64,10 @@ _NOT_FORWARDED = frozenset(
         "upgrade",
         caller.HEADER.lower(),
         GRANT_HEADER.lower(),
+        # Inbound copies are forged until decide() sets them from the token.
+        caller.AGENT_HEADER.lower(),
+        caller.RUN_HEADER.lower(),
+        caller.WORK_ITEM_HEADER.lower(),
     }
 )
 
@@ -430,11 +434,19 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
         query_string=request.rel_url.raw_query_string,
         encoded=True,
     )
+    forwarded = _forwardable(request.headers)
+    # ADR 0178 decision 5. The token stays stripped. The connector sees the
+    # verified claims as headers only this proxy can set.
+    if decision.agent is not None:
+        forwarded.add(caller.AGENT_HEADER, decision.agent)
+    if decision.run is not None and decision.work_item is not None:
+        forwarded.add(caller.RUN_HEADER, decision.run)
+        forwarded.add(caller.WORK_ITEM_HEADER, decision.work_item)
     try:
         answer = await request.app[_UPSTREAM].request(
             request.method,
             target,
-            headers=_forwardable(request.headers),
+            headers=forwarded,
             data=(
                 body
                 if buffered

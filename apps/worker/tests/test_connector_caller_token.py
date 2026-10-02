@@ -20,6 +20,7 @@ _VECTOR = (
 )
 _FILE_KEYS = {"comment", "prefix", "vectors"}
 _VECTOR_KEYS = {"name", "why", "seed", "public", "agent", "exp", "minted"}
+_RUN_KEYS = {"run", "work_item"}
 
 
 def _corpus() -> dict[str, object]:
@@ -41,7 +42,10 @@ def test_the_vector_carries_only_known_keys() -> None:
     corpus = _corpus()
     assert set(corpus) == _FILE_KEYS
     for vector in _vectors():
-        assert set(vector) == _VECTOR_KEYS, vector.get("name")
+        keys = set(vector)
+        assert _VECTOR_KEYS <= keys, vector.get("name")
+        assert keys <= _VECTOR_KEYS | _RUN_KEYS, vector.get("name")
+        assert ("run" in keys) == ("work_item" in keys)
 
 
 def test_the_prefix_is_the_one_the_worker_signs_under() -> None:
@@ -50,8 +54,16 @@ def test_the_prefix_is_the_one_the_worker_signs_under() -> None:
 
 @pytest.mark.parametrize("vector", _vectors(), ids=lambda v: str(v["name"]))
 def test_the_worker_mints_exactly_the_frozen_token(vector: dict[str, object]) -> None:
+    extra = (
+        {"run": str(vector["run"]), "work_item": str(vector["work_item"])}
+        if "run" in vector
+        else {}
+    )
     minted = caller_token.mint(
-        str(vector["seed"]), agent=str(vector["agent"]), exp=int(str(vector["exp"]))
+        str(vector["seed"]),
+        agent=str(vector["agent"]),
+        exp=int(str(vector["exp"])),
+        **extra,
     )
     assert minted == vector["minted"]
 
@@ -67,10 +79,22 @@ def test_every_frozen_token_verifies_under_its_public_key(vector: dict[str, obje
     prefix, payload, signature = str(vector["minted"]).split(".")
     assert prefix == _corpus()["prefix"]
     VerifyKey(public).verify(f"{prefix}.{payload}".encode("ascii"), _b64url_decode(signature))
-    assert json.loads(_b64url_decode(payload)) == {
-        "agent": vector["agent"],
-        "exp": vector["exp"],
-    }
+    expected = {"agent": vector["agent"], "exp": vector["exp"]}
+    if "run" in vector:
+        expected["run"] = vector["run"]
+        expected["work_item"] = vector["work_item"]
+    assert json.loads(_b64url_decode(payload)) == expected
+
+
+def test_one_of_the_run_pair_is_refused_without_echoing_it() -> None:
+    seed = str(_vectors()[0]["seed"])
+    run = "11111111-1111-4111-8111-111111111111"
+    work_item = "22222222-2222-4222-8222-222222222222"
+    with pytest.raises(ValueError, match="present together") as caught:
+        caller_token.mint(seed, agent="acme-dev", exp=1790000000, run=run)
+    assert run not in str(caught.value)
+    with pytest.raises(ValueError, match="present together"):
+        caller_token.mint(seed, agent="acme-dev", exp=1790000000, work_item=work_item)
 
 
 def test_a_key_that_is_not_a_32_byte_seed_is_refused() -> None:

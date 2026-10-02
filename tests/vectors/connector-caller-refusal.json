@@ -3,6 +3,11 @@
   "header": "X-Curie-Caller",
   "status": 403,
   "content_type": "application/json",
+  "unpaired": {
+    "why": "A signed token that carries run without work_item is malformed and refused as invalid.",
+    "token": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJydW4iOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEifQ.GENbUYfT0PWv5h5J_-m9v0LBE0A5TA7a7WdImBeLv_3y0uTueF0QWnWvA41C3FHEbXMKvwfpm0P_wHXHAKRVBQ",
+    "refusal": "invalid"
+  },
   "vectors": [
     {
       "refusal": "missing",
