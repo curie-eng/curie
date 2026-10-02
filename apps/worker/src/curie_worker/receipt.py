@@ -24,6 +24,8 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
+from curie_worker.action_wording import action_label, presentation_text
+
 # What the receipt shows, chosen per install (ADR-0180). ``WorkerConfig`` reads
 # it from ``CURIE_TURN_RECEIPT``, and the chart schema offers the same three.
 TurnReceiptMode = Literal["all", "failures", "off"]
@@ -69,13 +71,13 @@ def _clamp(text: str) -> str:
 
 
 def _described(action: dict[str, Any]) -> str:
-    """The connector's own summary, or the tool's name when it offered none."""
+    """The connector description or a plain label, never an execution claim."""
 
     result = action.get("result")
     summary = result.get("summary") if isinstance(result, dict) else None
     if isinstance(summary, str) and summary.strip():
-        return _clamp(summary)
-    return f"called `{_clamp(action.get('tool') or 'a tool')}`"
+        return _clamp(presentation_text(summary, action.get("tool")))
+    return _clamp(action_label(action.get("tool")))
 
 
 def _verdict(action: dict[str, Any]) -> str:
@@ -89,7 +91,7 @@ def _verdict(action: dict[str, Any]) -> str:
     detail = action.get("detail")
     # Runner bookkeeping is not a connector explanation of irreversibility.
     if isinstance(detail, str) and detail.strip() and detail not in _GENERIC_DETAILS:
-        return _clamp(detail)
+        return _clamp(presentation_text(detail, action.get("tool")))
     result = action.get("result")
     if action.get("prior_state") is not None or (
         isinstance(result, dict) and result.get("prior") is not None
@@ -120,9 +122,7 @@ def _read_only_bash(action: dict[str, Any]) -> bool:
     return any(re.fullmatch(pattern, command.strip()) for pattern in _READ_ONLY_COMMANDS)
 
 
-def render_receipt(
-    actions: list[dict[str, Any]], mode: TurnReceiptMode = "all"
-) -> str | None:
+def render_receipt(actions: list[dict[str, Any]], mode: TurnReceiptMode = "all") -> str | None:
     """One line per action, or None when the turn changed nothing.
 
     Most turns are reads, and a receipt on every one of them is noise. This
