@@ -135,7 +135,13 @@ fn new_branch_checks_only_python_and_cli_rust_touched_by_pushed_commits() {
         String::from_utf8_lossy(&output.stderr)
     );
     let calls = fixture.calls();
-    let expected = format!("cargo|{}/cli|fmt --check", fixture.dir().display());
+    // Git and child PWD report the physical directory; TempDir may use a
+    // symlink alias such as /var on macOS. Keep directory and argv exact.
+    let physical_root = fixture
+        .dir()
+        .canonicalize()
+        .expect("physical fixture directory");
+    let expected = format!("cargo|{}/cli|fmt --check", physical_root.display());
     assert!(
         calls.contains(&expected),
         "expected {expected}; observed calls:\n{calls}"
