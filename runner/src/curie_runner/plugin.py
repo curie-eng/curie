@@ -22,6 +22,7 @@ frozen validator gets a chance to mis-attribute it.
 """
 
 import json
+import logging
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -29,12 +30,15 @@ from typing import Any, cast
 
 from aci_protocol import BootEnv
 from claude_agent_sdk import SdkPluginConfig
+from claude_agent_sdk._internal.transport.subprocess_cli import _validate_skill_name
 from plugin_format import (
     TOOL_POLICY_ENFORCEMENT,
     PluginManifest,
     resolve_manifest,
     validate_bundle,
 )
+
+logger = logging.getLogger(__name__)
 
 BUNDLE_CONFIG_NAME = "curie.bundle.json"
 
@@ -281,6 +285,14 @@ def bundle_skill_names(plugin_dir: str | None) -> list[str]:
     list follows the same rule (verified on CLI 2.1.281). Sorted, so the list
     is deterministic. No bundle, or a bundle without skills, gives ``[]``. Call
     only after ``load_plugins`` has validated the bundle.
+
+    The bundle validator only warns about odd folder names, but the SDK raises
+    ``ValueError`` while building the CLI command for a name it cannot carry in
+    a ``Skill(<name>)`` rule (a comma, a parenthesis, edge whitespace and so
+    on). One such folder would stop the whole session at connect, so each name
+    goes through the SDK's own check, and a rejected folder is skipped with a
+    warning that names it. Calling the SDK's check keeps the accepted set
+    exactly what the installed SDK accepts.
     """
 
     if not plugin_dir:
@@ -293,11 +305,22 @@ def bundle_skill_names(plugin_dir: str | None) -> list[str]:
     skills_dir = root / "skills"
     if not skills_dir.is_dir():
         return []
-    return [
-        f"{manifest.name}:{entry.name}"
-        for entry in sorted(skills_dir.iterdir(), key=lambda path: path.name)
-        if entry.is_dir() and (entry / "SKILL.md").is_file()
-    ]
+    names: list[str] = []
+    for entry in sorted(skills_dir.iterdir(), key=lambda path: path.name):
+        if not (entry.is_dir() and (entry / "SKILL.md").is_file()):
+            continue
+        name = f"{manifest.name}:{entry.name}"
+        try:
+            _validate_skill_name(name)
+        except ValueError as exc:
+            logger.warning(
+                "skipping bundle skill folder %r: the agent SDK cannot pass its name (%s)",
+                entry.name,
+                exc,
+            )
+            continue
+        names.append(name)
+    return names
 
 
 def _substitute_plugin_root(value: object, plugin_root: str) -> object:

@@ -7,7 +7,7 @@ Status: Draft
 Tracked in [#3766](https://github.com/curie-eng/curie/issues/3766), split out
 of [#3625](https://github.com/curie-eng/curie/issues/3625).
 
-This ADR builds on
+This ADR builds on two Draft ADRs,
 [ADR-0137](0137-coding-tools-are-built-in-and-an-initial-repository-url-selects-the-workspace.md)
 and [ADR-0139](0139-bundle-owners-classify-every-vanilla-mcp-tool.md). It
 supersedes neither.
@@ -44,21 +44,22 @@ Bundle skills use the same `Skill` tool. A bundle's `skills/<dir>/SKILL.md`
 loads as `<manifest name>:<dir>`. So removing the tool would remove every
 bundle skill too.
 
-How this relates to the earlier decisions:
+How this relates to the earlier decisions, both still Drafts:
 
 - [ADR-0137](0137-coding-tools-are-built-in-and-an-initial-repository-url-selects-the-workspace.md)
-  makes the Claude Code file-tool preset a platform capability of every
-  session. This ADR keeps that. The coding tools and the `Skill` tool stay. Only
-  the list of skills the `Skill` tool offers gets narrower. The built-in skills
-  are not part of the coding surface ADR-0137 describes.
-- [ADR-0139](0139-bundle-owners-classify-every-vanilla-mcp-tool.md) says bundle
-  configuration may add restrictions but may not hollow out operator or
-  platform controls. It also keeps harness built-ins outside `toolPolicy`, and
-  says that hiding a tool from the model is not authorization. Both hold here.
-  The skill list is a visibility filter. The `PreToolUse` hook stays the
-  enforcement point. A later bundle opt-in that adds built-in skills back would
-  widen what the agent can reach, so it needs its own explicit rule (see
-  Consequences).
+  (Draft) proposes the Claude Code file-tool preset as a platform capability
+  of every session. This ADR keeps that. The coding tools and the `Skill` tool
+  stay. Only the list of skills the `Skill` tool offers gets narrower. The
+  built-in skills are not part of the coding surface the Draft ADR-0137
+  describes.
+- [ADR-0139](0139-bundle-owners-classify-every-vanilla-mcp-tool.md) (Draft)
+  proposes that bundle configuration may add restrictions but may not hollow
+  out operator or platform controls. It also keeps harness built-ins outside
+  `toolPolicy`, and says that hiding a tool from the model is not
+  authorization. This ADR is consistent with both points. The skill list is a
+  visibility filter. The `PreToolUse` hook stays the enforcement point. A
+  later bundle opt-in that adds built-in skills back would widen what the
+  agent can reach, so it needs its own explicit rule (see Consequences).
 
 No earlier ADR mentions `skills`, `setting_sources` or the `Skill` tool.
 
@@ -78,16 +79,23 @@ Code CLI's built-in skills.
 
 ## Consequences
 
-- **The model's skill listing has only bundle skills.** The CLI leaves unlisted
-  skills out of the listing and rejects them in the `Skill` tool. A "make this
-  stick" request no longer has `update-config` to go to.
+- **The model's skill listing has only bundle skills.** On CLI 2.1.281, a test
+  that runs the real CLI shows that unlisted skills are not offered to the
+  model: the first model request names the bundle's skills and none of the
+  built-in ones. A "make this stick" request no longer has `update-config` to
+  go to. Whether the `Skill` tool also refuses an unlisted name the model
+  guesses was not checked, so this ADR does not rely on it. For listed skills,
+  the `PreToolUse` hook is the gate (next point).
 - **Listed skills are pre-approved.** With a list, the SDK adds
   `Skill(<name>)` to the allowed tools for each listed skill. Those calls then
   skip `can_use_tool`. The runner has kept `allowed_tools` empty so that no call
   skips it. The `PreToolUse` hook still sees every call, so read-only turns and
   approval gates still apply. This matters only if an operator gates `Skill`
-  itself. `assert_gates_not_shadowed` does not see these SDK-added rules, so a
-  test must show a `Skill` gate still holds through the hook.
+  itself. `assert_gates_not_shadowed` does not see these SDK-added rules. A
+  test on the real CLI 2.1.281 confirmed that the SDK's `Skill(<name>)` allow
+  rule does skip `can_use_tool`, and that an operator gate on `Skill` still
+  stops the call through the hook. So the hook, not `can_use_tool`, is the
+  gate for listed skills.
 - **`local` settings keep loading.** When `skills` is set and
   `setting_sources` is not, the SDK fills in `["user", "project"]`. That would
   quietly drop `local` settings. Passing `["user", "project", "local"]` keeps
@@ -98,6 +106,14 @@ Code CLI's built-in skills.
   not its frontmatter `name`, and does not load nested skill folders. The list
   must use the same one-level rule. The validator and approval code currently
   walk nested folders, so they can see skills the CLI ignores.
+- **Folders the SDK cannot name are skipped with a warning.** The bundle
+  validator only warns about odd folder names. The SDK, though, refuses to
+  build the CLI command for a skill name it cannot carry in a `Skill(<name>)`
+  rule, such as one with a comma, a parenthesis or leading or trailing
+  whitespace. So that one such folder does not stop the session at connect,
+  the runner checks each name with the SDK's own check and leaves out any it
+  rejects, logging a warning that names the folder. That skill is then not
+  offered to the model.
 - **A CLI upgrade could change naming or filtering.** A test that runs the real
   CLI and reads the model's skill listing pins this. The `init` message is not
   enough: it lists every registered skill even when filtered.
