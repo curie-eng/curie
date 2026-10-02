@@ -33,6 +33,7 @@ The point of the three targets (`skill` in-process, `local` via docker compose, 
 
 - [examples/weather/](examples/weather/): the first-party example bundle, a runnable web-search skill that `curie init` scaffolds.
 - [examples/text-stats-engine/README.md](examples/text-stats-engine/README.md): a bundle that ships its own tools as an in-bundle stdio MCP server, a shape a hosted harness cannot do.
+- [examples/chief-of-staff/README.md](examples/chief-of-staff/README.md): a program manager bot that keeps deliverables and blockers in curie-state and posts a scheduled morning plan to its Slack channel.
 
 ## Optional
 

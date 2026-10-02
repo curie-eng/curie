@@ -1,0 +1,40 @@
+{
+  "name": "chief-of-staff",
+  "version": "0.1.0",
+  "description": "Example bundle: a program manager bot in one Slack channel. It keeps the team's deliverables and blockers in curie-state, answers who owns what and what someone's top priority is, posts a plan every weekday morning that cites the pull requests merged since the last one, and recommends the week's deliverables on Mondays.",
+  "author": { "name": "CurieTech" },
+  "keywords": ["example", "program-manager", "scheduled", "cron", "curie-state", "github", "slack"],
+  "secrets": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+  "toolPolicy": {
+    "enforcement": "curie/mcp-tool-policy@1",
+    "allow": [
+      "github/search_issues",
+      "github/list_pull_requests",
+      "github/get_pull_request"
+    ]
+  },
+  "triggers": [
+    {
+      "type": "cron",
+      "name": "monday-deliverables",
+      "schedule": "45 4 * * MON",
+      "timezone": "America/New_York",
+      "target": "C0YOURCHANNEL",
+      "prompt": "[scheduled: monday-deliverables] Recommend this week's deliverables."
+    },
+    {
+      "type": "cron",
+      "name": "daily-plan",
+      "schedule": "0 5 * * MON-FRI",
+      "timezone": "America/New_York",
+      "target": "C0YOURCHANNEL",
+      "prompt": "[scheduled: daily-plan] Post today's plan."
+    }
+  ],
+  "starterPrompts": [
+    "What is the top priority for Priya?",
+    "Add deliverable: Billing export ready, owner Priya, P0, due 2026-10-09, done when finance can download it.",
+    "I'm Sam, I'm blocked on the Slack app tokens.",
+    "What is open this week?"
+  ]
+}
