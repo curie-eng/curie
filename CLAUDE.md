@@ -1,5 +1,11 @@
 See [AGENTS.md](AGENTS.md) - the agent instructions for this repo live there.
 
+Never publish real customer or downstream deployment information in files,
+commit messages, branch or tag names, PRs, issues, comments, releases, or CI
+logs and artifacts. Anonymize live-test evidence and provenance before
+publication. Review the exact outgoing content; a green secret scan does not
+cover every public surface or every identifier.
+
 ## One entry point: `curie <command>`
 
 Dev and operator flows go through the `curie` CLI, not loose shell scripts or
