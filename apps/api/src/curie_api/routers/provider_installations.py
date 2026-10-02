@@ -1,8 +1,11 @@
-"""Admin CRUD for provider installations (#2909, ADR 0155 step 4).
+"""Admin CRUD for provider installations (#2909, ADR 0166 step 4).
 
-Platform key only, like every other administrative router. The table holds
-references rather than credentials, a value in a well-known credential shape
-is refused, and no error body echoes a submitted value.
+The platform key only, via ``require_platform_key``: a row decides which env
+var or Secret becomes a provider credential once references are resolved, the
+same class of decision as the principal and console-code mint routes, so a
+future widening of ``require_api_key`` must not reach it either. The table
+holds references rather than credentials, a value in a well-known credential
+shape is refused, and no error body echoes a submitted value.
 """
 
 import uuid
@@ -16,7 +19,7 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
 from .. import provider_installations as installations
-from ..auth import require_api_key
+from ..auth import require_platform_key
 from ..deps import SessionDep
 from ..schemas import (
     ProviderInstallationCreate,
@@ -57,7 +60,7 @@ router = APIRouter(
     route_class=_RedactedValidationRoute,
     prefix="/provider-installations",
     tags=["provider-installations"],
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_platform_key)],
 )
 
 
