@@ -63,7 +63,7 @@ pub fn action_label(tool: &str) -> String {
             {
                 label.push(' ');
             }
-            label.push(c.to_ascii_lowercase());
+            label.extend(c.to_lowercase());
         }
     }
     let label = label.trim();
@@ -417,6 +417,7 @@ mod tests {
             );
         }
         assert_eq!(action_label("mcp__acme__파일_첨부"), "파일 첨부");
+        assert_eq!(action_label("mcp__acme__ÜBER_첨부"), "über 첨부");
         assert_eq!(
             action_text(
                 "Save /tmp/mcp__a__save_item and mcp__a__save_item.txt; call `mcp__a__save_item`"
