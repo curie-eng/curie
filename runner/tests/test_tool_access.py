@@ -126,7 +126,8 @@ def test_read_only_allows_exactly_the_classified_tools() -> None:
     ):
         reason = access.refusal(tool)
         assert reason is not None, tool
-        assert tool in reason
+        assert "mcp__" not in reason
+        assert "was not run" in reason
         assert "read-only" in reason
 
 
@@ -971,3 +972,13 @@ def test_turns_under_one_access_keep_their_session() -> None:
         _event("probe again", tool_access=ToolAccess.READ_ONLY),
     )
     assert [s.queries for s in restricted_sessions] == [["probe", "probe again"]]
+
+
+def test_read_only_feedback_uses_plain_action_and_keeps_exact_denied_id() -> None:
+    access = _read_only(_access())
+    reason = access.refuse("mcp__acme__delete_files", "call-acme-1")
+    assert reason is not None
+    assert "delete files" in reason
+    assert "mcp__" not in reason
+    assert "call-acme-1" in access.refused_call_ids
+    assert access.refusal(_READ_ONLY_MCP) is None

@@ -308,10 +308,26 @@ def test_reprobe_never_redials_expansion_failures(monkeypatch: pytest.MonkeyPatc
     assert dialed == ["dial"]
 
 
-@pytest.mark.parametrize("reason,phrase", [("missing_credential", "sign-in settings"), ("empty_expansion", "sign-in settings"), ("probe_misconfigured", "connection settings"), ("probe_failed", "could not be reached"), ("caller_refused", "access was refused")])
+@pytest.mark.parametrize(
+    "reason,phrase",
+    [
+        ("missing_credential", "sign-in settings"),
+        ("empty_expansion", "sign-in settings"),
+        ("probe_misconfigured", "connection settings"),
+        ("probe_failed", "could not be reached"),
+        ("caller_refused", "access was refused"),
+    ],
+)
 def test_caller_feedback_keeps_technical_details_in_diagnostics(reason: str, phrase: str) -> None:
     from curie_runner.mcp_tool_capability import ConnectorCapabilityFailure
-    failure = ConnectorCapabilityFailure(connector="acme-internal", credential_names=("ACME_TOKEN",), reason=reason, refusal="invalid" if reason == "caller_refused" else None, attempts=3)
+
+    failure = ConnectorCapabilityFailure(
+        connector="acme-internal",
+        credential_names=("ACME_TOKEN",),
+        reason=reason,
+        refusal="invalid" if reason == "caller_refused" else None,
+        attempts=3,
+    )
     caller = failure.caller_message()
     diagnostic = failure.diagnostic_message()
     assert phrase in caller
