@@ -51,7 +51,7 @@ fn truncated_approval_requires_review_instead_of_hiding_missing_details() {
 #[test]
 fn nested_document_keys_are_data_and_granted_tool_remains_exact() {
     let tool = "mcp__acme__file_attachment";
-    let nested = json!({ "mcp__acme__file_attachment": "draft", "example.pdf": "literal", "customer_id": "keep" });
+    let nested = json!({ "mcp__acme__file_attachment": "draft", "example.pdf": "literal", "customer_id": "keep", "record_values": ["1", 1, true, null, {"customer_id":"keep"}, "문서"] });
     let summary = format!(
         "Tool call awaiting approval: {tool} {}",
         json!({"file_contents": nested})
@@ -63,18 +63,14 @@ fn nested_document_keys_are_data_and_granted_tool_remains_exact() {
     }))
     .unwrap();
     let display = approval_display(&record);
-    assert!(
-        display.starts_with("Approve file attachment. File contents: "),
-        "{display}"
+    let prefix = "Approve file attachment. File contents: ";
+    assert_eq!(
+        display,
+        format!("{prefix}{}", serde_json::to_string(&nested).unwrap())
     );
-    for (key, value) in nested.as_object().unwrap() {
-        assert!(
-            display.contains(key),
-            "missing literal key {key}: {display}"
-        );
-        assert!(display.contains(value.as_str().unwrap()), "{display}");
-    }
-    assert!(!display.contains("Customer id: keep"), "{display}");
+    let shown: serde_json::Value =
+        serde_json::from_str(display.strip_prefix(prefix).unwrap()).unwrap();
+    assert_eq!(shown, nested);
     assert_eq!(record.granted_tool.as_deref(), Some(tool));
     assert_eq!(record.summary, summary);
 }

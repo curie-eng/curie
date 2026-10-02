@@ -77,17 +77,16 @@ def test_approval_nested_document_keys_are_literal_data_and_grant_stays_exact() 
         "mcp__acme__file_attachment": "draft",
         "example.pdf": "literal",
         "customer_id": "keep",
+        "record_values": ["1", 1, True, None, {"customer_id": "keep"}, "문서"],
     }
     arguments = {"file_contents": nested}
     summary = "Tool call awaiting approval: " + tool + " " + json.dumps(arguments)
     row = approval(summary, tool, arguments)
     out = ApprovalOut.model_validate(row).model_dump()
     display = out["display_summary"]
-    assert display.startswith("Approve file attachment. File contents: ")
-    for key, value in nested.items():
-        assert key in display
-        assert value in display
-    assert "Customer id: keep" not in display
+    prefix = "Approve file attachment. File contents: "
+    assert display == prefix + json.dumps(nested, ensure_ascii=False)
+    assert json.loads(display.removeprefix(prefix)) == nested
     assert out["summary"] == summary
     assert out["granted_tool"] == tool
     assert row.granted_arguments == arguments
