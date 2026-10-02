@@ -1416,10 +1416,13 @@ class WorkerConfig(BaseSettings):
         # would never reach a turn whose stream entry was already acked.
         return f"{self.key_prefix}:completions:pending"
 
-    def memory_steer_turns_key(self, thread_key: str) -> str:
-        # The memory turn claims steered into this thread's live turn (#3776),
+    def memory_steer_turns_key(self, agent_id: str, live_turn: str) -> str:
+        # The memory turn claims steered into one live runner turn (#3776),
         # which the attempt owning that turn drains and closes when it ends.
-        return f"{self.key_prefix}:memory-steer-turns:{thread_key}"
+        # Keyed by the live turn, not the thread: the next turn on the thread
+        # can open before this one's owner has drained, and this owner must
+        # not close the steers that joined the next turn.
+        return f"{self.key_prefix}:memory-steer-turns:{agent_id}:{live_turn}"
 
     def progress_key(self, progress_id: str) -> str:
         # One logical turn chain's progress record (ADR 0130); see the worker

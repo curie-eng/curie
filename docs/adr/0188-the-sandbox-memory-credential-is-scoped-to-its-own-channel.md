@@ -150,10 +150,17 @@ after the turn ends: when an attempt at a turn ends, on any outcome, the worker
 reports its turn to the API (`POST /v1/internal/memory/closed-turns`, worker
 token), and the API refuses writes with that turn's credential from then on,
 before it expires ([#3776](https://github.com/curie-eng/curie/issues/3776)).
-Reads with it still work. A steer's credential is closed when the live turn it
-joined ends. If the worker cannot reach the API, the credential falls back to
-expiring at the turn's time limit (for a steered message, the live turn's, or
-the message's own when another worker opened that turn).
+Reads with it still work. A steer's credential is closed when the live runner
+turn it joined ends, by the attempt that opened that turn; it is matched to that
+turn, not to the thread, so closing one turn never closes a steer into the next.
+The worker reports in the background, concurrently and with a timeout per call,
+so an attempt's end never waits on the API. The report is best effort and expiry
+is the backstop: if the worker crashes or is killed before it reports, the
+report fails or times out, the API predates it, or a steer hands its credential
+over after the live turn's owner has already reported, the credential is still
+refused at its expiry, which is the turn's stream deadline (for a steered
+message, the live turn's, or the message's own when another worker opened that
+turn).
 
 ### 5. Keep the credential out of Bash and hooks, as defense in depth
 

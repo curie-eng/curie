@@ -249,27 +249,30 @@ class Markers:
         self._config = config
 
     async def push_steer_memory_turns(
-        self, thread_key: str, turns: Sequence[tuple[uuid.UUID, str]]
+        self, agent_id: uuid.UUID, live_turn: str, turns: Sequence[tuple[uuid.UUID, str]]
     ) -> None:
-        """Hand a steer's memory turn claims to the thread's live turn (#3776).
+        """Hand a steer's memory turn claims to the live turn it joined (#3776).
 
-        The attempt that owns the live turn drains them when it ends. The TTL
-        is the longest a turn credential lives, so an owner that never drains
-        leaves nothing behind once the credentials have expired anyway."""
+        ``live_turn`` names the runner turn the steer landed in. The attempt
+        that owns that turn drains them when it ends. The TTL is the longest a
+        turn credential lives, so an owner that never drains leaves nothing
+        behind once the credentials have expired anyway."""
 
         if not turns:
             return
-        key = self._config.memory_steer_turns_key(thread_key)
+        key = self._config.memory_steer_turns_key(str(agent_id), live_turn)
         values = [json.dumps([str(agent), turn]) for agent, turn in turns]
         async with self._redis.pipeline(transaction=True) as pipe:
             pipe.rpush(key, *values)
             pipe.expire(key, _MEMORY_STEER_TURNS_TTL_S)
             await pipe.execute()
 
-    async def drain_steer_memory_turns(self, thread_key: str) -> list[tuple[uuid.UUID, str]]:
-        """Take every memory turn claim steered into the thread's live turn."""
+    async def drain_steer_memory_turns(
+        self, agent_id: uuid.UUID, live_turn: str
+    ) -> list[tuple[uuid.UUID, str]]:
+        """Take every memory turn claim steered into one live turn."""
 
-        key = self._config.memory_steer_turns_key(thread_key)
+        key = self._config.memory_steer_turns_key(str(agent_id), live_turn)
         async with self._redis.pipeline(transaction=True) as pipe:
             pipe.lrange(key, 0, -1)
             pipe.delete(key)

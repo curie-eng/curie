@@ -1929,9 +1929,13 @@ credential is held: code that copies the credential during a turn can write as
 that turn's sender until the turn ends. Then the worker reports the turn ended
 and the API refuses writes with its credential (403, "this conversation's turn
 has ended"), even though it has not expired
-([#3776](https://github.com/curie-eng/curie/issues/3776)). Reads still work. If
-the worker cannot reach the API, or the API predates this, the credential still
-expires at the turn's time limit. A message steered into a live turn gets a
+([#3776](https://github.com/curie-eng/curie/issues/3776)). Reads still work. The
+worker sends that report in the background, so a slow API never delays a reply.
+The report is best effort, and expiry is the backstop: if the worker crashes or
+is killed before it reports, the report fails or times out, the API predates
+this, or a steered message hands its credential over after the live turn's
+owner has already reported, the credential is still refused at its expiry,
+which is the turn's stream deadline (its time limit). A message steered into a live turn gets a
 credential for its own sender, which expires no later than the live turn's time
 limit when the same worker opened that turn, and at the message's own time
 limit otherwise. With writes off, the sandbox cannot write memory at all.
