@@ -1908,6 +1908,22 @@ A chart upgrade is a **full** upgrade: anything the new chart does not render is
 deleted. For a Deployment that means a restart. For a StatefulSet it means the
 data too.
 
+### Agent memory (0.12.0)
+
+0.12.0 adds agent and channel memory, with writes off by default (see
+[Letting the agent remember facts](#letting-the-agent-remember-facts)). Until
+[ADR-0188](adr/0188-the-sandbox-memory-credential-is-scoped-to-its-own-channel.md)
+is implemented, only the memory tools keep each channel's memory to itself.
+Code running in an agent's sandbox, such as a Bash command or a hook, can read
+and write the memory of any channel that agent serves, and can set any author
+on a fact it saves. It cannot reach another agent's memory. Turning writes off
+removes the tools but does not stop that code: it can still overwrite the
+agent's memory guidance and add agent facts.
+
+So don't turn memory writes on for an agent that serves direct messages or
+sensitive channels. Tracked in
+[#3623](https://github.com/curie-eng/curie/issues/3623).
+
 ### Bundles that carry their own stdio MCP servers (0.11.0)
 
 From 0.11.0 the platform runner no longer contains `mcp-server-github` or
