@@ -479,7 +479,8 @@ the exact messages that found the defect.
 3. Send the same messages again, word for word and in the same order: each
    root probe opens a new thread and each follow-up goes in its new thread,
    within the thread rate. Only the id in the mark changes.
-4. Find the campaign's report by its id, as "continue" does, and read each
+4. To read prior evidence, find the campaign's report by its id, as "continue"
+   does, and read each
    explicit per-case and repeat status. Preserve prior UNCLEAR, BLOCKED and
    NOT RUN; an unlisted case has unknown prior status, never an inferred PASS.
    When the report cannot be found, or its exact case evidence is missing,
