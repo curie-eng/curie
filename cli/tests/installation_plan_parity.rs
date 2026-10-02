@@ -125,6 +125,17 @@ impl HelmFixture {
 if [ -n "${CURIE_TEST_CALL_LOG:-}" ]; then
     printf 'HELM_CALL: %s\n' "$*" >> "$CURIE_TEST_CALL_LOG"
 fi
+# Capture private generated values before the CLI's file guard unlinks them.
+# Only the parity assertion opts in; do not change the recorded argv.
+if [ -n "${CURIE_TEST_CAPTURE_VALUES_DIR:-}" ] && [ "$1" = template ]; then
+    previous=""
+    for argument in "$@"; do
+        if [ "$previous" = '-f' ]; then
+            cp "$argument" "$CURIE_TEST_CAPTURE_VALUES_DIR/$(basename "$argument")" || exit 1
+        fi
+        previous="$argument"
+    done
+fi
 if [ "$1" = get ] && [ "$2" = values ]; then
     case "${CURIE_TEST_HELM_VALUES_MODE:-}" in
         absent)
@@ -391,7 +402,9 @@ unexpected() {{
 migration_target="$CURIE_TEST_MIGRATION_STATE/target"
 migration_source="$CURIE_TEST_MIGRATION_STATE/source.list"
 persist_target() {{
-    target=$(printf '%s\n' "$script" | sed -n "s/.*printf '%s\\\\n' '\\(minio\\|rustfs\\)' > .*/\\1/p")
+    # POSIX BRE has no \| alternation (BSD sed treats it literally).
+    # Extract the quoted target, then validate its supported values below.
+    target=$(printf '%s\n' "$script" | sed -n "s/.*printf '[^']*' '\\([a-z]*\\)' > .*/\\1/p")
     case "$target" in
         minio|rustfs) printf '%s\n' "$target" > "$migration_target" ;;
         *) unexpected ;;
@@ -656,6 +669,7 @@ exit 0
             .env_remove("CURIE_TEST_KUBECTL_FORBIDDEN")
             .env_remove("CURIE_TEST_COMMS_ROLLOUTS")
             .env_remove("CURIE_TEST_HELM_MIXED_STATEFULSETS")
+            .env_remove("CURIE_TEST_CAPTURE_VALUES_DIR")
             .env_remove("CURIE_TEST_RELEASE_SECRET")
             .env_remove("CURIE_TEST_SOURCE_LIST_FAIL")
             .env_remove("CURIE_TEST_SOURCE_LIST")
