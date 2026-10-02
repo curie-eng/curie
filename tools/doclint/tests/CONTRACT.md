@@ -43,7 +43,7 @@ include at least: `py rs ts tsx yaml yml json sh toml md`.
 
 `docs/` EXCLUDING `docs/adr/` (E2), PLUS the repo-root docs named in an
 explicit allowlist (currently `ARCHITECTURE.md`). ADR docs are never
-path/symbol/line checked; a root doc named in the allowlist that does not
+path/symbol/line/ADR-number checked; a root doc named in the allowlist that does not
 resolve is a finding (deletion, not a skip).
 
 ## Expected message fragments (the reason the suite asserts)
@@ -62,6 +62,8 @@ resolve is a finding (deletion, not a skip).
 - Grade disagreement: names the seam and both the declared grade and the
   vision-row's grade.
 - Duplicate ADR number prefix: names both (or all) colliding filenames.
+- Cited ADR number with no file in `docs/adr/`: names the doc, the line, and
+  `ADR-NNNN`, and contains `does not exist`.
 - Missing allowlisted root doc (e.g. `ARCHITECTURE.md`) or missing ADR index
   (`docs/adr/README.md`): names the doc; neither is scaffolded back by
   `--write`, only reported.
