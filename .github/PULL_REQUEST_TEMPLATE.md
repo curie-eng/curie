@@ -1,3 +1,8 @@
+<!-- This repository is public. Anonymize customer and downstream information
+     in this PR's title/body, comments, links, attachments, and every outgoing
+     commit subject/body. Do not reproduce a leaked value when explaining a
+     redaction. Live-test evidence and provenance are not exceptions. -->
+
 ## Summary
 
 <!-- One paragraph: what changed, and why. Skip the play by play. -->
@@ -118,3 +123,4 @@ Fix pin waiver: <reason>
 - [ ] Tests pass for the area I touched (see CONTRIBUTING.md for the commands).
 - [ ] Docs updated if behavior changed.
 - [ ] An ADR is added under `docs/adr/` if this is an architectural decision.
+- [ ] Reviewed the public title, body, commits, branch name, links, and attachments for customer and downstream information; used anonymous roles and placeholders throughout.
