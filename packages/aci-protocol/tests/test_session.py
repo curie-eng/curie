@@ -199,6 +199,7 @@ def _full_boot_env() -> BootEnv:
         max_turns=50,
         history_max_turns=10,
         history_max_bytes=2048,
+        memory_max_facts=300,
     )
 
 
@@ -676,6 +677,7 @@ def test_knobs_are_none_when_absent_so_the_consumer_applies_its_own_defaults() -
     assert boot.max_turns is None
     assert boot.history_max_turns is None
     assert boot.history_max_bytes is None
+    assert boot.memory_max_facts is None
 
 
 def test_knobs_and_port_hold_no_default_value_on_the_model_itself() -> None:
@@ -691,12 +693,14 @@ def test_knobs_and_port_hold_no_default_value_on_the_model_itself() -> None:
     assert boot.max_turns is None
     assert boot.history_max_turns is None
     assert boot.history_max_bytes is None
+    assert boot.memory_max_facts is None
     assert boot.port is None
     env = boot.to_env()
     for key in (
         "CURIE_MAX_TURNS",
         "CURIE_HISTORY_MAX_TURNS",
         "CURIE_HISTORY_MAX_BYTES",
+        "CURIE_MEMORY_MAX_FACTS",
         "CURIE_RUNNER_PORT",
     ):
         assert key not in env, f"{key} was rendered although no producer set it"
@@ -710,12 +714,14 @@ def test_knobs_parse_when_set_through_the_declared_operator_surface() -> None:
             "CURIE_MAX_TURNS": "5",
             "CURIE_HISTORY_MAX_TURNS": "7",
             "CURIE_HISTORY_MAX_BYTES": "512",
+            "CURIE_MEMORY_MAX_FACTS": "250",
         }
     )
     boot = BootEnv.from_env(env)
     assert boot.max_turns == 5
     assert boot.history_max_turns == 7
     assert boot.history_max_bytes == 512
+    assert boot.memory_max_facts == 250
 
 
 @pytest.mark.parametrize("garbage", ["abc", "", "   ", "0", "-5", "3.5"])
@@ -739,6 +745,30 @@ def test_history_window_knobs_degrade_rather_than_raise_on_garbage(garbage: str)
     assert boot.history_max_bytes is None
 
 
+@pytest.mark.parametrize("garbage", ["abc", "", "   ", "0", "-5", "3.5"])
+def test_memory_fact_limit_degrades_rather_than_raises_on_garbage(garbage: str) -> None:
+    """CURIE_MEMORY_MAX_FACTS is tolerant like the history window (#3624).
+
+    A typo in an operator's extraEnv must not become a boot crash, and a limit of
+    zero or less would refuse every save while showing nothing, so both degrade
+    to None and the runner applies its default of 200.
+    """
+    env = _worker_env() | _SUBSTRATE_ENV | {"CURIE_MEMORY_MAX_FACTS": garbage}
+    assert BootEnv.from_env(env).memory_max_facts is None
+
+
+def test_memory_fact_limit_is_an_optional_operator_key_in_the_schema() -> None:
+    """A new optional field: a patch under 0.x, owned by the operator alone."""
+    from aci_protocol.schema_export import build_schema
+
+    boot_env = build_schema()["$defs"]["BootEnv"]
+    assert "memory_max_facts" not in boot_env.get("required", [])
+    field = boot_env["properties"]["memory_max_facts"]
+    assert {"type": "integer"} in field["anyOf"]
+    assert BootEnv.env_key("memory_max_facts") == "CURIE_MEMORY_MAX_FACTS"
+    assert "CURIE_MEMORY_MAX_FACTS" not in BootEnv.env_keys(producer="worker")
+
+
 def test_max_turns_raises_on_garbage_rather_than_degrading() -> None:
     """config.py:98 uses a bare int() today and DOES raise. Keep it raising."""
     env = _worker_env() | _SUBSTRATE_ENV | {"CURIE_MAX_TURNS": "not-a-number"}
@@ -758,6 +788,7 @@ def test_no_code_producer_owns_the_knobs() -> None:
         "CURIE_MAX_TURNS",
         "CURIE_HISTORY_MAX_TURNS",
         "CURIE_HISTORY_MAX_BYTES",
+        "CURIE_MEMORY_MAX_FACTS",
         "OTEL_EXPORTER_OTLP_HEADERS",
     }
 
@@ -819,6 +850,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_MAX_TURNS",
         "CURIE_HISTORY_MAX_TURNS",
         "CURIE_HISTORY_MAX_BYTES",
+        "CURIE_MEMORY_MAX_FACTS",
     }
 
 
