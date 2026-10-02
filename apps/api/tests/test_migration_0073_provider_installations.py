@@ -25,7 +25,7 @@ NAMED_CONSTRAINTS = {
     "provider_installations_disconnected_at_ck",
     "provider_installations_credential_ref_ck",
     "provider_installations_webhook_verification_ref_ck",
-    "provider_installations_tenant_provider_external_key",
+    "provider_installations_tenant_provider_name_key",
     "provider_installations_tenant_id_fkey",
     "provider_installations_installer_fkey",
 }

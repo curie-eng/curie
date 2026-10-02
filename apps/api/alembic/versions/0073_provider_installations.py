@@ -1,12 +1,17 @@
-"""Provider installations: connected external accounts (#2909, ADR 0155 step 4).
+"""Provider installations: one row per channel identity (#2909, ADR 0166 step 4).
 
-Adds tenant scoped ``provider_installations``: one row per connected external
-account, such as one Slack workspace. ``credential_ref`` and
-``webhook_verification_ref`` point into the deployment's secret store and are
-CHECKed to be references (``env:NAME`` or ``k8s-secret:name/key``) that do
-not have the shape of a well-known credential, whoever writes them. The row for today's
-static Slack app is created by the API at boot, not here: only the API knows
-whether a bot token is configured.
+Adds tenant scoped ``provider_installations``. As amended by ADR 0168 decision
+1, a row is one bot's identity on one provider, not one connected account: two
+bots in one Slack workspace are two rows sharing one ``external_account_id``
+but never a ``name``, which is unique with ``(tenant_id, provider)`` and is
+what a binding's ``adapter`` names (ADR 0168 decision 3). ``attributes`` holds
+whatever that provider's identity needs beyond the fixed columns.
+``credential_ref`` and ``webhook_verification_ref`` point into the deployment's
+secret store and are CHECKed to be references (``env:NAME`` or
+``k8s-secret:name/key``) that do not have the shape of a well-known
+credential, whoever writes them. The rows for today's static Slack app(s) are
+created by the API at boot, not here: only the API knows which identities are
+configured.
 
 Revision ID: 0073
 Revises: 0072
@@ -54,6 +59,7 @@ def upgrade() -> None:
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("tenant_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("provider", sa.String(), nullable=False),
+        sa.Column("name", sa.String(), server_default="default", nullable=False),
         sa.Column("external_account_id", sa.String(), nullable=False),
         sa.Column("display_name", sa.String(), nullable=True),
         sa.Column("credential_ref", sa.String(), nullable=True),
@@ -64,6 +70,12 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("webhook_verification_ref", sa.String(), nullable=True),
+        sa.Column(
+            "attributes",
+            postgresql.JSONB(),
+            server_default=sa.text("'{}'::jsonb"),
+            nullable=False,
+        ),
         sa.Column("status", sa.String(), server_default="connected", nullable=False),
         sa.Column("installed_by_principal_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column(
@@ -103,8 +115,8 @@ def upgrade() -> None:
         sa.UniqueConstraint(
             "tenant_id",
             "provider",
-            "external_account_id",
-            name="provider_installations_tenant_provider_external_key",
+            "name",
+            name="provider_installations_tenant_provider_name_key",
         ),
         schema=SCHEMA,
     )
