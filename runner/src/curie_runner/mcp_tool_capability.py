@@ -175,7 +175,7 @@ class ConnectorCapabilityFailure:
         attempts = f" after {self.attempts} attempts" if self.attempts > 1 else ""
         return (
             "Connected service features are unavailable: "
-            f"the service could not be reached{attempts}. "
+            f"the connection could not be completed{attempts}. "
             "Try again later. If this continues, ask an administrator to check the connection."
         )
 

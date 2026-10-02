@@ -317,7 +317,7 @@ def test_reprobe_never_redials_expansion_failures(monkeypatch: pytest.MonkeyPatc
         ("missing_credential", "sign-in settings"),
         ("empty_expansion", "sign-in settings"),
         ("probe_misconfigured", "connection settings"),
-        ("probe_failed", "could not be reached"),
+        ("probe_failed", "connection could not be completed"),
         ("caller_refused", "access was refused"),
     ],
 )
