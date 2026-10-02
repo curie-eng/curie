@@ -45,9 +45,9 @@ PostgreSQL 16:
 - **Migrations**: the target DB must apply the **whole Alembic chain in `apps/api/alembic/versions/`**, in revision order, ending at `alembic heads`. The chain grows with the product, so it is deliberately not enumerated here: `ls apps/api/alembic/versions/` is the list, and `alembic heads` is the tip a conforming DB must reach. A single head is the invariant — a fork means two branches each added a migration (rebase and merge the heads before swapping anything). Two recent expand revisions make authenticated review feedback part of this schema contract: `0042_review_lineage_authority.py` adds immutable App-observed authority to publication lineages and the `publication_review_reservations` concurrency table; `0043_github_review_feedback.py` adds the `github_review_deliveries` audit table and the `github_review_feedback` durable feedback/outbox table. The latter stores normalized feedback and a credential-free queued turn, never a raw webhook body or GitHub credential.
 
 The application schema window keeps minimum `0070` and advances its head to
-`0073`, as recorded in `apps/api/src/curie_api/schema_compat.json`. Polling
-cursor migration `0073` follows `0072`; both existing next migrations, `0071`
-and `0072`, remain in the chain.
+`0074`, as recorded in `apps/api/src/curie_api/schema_compat.json`. Provider
+installations migration `0074` follows polling cursor migration `0073`, which
+follows `0072`; `0071`, `0072`, and `0073` remain in the chain.
 
 ## Implementations today
 

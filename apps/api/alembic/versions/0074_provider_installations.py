@@ -13,8 +13,8 @@ credential, whoever writes them. The rows for today's static Slack app(s) are
 created by the API at boot, not here: only the API knows which identities are
 configured.
 
-Revision ID: 0073
-Revises: 0072
+Revision ID: 0074
+Revises: 0073
 Create Date: 2026-09-23
 """
 
@@ -24,14 +24,14 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0073"
-down_revision: str | None = "0072"
+revision: str = "0074"
+down_revision: str | None = "0073"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 SCHEMA = "curie"
 
-# Frozen copies of curie_api.models.PROVIDER_REFERENCE_* at 0073.
+# Frozen copies of curie_api.models.PROVIDER_REFERENCE_* at 0074.
 REFERENCE_PATTERN = (
     r"^(env:[A-Z_][A-Z0-9_]*"
     r"|k8s-secret:[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?/[-._a-zA-Z0-9]{1,253})$"

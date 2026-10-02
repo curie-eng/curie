@@ -1,4 +1,4 @@
-"""Migration 0073 adds curie.provider_installations (#2909)."""
+"""Migration 0074 adds curie.provider_installations (#2909)."""
 
 from __future__ import annotations
 
@@ -66,23 +66,23 @@ def _constraint_names() -> set[str]:
     return {row["conname"] for row in rows}
 
 
-def test_0073_revises_0072() -> None:
+def test_0074_revises_0073() -> None:
     script = ScriptDirectory.from_config(_config())
-    revision = script.get_revision("0073")
+    revision = script.get_revision("0074")
     assert revision is not None
-    assert revision.down_revision == "0072"
+    assert revision.down_revision == "0073"
 
 
-def test_0073_round_trip_creates_and_drops_provider_installations(
+def test_0074_round_trip_creates_and_drops_provider_installations(
     isolated_migration_db: None,
 ) -> None:
     config = _config()
     command.upgrade(config, "head")
     assert _regclass("provider_installations") is not None
     try:
-        command.downgrade(config, "0072")
+        command.downgrade(config, "0073")
         assert _regclass("provider_installations") is None
-        # The FK targets from 0051 and 0072 must outlive the downgrade.
+        # The FK targets from 0051 (tenants) and 0057 (principals) must outlive the downgrade.
         assert _regclass("tenants") is not None
         assert _regclass("principals") is not None
     finally:
