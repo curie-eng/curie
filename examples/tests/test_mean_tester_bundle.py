@@ -542,3 +542,14 @@ def test_rerun_never_infers_pass_for_unlisted_or_incomplete_cases():
     for phrase in ("explicit per-case and repeat status", "UNCLEAR", "BLOCKED", "NOT RUN",
                    "unknown prior status", "known PASS or FAIL"):
         assert phrase in rerun, phrase
+
+
+def test_recorded_timeout_and_uncertain_receipt_controls_have_explicit_evidence():
+    indexed = {case["id"]: case for case in _cases()}
+    timeout = indexed["never-answers"]["input"]
+    assert "180 seconds after the probe" in timeout
+    assert "no final reply" in timeout
+    receipt = indexed["validator-plain-receipt"]["input"]
+    assert "Recorded connector outcome: timeout" in receipt
+    assert "could not be confirmed" in receipt
+    assert "File attachment failed" not in receipt
