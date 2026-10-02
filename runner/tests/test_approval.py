@@ -172,7 +172,7 @@ def test_block_renders_a_declared_template_as_pending_display() -> None:
     assert gate.pending_display == "Run ls: 2 files. Approve?"
 
 
-def test_block_falls_back_to_machine_string_when_the_template_cannot_render() -> None:
+def test_block_uses_plain_fallback_when_the_template_cannot_render() -> None:
     gate = ApprovalGate(
         required=frozenset({"Bash"}),
         route_by_tool={"Bash": "managers"},
@@ -180,18 +180,18 @@ def test_block_falls_back_to_machine_string_when_the_template_cannot_render() ->
     )
     tool_input = {"command": "ls"}
     gate.block("Bash", tool_input)
-    assert gate.pending_display is None
+    assert gate.pending_display == "Approve shell request. Command: ls"
     assert gate.pending_summary == summarize_tool_call("Bash", tool_input)
 
 
-def test_block_without_a_template_leaves_pending_display_unset() -> None:
+def test_block_without_a_template_describes_the_pending_action() -> None:
     gate = ApprovalGate(
         required=frozenset({"Bash"}),
         route_by_tool={"Bash": "managers"},
     )
     tool_input = {"command": "ls"}
     gate.block("Bash", tool_input)
-    assert gate.pending_display is None
+    assert gate.pending_display == "Approve shell request. Command: ls"
     assert gate.pending_summary == summarize_tool_call("Bash", tool_input)
 
 
@@ -3241,3 +3241,23 @@ def test_approval_server_lists_report_progress_only_when_a_tool_is_passed() -> N
         ) == {"publish_changes", "report_progress"}
 
     anyio.run(go)
+
+
+def test_permission_display_keeps_values_without_showing_internal_identifiers() -> None:
+    tool = "mcp__plugin_acme_files__file_attachment"
+    arguments = {"file_name": "example.pdf", "destination": "Approved"}
+    gate = ApprovalGate(required=frozenset({tool}))
+    gate.block(tool, arguments)
+    assert gate.pending_display == "Approve file attachment. Destination: Approved; File name: example.pdf"
+    assert gate.pending_summary == summarize_tool_call(tool, arguments)
+    assert gate.pending_granted_tool == tool
+    assert gate.pending_granted_arguments == arguments
+
+
+def test_permission_display_preserves_argument_content_even_if_it_names_a_tool() -> None:
+    tool = "mcp__plugin_acme_files__file_attachment"
+    arguments = {"file_name": "mcp__example__read.txt"}
+    gate = ApprovalGate(required=frozenset({tool}))
+    gate.block(tool, arguments)
+    assert "mcp__example__read.txt" in gate.pending_display
+    assert tool not in gate.pending_display
