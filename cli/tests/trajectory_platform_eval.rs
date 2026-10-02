@@ -212,7 +212,10 @@ import sys
 import ctypes
 import signal
 
-ctypes.CDLL(None).prctl(1, signal.SIGTERM)
+# Linux alone exposes prctl. Normal CLI-owned termination applies on all Unix
+# hosts; keep Linux parent-death protection without calling absent libc symbols.
+if sys.platform == "linux":
+    ctypes.CDLL(None).prctl(1, signal.SIGTERM)
 
 args = sys.argv[1:]
 if "port-forward" not in args:
