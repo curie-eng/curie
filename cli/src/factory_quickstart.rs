@@ -87,6 +87,10 @@ pub enum Action {
     Register {
         org: Option<String>,
         repo: String,
+        context: String,
+        namespace: String,
+        release: String,
+        model: String,
     },
     Intake(Box<FactoryIntakeOpts>),
     Deploy {
@@ -300,13 +304,31 @@ pub fn credential_decision(
     }
 }
 
-pub fn registration_steps(repo: &str) -> Vec<String> {
+pub struct RerunTarget<'a> {
+    pub repo: &'a str,
+    pub context: &'a str,
+    pub namespace: &'a str,
+    pub release: &'a str,
+    pub model: &'a str,
+    pub org: Option<&'a str>,
+}
+
+pub fn registration_steps(target: &RerunTarget<'_>) -> Vec<String> {
+    let org = target
+        .org
+        .map(|org| format!(" --org {org}"))
+        .unwrap_or_default();
     vec![
         "Open the link and click Create GitHub App. The name, permissions, and the disabled webhook are already filled in.".to_string(),
         "On the App settings page, note the App ID and click Generate a private key to download the .pem file.".to_string(),
-        format!("Click Install App and install it on {repo}."),
+        format!("Click Install App and install it on {}.", target.repo),
         format!(
-            "Rerun: curie factory quickstart --repo {repo} --app-id <APP_ID> --private-key-file <PATH.pem>"
+            "Rerun: curie factory quickstart --repo {repo} --context {context} --namespace {namespace} --release {release} --model {model}{org} --app-id <APP_ID> --private-key-file <PATH.pem>",
+            repo = target.repo,
+            context = target.context,
+            namespace = target.namespace,
+            release = target.release,
+            model = target.model,
         ),
     ]
 }
@@ -452,6 +474,10 @@ pub fn plan(input: &PlanInput) -> Result<Planned> {
         actions.push(Action::Register {
             org: input.org.clone(),
             repo: input.repo.clone(),
+            context: context.clone(),
+            namespace: input.namespace.clone(),
+            release: input.release.clone(),
+            model: input.model.clone(),
         });
     }
 
@@ -523,7 +549,14 @@ pub fn describe(planned: &Planned) -> Vec<String> {
             Action::Cluster { args } => {
                 lines.push(format!("curie {}", args.join(" ")));
             }
-            Action::Register { org, repo } => {
+            Action::Register {
+                org,
+                repo,
+                context,
+                namespace,
+                release,
+                model,
+            } => {
                 let org_note = org
                     .as_ref()
                     .map(|org| format!(" for organization {org}"))
@@ -531,6 +564,14 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 lines.push(format!(
                     "print the GitHub App registration link{org_note} and the rerun steps for {repo}; apply no intake"
                 ));
+                lines.extend(registration_steps(&RerunTarget {
+                    repo,
+                    context,
+                    namespace,
+                    release,
+                    model,
+                    org: org.as_deref(),
+                }));
             }
             Action::Intake(opts) => {
                 let values = intake_values(opts, &[]);
@@ -586,10 +627,14 @@ pub fn describe(planned: &Planned) -> Vec<String> {
 pub fn plan_touches_forbidden_tool(lines: &[String]) -> Option<String> {
     for line in lines {
         let lower = line.to_ascii_lowercase();
-        for banned in ["gh ", " xdg-open", "webbrowser", " open "] {
-            if lower.contains(banned) || lower.starts_with("gh ") || lower.starts_with("open ") {
-                return Some(line.clone());
-            }
+        // Prose may say "Open the link". Flag a browser or gh invocation, not that sentence.
+        if lower.starts_with("gh ")
+            || lower.starts_with("xdg-open")
+            || lower.contains(" xdg-open")
+            || lower.contains(" gh ")
+            || lower.contains("webbrowser")
+        {
+            return Some(line.clone());
         }
     }
     None
@@ -615,10 +660,18 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     };
     let interactive = std::io::stdin().is_terminal();
     let credential_in_env = crate::ops::model_credential_env()?.is_some();
-    let release_has_real_model = if opts.dry_run || (opts.context.is_none() && current.is_none()) {
+    let targeted = opts.context.clone().or_else(|| current.clone());
+    if let Some(context) = &targeted {
+        if !opts.dry_run {
+            // Helm value reads have no context flag. Pin first so a rerun
+            // against --context sees that release, not the ambient one.
+            crate::kube_context::pin_for_cluster_command(Some(context))?;
+        }
+    }
+    let release_has_real_model = if opts.dry_run || targeted.is_none() {
         false
     } else {
-        release_model_recorded(&opts).await
+        release_model_recorded(&opts).await?
     };
     let planned = plan(&PlanInput {
         repo: opts.repo.clone(),
@@ -659,16 +712,18 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     execute(&planned).await
 }
 
-async fn release_model_recorded(opts: &QuickstartOpts) -> bool {
+async fn release_model_recorded(opts: &QuickstartOpts) -> Result<bool> {
     let common = CommonOpts {
         namespace: opts.namespace.clone(),
         release: opts.release.clone(),
         dry_run: false,
     };
-    match crate::ops::fetch_release_values(&common).await {
-        Ok(Some(values)) => release_has_real_model(&values),
-        _ => false,
-    }
+    // `Ok(None)` is helm reporting the release does not exist yet. Any other
+    // failure stays an error so a rerun does not prompt as if no model was set.
+    Ok(match crate::ops::fetch_release_values(&common).await? {
+        Some(values) => release_has_real_model(&values),
+        None => false,
+    })
 }
 
 async fn execute(planned: &Planned) -> Result<QuickstartOutput> {
@@ -682,10 +737,24 @@ async fn execute(planned: &Planned) -> Result<QuickstartOutput> {
         match action {
             Action::External { program, args } => run_program(program, args).await?,
             Action::Cluster { args } => run_self(args).await?,
-            Action::Register { org, repo } => {
+            Action::Register {
+                org,
+                repo,
+                context,
+                namespace,
+                release,
+                model,
+            } => {
                 let name = crate::factory_app::random_app_name();
                 let url = crate::factory_app::registration_url(org.as_deref(), &name);
-                let steps = registration_steps(repo);
+                let steps = registration_steps(&RerunTarget {
+                    repo,
+                    context,
+                    namespace,
+                    release,
+                    model,
+                    org: org.as_deref(),
+                });
                 return Ok(QuickstartOutput::Registration {
                     context: planned.context.clone(),
                     url,
@@ -1122,15 +1191,35 @@ mod tests {
 
     #[test]
     fn registration_steps_name_the_rerun_and_no_browser_tool() {
-        let steps = registration_steps("acme/widgets");
+        let steps = registration_steps(&RerunTarget {
+            repo: "acme/widgets",
+            context: "kind-curie-factory",
+            namespace: "factory-ns",
+            release: "factory",
+            model: DEFAULT_MODEL,
+            org: None,
+        });
         let text = steps.join("\n");
         assert!(text.contains(
-            "curie factory quickstart --repo acme/widgets --app-id <APP_ID> --private-key-file <PATH.pem>"
+            "curie factory quickstart --repo acme/widgets --context kind-curie-factory --namespace factory-ns --release factory --model z-ai/glm-5.3-flash --app-id <APP_ID> --private-key-file <PATH.pem>"
         ));
         assert!(!text.to_ascii_lowercase().contains("gh "));
         assert!(!text.contains("webhook secret"));
         let url = crate::factory_app::registration_url(None, "curie-factory-abcdef12");
         assert!(url.contains("webhook_active=false"), "{url}");
+    }
+
+    #[test]
+    fn the_printed_rerun_keeps_an_explicit_context() {
+        let mut input = base();
+        input.explicit_context = Some("remote-cluster".into());
+        input.namespace = "acme".into();
+        input.release = "trial".into();
+        let text = describe(&plan(&input).unwrap()).join("\n");
+        assert!(text.contains(
+            "--repo acme/widgets --context remote-cluster --namespace acme --release trial --model z-ai/glm-5.3-flash"
+        ), "{text}");
+        assert!(!text.contains("kind create"), "{text}");
     }
 
     #[test]
