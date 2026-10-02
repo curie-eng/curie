@@ -1646,6 +1646,30 @@ each channel's memory, are still shown to the agent. Instead of the guidance, th
 agent is told that saving is off, so it doesn't claim to have remembered
 anything.
 
+Each memory, the agent memory and each channel's memory, holds at most 200
+facts by default. Every fact is loaded into the agent's prompt at boot, newest
+first. When a memory is full, `remember` is refused and the agent is told to
+update or forget a fact to make room; nothing is dropped silently. To change the
+limit, set `CURIE_MEMORY_MAX_FACTS` on the runner through the chart's
+`agentSandbox.runner.extraEnv` (or `docker run -e` for a local runner):
+
+```yaml
+agentSandbox:
+  runner:
+    extraEnv:
+      - name: CURIE_MEMORY_MAX_FACTS
+        value: "400"
+```
+
+The same number caps saving and loading, so a saved fact is always shown, and
+it applies to both kinds of memory. It takes effect at the next sandbox boot. A
+value that is not a positive integer is ignored and the default applies.
+Raising it costs prompt tokens: every fact is in the prompt on every turn.
+Lowering it below what a memory already holds hides the oldest facts from the
+prompt (boot says how many it left out) and refuses new saves until facts are
+forgotten. Whatever the limit, the state API still caps each memory at 1 MiB
+(`STATE_MAX_NAMESPACE_BYTES` on the API), and a save past that is refused too.
+
 Upgrade runners with or before workers across this change. An older runner
 doesn't understand `CURIE_MEMORY_WRITES`, so behind a newer worker it would
 mount the memory tools even for an agent with writes off. One `helm upgrade`
