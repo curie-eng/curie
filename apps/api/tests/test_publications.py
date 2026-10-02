@@ -2122,6 +2122,7 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
             *,
             kind: str | None = None,
             address: str | None = None,
+        **_: object,
         ) -> dict[str, str]:
             return {"CURIE_SESSION_ID": f"session-{thread}"}
 
@@ -2831,6 +2832,7 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
             *,
             kind: str | None = None,
             address: str | None = None,
+        **_: object,
         ) -> dict[str, str]:
             env = self._resolver.boot_env(
                 resolved,

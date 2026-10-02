@@ -1525,6 +1525,7 @@ class WorkspaceClaimCoordinator:
         lineage_base_sha: str | None = None,
         publication_visible_outcome_revision: int = 0,
         fresh_only: bool = False,
+        caller_run: str | None = None,
     ) -> WorkspaceClaimResult:
         """Prepare once, then cold-claim or resume a suspended route.
 
@@ -1606,6 +1607,7 @@ class WorkspaceClaimCoordinator:
                     ),
                     agent_name=agent_name,
                     runner_resources=runner_resources,
+                    caller_run=caller_run,
                     **candidate_guard,
                 )
             else:
@@ -1621,6 +1623,7 @@ class WorkspaceClaimCoordinator:
                             publication_visible_outcome_revision
                         ),
                         fresh_only=fresh_only,
+                        caller_run=caller_run,
                     )
                 except Exception as exc:
                     # The substrate signal is injected to keep this worker-local
@@ -1637,6 +1640,7 @@ class WorkspaceClaimCoordinator:
                         publication_visible_outcome_revision=(
                             publication_visible_outcome_revision
                         ),
+                        caller_run=caller_run,
                     )
             sandbox_exposed = True
             self._commit_ownership(thread_key, prepared)

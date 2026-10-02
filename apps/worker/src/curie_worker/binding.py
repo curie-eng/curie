@@ -176,6 +176,9 @@ DECISION_ENV = BootEnv.env_key("approval_decision")
 FALSE_COMPLETION_CHECK_ENV = "CURIE_FALSE_COMPLETION_CHECK"
 # the worker re-mints every turn; this only bounds a leaked-token window (ADR-0033)
 SANDBOX_TOKEN_TTL_SECONDS = 24 * 60 * 60
+# NULL agents.execution_deadline_seconds means this span. The API stamps the
+# same number at start (curie_api.models.DEFAULT_EXECUTION_DEADLINE_SECONDS).
+DEFAULT_EXECUTION_DEADLINE_SECONDS = 1800
 # #3776: the API route a turn's end is reported on, and how long that call may
 # take. Short: it runs as each attempt ends, and failing it only leaves the
 # credential to expire as it did before.
@@ -272,6 +275,7 @@ def _parse_resume_event_id(event_id: str) -> uuid.UUID | None:
         return uuid.UUID(match.group(1))
     except ValueError:
         return None
+
 
 # The trailing `d.id DESC` carries no meaning of its own -- id order is not a
 # precedence rule and nothing may start reading one into it. It exists only to
@@ -571,13 +575,9 @@ class BindingResolver:
         self._config = config
         # Table identifiers are not user input; the schema comes from config.
         self._sql = text(_RESOLVE_SQL.format(schema=config.db_schema))
-        self._undeployed_binding_sql = text(
-            _UNDEPLOYED_BINDING_SQL.format(schema=config.db_schema)
-        )
+        self._undeployed_binding_sql = text(_UNDEPLOYED_BINDING_SQL.format(schema=config.db_schema))
         self._resolve_agent_sql = text(_RESOLVE_AGENT_SQL.format(schema=config.db_schema))
-        self._address_identity_sql = text(
-            _ADDRESS_IDENTITY_SQL.format(schema=config.db_schema)
-        )
+        self._address_identity_sql = text(_ADDRESS_IDENTITY_SQL.format(schema=config.db_schema))
 
     async def resolve(
         self, kind: str, adapter: str | None, address: str
@@ -904,10 +904,7 @@ class BindingResolver:
         This is a separate read from deployment resolution. Resolution runs in
         migration tests against schemas that predate the column.
         """
-        sql = text(
-            "SELECT runner_resources "
-            f"FROM {self._config.db_schema}.agents WHERE id = :id"
-        )
+        sql = text(f"SELECT runner_resources FROM {self._config.db_schema}.agents WHERE id = :id")
         async with self._engine.connect() as conn:
             result = await conn.execute(sql, {"id": agent_id})
             row = result.first()
@@ -931,6 +928,31 @@ class BindingResolver:
             result = await conn.execute(sql, {"id": agent_id})
             row = result.first()
         return bool(row is not None and row[0])
+
+    async def execution_deadline_seconds_for(self, agent_id: uuid.UUID) -> int:
+        """The agent's work item execution span, or the platform default.
+
+        A separate read, like ``memory_writes_for``, so a schema from before
+        the column still boots. A missing row, a null, or a read error uses
+        ``DEFAULT_EXECUTION_DEADLINE_SECONDS``.
+        """
+
+        sql = text(
+            f"SELECT execution_deadline_seconds FROM {self._config.db_schema}.agents WHERE id = :id"
+        )
+        try:
+            async with self._engine.connect() as conn:
+                result = await conn.execute(sql, {"id": agent_id})
+                row = result.first()
+        except Exception:  # noqa: BLE001 - a missing column still boots
+            logger.warning(
+                "execution deadline read failed agent=%s; using the platform default",
+                agent_id,
+            )
+            return DEFAULT_EXECUTION_DEADLINE_SECONDS
+        if row is None or row[0] is None:
+            return DEFAULT_EXECUTION_DEADLINE_SECONDS
+        return int(row[0])
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
@@ -985,6 +1007,9 @@ class BindingResolver:
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+        caller_run: str | None = None,
+        caller_work_item: str | None = None,
+        caller_exp_ceiling: int | None = None,
     ) -> dict[str, str]:
         """The env injected into the sandbox claim for a bound run.
 
@@ -1108,10 +1133,15 @@ class BindingResolver:
         # the connector scope.
         connector_caller_token: str | None = None
         if self._config.connector_caller_signing_key.strip():
+            caller_exp = exp
+            if caller_exp_ceiling is not None:
+                caller_exp = min(caller_exp, int(caller_exp_ceiling))
             connector_caller_token = caller_token.mint(
                 self._config.connector_caller_signing_key,
                 agent=resolved.agent_name,
-                exp=exp,
+                exp=caller_exp,
+                run=caller_run,
+                work_item=caller_work_item,
             )
         env = BootEnv.render_worker(
             plugin_dir=self._config.bundle_plugin_dir,
@@ -1189,9 +1219,7 @@ class BindingResolver:
         # Runs AFTER the render so the reserved-name filter sees the rendered
         # keys, and stays the marker's sole writer -- see the
         # inject_connector_secrets docstring for the #457/#429 rationale.
-        inject_connector_secrets(
-            env, resolved.secrets, agent_label=resolved.agent_id
-        )
+        inject_connector_secrets(env, resolved.secrets, agent_label=resolved.agent_id)
         # #1909: default local/cluster eval is a static bundle-plus-cases gate.
         # Ambient durable memory is per-agent, so a fresh thread still loaded
         # it and could change a committed case. The CLI marks those turns with
@@ -1273,9 +1301,7 @@ class BindingResolver:
             ):
                 status = response.status
         except (aiohttp.ClientError, TimeoutError, OSError) as exc:
-            logger.warning(
-                "could not report memory turn %s as ended: %s", turn, type(exc).__name__
-            )
+            logger.warning("could not report memory turn %s as ended: %s", turn, type(exc).__name__)
             return
         if status == 404:
             if not getattr(self, "_closed_turns_route_missing", False):

@@ -2931,7 +2931,7 @@ class GrantBinding:
 
         return Budget(max_output_tokens_per_run=1000, max_usd_per_day=1.0)
 
-    def boot_env(self, resolved, thread_key, *, kind=None, address=None):  # noqa: ANN001, ANN201
+    def boot_env(self, resolved, thread_key, *, kind=None, address=None, **_: object):  # noqa: ANN001, ANN201
         return {"CURIE_SESSION_ID": f"s-{thread_key}"}
 
     async def approval_grant_tool(self, event_id: str, agent_id):  # noqa: ANN001, ANN201
@@ -3280,7 +3280,7 @@ class RoutedBinding:
 
         return Budget(max_output_tokens_per_run=1000, max_usd_per_day=1.0)
 
-    def boot_env(self, resolved, thread_key, *, kind=None, address=None):  # noqa: ANN001, ANN201
+    def boot_env(self, resolved, thread_key, *, kind=None, address=None, **_: object):  # noqa: ANN001, ANN201
         return {"CURIE_SESSION_ID": f"s-{thread_key}"}
 
 
@@ -5295,6 +5295,7 @@ class _WorkspacelessBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         return {}
 

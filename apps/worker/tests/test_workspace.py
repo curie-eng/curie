@@ -1145,8 +1145,9 @@ class _RecordingSubstrate:
         agent_name: str | None = None,
         runner_resources: dict[str, Any] | None = None,
         validate_candidate: Callable[[object], None] | None = None,
+        caller_run: str | None = None,
     ) -> object:
-        del runner_resources
+        del runner_resources, caller_run
         payload = dict(env or {})
         candidate = object()
         self.calls.append(("handoff", thread_key, payload))
@@ -1587,8 +1588,9 @@ def test_late_handoff_fence_loss_restores_prior_durable_ownership(
             agent_name: str | None = None,
             runner_resources: dict[str, Any] | None = None,
             validate_candidate: Callable[[object], None] | None = None,
+            caller_run: str | None = None,
         ) -> object:
-            del runner_resources
+            del runner_resources, caller_run
             del (
                 expected,
                 env,
