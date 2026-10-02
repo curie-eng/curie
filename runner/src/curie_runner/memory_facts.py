@@ -91,7 +91,8 @@ NO_PERSON = "<no person>"
 # Exactly what ``add`` mints. An id the model passes must match it, so it can
 # neither name a reserved key (``log``, ``guidance``) nor compose a path outside
 # the namespace.
-_FACT_ID = re.compile(r"^fact-[0-9a-f]{32}$")
+# ``\Z``, not ``$``: ``$`` also matches before a trailing newline.
+_FACT_ID = re.compile(r"^fact-[0-9a-f]{32}\Z")
 _TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
@@ -136,7 +137,7 @@ class Fact:
 
 
 def is_fact_id(value: object) -> bool:
-    return isinstance(value, str) and _FACT_ID.match(value) is not None
+    return isinstance(value, str) and _FACT_ID.fullmatch(value) is not None
 
 
 def _now() -> str:

@@ -69,8 +69,9 @@ RESERVED_NAMESPACES = frozenset({MEMORY_NAMESPACE, TRANSCRIPT_NAMESPACE})
 # The only memory keys a sandbox credential may write (ADR-0188): the fact ids
 # the runner's memory tools mint. Mirrors ``memory_facts._FACT_ID`` in the
 # runner; ``tests/test_memory_fact_key_parity.py`` pins the two. ``guidance``
-# and the legacy ``log`` are written with the platform key only.
-_FACT_KEY = re.compile(r"^fact-[0-9a-f]{32}$")
+# and the legacy ``log`` are written with the platform key only. ``\Z``, not
+# ``$``: ``$`` also matches before a trailing newline.
+_FACT_KEY = re.compile(r"^fact-[0-9a-f]{32}\Z")
 
 
 class StateCaller(enum.Enum):
@@ -224,7 +225,7 @@ def _check_memory_reach(
             path,
             "memory facts are written with PUT; append is not allowed with a sandbox credential",
         )
-    if key is None or _FACT_KEY.match(key) is None:
+    if key is None or _FACT_KEY.fullmatch(key) is None:
         _refuse(
             principal, agent_id, path, "only fact keys are writable with a sandbox credential"
         )
