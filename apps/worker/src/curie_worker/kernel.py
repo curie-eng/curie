@@ -1469,6 +1469,31 @@ class _MemoryMint:
 _MEMORY_MINT: ContextVar[_MemoryMint | None] = ContextVar("curie_worker_memory_mint", default=None)
 
 
+@dataclass
+class _AttemptMemoryTurns:
+    """The memory write credentials one ``_attempt`` minted (#3776).
+
+    ``_with_memory_token`` records each turn claim here, so the attempt can tell
+    the API those turns are over when it ends. ``steered`` means the attempt
+    folded into another attempt's live turn, which keeps using the credential;
+    ``owner`` means the attempt opened that live turn, so it also closes the
+    steers that joined it."""
+
+    thread_key: str
+    minted: list[tuple[uuid.UUID, str]] = field(default_factory=list)
+    steered: bool = False
+    owner: bool = False
+
+
+# Per attempt, like the carries above; set and reset by ``Kernel._attempt``.
+_MEMORY_TURNS: ContextVar[_AttemptMemoryTurns | None] = ContextVar(
+    "curie_worker_memory_turns", default=None
+)
+# Strong references to in-flight closes, so a close scheduled from a cancelled
+# attempt is not garbage collected before it finishes.
+_PENDING_MEMORY_CLOSES: set[asyncio.Task[None]] = set()
+
+
 def _hook_success_outcome() -> HookRunOutcome | None:
     carry = _HOOK_RUN_CARRY.get()
     if carry is None:
@@ -4889,6 +4914,56 @@ class Kernel:
         workspace_inference: _WorkspaceInferenceCarry,
         memory_grant: TurnMemoryGrant | None = None,
     ) -> TurnOutcome:
+        """One attempt at a turn, then close its memory write credentials (#3776).
+
+        Every turn claim the attempt minted is reported closed to the API when
+        the attempt ends, on every outcome (success, runner error, start
+        failure, cancellation), so a credential copied out of the sandbox stops
+        writing then rather than at its expiry. A steered attempt hands its
+        claim to the live turn it joined instead (``_close_memory_turns``)."""
+
+        record = _AttemptMemoryTurns(thread_key=_thread_key_for(qevent))
+        reset = _MEMORY_TURNS.set(record)
+        try:
+            return await self._attempt_turn(
+                qevent,
+                route,
+                release_order,
+                boot_env,
+                agent_id,
+                nav,
+                packs,
+                workspace_deployment_id,
+                agent_name,
+                runner_resources=runner_resources,
+                remaining_s=remaining_s,
+                pressure_retried=pressure_retried,
+                workspace_inference=workspace_inference,
+                memory_grant=memory_grant,
+            )
+        finally:
+            _MEMORY_TURNS.reset(reset)
+            if record.minted or record.owner:
+                await self._settle_memory_turns(record)
+
+    async def _attempt_turn(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        release_order: Callable[[], None],
+        boot_env: dict[str, str] | None = None,
+        agent_id: uuid.UUID | None = None,
+        nav: NavAffordance | None = None,
+        packs: BehaviorPacks | None = None,
+        workspace_deployment_id: uuid.UUID | None = None,
+        agent_name: str | None = None,
+        *,
+        runner_resources: dict[str, Any] | None = None,
+        remaining_s: float | None = None,
+        pressure_retried: bool,
+        workspace_inference: _WorkspaceInferenceCarry,
+        memory_grant: TurnMemoryGrant | None = None,
+    ) -> TurnOutcome:
         handle = qevent.reply_handle
         thread_key = _thread_key_for(qevent)
         attempt_started = time.monotonic()
@@ -5329,10 +5404,19 @@ class Kernel:
             # steer folded into a since-failed turn is not itself replayed. This is
             # the accepted MVP semantic; durable per-steer replay is a deliberate
             # follow-up, flagged to the orchestrator rather than silently assumed.
+            memory_turns = _MEMORY_TURNS.get()
+            if memory_turns is not None:
+                # The live turn now holds this attempt's credential (#3776).
+                memory_turns.steered = True
             await self._reply_for(qevent, route, "Folded into the in-progress reply above.")
             return TurnOutcome(terminal_ok=True, steered=True)
 
         assert routed.handle is not None and routed.turn is not None
+        memory_turns = _MEMORY_TURNS.get()
+        if memory_turns is not None:
+            # This attempt opened the live turn, so it closes the steers that
+            # join it as well as its own turns (#3776).
+            memory_turns.owner = True
         hook_carry = _HOOK_RUN_CARRY.get()
         if hook_carry is not None:
             hook_carry.this_attempt_started = True
@@ -6408,11 +6492,14 @@ class Kernel:
                         )
             steer_event = event
             mint = _MEMORY_MINT.get()
-            if mint is not None:
+            if mint is not None and retained_live_route and active_before_steer:
                 # ADR-0188: a steer ends when the live turn ends, so its
                 # credential never outlives that turn's stream deadline. A turn
                 # another worker opened has no recorded deadline here; the
-                # steer's own bound applies.
+                # steer's own bound applies. Minted only when the retained
+                # sandbox reports a live turn to fold into: a fresh, replacement
+                # or idle runner refuses the probe, and a credential minted for
+                # it would be one more claim to close (#3776).
                 steer_event = self._with_memory_token(
                     event,
                     mint.qevent,
@@ -8749,17 +8836,25 @@ class Kernel:
             ttl_s = min(ttl_s, math.floor(cap_at - time.time()))
             if ttl_s <= 0:
                 return unminted
+        # Unique per mint (#3776): the attempt closes its turn when it ends, so a
+        # retry or a continuation needs its own claim, or the close would refuse
+        # it. It still starts with the event id, for the API's refusal log.
+        turn = f"{qevent.event_id}#{uuid.uuid4().hex[:8]}"
         token = mint(
             grant.resolved,
             kind=grant.kind,
             address=grant.address,
             thread_key=grant.thread_key,
             sender=qevent.author or "",
-            turn=qevent.event_id,
+            turn=turn,
             ttl_s=ttl_s,
         )
         if not token:
             return unminted
+        record = _MEMORY_TURNS.get()
+        agent = getattr(grant.resolved, "agent_id", None)
+        if record is not None and isinstance(agent, uuid.UUID):
+            record.minted.append((agent, turn))
         return event.model_copy(update={"memory_token": token})
 
     def _record_turn_deadline(self, grant: TurnMemoryGrant, remaining_s: float | None) -> None:
@@ -8769,6 +8864,59 @@ class Kernel:
         for key in [k for k, at in self._turn_deadlines.items() if at <= now]:
             del self._turn_deadlines[key]
         self._turn_deadlines[grant.thread_key] = now + self._runner.turn_deadline_s(remaining_s)
+
+    async def _settle_memory_turns(self, record: _AttemptMemoryTurns) -> None:
+        """Close the turns an attempt minted, once it ends (#3776).
+
+        Runs as its own task and is shielded, so a cancelled attempt still
+        closes its credential. A failed close never fails the turn: the
+        credential then expires at the turn's deadline, as before."""
+
+        task = asyncio.ensure_future(self._close_memory_turns(record))
+        _PENDING_MEMORY_CLOSES.add(task)
+        task.add_done_callback(_PENDING_MEMORY_CLOSES.discard)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- a close never fails the turn
+            logger.warning("memory turn close failed: %s", type(exc).__name__)
+
+    async def _close_memory_turns(self, record: _AttemptMemoryTurns) -> None:
+        close = getattr(self._binding, "close_turn_memory", None)
+        if close is None:
+            return
+        turns: list[tuple[uuid.UUID, str]] = []
+        if record.steered:
+            # The live turn this attempt joined holds the steering credential
+            # (the runner's ``MemoryTurn.begin`` on steer) until it ends, so the
+            # attempt that owns that turn closes it. A list in Valkey, so the
+            # owner can be on another worker.
+            push = getattr(self._markers, "push_steer_memory_turns", None)
+            if push is not None and record.minted:
+                try:
+                    await push(record.thread_key, record.minted)
+                except Exception as exc:  # noqa: BLE001 -- falls back to expiry
+                    logger.warning(
+                        "could not hand a steer's memory turn to its live turn: %s",
+                        type(exc).__name__,
+                    )
+        else:
+            turns.extend(record.minted)
+        if record.owner:
+            drain = getattr(self._markers, "drain_steer_memory_turns", None)
+            if drain is not None:
+                try:
+                    turns.extend(await drain(record.thread_key))
+                except Exception as exc:  # noqa: BLE001 -- falls back to expiry
+                    logger.warning(
+                        "could not read the steers that joined a turn: %s", type(exc).__name__
+                    )
+        for agent, turn in turns:
+            try:
+                await close(agent, turn)
+            except Exception as exc:  # noqa: BLE001 -- a close never fails the turn
+                logger.warning("memory turn close failed for %s: %s", turn, type(exc).__name__)
 
     @staticmethod
     def _to_event(qevent: QueuedTurn) -> Event:
