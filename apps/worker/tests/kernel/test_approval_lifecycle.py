@@ -5879,3 +5879,28 @@ def test_routed_requester_is_used_in_card_memory_and_notification_metadata(make_
             assert approvals.requests[0].author == "U0EXAMPLE2"
 
     asyncio.run(go())
+
+
+def test_missing_display_uses_plain_notice_and_card_without_rewriting_record(make_harness) -> None:
+    tool = "mcp__plugin_acme_files__file_attachment"
+    machine = "Tool call awaiting approval: " + tool + ' {"file_name": "example.pdf"}'
+    sentence = "Approve file attachment. File name: example.pdf"
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"managers": _resolution_route()})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            script = _awaiting_script_with_display(machine, "")
+            script[-1] = script[-1].model_copy(
+                update={"approval_display": None, "approval_route": "managers"}
+            )
+            h.runner.default_script = script
+            await h.kernel.process_event(_qevent("please attach", event_id="ev-plain-display"))
+            assert approvals.requests[0].summary == machine
+            assert h.sink.last_text is not None
+            assert sentence in h.sink.last_text and tool not in h.sink.last_text
+            assert h.sink.posts[0][1].text == sentence
+            assert isinstance(h.sink.posts[0][1].interaction, ConfirmIntent)
+            assert h.sink.posts[0][1].interaction.prompt == sentence
+
+    asyncio.run(go())
