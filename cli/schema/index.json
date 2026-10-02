@@ -304,6 +304,12 @@
       "version": "1.0"
     },
     {
+      "result": "QuickstartOutput",
+      "kind": "CliOutput",
+      "schema": "factory-quickstart.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ReleaseAcceptOutput",
       "kind": "CliOutput",
       "schema": "release-accept.schema.json",

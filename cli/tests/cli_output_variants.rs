@@ -47,6 +47,7 @@ use curie::commands::{
 };
 use curie::comms::CommsOutput;
 use curie::factory_intake::FactoryIntakeOutput;
+use curie::factory_quickstart::QuickstartOutput;
 use curie::github_app::GithubAppOutput;
 use curie::installation::ApplyOutput;
 use curie::local::{
@@ -631,6 +632,34 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         samples![
             "DryRun" => GithubAppOutput::DryRun(plan()),
             "Done" => GithubAppOutput::Done { configured: true },
+        ],
+    );
+    m.insert(
+        "QuickstartOutput",
+        samples![
+            "DryRun" => QuickstartOutput::DryRun(plan()),
+            "Registration" => QuickstartOutput::Registration {
+                context: "kind-curie-factory".to_string(),
+                url: "https://github.com/settings/apps/new?name=curie-factory-example".to_string(),
+                steps: vec!["Rerun with --app-id and --private-key-file.".to_string()],
+                kind_cluster: Some("curie-factory".to_string()),
+            },
+            "Ready" => QuickstartOutput::Ready {
+                context: "kind-curie-factory".to_string(),
+                repo: "acme/widgets".to_string(),
+                intake: "poll".to_string(),
+                app_id: "12345".to_string(),
+                slug: "curie-factory-example".to_string(),
+                mention: "curie-factory-example".to_string(),
+                mention_inferred: true,
+                repos: vec!["acme/widgets".to_string()],
+                label: "curie-factory".to_string(),
+                label_inferred: true,
+                runner_image: "ghcr.io/curie-eng/curie-dark-factory-runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                agent: "dark-factory".to_string(),
+                deadline_seconds: 3600,
+                budget_usd: 5.0,
+            },
         ],
     );
     m.insert(
