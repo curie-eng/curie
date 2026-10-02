@@ -242,16 +242,6 @@ pub fn available_contexts() -> Vec<String> {
         .collect()
 }
 
-/// The current context name, without pinning and without spawning kubectl.
-/// Unreadable kubeconfig or an empty current context is `None`.
-pub fn current_context_name() -> Option<String> {
-    let view = read_kubeconfig().ok()?;
-    select_target(&view, None)
-        .ok()
-        .flatten()
-        .map(|target| target.context)
-}
-
 /// Resolve and pin the Kubernetes context for this `curie cluster` process.
 ///
 /// With an explicit name, any failure to read the kubeconfig or an unknown name is an

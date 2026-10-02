@@ -43,8 +43,6 @@ def test_factory_ingress_defaults_off() -> None:
     settings = Settings(_env_file=None)
 
     assert settings.github_factory_ingress_enabled is False
-    assert settings.github_factory_intake == "poll"
-    assert settings.github_factory_poll_interval_s == 45.0
     assert settings.github_factory_label == ""
     assert settings.github_factory_mention == ""
 
@@ -66,13 +64,6 @@ def test_enabled_factory_ingress_accepts_complete_configuration() -> None:
 
     assert settings.github_factory_label == "factory"
     assert settings.github_factory_mention == "curie"
-
-
-def test_poll_intake_accepts_an_empty_webhook_secret() -> None:
-    settings = _enabled(github_webhook_secret="", github_factory_intake="poll")
-
-    assert settings.github_webhook_secret == ""
-    assert settings.github_factory_intake == "poll"
 
 
 _RECONCILE_SETTINGS = (
@@ -129,14 +120,8 @@ def test_factory_reconcile_settings_refuse_the_same_via_the_environment(
     [
         ({"github_app_id": ""}, "GITHUB_APP_ID"),
         ({"github_app_private_key": ""}, "GITHUB_APP_PRIVATE_KEY"),
-        (
-            {"github_webhook_secret": "", "github_factory_intake": "webhook"},
-            "GITHUB_WEBHOOK_SECRET",
-        ),
-        (
-            {"github_webhook_secret": "dev-webhook-secret", "github_factory_intake": "webhook"},
-            "GITHUB_WEBHOOK_SECRET",
-        ),
+        ({"github_webhook_secret": ""}, "GITHUB_WEBHOOK_SECRET"),
+        ({"github_webhook_secret": "dev-webhook-secret"}, "GITHUB_WEBHOOK_SECRET"),
         ({"github_factory_label": ""}, "GITHUB_FACTORY_LABEL"),
         ({"github_factory_label": "factory label"}, "GITHUB_FACTORY_LABEL"),
         ({"github_factory_mention": ""}, "GITHUB_FACTORY_MENTION"),

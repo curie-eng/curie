@@ -885,18 +885,13 @@ built artifact without rebuilding.
 
 ### Admitting a labelled GitHub issue
 
-Factory intake polls GitHub by default. It is off until
-`api.githubFactoryIngressEnabled` is true (environment
-`GITHUB_FACTORY_INGRESS_ENABLED=true`). `api.githubFactoryIntake`
-(`GITHUB_FACTORY_INTAKE`) is `poll` or `webhook`, and `poll` is the default.
-Poll mode does not require a webhook secret. The API still refuses to start
-with the gate on unless the GitHub App id and private key are set,
-`api.githubFactoryLabel` (`GITHUB_FACTORY_LABEL`) is a single label name,
-`api.githubFactoryMention` (`GITHUB_FACTORY_MENTION`) is one GitHub login, and
-`api.githubRepoAllowlist` is non-empty. Webhook mode keeps the signed
-`POST /github/webhook` path and requires a webhook secret that is not the
-development default. An empty webhook secret is not a signing key, so a
-delivery signed with a blank secret is rejected.
+Factory intake uses the same signed `POST /github/webhook` endpoint and is off
+until `api.githubFactoryIngressEnabled` is true (environment
+`GITHUB_FACTORY_INGRESS_ENABLED=true`). The API refuses to start with that gate
+on unless the GitHub App id and private key are set, the webhook secret is not
+the development default, `api.githubFactoryLabel` (`GITHUB_FACTORY_LABEL`) is a
+single label name, `api.githubFactoryMention` (`GITHUB_FACTORY_MENTION`) is one
+GitHub login, and `api.githubRepoAllowlist` is non-empty.
 
 `curie cluster factory` sets these values for you (see the dark-factory
 example README). It checks the merged config against this boot gate before
@@ -912,23 +907,19 @@ waiting work and requests termination of a running execution. Cancellation
 stays requested until the runtime reports that it stopped. An already linked
 pull request stays linked, and later publication is refused.
 
-Polling reads each bound repository every `GITHUB_FACTORY_POLL_INTERVAL_S`
-(default 45 seconds). It admits an open labeled issue with no grace delay,
-admits a mention and review feedback on a factory pull request, and cancels a
-work item whose issue was closed or unlabeled. Those reads do not record a
-webhook delivery. The webhook is optional. In webhook mode the missed-label
-backstop stays: every `GITHUB_FACTORY_RECONCILE_INTERVAL_S` (default 300, 0
-disables) the reconciler lists the open issues carrying the factory label and
-admits any that has no work item, once the label is older than
+GitHub does not retry a label delivery that failed, for example while the API
+was unreachable. The work item reconciler covers that gap: every
+`GITHUB_FACTORY_RECONCILE_INTERVAL_S` (default 300, 0 disables) it lists the
+open issues carrying the factory label on each bound repository and admits any
+that has no work item, once the label is older than
 `GITHUB_FACTORY_RECONCILE_GRACE_S` (default 300). It applies the same checks as
 a delivery, including the labeling user's current write permission, and it
 never admits an issue that already has a work item, so it does not duplicate a
-delivery that arrived. A manual redelivery of the lost label after that
-backstop admitted the issue counts as a relabel and starts a second run.
+delivery that arrived. A manual redelivery of the lost label after the
+reconciler admitted the issue counts as a relabel and starts a second run.
 
-When intake is webhook, subscribe the App webhook to **Issues** and **Issue
-comments** in addition to the review subscriptions when both gates are on. Give
-the App **Issues: Read and write**
+Subscribe the App webhook to **Issues** and **Issue comments** in addition to
+the review subscriptions when both gates are on. Give the App **Issues: Read and write**
 so Curie can re-read the issue, keep its one status comment, and set the
 `curie-factory:*` state labels. **Metadata: Read** is already implied by repository
 installation discovery.

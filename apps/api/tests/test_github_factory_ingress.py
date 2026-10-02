@@ -326,6 +326,64 @@ def test_bad_signature_is_rejected_before_a_work_item_exists(
     assert _requests(number) == []
 
 
+def _signed_webhook(client: TestClient, secret: str) -> httpx.Response:
+    body = b'{"action":"labeled"}'
+    signature = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return client.post(
+        "/github/webhook",
+        content=body,
+        headers={
+            "X-GitHub-Delivery": str(uuid.uuid4()),
+            "X-GitHub-Event": "issues",
+            "X-Hub-Signature-256": signature,
+            "Content-Type": "application/json",
+        },
+    )
+
+
+def test_empty_webhook_secret_rejects_its_own_hmac(
+    monkeypatch: pytest.MonkeyPatch, clean_db: None, valkey: object
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+    monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "false")
+    monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "")
+    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
+    monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
+    monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
+    monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
+    get_settings.cache_clear()
+    try:
+        with TestClient(create_app()) as client:
+            response = _signed_webhook(client, "")
+    finally:
+        get_settings.cache_clear()
+
+    assert response.status_code == 401, response.text
+
+
+def test_configured_webhook_secret_accepts_a_valid_signature(
+    monkeypatch: pytest.MonkeyPatch, clean_db: None, valkey: object
+) -> None:
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+    monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "false")
+    monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "example-factory-hmac-secret")
+    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
+    monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
+    monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
+    monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
+    get_settings.cache_clear()
+    try:
+        with TestClient(create_app()) as client:
+            response = _signed_webhook(client, "example-factory-hmac-secret")
+    finally:
+        get_settings.cache_clear()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "ignored"
+
+
 def test_factory_disabled_issues_stay_ignored(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -821,38 +879,28 @@ def test_concurrent_label_deliveries_leave_one_active_execution(
     number = next(_ISSUES)
     api.issue_number = number
     payload = _issue_event("labeled", number, label={"name": LABEL})
-    body = json.dumps(payload).encode()
+    responses: list[httpx.Response] = []
+    errors: list[BaseException] = []
 
-    async def go() -> list[str]:
-        engine = create_async_engine(get_settings().database_url)
-        maker = async_sessionmaker(engine, expire_on_commit=False)
-
-        async def deliver() -> str:
-            async with maker() as session:
-                result = await handle_factory_delivery(
-                    session,
-                    settings=get_settings(),
-                    client=client.app.state.http_client,
-                    event="issues",
-                    delivery_id=str(uuid.uuid4()),
-                    body=body,
-                    payload=payload,
-                )
-            return result.status
-
+    def post_once() -> None:
         try:
-            return list(await asyncio.gather(deliver(), deliver()))
-        finally:
-            await engine.dispose()
+            responses.append(_post(client, "issues", payload, delivery=str(uuid.uuid4())))
+        except BaseException as exc:
+            errors.append(exc)
 
-    statuses = asyncio.run(go())
-    # Both deliveries name the same timeline event, so they share one request.
-    assert "factory_admitted" in statuses, statuses
-    assert set(statuses) <= {"factory_admitted", "factory_duplicate"}
+    threads = [threading.Thread(target=post_once) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert [response.status_code for response in responses] == [200, 200]
+    statuses = [response.json()["status"] for response in responses]
+    assert statuses == ["factory_admitted", "factory_admitted"]
     rows = _requests(number)
     assert len({row["work_item_id"] for row in rows}) == 1
-    assert [row["status"] for row in rows].count("waiting") == 1, (statuses, rows)
-    assert len({row["id"] for row in rows}) == 1
+    assert [row["status"] for row in rows].count("waiting") == 1
 
 
 def _mark_running(request_id: uuid.UUID) -> None:

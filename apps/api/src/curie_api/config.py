@@ -12,7 +12,7 @@ production deployments.
 
 import json
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from aci_protocol import (
@@ -174,11 +174,6 @@ class Settings(BaseSettings):
     # boot rather than surfacing as a mid-reconcile timedelta error (#3709).
     github_factory_reconcile_interval_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
     github_factory_reconcile_grace_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
-    # Polling is the default intake (#3745). Webhook mode is opt-in and keeps
-    # the missed-label backstop. The interval is a positive finite number of
-    # seconds; 45 sits in the 30 to 60 second band.
-    github_factory_intake: Literal["poll", "webhook"] = "poll"
-    github_factory_poll_interval_s: float = Field(default=45, gt=0, allow_inf_nan=False)
     # Public origin GitHub's image proxy fetches the live status card from
     # (#3077), e.g. https://curie.example.com. Empty omits the card image; the
     # status comment still carries the checklist and the result.
@@ -842,7 +837,7 @@ class Settings(BaseSettings):
             offenders.append("GITHUB_APP_ID")
         if not self.github_app_private_key.strip():
             offenders.append("GITHUB_APP_PRIVATE_KEY")
-        if self.github_factory_intake == "webhook" and (
+        if (
             not self.github_webhook_secret.strip()
             or self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET
         ):
@@ -913,14 +908,7 @@ class Settings(BaseSettings):
         offenders = []
         if self.api_key in ("", _DEV_DEFAULT_API_KEY):
             offenders.append("API_KEY")
-        empty_poll_secret = (
-            self.github_webhook_secret == ""
-            and self.github_factory_ingress_enabled
-            and self.github_factory_intake == "poll"
-        )
-        if self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET or (
-            self.github_webhook_secret == "" and not empty_poll_secret
-        ):
+        if self.github_webhook_secret in ("", _DEV_DEFAULT_WEBHOOK_SECRET):
             offenders.append("GITHUB_WEBHOOK_SECRET")
         if self.internal_worker_token in ("", _DEV_DEFAULT_INTERNAL_WORKER_TOKEN):
             offenders.append("CURIE_INTERNAL_WORKER_TOKEN")

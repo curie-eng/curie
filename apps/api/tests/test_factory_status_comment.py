@@ -82,7 +82,6 @@ def _marked(sink: Any, request_id: uuid.UUID) -> list[dict[str, Any]]:
 def _admit(client: Any, github: Any, sink: Any, number: int) -> uuid.UUID:
     github.issue_number = number
     github.labels = [LABEL]
-    github.advance_label_event(number)
     sink.issue_labels[number] = {LABEL, "bug"}
     response = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
     assert response.json()["status"] == "factory_admitted", response.text
@@ -523,7 +522,6 @@ def test_relabel_while_waiting_finalizes_the_old_comment_and_opens_a_new_one(
     number = 9911
     old_id = _admit(client, github, sink, number)
     _reconcile()
-    github.advance_label_event(number)
     again = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
     assert again.json()["status"] == "factory_admitted"
     rows = _rows(

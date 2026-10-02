@@ -127,10 +127,8 @@ api:
   GITHUB_FACTORY_CI_WAIT_S: api.githubFactoryCiWaitSeconds
   GITHUB_FACTORY_PYTHON_CI: api.githubFactoryPythonCi
   GITHUB_FACTORY_INGRESS_ENABLED: api.githubFactoryIngressEnabled
-  GITHUB_FACTORY_INTAKE: api.githubFactoryIntake
   GITHUB_FACTORY_LABEL: api.githubFactoryLabel
   GITHUB_FACTORY_MENTION: api.githubFactoryMention
-  GITHUB_FACTORY_POLL_INTERVAL_S: api.githubFactoryPollIntervalSeconds
   GITHUB_REPO_ALLOWLIST: api.githubRepoAllowlist
   GITHUB_REVIEW_INGRESS_ENABLED: api.githubReviewIngressEnabled
   GITHUB_REVIEW_RECONCILER_INTERVAL_S: api.githubReviewReconcilerIntervalSeconds

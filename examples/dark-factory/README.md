@@ -132,10 +132,9 @@ curie cluster overrides dark-factory --execution-deadline 10800
 # registration link (add --org <org> for an organization) and four manual
 # steps, and applies nothing. It never opens a browser. Click Create, copy the
 # App ID, generate a private key, install the App on the repositories, and in
-# the App settings subscribe to Issues, Issue comment, Pull request review,
-# and Pull request review comment. A webhook URL and secret are optional.
-# Polling is the default and does not need them. Then rerun with the App's
-# details.
+# the App settings turn the webhook on, set its URL and secret, and subscribe
+# to Issues, Issue comment, Pull request review, and Pull request review
+# comment. Then rerun with the App's details.
 curie cluster factory
 
 # The rerun confirms the App with GET /app, takes the mention from its slug,
@@ -143,13 +142,14 @@ curie cluster factory
 # is checked against them instead). The label defaults to curie-factory and
 # is created in each repository. The key goes into the Secret
 # curie-github-app (key privateKey) through kubectl stdin; a Secret that
-# holds another App's key is refused. Polling does not need a webhook secret.
-# Pass --webhook-secret-file (or CURIE_GITHUB_WEBHOOK_SECRET) only for webhook
-# mode. Before applying anything, the command checks the merged config
+# holds another App's key is refused. The webhook secret comes from the file
+# (or CURIE_GITHUB_WEBHOOK_SECRET) and is still required until polling intake
+# ships. Before applying anything, the command checks the merged config
 # against the API boot gate and applies nothing if one value is missing. The
 # values survive a later `curie cluster up`.
 curie cluster factory \
-  --app-id <app-id> --private-key-file ./app.pem
+  --app-id <app-id> --private-key-file ./app.pem \
+  --webhook-secret-file ./webhook-secret
 
 curie cluster deploy --plugin-dir ./dark-factory \
   --agent dark-factory --env prod --repo acme-corp/acme-bot
@@ -170,9 +170,8 @@ gate requires.
 A kind cluster works for a single operator. It pulls the published runner
 layer from GHCR, so it needs no local registry.
 
-Polling does not need GitHub to reach the API. Webhook mode is optional.
-For that mode, GitHub must reach the API to deliver webhooks. Start a
-port-forward and a cloudflared quick tunnel to it:
+GitHub must reach the API to deliver webhooks. Start a port-forward and a
+cloudflared quick tunnel to it:
 
 ```bash
 kubectl --context kind-<name> -n curie port-forward svc/curie-api 8000:8000

@@ -401,7 +401,6 @@ def test_a_failed_requests_token_cannot_write_onto_the_run_that_replaced_it(
     first = _request(number)["id"]
     _fail(client, first)
     github.labels = [LABEL]
-    github.advance_label_event(number)
     again = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
     assert again.json()["status"] == "factory_admitted", again.text
     rows = _all_requests(number)
@@ -859,7 +858,6 @@ def test_a_stale_request_cannot_record_verification_for_its_replacement(
     first = _request(number)["id"]
     _fail(client, first)
     github.labels = [LABEL]
-    github.advance_label_event(number)
     again = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
     assert again.json()["status"] == "factory_admitted", again.text
     rows = _all_requests(number)
