@@ -37,7 +37,7 @@ separate trusted job with your GitHub App's identity.
 | `kind` v0.24 or later, `kubectl`, `helm` | the local cluster. kind's network plugin enforces NetworkPolicy from v0.24, which the sandbox lockdown relies on. |
 | `cloudflared` | a public URL for the GitHub webhook |
 | `gh` | creating the repository, label and issue (the web UI works too) |
-| `curie` v0.11.3 or later | install and deploy ([releases](https://github.com/curie-eng/curie/releases)) |
+| `curie` v0.11.2 or later | install and deploy ([releases](https://github.com/curie-eng/curie/releases)) |
 | An [OpenRouter](https://openrouter.ai/) API key | the factory model, `z-ai/glm-5.3-flash` by default |
 | A GitHub account | your own GitHub App and the trial repository |
 
