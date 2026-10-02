@@ -51,9 +51,9 @@ git history (`git log -- docs/`).
 - [`operations.md`](operations.md): running a cluster install, plus
   operator-facing findings from early installs.
 * [`guides/dark-factory-quickstart.md`](guides/dark-factory-quickstart.md):
-  `curie factory quickstart` takes a new repository from nothing to a labelled
-  issue the dark factory can turn into a pull request, with polling intake and
-  no webhook tunnel.
+  from nothing to a pull request the dark factory opened on a new repository,
+  on a laptop kind cluster: your own GitHub App, factory intake, the tunnel,
+  the agent deploy, and troubleshooting.
 - [`guides/repository-toolchain-in-the-managed-sandbox.md`](guides/repository-toolchain-in-the-managed-sandbox.md):
   the supported recipe for installing a repository's dependencies and running
   its checks inside a managed sandbox, including the measured fail-closed

@@ -736,11 +736,6 @@ enum Command {
         #[arg(long, global = true, value_name = "NAME")]
         context: Option<String>,
     },
-    /// Bring up Curie and the dark factory without a webhook or a tunnel.
-    Factory {
-        #[command(subcommand)]
-        action: FactoryAction,
-    },
     /// Install a complete first party example workflow.
     Example {
         #[command(subcommand)]
@@ -1046,59 +1041,6 @@ enum Command {
         /// it at the same chart `curie apply --chart` would use.
         #[arg(long)]
         chart: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum FactoryAction {
-    /// Create a cluster when none is targeted, install Curie, register the
-    /// GitHub App, and on the second run deploy the published dark factory.
-    /// Never opens a browser and never runs gh.
-    Quickstart {
-        /// GitHub repository the factory may work in, as owner/name.
-        #[arg(long = "repo", value_name = "OWNER/NAME")]
-        repo: String,
-        /// Numeric GitHub App ID. Pair with --private-key-file. Without both,
-        /// the command prints the registration link and exits after cluster up.
-        #[arg(long, value_name = "ID", requires = "private_key_file")]
-        app_id: Option<String>,
-        /// PEM private key downloaded from the App. The path is passed through;
-        /// the key contents never enter argv.
-        #[arg(long, value_name = "PATH", requires = "app_id")]
-        private_key_file: Option<PathBuf>,
-        /// Kubernetes context. When omitted, the current kubeconfig context is
-        /// used. When neither exists, a kind cluster is created.
-        #[arg(long, value_name = "NAME")]
-        context: Option<String>,
-        /// Kubernetes namespace. Default: curie.
-        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
-        namespace: String,
-        /// Helm release name. Default: curie.
-        #[arg(long, default_value = "curie")]
-        release: String,
-        /// Print the registration link for this GitHub organization instead of
-        /// a personal account.
-        #[arg(long, value_name = "ORG")]
-        org: Option<String>,
-        /// Kind cluster name used only when no kube context is targeted.
-        #[arg(long, default_value = curie::factory_quickstart::DEFAULT_KIND_NAME)]
-        kind_name: String,
-        /// Model id installed by cluster up.
-        #[arg(long, default_value = curie::factory_quickstart::DEFAULT_MODEL)]
-        model: String,
-        /// Per run execution deadline in seconds for the deployed agent.
-        #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_DEADLINE_SECONDS)]
-        execution_deadline: u32,
-        /// Daily USD budget for the deployed agent.
-        #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_BUDGET_USD)]
-        budget: f64,
-        /// Helm chart. Default: the version pinned chart on release builds;
-        /// local charts/curie on dev builds.
-        #[arg(long)]
-        chart: Option<String>,
-        /// Print the steps and exit without creating a cluster or applying anything.
-        #[arg(long)]
-        dry_run: bool,
     },
 }
 
@@ -5511,52 +5453,6 @@ async fn run(command: Option<Command>) -> Result<()> {
                 .await?,
             ),
         },
-        Some(Command::Factory { action }) => match action {
-            FactoryAction::Quickstart {
-                repo,
-                app_id,
-                private_key_file,
-                context,
-                namespace,
-                release,
-                org,
-                kind_name,
-                model,
-                execution_deadline,
-                budget,
-                chart,
-                dry_run,
-            } => {
-                let resolved = artifacts::resolve_chart(
-                    chart.as_deref(),
-                    artifacts::Channel::current(),
-                    artifacts::version(),
-                    artifacts::cache_root,
-                    std::path::Path::new("charts/curie").is_dir(),
-                )?;
-                let chart = materialize_artifact(resolved, dry_run, "chart").await?;
-                emit(
-                    curie::factory_quickstart::quickstart(
-                        curie::factory_quickstart::QuickstartOpts {
-                            repo,
-                            app_id,
-                            private_key_file,
-                            context,
-                            namespace,
-                            release,
-                            org,
-                            kind_name,
-                            model,
-                            execution_deadline_seconds: execution_deadline,
-                            budget_usd: budget,
-                            chart,
-                            dry_run,
-                        },
-                    )
-                    .await?,
-                )
-            }
-        },
         Some(Command::Cluster { action, context }) => {
             let target = curie::kube_context::pin_for_cluster_command(context.as_deref())?;
             if let Some(target) = &target {
@@ -5936,7 +5832,6 @@ async fn run(command: Option<Command>) -> Result<()> {
                         app_id,
                         private_key_file,
                         org,
-                        intake: None,
                     })
                     .await?,
                 )

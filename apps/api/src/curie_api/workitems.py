@@ -536,9 +536,7 @@ async def create_execution_request(
         work_item = await _reload_work_item(session, work_item_id)
         existing = await _lock_request_by_id(session, request_id)
         if existing is not None:
-            if existing.work_item_id == work_item_id and (
-                existing.wait_deadline == wait_deadline or existing.status == "waiting"
-            ):
+            if existing.work_item_id == work_item_id and existing.wait_deadline == wait_deadline:
                 return await _outcome(session, work_item, existing, replayed=True)
             return await _conflict(
                 session, "identity_mismatch", work_item=work_item, request=existing
@@ -1523,11 +1521,6 @@ async def readmit(
     if work_item is None:
         return await _conflict(session, "not_found", work_item_id=work_item_id)
     active = await _lock_active_request(session, work_item_id)
-    # The same timeline event can arrive twice before either caller has
-    # committed its request row. Superseding that row would cancel the run
-    # the other caller just admitted.
-    if active is not None and active.id == request_id:
-        return await _outcome(session, work_item, active, replayed=True)
     now = await _database_now(session)
     if active is not None and active.status in ("running", "cancellation_requested"):
         if active.status == "running":

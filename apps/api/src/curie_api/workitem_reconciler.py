@@ -23,7 +23,7 @@ from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
-from . import factory_ci, factory_label_reconcile, factory_notices, factory_poll_intake, workitems
+from . import factory_ci, factory_label_reconcile, factory_notices, workitems
 from .config import Settings
 from .models import ExecutionRequest, Publication, WorkItem
 from .workitem_dispatch import (
@@ -498,10 +498,7 @@ class WorkItemReconciler:
         """Admit labeled issues whose delivery GitHub never retried (#3081)."""
 
         settings = self._settings
-        if settings.github_factory_intake == "poll":
-            interval = settings.github_factory_poll_interval_s
-        else:
-            interval = settings.github_factory_reconcile_interval_s
+        interval = settings.github_factory_reconcile_interval_s
         if not settings.github_factory_ingress_enabled or interval <= 0:
             return
         clock = asyncio.get_running_loop().time()
@@ -509,12 +506,9 @@ class WorkItemReconciler:
             return
         self._labels_due = clock + interval
         async with httpx.AsyncClient(timeout=settings.github_app_timeout_seconds) as client:
-            if settings.github_factory_intake == "poll":
-                await factory_poll_intake.poll_once(self._sessionmaker, settings, client)
-            else:
-                await factory_label_reconcile.reconcile_missed_labels(
-                    self._sessionmaker, settings, client, now=datetime.now(UTC)
-                )
+            await factory_label_reconcile.reconcile_missed_labels(
+                self._sessionmaker, settings, client, now=datetime.now(UTC)
+            )
 
     async def _sync_status_comments(self) -> None:
         paused_for_upgrade = False

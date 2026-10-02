@@ -62,7 +62,6 @@ def _all(number: int) -> list[dict[str, Any]]:
 def _labelled(client: Any, github: Any, number: int) -> Any:
     github.issue_number = number
     github.labels = [LABEL]
-    github.advance_label_event(number)
     return _post(
         client,
         "issues",

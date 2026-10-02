@@ -84,11 +84,8 @@ another handler that mints a `QueuedTurn` with the right `source`. The seven tha
   so without it a label is lost. It runs as a step of the API's WorkItem reconciler
   loop (`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._reconcile_missed_labels`),
   at most every `github_factory_reconcile_interval_s` (300 seconds by default, 0
-  disables it), and only when factory ingress is on and `github_factory_intake` is
-  `webhook`. Under the default `poll` intake the same step instead runs
-  `apps/api/src/curie_api/factory_poll_intake.py::poll_once` every
-  `github_factory_poll_interval_s`, which lists labeled issues, mentions, and review
-  feedback and admits through the same verification.
+  disables it), and only when factory ingress is on. The signed webhook remains
+  the immediate intake path; reconciliation recovers labels whose delivery was missed.
 - **Commit poll** — `apps/api/src/curie_api/commitpoller.py::CommitPoller.run_forever`:
   a timer in the API asks GitHub whether the deploy branches moved and hands any
   new commit to the same `process_push(...)`. Off unless
@@ -198,9 +195,8 @@ scheduler in the worker:
    that the WorkItem reconciler later enqueues.
 7. Factory missed-label reconciliation in the API
    (`apps/api/src/curie_api/factory_label_reconcile.py::reconcile_missed_labels`), a
-   step of the WorkItem reconciler loop in `webhook` intake mode; the default `poll`
-   mode runs `apps/api/src/curie_api/factory_poll_intake.py::poll_once` in that step
-   instead.
+   step of the WorkItem reconciler loop that recovers labels whose signed
+   webhook delivery was missed.
 8. Declared cron triggers in the worker
    (`apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop.run_forever`, ADR-0099, #268):
    each tick reads every in-force deployment's `cron` triggers, records the due slot in
