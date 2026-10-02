@@ -151,9 +151,17 @@ class UsageReporter:
         self._url = url
         self._token = token
         self._observed: dict[tuple[str, str], dict[str, int]] = {}
+        self._seen_message_ids: set[tuple[str, str, str]] = set()
 
     def observe(self, message: AssistantMessage) -> None:
-        """Accumulate one assistant message's usage under its SDK-given role."""
+        """Accumulate one assistant message's usage under its SDK-given role.
+
+        The Claude Agent SDK can yield several ``AssistantMessage`` objects for
+        one API response, each repeating ``message_id`` and ``usage`` (one per
+        content block when the model emits parallel tools). Count each
+        ``message_id`` once per ``(role, model)``. Messages with no id still
+        accumulate, because there is nothing to deduplicate.
+        """
 
         usage = getattr(message, "usage", None)
         model = getattr(message, "model", None)
@@ -164,12 +172,19 @@ class UsageReporter:
         if not isinstance(usage, dict):
             usage = {}
         role = REVIEWER if getattr(message, "parent_tool_use_id", None) is not None else IMPLEMENTER
+        message_id = getattr(message, "message_id", None)
+        if isinstance(message_id, str) and message_id:
+            seen = (role, model, message_id)
+            if seen in self._seen_message_ids:
+                return
+            self._seen_message_ids.add(seen)
         bucket = self._observed.setdefault((role, model), dict.fromkeys(_WIRE_KEYS, 0))
         for source, wire in _USAGE_KEYS.items():
             bucket[wire] += _count(usage.get(source))
 
     async def report(self, message: ResultMessage, primary_model: str | None) -> None:
         observed, self._observed = self._observed, {}
+        self._seen_message_ids.clear()
         try:
             body = build_usage_body(message, primary_model, observed=observed)
         except Exception as exc:  # never fail the turn over a cost line

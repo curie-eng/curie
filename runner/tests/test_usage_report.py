@@ -253,8 +253,10 @@ def test_the_report_is_awaited_before_the_final_event_is_yielded() -> None:
 # - ``UsageReporter.observe(message: AssistantMessage) -> None``: accumulates the
 #   message's ``usage`` keyed by ``(role, model)`` where role is ``"reviewer"``
 #   when ``message.parent_tool_use_id is not None`` else ``"implementer"``.
-#   ``report(result, primary_model)`` builds the body from the accumulated
-#   observations and then resets them, whether or not anything was posted.
+#   A non-empty ``message_id`` counts once per ``(role, model)`` for the turn;
+#   a message with no id still adds. ``report(result, primary_model)`` builds
+#   the body from the accumulated observations and then resets them, whether
+#   or not anything was posted.
 # - ``build_usage_body(message, primary_model, observed=None)``: ``observed`` is a
 #   ``Mapping[tuple[str, str], Mapping[str, int]]`` of ``(role, model)`` to wire
 #   token counts (``input_tokens``, ``cached_input_tokens``,
@@ -268,12 +270,19 @@ def test_the_report_is_awaited_before_the_final_event_is_yielded() -> None:
 from claude_agent_sdk import AssistantMessage, TextBlock  # noqa: E402
 
 
-def _assistant(model: str, usage: dict[str, int], *, parent: str | None = None) -> AssistantMessage:
+def _assistant(
+    model: str,
+    usage: dict[str, int],
+    *,
+    parent: str | None = None,
+    message_id: str | None = None,
+) -> AssistantMessage:
     return AssistantMessage(
         content=[TextBlock(text="x")],
         model=model,
         parent_tool_use_id=parent,
         usage=usage,
+        message_id=message_id,
     )
 
 
@@ -439,6 +448,124 @@ def test_the_session_runner_observes_every_assistant_message_before_the_report()
     anyio.run(go)
     assert [kind for kind, _ in calls] == ["observe", "observe", "report"]
     assert calls[0][1] is main and calls[1][1] is sub
+
+
+def test_observe_counts_each_message_id_once() -> None:
+    """Several AssistantMessages can repeat one API response.
+
+    The Agent SDK cost guide says that when Claude uses multiple tools in one
+    turn, all messages in that turn share the same ID and the same usage, so
+    callers deduplicate by ID. The posted reviewer share is that once-count,
+    capped by the result total. A missing id is not a shared response, so
+    those messages still add. A distinct id adds too.
+    https://code.claude.com/docs/en/agent-sdk/cost-tracking
+    """
+
+    recorder = _Recorder()
+
+    async def go() -> None:
+        server = TestServer(recorder.app())
+        await server.start_server()
+        try:
+            url = str(server.make_url("/v1/work-item-progress/example-request/usage"))
+            reporter = UsageReporter(url, TOKEN)
+            repeated = _sdk_usage(100, 10, cached=4, write=2)
+            for _ in range(3):
+                reporter.observe(
+                    _assistant(
+                        PRIMARY,
+                        repeated,
+                        parent="toolu_example",
+                        message_id="msg_example_repeat",
+                    )
+                )
+            reporter.observe(
+                _assistant(
+                    PRIMARY,
+                    _sdk_usage(7, 1),
+                    parent="toolu_example",
+                    message_id="msg_example_other",
+                )
+            )
+            for _ in range(2):
+                reporter.observe(_assistant(PRIMARY, _sdk_usage(1, 0), parent="toolu_example"))
+            await reporter.report(
+                _result(
+                    model_usage={PRIMARY: _model_usage(200, 20, cached=10, write=4)},
+                    uuid="t-dedupe",
+                ),
+                PRIMARY,
+            )
+            # The seen set is per turn. The same id on the next turn counts again.
+            reporter.observe(
+                _assistant(
+                    PRIMARY,
+                    _sdk_usage(5, 1),
+                    parent="toolu_example",
+                    message_id="msg_example_repeat",
+                )
+            )
+            await reporter.report(
+                _result(model_usage={PRIMARY: _model_usage(5, 1)}, uuid="t-dedupe-next"),
+                PRIMARY,
+            )
+        finally:
+            await server.close()
+
+    anyio.run(go)
+    assert len(recorder.received) == 2
+    got = _by_role_model(recorder.received[0][0])
+    assert set(got) == {("implementer", PRIMARY), ("reviewer", PRIMARY)}
+    assert {k: got[("reviewer", PRIMARY)][k] for k in _wire(0, 0)} == _wire(
+        109, 11, cached=4, write=2
+    )
+    assert {k: got[("implementer", PRIMARY)][k] for k in _wire(0, 0)} == _wire(
+        91, 9, cached=6, write=2
+    )
+    nxt = _by_role_model(recorder.received[1][0])
+    assert set(nxt) == {("reviewer", PRIMARY)}
+    assert nxt[("reviewer", PRIMARY)]["input_tokens"] == 5
+
+
+def test_shared_model_split_uses_deduplicated_message_counts() -> None:
+    """Implementer and reviewer on one model split from once-per-message counts.
+
+    Three reviewer blocks that repeat one message_id must not consume the whole
+    model total and leave the implementer the remainder of a triple count.
+    """
+
+    recorder = _Recorder()
+
+    async def go() -> None:
+        server = TestServer(recorder.app())
+        await server.start_server()
+        try:
+            url = str(server.make_url("/v1/work-item-progress/example-request/usage"))
+            reporter = UsageReporter(url, TOKEN)
+            reporter.observe(_assistant(SHARED, _sdk_usage(600, 60), message_id="msg_example_impl"))
+            reviewer = _sdk_usage(200, 20)
+            for _ in range(3):
+                reporter.observe(
+                    _assistant(
+                        SHARED,
+                        reviewer,
+                        parent="toolu_example",
+                        message_id="msg_example_rev",
+                    )
+                )
+            await reporter.report(
+                _result(model_usage={SHARED: _model_usage(800, 80)}, uuid="t-shared-dedupe"),
+                SHARED,
+            )
+        finally:
+            await server.close()
+
+    anyio.run(go)
+    assert len(recorder.received) == 1
+    got = _by_role_model(recorder.received[0][0])
+    assert set(got) == {("implementer", SHARED), ("reviewer", SHARED)}
+    assert {k: got[("reviewer", SHARED)][k] for k in _wire(0, 0)} == _wire(200, 20)
+    assert {k: got[("implementer", SHARED)][k] for k in _wire(0, 0)} == _wire(600, 60)
 
 
 def test_a_subagent_message_without_usage_still_marks_its_model_reviewer() -> None:
