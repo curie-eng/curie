@@ -401,6 +401,7 @@ LOCAL_FAILURE_ENV_VALUES=()
 LOCAL_FAILURE_ENV_PRESENT=()
 LOCAL_MODEL_ERROR_PROVIDER_NAME="curie-ladder-model-error-$$"
 LOCAL_MODEL_ERROR_PROVIDER_OWNED=0
+LOCAL_MODEL_ERROR_PROVIDER_ID=""
 OTEL_E2E_SECRET_SENTINEL="xapp-"
 OTEL_E2E_SECRET_SENTINEL+="0-0000000000-0000000000-$$"
 
@@ -4222,12 +4223,14 @@ start_local_model_error_provider() {
         return 1
     fi
     LOCAL_MODEL_ERROR_PROVIDER_OWNED=1
-    docker run -d --name "$LOCAL_MODEL_ERROR_PROVIDER_NAME" \
+    if ! LOCAL_MODEL_ERROR_PROVIDER_ID="$(docker run -d --name "$LOCAL_MODEL_ERROR_PROVIDER_NAME" \
         --label "curietech.ai/e2e-owner=$LOCAL_OTEL_SINK_NAME" \
         --network "$network" \
         -v "$REPO_ROOT/cli/scripts/fixtures/terminal-provider-error.py:/terminal-provider-error.py:ro" \
         --entrypoint python3 "$image" /terminal-provider-error.py --host 0.0.0.0 --port 8081 \
-        >/dev/null || return 1
+        )"; then
+        return 1
+    fi
     local attempt
     for attempt in $(seq 1 10); do
         if local_model_error_provider_health >/dev/null 2>&1; then
@@ -4249,18 +4252,28 @@ with urllib.request.urlopen("http://127.0.0.1:8081/health", timeout=2) as respon
 
 stop_local_model_error_provider() {
     if (( LOCAL_MODEL_ERROR_PROVIDER_OWNED )); then
-        local owner
-        if ! owner="$(docker inspect "$LOCAL_MODEL_ERROR_PROVIDER_NAME" \
-            --format '{{index .Config.Labels "curietech.ai/e2e-owner"}}' 2>/dev/null)"; then
+        local identity owner container
+        local inspect_target="${LOCAL_MODEL_ERROR_PROVIDER_ID:-$LOCAL_MODEL_ERROR_PROVIDER_NAME}"
+        if ! identity="$(docker inspect "$inspect_target" \
+            --format '{{.Id}} {{index .Config.Labels "curietech.ai/e2e-owner"}}' \
+            2>"$WORKDIR/model-provider-inspect-error")"; then
+            if ! grep -Eq 'No such (object|container)' "$WORKDIR/model-provider-inspect-error"; then
+                echo "local: could not verify model failure provider cleanup" >&2
+                return 1
+            fi
             LOCAL_MODEL_ERROR_PROVIDER_OWNED=0
+            LOCAL_MODEL_ERROR_PROVIDER_ID=""
             return 0
         fi
+        container="${identity%% *}"
+        owner="${identity#* }"
         if [[ "$owner" != "$LOCAL_OTEL_SINK_NAME" ]]; then
             echo "local: model failure provider ownership changed; refusing to remove it" >&2
             return 1
         fi
-        docker rm -f "$LOCAL_MODEL_ERROR_PROVIDER_NAME" >/dev/null || return 1
+        docker rm -f "$container" >/dev/null || return 1
         LOCAL_MODEL_ERROR_PROVIDER_OWNED=0
+        LOCAL_MODEL_ERROR_PROVIDER_ID=""
     fi
 }
 
