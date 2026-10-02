@@ -193,6 +193,7 @@ def _full_boot_env() -> BootEnv:
         api_backend="messages",
         thinking="disabled",
         deployment_environment="prod",
+        channel_bound=True,
         model_env_key="MY_PROVIDER_KEY",
         metrics_temporality_preference="delta",
         max_turns=50,
@@ -557,6 +558,7 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         connector_namespace="curie",
         connector_caller_token="cct.payload.signature",
         bundle_version="abc123def456",
+        channel_bound=True,
     )
     worker_owned = set(BootEnv.env_keys(producer="worker"))
     assert set(maximal) <= worker_owned
@@ -814,6 +816,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_MODEL_API_BACKEND",
         "CURIE_THINKING",
         "CURIE_DEPLOYMENT_ENVIRONMENT",
+        "CURIE_CHANNEL_BOUND",
         "CURIE_MODEL_ENV_KEY",
         "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
         "CURIE_MAX_TURNS",
@@ -1036,3 +1039,30 @@ def test_the_caller_token_survives_the_worker_render_and_the_consumer_parse() ->
 
 def test_the_caller_token_has_one_producer_the_worker() -> None:
     assert _producers_of("CURIE_CONNECTOR_CALLER_TOKEN") == {"worker"}
+
+
+def test_render_worker_omits_channel_bound_by_default() -> None:
+    assert "CURIE_CHANNEL_BOUND" not in _worker_env()
+
+
+def test_render_worker_emits_channel_bound_when_the_turn_is_bound() -> None:
+    assert _worker_env(channel_bound=True)["CURIE_CHANNEL_BOUND"] == "1"
+
+
+def test_from_env_leaves_channel_bound_unset_when_absent_or_blank() -> None:
+    env = _worker_env() | _SUBSTRATE_ENV
+    assert "CURIE_CHANNEL_BOUND" not in env
+    assert BootEnv.from_env(env).channel_bound is None
+    for blank in ("", " "):
+        parsed = BootEnv.from_env(env | {"CURIE_CHANNEL_BOUND": blank})
+        assert parsed.channel_bound is None
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "True", "yes", "YES"])
+def test_from_env_reads_channel_bound_with_the_fake_model_truthy_set(raw: str) -> None:
+    env = _worker_env() | _SUBSTRATE_ENV | {"CURIE_CHANNEL_BOUND": raw}
+    assert BootEnv.from_env(env).channel_bound is True
+
+
+def test_channel_bound_is_not_a_session_config_field() -> None:
+    assert "channel_bound" not in SessionConfig.model_fields
