@@ -2,7 +2,10 @@
 
 Date: 2026-10-01
 
-Status: Draft
+Status: Accepted
+
+Accepted by Brian on 2026-10-02 for v0.12.0. The implementation was
+already present in `runner/src/curie_runner/adapter.py`.
 
 Tracked in [#3766](https://github.com/curie-eng/curie/issues/3766), split out
 of [#3625](https://github.com/curie-eng/curie/issues/3625).

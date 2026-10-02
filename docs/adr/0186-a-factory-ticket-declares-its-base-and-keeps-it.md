@@ -2,7 +2,10 @@
 
 Date: 2026-10-01
 
-Status: Draft
+Status: Accepted
+
+Accepted by Brian on 2026-10-02 for v0.12.0. The implementation was
+already present in `apps/api/src/curie_api/factory_base.py`.
 
 Tracked in [#3095](https://github.com/curie-eng/curie/issues/3095).
 
