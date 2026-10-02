@@ -87,7 +87,7 @@ from pydantic import ValidationError
 from . import sandbox_token
 from .actions import ActionBackendError, ActionRecorder
 from .approval_cards import ApprovalCardStore
-from .approval_wording import approval_display, presentation_text
+from .approval_wording import approval_display
 from .approvals import (
     ApprovalBackendError,
     ApprovalCreator,
@@ -7446,7 +7446,7 @@ class Kernel:
         thread_key = _thread_key_for(qevent)
         summary = outcome.approval_summary or outcome.text or "Approval requested"
         display_summary = (
-            presentation_text(outcome.approval_display, outcome.approval_granted_tool)
+            outcome.approval_display
             if outcome.approval_display
             else approval_display(
                 summary, outcome.approval_granted_tool, outcome.approval_granted_arguments
