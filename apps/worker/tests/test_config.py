@@ -17,7 +17,7 @@ import os
 import socket
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import NamedTuple, cast
+from typing import Any, NamedTuple, cast
 
 import pytest
 import yaml
@@ -456,6 +456,67 @@ def test_field_name_kwargs_still_populate() -> None:
     assert config.fake_model is True
     assert config.api_key == "x"
     assert config.credentials == "c"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lock_ttl_ms", 0),
+        ("lock_ttl_ms", -1),
+        ("lock_acquire_timeout_s", 0),
+        ("lock_acquire_timeout_s", -0.5),
+        ("lock_acquire_timeout_s", float("nan")),
+        ("lock_acquire_timeout_s", float("inf")),
+        ("lock_acquire_timeout_s", float("-inf")),
+        ("lock_poll_interval_s", 0),
+        ("lock_poll_interval_s", -0.02),
+        ("lock_poll_interval_s", float("nan")),
+        ("lock_poll_interval_s", float("inf")),
+        ("lock_poll_interval_s", float("-inf")),
+    ],
+)
+def test_thread_lock_settings_must_be_positive_and_finite(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: Any
+) -> None:
+    """#3730: refuse the lock knobs at boot instead of failing every turn.
+
+    ``lock_ttl_ms`` goes straight into ``SET key token NX PX <ttl>``, so a
+    non-positive value is rejected by Valkey on every acquire; a non-positive
+    poll interval turns a contended acquire into a hot loop; a non-positive
+    acquire timeout gives up immediately; inf/nan in either float breaks the
+    timeout arithmetic the same way.
+    """
+    _clear_all_config_env(monkeypatch)
+    with pytest.raises(ValidationError):
+        WorkerConfig(**{field: value})
+
+
+def test_thread_lock_settings_env_vars_refuse_non_positive_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The issue's repro shape: LOCK_TTL_MS=0 in the pod env must refuse boot."""
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("LOCK_TTL_MS", "0")
+    with pytest.raises(ValidationError):
+        WorkerConfig()
+
+
+def test_thread_lock_settings_accept_positive_finite_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive finite values and the defaults are unchanged (#3730)."""
+    _clear_all_config_env(monkeypatch)
+
+    config = WorkerConfig()
+
+    assert config.lock_ttl_ms == 120000
+    assert config.lock_acquire_timeout_s == 45.0
+    assert config.lock_poll_interval_s == 0.02
+
+    explicit = WorkerConfig(lock_ttl_ms=1, lock_acquire_timeout_s=0.5, lock_poll_interval_s=0.001)
+    assert explicit.lock_ttl_ms == 1
+    assert explicit.lock_acquire_timeout_s == 0.5
+    assert explicit.lock_poll_interval_s == 0.001
 
 
 # --- Env-var parity vs the pre-pydantic from_env (review #178) ---------------

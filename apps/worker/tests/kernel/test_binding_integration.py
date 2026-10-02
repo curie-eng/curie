@@ -299,6 +299,34 @@ def test_eval_isolate_turn_claims_without_ambient_memory(make_harness) -> None:
     asyncio.run(go())
 
 
+def test_slack_channel_claim_marks_the_boot_env_channel_bound(make_harness) -> None:
+    """A slack claim with kind and address emits CURIE_CHANNEL_BOUND=1.
+
+    A direct boot without those coordinates omits the key. The flag is the
+    turn binding, not a second channel detector.
+    """
+
+    async def go() -> None:
+        agent_id = uuid.uuid4()
+        resolved = _resolved(agent_id, bundle="bundles/x.zip")
+        binding = RealBootEnvBinding({("slack", "C0EXAMPLE1"): resolved})
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            await h.kernel.process_event(
+                _qevent("hi", channel="C0EXAMPLE1", thread="thread-1")
+            )
+            claim_env = h.fake_k8s.claim_envs[-1]
+            assert claim_env is not None
+            assert claim_env["CURIE_CHANNEL_BOUND"] == "1"
+
+        resolver = BindingResolver.__new__(BindingResolver)
+        resolver._config = WorkerConfig()  # type: ignore[attr-defined]
+        plain = resolver.boot_env(resolved, "thread-1")
+        assert "CURIE_CHANNEL_BOUND" not in plain
+
+    asyncio.run(go())
+
+
 def test_killed_agent_refuses_new_runs(make_harness) -> None:
     async def go() -> None:
         agent_id = uuid.uuid4()

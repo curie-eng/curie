@@ -37,6 +37,7 @@ from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemConflict,
     WorkItemStartGrant,
+    WorkItemStartRefused,
 )
 from redis.exceptions import ResponseError
 
@@ -135,6 +136,10 @@ class _WorkItems:
             heartbeat_interval_s=60.0,
         )
 
+    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+        self.calls.append("issue_read_context")
+        return f"{WORK_ITEM_REPO}#7", f"wir.capability-for-{request_id}"
+
     async def finish(self, _request_id: uuid.UUID, **kwargs: object) -> None:
         self.calls.append("finish")
         self.finishes.append(kwargs)
@@ -179,6 +184,12 @@ class _RecordingSink:
             route=route,
             best_effort_unreachable=best_effort_unreachable,
         )
+
+
+def _thread_key(conversation_id: str = "1700000000.000001") -> str:
+    """The worker-internal route key for a turn built by ``_turn`` below."""
+
+    return f"slack:{CHANNEL}:{conversation_id}"
 
 
 def _turn(
@@ -574,6 +585,120 @@ def test_finished_work_item_deletes_its_sandbox_claim(
             assert "finish" in work_items.calls
             assert h.fake_k8s.deleted_claims
             assert h.fake_k8s.claims == {}
+
+    asyncio.run(exercise())
+
+
+class _StartRefusedWorkItems(_WorkItems):
+    """The API refuses ``start``: the request settled before the turn could open."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__()
+        self.code = code
+
+    async def start(self, _request_id: uuid.UUID, **_: object) -> WorkItemStartGrant:
+        self.calls.append("start")
+        raise WorkItemStartRefused(self.code)
+
+
+class _FinishRefusedWorkItems(_WorkItems):
+    """The label came off mid-turn: ``finish`` is refused ``work_item_cancelled``."""
+
+    async def finish(self, _request_id: uuid.UUID, **_: object) -> None:
+        self.calls.append("finish")
+        raise WorkItemConflict("work_item_cancelled")
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["work_item_cancelled", "waiting_deadline_elapsed", "not_found"],
+)
+def test_start_refused_on_a_terminal_code_releases_the_claimed_sandbox(
+    make_harness, code: str
+) -> None:
+    """#3208: a start refusal on a terminal code ends the execution, so the
+    claim the delivery just made must not hold quota until the route TTL lapses.
+    A request cancelled from ``waiting`` gets no terminate wake and carries no
+    teardown flag, so the worker is the only one that can release it."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            work_items = _StartRefusedWorkItems(code)
+            h.kernel._work_items = work_items
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            assert "start" in work_items.calls
+            assert h.fake_k8s.deleted_claims
+            assert h.fake_k8s.claims == {}
+            assert h.substrate._affinity.get(_thread_key()) is None
+
+    asyncio.run(exercise())
+
+
+def test_start_refused_not_dispatchable_keeps_its_sandbox_claim(make_harness) -> None:
+    """#3208's allowlist has an opposite: ``not_dispatchable`` can mean a lapsed
+    acquire lease, where a replacement re-acquires the same generation and
+    adopts this thread's route, so the refused delivery must leave the claim
+    standing rather than yank it out from under the next owner."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            work_items = _StartRefusedWorkItems("not_dispatchable")
+            h.kernel._work_items = work_items
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            assert "start" in work_items.calls
+            assert h.fake_k8s.deleted_claims == []
+            assert len(h.fake_k8s.claims) == 1
+            assert h.substrate._affinity.get(_thread_key()) is not None
+
+    asyncio.run(exercise())
+
+
+def test_finish_refused_as_cancelled_releases_the_sandbox_claim(make_harness) -> None:
+    """#3208: the label came off mid-turn, so the request is already settled
+    ``cancelled`` and ``finish`` is refused. The run must still count as
+    settled locally so the delivery releases its claim instead of holding
+    quota until the terminate-wake backstop catches up."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            work_items = _FinishRefusedWorkItems()
+            h.kernel._work_items = work_items
+            h.runner.default_script = [
+                TextDelta(text="Working. "),
+                Final(text="Working. Done.", status=SessionStatus.DONE),
+            ]
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            assert "finish" in work_items.calls
+            assert h.fake_k8s.deleted_claims
+            assert h.fake_k8s.claims == {}
+            assert h.substrate._affinity.get(_thread_key()) is None
 
     asyncio.run(exercise())
 

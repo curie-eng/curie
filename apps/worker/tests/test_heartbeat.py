@@ -15,6 +15,7 @@ import time
 import pytest
 from curie_worker.config import WorkerConfig
 from curie_worker.heartbeat import run_heartbeat
+from pydantic import ValidationError
 
 
 def test_run_heartbeat_touches_file_and_exits_promptly_on_stop(tmp_path) -> None:
@@ -106,3 +107,41 @@ def test_worker_config_reads_heartbeat_env(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert cfg.heartbeat_file == "/var/run/curie/wk.hb"
     assert cfg.heartbeat_interval_s == 2.5
+
+
+# An interval of 0, a negative, or a non finite number is not a slower
+# heartbeat but NO heartbeat: run_heartbeat waits
+# ``asyncio.wait_for(stop.wait(), timeout=interval_s)``, and a timeout of 0 or
+# below expires at once, so the loop touches the file as fast as the loop can
+# turn (issue #3726 measured 117617 touches in one second on v0.11.1). A
+# heartbeat that exists to detect a wedged event loop must not be able to load
+# that loop itself, so the settings refuse these values at construction
+# instead of letting the worker boot into the spin.
+@pytest.mark.parametrize("env_value", ["0", "-1", "nan", "inf"])
+def test_worker_config_refuses_degenerate_heartbeat_interval(
+    monkeypatch: pytest.MonkeyPatch, env_value: str
+) -> None:
+    monkeypatch.setenv("CURIE_HEARTBEAT_INTERVAL_SECONDS", env_value)
+
+    with pytest.raises(ValidationError):
+        WorkerConfig()
+
+
+@pytest.mark.parametrize("interval", [0.0, -1.0, float("nan"), float("inf")])
+def test_worker_config_refuses_degenerate_heartbeat_interval_by_kwarg(
+    interval: float,
+) -> None:
+    with pytest.raises(ValidationError):
+        WorkerConfig(heartbeat_interval_s=interval)
+
+
+def test_worker_config_accepts_small_positive_heartbeat_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CURIE_HEARTBEAT_INTERVAL_SECONDS", "0.5")
+
+    cfg = WorkerConfig()
+
+    assert cfg.heartbeat_interval_s == 0.5
+    # The same small positive value is accepted by kwarg construction too.
+    assert WorkerConfig(heartbeat_interval_s=0.5).heartbeat_interval_s == 0.5

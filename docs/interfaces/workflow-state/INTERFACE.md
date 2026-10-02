@@ -61,11 +61,18 @@ Identity is `(agent_id, binding_scope, namespace, key)` with
 `postgresql_nulls_not_distinct=True`
 (`apps/api/src/curie_api/models.py::WorkflowStateEntry`). A NULL `binding_scope` is
 one agent-wide shared identity (general state when the agent has `memory=True`, and
-always for the reserved `memory` / `transcript` namespaces); a non-NULL
+always for the reserved `memory` namespace); a non-NULL
 `"{kind}:{address}"` scope isolates general state when `memory=False`.
 
-Memory and Conversation history are the CLEAN loaders already built over this store
-(`StateApiMemoryStore`, `StateApiTranscriptStore`).
+The reserved `transcript` namespace shares these routes but not this row identity.
+The router dispatches it to `apps/api/src/curie_api/transcripts.py::put` and its
+siblings, which store one `thread_transcripts` row per thread
+(`apps/api/src/curie_api/models.py::ThreadTranscript`, ADR-0170) under a per-thread
+byte cap instead of the namespace caps general state uses. Every other namespace,
+including `memory`, keeps the `WorkflowStateEntry` identity above.
+
+Memory and Conversation history are the CLEAN loaders already built over these
+routes (`StateApiMemoryStore`, `StateApiTranscriptStore`).
 
 Bundle code reaches the store two ways (#249), without shipping its own server. The
 platform mounts an in-process `curie-state` MCP server into every sandbox

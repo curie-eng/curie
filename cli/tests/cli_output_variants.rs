@@ -46,6 +46,7 @@ use curie::commands::{
     WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
+use curie::factory_intake::FactoryIntakeOutput;
 use curie::github_app::GithubAppOutput;
 use curie::installation::ApplyOutput;
 use curie::local::{
@@ -303,7 +304,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         "BudgetOutput",
         samples![
             "DryRun" => BudgetOutput::DryRun(plan()),
-            "Done" => BudgetOutput::Done { agent: "a".to_string(), max_usd_per_day: Some(1.5) },
+            "Done" => BudgetOutput::Done { agent: "a".to_string(), max_usd_per_day: Some(1.5), max_output_tokens_per_run: Some(64000) },
         ],
     );
     m.insert(
@@ -631,6 +632,13 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         samples![
             "DryRun" => GithubAppOutput::DryRun(plan()),
             "Done" => GithubAppOutput::Done { configured: true },
+        ],
+    );
+    m.insert(
+        "FactoryIntakeOutput",
+        samples![
+            "DryRun" => FactoryIntakeOutput::DryRun(plan()),
+            "Done" => FactoryIntakeOutput::Done { enabled: true },
         ],
     );
     m.insert(

@@ -10,12 +10,21 @@ import logging
 import sys
 import time
 import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 import redis.exceptions
-from aci_protocol import Event, Final, QueuedTurn, SessionStatus, TextDelta, TurnSource
+from aci_protocol import (
+    Event,
+    Final,
+    OutboundEvent,
+    QueuedTurn,
+    SessionStatus,
+    TextDelta,
+    TurnSource,
+)
 from curie_dispatcher.queue import to_stream_fields
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker import capacity_wait as capacity_wait_module
@@ -34,6 +43,7 @@ from curie_worker.consumer_liveness import (
     consumer_heartbeat_key,
 )
 from curie_worker.delivery_lease import DeliveryLeaseStore
+from curie_worker.runner_client import TurnStream
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.stream_consumer import ConsumerLivenessExpired
 from curie_worker.threadlock import ThreadLock
@@ -1223,12 +1233,14 @@ def test_runner_acceptance_boundary_respects_wait_deadline(
     asyncio.run(go())
 
 
-def test_active_wait_delivery_recovers_after_deadline_without_expiry(make_harness) -> None:
+def test_active_wait_delivery_recovers_after_deadline_without_expiry(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
     async def go() -> None:
         async with make_harness(
             slack_no_edit_streaming=True,
-            claim_timeout_seconds=0.05,
-            capacity_wait_budget_s=1.0,
+            claim_timeout_seconds=5.0,
+            capacity_wait_budget_s=60.0,
         ) as h:
             h.fake_k8s.quota_rejection = QuotaRejection(
                 quota_name="curie-sandbox-quota",
@@ -1239,21 +1251,28 @@ def test_active_wait_delivery_recovers_after_deadline_without_expiry(make_harnes
             event = _qevent("hello", thread="recovery-thread", event_id="recovery-turn")
             first = _capacity_consumer(h)
             await first.ensure_group()
-            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
-            first_task = asyncio.create_task(first.run())
-            try:
-                parked = await _wait_capacity_state(first, event.event_id, "waiting")
-                await _wait_until(
-                    lambda: any("queued" in text.lower() for _, _, text in h.sink.updates)
-                )
-            finally:
-                first.request_stop()
-                await first_task
+            entry_id, fields = await _pending_local_entry(h, event)
+            await first._sem.acquire()
+            # Park through the real delivery handler before introducing the
+            # wake owner, so maintenance cannot race this test's explicit wake.
+            await first._handle(entry_id, fields)
+            parked = await _wait_capacity_state(first, event.event_id, "waiting")
+            await _wait_until(
+                lambda: any("queued" in text.lower() for _, _, text in h.sink.updates)
+            )
 
             h.fake_k8s.quota_rejection = None
             hold = asyncio.Event()
             h.runner.hold = hold
             h.runner.default_script = []
+            owner_stream_reading = asyncio.Event()
+            real_iterate = TurnStream.__aiter__
+
+            def iterate_turn(stream: TurnStream) -> AsyncIterator[OutboundEvent]:
+                owner_stream_reading.set()
+                return real_iterate(stream)
+
+            monkeypatch.setattr(TurnStream, "__aiter__", iterate_turn)
             owner = _capacity_consumer(h)
             await owner.ensure_group()
             await h.async_redis.zadd(owner._waits._due, {event.event_id: 0})
@@ -1274,17 +1293,51 @@ def test_active_wait_delivery_recovers_after_deadline_without_expiry(make_harnes
                 assert active.deadline_ms == parked.deadline_ms
                 await _wait_until(lambda: h.runner.queried == ["hello"])
                 assert h.runner.admissions == [(h.runner.request_epochs[0][1], True)]
+                # The runner accepts the grant before the worker confirms it
+                # in Valkey. Recovery requires that persisted confirmation.
+                async with asyncio.timeout(10):
+                    while True:
+                        active = await owner._waits.get(event.event_id)
+                        if active is not None and active.grant_confirmed:
+                            assert active.state == "active"
+                            break
+                        await asyncio.sleep(0.01)
+                await asyncio.wait_for(owner_stream_reading.wait(), timeout=10)
                 assert not owner_task.done()
-            finally:
                 owner_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await owner_task
-                hold.set()
+                    async with asyncio.timeout(10):
+                        await owner_task
                 await _wait_until(lambda: not h.runner.turn_active)
+            finally:
+                hold.set()
+                if not owner_task.done():
+                    owner_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        async with asyncio.timeout(10):
+                            await owner_task
 
             server_time = await h.async_redis.time()
             now_ms = int(server_time[0]) * 1000 + int(server_time[1]) // 1000
-            await asyncio.sleep(max(0, parked.deadline_ms - now_ms) / 1000 + 0.05)
+            expired_deadline_ms = now_ms - 1
+            # Advance the persisted deadline after admission, without making
+            # scheduler latency consume the budget needed to reach that state.
+            async with h.async_redis.pipeline(transaction=True) as pipe:
+                pipe.hset(
+                    owner._waits._record(event.event_id),
+                    "deadline_ms",
+                    expired_deadline_ms,
+                )
+                pipe.zadd(owner._waits._flight, {event.event_id: expired_deadline_ms})
+                pipe.zadd(
+                    owner._waits._active,
+                    {event.event_id: expired_deadline_ms + owner._waits._retention_ms},
+                )
+                await pipe.execute()
+            expired = await owner._waits.get(event.event_id)
+            assert expired is not None and expired.state == "active"
+            assert expired.deadline_ms < now_ms
+            assert expired.grant_confirmed
 
             h.runner.default_script = [Final(text="recovered answer", status=DONE)]
             recovery = _capacity_consumer(h)

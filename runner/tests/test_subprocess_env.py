@@ -200,6 +200,7 @@ def test_turn_memory_token_never_reaches_env_hooks_or_bash() -> None:
         held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=10_000,
+        max_usd_per_day=1.0,
         tracer=RunTracer(None),
         classifier=SideEffectClassifier(),
         trace_name="t",

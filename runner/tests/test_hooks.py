@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import time
 from pathlib import Path
@@ -295,12 +296,19 @@ def test_command_hook_kills_child_on_timeout(monkeypatch, tmp_path) -> None:
     command it started (here a backgrounded ``sleep``) running as an orphan.
     """
 
-    monkeypatch.setattr(hooks, "_HOOK_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(hooks, "_HOOK_TIMEOUT_S", 1.0)
     pid_file = tmp_path / "grandchild.pid"
+    real_wait_for = hooks.asyncio.wait_for
+
+    async def timeout_after_child_starts(awaitable, *, timeout):
+        await _wait_for_hook_child(pid_file)
+        return await real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(hooks.asyncio, "wait_for", timeout_after_child_starts)
 
     async def go() -> dict:
         return await hooks._run_command_hook(
-            f"sleep 30 & echo $! > {pid_file}; wait",
+            _hook_child_command(pid_file),
             {"tool_name": "Bash", "tool_input": {}},
             Path.cwd(),
         )
@@ -314,9 +322,7 @@ def test_command_hook_kills_child_on_timeout(monkeypatch, tmp_path) -> None:
     assert "failed to run" in output["additionalContext"]
 
     grandchild = int(pid_file.read_text())
-    deadline = time.monotonic() + 5
-    while _process_alive(grandchild) and time.monotonic() < deadline:
-        time.sleep(0.05)
+    _wait_for_hook_child_exit(grandchild)
     alive = _process_alive(grandchild)
     if alive:
         os.kill(grandchild, signal.SIGKILL)
@@ -332,25 +338,65 @@ def test_command_hook_kills_its_group_when_cancelled(monkeypatch, tmp_path) -> N
 
     monkeypatch.setattr(hooks, "_HOOK_TIMEOUT_S", 30)
     pid_file = tmp_path / "grandchild.pid"
+    real_wait_for = hooks.asyncio.wait_for
 
     async def go() -> None:
-        with anyio.move_on_after(0.5):
-            await hooks._run_command_hook(
-                f"sleep 30 & echo $! > {pid_file}; wait",
+        child_ready = anyio.Event()
+
+        async def wait_after_subprocess_owned(awaitable, *, timeout):
+            await _wait_for_hook_child(pid_file)
+            child_ready.set()
+            return await real_wait_for(awaitable, timeout=timeout)
+
+        monkeypatch.setattr(hooks.asyncio, "wait_for", wait_after_subprocess_owned)
+        async with anyio.create_task_group() as group:
+            group.start_soon(
+                hooks._run_command_hook,
+                _hook_child_command(pid_file),
                 {"tool_name": "Bash", "tool_input": {}},
                 Path.cwd(),
             )
+            # The child can start before create_subprocess_exec returns. Wait
+            # until the hook owns its process handle before cancelling it.
+            with anyio.fail_after(10):
+                await child_ready.wait()
+            group.cancel_scope.cancel()
 
     anyio.run(go)
 
     grandchild = int(pid_file.read_text())
-    deadline = time.monotonic() + 5
-    while _process_alive(grandchild) and time.monotonic() < deadline:
-        time.sleep(0.05)
+    _wait_for_hook_child_exit(grandchild)
     alive = _process_alive(grandchild)
     if alive:
-        os.kill(grandchild, signal.SIGKILL)
+        try:
+            os.kill(grandchild, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     assert not alive, "a cancelled hook left its grandchild running (orphaned)"
+
+
+def _hook_child_command(pid_file: Path) -> str:
+    child = f"echo $$ > {shlex.quote(str(pid_file))}; exec sleep 30"
+    return f"/bin/sh -c {shlex.quote(child)} & wait"
+
+
+async def _wait_for_hook_child(pid_file: Path) -> None:
+    with anyio.fail_after(10):
+        while True:
+            try:
+                pid = pid_file.read_text().strip()
+            except FileNotFoundError:
+                pid = ""
+            if pid:
+                assert _process_alive(int(pid)), "hook child exited before the test stimulus"
+                return
+            await anyio.sleep(0.01)
+
+
+def _wait_for_hook_child_exit(pid: int) -> None:
+    deadline = time.monotonic() + 10
+    while _process_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 
 def _process_alive(pid: int) -> bool:
@@ -358,7 +404,7 @@ def _process_alive(pid: int) -> bool:
 
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 

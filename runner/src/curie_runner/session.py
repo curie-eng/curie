@@ -284,6 +284,7 @@ class SessionRunner:
         *,
         session_factory: SessionFactory,
         ceiling: int,
+        max_usd_per_day: float | None,
         tracer: RunTracer,
         classifier: SideEffectClassifier,
         trace_name: str,
@@ -344,6 +345,7 @@ class SessionRunner:
         # None when the tool is not mounted (a factory execution).
         self._turn_progress = turn_progress
         self._ceiling = ceiling
+        self._max_usd_per_day = max_usd_per_day
         self._tracer = tracer
         self._classifier = classifier
         self._trace_name = trace_name
@@ -1596,6 +1598,21 @@ class SessionRunner:
                 )
 
             for outbound in events:
+                if (
+                    isinstance(message, ResultMessage)
+                    and message.subtype == "error_max_budget_usd"
+                    and not budget_hit
+                    and isinstance(outbound, ErrorEvent)
+                    and outbound.classification == BUDGET_CLASSIFICATION
+                ):
+                    outbound = outbound.model_copy(
+                        update={
+                            "message": (
+                                "USD budget exceeded "
+                                f"(max_usd_per_day={self._max_usd_per_day})"
+                            )
+                        }
+                    )
                 if isinstance(outbound, ToolNote):
                     logger.info("tool call session=%s tool=%s", self._session_id, outbound.tool)
                 if isinstance(outbound, ErrorEvent):
@@ -2228,7 +2245,10 @@ class SessionRunner:
         return [
             to_ndjson_line(
                 ErrorEvent(
-                    message="output token budget exceeded",
+                    message=(
+                        "output token budget exceeded "
+                        f"(max_output_tokens_per_run={self._ceiling})"
+                    ),
                     classification=BUDGET_CLASSIFICATION,
                 )
             ),
@@ -2284,7 +2304,8 @@ class SessionRunner:
             # runner crash would be reported as this instead of a retryable
             # runner-error. The DONE final's leading notice is the delivery.
             logger.error(
-                "declared connector capability failed session=%s connectors=%s credentials=%s",
+                "declared connector capability failed session=%s connectors=%s "
+                "credentials=%s diagnosis=%s",
                 self._session_id,
                 ",".join(failure.connector for failure in self._connector_failures),
                 ",".join(
@@ -2292,6 +2313,7 @@ class SessionRunner:
                     for failure in self._connector_failures
                     for name in failure.credential_names
                 ),
+                " ".join(failure.diagnostic_message() for failure in self._connector_failures),
             )
             self._connector_notice = " ".join(
                 failure.caller_message() for failure in self._connector_failures

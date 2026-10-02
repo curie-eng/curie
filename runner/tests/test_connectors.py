@@ -865,11 +865,32 @@ def test_the_tool_policy_exemption_set_matches_what_the_boot_publishes(
     assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
     # report_progress mounts only when the worker injected the progress env
     # (#3077); its name is exempt regardless, like an omitted request_approval.
-    from curie_runner.approval import PROGRESS_TOOL_NAME
+    # get_issue (ADR 0187) mounts only with the worker's issue read env.
+    from curie_runner.approval import ISSUE_TOOL_NAME, PROGRESS_TOOL_NAME
 
     assert _published_live_tool_names(mounted) == platform_tool_names(state_server_mounted=True) - {
-        PROGRESS_TOOL_NAME
+        PROGRESS_TOOL_NAME,
+        ISSUE_TOOL_NAME,
     }
+
+
+def test_a_work_item_boot_mounts_get_issue_and_exempts_it(tmp_path, monkeypatch) -> None:
+    # ADR 0187: an execution with a WorkItem boots with the API's issue read
+    # route and capability, and only that boot publishes get_issue.
+    from curie_runner.approval import ISSUE_TOOL_NAME, PROGRESS_TOOL_NAME, platform_tool_names
+
+    env = _boot_env(monkeypatch, tmp_path, "issue-read")
+    monkeypatch.setenv("CURIE_ISSUE_READ_URL", "http://api.example/work-items/issue-read")
+    monkeypatch.setenv("CURIE_ISSUE_READ_TOKEN", "wir.example-capability.signature")
+    mounted = _boot_options(
+        monkeypatch,
+        RunnerConfig.from_env(env),
+        potential_write=True,
+    ).mcp_servers
+
+    published = _published_live_tool_names(mounted)
+    assert ISSUE_TOOL_NAME in published
+    assert published == platform_tool_names(state_server_mounted=True) - {PROGRESS_TOOL_NAME}
 
 
 def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
@@ -895,9 +916,12 @@ def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
 
     assert set(mounted) == {APPROVAL_SERVER_NAME}
     published = _published_live_tool_names(mounted)
-    from curie_runner.approval import PROGRESS_TOOL_NAME
+    from curie_runner.approval import ISSUE_TOOL_NAME, PROGRESS_TOOL_NAME
 
-    assert published == platform_tool_names(state_server_mounted=False) - {PROGRESS_TOOL_NAME}
+    assert published == platform_tool_names(state_server_mounted=False) - {
+        PROGRESS_TOOL_NAME,
+        ISSUE_TOOL_NAME,
+    }
     assert not any(name.startswith(f"mcp__{STATE_SERVER_NAME}__") for name in published)
 
 

@@ -606,6 +606,8 @@ pub struct ApprovalRecord {
     pub conversation_id: String,
     pub summary: String,
     #[serde(default)]
+    pub display_summary: Option<String>,
+    #[serde(default)]
     pub expires_at: Option<String>,
     #[serde(default)]
     pub resolved_by: Option<String>,
@@ -1336,14 +1338,12 @@ pub struct EvalMatrix {
 }
 
 /// The per-agent budget (`BudgetConfig` in openapi.json): the request and
-/// response body of `PUT /agents/{id}/budget`. Both fields are optional; an
-/// omitted field means "platform default" server-side, so we only serialize the
-/// ones the caller set.
+/// response body of `GET /agents/{id}/budget` and `PUT /agents/{id}/budget`.
+/// A null field means "platform default". Serialize both fields so a budget
+/// update sends the complete configuration, including preserved defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BudgetConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens_per_run: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_usd_per_day: Option<f64>,
 }
 
@@ -1884,6 +1884,41 @@ pub fn parse_trace_id(raw: &str) -> std::result::Result<String, String> {
     } else {
         Err("trace id must be 1-128 ASCII letters, digits, underscores, or hyphens".to_string())
     }
+}
+
+/// The percent-encoded request path for firing a hook:
+/// `/agents/{agent}/hooks/{name}/fire`.
+///
+/// Segments are pushed through [`reqwest::Url::path_segments_mut`], the same
+/// encoding `control_schedule` uses, so an agent name holding `#` or `?`
+/// cannot truncate the path or leak into the query string (#3731). A name
+/// without reserved characters encodes to itself. `commands::hook_fire_path`
+/// renders the same string for `--dry-run`, so the plan shows the path the
+/// request really uses.
+pub(crate) fn hook_fire_path(agent: &str, name: &str) -> String {
+    hook_agent_path(agent, name, &["fire"])
+}
+
+/// The percent-encoded request path for reading one hook run:
+/// `/agents/{agent}/hooks/{name}/runs/{run_id}`.
+pub(crate) fn hook_run_path(agent: &str, name: &str, run_id: &str) -> String {
+    hook_agent_path(agent, name, &["runs", run_id])
+}
+
+/// Percent-encode an agent hook path by pushing each segment through a
+/// throwaway URL, mirroring how `control_schedule` builds its request URL.
+fn hook_agent_path(agent: &str, name: &str, tail: &[&str]) -> String {
+    let mut url = reqwest::Url::parse("http://hook.invalid").expect("static URL base parses");
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .expect("static URL base accepts path segments");
+        segments.push("agents").push(agent).push("hooks").push(name);
+        for segment in tail {
+            segments.push(segment);
+        }
+    }
+    url.path().to_string()
 }
 
 impl ApiClient {
@@ -2924,16 +2959,13 @@ impl ApiClient {
     /// Force a thread's sandbox to be released: `POST
     /// /agents/{id}/threads/{thread_key}/reset` (no request body, #737). The
     /// worker's next maintenance tick deletes the thread's claim and route, so
-    /// its next message cold-creates a fresh sandbox.
+    /// its next message cold-creates a fresh sandbox. The thread key travels
+    /// as one percent-encoded path segment (#3727): see `thread_reset_url`.
     pub async fn reset_thread(&self, agent_id: &str, thread_key: &str) -> Result<ThreadResetState> {
+        let url = Self::thread_reset_url(&self.base_url, agent_id, thread_key)?;
         let resp = self
             .send_request(
-                self.http
-                    .post(format!(
-                        "{}/agents/{agent_id}/threads/{thread_key}/reset",
-                        self.base_url
-                    ))
-                    .header("X-API-Key", &self.api_key),
+                self.http.post(url).header("X-API-Key", &self.api_key),
                 "POST /agents/{id}/threads/{thread_key}/reset",
             )
             .await?;
@@ -2949,20 +2981,17 @@ impl ApiClient {
     /// from the POST until the worker's maintenance tick releases the sandbox,
     /// then flips to false -- so a caller can wait for the release to actually
     /// land (and the next message to be safe from adopting the pre-reset
-    /// sandbox) before it acts. Mirrors the POST above.
+    /// sandbox) before it acts. Mirrors the POST above, including its
+    /// percent-encoded thread key segment (#3727).
     pub async fn thread_reset_state(
         &self,
         agent_id: &str,
         thread_key: &str,
     ) -> Result<ThreadResetState> {
+        let url = Self::thread_reset_url(&self.base_url, agent_id, thread_key)?;
         let resp = self
             .send_request(
-                self.http
-                    .get(format!(
-                        "{}/agents/{agent_id}/threads/{thread_key}/reset",
-                        self.base_url
-                    ))
-                    .header("X-API-Key", &self.api_key),
+                self.http.get(url).header("X-API-Key", &self.api_key),
                 "GET /agents/{id}/threads/{thread_key}/reset",
             )
             .await?;
@@ -2971,6 +3000,48 @@ impl ApiClient {
             .json()
             .await
             .context("decoding thread reset state")
+    }
+
+    /// Build `/agents/{agent_id}/threads/{thread_key}/reset` with the thread
+    /// key as a single percent-encoded path segment (#3727). Stored thread
+    /// keys already carry `%XX` escapes (`scoped_conversation_id` applies
+    /// `quote(component, safe="")` to every component), and the platform API
+    /// decodes escapes when it reads `thread_key` -- so the key must go
+    /// through `path_segments_mut().push`, which encodes `%` as `%25` and `/`
+    /// as `%2F` (the same pattern `control_schedule` uses below), never
+    /// through string formatting. Sent raw, `github:curie-eng%2Fcurie:3698`
+    /// would arrive as `github:curie-eng/curie:3698` and match no route,
+    /// while `email:ops%40example.com:abc` would name a different thread than
+    /// the operator asked for. Characters the URL parser passes through
+    /// untouched (`:`, `.`, `@`, alphanumerics) keep today's wire form, so a
+    /// plain `slack:...` key is sent exactly as before.
+    fn thread_reset_url(base_url: &str, agent_id: &str, thread_key: &str) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(base_url)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("api URL cannot hold path segments"))?
+            .push("agents")
+            .push(agent_id)
+            .push("threads")
+            .push(thread_key)
+            .push("reset");
+        Ok(url)
+    }
+
+    /// Read the agent budget: `GET /agents/{id}/budget`.
+    pub async fn get_budget(&self, agent_id: &str) -> Result<BudgetConfig> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/agents/{agent_id}/budget", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/budget",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading the budget")
+            .await?
+            .json()
+            .await
+            .context("decoding budget")
     }
 
     /// Set the agent budget: `PUT /agents/{id}/budget` with a `BudgetConfig` body.
@@ -3247,14 +3318,11 @@ impl ApiClient {
 
     /// Start a hook now: `POST /agents/{agent}/hooks/{name}/fire`.
     pub async fn fire_hook(&self, agent: &str, name: &str) -> Result<HookFireRecord> {
+        let url =
+            reqwest::Url::parse(&format!("{}{}", self.base_url, hook_fire_path(agent, name)))?;
         let resp = self
             .send_request(
-                self.http
-                    .post(format!(
-                        "{}/agents/{agent}/hooks/{name}/fire",
-                        self.base_url
-                    ))
-                    .header("X-API-Key", &self.api_key),
+                self.http.post(url).header("X-API-Key", &self.api_key),
                 "POST /agents/{agent}/hooks/{name}/fire",
             )
             .await?;
@@ -3272,14 +3340,14 @@ impl ApiClient {
         name: &str,
         run_id: &str,
     ) -> Result<HookFireRecord> {
+        let url = reqwest::Url::parse(&format!(
+            "{}{}",
+            self.base_url,
+            hook_run_path(agent, name, run_id)
+        ))?;
         let resp = self
             .send_request(
-                self.http
-                    .get(format!(
-                        "{}/agents/{agent}/hooks/{name}/runs/{run_id}",
-                        self.base_url
-                    ))
-                    .header("X-API-Key", &self.api_key),
+                self.http.get(url).header("X-API-Key", &self.api_key),
                 "GET /agents/{agent}/hooks/{name}/runs/{id}",
             )
             .await?;

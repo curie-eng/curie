@@ -2,6 +2,7 @@
 
 GitHub REST shapes follow:
 https://docs.github.com/en/rest/branches/branches#get-a-branch
+https://docs.github.com/en/rest/issues/events
 https://docs.github.com/en/rest/issues/comments#list-issue-comments
 https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
 https://docs.github.com/en/rest/issues/comments#update-an-issue-comment
@@ -174,6 +175,7 @@ def _work_item(number: int) -> dict[str, Any] | None:
 def _label(client: TestClient, api: BaseGitHubAPI, number: int, *labels: str) -> httpx.Response:
     api.issue_number = number
     api.labels = [LABEL, *labels]
+    api.advance_label_event(number)
     return _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
 
 

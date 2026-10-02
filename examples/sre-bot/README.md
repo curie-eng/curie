@@ -265,6 +265,18 @@ Python image. Its Service is named `alert-signer` in Alertmanager's namespace.
 The webhook overlay mounts only the bearer token into Alertmanager; the
 derived Curie hook secret stays in the signer pod.
 
+For an existing installation, update the API and every custom signer together
+to the context format in the [trigger contract](../../docs/interfaces/triggers/INTERFACE.md).
+The signed bytes are `b"curie.hook.delivery.v2\n"` followed by
+`{timestamp}.{delivery_id}.{len(context)}:`, compact ASCII JSON for
+`[hook, tool_access]`, and the raw body. The omitted policy is `null` in the
+context, and `len(context)` is its byte length.
+The API refuses signatures made with the previous format. This example copies
+`server.py` into the `alert-signer-code` ConfigMap, so updating the checkout alone
+does not update the installed signer. Repeat the ConfigMap creation and apply
+commands below from the updated checkout, then restart `deployment/alert-signer`
+as described after the command block, alongside the API upgrade.
+
 Configure the two distinct agent fields first. `source_bindings.alertmanager`
 maps `/commonLabels/curie_workload` to the repository and deployed revision.
 `hook_partitions.alertmanager.pointer` names `/curie_partition`, which the

@@ -183,7 +183,13 @@ def clean_db(migrated: None) -> None:
 def client(_disposable_db: Any) -> Any:
     # Depends on _disposable_db so the app engine is built against the disposable
     # DB (the app lifespan already requires the compose stack: RustFS, Valkey).
-    with TestClient(create_app()) as test_client:
+    # Give each fixture instance its own client address so a session request in
+    # one test cannot consume another test's Valkey rate limit budget.
+    suffix = secrets.token_hex(8)
+    address = "2001:db8::" + ":".join(
+        suffix[index : index + 4] for index in range(0, 16, 4)
+    )
+    with TestClient(create_app(), client=(address, 5000)) as test_client:
         yield test_client
 
 

@@ -163,6 +163,65 @@ def test_a_ci_cause_still_labels_its_details() -> None:
     assert "Agent's last message" not in body
 
 
+@pytest.mark.parametrize(
+    ("detail", "field", "value", "remedy", "other_remedy"),
+    [
+        (
+            "output token budget exceeded (max_output_tokens_per_run=64000)",
+            "max_output_tokens_per_run",
+            "64000",
+            "curie cluster budget <agent> --output-tokens <tokens>",
+            "--limit",
+        ),
+        (
+            "USD budget exceeded (max_usd_per_day=6.5)",
+            "max_usd_per_day",
+            "6.5",
+            "curie cluster budget <agent> --limit <usd>",
+            "--output-tokens",
+        ),
+    ],
+)
+def test_budget_notice_names_the_limit_and_its_matching_remedy(
+    detail: str, field: str, value: str, remedy: str, other_remedy: str
+) -> None:
+    body = result_section("budget_exceeded", pr_url=None, detail=detail)
+
+    headline = body.splitlines()[0]
+    assert headline.startswith("Could not complete:")
+    assert field in headline
+    assert value in headline
+    assert f"`{remedy}`" in headline
+    assert other_remedy not in body
+    assert f"Provider message: {detail}\n" in body
+    assert body.endswith("Cause: budget_exceeded\nFailure class: budget-exceeded\n")
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        None,
+        "run failed",
+        "The run reached its output token limit",
+        "output token budget exceeded (max_output_tokens_per_run=64000) extra",
+        "output token budget exceeded (max_output_tokens_per_run=0)",
+        "USD budget exceeded (max_usd_per_day=None)",
+        "USD budget exceeded (max_usd_per_day=NaN)",
+        "USD budget exceeded (max_usd_per_day=-5)",
+    ],
+)
+def test_unknown_budget_detail_does_not_guess_the_limit_or_remedy(detail: str | None) -> None:
+    body = result_section("budget_exceeded", pr_url=None, detail=detail)
+
+    headline = body.splitlines()[0].lower()
+    assert "cannot identify" in headline
+    assert "budget" in headline
+    assert "curie cluster budget" not in body
+    assert "--limit" not in body
+    assert "--output-tokens" not in body
+    assert body.endswith("Cause: budget_exceeded\nFailure class: budget-exceeded\n")
+
+
 # --- N4a-e: inert rendering of model-authored text ----------------------------------
 
 

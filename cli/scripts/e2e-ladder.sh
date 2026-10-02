@@ -389,17 +389,20 @@ adopt_stored_local_api_key() {
 LOCAL_OTEL_SINK_NAME="curie-ladder-otel-sink-$$"
 LOCAL_OTEL_SINK_OWNED=0
 LOCAL_OTEL_NETWORK_OWNED=0
+LOCAL_OTEL_NETWORK=""
 LOCAL_OTEL_SINK_ACTIVE=0
 LOCAL_OTEL_ENDPOINT=""
 LOCAL_OTEL_METRICS_ENDPOINT=""
 LOCAL_OTEL_FAILURE_MODE=0
-# Snapshots for restore_local_runner_health. Values are never printed.
-LOCAL_OTEL_SAVED_CREDENTIALS=""
-LOCAL_OTEL_SAVED_API_KEY=""
-LOCAL_OTEL_SAVED_OAUTH=""
-LOCAL_OTEL_SAVED_CREDENTIALS_SET=0
-LOCAL_OTEL_SAVED_API_KEY_SET=0
-LOCAL_OTEL_SAVED_OAUTH_SET=0
+# Snapshots retain exact presence and values; credential values are never printed.
+LOCAL_FAILURE_ENV_NAMES=(CURIE_CREDENTIALS ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+    CURIE_MODEL_BASE_URL ANTHROPIC_BASE_URL CURIE_MODEL_API_BACKEND CURIE_MODEL_ENV_KEY
+    ANTHROPIC_AUTH_TOKEN)
+LOCAL_FAILURE_ENV_VALUES=()
+LOCAL_FAILURE_ENV_PRESENT=()
+LOCAL_MODEL_ERROR_PROVIDER_NAME="curie-ladder-model-error-$$"
+LOCAL_MODEL_ERROR_PROVIDER_OWNED=0
+LOCAL_MODEL_ERROR_PROVIDER_ID=""
 OTEL_E2E_SECRET_SENTINEL="xapp-"
 OTEL_E2E_SECRET_SENTINEL+="0-0000000000-0000000000-$$"
 
@@ -489,6 +492,10 @@ cleanup() {
     stop_approval_seed_message terminate || true
     if ! cleanup_approval_seed_fixture; then
         echo "error: could not remove owned approval seed agent" >&2
+        [[ "$code" -ne 0 ]] || code=1
+    fi
+    if ! stop_local_model_error_provider; then
+        echo "error: could not remove the owned model failure provider" >&2
         [[ "$code" -ne 0 ]] || code=1
     fi
     # The compose worker spawns runner containers as SIBLINGS on the host daemon
@@ -3588,7 +3595,8 @@ start_local_otel_sink() {
         return 1
     fi
 
-    local network=curie_runner
+    local network="${CURIE_DOCKER_NETWORK:-curie_runner}"
+    LOCAL_OTEL_NETWORK="$network"
     if ! docker network inspect "$network" >/dev/null 2>&1; then
         docker network create \
             --label "com.docker.compose.project=$COMPOSE_PROJECT" \
@@ -3688,7 +3696,7 @@ stop_local_otel_sink() {
         LOCAL_OTEL_SINK_OWNED=0
     fi
     if (( LOCAL_OTEL_NETWORK_OWNED )); then
-        docker network rm curie_runner >/dev/null 2>&1 || true
+        docker network rm "$LOCAL_OTEL_NETWORK" >/dev/null 2>&1 || true
         LOCAL_OTEL_NETWORK_OWNED=0
     fi
     LOCAL_OTEL_SINK_ACTIVE=0
@@ -4209,26 +4217,98 @@ reap_local_runner_sandboxes() {
     done < <(docker ps -aq --filter "label=$SANDBOX_LABEL" --format '{{.Names}}' 2>/dev/null)
 }
 
+start_local_model_error_provider() {
+    local network="${CURIE_DOCKER_NETWORK:-curie_runner}"
+    local image="${CURIE_RUNNER_IMAGE:-${CURIE_E2E_IMAGE:-$RUNNER_IMAGE}}"
+    if docker inspect "$LOCAL_MODEL_ERROR_PROVIDER_NAME" >/dev/null 2>&1; then
+        echo "local: model failure provider name is already owned; refusing to replace it" >&2
+        return 1
+    fi
+    LOCAL_MODEL_ERROR_PROVIDER_OWNED=1
+    if ! LOCAL_MODEL_ERROR_PROVIDER_ID="$(docker run -d --name "$LOCAL_MODEL_ERROR_PROVIDER_NAME" \
+        --label "curietech.ai/e2e-owner=$LOCAL_OTEL_SINK_NAME" \
+        --network "$network" \
+        -v "$REPO_ROOT/cli/scripts/fixtures/terminal-provider-error.py:/terminal-provider-error.py:ro" \
+        --entrypoint python3 "$image" /terminal-provider-error.py --host 0.0.0.0 --port 8081 \
+        )"; then
+        return 1
+    fi
+    local attempt
+    for attempt in $(seq 1 10); do
+        if local_model_error_provider_health >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "local: task-owned model failure provider did not become healthy" >&2
+    return 1
+}
+
+local_model_error_provider_health() {
+    docker exec "${LOCAL_MODEL_ERROR_PROVIDER_ID:-$LOCAL_MODEL_ERROR_PROVIDER_NAME}" python3 -c '
+import urllib.request
+with urllib.request.urlopen("http://127.0.0.1:8081/health", timeout=2) as response:
+    print(response.read().decode())
+'
+}
+
+stop_local_model_error_provider() {
+    if (( LOCAL_MODEL_ERROR_PROVIDER_OWNED )); then
+        local identity owner container
+        local inspect_target="${LOCAL_MODEL_ERROR_PROVIDER_ID:-$LOCAL_MODEL_ERROR_PROVIDER_NAME}"
+        if ! identity="$(docker inspect "$inspect_target" \
+            --format '{{.Id}} {{index .Config.Labels "curietech.ai/e2e-owner"}}' \
+            2>"$WORKDIR/model-provider-inspect-error")"; then
+            if ! grep -Eq 'No such (object|container)' "$WORKDIR/model-provider-inspect-error"; then
+                echo "local: could not verify model failure provider cleanup" >&2
+                return 1
+            fi
+            LOCAL_MODEL_ERROR_PROVIDER_OWNED=0
+            LOCAL_MODEL_ERROR_PROVIDER_ID=""
+            return 0
+        fi
+        container="${identity%% *}"
+        owner="${identity#* }"
+        if [[ "$owner" != "$LOCAL_OTEL_SINK_NAME" ]]; then
+            echo "local: model failure provider ownership changed; refusing to remove it" >&2
+            return 1
+        fi
+        docker rm -f "$container" >/dev/null || return 1
+        LOCAL_MODEL_ERROR_PROVIDER_OWNED=0
+        LOCAL_MODEL_ERROR_PROVIDER_ID=""
+    fi
+}
+
 inject_local_runner_failure() {
+    # A terminal provider error exercises the real SDK without its retryable
+    # refused-TCP backoff consuming the worker's delivery deadline (#3771).
+    # The explicit retry directive is measured with the pinned SDK and grounded
+    # in cli/scripts/fixtures/terminal-provider-error.py. No live key is sent.
+    start_local_model_error_provider || return 1
     LOCAL_OTEL_FAILURE_MODE=1
-    LOCAL_OTEL_SAVED_CREDENTIALS="${CURIE_CREDENTIALS-}"
-    LOCAL_OTEL_SAVED_API_KEY="${ANTHROPIC_API_KEY-}"
-    LOCAL_OTEL_SAVED_OAUTH="${CLAUDE_CODE_OAUTH_TOKEN-}"
-    LOCAL_OTEL_SAVED_CREDENTIALS_SET=0
-    LOCAL_OTEL_SAVED_API_KEY_SET=0
-    LOCAL_OTEL_SAVED_OAUTH_SET=0
-    [[ -n "${CURIE_CREDENTIALS+x}" ]] && LOCAL_OTEL_SAVED_CREDENTIALS_SET=1
-    [[ -n "${ANTHROPIC_API_KEY+x}" ]] && LOCAL_OTEL_SAVED_API_KEY_SET=1
-    [[ -n "${CLAUDE_CODE_OAUTH_TOKEN+x}" ]] && LOCAL_OTEL_SAVED_OAUTH_SET=1
+    LOCAL_FAILURE_ENV_VALUES=()
+    LOCAL_FAILURE_ENV_PRESENT=()
+    local key
+    for key in "${LOCAL_FAILURE_ENV_NAMES[@]}"; do
+        if declare -p "$key" >/dev/null 2>&1; then
+            LOCAL_FAILURE_ENV_PRESENT+=(1)
+            LOCAL_FAILURE_ENV_VALUES+=("${!key}")
+        else
+            LOCAL_FAILURE_ENV_PRESENT+=(0)
+            LOCAL_FAILURE_ENV_VALUES+=("")
+        fi
+    done
     export CURIE_FAKE_MODEL=0
-    # Connection-refused on the runner's own loopback: a live model cannot
-    # answer, and the OTel sink (a reachable HTTP server) is not the backend.
-    export CURIE_MODEL_BASE_URL="http://127.0.0.1:1"
+    export CURIE_MODEL_BASE_URL="http://$LOCAL_MODEL_ERROR_PROVIDER_NAME:8081"
+    export ANTHROPIC_BASE_URL=""
     export CURIE_MODEL_API_BACKEND=messages
-    # Empty-string export, not unset: compose `.env` must not refill a live key.
+    # Empty-string export prevents compose .env from refilling a credential;
+    # clearing the declaration also excludes custom provider credential names.
+    export CURIE_MODEL_ENV_KEY=""
     export CURIE_CREDENTIALS=""
     export ANTHROPIC_API_KEY=""
     export CLAUDE_CODE_OAUTH_TOKEN=""
+    export ANTHROPIC_AUTH_TOKEN=""
     ladder_compose --profile core --profile full \
         up -d --force-recreate --no-deps curie-worker >/dev/null
     reap_local_runner_sandboxes
@@ -4241,26 +4321,21 @@ restore_local_runner_health() {
     else
         export CURIE_FAKE_MODEL=1
     fi
-    unset CURIE_MODEL_BASE_URL CURIE_MODEL_API_BACKEND
-    if (( LOCAL_OTEL_SAVED_CREDENTIALS_SET )); then
-        export CURIE_CREDENTIALS="$LOCAL_OTEL_SAVED_CREDENTIALS"
-    else
-        unset CURIE_CREDENTIALS
-    fi
-    if (( LOCAL_OTEL_SAVED_API_KEY_SET )); then
-        export ANTHROPIC_API_KEY="$LOCAL_OTEL_SAVED_API_KEY"
-    else
-        unset ANTHROPIC_API_KEY
-    fi
-    if (( LOCAL_OTEL_SAVED_OAUTH_SET )); then
-        export CLAUDE_CODE_OAUTH_TOKEN="$LOCAL_OTEL_SAVED_OAUTH"
-    else
-        unset CLAUDE_CODE_OAUTH_TOKEN
-    fi
+    local key index=0
+    for key in "${LOCAL_FAILURE_ENV_NAMES[@]}"; do
+        if (( LOCAL_FAILURE_ENV_PRESENT[index] )); then
+            printf -v "$key" '%s' "${LOCAL_FAILURE_ENV_VALUES[index]}"
+            export "$key"
+        else
+            unset "$key"
+        fi
+        (( index += 1 ))
+    done
     ladder_compose --profile core --profile full \
         up -d --force-recreate --no-deps curie-worker >/dev/null
     reap_local_runner_sandboxes
     LOCAL_OTEL_FAILURE_MODE=0
+    stop_local_model_error_provider || return 1
     sleep 3
 }
 
@@ -4533,10 +4608,9 @@ case_local_otel_runner_failure() {
     echo
     echo "=== case: local runner failure is observable and recovers ==="
     # Negative evidence requires explicit ERROR status and classified_failure
-    # outcome before the restored healthy trace. The injected backend is
-    # unreachable independently of prompt text and of CURIE_E2E_LIVE=1; a live
-    # model must not be able to answer the marker. runner-error is retryable,
-    # and the kernel's bounded retry still terminates as classified_failure.
+    # outcome before the restored healthy trace. A run-owned provider rejects
+    # the actual SDK request, independently of prompt text and model mode.
+    # model-credential-rejected is terminal and the kernel does not retry it.
     local failure_before="$WORKDIR/otel-before-failure.json"
     local restored_before="$WORKDIR/otel-before-restored.json"
     local failure_out failure_code=0 restored_out
@@ -4552,6 +4626,13 @@ case_local_otel_runner_failure() {
         # failed:true (#3401); a finalized reply remains the older shape.
         restore_local_runner_health
         echo "local: injected runner failure produced neither a finalized escalation nor a queryable reply" >&2
+        return 1
+    fi
+    if ! local_model_error_provider_health | python3 -c '
+import json, sys
+assert json.load(sys.stdin)["requests"] >= 1, "actual SDK never reached the model failure provider"
+'; then
+        restore_local_runner_health
         return 1
     fi
     # Assert before recreating the worker: the live BatchSpanProcessor owns

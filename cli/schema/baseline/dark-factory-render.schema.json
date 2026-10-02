@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/dark-factory-render/v2.json",
+  "title": "curie example dark-factory render --json",
+  "description": "Receipt for the dark-factory example bundle written to a new or empty directory.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "bundle_dir": {"type": "string"},
+    "rendered": {"const": true},
+    "runner_image": {"type": ["string", "null"]},
+    "runner_note": {"type": ["string", "null"]}
+  },
+  "required": ["bundle_dir", "rendered", "runner_image", "runner_note"]
+}

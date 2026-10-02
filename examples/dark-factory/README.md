@@ -3,6 +3,11 @@
 This is the agent Curie runs for a labelled GitHub issue. One issue goes in.
 One pull request, or one stated reason, comes out.
 
+Trying it for the first time? The
+[dark factory quickstart](../../docs/guides/dark-factory-quickstart.md) takes
+you from nothing to a pull request this agent opened on a new repository, on a
+laptop kind cluster.
+
 One agent does the work with one skill,
 [`skills/implement-issue/SKILL.md`](skills/implement-issue/SKILL.md), and two
 reviewer subagents check it on a stronger model. The skill walks nine phases:
@@ -38,8 +43,9 @@ does not enforce it, and a different bundle can choose differently.
 
 Each loop (`plan` and `plan_review`, `implement` and `review_diff`, and
 `wait_ci` back to `implement`) runs at most 3 rounds. When a reviewer still asks for changes on round 3, or a review
-call fails, the run publishes nothing. It posts the reviewer's unresolved
-findings and open questions on the issue and ends with `Could not complete:`.
+call fails, the run publishes nothing. It ends its reply with `Could not complete:` and the
+reviewer's unresolved findings and open questions, and the platform's status
+comment on the issue carries that result.
 
 A reviewer tags every finding `blocking` (the change would be incorrect or
 unverifiable, or misses a criterion) or `note` (an improvement that does not
@@ -70,73 +76,83 @@ the runner's bundled Claude Code CLI 2.1.280 or later (claude-agent-sdk
   gives every session the built-in file tools. The sandbox has no general
   network access. The operator may allow package registry routes for locked
   dependency fetches, and the sandbox holds no push or publication credential.
-- **The issue.** `.mcp.json` declares the GitHub MCP server. This bundle's
-  `runner.Dockerfile` installs it in a runner layer that `connectors.yaml`
-  declares (ADR 0173). The platform runner does not carry it, so the layer
-  must be built with `curie build` before the deploy (below). The server is
-  authenticated with the bundle's own `GITHUB_PERSONAL_ACCESS_TOKEN`
-  (ADR 0145: reading the ticket is the bundle's job). The manifest's
-  `toolPolicy` allows `github/get_issue` and `github/add_issue_comment`.
-  The review gate hook refuses the comment tool except for one comment on
-  the run's own issue, after a failed or capped review, to post the
-  unresolved findings. Every other GitHub tool, including every other
-  write tool, is denied by the runner, and so is any tool the server adds
-  later.
+- **The issue.** The platform tool `mcp__curie__get_issue` (arguments
+  `owner`, `repo`, `issue_number`), mounted for executions that have a
+  WorkItem. The tool presents an execution scoped capability the API minted
+  for that execution. The API checks that it names this execution and the
+  WorkItem's issue, reads the issue and its comments with the GitHub App
+  installation token (minted fresh per read, so runs longer than one hour
+  keep reading), and returns the title, body, state, author and comments
+  verbatim. It stores nothing. The sandbox holds no GitHub credential at all.
+  A failed or capped review ends the reply with `Could not complete:` and the
+  unresolved findings, and the platform's factory status comment on the issue
+  carries that result.
 - **Publication.** The built-in `mcp__curie__publish_changes` tool. The platform
   captures the patch and publishes it from a separate trusted job. The agent
   never pushes.
 
-Give the bundle a narrow token: a fine-grained token (or a GitHub App
-installation token) limited to the factory repositories with **Issues: Read
-and write** and nothing else. Write is for the findings comment. With a
-read-only token a capped run still stops and states its findings in its final
-reply, but they do not reach the issue. That token is in the sandbox's
-environment, so any tool in the session can read it. The tool policy limits
-which GitHub MCP tools the agent can call; it does not hide the credential
-from other tools. The token scope is the real bound.
-
 ## Deploy it as the factory agent
 
-Enable factory intake first (see "Admitting a labelled GitHub issue" in
-[`docs/operations.md`](../../docs/operations.md)). Then:
+For a laptop trial on a small repository, follow the
+[quickstart](../../docs/guides/dark-factory-quickstart.md) instead; it needs
+none of the long run sizing below. This section is the production recipe for a
+repository the size of Curie itself.
+
+Write the bundle out first. No clone of this repository is needed:
 
 ```bash
-# The skill plans for a 3 hour run. The chart worker budget and runner ceiling
-# already default to 10800. The execution deadline still defaults to 1800, so
-# the required override is:
-#   curie cluster overrides dark-factory --execution-deadline 10800
-# The helm sets below pin those worker values explicitly. The chart raises the
-# worker termination grace with the budget. At this budget, the drain Job
-# publishes a minimum Helm timeout of 21900 seconds in its annotation.
+curie example dark-factory render --out ./dark-factory
+```
+
+A release CLI records the runner layer its release published (the repository
+toolchains, for linux/amd64 and linux/arm64) in `connectors.lock.yaml`, so the
+deploy below builds nothing. A CLI built from source has no published layer,
+says so, and names the `curie build` that builds one instead.
+
+Then enable the model and intake. The skill plans for a 3 hour run. The chart
+worker budget and runner ceiling already default to 10800. The execution
+deadline still defaults to 1800, so it needs an override.
+
+```bash
+# The factory's default model: GLM 5.3 Flash through OpenRouter. The
+# credential comes from the environment, never argv.
+export CURIE_CREDENTIALS=<openrouter-api-key>
+curie cluster up --model z-ai/glm-5.3-flash --allow-egress-host openrouter
+
+# The helm sets pin the worker budget explicitly. The chart raises the worker
+# termination grace with the budget. At this budget, the drain Job publishes a
+# minimum Helm timeout of 21900 seconds in its annotation.
 helm upgrade curie <chart> -n curie --reuse-values \
   --timeout 21900s \
   --set worker.deliveryBudgetSeconds=10800 \
   --set worker.runnerTotalTimeoutSeconds=10800
 curie cluster overrides dark-factory --execution-deadline 10800
 
-# The factory's default model: GLM 5.3 Flash through OpenRouter.
-helm upgrade curie <chart> -n curie --reuse-values \
-  --timeout 21900s \
-  --set agentSandbox.runner.fakeModel=false \
-  --set agentSandbox.runner.model=z-ai/glm-5.3-flash \
-  --set agentSandbox.runner.credentials=<openrouter-api-key>
+# Intake. On a release with no GitHub App, the first run prints a prefilled App
+# registration link (add --org <org> for an organization) and four manual
+# steps, and applies nothing. It never opens a browser. Click Create, copy the
+# App ID, generate a private key, install the App on the repositories, and in
+# the App settings turn the webhook on, set its URL and secret, and subscribe
+# to Issues, Issue comment, Pull request review, and Pull request review
+# comment. Then rerun with the App's details.
+curie cluster factory
 
-# Runner egress to the GitHub API for the MCP server, one entry per CIDR
-# from the "api" list at https://api.github.com/meta.
-helm upgrade curie <chart> -n curie --reuse-values \
-  --timeout 21900s \
-  --set 'agentSandbox.connectorEgress.dark-factory[0].cidr=<github-api-cidr>' \
-  --set 'agentSandbox.connectorEgress.dark-factory[0].ports[0].port=443' \
-  --set 'agentSandbox.connectorEgress.dark-factory[0].ports[0].protocol=TCP'
+# The rerun confirms the App with GET /app, takes the mention from its slug,
+# and uses its installed repositories as the allowlist (--repo, repeatable,
+# is checked against them instead). The label defaults to curie-factory and
+# is created in each repository. The key goes into the Secret
+# curie-github-app (key privateKey) through kubectl stdin; a Secret that
+# holds another App's key is refused. The webhook secret comes from the file
+# (or CURIE_GITHUB_WEBHOOK_SECRET) and is still required until polling intake
+# ships. Before applying anything, the command checks the merged config
+# against the API boot gate and applies nothing if one value is missing. The
+# values survive a later `curie cluster up`.
+curie cluster factory \
+  --app-id <app-id> --private-key-file ./app.pem \
+  --webhook-secret-file ./webhook-secret
 
-# Build the runner layer that carries the repository toolchains and GitHub MCP
-# server. It records the layer digest in connectors.lock.yaml for deployment.
-curie build --plugin-dir examples/dark-factory --registry <registry-ref>
-
-export GITHUB_PERSONAL_ACCESS_TOKEN=<read-only token>
-curie cluster deploy --plugin-dir examples/dark-factory \
-  --agent dark-factory --env prod --repo acme-corp/acme-bot \
-  --secret GITHUB_PERSONAL_ACCESS_TOKEN
+curie cluster deploy --plugin-dir ./dark-factory \
+  --agent dark-factory --env prod --repo acme-corp/acme-bot
 # Illustrative USD cap for a run that can last 3 hours. Tune it for your model.
 curie cluster budget dark-factory --limit 100
 curie cluster surfaces dark-factory --add github=acme-corp/acme-bot
@@ -144,6 +160,29 @@ curie cluster surfaces dark-factory --add github=acme-corp/acme-bot
 # Optional. Human approval of each pull request stays the default.
 curie cluster publication-policy dark-factory --policy auto
 ```
+
+`curie cluster factory --disable` turns intake off. See "Admitting a labelled
+GitHub issue" in [`docs/operations.md`](../../docs/operations.md) for what the
+gate requires.
+
+### On a laptop (kind)
+
+A kind cluster works for a single operator. It pulls the published runner
+layer from GHCR, so it needs no local registry.
+
+GitHub must reach the API to deliver webhooks. Start a port-forward and a
+cloudflared quick tunnel to it:
+
+```bash
+kubectl --context kind-<name> -n curie port-forward svc/curie-api 8000:8000
+cloudflared tunnel --url http://localhost:8000
+```
+
+Set the App's webhook URL to `<tunnel>/github/webhook`, and pass
+`--card-base-url <tunnel>` to `curie cluster factory` so links in status
+comments resolve. The port-forward and the tunnel both die when the laptop
+sleeps or the api restarts. Restart them, and update the App webhook URL if
+the quick tunnel hostname changed.
 
 Before a production factory run resolves dependencies, provide an operator
 controlled registry mirror or terminating proxy. Configure uv, Cargo and pnpm
@@ -181,23 +220,34 @@ PyPI resolves package metadata through `pypi.org` and downloads artifacts from
 check redirects against its allowed upstream hosts. The `registryEgress` CIDR
 above points only to that proxy. NetworkPolicy matches IP addresses, not
 hostnames, and a shared CDN CIDR can also serve unrelated hosts. Direct CDN
-CIDRs are unsafe for factory runs carrying a GitHub token because dependency
-build scripts or other runner code could send it to an unrelated host on the
-same address range. If the proxy is unavailable, leave registry egress closed
-and report the locked installs as unavailable. The proxy narrows network access
-but does not hide the token from code in the runner. Verify the rendered policy
+CIDRs are unsafe for factory runs because dependency build scripts or other
+runner code could reach unrelated hosts on the same address range. If the
+proxy is unavailable, leave registry egress closed and report the locked
+installs as unavailable. Verify the rendered policy
 selects the `dark-factory` runner pods.
+
+If runs fetch a registry on some attempts and fail with `Failed to connect` on
+others, the `registryEgress` list covers only part of that host's addresses.
+`index.crates.io` resolves through Fastly to several rotating IPv4 addresses
+and IPv6 addresses in `2a04:4e42::/32`, and each fetch picks one. A CIDR that
+covers one of those addresses passes the runs that pick it and fails the rest.
+The factory reports this as `registry_egress_unreachable` with the addresses
+that connected and the ones that did not. Point `registryEgress` at the
+proxy's fixed address instead of the CDN.
 
 The platform runner already supplies Python 3.13 and Node 22. This bundle
 adds pinned uv, Rust and pnpm 9 for repositories with committed lockfiles. It
-does not bake repository dependencies into the image. After changing the
-toolchain layer or upgrading the platform runner, rebuild and redeploy:
+does not bake repository dependencies into the image. The published layer is
+built on the platform runner of the same release, so after upgrading Curie,
+render the bundle again with the upgraded CLI. After changing the toolchain
+layer, build it yourself into a registry your nodes can pull from; the build
+replaces the published entry in the lock:
 
 ```bash
-curie build --plugin-dir examples/dark-factory --registry <registry-ref>
-curie cluster deploy --plugin-dir examples/dark-factory \
-  --agent dark-factory --env prod --repo acme-corp/acme-bot \
-  --secret GITHUB_PERSONAL_ACCESS_TOKEN
+curie build --plugin-dir ./dark-factory --registry <registry-ref> \
+  --platform linux/amd64
+curie cluster deploy --plugin-dir ./dark-factory \
+  --agent dark-factory --env prod --repo acme-corp/acme-bot
 ```
 
 The build updates the layer digest, and the deploy selects that digest.

@@ -2846,7 +2846,7 @@
           "name": "callers"
         },
         {
-          "about": "Set an agent's daily budget (`PUT /agents/{id}/budget`)",
+          "about": "Update an agent's budget, preserving unspecified limits",
           "args": [
             {
               "global": false,
@@ -2861,7 +2861,15 @@
               "id": "limit",
               "long": "limit",
               "positional": false,
-              "required": true
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Output token cap for each run. Must be > 0",
+              "id": "output_tokens",
+              "long": "output-tokens",
+              "positional": false,
+              "required": false
             },
             {
               "default_values": [
@@ -4351,6 +4359,148 @@
           "name": "github-app"
         },
         {
+          "about": "Turn on the GitHub factory intake (label or mention triggers, webhook secret, repo allowlist, GitHub API egress) on an existing release",
+          "args": [
+            {
+              "global": false,
+              "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`",
+              "id": "repos",
+              "long": "repo",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Issue label that hands an issue to the factory. Required (here or already recorded on the release); no whitespace, 50 chars max",
+              "id": "label",
+              "long": "label",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "GitHub App login (the app slug, no '@', e.g. `my-app-slug`) whose comment mention hands an issue to the factory. Required (here or already recorded on the release)",
+              "id": "mention",
+              "long": "mention",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Public base URL the factory links its progress cards to",
+              "id": "card_base_url",
+              "long": "card-base-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "File holding the GitHub webhook secret. Alternatively set CURIE_GITHUB_WEBHOOK_SECRET; never both. The secret never enters argv",
+              "id": "webhook_secret_file",
+              "long": "webhook-secret-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Give this agent egress to the GitHub API ranges published at <api>/meta (port 443). Repeatable",
+              "id": "github_api_egress",
+              "long": "github-api-egress",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Turn the factory intake off; changes nothing else",
+              "id": "disable",
+              "long": "disable",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The factory GitHub App's numeric App ID. Pair with --private-key-file. Without both, and with no App recorded on the release, the command prints the App registration link and applies nothing. Mention, allowlist, and label default from the App",
+              "id": "app_id",
+              "long": "app-id",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "File holding the App's PEM private key. Stored in a Kubernetes Secret through kubectl stdin; the key never enters argv",
+              "id": "private_key_file",
+              "long": "private-key-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the registration link for this GitHub organization instead of your personal account",
+              "id": "org",
+              "long": "org",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Helm `--timeout` in seconds for the upgrade. Default: the release's own drain contract, the `curie.ai/minimum-helm-timeout-seconds` annotation on its pre-upgrade worker drain hook (worker deliveryBudgetSeconds + reserve + Job and grace slack), never below 900. A factory install with a 10800s budget needs about 21900s",
+              "id": "timeout",
+              "long": "timeout",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Helm chart. Default: the version-pinned chart release asset on release builds; local `charts/curie` on dev builds. Pass a path or ref to override",
+              "id": "chart",
+              "long": "chart",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the commands that would run and exit without executing",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "factory"
+        },
+        {
           "about": "Drive the deployed Kubernetes release end to end with zero Slack contact",
           "args": [
             {
@@ -5677,7 +5827,7 @@
           "name": "channel-token"
         },
         {
-          "about": "Set an agent's budget via the platform API (`PUT /agents/{id}/budget`)",
+          "about": "Update an agent's budget, preserving unspecified limits",
           "args": [
             {
               "global": false,
@@ -5692,7 +5842,15 @@
               "id": "limit",
               "long": "limit",
               "positional": false,
-              "required": true
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Output token cap for each run (BudgetConfig.max_output_tokens_per_run). Must be > 0",
+              "id": "output_tokens",
+              "long": "output-tokens",
+              "positional": false,
+              "required": false
             },
             {
               "env": "CURIE_API_URL",
@@ -7038,6 +7196,28 @@
               "name": "provision-observability"
             }
           ]
+        },
+        {
+          "about": "Work with the dark-factory example bundle",
+          "hidden": false,
+          "name": "dark-factory",
+          "subcommands": [
+            {
+              "about": "Write the dark-factory bundle into a new or empty directory. Touches no cluster",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Directory to write the bundle into. Must not exist or be empty",
+                  "id": "out",
+                  "long": "out",
+                  "positional": false,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "render"
+            }
+          ]
         }
       ]
     },
@@ -7152,7 +7332,7 @@
         },
         {
           "global": false,
-          "help": "Push a multi-platform index to this registry (e.g. ghcr.io/acme-corp)",
+          "help": "Push every declared platform (or the `--platform` subset) to this registry (e.g. ghcr.io/acme-corp)",
           "id": "registry",
           "long": "registry",
           "positional": false,
@@ -7176,6 +7356,14 @@
             "true",
             "false"
           ],
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Push only these declared platforms (repeatable; requires `--registry`), e.g. the one architecture a laptop cluster runs. The default Docker driver can push a single platform; a multi-platform push needs a docker-container builder. Without `--registry` the build is the host platform only, so `--platform` is refused there",
+          "id": "platform",
+          "long": "platform",
+          "positional": false,
           "required": false
         }
       ],

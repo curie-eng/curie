@@ -301,6 +301,8 @@ spec:
               value: {{ .Values.api.logLevel | quote }}
             - name: ENVIRONMENT
               value: {{ .Values.api.environment | quote }}
+            - name: FORWARDED_ALLOW_IPS
+              value: ""
             - name: ORG_NAME
               value: {{ .Values.api.orgName | quote }}
             # Runner sandboxes are claimed in the release namespace (the
@@ -374,7 +376,7 @@ spec:
             # Per-thread conversation transcript cap in bytes (#3301).
             - name: TRANSCRIPT_MAX_THREAD_BYTES
               value: {{ .Values.api.transcriptMaxThreadBytes | int64 | quote }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson)) | nindent 12 }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (merge (dict "FORWARDED_ALLOW_IPS" "socket peer identity") (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson))) | nindent 12 }}
           ports:
             - name: http
               containerPort: 8000

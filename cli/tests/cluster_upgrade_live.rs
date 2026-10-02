@@ -59,14 +59,26 @@ impl Fixture {
             fs::write(&path, include_str!("data/upgrade-driver.py")).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        if let Some(retained) = retained {
-            fs::write(
-                temp.path().join("retained.json"),
-                strip_annotation(retained),
-            )
-            .unwrap();
-        }
+        let retained = strip_annotation(retained.unwrap_or("{}"));
+        let retained = match serde_json::from_str::<Value>(&retained) {
+            Ok(Value::Object(mut values)) => {
+                values
+                    .entry("connectorCaller")
+                    .or_insert_with(|| serde_json::json!({"existingSecret": "acme-caller-pair"}));
+                serde_json::to_string(&values).unwrap()
+            }
+            _ => retained,
+        };
+        fs::write(temp.path().join("retained.json"), retained).unwrap();
         Self(temp)
+    }
+
+    fn set_retained(&self, values: &Value) {
+        fs::write(
+            self.0.path().join("retained.json"),
+            serde_json::to_string(values).unwrap(),
+        )
+        .unwrap();
     }
 
     /// Seed the complete upgrade checkpoint ConfigMap `kubectl get` returns.
@@ -3034,6 +3046,187 @@ fn resume_after_validate_still_refuses_fresh_schema_contract() {
         "refusal must name --forward-only: {}",
         visible(&output)
     );
+}
+
+fn assert_connector_caller_refusal(fixture: &Fixture, output: &Output) {
+    let text = visible(output);
+    assert!(
+        !output.status.success(),
+        "an installed release without a retained caller pair must refuse: {text}"
+    );
+    assert!(
+        text.contains("connector_caller_pair_required"),
+        "the refusal must have its named reason: {text}"
+    );
+    assert!(
+        text.contains("curie cluster up --namespace ns --release rel"),
+        "the refusal must name the repair command for this installation: {text}"
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "caller refusal must precede Helm upgrade: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        !fixture.issued(&["kubectl", "get", "deploy", "rel-worker"]),
+        "caller refusal must precede the drain preflight: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        !fixture.argv().iter().any(|call| {
+            argv_starts(call, &["kubectl", "exec"])
+                && call
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "upgrade" | "downgrade" | "stamp"))
+        }),
+        "caller refusal must precede database mutation: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        fixture
+            .patches()
+            .iter()
+            .all(|patch| !is_record_patch(patch)),
+        "caller refusal must not persist an upgrade record: {:?}",
+        fixture.patches()
+    );
+    assert!(
+        fixture
+            .created()
+            .iter()
+            .all(|config_map| config_map.pointer("/data/record").is_none()),
+        "ownership creation must not create an upgrade record: {:?}",
+        fixture.created()
+    );
+}
+
+#[test]
+fn installed_release_without_connector_caller_pair_refuses_before_mutation() {
+    for values in [
+        serde_json::json!({}),
+        serde_json::json!({"connectorCaller": {}}),
+        serde_json::json!({
+            "api": {"existingSecret": "acme-api-secret"},
+            "connectorCaller": {"existingSecret": " ", "signingKey": "", "verifyKey": ""}
+        }),
+    ] {
+        let fixture = Fixture::new(None);
+        fixture.set_retained(&values);
+        let output = fixture.local("healthy");
+        assert_connector_caller_refusal(&fixture, &output);
+    }
+}
+
+#[test]
+fn installed_release_with_half_connector_caller_pair_refuses_before_mutation() {
+    for caller in [
+        serde_json::json!({"signingKey": "synthetic-signing-key"}),
+        serde_json::json!({"verifyKey": "synthetic-verify-key"}),
+        serde_json::json!({"signingKey": "synthetic-signing-key", "verifyKey": " "}),
+        serde_json::json!({"signingKey": "", "verifyKey": "synthetic-verify-key"}),
+    ] {
+        let values = serde_json::json!({"connectorCaller": caller});
+        let fixture = Fixture::new(Some(&values.to_string()));
+        let output = fixture.local("healthy");
+        assert_connector_caller_refusal(&fixture, &output);
+    }
+}
+
+#[test]
+fn dry_run_without_connector_caller_pair_refuses_without_mutating() {
+    let fixture = Fixture::new(None);
+    fixture.set_retained(&serde_json::json!({}));
+    let output = fixture.run_with("healthy", "0.9.0", "charts/curie", &["--dry-run"]);
+    assert_connector_caller_refusal(&fixture, &output);
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+    assert!(
+        json(&output)["plan"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| {
+                line.as_str().is_some_and(|line| {
+                    line.contains("refusal at validate")
+                        && line.contains("connector_caller_pair_required")
+                })
+            }),
+        "the dry run must include the refusal in its plan: {}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn cold_release_dry_run_without_connector_caller_pair_refuses_without_fetching() {
+    let fixture = Fixture::new(None);
+    fixture.set_retained(&serde_json::json!({}));
+    let output =
+        fixture.run_without_chart_with("healthy", "0.9.0", fixture.0.path(), true, &["--dry-run"]);
+    assert_connector_caller_refusal(&fixture, &output);
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+    assert!(
+        !fixture.cache_home().exists(),
+        "caller refusal must not download the target chart"
+    );
+}
+
+#[test]
+fn same_version_without_connector_caller_pair_refuses_before_mutation() {
+    let fixture = Fixture::new(None);
+    fixture.set_retained(&serde_json::json!({}));
+    let output = fixture.local("resumed-applied");
+    assert_connector_caller_refusal(&fixture, &output);
+}
+
+#[test]
+fn resume_after_validate_without_connector_caller_pair_preserves_checkpoint_record() {
+    let record = checkpoint_through(&["plan", "validate"], false);
+    let fixture = Fixture::new(None).checkpoint(&record);
+    fixture.set_retained(&serde_json::json!({}));
+    let retained_record = fixture.config_map_state()["data"]["record"].clone();
+    let output = fixture.local("healthy");
+    assert_connector_caller_refusal(&fixture, &output);
+    assert_eq!(
+        fixture.config_map_state()["data"]["record"],
+        retained_record,
+        "a fresh caller refusal must preserve the completed Validate record"
+    );
+}
+
+#[test]
+fn retained_connector_caller_secret_and_inline_pair_survive_upgrade_unchanged() {
+    for caller in [
+        serde_json::json!({
+            "existingSecret": "acme-external-caller",
+            "signingKeyKey": "private-key",
+            "verifyKeyKey": "public-key"
+        }),
+        serde_json::json!({
+            "existingSecret": "",
+            "signingKey": " synthetic signing key ",
+            "verifyKey": " synthetic verify key "
+        }),
+    ] {
+        let values = serde_json::json!({"connectorCaller": caller});
+        let fixture = Fixture::new(Some(&values.to_string()));
+        let output = fixture.local("healthy");
+        assert!(output.status.success(), "{}", visible(&output));
+        assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
+        let applied = values_doc(&fixture.values(1));
+        assert_eq!(
+            applied.get("connectorCaller"),
+            values.get("connectorCaller"),
+            "the supplied caller material must remain unchanged: {applied}"
+        );
+        for key in ["signingKey", "verifyKey"] {
+            if let Some(value) = caller.get(key).and_then(Value::as_str) {
+                assert!(
+                    !visible(&output).contains(value)
+                        && !fixture.persisted_payloads().contains(value),
+                    "inline caller credentials must stay out of output and checkpoint records"
+                );
+            }
+        }
+    }
 }
 
 /// #2588 -- the same pending contract proceeds once `--forward-only` is set.

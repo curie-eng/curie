@@ -72,6 +72,7 @@ from .history import (
     resolve_history,
 )
 from .hooks import build_factory_foreground_hooks, build_gated_pre_tool_use_hooks, load_bundle_hooks
+from .issue_read import build_issue_tool, resolve_issue_read
 from .mcp_tool_capability import (
     ConnectorAvailability,
     ConnectorCapabilityFailure,
@@ -106,6 +107,7 @@ from .server import bind_status_attestation, create_app
 from .session import ConnectorReprobe, SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
+from .subprocess_env import lock_process_environ
 from .tool_access import TurnToolAccess, front_can_use_tool, front_pre_tool_use_hooks
 from .turn_progress import (
     PROGRESS_PREAMBLE,
@@ -725,6 +727,9 @@ def build_runner(
     # bundle shipping its own server. Absent (fake/local, or an older worker), no
     # state server is mounted and the agent simply sees no state tools.
     state_client = resolve_state_client(os.environ)
+    # The GitHub factory issue read (ADR 0187) is present only for an execution
+    # with a WorkItem whose worker injected the route and capability.
+    issue_read = resolve_issue_read(os.environ)
     progress_activity = ProgressActivity()
     progress_activity.model = config.model
     # Per-model token usage for the run's cost line (#3223): reported whenever
@@ -915,6 +920,7 @@ def build_runner(
                     and memory_turn is not None
                     else ()
                 ),
+                issue_tool=(build_issue_tool(*issue_read) if issue_read is not None else None),
             ),
             **(
                 {STATE_SERVER_NAME: build_state_server(state_client)}
@@ -1048,6 +1054,7 @@ def build_runner(
         SessionRunner(
             session_factory=factory,
             ceiling=config.ceiling,
+            max_usd_per_day=config.max_usd_per_day,
             tracer=RunTracer(provider),
             classifier=SideEffectClassifier(
                 readonly_tools=_readonly_tools(harness, observed_readonly_tools, approval_gate)
@@ -1481,6 +1488,7 @@ def _serve() -> None:
 
 
 def main() -> None:
+    lock_process_environ()
     install_stdout_redaction()
     telemetry = bootstrap_service_telemetry(
         "curie-runner",

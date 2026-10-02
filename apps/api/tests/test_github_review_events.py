@@ -864,6 +864,19 @@ def _review_stack(
     """
     event = getattr(request, "param", "issue_comment")
     truth = GitHubTruth(event, review_app_key)
+    # The canonical event identity becomes a Valkey key, shared across workers.
+    # Keep each fixture's identity consistent across the webhook and GitHub read.
+    feedback_id = uuid.uuid4().int >> 80
+    fragment = truth.feedback.url.rsplit("#", 1)[1].removesuffix(
+        str(truth.feedback.feedback_id)
+    )
+    payload_feedback = truth.payload["review" if event == "pull_request_review" else "comment"]
+    for feedback in (payload_feedback, truth.comment):
+        feedback["id"] = feedback_id
+        feedback["html_url"] = f"https://github.com/{REPO}/pull/17#{fragment}{feedback_id}"
+    truth.feedback = parse_feedback(
+        event, truth.payload, DELIVERY, github_html_base="https://github.com"
+    )
     # `curie cluster message` replies through the built-in relay: a Slack-shaped
     # address, no endpoint, the reserved adapter and a session reply ref (#2789).
     reply_channel = "C0LOCALDEV" if cluster_message else "C0EXAMPLE1"
@@ -877,6 +890,9 @@ def _review_stack(
         else {"reply_placeholder": "1700000000.000002"}
     )
     stream = f"test:curie:github-review:{uuid.uuid4().hex}"
+    held_index = f"{stream}:held"
+    monkeypatch.setattr("curie_api.github_review_store._HELD_INDEX", held_index)
+    monkeypatch.setitem(globals(), "HELD_INDEX", held_index)
     for key, value in {
         "RUNS_STREAM": stream,
         "KEY_PREFIX": f"{stream}:worker",
@@ -889,11 +905,15 @@ def _review_stack(
         "GITHUB_REPO_ALLOWLIST": '["acme-corp/*"]',
         "GITHUB_REVIEW_RECONCILER_INTERVAL_S": "3600",
         "APPROVAL_SWEEP_INTERVAL_S": "0",
+        "CURIE_WORK_ITEM_RECONCILER_ENABLED": "false",
         "RESUME_RECONCILER_ENABLED": "false",
         "DEAD_LETTER_WATCH_INTERVAL_S": "0",
     }.items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
+    # Validate enabled ingress normally, then disable only the fixture's poller.
+    # A long interval still runs its first pass immediately and races test calls.
+    get_settings().github_review_reconciler_interval_s = 0
     _RESOLVERS.clear()
     valkey = connect_or_skip(decode_responses=True)
     with ExitStack() as owned:
@@ -911,9 +931,9 @@ def _review_stack(
             stream,
             f"{stream}:dead",
             f"curie:github-review:{truth.feedback.event_id}",
-            "curie:github-review:held",
-            f"curie:github-review:held:{truth.feedback.event_id}",
-            f"curie:github-review:held:{truth.feedback.event_id}:deliveries",
+            held_index,
+            f"{held_index}:{truth.feedback.event_id}",
+            f"{held_index}:{truth.feedback.event_id}:deliveries",
         )
         client = owned.enter_context(TestClient(create_app()))
         real_client = httpx.Client
@@ -2333,7 +2353,7 @@ def test_review_verification_uses_its_own_budget_over_actual_api_http(review_sta
 
     async def exercise() -> None:
         async def delayed_github(request: httpx.Request) -> httpx.Response:
-            if request.url.path.endswith("/comments/71"):
+            if request.url.path.endswith(f"/comments/{truth.feedback.feedback_id}"):
                 await asyncio.sleep(2.2)
             return truth.handle(request)
 

@@ -127,8 +127,10 @@ Call report_progress with phase `read_issue`.
 
 Your message is the issue link, for example
 `https://github.com/<owner>/<repo>/issues/<number>`. Read it with the
-`mcp__github__get_issue` tool (`owner`, `repo`, `issue_number`). That tool is
-the only GitHub tool this bundle grants; the repository itself is already
+`mcp__curie__get_issue` tool (`owner`, `repo`, `issue_number`). The platform
+reads the issue for you and returns its title, body and comments verbatim; it
+reads only this run's issue. That tool is the only GitHub tool this bundle has,
+and the sandbox holds no GitHub credential; the repository itself is already
 checked out at `/workspace`.
 
 If the issue cannot be read (the tool is missing, refused, or returns an
@@ -200,7 +202,18 @@ Call report_progress with phase `failing_test`.
 
 Where a test is feasible, write the test for the new behavior first and run
 it. Confirm it fails, and fails for the reason the issue describes, before
-you change the code. When a test is not feasible (documentation, pure
+you change the code. When the new test needs a service the sandbox lacks
+(Postgres, Valkey, or another server the repository's CI starts), it cannot
+run here, and a failure at import or connection is not the red you need. Write
+the test anyway and record it as a service-backed test: its exact command, the
+missing service, and the line in the base code it exercises that your change
+fixes. Its green run comes from the pull request's CI, which starts the
+services. Its red-on-base run is a defined procedure for a machine with those
+services, not this sandbox: keep the new test file, restore only the changed
+non-test files from the base with `git checkout <base-sha> -- <changed source
+files>`, start the services the repository documents, and run the recorded
+command; it must fail on the bug, not at import. Put that procedure in the
+pull request body. Do not stop for want of a red run you cannot obtain. When a test is not feasible (documentation, pure
 configuration, or a project with no test framework), say so and say how you
 will verify the change instead.
 
@@ -230,6 +243,24 @@ Do not change a lockfile or run an ad hoc package install, an unpinned install,
 or another dependency download command. An unavailable registry is a blocked
 check, not permission to use a different source.
 
+When a locked fetch cannot connect to a registry host, name the cause instead
+of only deferring the check. Run, for that host:
+
+```sh
+getent ahosts <host>
+curl -sS -o /dev/null -m 10 -w '%{http_code} %{remote_ip}\n' --resolve <host>:443:<address> https://<host>/
+```
+
+running the `curl` once for each distinct address `getent` returned. Report
+the blocked check with the cause `registry_egress_unreachable`, the host, and
+which resolved addresses connected and which timed out or were refused. Add
+this operator guidance: NetworkPolicy matches addresses, not hostnames, and a
+CDN host such as `index.crates.io` rotates across many IPv4 and IPv6
+addresses, so a registry egress CIDR list that covers only some of them fails
+on some runs and passes on others. Point `agentSandbox.registryEgress` for
+this agent at a registry mirror or proxy with a fixed address, as the bundle
+README describes.
+
 Run every available check for the changed area. Record the exact command,
 exit status and result for each check you run. If Postgres or another required
 service is absent from the sandbox, record which check it blocks and the
@@ -237,7 +268,12 @@ missing service. Name each blocked check and its cause in the pull request body;
 never claim it passed. A blocked service check can be left to the
 repository's independent pull request CI only when the functional acceptance
 criteria are verified by checks you did run. A real product check failure or
-an unmet criterion still requires a fix or a stated stop reason. Never fake a
+an unmet criterion still requires a fix or a stated stop reason.
+A criterion whose only test is service-backed counts as verified for
+publication when the test is written, the serviceless checks pass, and the
+diff reviewer approves the test as exercising that criterion. The pull
+request's required CI, which starts the services, is that test's run, and
+`wait_ci` returns any failure to `implement`. Never fake a
 missing package, service or file with a stub, a mock presented as real, or a
 fixed result.
 
@@ -248,7 +284,8 @@ Call report_progress with phase `review_diff` and round `<n>`.
 Call the `Agent` tool exactly as in step 4, with `subagent_type`
 `"dark-factory:diff-reviewer"` (required; never omit it), `description`
 `"Diff review round <n>"`, and a `prompt` with the issue link and text, your
-numbered acceptance criteria, each check you ran with its exit status, and,
+numbered acceptance criteria, each check you ran with its exit status, each
+service-backed test with its command and missing service, and,
 from round 2 on, the previous round's findings.
 The reviewer reads the diff in `/workspace` itself. Do not pass `isolation` or
 `model`. Set `run_in_background` to `false`; wait for the foreground call to
@@ -272,11 +309,11 @@ Each loop runs at most 3 rounds. A diff review rejection returns to step 6
 (implement), never to the plan. When a reviewer still answers
 `VERDICT: CHANGES` on round 3, or a review fails, do not publish:
 
-1. Post the reviewer's unresolved findings and open questions on the issue
-   with `add_issue_comment`, once, as a short bulleted list a maintainer can
-   answer. This is the only comment you may post.
-2. End your final reply with `Could not complete:`, one sentence naming the
-   loop that did not converge (or the review that failed), and the same list.
+End your final reply with `Could not complete:`, one sentence naming the loop
+that did not converge (or the review that failed), and the reviewer's
+unresolved findings and open questions as a short bulleted list a maintainer
+can answer. The platform posts that reply on the issue; you post nothing
+there yourself.
 
 ## 8. Finish (phase `publish`)
 
@@ -286,7 +323,9 @@ Call report_progress with phase `publish`.
 available product check passes, and the diff reviewer's latest verdict is
 `VERDICT: APPROVE`. Checks blocked by an absent service must be named with
 their causes in the pull request body and left to the independent pull request
-CI. Never treat a failed check or an unmet criterion as a service gap. First
+CI. For each service-backed test, the body also states that red-on-base was
+not observed in the sandbox and gives the red-on-base procedure from step 5,
+with the base commit and the changed source files filled in. Never treat a failed check or an unmet criterion as a service gap. First
 read the repository's pull request conventions: `AGENTS.md` and `CONTRIBUTING.md`, the pull request
 template (often under `.github/`), and any CI job that checks pull request
 bodies. Follow them in the pull request's title and body, including required
@@ -323,6 +362,13 @@ the approval, and its checks run there.
 
 After `publish`, end your turn as step 8 says. The platform waits on the pull
 request's checks for you; you do not poll for them yourself.
+
+When checks fail, the platform reruns each failed GitHub Actions job once at
+that same head commit before it sends you a `wait_ci` round. That rerun does
+not use one of the three rounds. You are sent back to `implement` only when a
+failure is still there after the rerun, or when the rerun could not be
+requested. The platform records the rerun, or the reason it was refused, on
+the run. You still do not rerun jobs yourself.
 
 If the checks fail, the platform sends a new message in this same run whose
 second line is `Curie wait_ci round N of 3: ...`, followed by the failing

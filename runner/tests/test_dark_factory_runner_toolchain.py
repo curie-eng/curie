@@ -267,6 +267,21 @@ def test_factory_skill_allows_locked_installs_and_reports_service_gaps() -> None
     assert re.search(r"(?:pull request|PR) body", step, re.IGNORECASE)
 
 
+def test_factory_skill_names_registry_egress_cause_with_guidance() -> None:
+    """#3761: an unreachable registry is reported as a named environment cause."""
+    skill = SKILL.read_text(encoding="utf-8")
+    step = skill.split("## 6. Implement and check", 1)[1].split(
+        "## 7. Diff review", 1
+    )[0]
+    assert "registry_egress_unreachable" in step
+    # The probe distinguishes per-address reachability, which is what makes a
+    # partial CIDR allowlist visible.
+    assert "getent ahosts <host>" in step
+    assert "--resolve <host>:443:<address>" in step
+    assert "agentSandbox.registryEgress" in step
+    assert re.search(r"addresses, not hostnames", step)
+
+
 def test_factory_runner_pod_resolves_repository_lockfiles() -> None:
     image = os.environ.get(IMAGE_ENV, "").strip()
     if not image:

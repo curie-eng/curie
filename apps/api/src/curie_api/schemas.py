@@ -2075,6 +2075,52 @@ class PublicationPrecheckResult(BaseModel):
     result: Literal["unchanged", "metadata_changed"]
 
 
+class IssueReadContextMint(BaseModel):
+    """Trusted worker identity for one factory execution's issue read (ADR 0187)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    execution_request_id: uuid.UUID
+
+
+class IssueReadContext(BaseModel):
+    """The execution scoped capability and the one issue it names."""
+
+    work_item_id: uuid.UUID
+    execution_request_id: uuid.UUID
+    repo_full_name: str
+    issue_number: int
+    capability: str
+
+
+class IssueReadRequest(BaseModel):
+    """The issue the sandbox asks for. Anything but the capability's is refused."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repo_full_name: str = Field(min_length=3, max_length=512)
+    issue_number: int = Field(gt=0)
+
+
+class IssueReadComment(BaseModel):
+    author: str | None
+    created_at: str | None
+    body: str
+
+
+class IssueReadResult(BaseModel):
+    """The issue verbatim. The platform parses and stores none of it."""
+
+    repo_full_name: str
+    issue_number: int
+    title: str
+    body: str
+    state: str | None
+    author: str | None
+    comments: list[IssueReadComment]
+    comments_truncated: bool
+
+
 class PublicationLineageAdvance(BaseModel):
     """Exact compare-and-set facts for one publication revision outcome."""
 
@@ -2506,6 +2552,7 @@ class ApprovalOut(BaseModel):
     conversation_id: str
     author: str
     summary: str
+    display_summary: str | None = None
     reply_channel: str
     reply_placeholder: str | None
     reply_endpoint: str | None
