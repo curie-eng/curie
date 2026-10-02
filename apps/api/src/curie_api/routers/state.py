@@ -10,13 +10,18 @@ consume. It is also exposed to bundle code (#249) via the auto-mounted
 ``curie-state`` MCP server and the ``CURIE_STATE_URL`` / ``CURIE_STATE_TOKEN``
 boot-env pair, so a skill reads and writes state without shipping its own server;
 the sandbox authenticates with a scoped ``state`` token (ADR-0033), never the
-platform key.
+platform key. On the ``memory`` namespace a sandbox credential is further held to
+its own channel, to fact keys, and to the sender its per-turn credential names
+(ADR-0188).
 """
 
 import enum
 import hashlib
+import logging
+import re
 import uuid
-from typing import Annotated, Any
+from dataclasses import dataclass
+from typing import Annotated, Any, Literal, NoReturn
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy import Text, cast, delete, func, select, text
@@ -31,10 +36,17 @@ from ..schemas import StateAppendIn, StateEntryOut, StateEntryPut, StateNamespac
 from ..transcripts import TRANSCRIPT_NAMESPACE
 from ..transcripts import json_size as _json_size
 
+logger = logging.getLogger(__name__)
+
 # Two scoped-token scopes the state router accepts (ADR-0033). The BROAD scope is
-# minted for the runner's own memory/history loaders, which MUST read and write
-# the reserved namespaces to rehydrate the agent across a suspend/resume; it
-# reaches every namespace. The NARROW scope is minted for the bundle-facing
+# minted for the runner's own memory/history loaders and memory tools, which MUST
+# read the reserved namespaces to rehydrate the agent across a suspend/resume
+# (and read and write transcripts). It reaches every namespace, but on ``memory``
+# its claims narrow it (ADR-0188, ``_check_memory_reach``): ``binding`` names the
+# one channel whose memory it may reach, and ``memory`` says whether it may write
+# (only the per-turn credential the worker puts on the turn's ACI ``Event`` is
+# ``"write"``, and it carries the ``sender`` the API stamps as the fact's
+# author). The NARROW scope is minted for the bundle-facing
 # ``CURIE_STATE_TOKEN`` and is refused on the reserved namespaces by
 # ``forbid_reserved_namespace`` below -- so a skill using the mounted state
 # interface (the ``curie-state`` MCP tools or a direct ``CURIE_STATE_URL``
@@ -51,44 +63,193 @@ STATE_APP_SCOPE = "state.app"
 # (``runner/src/curie_runner/state.py``) and ``memory.MEMORY_NAMESPACE`` /
 # the history transcript key -- a bundle wanting durable memory uses the remember
 # tool, not raw state. A future fixed namespace must be added here too.
-RESERVED_NAMESPACES = frozenset({"memory", TRANSCRIPT_NAMESPACE})
+MEMORY_NAMESPACE = "memory"
+RESERVED_NAMESPACES = frozenset({MEMORY_NAMESPACE, TRANSCRIPT_NAMESPACE})
+
+# The only memory keys a sandbox credential may write (ADR-0188): the fact ids
+# the runner's memory tools mint. Mirrors ``memory_facts._FACT_ID`` in the
+# runner; ``tests/test_memory_fact_key_parity.py`` pins the two. ``guidance``
+# and the legacy ``log`` are written with the platform key only.
+_FACT_KEY = re.compile(r"^fact-[0-9a-f]{32}$")
 
 
 class StateCaller(enum.Enum):
     """Which credential authorized a state-router request, and thus how far it
-    reaches. PLATFORM (the shared key) and STATE (the broad scoped token, i.e.
-    the memory/history loaders) are unrestricted; APP (the narrow bundle token)
-    is refused on ``RESERVED_NAMESPACES``."""
+    reaches. PLATFORM (the shared key) is unrestricted. STATE (the broad scoped
+    token: the runner's loaders and memory tools) reaches every namespace, but
+    on ``memory`` only as far as its claims allow (ADR-0188). APP (the narrow
+    bundle token) is refused on ``RESERVED_NAMESPACES``."""
 
     PLATFORM = "platform"
     STATE = "state"
     APP = "app"
 
 
+@dataclass(frozen=True)
+class StatePrincipal:
+    """Who a state-router request is, as far as the router needs to know.
+
+    ``binding``, ``memory``, ``sender`` and ``turn`` are the ADR-0188 claims of a
+    STATE token (all None for the platform key and the app token). A STATE token
+    with no ``memory`` claim was minted by a pre-ADR-0188 worker: ``legacy``,
+    which fails closed on memory (read-only, agent memory only)."""
+
+    caller: StateCaller
+    binding: str | None = None
+    memory: Literal["read", "write"] | None = None
+    sender: str | None = None
+    turn: str | None = None
+
+    @property
+    def legacy(self) -> bool:
+        return self.caller is StateCaller.STATE and self.memory is None
+
+
+def _str_claim(payload: dict[str, Any], name: str) -> str | None:
+    value = payload.get(name)
+    return value if isinstance(value, str) else None
+
+
+def _state_principal(payload: dict[str, Any]) -> StatePrincipal:
+    if "memory" not in payload:
+        return StatePrincipal(StateCaller.STATE)
+    # Anything but an explicit "write" is read-only: fail closed.
+    memory: Literal["read", "write"] = "write" if payload.get("memory") == "write" else "read"
+    return StatePrincipal(
+        StateCaller.STATE,
+        binding=_str_claim(payload, "binding"),
+        memory=memory,
+        sender=_str_claim(payload, "sender"),
+        turn=_str_claim(payload, "turn"),
+    )
+
+
 async def require_state_access(
     agent_id: uuid.UUID,
     x_api_key: Annotated[str | None, Header()] = None,
-) -> StateCaller:
+) -> StatePrincipal:
     """State-router auth (ADR-0033): the platform key (trusted callers) OR a
     scoped token bound to this path's ``agent_id`` (the sandbox). The broad
-    ``state`` scope (the runner's memory/history loaders) reaches every namespace;
-    the narrow app scope (the bundle-facing ``CURIE_STATE_TOKEN``) is refused on
-    the reserved namespaces by ``forbid_reserved_namespace``. Every other router
-    keeps the platform-key-only ``require_api_key``. Returns which caller
-    authenticated so the namespace guard can apply the right reach."""
+    ``state`` scope (the runner's loaders and memory tools) reaches every
+    namespace, held on ``memory`` to its claims by ``_check_memory_reach``
+    (ADR-0188); the narrow app scope (the bundle-facing ``CURIE_STATE_TOKEN``)
+    is refused on the reserved namespaces by ``forbid_reserved_namespace``.
+    Every other router keeps the platform-key-only ``require_api_key``. Returns
+    the caller and its verified claims so the guards can apply the right
+    reach."""
 
     if verify_platform_key(x_api_key):
-        return StateCaller.PLATFORM
+        return StatePrincipal(StateCaller.PLATFORM)
     if x_api_key is not None:
         api_key = get_settings().api_key
         agent = str(agent_id)
-        if sandbox_token.verify(x_api_key, api_key, agent=agent, scope=STATE_SCOPE):
-            return StateCaller.STATE
+        payload = sandbox_token.decode(x_api_key, api_key, agent=agent, scope=STATE_SCOPE)
+        if payload is not None:
+            return _state_principal(payload)
         if sandbox_token.verify(x_api_key, api_key, agent=agent, scope=STATE_APP_SCOPE):
-            return StateCaller.APP
+            return StatePrincipal(StateCaller.APP)
     raise HTTPException(
         status.HTTP_401_UNAUTHORIZED, detail="missing or invalid credential"
     )
+
+
+def _state_path(
+    namespace: str, key: str | None, kind: str | None = None, address: str | None = None
+) -> str:
+    """The request's state path, for log lines (never carries a credential)."""
+    parts = ["state"]
+    if kind is not None and address is not None:
+        parts += ["bindings", kind, address]
+    parts.append(namespace)
+    if key is not None:
+        parts.append(key)
+    return "/".join(parts)
+
+
+def _refuse(principal: StatePrincipal, agent_id: uuid.UUID, path: str, reason: str) -> NoReturn:
+    """Log and raise a 403 for a memory request the credential may not make.
+
+    The log names the agent, the path and the turn claim, never the token."""
+
+    if principal.legacy:
+        logger.warning(
+            "state: refused legacy sandbox token (no memory claim) for agent %s on %s: %s",
+            agent_id,
+            path,
+            reason,
+        )
+    else:
+        logger.warning(
+            "state: refused sandbox credential for agent %s on %s (turn %s): %s",
+            agent_id,
+            path,
+            principal.turn,
+            reason,
+        )
+    raise HTTPException(status.HTTP_403_FORBIDDEN, reason)
+
+
+def _check_memory_reach(
+    principal: StatePrincipal,
+    agent_id: uuid.UUID,
+    namespace: str,
+    *,
+    requested_binding: str | None,
+    key: str | None,
+    write: bool,
+    path: str,
+    append: bool = False,
+) -> None:
+    """ADR-0188: what a sandbox (STATE) credential may do on ``memory``.
+
+    The platform key keeps full reach, the app token is already fenced off by
+    ``forbid_reserved_namespace``, and other namespaces are unchanged. Runs
+    before ``_binding_scope``'s database lookup, so the 403 for another
+    channel cannot be used to probe which bindings exist."""
+
+    if principal.caller is not StateCaller.STATE or namespace != MEMORY_NAMESPACE:
+        return
+    if requested_binding is not None and (
+        principal.legacy or principal.binding != requested_binding
+    ):
+        _refuse(principal, agent_id, path, "credential is scoped to another channel")
+    if not write:
+        return
+    if principal.memory != "write":
+        _refuse(principal, agent_id, path, "memory credential is read-only")
+    if append:
+        _refuse(
+            principal,
+            agent_id,
+            path,
+            "memory facts are written with PUT; append is not allowed with a sandbox credential",
+        )
+    if key is None or _FACT_KEY.match(key) is None:
+        _refuse(
+            principal, agent_id, path, "only fact keys are writable with a sandbox credential"
+        )
+
+
+def _stamp_author(
+    principal: StatePrincipal,
+    agent_id: uuid.UUID,
+    namespace: str,
+    data: StateEntryPut,
+    path: str,
+) -> StateEntryPut:
+    """ADR-0188: a sandbox fact's author is the per-turn credential's ``sender``
+    claim, whatever the body says. The platform key keeps the body's author."""
+
+    if principal.caller is not StateCaller.STATE or namespace != MEMORY_NAMESPACE:
+        return data
+    if principal.sender is None:
+        _refuse(principal, agent_id, path, "memory write credential names no sender")
+    if not isinstance(data.value, dict):
+        raise HTTPException(
+            422,
+            "a memory fact written with a sandbox credential must be a JSON object",
+        )
+    return data.model_copy(update={"value": {**data.value, "author": principal.sender}})
 
 
 async def _binding_scope(
@@ -98,20 +259,19 @@ async def _binding_scope(
     (#1525 follow-up): `"{kind}:{address}"`, once confirmed to actually belong
     to this agent.
 
-    Not a security boundary -- the caller already reached this far only by
-    presenting a credential authenticating it as THIS agent's own sandbox (or
-    the platform key), and a scope string is just a partition key within that
-    one agent's already-fully-accessible general-state store, the same as any
-    `namespace`/`key` a caller could always freely choose. Checking it against
+    For general state this is a partition key, not a permission: a sandbox
+    credential for this agent may use any of the agent's bindings, the same as
+    any `namespace`/`key` it could always freely choose. Checking it against
     `agent_channels` is a correctness guard -- a typo or a stale binding name
     fails loudly as 404 instead of silently opening a new, orphaned partition
-    that corresponds to nothing -- not an authorization check. That is also
-    why this reads the database directly rather than trusting a claim on the
-    presented credential: the credential (`sandbox_token`) authenticates WHICH
-    agent, never which of that agent's own bindings, by design (ADR-0033;
-    rejected alternative for #1525 was widening it to carry one, but a
-    same-agent partition key has no privilege for that credential to carry in
-    the first place).
+    that corresponds to nothing.
+
+    For the `memory` namespace the binding IS a permission (ADR-0188, which
+    reverses the #1525 follow-up's rejection of a binding claim for memory): one
+    channel's memory can hold a direct message, so a sandbox credential reaches
+    only the channel its `binding` claim names. That check is
+    `_check_memory_reach`, which callers run before this lookup so a 403 cannot
+    be used to learn which bindings exist.
 
     No caller here NAMES an adapter -- the state API has no such parameter --
     and an agent's rows on one pair share this one scope whichever identity
@@ -130,7 +290,7 @@ async def _binding_scope(
 
 async def forbid_reserved_namespace(
     namespace: str,
-    caller: Annotated[StateCaller, Depends(require_state_access)],
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> None:
     """Server-side backstop for the reserved-namespace rule (#249): a narrow
     app-scoped (bundle) token may not read or write the memory/transcript
@@ -138,8 +298,9 @@ async def forbid_reserved_namespace(
     platform key and the broad ``state`` token (the loaders) are unrestricted.
     Without this a skill could bypass the ``curie-state`` tool's own client-side
     refusal by composing ``CURIE_STATE_URL`` directly with the token it holds;
-    here the token it holds is simply refused."""
-    if caller is StateCaller.APP and namespace in RESERVED_NAMESPACES:
+    here the token it holds is simply refused. The broad token's narrower reach
+    on ``memory`` (ADR-0188) is ``_check_memory_reach``."""
+    if principal.caller is StateCaller.APP and namespace in RESERVED_NAMESPACES:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             f"namespace {namespace!r} is reserved by the platform "
@@ -465,8 +626,18 @@ async def _put_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def put_state(
-    agent_id: uuid.UUID, namespace: str, key: str, data: StateEntryPut, session: SessionDep
+    agent_id: uuid.UUID,
+    namespace: str,
+    key: str,
+    data: StateEntryPut,
+    session: SessionDep,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    path = _state_path(namespace, key)
+    _check_memory_reach(
+        principal, agent_id, namespace, requested_binding=None, key=key, write=True, path=path
+    )
+    data = _stamp_author(principal, agent_id, namespace, data, path)
     return await _put_state(agent_id, None, namespace, key, data, session)
 
 
@@ -483,7 +654,19 @@ async def put_state_for_binding(
     key: str,
     data: StateEntryPut,
     session: SessionDep,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    path = _state_path(namespace, key, kind, address)
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
+        write=True,
+        path=path,
+    )
+    data = _stamp_author(principal, agent_id, namespace, data, path)
     scope = await _binding_scope(session, agent_id, kind, address)
     return await _put_state(agent_id, scope, namespace, key, data, session)
 
@@ -542,8 +725,23 @@ async def _append_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def append_state(
-    agent_id: uuid.UUID, namespace: str, key: str, data: StateAppendIn, session: SessionDep
+    agent_id: uuid.UUID,
+    namespace: str,
+    key: str,
+    data: StateAppendIn,
+    session: SessionDep,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=key,
+        write=True,
+        append=True,
+        path=_state_path(namespace, key),
+    )
     return await _append_state(agent_id, None, namespace, key, data, session)
 
 
@@ -560,7 +758,18 @@ async def append_state_for_binding(
     key: str,
     data: StateAppendIn,
     session: SessionDep,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
+        write=True,
+        append=True,
+        path=_state_path(namespace, key, kind, address),
+    )
     scope = await _binding_scope(session, agent_id, kind, address)
     return await _append_state(agent_id, scope, namespace, key, data, session)
 
@@ -570,6 +779,8 @@ async def _list_namespaces(
     scope: str | None,
     session: AsyncSession,
     caller: StateCaller,
+    *,
+    hide_memory: bool = False,
 ) -> list[StateNamespaceOut]:
     """List the namespaces stored under one scope, each with its key count and
     the most recent write time (#250). This is the enumeration the operator's
@@ -586,6 +797,10 @@ async def _list_namespaces(
     for every caller alike; an operator wanting the full picture of a
     memory=False agent calls once per binding, the same way its own bundle
     code only ever sees the one scope the worker handed it.
+
+    ``hide_memory`` drops the ``memory`` row for a sandbox credential listing a
+    binding whose memory it may not reach (ADR-0188), rather than refusing the
+    whole listing: that binding's general state stays reachable.
     """
     query = (
         select(
@@ -609,6 +824,7 @@ async def _list_namespaces(
         # namespaces exist -- their key counts and write times are exactly what
         # the state.app scope fences off (#856).
         if not (caller is StateCaller.APP and row.namespace in RESERVED_NAMESPACES)
+        and not (hide_memory and row.namespace == MEMORY_NAMESPACE)
     ]
     # Transcripts live in their own table (ADR-0170) but are still listed here
     # as the reserved namespace the operator's inspector already knows.
@@ -630,9 +846,9 @@ async def _list_namespaces(
 async def list_namespaces(
     agent_id: uuid.UUID,
     session: SessionDep,
-    caller: Annotated[StateCaller, Depends(require_state_access)],
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> list[StateNamespaceOut]:
-    return await _list_namespaces(agent_id, None, session, caller)
+    return await _list_namespaces(agent_id, None, session, principal.caller)
 
 
 @router.get("/{agent_id}/state/bindings/{kind}/{address}", response_model=list[StateNamespaceOut])
@@ -641,10 +857,15 @@ async def list_namespaces_for_binding(
     kind: str,
     address: str,
     session: SessionDep,
-    caller: Annotated[StateCaller, Depends(require_state_access)],
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> list[StateNamespaceOut]:
     scope = await _binding_scope(session, agent_id, kind, address)
-    return await _list_namespaces(agent_id, scope, session, caller)
+    hide_memory = principal.caller is StateCaller.STATE and (
+        principal.legacy or principal.binding != scope
+    )
+    return await _list_namespaces(
+        agent_id, scope, session, principal.caller, hide_memory=hide_memory
+    )
 
 
 async def _get_state(
@@ -680,8 +901,22 @@ async def _get_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def get_state(
-    agent_id: uuid.UUID, namespace: str, key: str, session: SessionDep, response: Response
+    agent_id: uuid.UUID,
+    namespace: str,
+    key: str,
+    session: SessionDep,
+    response: Response,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=key,
+        write=False,
+        path=_state_path(namespace, key),
+    )
     return await _get_state(agent_id, None, namespace, key, session, response)
 
 
@@ -698,7 +933,17 @@ async def get_state_for_binding(
     key: str,
     session: SessionDep,
     response: Response,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
+        write=False,
+        path=_state_path(namespace, key, kind, address),
+    )
     scope = await _binding_scope(session, agent_id, kind, address)
     return await _get_state(agent_id, scope, namespace, key, session, response)
 
@@ -727,8 +972,20 @@ async def _list_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def list_state(
-    agent_id: uuid.UUID, namespace: str, session: SessionDep
+    agent_id: uuid.UUID,
+    namespace: str,
+    session: SessionDep,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> list[StateEntryOut]:
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=None,
+        write=False,
+        path=_state_path(namespace, None),
+    )
     return await _list_state(agent_id, None, namespace, session)
 
 
@@ -738,8 +995,22 @@ async def list_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def list_state_for_binding(
-    agent_id: uuid.UUID, kind: str, address: str, namespace: str, session: SessionDep
+    agent_id: uuid.UUID,
+    kind: str,
+    address: str,
+    namespace: str,
+    session: SessionDep,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> list[StateEntryOut]:
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=None,
+        write=False,
+        path=_state_path(namespace, None, kind, address),
+    )
     scope = await _binding_scope(session, agent_id, kind, address)
     return await _list_state(agent_id, scope, namespace, session)
 
@@ -819,11 +1090,20 @@ async def delete_state(
     namespace: str,
     key: str,
     session: SessionDep,
-    caller: Annotated[StateCaller, Depends(require_state_access)],
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
     expected_version: int | None = None,
 ) -> Response:
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=key,
+        write=True,
+        path=_state_path(namespace, key),
+    )
     return await _delete_state(
-        agent_id, None, namespace, key, expected_version, session, caller
+        agent_id, None, namespace, key, expected_version, session, principal.caller
     )
 
 
@@ -839,10 +1119,19 @@ async def delete_state_for_binding(
     namespace: str,
     key: str,
     session: SessionDep,
-    caller: Annotated[StateCaller, Depends(require_state_access)],
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
     expected_version: int | None = None,
 ) -> Response:
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
+        write=True,
+        path=_state_path(namespace, key, kind, address),
+    )
     scope = await _binding_scope(session, agent_id, kind, address)
     return await _delete_state(
-        agent_id, scope, namespace, key, expected_version, session, caller
+        agent_id, scope, namespace, key, expected_version, session, principal.caller
     )
