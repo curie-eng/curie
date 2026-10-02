@@ -5380,8 +5380,13 @@
         "type": "string"
       },
       "ProviderInstallationCreate": {
-        "description": "A connected external account, created by an administrator.\n\n``credential_ref`` and ``webhook_verification_ref`` are plain strings\nhere, with no Field constraints, on purpose: FastAPI's 422 echoes the\nrejected input, and a value pasted where a reference belongs is exactly\nthe credential that must not come back. The router checks both against\nthe reference grammar and answers with a message that omits the value.",
+        "description": "One channel identity, created by an administrator.\n\n``credential_ref`` and ``webhook_verification_ref`` are plain strings\nhere, with no Field constraints, on purpose: FastAPI's 422 echoes the\nrejected input, and a value pasted where a reference belongs is exactly\nthe credential that must not come back. The router checks both against\nthe reference grammar and answers with a message that omits the value.",
         "properties": {
+          "attributes": {
+            "additionalProperties": true,
+            "title": "Attributes",
+            "type": "object"
+          },
           "credential_ref": {
             "anyOf": [
               {
@@ -5420,6 +5425,12 @@
               }
             ],
             "title": "Installed By Principal Id"
+          },
+          "name": {
+            "default": "default",
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
           },
           "provider": {
             "enum": [
@@ -5485,6 +5496,11 @@
       },
       "ProviderInstallationOut": {
         "properties": {
+          "attributes": {
+            "additionalProperties": true,
+            "title": "Attributes",
+            "type": "object"
+          },
           "credential_ref": {
             "anyOf": [
               {
@@ -5545,7 +5561,21 @@
             ],
             "title": "Installed By Principal Id"
           },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
           "provider": {
+            "enum": [
+              "slack",
+              "m365",
+              "github",
+              "jira",
+              "linear",
+              "confluence",
+              "quickbooks",
+              "other"
+            ],
             "title": "Provider",
             "type": "string"
           },
@@ -5557,6 +5587,11 @@
             "type": "array"
           },
           "status": {
+            "enum": [
+              "connected",
+              "disconnected",
+              "degraded"
+            ],
             "title": "Status",
             "type": "string"
           },
@@ -5581,11 +5616,13 @@
           "id",
           "tenant_id",
           "provider",
+          "name",
           "external_account_id",
           "display_name",
           "credential_ref",
           "scopes",
           "webhook_verification_ref",
+          "attributes",
           "status",
           "installed_by_principal_id",
           "installed_at",
@@ -5597,6 +5634,18 @@
       "ProviderInstallationUpdate": {
         "description": "Partial update: an omitted field is unchanged, and null clears a nullable one.\n\nThe reference fields follow ``ProviderInstallationCreate``'s rule.",
         "properties": {
+          "attributes": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attributes"
+          },
           "credential_ref": {
             "anyOf": [
               {
@@ -5630,6 +5679,18 @@
               }
             ],
             "title": "External Account Id"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
           },
           "scopes": {
             "anyOf": [

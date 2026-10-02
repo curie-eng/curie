@@ -2080,7 +2080,16 @@ def _provider_reference_check(column: str) -> CheckConstraint:
 
 
 class ProviderInstallation(Base):
-    """One connected external account, such as one Slack workspace (#2909, ADR 0155 step 4).
+    """One channel identity: a bot speaking through one connected account.
+
+    #2909, ADR 0166 step 4, as amended by ADR 0168 decision 1: "An identity is
+    a provider installation." ``name`` is unique within the provider and tenant
+    and is what a binding's ``adapter`` names (decision 3): one Slack workspace
+    with two bots is two rows sharing one ``external_account_id`` but never a
+    ``name``. ``attributes`` holds whatever that provider's identity needs
+    beyond the fixed columns -- for Slack, the app-token reference alongside
+    ``credential_ref``'s bot-token reference, and later the team, app and bot
+    user ids once something resolves them.
 
     ``credential_ref`` and ``webhook_verification_ref`` point into the
     deployment's secret store; the CHECKs hold them to the reference grammar
@@ -2115,8 +2124,8 @@ class ProviderInstallation(Base):
         UniqueConstraint(
             "tenant_id",
             "provider",
-            "external_account_id",
-            name="provider_installations_tenant_provider_external_key",
+            "name",
+            name="provider_installations_tenant_provider_name_key",
         ),
     )
 
@@ -2125,11 +2134,19 @@ class ProviderInstallation(Base):
         ForeignKey(f"{SCHEMA}.tenants.id", name="provider_installations_tenant_id_fkey")
     )
     provider: Mapped[str] = mapped_column(String)
+    # Unique with (tenant_id, provider); what a binding's `adapter` names
+    # (ADR 0168 decision 3). "default" is the one identity an install need not
+    # name explicitly.
+    name: Mapped[str] = mapped_column(String, default="default", server_default="default")
     external_account_id: Mapped[str] = mapped_column(String)
     display_name: Mapped[str | None] = mapped_column(default=None)
     credential_ref: Mapped[str | None] = mapped_column(default=None)
     scopes: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
     webhook_verification_ref: Mapped[str | None] = mapped_column(default=None)
+    # Provider-specific identity details that don't fit a fixed column (ADR
+    # 0168 decision 1): for Slack, today just the app-token reference; later,
+    # once something resolves them, the team/app/bot user ids.
+    attributes: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default="{}")
     status: Mapped[str] = mapped_column(String, default="connected", server_default="connected")
     installed_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), default=None
