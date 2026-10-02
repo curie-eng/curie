@@ -280,6 +280,13 @@ _SKILL_NAME_SAMPLES = {
     "probe:tab\there": False,
     "probe:back\\\\slash": False,
     "probe:ends\\": False,
+    "probe:a﻿": False,
+    "﻿probe:a": False,
+    "probe:a\x7f": False,
+    "probe:a\x85": False,
+    "probe:a\x9f": False,
+    "probe:\ud800": False,
+    "probe: *": False,
 }
 
 
