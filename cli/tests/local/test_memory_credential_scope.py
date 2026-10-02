@@ -17,6 +17,7 @@ owned survives. It never touches another stack.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import pathlib
@@ -444,3 +445,36 @@ def test_channel_a_sandbox_gets_403_on_channel_b_transcript(api_url: str) -> Non
     assert _http(cron_ref, "PUT", {"value": history}, key=cron_token).status == 200
     assert _http(cron_ref, key=cron_token).status == 200
     assert _http(other_ref, key=cron_token).status == 403
+
+
+def test_turn_token_is_refused_after_its_turn_is_closed(api_url: str) -> None:
+    # #3776: a credential copied during a turn must stop writing once the
+    # worker reports that turn closed, even though it has not expired yet.
+    sandbox = _sandbox(api_url, memory_writes=True)
+    turn = f"evt-{uuid.uuid4().hex}#1"
+    turn_token = sandbox.turn_token(sender=ALICE, turn=turn)
+    assert turn_token, "the worker minted no per-turn memory credential"
+    ref = sandbox.env["CURIE_CHANNEL_MEMORY_REF"]
+    during = _http(f"{ref}/{FACT}", "PUT", {"value": _fact("during", ALICE)}, key=turn_token)
+    assert during.status == 200, during
+
+    # The real worker call, with the worker token the compose API is given.
+    asyncio.run(
+        sandbox.resolver.close_turn_memory(  # type: ignore[attr-defined]
+            uuid.UUID(sandbox.agent_id), turn
+        )
+    )
+
+    after = _http(f"{ref}/{OTHER_FACT}", "PUT", {"value": _fact("after", ALICE)}, key=turn_token)
+    assert after.status == 403, after
+    assert "turn has ended" in json.dumps(after.body), after
+    assert _http(f"{ref}/{FACT}", "DELETE", key=turn_token).status == 403
+    assert _http(f"{ref}/{OTHER_FACT}").status == 404
+    # Reads with it still work, and the next turn's credential still writes.
+    read = _http(f"{ref}/{FACT}", key=turn_token)
+    assert read.status == 200, read
+    assert read.body["value"]["statement"] == "during"  # type: ignore[index]
+    next_token = sandbox.turn_token(sender=ALICE)
+    assert next_token
+    nxt = _http(f"{ref}/{OTHER_FACT}", "PUT", {"value": _fact("next", ALICE)}, key=next_token)
+    assert nxt.status == 200, nxt
