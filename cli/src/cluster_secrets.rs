@@ -94,6 +94,21 @@ where
 }
 
 /// Dotted helm keys for `agentSandbox.connectorSecrets.<agent>.<NAME>`.
+/// Connector secret names that must never be bound into a sandbox.
+///
+/// `E2E_CLUSTER_KUBECONFIG` is the test cluster credential (ADR 0176). The
+/// connector pod receives it from the connector Secret. The sandbox bind map
+/// does not. The spelling is frozen in `tests/vectors/e2e-connector-sandbox.json`.
+pub const SANDBOX_WITHHELD_CONNECTOR_SECRETS: &[&str] = &["E2E_CLUSTER_KUBECONFIG"];
+
+pub fn sandbox_connector_secrets(secrets: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    secrets
+        .iter()
+        .filter(|(name, _)| !SANDBOX_WITHHELD_CONNECTOR_SECRETS.contains(&name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
 pub fn helm_secret_pairs(
     agent: &str,
     secrets: &BTreeMap<String, String>,
@@ -925,6 +940,29 @@ mod tests {
             ("GITHUB_PERSONAL_ACCESS_TOKEN".into(), "ghp_agent_a".into()),
             ("JIRA_TOKEN".into(), "jira-a".into()),
         ])
+    }
+
+    #[test]
+    fn the_e2e_kubeconfig_is_withheld_from_the_sandbox_bind() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/vectors/e2e-connector-sandbox.json");
+        let raw = std::fs::read_to_string(path).expect("vector");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("vector json");
+        let key = doc["kubeconfig_secret"]
+            .as_str()
+            .expect("kubeconfig_secret")
+            .to_string();
+        let mut values = secrets();
+        values.insert(key.clone(), "kubeconfig-sentinel".into());
+        let bound = sandbox_connector_secrets(&values);
+        assert!(!bound.contains_key(&key));
+        assert!(!bound.values().any(|value| value == "kubeconfig-sentinel"));
+        assert_eq!(
+            bound
+                .get("GITHUB_PERSONAL_ACCESS_TOKEN")
+                .map(String::as_str),
+            Some("ghp_agent_a")
+        );
     }
 
     #[test]

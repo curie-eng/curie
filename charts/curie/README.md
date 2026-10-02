@@ -1417,6 +1417,12 @@ CURIE_E2E_IDENTITY_CONTEXT=<test cluster context> \
 
 It creates only objects named from its run id and deletes them on exit.
 
+## End to end connector on the factory cluster (ADR 0176)
+
+`e2eConnector.enabled` defaults to false. A factory bundle may declare a hosted connector named `e2e` (see `apps/e2e-connector/README.md`). While the flag is false the API renders no end to end connector and deploy is refused with `e2e_connector_not_configured`.
+
+Turn it on only when a separate test cluster already has the identity above. Set `serviceAccount`, `serviceAccountNamespace`, and `workerClusterRole` to that identity, and set `ownerLabel.value` to the same value the test cluster admission policy expects. The connector process uses the factory worker image. `E2E_CLUSTER_KUBECONFIG`, supplied with `curie secrets`, is mounted on the connector and is omitted from the sandbox template and from the per agent sandbox Secret.
+
 ## Uninstalling and CRD lifecycle
 
 `helm uninstall <release> -n <ns>` removes everything the chart templated, but

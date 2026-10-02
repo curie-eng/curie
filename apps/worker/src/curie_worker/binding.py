@@ -1376,6 +1376,12 @@ def apply_model_env(
         env[FALSE_COMPLETION_CHECK_ENV] = "1"
 
 
+# ADR 0176 decision 2. The test cluster kubeconfig is a connector secret the
+# sandbox must not receive. Frozen with the CLI and the chart in
+# tests/vectors/e2e-connector-sandbox.json.
+SANDBOX_WITHHELD_CONNECTOR_SECRETS = frozenset({"E2E_CLUSTER_KUBECONFIG"})
+
+
 def inject_connector_secrets(
     env: dict[str, str],
     secrets: dict[str, str] | None,
@@ -1398,6 +1404,15 @@ def inject_connector_secrets(
     """
     injected_secret_keys: list[str] = []
     for name, value in (secrets or {}).items():
+        if name in SANDBOX_WITHHELD_CONNECTOR_SECRETS:
+            # The test cluster kubeconfig stays in the hosted connector.
+            # ADR 0176 decision 2. The marker must not name it either, or the
+            # k8s substrate would look for a sandbox secretKeyRef.
+            logger.warning(
+                "Dropping connector secret withheld from the sandbox "
+                "(never injected, never marked)"
+            )
+            continue
         if is_reserved_boot_env_name(name):
             logger.warning(
                 "Dropping connector secret with reserved boot-env name "

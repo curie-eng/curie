@@ -103,6 +103,27 @@ e2eConnectorIdentity:
     value: ""
 
 # ---------------------------------------------------------------------------
+# End to end connector on the factory cluster (ADR 0176 decisions 1 to 3,
+# issue #3244). Off unless this installation has a separate test cluster.
+# The connector process runs here. The credential and the identity live on
+# the test cluster (e2eConnectorIdentity, installed only there).
+# ---------------------------------------------------------------------------
+e2eConnector:
+  enabled: false
+  namespacePrefix: "curie-e2e-"
+  ownerLabel:
+    key: "curietech.ai/e2e-owner"
+    # The test cluster release name. Required when enabled. It must equal
+    # e2eConnectorIdentity.ownerLabel.value on that cluster.
+    value: ""
+  # The test cluster service account installed by --e2e-connector-identity.
+  serviceAccount: ""
+  serviceAccountNamespace: ""
+  workerClusterRole: ""
+  ttlSeconds: 3600
+  podSecurity: baseline
+
+# ---------------------------------------------------------------------------
 # PriorityClass (ADR-0059 decision 5): ranks the platform -- worker, api,
 # dispatcher, the data tier (postgres, valkey, clickhouse, rustfs), and the
 # observability and UI tier (langfuse web/worker, the OTel collector, the UI,

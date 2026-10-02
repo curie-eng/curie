@@ -282,6 +282,27 @@ def test_boot_env_never_writes_the_kernel_owned_resume_keys() -> None:
     assert "CURIE_APPROVAL_RESUMED_KIND" not in env
 
 
+def test_the_e2e_kubeconfig_is_withheld_from_the_sandbox() -> None:
+    """ADR 0176 decision 2. The test cluster credential never enters boot env."""
+
+    import json
+    from pathlib import Path
+
+    vector_path = Path(__file__).resolve().parents[4] / "tests/vectors/e2e-connector-sandbox.json"
+    vector = json.loads(vector_path.read_text())
+    secret = vector["kubeconfig_secret"]
+    env = _boot_env(
+        WorkerConfig(),
+        _resolved(secrets={secret: "kubeconfig-sentinel", "GITHUB_TOKEN": "ghp-1"}),
+    )
+
+    rendered = json.dumps(env)
+    assert "kubeconfig-sentinel" not in rendered
+    assert secret not in env
+    assert secret not in env.get("CURIE_CONNECTOR_SECRET_KEYS", "")
+    assert env["GITHUB_TOKEN"] == "ghp-1"
+
+
 def test_connector_secret_with_a_reserved_name_is_dropped_and_unmarked() -> None:
     """#457: the filter is name-policy-based, so it holds on this path too.
 
