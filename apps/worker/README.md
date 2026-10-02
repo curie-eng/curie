@@ -967,3 +967,10 @@ selection refusal and the same recovery. When repository workspaces are
 disabled, the existing workspaces disabled refusal takes precedence before the
 file is resolved. Fresh workspace claims and suspended workspace resumes still
 receive attachments. Retained workspace replacement is tracked in #2728.
+
+Approval metadata references follow the same sentence boundary rules across API,
+worker, runner and the UI fallback for older API responses. A tool identifier
+followed by a sentence-ending period (including whitespace or closing punctuation)
+uses its plain action label. Filenames, extensions, paths, URLs and identifiers
+embedded within another word remain literal data, including Unicode text. The
+stored summary, exact grant target, arguments and nested content remain unchanged.

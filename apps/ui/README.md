@@ -192,3 +192,10 @@ Config reference: `.env.example`.
   (#869), reusing the `WiredAgentMemory` panel from the agent detail page behind
   an agent selector. The ACI (Agent Container Interface) `memory_ref` seam
   stays in the contract.
+
+Approval metadata references follow the same sentence boundary rules across API,
+worker, runner and the UI fallback for older API responses. A tool identifier
+followed by a sentence-ending period (including whitespace or closing punctuation)
+uses its plain action label. Filenames, extensions, paths, URLs and identifiers
+embedded within another word remain literal data, including Unicode text. The
+stored summary, exact grant target, arguments and nested content remain unchanged.

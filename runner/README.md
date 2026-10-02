@@ -388,3 +388,10 @@ The card and waiting notice describe the requested action in plain language,
 including when a bundle has no summary template or its template cannot render.
 Do not present MCP identifiers or argument field names as prose. Preserve the
 requested values and do not imply that the pending action has run.
+
+Approval metadata references follow the same sentence boundary rules across API,
+worker, runner and the UI fallback for older API responses. A tool identifier
+followed by a sentence-ending period (including whitespace or closing punctuation)
+uses its plain action label. Filenames, extensions, paths, URLs and identifiers
+embedded within another word remain literal data, including Unicode text. The
+stored summary, exact grant target, arguments and nested content remain unchanged.
