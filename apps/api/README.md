@@ -19,3 +19,7 @@ keys and Actions rerun records, including locks, for requests created in the
 fixture's database. Cleanup runs after a failing test as well as a passing one,
 so a retry begins without a previous attempt's rerun decision. Assertions about
 one continuation or one external rerun remain unchanged.
+Independent GitHub stand-ins must give independent timeline events distinct
+identities, even when tests use the same repository and issue. Repeated reads
+and redeliveries inside one fixture keep the same event identity; relabeling
+advances it.
