@@ -443,7 +443,12 @@
     {
       "output": "ApprovalsOutput",
       "struct": "ApprovalRecord",
-      "omissions": []
+      "omissions": [
+        {
+          "field": "display_summary",
+          "why": "Human presentation uses this optional API field. The existing machine-readable approvals result retains exact summary and granted_tool, without adding a display-only key; cli/tests/json_contract.rs pins that JSON shape."
+        }
+      ]
     },
     {
       "output": "OverridesOutput",

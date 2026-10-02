@@ -87,6 +87,7 @@ from pydantic import ValidationError
 from . import sandbox_token
 from .actions import ActionBackendError, ActionRecorder
 from .approval_cards import ApprovalCardStore
+from .approval_wording import approval_display
 from .approvals import (
     ApprovalBackendError,
     ApprovalCreator,
@@ -7444,7 +7445,13 @@ class Kernel:
         thread = qevent.conversation_id
         thread_key = _thread_key_for(qevent)
         summary = outcome.approval_summary or outcome.text or "Approval requested"
-        display_summary = outcome.approval_display or summary
+        display_summary = (
+            outcome.approval_display
+            if outcome.approval_display
+            else approval_display(
+                summary, outcome.approval_granted_tool, outcome.approval_granted_arguments
+            )
+        )
 
         # Resolve the manifest route NAME (#247) to its workspace channel. A named
         # route that resolves to no binding escalates instead of widening (#544).

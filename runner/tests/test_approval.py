@@ -172,7 +172,7 @@ def test_block_renders_a_declared_template_as_pending_display() -> None:
     assert gate.pending_display == "Run ls: 2 files. Approve?"
 
 
-def test_block_falls_back_to_machine_string_when_the_template_cannot_render() -> None:
+def test_block_uses_plain_fallback_when_the_template_cannot_render() -> None:
     gate = ApprovalGate(
         required=frozenset({"Bash"}),
         route_by_tool={"Bash": "managers"},
@@ -180,18 +180,18 @@ def test_block_falls_back_to_machine_string_when_the_template_cannot_render() ->
     )
     tool_input = {"command": "ls"}
     gate.block("Bash", tool_input)
-    assert gate.pending_display is None
+    assert gate.pending_display == "Approve shell request. Command: ls"
     assert gate.pending_summary == summarize_tool_call("Bash", tool_input)
 
 
-def test_block_without_a_template_leaves_pending_display_unset() -> None:
+def test_block_without_a_template_describes_the_pending_action() -> None:
     gate = ApprovalGate(
         required=frozenset({"Bash"}),
         route_by_tool={"Bash": "managers"},
     )
     tool_input = {"command": "ls"}
     gate.block("Bash", tool_input)
-    assert gate.pending_display is None
+    assert gate.pending_display == "Approve shell request. Command: ls"
     assert gate.pending_summary == summarize_tool_call("Bash", tool_input)
 
 
@@ -853,7 +853,9 @@ def test_granted_tool_with_different_arguments_is_refused_with_a_reason() -> Non
 
         other = await callback("share_asset", {"asset": "a-2"}, ToolPermissionContext())
         assert isinstance(other, PermissionResultDeny)
-        assert "exact arguments" in other.message
+        assert "approved details" in other.message
+        assert "share asset" in other.message
+        assert "share_asset" not in other.message
         assert other.interrupt is False
         # A refused mismatch mints no new approval and leaves the grant unspent.
         assert gate.pending_summary is None
@@ -3241,3 +3243,69 @@ def test_approval_server_lists_report_progress_only_when_a_tool_is_passed() -> N
         ) == {"publish_changes", "report_progress"}
 
     anyio.run(go)
+
+
+def test_permission_display_keeps_values_without_showing_internal_identifiers() -> None:
+    tool = "mcp__plugin_acme_files__file_attachment"
+    arguments = {"file_name": "example.pdf", "destination": "Approved"}
+    gate = ApprovalGate(required=frozenset({tool}))
+    gate.block(tool, arguments)
+    assert gate.pending_display == (
+        "Approve file attachment. Destination: Approved; File name: example.pdf"
+    )
+    assert gate.pending_summary == summarize_tool_call(tool, arguments)
+    assert gate.pending_granted_tool == tool
+    assert gate.pending_granted_arguments == arguments
+
+
+def test_permission_display_preserves_argument_content_even_if_it_names_a_tool() -> None:
+    tool = "mcp__plugin_acme_files__file_attachment"
+    arguments = {"file_name": "mcp__example__read.txt"}
+    gate = ApprovalGate(required=frozenset({tool}))
+    gate.block(tool, arguments)
+    assert "mcp__example__read.txt" in gate.pending_display
+    assert tool not in gate.pending_display
+@pytest.mark.parametrize(
+    "name,label",
+    [
+        ("mcp__acme__shareAsset", "share asset"),
+        ("Bash", "shell request"),
+        ("Skill", "instruction request"),
+        ("mcp__acme__", "action"),
+    ],
+)
+def test_mismatch_feedback_uses_action_words(name: str, label: str) -> None:
+    async def go() -> None:
+        gate = ApprovalGate(
+            required=frozenset({name}), grant_tool=name, grant_arguments={"asset": "a-1"}
+        )
+        refusal = await build_can_use_tool(gate)(name, {"asset": "a-2"}, ToolPermissionContext())
+        assert isinstance(refusal, PermissionResultDeny)
+        assert f"The approval for {label}" in refusal.message
+        assert "mcp__" not in refusal.message
+        assert "was not run" in refusal.message
+        assert gate.grant_tool == name
+        assert gate.pending_summary is None
+
+    anyio.run(go)
+
+
+def test_declared_gate_summary_sentence_boundaries_preserve_exact_request() -> None:
+    """@spec plain-approval-wording: declared gate summaries share all boundaries."""
+    import json
+    from pathlib import Path
+
+    cases = json.loads(
+        (Path(__file__).resolve().parents[2] / "tests/vectors/user-action-wording.json").read_text()
+    )["metadata_references"]
+    for case in cases:
+        tool = case["tool"]
+        arguments = {"file_name": tool + ".json"}
+        gate = ApprovalGate(
+            required=frozenset({tool}), summary_by_tool={tool: case["summary"]}
+        )
+        gate.block(tool, arguments)
+        assert gate.pending_display == case["display"], case
+        assert gate.pending_summary == summarize_tool_call(tool, arguments)
+        assert gate.pending_granted_tool == tool
+        assert gate.pending_granted_arguments == arguments

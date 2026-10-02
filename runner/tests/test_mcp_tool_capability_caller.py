@@ -87,7 +87,10 @@ def test_a_refused_caller_is_reported_as_its_own_reason(vector: dict[str, Any]) 
         vector["refusal"],
     )
     message = failure.caller_message()
-    assert message.startswith("declared connector 'grafana' refused this sandbox: ")
+    assert message.startswith("Connected service access was refused.")
+    assert "grafana" not in message
+    assert "sandbox" not in message
+    assert "refused this sandbox" in failure.diagnostic_message()
     assert "cct.payload.signature" not in message
 
 

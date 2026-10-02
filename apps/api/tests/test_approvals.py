@@ -3796,3 +3796,28 @@ def test_requester_valid_immediate_link_does_not_hide_an_invalid_older_link(
         **payload, "author": "U0EXAMPLE3", "dedupe_key": resume_event_id(second["id"]),
     })
     assert "requested_by" in third and third["requested_by"] is None
+
+
+def test_plain_approval_display_round_trips_without_rewriting_grant_data(
+    approvals_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    tool = "mcp__plugin_acme_files__file_attachment"
+    arguments = {"file_name": "example.pdf", "destination": "Approved"}
+    summary = "Tool call awaiting approval: " + tool + " " + json.dumps(arguments)
+    payload = _payload(
+        summary=summary, gate_kind="permission", granted_tool=tool, granted_arguments=arguments
+    )
+    created = approvals_client.post("/approvals", json=payload, headers=auth_headers)
+    assert created.status_code == 201, created.text
+    body = created.json()
+    for record in [
+        body,
+        approvals_client.get(f"/approvals/{body['id']}", headers=auth_headers).json(),
+    ]:
+        assert record["display_summary"] == (
+            "Approve file attachment. Destination: Approved; File name: example.pdf"
+        )
+        assert record["summary"] == summary
+        assert record["granted_tool"] == tool and record["status"] == "pending"
+        assert "granted_arguments" not in record
+    assert _read_provenance(uuid.UUID(body["id"])) == ("permission", tool)

@@ -1659,6 +1659,17 @@
             "title": "Dedupe Key",
             "type": "string"
           },
+          "display_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Summary"
+          },
           "expires_at": {
             "anyOf": [
               {
@@ -2019,6 +2030,17 @@
           "dedupe_key": {
             "title": "Dedupe Key",
             "type": "string"
+          },
+          "display_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Summary"
           },
           "expires_at": {
             "anyOf": [

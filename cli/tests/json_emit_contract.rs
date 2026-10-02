@@ -805,6 +805,7 @@ fn approvals_pending_and_resolved_json_shapes_are_pinned() {
         status: "pending".to_string(),
         conversation_id: "C1-thread-9".to_string(),
         summary: "Deploy the thing".to_string(),
+        display_summary: None,
         expires_at: Some("2026-07-16T00:00:00Z".to_string()),
         resolved_by: None,
         // #1078: the persisted card location for a route-bound approval.

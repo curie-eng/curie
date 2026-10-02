@@ -2123,6 +2123,9 @@ def test_declared_connector_failure_runs_the_model_with_a_notice(
         assert events[-1].status == SessionStatus.DONE
         assert events[-1].text.startswith(notice)
         assert events[-1].text.endswith("all done")
+        assert "GITHUB_TOKEN" not in events[-1].text
+        assert "MCP" not in events[-1].text
+        assert "sandbox" not in events[-1].text
         assert planted not in events[-1].text
     assert any(
         record.levelno == logging.ERROR
