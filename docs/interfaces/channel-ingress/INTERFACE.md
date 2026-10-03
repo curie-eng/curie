@@ -331,7 +331,8 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
 ## Known leakage
 
 Two ends and the binding surface were cleaned; what remains is egress semantics and
-incomplete adapter coverage and conformance.
+incomplete adapter coverage (no registered address shapes for most kinds, and no
+attachments from Discord or mail).
 
 - **Fixed (#7).** The ingress field names were Slack's (`slack_event_id`, `thread_ts`,
   `placeholder_ts`); the payload was promoted into `packages/aci-protocol` as `QueuedTurn`
@@ -383,6 +384,11 @@ incomplete adapter coverage and conformance.
   egress secret. The channel-port ingress carries the references on `TurnIn.attachments`
   (`apps/api/src/curie_api/routers/channels.py::TurnIn`). Discord and the first-party
   mail adapter do not emit attachments yet.
+- **Fixed (#3830) — adapter conformance.** One suite now drives every first-party
+  adapter (Discord, mail, GitHub and `HttpReplyAdapter`) through the `ReplySink` port
+  with the kit in `packages/channel-protocol/src/channel_protocol/conformance.py`. It
+  caught the Discord reply app answering a provider failure with a bare 500 that
+  closed the socket; it now answers 502.
 
 ## Cross-links
 
