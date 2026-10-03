@@ -828,6 +828,21 @@ mod tests {
     }
 
     #[test]
+    fn sender_loads_when_present_and_defaults_to_none() {
+        let with_sender = write(
+            r#"{"name":"s","cases":[{"id":"a","input":"b","sender":"eval-sender-acme","grader":{"kind":"contains","expected":"x"}}]}"#,
+        );
+        let suite = load_suite(&with_sender.1).unwrap();
+        assert_eq!(suite.cases[0].sender.as_deref(), Some("eval-sender-acme"));
+
+        let without_sender = write(
+            r#"{"name":"s","cases":[{"id":"a","input":"b","grader":{"kind":"contains","expected":"x"}}]}"#,
+        );
+        let suite = load_suite(&without_sender.1).unwrap();
+        assert_eq!(suite.cases[0].sender, None);
+    }
+
+    #[test]
     fn loads_the_object_suite_form() {
         let (_dir, path) = write(
             r#"{"name":"s","cases":[{"id":"a","input":"b","grader":{"kind":"contains","expected":"x"}}]}"#,

@@ -127,10 +127,16 @@ def test_the_message_a_file_arrived_with_names_it_by_its_absolute_path(
     queries = _serve(runner, [text])
 
     sent = queries[0]
-    assert sent.startswith(text), "the person's own words must lead the message"
-    assert str(mount / "notes.md") in sent, (
-        "the message that carried notes.md does not name it, so the model "
-        "cannot tell this message brought a file"
+    assert "[platform-sender" in sent, "the query has no platform sender header"
+    user_at = sent.index("[user-message")
+    end_at = sent.index("[end-user-message")
+    assert text in sent[user_at:end_at], (
+        "the person's own words must sit inside the user fence"
+    )
+    attachment = str(mount / "notes.md")
+    assert attachment in sent[end_at:], (
+        "the message that carried notes.md does not name it after the user "
+        "fence, so the model cannot tell this message brought a file"
     )
     (turn,) = store.turns
     assert turn.messages[0].role == "user"
