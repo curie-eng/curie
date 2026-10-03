@@ -90,6 +90,19 @@ A lock waiter must not retain a work/claim connection. Pass an acquired gate
 context to inner helpers; never reacquire the same agent lock on another
 connection. Close the outer transaction on every error or cancellation path.
 
+Manual and scheduled cron producers validate the acquired gate context and
+probe its held connection after any blocking inner hook lock and immediately
+before each hook-run or schedule-control INSERT or UPDATE and each ordinary
+enqueue, including enqueue-failure cleanup. Keep the outer gate across the
+existing durable claim commit and enqueue. A failed probe authorizes no
+following mutation or enqueue; never route detected gate loss through an
+unguarded failure-cleanup write. Loss detected after a durable claim commit
+may leave that claim for existing lease/recovery behavior; it does not roll
+back the commit or authorize a replacement enqueue. A later cleanup failure
+does not replace the original safe admission/enqueue refusal. These probes
+establish current held-connection liveness, not atomicity between later SQL
+effects and a broker operation.
+
 Preserve existing durable cron claim commit before ordinary enqueue. The outer
 agent gate spans the inner claim commit and enqueue, including manual fire and
 scheduled, deferred, retry, skipped, blocked and reclaim paths. Configured
