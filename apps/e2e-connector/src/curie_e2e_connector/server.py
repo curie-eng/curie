@@ -319,8 +319,9 @@ def deploy(ctx: Context, manifests: str) -> str:
     any other kind the cluster serves outside a namespace) are refused with
     ``e2e_cluster_scoped_object``: that change cannot be proven here and needs
     CI only proof. NetworkPolicy, ResourceQuota, LimitRange, the build's
-    objects, and any Role or RoleBinding that reaches Secrets or RBAC are
-    refused too.
+    objects are refused too. A Role may grant only get, list and watch, never
+    on secrets or pods (including pods subresources); a RoleBinding may name
+    only such a Role.
     """
 
     caller = caller_from_headers(ctx.headers)

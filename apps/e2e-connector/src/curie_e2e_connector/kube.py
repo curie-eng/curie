@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 import ssl
 import urllib.parse
 from typing import Any
@@ -23,6 +24,12 @@ logger = logging.getLogger(__name__)
 # read_text keeps at most this many trailing bytes of a text body, so a pod
 # that logs gigabytes never lands whole in connector memory.
 TEXT_LIMIT_BYTES = 1024 * 1024
+
+# Shared by image_build and run Jobs.
+JOB_TTL_S = 600
+# Polling stops this long after the Job's own activeDeadlineSeconds.
+JOB_DEADLINE_GRACE_S = 30
+DNS_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 
 
 class ClusterError(ToolError):
@@ -235,17 +242,25 @@ def job_state(status: Any) -> tuple[bool, str, str] | None:
     return None
 
 
-def job_pods(cluster: ClusterApi, namespace: str, job: str) -> list[dict[str, Any]]:
-    """The pods the Job controller labelled ``job-name=<job>``; empty on any non 200."""
+def job_pods_strict(
+    cluster: ClusterApi, namespace: str, job: str
+) -> tuple[int, list[dict[str, Any]]]:
+    """``(status code, pods)``; the caller decides what a non 200 or no pods means."""
 
     selector = urllib.parse.quote(f"job-name={job}", safe="")
     code, payload = checked_request(
         cluster, "GET", f"/api/v1/namespaces/{namespace}/pods?labelSelector={selector}"
     )
-    if code != 200:
-        return []
     items = payload.get("items")
-    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+    pods = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+    return code, pods
+
+
+def job_pods(cluster: ClusterApi, namespace: str, job: str) -> list[dict[str, Any]]:
+    """The pods the Job controller labelled ``job-name=<job>``; empty on any non 200."""
+
+    code, pods = job_pods_strict(cluster, namespace, job)
+    return pods if code == 200 else []
 
 
 def container_statuses(pod: dict[str, Any], key: str) -> list[dict[str, Any]]:

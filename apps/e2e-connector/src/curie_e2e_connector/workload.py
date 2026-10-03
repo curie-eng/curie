@@ -45,6 +45,9 @@ from curie_e2e_connector.contract import (
     RUN_TIMEOUT_S,
 )
 from curie_e2e_connector.kube import (
+    DNS_LABEL,
+    JOB_DEADLINE_GRACE_S,
+    JOB_TTL_S,
     ClusterApi,
     ClusterError,
     checked_request,
@@ -52,6 +55,7 @@ from curie_e2e_connector.kube import (
     container_statuses,
     delete_quietly,
     job_pods,
+    job_pods_strict,
     job_state,
     tail_text,
     terminated_state,
@@ -65,6 +69,7 @@ from curie_e2e_connector.namespace import (
     require_environment,
     run_labels,
 )
+from curie_e2e_connector.registry import DIGEST
 
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_OBJECTS = 100
@@ -73,19 +78,12 @@ MAX_ARG_CHARS = 4096
 DEFAULT_LOG_TAIL = 500
 MAX_LOG_TAIL = 5000
 MAX_EVENTS = 200
-_JOB_TTL_S = 600
-# Polling stops this long after the Job's own activeDeadlineSeconds.
-_DEADLINE_GRACE_S = 30
 _DETAIL_LIMIT = 500
 _EVENT_MESSAGE_LIMIT = 1000
 
 _DNS_SUBDOMAIN = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$")
-_DNS_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 _KIND = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,62}$")
 _RUN_ID = re.compile(r"^[a-z0-9]{1,16}$")
-# ``<ref>@sha256:<64 hex>``; a tag before the digest is allowed, because the
-# digest pins it.
-_DIGEST_IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 
 _CONTAINER_LISTS = ("containers", "initContainers", "ephemeralContainers")
 _SERVER_METADATA = (
@@ -142,11 +140,18 @@ def _valid_name(value: Any) -> bool:
 
 
 def _valid_label(value: Any) -> bool:
-    return isinstance(value, str) and bool(_DNS_LABEL.fullmatch(value))
+    return isinstance(value, str) and bool(DNS_LABEL.fullmatch(value))
 
 
 def is_digest_image(image: Any) -> bool:
-    return isinstance(image, str) and bool(_DIGEST_IMAGE.fullmatch(image))
+    """``<ref>@sha256:<64 hex>``; a tag before the digest is allowed, because it pins it."""
+
+    if not isinstance(image, str):
+        return False
+    ref, _at, tail = image.rpartition("@")
+    return (
+        bool(ref) and not any(c.isspace() or c == "@" for c in ref) and bool(DIGEST.fullmatch(tail))
+    )
 
 
 def _nodes(value: Any) -> Iterator[Any]:
@@ -193,6 +198,9 @@ class _Object:
 
     def entry(self) -> dict[str, str]:
         return {"kind": self.kind, "name": self.name}
+
+    def scoped_entry(self) -> dict[str, str]:
+        return {"apiVersion": self.api_version, **self.entry()}
 
 
 def parse_manifests(text: str) -> list[_Object]:
@@ -496,7 +504,7 @@ def deploy(cluster: ClusterApi, install: Install, caller: Caller, manifests: str
     resources: list[_Resource] = []
     for obj in objects:
         if (obj.group, obj.kind) in CLUSTER_SCOPED:
-            scoped.append({"apiVersion": obj.api_version, "kind": obj.kind, "name": obj.name})
+            scoped.append(obj.scoped_entry())
             continue
         resource = discovery.resolve(obj)
         if resource is None:
@@ -508,7 +516,7 @@ def deploy(cluster: ClusterApi, install: Install, caller: Caller, manifests: str
             )
             continue
         if not resource.namespaced:
-            scoped.append({"apiVersion": obj.api_version, "kind": obj.kind, "name": obj.name})
+            scoped.append(obj.scoped_entry())
             continue
         resources.append(resource)
     if scoped:
@@ -577,6 +585,7 @@ def deploy(cluster: ClusterApi, install: Install, caller: Caller, manifests: str
 
     labels = run_labels(install, caller)
     applied: list[dict[str, str]] = []
+    ok = (200, 201)
     for obj, resource, path in zip(objects, resources, paths, strict=True):
         current = existing.get(path)
         version: str | None = None
@@ -586,9 +595,9 @@ def deploy(cluster: ClusterApi, install: Install, caller: Caller, manifests: str
             version = stored if isinstance(stored, str) else None
         body = _write_body(obj, namespace, labels, version)
         if current is None:
-            method, target, ok = "POST", _collection(namespace, obj, resource), (200, 201)
+            method, target = "POST", _collection(namespace, obj, resource)
         else:
-            method, target, ok = "PUT", path, (200, 201)
+            method, target = "PUT", path
         try:
             code, payload = cluster.request(method, target, body)
         except ClusterError:
@@ -638,7 +647,7 @@ def _run_job_body(
         "spec": {
             "backoffLimit": 0,
             "activeDeadlineSeconds": RUN_TIMEOUT_S,
-            "ttlSecondsAfterFinished": _JOB_TTL_S,
+            "ttlSecondsAfterFinished": JOB_TTL_S,
             "template": {
                 "metadata": {"labels": labels},
                 "spec": {
@@ -760,7 +769,7 @@ def _await_run(
     on_poll: Callable[[float], None] | None,
 ) -> dict[str, Any]:
     start = clock()
-    limit = start + RUN_TIMEOUT_S + _DEADLINE_GRACE_S
+    limit = start + RUN_TIMEOUT_S + JOB_DEADLINE_GRACE_S
     path = f"/apis/batch/v1/namespaces/{namespace}/jobs/{job}"
     while True:
         code, payload = checked_request(cluster, "GET", path)
@@ -785,18 +794,20 @@ def _await_run(
     # timeout even when that container reports an exit.
     if not succeeded and reason == "DeadlineExceeded":
         raise _run_timeout()
-    failed = ClusterError(
-        f"{REFUSAL_RUN_FAILED}: {(message or reason or 'the run Job failed')[-_DETAIL_LIMIT:]}"
-    )
+
+    def failed() -> ClusterError:
+        detail = (message or reason or "the run Job failed")[-_DETAIL_LIMIT:]
+        return ClusterError(f"{REFUSAL_RUN_FAILED}: {detail}")
+
     try:
         found = _run_result(_finished_run_pods(cluster, namespace, job))
     except ClusterError:
         if not succeeded:
-            raise failed from None
+            raise failed() from None
         raise
     if found is None:
         if not succeeded:
-            raise failed
+            raise failed()
         raise ClusterError(f"{REFUSAL_RUN_FAILED}: the run container reported no exit")
     pod, terminated = found
     exit_code = terminated.get("exitCode")
@@ -809,14 +820,13 @@ def _await_run(
         stderr = term_reason
     else:
         stderr = ""
-    log_code, text = checked_text(
+    log_code, stdout = checked_text(
         cluster, f"/api/v1/namespaces/{namespace}/pods/{pod}/log?container=run"
     )
     if log_code != 200:
         raise ClusterError(
             f"{REFUSAL_RUN_FAILED}: the test cluster did not return the run log ({log_code})"
         )
-    stdout = text
     return {
         "exit_code": exit_code,
         "stdout": tail_text(stdout.encode("utf-8"), OUTPUT_LIMIT_BYTES),
@@ -827,16 +837,11 @@ def _await_run(
 def _finished_run_pods(cluster: ClusterApi, namespace: str, job: str) -> list[dict[str, Any]]:
     """The finished run Job's pods; unlike ``job_pods``, a failed read or none is an error."""
 
-    selector = urllib.parse.quote(f"job-name={job}", safe="")
-    code, payload = checked_request(
-        cluster, "GET", f"/api/v1/namespaces/{namespace}/pods?labelSelector={selector}"
-    )
+    code, pods = job_pods_strict(cluster, namespace, job)
     if code != 200:
         raise ClusterError(
             f"{REFUSAL_RUN_FAILED}: the test cluster did not list the run pods ({code})"
         )
-    items = payload.get("items")
-    pods = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
     if not pods:
         raise ClusterError(f"{REFUSAL_RUN_FAILED}: the finished run Job has no pods")
     return pods
@@ -913,13 +918,11 @@ def _event_stamp(item: dict[str, Any]) -> str:
 
 
 def _event_count(item: dict[str, Any]) -> int:
-    count = item.get("count")
-    if isinstance(count, int) and not isinstance(count, bool) and count > 0:
-        return count
     series = item.get("series")
-    count = series.get("count") if isinstance(series, dict) else None
-    if isinstance(count, int) and not isinstance(count, bool) and count > 0:
-        return count
+    nested = series.get("count") if isinstance(series, dict) else None
+    for count in (item.get("count"), nested):
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            return count
     return 1
 
 

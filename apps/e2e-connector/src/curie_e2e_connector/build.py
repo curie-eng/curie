@@ -49,6 +49,9 @@ from curie_e2e_connector.contract import (
     STAGING_TAG_PREFIX,
 )
 from curie_e2e_connector.kube import (
+    DNS_LABEL,
+    JOB_DEADLINE_GRACE_S,
+    JOB_TTL_S,
     ClusterApi,
     ClusterError,
     checked_request,
@@ -93,9 +96,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_SOURCE_HOSTS = ("github.com",)
 _MIN_TIMEOUT = 60
 _MAX_TIMEOUT = 3600
-# Polling stops this long after the Job's own activeDeadlineSeconds.
-_DEADLINE_GRACE_S = 30
-_JOB_TTL_S = 600
 _REASON_LIMIT = 1000
 _MIN_REDACTED = 4
 
@@ -103,7 +103,6 @@ _PATH_SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
 _PLATFORM = re.compile(r"^[a-z0-9]+/[a-z0-9]+(/[a-z0-9]+)?$")
 _SOURCE_PATH = re.compile(r"^/[A-Za-z0-9._/-]+$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
-_DNS_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 _BUILD_ID = re.compile(r"^[a-z0-9]{1,16}$")
 
 
@@ -197,7 +196,7 @@ class BuildRequest:
         if (
             not isinstance(name, str)
             or not NAME_COMPONENT.fullmatch(name)
-            or not _DNS_LABEL.fullmatch(name)
+            or not DNS_LABEL.fullmatch(name)
         ):
             raise _refuse("name", "must be a lowercase DNS label")
         return cls(
@@ -584,7 +583,7 @@ def _job_body(
         "spec": {
             "backoffLimit": 0,
             "activeDeadlineSeconds": config.timeout_seconds,
-            "ttlSecondsAfterFinished": _JOB_TTL_S,
+            "ttlSecondsAfterFinished": JOB_TTL_S,
             "template": {
                 "metadata": {"labels": labels},
                 "spec": {
@@ -623,7 +622,7 @@ def _poll(
     """Return ``(succeeded, reason, message)``, or None at the connector deadline."""
 
     start = clock()
-    limit = start + config.timeout_seconds + _DEADLINE_GRACE_S
+    limit = start + config.timeout_seconds + JOB_DEADLINE_GRACE_S
     path = f"/apis/batch/v1/namespaces/{namespace}/jobs/{job}"
     while True:
         code, payload = checked_request(cluster, "GET", path)
