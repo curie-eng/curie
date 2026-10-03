@@ -179,7 +179,7 @@ Helm and the deployed release with `up`, `upgrade`, `status`, `down`, `comms`, `
   `cli/api-mirrors.json`** (as a `mirrors` entry with its allowlisted field
   omissions, or a `non_mirrors` entry with a one-line reason). `curie dev
   field-parity` is the check (#691).
-- **A new `Deserialize` struct in `cli/src/commands.rs` or `cli/src/spec.rs`
+- **A new `Deserialize` struct in `cli/src/commands/` or `cli/src/spec.rs`
   that hand-mirrors the frozen `packages/plugin-format` manifest shape must be
   declared in `cli/plugin-format-mirrors.json`** the same way (`mirrors` with
   omissions, or `non_mirrors` with a reason) -- this is a SIBLING gate to the

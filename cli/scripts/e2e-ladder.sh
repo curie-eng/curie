@@ -1995,7 +1995,7 @@ assert_model_mode() {
 
 # A deploy receipt proves what was UPLOADED. It does NOT prove the following
 # `message` and `eval` turns ran that deployment: `deploy` defaults the
-# environment to dev (cli/src/commands.rs) while the worker's runtime binding
+# environment to dev (cli/src/commands/deploy.rs) while the worker's runtime binding
 # prefers prod over recency (apps/worker/src/curie_worker/binding.py's
 # `ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC`) over the ACTIVE
 # set only. So one stale active prod row for this agent serves the turn while the
@@ -2029,7 +2029,7 @@ assert_model_mode() {
 # stack rather than fighting a foreign one.
 assert_sole_active_deployment() {
     local label="$1" agent_id="$2" deployment_id="$3" api_base verdict listed
-    # The CLI's own public inputs, with the CLI's own defaults (cli/src/main.rs's
+    # The CLI's own public inputs, with the CLI's own defaults (cli/src/args/'s
     # --api-url/--api-key clap declarations, defaulting to the crate constants
     # DEFAULT_LOCAL_API_URL and DEFAULT_API_KEY in cli/src/message.rs). Reading
     # the same two variables means this queries whatever API the deploy above
@@ -2515,7 +2515,7 @@ connector_mode() {
 # provisioned into THIS RUN's process environment and the scratch bundle copies
 # only. Nothing of the operator's is read, written or restored: the CLI resolves
 # a connector credential from the environment first and the host vault second
-# (cli/src/commands.rs resolve_connector_secret), so exporting is sufficient and
+# (cli/src/commands/connector_images.rs resolve_connector_secret), so exporting is sufficient and
 # `curie secrets set` -- which writes the operator's real store -- is never run.
 #
 # The kubeconfigs need no cluster. These rungs assert HOSTING, not live
@@ -3450,7 +3450,7 @@ case_connector_changed_source_skill() {
         echo "=== curie build --plugin-dir (changed source, registry delivery: $CONNECTOR_REGISTRY) ==="
         "$BIN" build --plugin-dir "$dir" --registry "$CONNECTOR_REGISTRY"
     else
-        echo "the rebuild below is skill up's OWN (cli/src/commands.rs, ADR 0113 Decision 3), not a hand-run build: the production consumer of a stale lock is the tier's bring-up, so that is what this case exercises."
+        echo "the rebuild below is skill up's OWN (cli/src/commands/skill.rs, ADR 0113 Decision 3), not a hand-run build: the production consumer of a stale lock is the tier's bring-up, so that is what this case exercises."
     fi
 
     "$BIN" skill up --fake-model --plugin-dir "$dir" --name "$CHANGED_RUNNER_NAME"
@@ -3503,7 +3503,7 @@ assert_connector_source_change() {
 }
 
 # A cluster deploy whose locked image the REGISTRY cannot resolve must refuse,
-# and must refuse before it has touched the cluster (ADR 0113, cli/src/commands.rs
+# and must refuse before it has touched the cluster (ADR 0113, cli/src/commands/connector_images.rs
 # registry_preflight). The failure this guards against is not theoretical: the
 # lock is what a node pulls from, so an image that is gone from the registry
 # surfaces after apply as a pod stuck on ImagePullBackOff, with a healthy
@@ -5700,7 +5700,7 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
 
     # The full runtime-binding assertion is CONDITIONAL here, and only here,
     # because the cluster API key has no default -- it is resolved from the
-    # installed release (cli/src/main.rs's --api-key value_parser) -- and CI's
+    # installed release (cli/src/args/mod.rs's --api-key value_parser) -- and CI's
     # cluster ladder job supplies none, so requiring it would red a job this
     # change cannot touch.
     #

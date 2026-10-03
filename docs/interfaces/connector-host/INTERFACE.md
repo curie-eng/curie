@@ -275,7 +275,7 @@ The port is a real `Protocol`, and the values crossing it are Kubernetes:
   (`ConnectorStartSpec` in `cli/src/docker.rs`), tags it with its own
   `CONNECTOR_COMPONENT_LABEL` and reaps undesired ones by that label, then
   blocks on its own readiness wait, `wait_for_connectors_ready`, called from
-  `bring_up_local` and `start_skill_connectors` in `cli/src/commands.rs`. That
+  `bring_up_local` and `start_skill_connectors` in `cli/src/commands/connector_images.rs`. That
   path goes around both `render` and `ConnectorClient`: it neither consumes the
   rendered Kubernetes objects nor implements the port, so it is leakage, not a
   second implementation. Of the two cluster appliers, the CLI applies the same

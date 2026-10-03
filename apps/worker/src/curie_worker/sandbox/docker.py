@@ -139,7 +139,7 @@ _OTEL_PROTOCOL_ENV = BootEnv.env_key("otel_protocol")
 # real-Anthropic path, and are forwarded only when no explicit CURIE_CREDENTIALS
 # is chosen. CURIE_CREDENTIALS (the ACI reference the runner maps onto an SDK
 # var) is selected positively and alone. Mirrors the CLI (cli/src/docker.rs,
-# cli/src/commands.rs).
+# cli/src/commands/credential_env.rs).
 _SDK_PASSTHROUGH_ENV = (
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",

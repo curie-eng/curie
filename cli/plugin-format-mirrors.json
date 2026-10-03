@@ -1,22 +1,22 @@
 {
-  "_comment": "Declared hand-mirrors of the frozen packages/plugin-format schema (issue #701, the plugin_format sibling of #691's openapi.json gate; see packages/CLAUDE.md's frozen-contracts rule). Every Deserialize struct in cli/src/commands.rs and cli/src/spec.rs must appear in exactly one of mirrors or non_mirrors for its file. A mirrors entry names the plugin-format.schema.json $defs entry it mirrors and allowlists any field it deliberately does not carry, each with a why. A non_mirrors entry is a Deserialize struct that mirrors something OTHER than a plugin_format shape (a different local contract entirely) or whose field names deliberately diverge from the wire shape (an author-facing spec translated by scaffold.rs, not deserialized off a manifest), so field-by-field comparison does not apply to it. Check with: bash cli/scripts/check-field-parity.sh (rides curie dev field-parity).",
+  "_comment": "Declared hand-mirrors of the frozen packages/plugin-format schema (issue #701, the plugin_format sibling of #691's openapi.json gate; see packages/CLAUDE.md's frozen-contracts rule). Every Deserialize struct in cli/src/commands/*.rs and cli/src/spec.rs must appear in exactly one of mirrors or non_mirrors for its file. A mirrors entry names the plugin-format.schema.json $defs entry it mirrors and allowlists any field it deliberately does not carry, each with a why. A non_mirrors entry is a Deserialize struct that mirrors something OTHER than a plugin_format shape (a different local contract entirely) or whose field names deliberately diverge from the wire shape (an author-facing spec translated by scaffold.rs, not deserialized off a manifest), so field-by-field comparison does not apply to it. Check with: bash cli/scripts/check-field-parity.sh (rides curie dev field-parity).",
   "schema": "packages/plugin-format/schema/plugin-format.schema.json",
   "mirrors": [
     {
       "struct": "ApprovalGateDecl",
-      "file": "cli/src/commands.rs",
+      "file": "cli/src/commands/skill_approvals.rs",
       "schema": "ApprovalGate",
       "omissions": []
     },
     {
       "struct": "ApprovalPolicyDecl",
-      "file": "cli/src/commands.rs",
+      "file": "cli/src/commands/skill_approvals.rs",
       "schema": "ApprovalPolicy",
       "omissions": []
     },
     {
       "struct": "ManifestApprovals",
-      "file": "cli/src/commands.rs",
+      "file": "cli/src/commands/skill_approvals.rs",
       "schema": "PluginManifest",
       "omissions": [
         { "field": "version", "why": "skill_approvals reports gate/route pairs only; the manifest's own declared version string has no output surface on this verb." },
@@ -95,27 +95,27 @@
   "non_mirrors": [
     {
       "struct": "CheckReport",
-      "file": "cli/src/commands.rs",
+      "file": "cli/src/commands/init.rs",
       "reason": "Mirrors the frozen curie_runner.check report contract (parse_check_report), a different local contract entirely -- unrelated to plugin_format and out of scope for #701."
     },
     {
       "struct": "DeclaredServer",
-      "file": "cli/src/commands.rs",
+      "file": "cli/src/commands/init.rs",
       "reason": "A row of CheckReport.declared; same curie_runner.check contract, not plugin_format."
     },
     {
       "struct": "CheckMatch",
-      "file": "cli/src/commands.rs",
+      "file": "cli/src/commands/init.rs",
       "reason": "A row of CheckReport.matches; same curie_runner.check contract, not plugin_format."
     },
     {
       "struct": "ForwardingVector",
-      "file": "cli/src/commands.rs",
+      "file": "cli/src/commands/tests.rs",
       "reason": "One row of the credential-forwarding cross-language test vector (#495, cli/tests/data/... fixture), unrelated to plugin_format."
     },
     {
       "struct": "ForwardingVectors",
-      "file": "cli/src/commands.rs",
+      "file": "cli/src/commands/tests.rs",
       "reason": "The forwarding-vector file wrapper (#495); same unrelated fixture contract as ForwardingVector."
     },
     {

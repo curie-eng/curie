@@ -2811,7 +2811,7 @@ esac
 /// and return its base URL for `CURIE_API_URL`.
 ///
 /// `CURIE_API_URL` is not a test-only knob: it is the documented env fallback of
-/// every local verb's `--api-url` (`cli/src/main.rs:1193`), with the same
+/// every local verb's `--api-url` (`cli/src/args/local.rs`), with the same
 /// default the CLI itself applies, so pointing the ladder's deployments read at
 /// a different API is production behavior that happens to also be the seam this
 /// control needs.

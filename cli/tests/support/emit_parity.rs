@@ -3,7 +3,7 @@
 //! One hop downstream of the struct-level field-parity gate (`support/field_parity.rs`,
 //! issue #691). That gate proves a `cli/src/api.rs` mirror struct carries every
 //! field its API schema declares. It says nothing about the SECOND hop: a
-//! `CliOutput::to_json` impl in `cli/src/commands.rs` (or a sibling file) can
+//! `CliOutput::to_json` impl in a `cli/src/commands/` module (or a sibling file) can
 //! still hand-project that struct into a `serde_json::json!` literal and drop
 //! one of its fields on the floor. The proof case was `VersionsOutput::to_json`
 //! dropping `Version::id` (fixed inline in #691's PR).
