@@ -22,7 +22,7 @@ The image value is a sentinel. The factory release substitutes the worker image,
 
 ## Caller identity
 
-`env_create`, `env_destroy`, and `image_build` read `X-Curie-Run` and `X-Curie-Work-Item`. The caller proxy sets those headers from the signed caller token. A call with no pair is refused with `e2e_run_identity_required` and does not touch the test cluster.
+Every tool reads `X-Curie-Run` and `X-Curie-Work-Item`. The caller proxy sets those headers from the signed caller token. A call with no pair is refused with `e2e_run_identity_required` and does not touch the test cluster.
 
 ## Tools served now
 
@@ -109,16 +109,103 @@ The cache credential is mounted in the `build` container, where Dockerfile `RUN`
 
 `e2eConnector.registryInsecure` switches registry calls to plain http and passes `--insecure-registry` per host to kaniko. A Bearer token realm must be https, carry no userinfo, and be on the registry host or a host listed in `E2E_REGISTRY_TOKEN_HOSTS` (`e2eConnector.registryTokenHosts`). An entry without a port matches 443 only, and `:443` on the registry host or an entry is ignored when comparing. Any other realm is refused before a credential is sent, and redirects are never followed.
 
-#### Required of #3247
+### deploy
 
-`deploy` shares the namespace with build Jobs and their Secrets. Before `deploy` ships beside `image_build`, it must refuse:
+Argument: `manifests`, YAML text of at most 1 MiB. It holds one or more documents, or a `kind: List` (any kind ending in `List` with `items`), up to 100 objects in total. Each object needs `apiVersion`, `kind`, and a `metadata.name` that is a DNS subdomain of at most 253 characters. YAML anchors and aliases are refused.
 
-1. Create, update, or delete of any Job or Pod carrying label `curietech.ai/e2e-build`, judged on both the submitted object and the existing object of the same name.
-2. Create, update, or delete of any Secret whose name starts with `e2e-registry-`.
-3. Create, update, or delete of ConfigMap `e2e-images`.
-4. Create, update, or delete of NetworkPolicy `e2e-build-egress`.
-5. Label `curietech.ai/e2e-build` on any workload or pod template.
-6. Any Role or RoleBinding that grants access to `secrets`.
+Result:
+
+```json
+{"namespace": "curie-e2e-<run uuid>", "applied": [{"kind": "Deployment", "name": "web"}]}
+```
+
+`applied` follows manifest order. Each object lands in the run's namespace with the three run labels merged into `metadata.labels`. `status` and the server set metadata (`resourceVersion`, `uid`, `creationTimestamp`, `managedFields`, `generation`, `selfLink`) are dropped. An object that does not exist is created; one that exists is replaced with its current `resourceVersion`.
+
+Every refusal below is decided before the first write, so a refused manifest applies nothing. They are checked in this order:
+
+1. `e2e_run_identity_required`, then `e2e_environment_required` or `e2e_namespace_not_owned` for the run's namespace, as for `image_build`.
+2. `e2e_deploy_manifest_refused: <reason>`: the text does not parse, or an object breaks the rules above.
+3. `e2e_cluster_scoped_object: <json>`: at least one object is cluster scoped. The whole deploy is refused, whatever else the manifest holds. A cluster scoped object needs CI only proof; this connector never applies one. The connector knows these kinds without asking: Namespace, Node, PersistentVolume, ComponentStatus, CustomResourceDefinition, PriorityClass, ClusterRole, ClusterRoleBinding, Validating and Mutating WebhookConfiguration, Validating and Mutating AdmissionPolicy and their Bindings, StorageClass, CSIDriver, CSINode, VolumeAttachment, APIService, IngressClass, RuntimeClass, CertificateSigningRequest, FlowSchema, and PriorityLevelConfiguration. Every other kind is resolved through API discovery, and a kind discovery reports with `namespaced: false` is refused the same way.
+4. `e2e_deploy_object_refused: <json>`: the cluster does not serve the object's kind in its `apiVersion`.
+5. `e2e_namespace_not_owned`: an object names a `metadata.namespace` other than the run's.
+6. `e2e_image_not_digest: <json>`: an image is not `<ref>@sha256:<64 hex>`, or is missing. Every list named `containers`, `initContainers`, or `ephemeralContainers` anywhere in the object is checked, so Deployments, StatefulSets, Jobs, CronJobs, Pods, and custom resources with pod templates are all covered, and so is `volumes[].image.reference`. A tag followed by a digest is accepted, because the digest pins it.
+7. `e2e_deploy_object_refused: <json>`: the object reaches something the connector owns (see Deploy guard).
+8. `e2e_deploy_failed: <kind>/<name> (<status>) <message>; applied: <json>`: the test cluster refused a write. The message is the tail of the API server's Status message. `applied` lists the objects written before the failure, which stay in place.
+
+The JSON after the code and `": "` has sorted keys:
+
+1. `e2e_cluster_scoped_object`: `{"objects": [{"apiVersion": "...", "kind": "...", "name": "..."}]}`, every cluster scoped object in manifest order.
+2. `e2e_image_not_digest`: `{"images": [{"container": "...", "image": "...", "kind": "...", "name": "..."}]}`. `container` is the container name, or `volume/<name>` for an image volume. `image` is empty when the container has none.
+3. `e2e_deploy_object_refused`: `{"objects": [{"kind": "...", "name": "...", "reason": "..."}]}`, one entry per refused object.
+
+#### Deploy guard
+
+`deploy` shares the namespace with `env_create`'s bounds and with build Jobs and their Secrets. It refuses an object, with `e2e_deploy_object_refused`, when:
+
+1. Any mapping key anywhere in it is `curietech.ai/e2e-build`, which covers labels, pod template labels, and selectors, or any string value is exactly that label.
+2. Any string value anywhere in it starts with `e2e-registry-`. That covers a Secret of that name and every volume, env, or image pull reference to one.
+3. It is the ConfigMap `e2e-images`.
+4. It is a NetworkPolicy of any name. `env_create` owns egress through its `allow` rules, and an extra policy would widen the default deny.
+5. It is a ResourceQuota or a LimitRange. `env_create` owns the namespace bounds.
+6. It is the RoleBinding `e2e-connector`.
+7. It is a Role with a rule that reaches `secrets` (resources `secrets` or `*` in API group `""` or `*`), or reaches `roles` or `rolebindings` in `rbac.authorization.k8s.io` or `*`, which could grant Secrets later.
+8. It is a RoleBinding whose `roleRef` is not a Role, such as a ClusterRole the connector cannot read to check, or a RoleBinding to a Role refused by the rule above, whether that Role is in the same manifest or already exists in the namespace.
+9. An object of the same kind and name already exists and carries `curietech.ai/e2e-build`, such as a build Job or pod.
+
+A Role that grants only other resources, such as `configmaps`, and a Secret with any other name, deploy normally.
+
+### run
+
+Arguments:
+
+1. `command`, required. 1 to 64 strings of at most 4096 characters each. It is the container's argv, so use `["sh", "-c", "..."]` for a shell line.
+2. `image`, required. `<ref>@sha256:<64 hex>`.
+
+The connector creates the Job `e2e-run-<id>` in the run's namespace with the run labels, `backoffLimit: 0`, `activeDeadlineSeconds: 1200`, and `ttlSecondsAfterFinished: 600`. Its pod sets `restartPolicy: Never`, `automountServiceAccountToken: false`, and `enableServiceLinks: false`. The single container `run` sets `allowPrivilegeEscalation: false` and the RuntimeDefault seccomp profile, plus `runAsNonRoot` and dropping all capabilities when the installation enforces `restricted`. The connector polls the Job every 5 seconds and deletes it, with Background propagation, on every exit path.
+
+Result:
+
+```json
+{"exit_code": 0, "stdout": "...", "stderr": ""}
+```
+
+Kubernetes merges a container's stdout and stderr into one log. `stdout` carries that log, its last 64 KiB. `stderr` carries the container's termination message, or its termination reason (such as `OOMKilled`) when the exit is non zero and there is no message. A non zero exit is a result, not a refusal.
+
+Refusals:
+
+1. `e2e_run_identity_required`, `e2e_environment_required`, `e2e_namespace_not_owned`: as for `deploy`.
+2. `e2e_image_not_digest`: `image` is not pinned by digest. Nothing is created.
+3. `e2e_run_argument_refused: <reason>`: `command` breaks the rules above. Nothing is created.
+4. `e2e_run_failed: <reason>`: the container waits on `InvalidImageName`, `ErrImageNeverPull`, or `ImagePullBackOff`, or the Job failed without a container exit. `ContainerCreating`, `PodInitializing`, and `ErrImagePull` keep waiting; the kubelet turns a pull failure that persists into `ImagePullBackOff`.
+5. `e2e_run_timeout`: the run passed 1200 seconds.
+
+### logs
+
+Arguments:
+
+1. `pod`, required. A DNS subdomain name.
+2. `container`, optional. A DNS label, for a pod with more than one container.
+3. `tail`, optional. Lines from the end, 1 to 5000 (default 500).
+
+Result: `{"logs": "..."}`, at most the last 64 KiB.
+
+Refusals:
+
+1. `e2e_run_identity_required`, `e2e_environment_required`, `e2e_namespace_not_owned`: as for `deploy`.
+2. `e2e_pod_not_found`: no such pod in the run's namespace, or the name is not a DNS subdomain.
+3. `e2e_logs_refused`: the pod carries `curietech.ai/e2e-build`. Build output would bypass `image_build`'s credential redaction, so `image_build` reports build failures itself.
+
+### events
+
+Argument: `involved`, optional. An object name; only events whose `involvedObject.name` matches are returned.
+
+Result:
+
+```json
+{"events": [{"reason": "BackOff", "message": "...", "type": "Warning", "count": 4}]}
+```
+
+Events are core v1 Events in the run's namespace, oldest first by `lastTimestamp`, `eventTime`, or creation time, at most the last 200. `count` is the event's `count`, else `series.count`, else 1. Refusals are those of `deploy` in item 1.
 
 ## Reaper
 
@@ -157,12 +244,3 @@ Three worker gauges report its health:
 3. `curie.e2e.namespaces.overdue` (Prometheus `curie_e2e_namespaces_overdue`) counts scoped namespaces at least ten minutes past their TTL, or without a readable one.
 
 Both namespace gauges are recorded only by a pass that listed every test cluster, so a listing failure holds the last full counts. A slow pass keeps reporting its stale timestamp every interval and is never cancelled or overlapped, so it still reaches deletion. The SRE example pages on three alerts: `CurieE2EReaperStalled` when the last clean pass is more than 15 minutes old, `CurieE2EReaperSignalAbsent` when the timestamp was reported in the last 7 days but not in the last 15 minutes, and `CurieE2EExpiredNamespacesAccumulating` when `curie_e2e_namespaces_overdue` stays above 0 for 15 minutes. That last alert keys on overdue rather than expired, because a healthy reaper always sees a few namespaces just past their TTL between sweeps.
-
-## Names reserved for later issues
-
-These tools are not served yet. Their names and result fields stay as written here.
-
-1. `deploy` argument `manifests` (YAML). Result `{"namespace": "<name>", "applied": [{"kind": "<kind>", "name": "<name>"}]}`. A tag reference returns `e2e_image_not_digest`. A cluster scoped object returns `e2e_cluster_scoped_object` and applies nothing.
-2. `run` arguments `command` (string array) and `image` (digest). Result `{"exit_code": 0, "stdout": "", "stderr": ""}`.
-3. `logs` arguments `pod`, optional `container`, optional `tail`. Result `{"logs": ""}`.
-4. `events` optional argument `involved`. Result `{"events": [{"reason": "", "message": "", "type": "", "count": 1}]}`.

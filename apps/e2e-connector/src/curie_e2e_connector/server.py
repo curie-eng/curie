@@ -37,6 +37,7 @@ from curie_e2e_connector.contract import (
     REFUSAL_MISCONFIGURED,
     REGISTRY_PUSH_MOUNT,
     RUN_HEADER,
+    RUN_TIMEOUT_S,
     WORK_ITEM_HEADER,
 )
 from curie_e2e_connector.kube import ClusterApi, HttpxCluster, client_from_kubeconfig
@@ -53,12 +54,21 @@ from curie_e2e_connector.registry import (
     parse_docker_config,
     registry_client,
 )
+from curie_e2e_connector.workload import deploy as deploy_manifests
+from curie_e2e_connector.workload import list_events, read_logs, run_command
 
 mcp = MCPServer("e2e")
 
 _WRITE = ToolAnnotations(
     read_only_hint=False,
     destructive_hint=True,
+    idempotent_hint=True,
+    open_world_hint=True,
+)
+
+_READ = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
     idempotent_hint=True,
     open_world_hint=True,
 )
@@ -290,6 +300,98 @@ def image_build(
         build_id=secrets.token_hex(4),
         on_poll=on_poll,
     )
+    return _reply(result)
+
+
+@mcp.tool(annotations=_WRITE)
+def deploy(ctx: Context, manifests: str) -> str:
+    """Apply Kubernetes manifests in this run's namespace.
+
+    ``manifests`` is YAML: one or more documents, or a ``kind: List``. Every
+    object lands in the namespace env_create returned, labelled with this run.
+    An object that already exists is replaced. Every container image must be
+    pinned by digest (``<ref>@sha256:<hex>``, as image_build returns it).
+
+    Result: ``{"namespace": "<name>", "applied": [{"kind", "name"}]}``.
+
+    A refusal applies nothing. Cluster scoped objects (CustomResourceDefinition,
+    ClusterRole, ClusterRoleBinding, webhooks, PriorityClass, Namespace and
+    any other kind the cluster serves outside a namespace) are refused with
+    ``e2e_cluster_scoped_object``: that change cannot be proven here and needs
+    CI only proof. NetworkPolicy, ResourceQuota, LimitRange, the build's
+    objects, and any Role or RoleBinding that reaches Secrets or RBAC are
+    refused too.
+    """
+
+    caller = caller_from_headers(ctx.headers)
+    result = deploy_manifests(cluster_from_env(), install_from_env(), caller, manifests)
+    return _reply(result)
+
+
+@mcp.tool(annotations=_WRITE)
+def run(ctx: Context, command: list[str], image: str) -> str:
+    """Run one command to completion as a Job in this run's namespace.
+
+    ``command`` is the argv, 1 to 64 strings; use ``["sh", "-c", "..."]`` for
+    a shell line. ``image`` must be pinned by digest. The Job gets no service
+    account token, never retries, and stops after 1200 seconds.
+
+    Result: ``{"exit_code": <int>, "stdout": "...", "stderr": "..."}``.
+    Kubernetes merges stdout and stderr into one log, so ``stdout`` is that
+    log (its last 64 KiB) and ``stderr`` is the termination message or reason,
+    such as ``OOMKilled``. A non zero exit is a result, not an error.
+    """
+
+    caller = caller_from_headers(ctx.headers)
+    total = float(RUN_TIMEOUT_S)
+
+    def on_poll(elapsed: float) -> None:
+        # Progress is best effort and never fails the run.
+        try:
+            anyio.from_thread.run(ctx.report_progress, min(elapsed, total), total)
+        except Exception:  # noqa: BLE001
+            pass
+
+    result = run_command(
+        cluster_from_env(),
+        install_from_env(),
+        caller,
+        command,
+        image,
+        clock=time.monotonic,
+        sleep=time.sleep,
+        run_id=secrets.token_hex(4),
+        on_poll=on_poll,
+    )
+    return _reply(result)
+
+
+@mcp.tool(annotations=_READ)
+def logs(ctx: Context, pod: str, container: str | None = None, tail: int | None = None) -> str:
+    """Read the last lines of a pod's log in this run's namespace.
+
+    ``container`` picks one container of a multi container pod. ``tail`` is
+    the line count, 1 to 5000 (default 500). Result: ``{"logs": "..."}``, at
+    most the last 64 KiB. image_build pods are refused; image_build reports
+    their failures itself.
+    """
+
+    caller = caller_from_headers(ctx.headers)
+    result = read_logs(cluster_from_env(), install_from_env(), caller, pod, container, tail)
+    return _reply(result)
+
+
+@mcp.tool(annotations=_READ)
+def events(ctx: Context, involved: str | None = None) -> str:
+    """List recent Kubernetes events in this run's namespace, oldest first.
+
+    ``involved`` limits them to one object by name, such as a pod. Result:
+    ``{"events": [{"reason", "message", "type", "count"}]}``, at most 200.
+    Use it when a deploy applied but its pods never became ready.
+    """
+
+    caller = caller_from_headers(ctx.headers)
+    result = list_events(cluster_from_env(), install_from_env(), caller, involved)
     return _reply(result)
 
 

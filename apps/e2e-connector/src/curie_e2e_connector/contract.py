@@ -59,6 +59,25 @@ REFUSAL_BUILD_NO_DIGEST = "e2e_build_no_digest"
 REFUSAL_BUILD_IN_PROGRESS = "e2e_build_in_progress"
 REFUSAL_REGISTRY_DELETE = "e2e_registry_delete_refused"
 
+# deploy, run, logs and events (#3247, ADR 0176). The three JSON refusals
+# (cluster scoped, image not digest, deploy object) carry sorted key JSON after
+# ": ", so the factory can parse the detail. The cluster scoped code is the
+# one the factory keys CI only proof on.
+REFUSAL_CLUSTER_SCOPED = "e2e_cluster_scoped_object"
+REFUSAL_IMAGE_NOT_DIGEST = "e2e_image_not_digest"
+REFUSAL_DEPLOY_MANIFEST = "e2e_deploy_manifest_refused"
+REFUSAL_DEPLOY_OBJECT = "e2e_deploy_object_refused"
+REFUSAL_DEPLOY_FAILED = "e2e_deploy_failed"
+REFUSAL_RUN_ARGUMENT = "e2e_run_argument_refused"
+REFUSAL_RUN_FAILED = "e2e_run_failed"
+REFUSAL_RUN_TIMEOUT = "e2e_run_timeout"
+REFUSAL_POD_NOT_FOUND = "e2e_pod_not_found"
+REFUSAL_LOGS_REFUSED = "e2e_logs_refused"
+RUN_JOB_PREFIX = "e2e-run-"
+RUN_TIMEOUT_S = 1200
+# run stdout and logs keep only this many trailing bytes.
+OUTPUT_LIMIT_BYTES = 65536
+
 # An empty E2E_*_IMAGE means these. The defaults live only here.
 DEFAULT_BUILDER_IMAGE = (
     "gcr.io/kaniko-project/executor:v1.23.2"
