@@ -55,12 +55,10 @@ _LOG = logging.getLogger("curie_api.provider_installations")
 
 # Migration 0051's auto-provisioned tenant.
 DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
-# Fixed, like the default tenant, so replicas booting together collide on the
-# primary key rather than each inserting a row, and so the row keeps its
-# identity after an administrator renames ``external_account_id``. Only the
-# "default" identity gets a fixed id; any other declared identity gets a fresh
-# one, since the (tenant, provider, name) unique key is what makes a race
-# between replicas safe for it (see ``_INSERT_SLACK_IDENTITY``).
+# Fixed, like the default tenant, so the row keeps its identity after an
+# administrator renames it, and two replicas booting together attempt the
+# SAME row rather than two different ones. Only the "default" identity gets a
+# fixed id; any other declared identity gets a fresh one every attempt.
 STATIC_SLACK_INSTALLATION_ID = uuid.UUID("00000000-0000-0000-0000-000000000101")
 STATIC_SLACK_EXTERNAL_ACCOUNT_ID = "static"
 # How often boot re-checks for the table when it started below this migration,
@@ -315,70 +313,26 @@ def _declared_slack_identities(settings: Settings) -> list[_DeclaredSlackIdentit
 
 _TABLE_EXISTS = text("SELECT to_regclass('curie.provider_installations') IS NOT NULL")
 
-# Keyed on "a row for this (tenant, provider, name)" rather than on the
-# placeholder account id: a renamed row, or one an administrator created in its
-# place, means that identity is already represented. A disconnected row still
-# counts, so disconnecting it sticks; deleting it does not, and the next boot
-# recreates it while its token is still configured. The conflict target is the
-# same unique key, so two replicas racing to bootstrap this identity collide
-# there instead of each inserting a row.
-#
-# Only safe for a declared identity whose id is freshly generated on every
-# bootstrap attempt (every identity but ``default``, see ``bootstrap_static_slack``):
-# a FRESH id never collides with a prior row's primary key, so the only
-# conflict this INSERT can hit is the one this statement's ON CONFLICT already
-# targets.
-_INSERT_DECLARED_SLACK_IDENTITY = text(
+# A plain INSERT, no WHERE NOT EXISTS or ON CONFLICT: Postgres's ON CONFLICT
+# clause only arbitrates a conflict on the ONE index it names, and a row that
+# also violates a DIFFERENT unique constraint still raises -- confirmed by a
+# real CI run (#3040 review round 2): two replicas concurrently bootstrapping
+# "default" (same fixed id, same name) can still hit a raw UniqueViolationError
+# on the NAME key even with `ON CONFLICT (id) DO NOTHING`, because genuinely
+# concurrent inserts resolve their unique indexes in an order Postgres does
+# not guarantee follows the declared arbiter. There is no single arbiter that
+# covers every way this row can already be represented (a prior boot's row
+# at the same id, a renamed row, an operator-created row with the same name
+# but a different id, or a second replica racing this exact attempt), so
+# catching the IntegrityError here, in a SAVEPOINT that rolls back only this
+# identity's own attempt, replaces trying to express all of that in SQL.
+_INSERT_SLACK_IDENTITY = text(
     """
     INSERT INTO curie.provider_installations
         (id, tenant_id, provider, name, external_account_id, credential_ref,
          webhook_verification_ref, attributes, status)
-    SELECT :id, :tenant_id, 'slack', :name, :external_account_id, :credential_ref,
-           :webhook_verification_ref, CAST(:attributes AS jsonb), 'connected'
-    WHERE NOT EXISTS (
-        SELECT 1 FROM curie.provider_installations
-        WHERE tenant_id = :tenant_id AND provider = 'slack' AND name = :existing_name
-    )
-    ON CONFLICT (tenant_id, provider, name) DO NOTHING
-    RETURNING id
-    """
-)
-# asyncpg's extended protocol infers one type per PARAMETER NAME, not per
-# occurrence: reusing `:name` for both the inserted value and the `WHERE`
-# comparison above made it deduce `character varying` at one site and `text`
-# at the other, raising `AmbiguousParameterError` on every real execution.
-# `:existing_name` is a distinct bind carrying the identical Python value,
-# never a different one (see its single caller below).
-
-# ``default`` reuses the SAME id (``STATIC_SLACK_INSTALLATION_ID``) on every
-# bootstrap attempt, so a name-keyed dedup check is not enough: once an
-# administrator renames that row, no row is named "default" any more, this
-# would try to INSERT a second row at the SAME primary key, and the ON CONFLICT
-# target above does not cover a conflict on a different index -- Postgres
-# raises a raw IntegrityError that aborts the whole bootstrap call (#3040
-# review). Checking `id = :id` as well as `name` covers both a prior
-# bootstrap's row (however it has since been renamed) and an administrator's
-# own pre-created "default" row (a different id); the ON CONFLICT target is
-# the primary key, so two replicas racing to bootstrap this identity with the
-# SAME fixed id collide there instead of each inserting a row. The one
-# remaining race this does not cover -- an administrator's own POST for this
-# exact name landing in the same instant as a boot's bootstrap attempt --
-# would still raise; accepted as a lower-probability race than two pods
-# booting together, which happens on every multi-replica rollout.
-_INSERT_DEFAULT_SLACK_IDENTITY = text(
-    """
-    INSERT INTO curie.provider_installations
-        (id, tenant_id, provider, name, external_account_id, credential_ref,
-         webhook_verification_ref, attributes, status)
-    SELECT :id, :tenant_id, 'slack', :name, :external_account_id, :credential_ref,
-           :webhook_verification_ref, CAST(:attributes AS jsonb), 'connected'
-    WHERE NOT EXISTS (
-        SELECT 1 FROM curie.provider_installations
-        WHERE id = :id
-           OR (tenant_id = :tenant_id AND provider = 'slack' AND name = :existing_name)
-    )
-    ON CONFLICT (id) DO NOTHING
-    RETURNING id
+    VALUES (:id, :tenant_id, 'slack', :name, :external_account_id, :credential_ref,
+            :webhook_verification_ref, CAST(:attributes AS jsonb), 'connected')
     """
 )
 
@@ -404,30 +358,32 @@ async def bootstrap_static_slack(
         for identity in declared:
             is_default = identity.name == DEFAULT_IDENTITY
             installation_id = STATIC_SLACK_INSTALLATION_ID if is_default else uuid.uuid4()
-            statement = (
-                _INSERT_DEFAULT_SLACK_IDENTITY if is_default else _INSERT_DECLARED_SLACK_IDENTITY
-            )
             webhook_ref = (
                 f"env:{identity.signing_secret_env}" if identity.signing_secret_env else None
             )
             attributes = json.dumps({"app_token_ref": f"env:{identity.app_token_env}"})
-            result = (
-                await session.execute(
-                    statement,
-                    {
-                        "id": installation_id,
-                        "tenant_id": DEFAULT_TENANT_ID,
-                        "name": identity.name,
-                        "existing_name": identity.name,
-                        "external_account_id": STATIC_SLACK_EXTERNAL_ACCOUNT_ID,
-                        "credential_ref": f"env:{identity.bot_token_env}",
-                        "webhook_verification_ref": webhook_ref,
-                        "attributes": attributes,
-                    },
-                )
-            ).scalar_one_or_none()
-            if result is not None:
-                inserted_ids.append(result)
+            try:
+                async with session.begin_nested():
+                    await session.execute(
+                        _INSERT_SLACK_IDENTITY,
+                        {
+                            "id": installation_id,
+                            "tenant_id": DEFAULT_TENANT_ID,
+                            "name": identity.name,
+                            "external_account_id": STATIC_SLACK_EXTERNAL_ACCOUNT_ID,
+                            "credential_ref": f"env:{identity.bot_token_env}",
+                            "webhook_verification_ref": webhook_ref,
+                            "attributes": attributes,
+                        },
+                    )
+            except IntegrityError:
+                # Already represented under this (tenant, provider, name) or
+                # at this fixed id -- a prior boot, a rename, an
+                # operator-created row, or a replica racing this exact
+                # attempt. The SAVEPOINT rolled back only this attempt, so
+                # the next identity in the loop is unaffected.
+                continue
+            inserted_ids.append(installation_id)
         await session.commit()
     for installation_id in inserted_ids:
         _LOG.info("bootstrapped Slack provider installation id=%s", installation_id)
