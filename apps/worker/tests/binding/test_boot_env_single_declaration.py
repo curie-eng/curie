@@ -280,6 +280,14 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # match the pod selector the connector NetworkPolicy uses.
         "CURIE_CONNECTOR_RECONCILE",
         "CURIE_CONNECTOR_RECONCILE_INTERVAL_S",
+        # End to end namespace reaper (#3245), read by the worker process only.
+        # The test cluster kubeconfig is not among them: the reaper reads it
+        # from the connector Secret at sweep time.
+        "CURIE_E2E_CONNECTOR_ENABLED",
+        "CURIE_E2E_NAMESPACE_PREFIX",
+        "CURIE_E2E_OWNER_LABEL_KEY",
+        "CURIE_E2E_OWNER_LABEL_VALUE",
+        "CURIE_E2E_REAPER_INTERVAL_S",
         # Cron scheduler tick (#268), read by the worker process only.
         "CURIE_CRON_TICK_INTERVAL_S",
         # Cron hook run claim lease (#2931), read by the worker process only.

@@ -420,6 +420,11 @@ _BACKGROUND_AGE_ATTRIBUTES = {
 # skipping right now (#1215). Which agents, and why, is in the log line each
 # skip transition emits; an agent label here would be a deployment identifier.
 _CONNECTOR_RECONCILE_SKIPPED_ATTRIBUTES = {"service.name": ["curie-worker"]}
+# The end to end namespace reaper's health (#3245, ADR 0176 decision 4): when
+# it last finished a clean sweep, and how many scoped namespaces were past
+# their TTL at the last pass. Namespace and run names are in the WARNING line
+# each reap emits, never on the metric.
+_E2E_REAPER_ATTRIBUTES = {"service.name": ["curie-worker"]}
 # Removals and rewrites of an agent's stored state (#3673). Namespaces are
 # caller-chosen, so every one the platform does not own shares ``other``; the
 # agent, scope and key are in the log line, never on the metric.
@@ -465,6 +470,7 @@ _SUPERVISED_RESTART_ATTRIBUTES = {
         "heartbeat",
         "connectors",
         "publications",
+        "e2e-reaper",
         "other",
     ],
     "outcome": ["restart", "give_up"],
@@ -682,6 +688,28 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Agents whose connector applies the reconciler is skipping.",
         False,
         _CONNECTOR_RECONCILE_SKIPPED_ATTRIBUTES,
+    ),
+    "curie.e2e.reaper.last_success": _definition(
+        "gauge",
+        "s",
+        "Unix time of the end to end namespace reaper's last successful sweep, 0 if none.",
+        False,
+        _E2E_REAPER_ATTRIBUTES,
+    ),
+    "curie.e2e.namespaces.expired": _definition(
+        "gauge",
+        "{namespace}",
+        "End to end namespaces past their TTL at the reaper's last pass.",
+        False,
+        _E2E_REAPER_ATTRIBUTES,
+    ),
+    "curie.e2e.namespaces.overdue": _definition(
+        "gauge",
+        "{namespace}",
+        "End to end namespaces at least ten minutes past their TTL, or without one, "
+        "at the reaper's last pass.",
+        False,
+        _E2E_REAPER_ATTRIBUTES,
     ),
     "curie.state.mutation": _definition(
         "counter",

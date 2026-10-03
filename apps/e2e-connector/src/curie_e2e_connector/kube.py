@@ -26,13 +26,27 @@ def load_kubeconfig(path: str) -> tuple[str, str, ssl.SSLContext | str | bool]:
 
     try:
         with open(path, encoding="utf-8") as handle:
-            cfg = yaml.safe_load(handle)
+            text = handle.read()
     except FileNotFoundError as exc:
         raise ClusterError(
             f"{REFUSAL_MISCONFIGURED}: no kubeconfig at {path}. "
             "Store E2E_CLUSTER_KUBECONFIG with curie secrets."
         ) from exc
-    except (OSError, yaml.YAMLError) as exc:
+    except OSError as exc:
+        raise ClusterError(f"{REFUSAL_MISCONFIGURED}: could not read the kubeconfig") from exc
+    return load_kubeconfig_text(text)
+
+
+def load_kubeconfig_text(text: str) -> tuple[str, str, ssl.SSLContext | str | bool]:
+    """Return ``(server, token, verify)`` from kubeconfig contents.
+
+    The worker's reaper (#3245) reads the kubeconfig from the connector Secret
+    rather than a mounted file, and gets the same refusals the connector does.
+    """
+
+    try:
+        cfg = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
         raise ClusterError(f"{REFUSAL_MISCONFIGURED}: could not read the kubeconfig") from exc
 
     try:
@@ -82,7 +96,16 @@ def load_kubeconfig(path: str) -> tuple[str, str, ssl.SSLContext | str | bool]:
 
 
 def client_from_kubeconfig(path: str, timeout: float) -> httpx.Client:
-    server, token, verify = load_kubeconfig(path)
+    return _client(*load_kubeconfig(path), timeout=timeout)
+
+
+def client_from_kubeconfig_text(text: str, timeout: float) -> httpx.Client:
+    return _client(*load_kubeconfig_text(text), timeout=timeout)
+
+
+def _client(
+    server: str, token: str, verify: ssl.SSLContext | str | bool, *, timeout: float
+) -> httpx.Client:
     return httpx.Client(
         base_url=server,
         headers={"Authorization": f"Bearer {token}"},

@@ -90,7 +90,8 @@ than an open bag of `gen_ai.*` names.
 - The metric catalog in `packages/telemetry/schema/metrics.json` is the committed
   contract for operational counters, histograms, and gauges across turn, queue,
   thread-lock, sandbox, runner RPC, approval, completion-outbox, reply, HTTP,
-  background-loop, connector-reconcile skips, schedule fires, eval work,
+  background-loop, connector-reconcile skips, end to end namespace reaper health,
+  schedule fires, eval work,
   transcript-capacity, state mutations, supervised-task restarts, tool results, and
   Slack Socket Mode connection state.
   `record_metric`
@@ -112,6 +113,17 @@ than an open bag of `gen_ai.*` names.
   per live or restarted process, never one per event, session, user, or sandbox. The
   1,000-identifier regression exercises this production resource shape as well as the
   point attributes.
+- `curie.e2e.reaper.last_success` is the unix time of the worker's last clean end to
+  end namespace sweep, recorded every pass and 0 until one succeeds.
+  `curie.e2e.namespaces.expired` counts the scoped namespaces past their TTL, and
+  `curie.e2e.namespaces.overdue` the ones at least ten minutes past it or without a
+  readable TTL (`OVERDUE_GRACE_S` in
+  `apps/e2e-connector/src/curie_e2e_connector/reaper.py`). Both are recorded only by a
+  pass that listed every test cluster
+  (`apps/worker/src/curie_worker/e2e_reaper.py::E2EReaperLoop.sweep_once`, #3245). The
+  page keys on `overdue`, since a healthy reaper always sees a few namespaces just past
+  their TTL between sweeps. None of the three carries a namespace or run name; each reaped namespace logs one WARNING
+  naming it and whether the TTL or a terminal run status caused the delete.
 - `curie.tool.result` counts each tool result the runner sees close a call made in the
   same turn, by `origin` and `outcome`
   (`runner/src/curie_runner/session.py::SessionRunner._observe_tool_results`). The

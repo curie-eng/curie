@@ -480,14 +480,48 @@ if helm template curie "$CHART" --set e2eConnector.enabled=true >/dev/null 2>&1;
   fail "e2eConnector.enabled without the test cluster identity rendered"
 fi
 
-enabled_api="$(require_resource "$(helm template curie "$CHART" \
-  --set e2eConnector.enabled=true \
-  --set e2eConnector.ownerLabel.value=acme \
-  --set e2eConnector.serviceAccount=curie-e2e-connector \
-  --set e2eConnector.serviceAccountNamespace=test-system \
-  --set e2eConnector.workerClusterRole=curie-e2e-connector-namespace \
-  2>/dev/null)" Deployment curie-api)"
+e2e_identity=(
+  --set e2eConnector.enabled=true
+  --set e2eConnector.ownerLabel.value=acme
+  --set e2eConnector.serviceAccount=curie-e2e-connector
+  --set e2eConnector.serviceAccountNamespace=test-system
+  --set e2eConnector.workerClusterRole=curie-e2e-connector-namespace
+)
+enabled_render="$(helm template curie "$CHART" "${e2e_identity[@]}" \
+  --set worker.connectorReconciler.enabled=true 2>/dev/null)"
+enabled_api="$(require_resource "$enabled_render" Deployment curie-api)"
 require_text "$(grep -A1 'name: CURIE_E2E_CONNECTOR_ENABLED' <<<"$enabled_api")" 'value: "true"' \
   "enabled install did not tell the API the test cluster is configured"
 require_text "$enabled_api" 'value: "acme"' \
   "enabled install did not pass the owner label value"
+
+# #3245: the worker's end to end namespace reaper gets the same scope as the
+# API, only when e2eConnector is enabled.
+stock_worker="$(require_resource "$(helm template curie "$CHART" 2>/dev/null)" Deployment curie-worker)"
+forbid_text "$stock_worker" 'name: CURIE_E2E_' \
+  "a stock install configured the e2e reaper on the worker"
+enabled_worker="$(require_resource "$enabled_render" Deployment curie-worker)"
+for name in CURIE_E2E_NAMESPACE_PREFIX CURIE_E2E_OWNER_LABEL_KEY CURIE_E2E_REAPER_INTERVAL_S; do
+  require_text "$enabled_worker" "name: ${name}\$" "enabled install did not give the worker ${name}"
+done
+require_text "$(grep -A1 'name: CURIE_E2E_CONNECTOR_ENABLED' <<<"$enabled_worker")" 'value: "true"' \
+  "enabled install did not turn the worker's e2e reaper on"
+require_text "$(grep -A1 'name: CURIE_E2E_OWNER_LABEL_VALUE' <<<"$enabled_worker")" 'value: "acme"' \
+  "the worker's reaper owner label value differs from the API's"
+require_text "$(grep -A1 'name: CURIE_E2E_REAPER_INTERVAL_S' <<<"$enabled_worker")" 'value: "60"' \
+  "the worker's reaper interval did not default to 60 seconds"
+
+# The reaper reads the kubeconfig through the reconciler's Secret list grant,
+# so enabling e2eConnector without the reconciler is refused by name.
+if no_reconciler="$(helm template curie "$CHART" "${e2e_identity[@]}" 2>&1)"; then
+  fail "e2eConnector.enabled without worker.connectorReconciler.enabled rendered"
+fi
+require_text "$no_reconciler" 'e2eConnector.enabled requires worker.connectorReconciler.enabled' \
+  "the missing reconciler refusal did not name worker.connectorReconciler.enabled"
+
+if helm template curie "$CHART" "${e2e_identity[@]}" --set worker.connectorReconciler.enabled=true \
+  --set e2eConnector.reaperIntervalSeconds=5 >/dev/null 2>&1; then
+  fail "a reaper interval below 10 seconds passed the schema"
+fi
+
+echo "OK: end to end connector render assertions passed"

@@ -3915,3 +3915,250 @@ tests:
       - eval_time: 20m
         alertname: CurieAlloyScrapeMissing
         exp_alerts: []
+
+  # End to end namespace reaper (#3245, ADR 0176 decision 4).
+  - name: e2e reaper timestamp stuck while time advances pages
+    interval: 1m
+    input_series:
+      # Healthy for ten minutes (value tracks time()), then stuck at 600.
+      - series: 'curie_e2e_reaper_last_success_seconds{service_name="curie-worker"}'
+        values: '0+60x10 600x50'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieE2EReaperStalled
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: CurieE2EReaperStalled
+        exp_alerts:
+          - exp_labels:
+              service_name: curie-worker
+              severity: page
+              component: curie-e2e
+            exp_annotations:
+              summary: The end to end namespace reaper has not completed a sweep in 15 minutes
+              description: >-
+                curie_e2e_reaper_last_success_seconds is more than 900 seconds
+                old. Expired and finished end to end namespaces are not being
+                deleted, and their quota on the test cluster is not being
+                released.
+
+  - name: e2e reaper timestamp advancing with time stays quiet
+    interval: 5m
+    input_series:
+      - series: 'curie_e2e_reaper_last_success_seconds{service_name="curie-worker"}'
+        values: '0+300x24'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: CurieE2EReaperStalled
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: CurieE2EReaperStalled
+        exp_alerts: []
+
+  - name: e2e reaper that never succeeded pages
+    interval: 1m
+    input_series:
+      - series: 'curie_e2e_reaper_last_success_seconds{service_name="curie-worker"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieE2EReaperStalled
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CurieE2EReaperStalled
+        exp_alerts:
+          - exp_labels:
+              service_name: curie-worker
+              severity: page
+              component: curie-e2e
+            exp_annotations:
+              summary: The end to end namespace reaper has not completed a sweep in 15 minutes
+              description: >-
+                curie_e2e_reaper_last_success_seconds is more than 900 seconds
+                old. Expired and finished end to end namespaces are not being
+                deleted, and their quota on the test cluster is not being
+                released.
+
+  - name: overdue e2e namespaces held for 15 minutes page
+    interval: 1m
+    input_series:
+      - series: 'curie_e2e_namespaces_overdue{service_name="curie-worker"}'
+        values: '2x45'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieE2EExpiredNamespacesAccumulating
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: CurieE2EExpiredNamespacesAccumulating
+        exp_alerts:
+          - exp_labels:
+              service_name: curie-worker
+              severity: page
+              component: curie-e2e
+            exp_annotations:
+              summary: End to end namespaces more than 10 minutes past their TTL are still on the test cluster
+              description: >-
+                curie_e2e_namespaces_overdue has stayed above 0 for 15 minutes.
+                Namespaces past their TTL are not being removed, so their quota
+                on the test cluster is not released.
+      - eval_time: 40m
+        alertname: CurieE2EExpiredNamespacesAccumulating
+        exp_alerts:
+          - exp_labels:
+              service_name: curie-worker
+              severity: page
+              component: curie-e2e
+            exp_annotations:
+              summary: End to end namespaces more than 10 minutes past their TTL are still on the test cluster
+              description: >-
+                curie_e2e_namespaces_overdue has stayed above 0 for 15 minutes.
+                Namespaces past their TTL are not being removed, so their quota
+                on the test cluster is not released.
+
+  # A healthy reaper always sees a few namespaces just past their TTL between
+  # sweeps. That churn is in curie_e2e_namespaces_expired and must never page.
+  - name: healthy expired churn with nothing overdue stays quiet
+    interval: 1m
+    input_series:
+      - series: 'curie_e2e_namespaces_expired{service_name="curie-worker"}'
+        values: '1 2 0 3 1 0 2 1 3 0 1 2 1 0 3 2 1 0 2 1 3 1 0 2 1 3 2 0 1 2 1 0 3 2 1 0 2 1 3 1 0 2 1 3 2 0 1 2 1 0 3 2 1 0 2 1 3 1 0 2 1'
+      - series: 'curie_e2e_namespaces_overdue{service_name="curie-worker"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CurieE2EExpiredNamespacesAccumulating
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: CurieE2EExpiredNamespacesAccumulating
+        exp_alerts: []
+
+  - name: overdue e2e namespaces drained to zero stay quiet
+    interval: 1m
+    input_series:
+      - series: 'curie_e2e_namespaces_overdue{service_name="curie-worker"}'
+        values: '2x10 0x50'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieE2EExpiredNamespacesAccumulating
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: CurieE2EExpiredNamespacesAccumulating
+        exp_alerts: []
+
+  # The reaper's timestamp stops being exported at all: the worker task died,
+  # or the worker stopped running it. CurieE2EReaperStalled sees no series and
+  # cannot fire, so this one does. max() strips every series label.
+  - name: e2e reaper signal that stops reporting pages
+    interval: 1m
+    input_series:
+      - series: 'curie_e2e_reaper_last_success_seconds{service_name="curie-worker"}'
+        values: '0+60x10'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-e2e
+            exp_annotations:
+              summary: The end to end namespace reaper stopped reporting
+              description: >-
+                curie_e2e_reaper_last_success_seconds was reported in the last
+                7 days but not in the last 15 minutes. The worker task that deletes
+                expired end to end namespaces is not running.
+
+  # An outage longer than a day still pages: the window is 7 days.
+  - name: e2e reaper signal absent for more than a day still pages
+    interval: 1h
+    input_series:
+      - series: 'curie_e2e_reaper_last_success_seconds{service_name="curie-worker"}'
+        values: '0+3600x3'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-e2e
+            exp_annotations:
+              summary: The end to end namespace reaper stopped reporting
+              description: >-
+                curie_e2e_reaper_last_success_seconds was reported in the last
+                7 days but not in the last 15 minutes. The worker task that deletes
+                expired end to end namespaces is not running.
+
+  # A reaper task that crashed until the supervisor gave up on it.
+  - name: parked e2e reaper pages
+    interval: 1m
+    input_series:
+      - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="e2e-reaper",outcome="give_up"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieWorkerSupervisedTaskParked
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-worker
+              service_name: curie-worker
+              operation: e2e-reaper
+              outcome: give_up
+            exp_annotations:
+              summary: A supervised worker task was parked after repeated crashes
+              description: >-
+                curie_worker_supervised_restart_total with outcome give_up
+                is present. The named operation stopped restarting and stays
+                down until the worker pod restarts.
+
+  - name: e2e reaper signal reported continuously stays quiet
+    interval: 1m
+    input_series:
+      - series: 'curie_e2e_reaper_last_success_seconds{service_name="curie-worker"}'
+        values: '0+60x150'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts: []
+
+  # An installation without the end to end connector never exports the gauge.
+  - name: e2e reaper signal never reported stays quiet
+    interval: 1m
+    input_series:
+      - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="runs",outcome="restart"}'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts: []
+
+  - name: e2e reaper signal that resumes after a gap stops paging
+    interval: 1m
+    input_series:
+      # Reported for 10 minutes, absent for 30, then reported again.
+      - series: 'curie_e2e_reaper_last_success_seconds{service_name="curie-worker"}'
+        values: '0+60x10 _x30 2460+60x30'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-e2e
+            exp_annotations:
+              summary: The end to end namespace reaper stopped reporting
+              description: >-
+                curie_e2e_reaper_last_success_seconds was reported in the last
+                7 days but not in the last 15 minutes. The worker task that deletes
+                expired end to end namespaces is not running.
+      - eval_time: 45m
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts: []

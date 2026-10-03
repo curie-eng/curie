@@ -240,6 +240,42 @@
       "type": "counter",
       "unit": "{outcome}"
     },
+    "curie.e2e.namespaces.expired": {
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 1,
+      "description": "End to end namespaces past their TTL at the reaper's last pass.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "{namespace}"
+    },
+    "curie.e2e.namespaces.overdue": {
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 1,
+      "description": "End to end namespaces at least ten minutes past their TTL, or without one, at the reaper's last pass.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "{namespace}"
+    },
+    "curie.e2e.reaper.last_success": {
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 1,
+      "description": "Unix time of the end to end namespace reaper's last successful sweep, 0 if none.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "s"
+    },
     "curie.eval.process": {
       "attributes": {
         "outcome": [
@@ -1833,6 +1869,7 @@
           "heartbeat",
           "connectors",
           "publications",
+          "e2e-reaper",
           "other"
         ],
         "outcome": [
@@ -1843,7 +1880,7 @@
           "curie-worker"
         ]
       },
-      "cardinality_bound": 14,
+      "cardinality_bound": 16,
       "description": "In-process supervised worker task restarts.",
       "monotonic": true,
       "type": "counter",

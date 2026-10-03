@@ -1301,6 +1301,22 @@ class WorkerConfig(BaseSettings):
     # chart's nameOverride, and it appears only in the pod selector the
     # NetworkPolicy matches on.
     connector_app_name: str = Field(default="", validation_alias="CURIE_CONNECTOR_APP_NAME")
+    # The end to end namespace reaper (#3245, ADR 0176 decision 4). The chart
+    # sets these from the same e2eConnector values the API reads, so the scope
+    # the reaper deletes in is the scope env_create creates in. It reads each
+    # agent's kubeconfig from its connector Secret, which needs the reconciler's
+    # Secret list grant, so run.py builds it only when the reconciler is on too.
+    e2e_reaper_enabled: bool = Field(default=False, validation_alias="CURIE_E2E_CONNECTOR_ENABLED")
+    e2e_namespace_prefix: str = Field(
+        default="curie-e2e-", validation_alias="CURIE_E2E_NAMESPACE_PREFIX"
+    )
+    e2e_owner_label_key: str = Field(
+        default="curietech.ai/e2e-owner", validation_alias="CURIE_E2E_OWNER_LABEL_KEY"
+    )
+    e2e_owner_label_value: str = Field(default="", validation_alias="CURIE_E2E_OWNER_LABEL_VALUE")
+    e2e_reaper_interval_s: float = Field(
+        default=60.0, gt=0, validation_alias="CURIE_E2E_REAPER_INTERVAL_S"
+    )
     report_max_attempts: int = 3
     report_backoff_base_s: float = Field(default=0.5, gt=0)
     # Langfuse for recording eval scores (the matrix reads them back by version).
