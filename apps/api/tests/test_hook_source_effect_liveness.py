@@ -177,9 +177,11 @@ def test_secondary_diagnostic_cannot_replace_genuine_enqueue_error(
     from opentelemetry.trace import SpanKind
 
     calls: list[str] = []
-    provider, exporter = TracerProvider(), InMemorySpanExporter()
+    with monkeypatch.context() as recorder_setup:
+        recorder_setup.setenv("OTEL_SDK_DISABLED", "false")
+        provider = TracerProvider()
+    exporter = InMemorySpanExporter()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
-    monkeypatch.setattr(tracing, "_tracer", provider.get_tracer("source-effect-test"))
     actual_span = hooks.operation_span
     actual_metric = hooks.record_metric
 
@@ -212,6 +214,7 @@ def test_secondary_diagnostic_cannot_replace_genuine_enqueue_error(
     async def scenario() -> None:
         """@spec PROTECTED-HOOK-SOURCE-2."""
         async with core.ingress() as (app, client, agent):
+            monkeypatch.setattr(tracing, "_tracer", provider.get_tracer("source-effect-test"))
             await app.state.valkey.set(get_settings().runs_stream, "owned-wrongtype")
             if diagnostic == "metric":
                 monkeypatch.setattr(hooks, "record_metric", fail_metric)
@@ -223,7 +226,10 @@ def test_secondary_diagnostic_cannot_replace_genuine_enqueue_error(
                     content=core.BODY,
                     headers=core.signed_headers(core.secret(agent), delivery="diagnostic-fault"),
                 )
-            keys = [k async for k in app.state.valkey.scan_iter(match=f"curie:hook:*{agent}*")]
+            keys = [
+                k.decode("utf-8") if isinstance(k, bytes) else k
+                async for k in app.state.valkey.scan_iter(match=f"curie:hook:*{agent}*")
+            ]
             assert not any(":delivery:" in k or ":attempt:" in k for k in keys)
             values = [await app.state.valkey.get(k) for k in keys]
             assert all(value in {"0", b"0"} for value in values)
@@ -235,7 +241,7 @@ def test_secondary_diagnostic_cannot_replace_genuine_enqueue_error(
             spans = [s for s in exporter.get_finished_spans() if s.name == "curie.queue.enqueue"]
             assert len(spans) == 1 and spans[0].kind == SpanKind.PRODUCER
             assert spans[0].attributes["service.name"] == "curie-api"
-            assert spans[0].attributes["source"] == "api"
+            assert spans[0].attributes["curie.source"] == "api"
 
     try:
         asyncio.run(asyncio.wait_for(scenario(), 10))
