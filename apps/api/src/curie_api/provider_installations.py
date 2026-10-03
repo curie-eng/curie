@@ -391,7 +391,7 @@ async def bootstrap_static_slack(
     Returns False only when the table does not exist yet, which is the one
     case worth retrying: this image may serve any schema from its
     ``schema_min``, and a fresh install applies migrations one transaction at
-    a time, so boot can land between 0073 and 0074.
+    a time, so boot can land between 0074 and 0075.
     """
 
     declared = _declared_slack_identities(settings)
