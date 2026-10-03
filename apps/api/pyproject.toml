@@ -22,6 +22,8 @@ dependencies = [
     "redis>=5.0",
     "plugin-format",
     "aci-protocol",
+    # @spec PROTECTED-HOOK-LANE-1: shared internal source/transport authority.
+    "curie-protected-hooks",
     "curie-channel-protocol",
     "curie-telemetry",
     "curie-telemetry-schema",

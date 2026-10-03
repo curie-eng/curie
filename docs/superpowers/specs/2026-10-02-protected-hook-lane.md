@@ -72,6 +72,81 @@ recovery contract before issuing matching qualification authorization and
 readiness. Earlier artifact observations may remain historical evidence; they
 do not themselves establish the new broker's preventive boundary.
 
+## Closed internal record encoding
+
+<!-- @spec PROTECTED-HOOK-LANE-2 -->
+The v1 runtime manifest, qualification authorization and readiness records use the closed field sets below. Every listed field is required and non-null. Unknown fields at every nesting level and unknown schema versions refuse. No optional extensions are accepted in v1. Input validation is strict: booleans are not integers, strings do not coerce to numbers, and numbers do not coerce to strings. Internal generation representation does not change the existing public API representation.
+
+Identifiers called UUID below use canonical lowercase hyphenated UUID spelling; parsing and reformatting must equal the input. A `generation` is a decimal string matching `[1-9][0-9]*`, with numeric value at most 9223372036854775807. Zero, sign, exponent, whitespace and leading zeros refuse. A `millisecond` is a decimal string matching `0|[1-9][0-9]*`, with numeric value at most 9007199254740991, preserving exact broker/Lua comparisons. A `sha256` is exactly 64 lowercase hexadecimal characters. An `oci_digest` is exactly `sha256:` followed by a `sha256`. An `opaque_ref` matches `[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}` and is a reference to provisioner-owned state, never a secret value, mutable locator or instruction to fetch a URL.
+
+Each encoded record is at most 16384 bytes. Decoder rejects invalid UTF-8, duplicate JSON object member names recursively, trailing data, NaN/Infinity, floats and unknown nested members before constructing a record. References and identity fields use only the defined ASCII alphabets; no Unicode normalization or case folding silently changes identity.
+
+Canonical record bytes are ASCII JSON with object keys sorted lexicographically, no insignificant whitespace, standard JSON string escaping and no nonfinite numbers. The only JSON integers are schema version, broker port and database. Decimal generations and milliseconds remain JSON strings. Implementations produce the same bytes as `json.dumps(validated_primitives, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")` for these closed v1 shapes. Input whitespace/member order does not change canonical content. Manifest identity is the lowercase SHA256 of its canonical bytes, without a prefix or an embedded self-digest member. Mutable dictionaries are not retained as record state: records and nested values remain immutable, and cached identities cannot survive content mutation.
+
+## Nested shared records
+
+<!-- @spec PROTECTED-HOOK-LANE-2 -->
+`BrokerIdentity` contains exactly:
+
+| Field | Type and meaning |
+| --- | --- |
+| `instance_id` | UUID assigned by the provisioner. |
+| `endpoint` | Object containing exactly `host` and `port`. |
+| `endpoint.host` | Lowercase ASCII DNS name without trailing dot, or canonical IP address; no scheme, userinfo, brackets, path, query or fragment. DNS labels follow ordinary hostname syntax, total at most 253 characters; a dotted numeric address cannot fall back to DNS parsing when noncanonical. IP addresses use canonical `ipaddress.ip_address(...).compressed` spelling. |
+| `endpoint.port` | Strict integer from 1 through 65535. |
+| `tls_server_name` | Lowercase ASCII DNS name or canonical IP address under the same grammar; the independently verified TLS identity. |
+| `tls_spki_sha256` | SHA256 of the designated server leaf certificate's DER SubjectPublicKeyInfo. |
+| `run_id` | Exactly 40 lowercase hexadecimal characters, the pinned Valkey server's observed live `INFO server` identifier. |
+| `database` | Strict integer literal 0. |
+
+The authenticated TLS client performs standard trust-chain and server-name validation and also matches the provisioner-authorized SPKI pin. Trust anchors and the expected pin are obtained from trusted provisioner configuration; source input, worker output and echoed evidence cannot select the trust root. The manifest binds the expected identity; matching a parsed manifest does not itself authenticate a connection. Renewal to another pinned public key changes the tuple and runtime generation. Missing identity facts or unsupported identity format refuses.
+
+`CredentialReference` contains exactly `id: opaque_ref` and `generation: generation`. These are immutable references to credential issuances; they never carry tokens, keys, passwords or credential material. `GuardIdentity` contains exactly `control_id: UUID`, `revision: generation` and `config_sha256: sha256`. `SubstrateIdentity` contains exactly `kind: "docker" | "kubernetes"`, `authority_domain_id: UUID`, `launch_identity: opaque_ref` and `launch_config_sha256: sha256`.
+
+`authority_domain_id` identifies the actual provisioner-owned preventive execution domain. The launch reference identifies an immutable, generation-specific Docker launch-policy or Kubernetes template record inside that domain. Names and labels for mutable templates do not satisfy this identity. Guard configuration observations and their digest include that authority domain and all credential-bearing creation paths. An identifier or digest is a binding to verified facts, never evidence by itself that the preventive guard is active or inaccessible to ordinary identities.
+
+## Runtime manifest v1
+
+<!-- @spec PROTECTED-HOOK-LANE-2 -->
+The manifest contains exactly:
+
+| Field | Type |
+| --- | --- |
+| `schema_version` | Strict integer literal 1. |
+| `runtime_id` | UUID. |
+| `runtime_generation` | generation. |
+| `broker_identity` | BrokerIdentity. |
+| `worker_image_digest` | oci_digest. |
+| `runner_image_digest` | oci_digest. |
+| `bundle_digest` | Object containing exactly `sha256: sha256` and `object_identity: opaque_ref`. |
+| `execution_config_digest` | sha256. |
+| `qualification_id` | UUID. |
+| `substrate` | SubstrateIdentity. |
+| `guard_identity` | GuardIdentity. |
+| `credential_refs` | Object containing exactly `enqueue`, `worker` and `verifier`, each a CredentialReference. |
+
+The three credential reference IDs are pairwise distinct. Provisioning also proves they do not alias one principal or credential issuance; different reference spelling alone does not establish authority separation. The separate SOURCE-6 source-writer credential is not substituted for enqueue and remains in its own provisioner authority inventory. It is not an additional v1 manifest member.
+
+The bundle object identity identifies an immutable content-addressed or versioned object. Its bytes must match the bound digest when fetched through the qualified artifact path. Registry/artifact retrieval configuration comes from trusted provisioning; the serializer does not fetch any reference. An OCI digest is a content identity, not a mutable image tag or a complete registry locator. Qualification records the trusted pinned image references and architecture-specific mapping from OCI identity to the substrate's actual imageID. Serializer validation alone does not establish that mapping.
+
+## Qualification authorization v1
+
+<!-- @spec PROTECTED-HOOK-LANE-2 -->
+The provisioner-owned qualification authorization record contains exactly `schema_version: 1`, `qualification_id: UUID`, `qualification_generation: generation`, `runtime_id: UUID`, `runtime_generation: generation`, `manifest_digest: sha256`, `broker_identity: BrokerIdentity`, `execution_config_digest: sha256`, `guard_identity: GuardIdentity` and `measurement_record_id: opaque_ref`.
+
+The runtime ID/generation, manifest digest, qualification ID, broker identity and execution/guard identities match the immutable manifest exactly. The provisioner assigns a never-reused qualification authorization generation; readiness binds it. The immutable measurement record contains the actual qualified artifact tuple and enforcement observations. An old measurement may be historical input to a new authorization, but cannot authorize a new live broker run_id without the runtime epoch and source-floor recovery already required by SOURCE-7 and LANE-5. Application identities cannot create or overwrite this authorization.
+
+## Readiness evidence v1
+
+<!-- @spec PROTECTED-HOOK-LANE-2 -->
+Readiness contains exactly `schema_version: 1`, `manifest_digest: sha256`, `runtime_id: UUID`, `runtime_generation: generation`, `qualification_id: UUID`, `qualification_generation: generation`, `broker_identity: BrokerIdentity`, `guard_identity: GuardIdentity`, `verifier_identity: CredentialReference`, `issued_at_ms: millisecond`, `expires_at_ms: millisecond` and `measurement_record_id: opaque_ref`.
+
+Manifest/runtime/qualification/broker/guard fields match the selected manifest and current qualification authorization exactly. The verifier identity matches the manifest's verifier credential reference. The measurement record identifies the immutable readiness measurement of current guard/deployment and qualification facts; it need not be the earlier artifact qualification measurement record, but both are authenticated provisioner/verifier-owned records. Equality of measurement IDs is not substituted for those distinct observations.
+
+Structural validation requires `issued_at_ms < expires_at_ms`. Currentness evaluation requires `issued_at_ms <= broker_now_ms < expires_at_ms` and `expires_at_ms - issued_at_ms <= trusted_max_readiness_ms`, where the maximum is a positive integer supplied by trusted provisioner policy, never by source input or evidence itself. Broker TIME and live INFO identity are read inside the existing admission atomic operation; a parser using local wall time cannot attest readiness. Bounded timestamp conversion is exact within the stated safe-integer range. Any missing, stale, future-issued, mismatched or unsupported record refuses.
+
+Verifier-only broker write authority authenticates readiness under LANE-3. These internal records introduce no application-held issuer key or portable proof-signature scheme. A decoder cannot create evidence authority, validate ACL separation, verify guard operation or reopen admission. Pure serialization tests leave actual TLS/INFO/TIME, role separation, preventive-control negative actions and restart/source-floor recovery qualification open.
+
 ## Broker authority and key partition
 
 <!-- @spec PROTECTED-HOOK-LANE-3 -->
