@@ -350,3 +350,121 @@ def test_waiting_request_reauthenticates_before_fresh_consistency(
                 await observer.dispose()
 
     asyncio.run(asyncio.wait_for(scenario(), 20))
+
+
+def test_canceled_signed_waiter_releases_resources_then_successor_enqueues(
+    ingress_db: None,
+) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        async with ingress() as (app, client, agent):
+            before = await effects(app, agent)
+            observer = create_async_engine(get_settings().database_url, poolclass=NullPool)
+            task = None
+            try:
+                async with app.state.source_gate.hold(uuid.UUID(agent)):
+                    task = asyncio.create_task(
+                        client.post(
+                            f"/hooks/{agent}/{HOOK}",
+                            content=BODY,
+                            headers=signed_headers(secret(agent), delivery="canceled-delivery"),
+                        )
+                    )
+                    await wait_for_advisory(observer)
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                    assert app.state.source_gate.engine.pool.checkedout() == 1
+                    assert app.state.engine.pool.checkedout() == 0
+                    assert await effects(app, agent) == before
+                response = await client.post(
+                    f"/hooks/{agent}/{HOOK}",
+                    content=BODY,
+                    headers=signed_headers(secret(agent), delivery="successor-delivery"),
+                )
+                assert response.status_code == 200, response.text
+                assert not response.json()["duplicate"]
+                assert await app.state.valkey.xlen(get_settings().runs_stream) == 1
+                assert app.state.source_gate.engine.pool.checkedout() == 0
+            finally:
+                if task is not None and not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                await observer.dispose()
+
+    asyncio.run(asyncio.wait_for(scenario(), 20))
+
+
+def test_actual_gate_loss_during_routing_refuses_before_delivery_claim(ingress_db: None) -> None:
+    """Pre-effect proof only, @spec PROTECTED-HOOK-SOURCE-2."""
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        async with ingress() as (app, client, agent):
+            before = await effects(app, agent)
+            observer = create_async_engine(get_settings().database_url, poolclass=NullPool)
+            task = None
+            try:
+                async with observer.connect() as blocker:
+                    transaction = await blocker.begin()
+                    try:
+                        async with app.state.source_gate.hold(uuid.UUID(agent)):
+                            task = asyncio.create_task(
+                                client.post(
+                                    f"/hooks/{agent}/{HOOK}",
+                                    content=BODY,
+                                    headers=signed_headers(
+                                        secret(agent), delivery="terminated-delivery"
+                                    ),
+                                )
+                            )
+                            await wait_for_advisory(observer)
+                            # Preauth has released its read transaction. The table
+                            # lock now stops a later real post-auth routing SELECT.
+                            await blocker.execute(
+                                text("LOCK TABLE curie.agent_channels IN ACCESS EXCLUSIVE MODE")
+                            )
+                        async with asyncio.timeout(5):
+                            while True:
+                                async with observer.connect() as conn:
+                                    relation_wait = await conn.scalar(
+                                        text(
+                                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                                            "WHERE datname=current_database() "
+                                            "AND wait_event='relation')"
+                                        )
+                                    )
+                                if relation_wait:
+                                    break
+                                await asyncio.sleep(0.01)
+                        assert not task.done()
+                        async with observer.connect() as conn:
+                            gate_pid = await conn.scalar(
+                                text(
+                                    "SELECT l.pid FROM pg_locks l "
+                                    "JOIN pg_database d ON d.oid=l.database "
+                                    "WHERE l.locktype='advisory' AND l.granted "
+                                    "AND d.datname=current_database()"
+                                )
+                            )
+                            assert gate_pid is not None
+                            assert await conn.scalar(
+                                text("SELECT pg_terminate_backend(:pid)"), {"pid": gate_pid}
+                            )
+                        await transaction.commit()
+                        response = await asyncio.wait_for(task, 5)
+                        assert response.status_code == 503, response.text
+                        assert response.json()["detail"] == "authority_unavailable"
+                        assert await effects(app, agent) == before
+                    finally:
+                        if transaction.is_active:
+                            await transaction.rollback()
+            finally:
+                if task is not None and not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                await observer.dispose()
+
+    asyncio.run(asyncio.wait_for(scenario(), 20))
