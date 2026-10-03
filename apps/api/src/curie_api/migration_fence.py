@@ -249,7 +249,7 @@ def _blockers(conn: Connection, own_pid: int | None) -> str:
     )
     try:
         rows = [row for row in conn.execute(query).all() if row.pid != own_pid]
-    except Exception:  # pragma: no cover - diagnostics must never mask the refusal
+    except Exception:  # noqa: BLE001 - pragma: no cover - diagnostics must never mask the refusal
         return "the holder could not be read from pg_locks"
     if not rows:
         return "no other session held either table when the fence was attempted"
@@ -276,7 +276,7 @@ def fence_identity_tables(conn: Connection, *, lock_timeout_ms: int | None = Non
     own_pid: int | None = None
     try:
         own_pid = conn.execute(sa.text("SELECT pg_backend_pid()")).scalar_one()
-    except Exception:  # pragma: no cover - only affects the diagnostic filter
+    except Exception:  # noqa: BLE001 - pragma: no cover - only affects the diagnostic filter
         own_pid = None
 
     schema = _schema()

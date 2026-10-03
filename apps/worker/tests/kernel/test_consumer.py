@@ -4349,7 +4349,7 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
                         )
                         if not in_requests and not in_flight:
                             violations.append(name)
-                    except Exception as exc:  # never raise inside the spy
+                    except Exception as exc:  # noqa: BLE001 - never raise inside the spy
                         observer_errors.append(f"{name}: {exc!r}")
                 return result
 

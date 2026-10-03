@@ -389,7 +389,7 @@ def test_e2e_resilience(
         for key in list(claimed):
             try:
                 substrate.release(key)
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 pass
 
 

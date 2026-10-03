@@ -1525,7 +1525,7 @@ def test_cluster_message_publication_card_consumer_is_delivered_or_bounded(
                     if not await reconciler.deliver_pending_card():
                         break
                     raised.append(None)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                     raised.append(type(exc).__name__)
         finally:
             await sink.aclose()

@@ -235,7 +235,7 @@ target-version = "py313"
 extend-exclude = ["prototypes", "runner/tests/fixtures/repo_toolchain"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = ["E", "F", "I", "UP", "B", "BLE"]
 
 [tool.ruff.lint.per-file-ignores]
 # The committed doclint test suite is frozen (issue #452) and groups its imports

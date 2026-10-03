@@ -1394,9 +1394,8 @@ def test_claim_latency_log_line_is_unchanged(request: pytest.FixtureRequest) -> 
 
     from pathlib import Path
 
-    kernel_source = (
-        Path(__file__).resolve().parents[2] / "src" / "curie_worker" / "kernel.py"
-    ).read_text()
+    kernel_dir = Path(__file__).resolve().parents[2] / "src" / "curie_worker" / "kernel"
+    kernel_source = "\n".join(path.read_text() for path in sorted(kernel_dir.glob("*.py")))
     line = 'logger.info("claim latency for %s: %d ms", thread_key, claim_ms)'
     assert kernel_source.count(line) == 1, (
         "AC 6 is a no-change assertion: the claim-latency log line must stay "

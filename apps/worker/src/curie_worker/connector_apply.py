@@ -106,7 +106,7 @@ def execute(
         try:
             client.apply(namespace, obj)
             report.applied.append((kind, name))
-        except Exception as exc:  # cluster errors are data here, not control flow
+        except Exception as exc:  # noqa: BLE001 - cluster errors are data here, not control flow
             report.failures.append((kind, name, str(exc)))
 
     # Only after every apply has been attempted. A failure above leaves extra
@@ -126,7 +126,7 @@ def execute(
             client.delete(namespace, kind, name)
             report.deleted.append((kind, name))
             logger.info("connector removed agent=%s kind=%s name=%s", agent, kind, name)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - existing broad catch retained
             # Keep going: one undeletable object must not strand the others.
             report.failures.append((kind, name, str(exc)))
 

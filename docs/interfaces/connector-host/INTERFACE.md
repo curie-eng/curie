@@ -203,7 +203,7 @@ with no public key renders no proxy, and the network policy is then the whole
 of the check again. A runner booted by a worker that held no key carries no
 token, and every proxied connector refuses its calls until the next turn on its
 thread that a worker holding the key takes, which claims a fresh one
-(`apps/worker/src/curie_worker/kernel.py::_boots_differently`). The minting
+(`apps/worker/src/curie_worker/kernel/claim.py::_boots_differently`). The minting
 worker and the proxy ship in the same release, so during the upgrade that gives
 an install its key this covers every runner from before it and any runner a
 worker pod the roll has not replaced yet boots; `charts/curie/README.md` says

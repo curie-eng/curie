@@ -110,7 +110,7 @@ class StreamRetention:
                 trimmed[stream] = await trim_settled(
                     self._redis, stream, min_age_s=self.min_age_s
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 logger.warning(
                     "stream retention pass failed on %s (%s: %s); retrying next tick",
                     stream,

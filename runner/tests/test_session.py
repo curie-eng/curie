@@ -1296,7 +1296,7 @@ def _exercise_timeout_interrupt_failure(
             with timeout_scope:
                 try:
                     await runner.timeout(first_epoch)
-                except BaseException as exc:
+                except BaseException as exc:  # noqa: BLE001 - existing broad catch retained
                     timeout_errors.append(exc)
             timeout_done.set()
 

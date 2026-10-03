@@ -309,7 +309,7 @@ def _bounded_provider_call(provider: TracerProvider, method: str, timeout_millis
                 function(timeout_millis=timeout_millis) if method == "force_flush" else function()
             )
             succeeded = result is not False
-        except BaseException:
+        except BaseException:  # noqa: BLE001 - existing broad catch retained
             succeeded = False
         finally:
             complete.set()

@@ -1291,7 +1291,7 @@ class WorkspacePreparer:
             if object_key is not None:
                 try:
                     self.objects.delete(object_key)
-                except Exception:
+                except Exception:  # noqa: BLE001 - existing broad catch retained
                     pass
             raise
         finally:
@@ -1841,7 +1841,7 @@ class WorkspaceClaimCoordinator:
                     key,
                     expected_thread_key=ownership.thread_key,
                 )
-            except Exception as read_exc:
+            except Exception as read_exc:  # noqa: BLE001 - existing broad catch retained
                 if self._is_missing_object(read_exc):
                     raise write_exc from None
                 raise _OwnershipWriteUncertain() from write_exc
@@ -1873,7 +1873,7 @@ class WorkspaceClaimCoordinator:
         for key in ownership.stale_object_keys:
             try:
                 self.preparer.objects.delete(key)
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 remaining.append(key)
         if tuple(remaining) != ownership.stale_object_keys:
             self._store_ownership(

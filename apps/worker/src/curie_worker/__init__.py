@@ -9,7 +9,9 @@ side-effects with human escalation, and crash-recovery reclaim. G1 owns the
 from .binding import BindingResolver, ResolvedDeployment
 from .config import WorkerConfig
 from .consumer import Consumer
-from .kernel import RETRYABLE_CLASSIFICATIONS, Kernel, TurnOutcome
+from .kernel.constants import RETRYABLE_CLASSIFICATIONS
+from .kernel.core import Kernel
+from .kernel.failures import TurnOutcome
 from .killswitch import KillSwitch
 from .markers import CompletionRecord, Markers
 from .reply_sink import (

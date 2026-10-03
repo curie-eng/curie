@@ -318,7 +318,7 @@ The pieces, cited:
   - `XADD curie:runs` at [`apps/dispatcher/src/curie_dispatcher/queue.py::enqueue`](apps/dispatcher/src/curie_dispatcher/queue.py)
 
   The Socket Mode handler is at [`apps/dispatcher/src/curie_dispatcher/app.py::SocketModeConnection`](apps/dispatcher/src/curie_dispatcher/app.py). The stream name is configured on [`apps/dispatcher/src/curie_dispatcher/config.py::DispatcherConfig`](apps/dispatcher/src/curie_dispatcher/config.py) (default `curie:runs`), and the payload model is the channel-neutral [`packages/aci-protocol/src/aci_protocol/turn.py::QueuedTurn`](packages/aci-protocol/src/aci_protocol/turn.py).
-- **The kernel** consumes at [`apps/worker/src/curie_worker/consumer.py::Consumer.run`](apps/worker/src/curie_worker/consumer.py) and processes at [`apps/worker/src/curie_worker/kernel.py::Kernel.process_event`](apps/worker/src/curie_worker/kernel.py). It talks to the runner over `POST /v1/event`, `/v1/steer`, `/v1/interrupt` ([`apps/worker/src/curie_worker/runner_client.py::RunnerClient`](apps/worker/src/curie_worker/runner_client.py)). These are the same routes the runner serves at [`runner/src/curie_runner/server.py::create_app`](runner/src/curie_runner/server.py).
+- **The kernel** consumes at [`apps/worker/src/curie_worker/consumer.py::Consumer.run`](apps/worker/src/curie_worker/consumer.py) and processes at [`apps/worker/src/curie_worker/kernel/core.py::Kernel.process_event`](apps/worker/src/curie_worker/kernel/core.py). It talks to the runner over `POST /v1/event`, `/v1/steer`, `/v1/interrupt` ([`apps/worker/src/curie_worker/runner_client.py::RunnerClient`](apps/worker/src/curie_worker/runner_client.py)). These are the same routes the runner serves at [`runner/src/curie_runner/server.py::create_app`](runner/src/curie_runner/server.py).
 - **Deployment binding**: a run resolves its agent, version, and `bundle_ref` by exact-match on the required `(kind, address)` channel-routing pair against the active deployment, joining `agents` -> `agent_channels` -> `deployments` -> `agent_versions` ([`apps/worker/src/curie_worker/binding.py::BindingResolver`](apps/worker/src/curie_worker/binding.py)). Neither half has a fallback: the same address may be bound under different kinds. This is how one worker serves many agents: the routing pair selects the bundle.
 
 ### The four kernel invariants
@@ -326,8 +326,8 @@ The pieces, cited:
 Each has an integration test under `apps/worker/tests/`:
 
 1. **One live session per thread.** A Valkey thread lock (`SET NX PX`) is the routing CAS (compare-and-swap) ([`apps/worker/src/curie_worker/threadlock.py::ThreadLock`](apps/worker/src/curie_worker/threadlock.py)).
-2. **The finish race.** A follow-up during a live turn is a steer; if the turn finished first, the runner returns 409 and the kernel opens a fresh turn on the same idle sandbox ([`apps/worker/src/curie_worker/kernel.py::Kernel._route_and_start`](apps/worker/src/curie_worker/kernel.py)).
-3. **No auto-retry after a side-effectful failure.** If a prior attempt flagged a side effect, the kernel escalates to a human instead of retrying ([`apps/worker/src/curie_worker/kernel.py::Kernel.process_event`](apps/worker/src/curie_worker/kernel.py)).
+2. **The finish race.** A follow-up during a live turn is a steer; if the turn finished first, the runner returns 409 and the kernel opens a fresh turn on the same idle sandbox ([`apps/worker/src/curie_worker/kernel/core.py::Kernel._route_and_start`](apps/worker/src/curie_worker/kernel/core.py)).
+3. **No auto-retry after a side-effectful failure.** If a prior attempt flagged a side effect, the kernel escalates to a human instead of retrying ([`apps/worker/src/curie_worker/kernel/core.py::Kernel.process_event`](apps/worker/src/curie_worker/kernel/core.py)).
 4. **Crash recovery.** A capable dead consumer's pending entries are transferred
    after sustained renewable-lease absence, with one Valkey arbitration lease
    preventing replacement replicas from racing through the delivery budget;
@@ -350,9 +350,9 @@ for a killed agent
 A turn does not always terminate in an answer. When a gate fires, the turn
 terminates `AWAITING_APPROVAL`. The kernel persists a durable approval record,
 then suspends the session until a human resolves it
-([`apps/worker/src/curie_worker/kernel.py::Kernel.process_event`](apps/worker/src/curie_worker/kernel.py),
+([`apps/worker/src/curie_worker/kernel/core.py::Kernel.process_event`](apps/worker/src/curie_worker/kernel/core.py),
 which calls
-[`apps/worker/src/curie_worker/kernel.py::Kernel._pause_for_approval`](apps/worker/src/curie_worker/kernel.py); ADR-0010,
+[`apps/worker/src/curie_worker/kernel/core.py::Kernel._pause_for_approval`](apps/worker/src/curie_worker/kernel/core.py); ADR-0010,
 [`docs/adr/0010-approval-gates-and-human-in-the-loop.md`](docs/adr/0010-approval-gates-and-human-in-the-loop.md)).
 This is the governance story, and it is load-bearing: it is why an agent can hold
 a side-effectful tool call rather than firing it. The user-facing walkthrough of

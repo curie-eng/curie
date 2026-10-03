@@ -615,7 +615,7 @@ class GitHubReviewReconciler:
                         )
                     if "-" not in receipt or not all(p.isdigit() for p in receipt.split("-")):
                         raise RuntimeError("enqueue receipt unavailable")
-                except Exception:
+                except Exception:  # noqa: BLE001 - existing broad catch retained
                     row.error_code = "enqueue_unavailable"
                     row.next_attempt_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(
                         seconds=min(300, 5 * 2 ** (row.enqueue_attempts - 1))
@@ -860,7 +860,7 @@ class GitHubReviewReconciler:
                 await self.reconcile_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 logger.warning("GitHub feedback outbox pass failed; durable rows retained")
             await asyncio.sleep(self._settings.github_review_reconciler_interval_s)
 

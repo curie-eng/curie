@@ -622,7 +622,7 @@ async def ingest_hook(
                             ),
                             transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
                         )
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                         enqueue_error = exc
                         span.set_status(StatusCode.ERROR)
                         span.add_event("queue.enqueue.failed", {"outcome": "failure"})

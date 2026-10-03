@@ -259,8 +259,9 @@ def test_the_kernel_source_carries_no_kind_branch() -> None:
     # regression it guards is textual: a ``kind ==`` re-appearing in the kernel
     # is the seam leaking back upward, and it would pass every behavioral test
     # that only ever exercises one kind.
-    source = (Path(__file__).resolve().parents[2] / "src" / "curie_worker" / "kernel.py").read_text(
-        encoding="utf-8"
+    kernel_dir = Path(__file__).resolve().parents[2] / "src" / "curie_worker" / "kernel"
+    source = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted(kernel_dir.glob("*.py"))
     )
     assert "kind ==" not in source
     assert '== "slack"' not in source

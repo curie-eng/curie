@@ -309,7 +309,7 @@ class DeployNoticeQueue:
                         _DEDUP_TTL_SECONDS,
                         row.payload,
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001 - existing broad catch retained
                     logger.warning("deploy notice outbox enqueue deferred; pending row retained")
                     break
                 row.enqueued_at = datetime.now(UTC)

@@ -190,7 +190,7 @@ class _ValkeyGrantStore:
     def spend(self, jti: str, ttl: int) -> bool:
         try:
             return _set_nx_ex(self._url, f"connector-grant:{jti}", max(ttl, 1))
-        except Exception:
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             logger.warning("connector grant spend failed")
             return False
 
@@ -365,7 +365,7 @@ def _grant_spent(config: ProxyConfig, grant: caller.Grant, now: int) -> bool:
         return False
     try:
         return bool(store.spend(grant.jti, max(grant.exp - now, 1)))
-    except Exception:
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         logger.warning("connector grant spend failed")
         return False
 

@@ -484,7 +484,7 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
 
     try:
         parsed = ConnectorsFile.model_validate(data)
-    except Exception as exc:  # pydantic ValidationError -- surface it verbatim
+    except Exception as exc:  # noqa: BLE001 - pydantic ValidationError -- surface it verbatim
         return None, [("connectors.invalid", str(exc)[:400])]
 
     hosted = {name for name, spec in parsed.connectors.items() if spec.is_hosted}

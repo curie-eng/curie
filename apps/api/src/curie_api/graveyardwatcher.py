@@ -113,7 +113,7 @@ class GraveyardWatcher:
                     await self.scan_once()
                 except asyncio.CancelledError:
                     raise
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                     error = exc
                     if hasattr(span, "set_status"):
                         span.set_status(StatusCode.ERROR)

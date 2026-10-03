@@ -672,7 +672,7 @@ async def probe_mcp_tool_capability(
                         reason="probe_misconfigured",
                     )
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - existing broad catch retained
             failures.append(name)
             logger.warning(
                 "MCP tool-capability probe failed server=%s; keeping approval tool: %s",

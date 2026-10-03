@@ -34,7 +34,7 @@ def _stack_up() -> bool:
     try:
         httpx.get(f"{LANGFUSE_HOST}/api/public/health", timeout=2.0).raise_for_status()
         httpx.get(COLLECTOR_PROBE, timeout=2.0)
-    except Exception:
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         return False
     return True
 

@@ -68,7 +68,7 @@ async def observe_pending_approvals(
 
     try:
         count, oldest = await crud.pending_approval_inventory(session)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         logger.warning("pending approval telemetry observation failed (%s)", type(exc).__name__)
         return
     observed_at = now or datetime.now(UTC).replace(tzinfo=None)
@@ -250,7 +250,7 @@ async def run_expiry_sweeper(
                         - timedelta(seconds=publication_patch_retention_seconds),
                         limit=100,
                     )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)

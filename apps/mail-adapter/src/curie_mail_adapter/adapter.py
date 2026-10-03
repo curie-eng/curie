@@ -377,7 +377,7 @@ class MailAdapter:
                 continue
             try:
                 self.handle_inbound(message)
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 logger.error(
                     "poll: handling correlation=%s failed unexpectedly",
                     _correlation(message_id),
@@ -440,7 +440,7 @@ class MailAdapter:
                     self.handle_inbound(pending["summary"])
                 elif pending["turn"] is not None:
                     self._deliver_turn(pending["message_id"], pending["turn"])
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 logger.error(
                     "poll: retrying correlation=%s failed unexpectedly",
                     _correlation(pending["message_id"]),

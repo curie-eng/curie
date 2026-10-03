@@ -115,7 +115,7 @@ class PublicationPrecheck:
                     call.refusal = await self._compare(context, tool_input)
             except _MalformedPublication as exc:
                 call.malformed = exc
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 # Never include a transport diagnostic containing the endpoint
                 # or its credential in model text, transcripts or logs.
                 call.refusal = _UNAVAILABLE
@@ -156,7 +156,7 @@ class PublicationPrecheck:
             snapshot = await anyio.to_thread.run_sync(
                 capture_workspace_snapshot, self._workspace, abandon_on_cancel=True
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             return (
                 "precheck_unavailable: The workspace snapshot could not be captured. "
                 "Correct the working tree and retry."

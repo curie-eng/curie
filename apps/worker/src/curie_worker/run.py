@@ -54,7 +54,8 @@ from .deploy_notice import DeployNoticeConsumer
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
-from .kernel import Kernel, drain_pending_memory_closes
+from .kernel.core import Kernel
+from .kernel.memory import drain_pending_memory_closes
 from .killswitch import KillSwitch
 from .markers import Markers
 from .progress import ProgressStore

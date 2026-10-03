@@ -179,7 +179,7 @@ async def github_webhook(
                     traceparent=request.headers.get("traceparent"),
                     settings=settings,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 # Without Valkey the hold cannot be durable; degrade to the
                 # pre-#2962 refusal rather than acknowledge a lost review.
                 logger.warning("GitHub review hold unavailable; refusing held feedback")

@@ -369,7 +369,7 @@ def _slack_response_field(response: object, field: str) -> object:
         return None
     try:
         return getter(field)
-    except Exception:
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         return None
 
 
@@ -519,7 +519,7 @@ def check_slack_channel_capabilities(
                             response.json(),
                             frozenset(identity.name for identity in declared),
                         )
-                    except Exception:
+                    except Exception:  # noqa: BLE001 - existing broad catch retained
                         raise SlackChannelPreflightError(
                             _AGENT_DISCOVERY_RESPONSE_SHAPE_MESSAGE
                         ) from None
@@ -532,7 +532,7 @@ def check_slack_channel_capabilities(
                 )
             except SlackChannelPreflightError:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 # Provider bodies, exception messages, and request metadata are
                 # deliberately discarded at this redaction boundary.
                 discovery_failure_message = _AGENT_DISCOVERY_CONNECTIVITY_MESSAGE
@@ -587,7 +587,7 @@ def check_slack_channel_capabilities(
             except FutureTimeoutError:
                 future.cancel()
                 outcomes[name] = SlackChannelPreflightError(_SLACK_CAPABILITY_DEADLINE_MESSAGE)
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 # Redaction boundary, as everywhere in this module: the
                 # exception's text can carry provider bodies.
                 outcomes[name] = SlackChannelPreflightError(_IDENTITY_PROBE_FAULT_MESSAGE)
@@ -655,7 +655,7 @@ def _probe_identity(
                 _MISSING_CHANNELS_READ_MESSAGE
             ) from None
         capability_status = "unverified"
-    except Exception:
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         capability_status = "unverified"
     else:
         if not _is_conversations_list_success(capability_response):
@@ -696,7 +696,7 @@ def _probe_identity(
             files_status = "missing-scope"
         else:
             files_status = "unverified"
-    except Exception:
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         # Every other outcome stays nondefinitive, exactly as the destination
         # loop's are: a rate limit, a transport fault, an org-token refusal, or
         # an injected seam that predates this probe must not crash-loop a stack
@@ -724,7 +724,7 @@ def _probe_identity(
         except SlackApiError:
             unverified += 1
             continue
-        except Exception:
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             unverified += 1
             continue
 
@@ -745,7 +745,7 @@ def _probe_identity(
         if deadline - monotonic() > 0:
             try:
                 bot_ids = bot_ids_from_auth_test(capability_client.auth_test())
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 bot_ids = None
         if bot_ids is None:
             logger.warning(

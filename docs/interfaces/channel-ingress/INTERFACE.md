@@ -372,7 +372,7 @@ incomplete adapter coverage and conformance.
   itself give other kinds a registered address shape.
 - **Fixed (#3678, ADR-0153) — attachment resolution.** The kernel hands the
   turn's reply handle to the lane
-  (`apps/worker/src/curie_worker/kernel.py::Kernel._resolve_attachments`), and the
+  (`apps/worker/src/curie_worker/kernel/core.py::Kernel._resolve_attachments`), and the
   lane picks the file port from its kind
   (`apps/worker/src/curie_worker/attachments.py::AttachmentCoordinator`). Slack keeps
   `apps/worker/src/curie_worker/attachments.py::SlackFileClient` (`files.info` /

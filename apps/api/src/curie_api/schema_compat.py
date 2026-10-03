@@ -152,7 +152,7 @@ def _walk_down(script: ScriptDirectory, revision: str) -> list[str]:
         chain.append(rev)
         try:
             rec = script.get_revision(rev)
-        except Exception:
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             break
         down = rec.down_revision
         next_rev: str | None
@@ -192,7 +192,7 @@ def can_serve(
     if script is None:
         try:
             script = _script(_alembic_config())
-        except Exception:
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             return False
     return _is_at_or_after(script, current, window.schema_min)
 
@@ -311,7 +311,7 @@ def _pending_from_script(
     lower = current or "base"
     try:
         revisions = list(script.iterate_revisions(target_head, lower))
-    except Exception:
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         if current is None:
             return (target_head,)
         return (target_head,)
@@ -372,7 +372,7 @@ def wait_for_schema(*, attempts: int = 60, interval_s: float = 2.0) -> int:
     for attempt in range(1, attempts + 1):
         try:
             last = asyncio.run(current_revision_async())
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - existing broad catch retained
             last = None
             probe = type(exc).__name__
             if attempt == 1:

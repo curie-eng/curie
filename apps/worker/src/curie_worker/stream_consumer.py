@@ -552,7 +552,7 @@ class StreamConsumer:
                     del tasks[name]
                     try:
                         task.result()
-                    except BaseException as exc:
+                    except BaseException as exc:  # noqa: BLE001 - existing broad catch retained
                         failure = exc
                         break
                     if name == "bootstrap":
@@ -1168,7 +1168,7 @@ class StreamConsumer:
                 # as a failed dead-letter, not swallowed into a half-settled
                 # entry. The XADD-before-XACK ordering above is untouched.
                 await self._settle_delivery(entry_id)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)

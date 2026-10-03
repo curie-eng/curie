@@ -70,7 +70,8 @@ from .completion_health import observe_completion_outbox
 from .config import WorkerConfig
 from .consumer_liveness import ConsumerLivenessStore
 from .delivery_lease import DeliveryLease, DeliveryLeaseStore, LeaseLostError
-from .kernel import Kernel, _thread_key_for
+from .kernel.core import Kernel
+from .kernel.routing import _thread_key_for
 from .markers import Markers
 from .progress import (
     ProgressStore,
@@ -895,7 +896,7 @@ class Consumer(StreamConsumer):
                 if name == self._config.consumer_group:
                     lag = float(group.get("lag") or 0)
                     break
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - existing broad catch retained
             logger.warning("queue telemetry observation failed (%s)", type(exc).__name__)
             return
 

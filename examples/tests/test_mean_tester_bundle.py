@@ -229,9 +229,10 @@ def test_every_platform_text_the_skill_judges_by_still_exists_in_the_platform():
         for path in (
             "apps/dispatcher/src/curie_dispatcher/config.py",
             "apps/worker/src/curie_worker/config.py",
-            "apps/worker/src/curie_worker/kernel.py",
         )
     )
+    kernel_dir = REPO / "apps/worker/src/curie_worker/kernel"
+    sources += "\n" + "\n".join(path.read_text() for path in sorted(kernel_dir.glob("*.py")))
     joined = re.sub(r'"\s*\n\s*"', "", sources)  # join implicitly concatenated literals
     texts = _platform_texts()
     assert len(texts) >= 6

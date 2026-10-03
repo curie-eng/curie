@@ -169,7 +169,7 @@ class ResumeReconciler:
         ) as span:
             try:
                 result = await self._reconcile_once()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
