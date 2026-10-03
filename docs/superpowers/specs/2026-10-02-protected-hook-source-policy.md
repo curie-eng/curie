@@ -90,6 +90,21 @@ A lock waiter must not retain a work/claim connection. Pass an acquired gate
 context to inner helpers; never reacquire the same agent lock on another
 connection. Close the outer transaction on every error or cancellation path.
 
+A scheduled producer's explicit context belongs to exactly its provided guard,
+agent, exact raw hook name, current task and active outer scope. Validate that
+provenance at every effect entry; another guard's context is not authority even
+for the same agent and name. The guard uses the producer's actual work engine
+and a distinct same-DSN gate pool. No missing guard/context grants ordinary
+admission, and no ambient context or implicit replacement pool supplies one.
+
+Scheduled target discovery is a read-only hint. After acquiring the source gate,
+reload the currently preferred deployment using existing precedence, then its
+bundle and exact declaration before planning any effect. Refresh budget,
+control, binding and kill decisions under that scope. A removed declaration
+has no effect. Retain the existing immutable-version bundle cache key.
+Report durable outcome counts and metrics only after their containing work
+transaction commits; rolled-back reclamation is not a committed outcome.
+
 Manual and scheduled cron producers validate the acquired gate context and
 probe its held connection after any blocking inner hook lock and immediately
 before each hook-run or schedule-control INSERT or UPDATE and each ordinary
