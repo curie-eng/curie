@@ -426,3 +426,73 @@ def test_exhaustion_refuses_fresh_allocation_but_not_current_replay(
 
     asyncio.run(asyncio.wait_for(scenario(), 10))
     assert state(admin_agent) == before
+
+
+@pytest.mark.parametrize("change", ["replace", "delete"])
+def test_mutation_captures_target_before_waiting_on_gate(
+    admin_agent: uuid.UUID, change: str
+) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2/3/10."""
+    module = admin_module()
+    before = state(admin_agent)
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2/3/10."""
+        async with service(module) as (admin, gate, _work):
+            target = dict(PROTECTED)
+            observer = create_async_engine(get_settings().database_url)
+            task = None
+            try:
+                async with SourceGate(gate).hold(admin_agent):
+                    task = asyncio.create_task(
+                        admin.mutate(str(admin_agent), HOOK, "0", str(uuid.uuid4()), target)
+                    )
+                    async with asyncio.timeout(5):
+                        while True:
+                            async with observer.connect() as conn:
+                                waiting = await conn.scalar(
+                                    text(
+                                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                                        "WHERE datname=current_database() "
+                                        "AND wait_event='advisory')"
+                                    )
+                                )
+                            if waiting:
+                                break
+                            await asyncio.sleep(0.01)
+                    assert not task.done()
+                    if change == "replace":
+                        target["mode"] = "secret-input"
+                        target["runtime_id"] = "secret-input"
+                    else:
+                        del target["runtime_id"]
+                with pytest.raises(module.SourceAdminError) as caught:
+                    await asyncio.wait_for(task, 5)
+                assert_error(caught.value, 503)
+            finally:
+                if task is not None and not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                await observer.dispose()
+
+    asyncio.run(asyncio.wait_for(scenario(), 12))
+    assert state(admin_agent) == before
+
+
+def test_constructor_refuses_gate_pool_and_alias_before_checkout(admin_agent: uuid.UUID) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2/3."""
+    module = admin_module()
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2/3."""
+        async with service(module) as (_admin, gate, _work):
+            alias = gate.execution_options(isolation_level="READ COMMITTED")
+            assert alias.pool is gate.pool
+            for work_engine in (gate, alias):
+                assert gate.pool.checkedout() == 0
+                with pytest.raises(module.SourceAdminError) as caught:
+                    module.SourceAdminService(SourceGate(gate), work_engine)
+                assert_error(caught.value, 503)
+                assert gate.pool.checkedout() == 0
+
+    asyncio.run(asyncio.wait_for(scenario(), 10))
