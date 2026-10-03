@@ -423,3 +423,73 @@ def test_canceled_gate_waiter_releases_for_ordinary_successor(fire_db: None) -> 
                 await observer.dispose()
 
     asyncio.run(asyncio.wait_for(scenario(), 25))
+
+
+def test_gate_loss_during_existing_hook_lock_wait_refuses_before_insert(fire_db: None) -> None:
+    """Exact first-effect boundary, @spec PROTECTED-HOOK-SOURCE-2."""
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        async with fire_app() as (app, client, headers, agent, _version):
+            observer = create_async_engine(get_settings().database_url, poolclass=NullPool)
+            task = None
+            before = await state(app, agent)
+            try:
+                async with observer.begin() as blocker:
+                    await blocker.execute(
+                        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                        {"key": agent + ":" + HOOK},
+                    )
+                    blocker_pid = await blocker.scalar(text("SELECT pg_backend_pid()"))
+                    task = asyncio.create_task(fire(client, headers, agent, HOOK))
+                    async with asyncio.timeout(5):
+                        while True:
+                            async with observer.connect() as conn:
+                                waiting = await conn.scalar(
+                                    text(
+                                        "SELECT EXISTS (SELECT 1 FROM pg_locks l "
+                                        "JOIN pg_database d ON d.oid=l.database "
+                                        "WHERE d.datname=current_database() "
+                                        "AND l.locktype='advisory' AND NOT l.granted "
+                                        "AND l.classid::bigint="
+                                        "((hashtextextended(:key,0)>>32)&4294967295) "
+                                        "AND l.objid::bigint="
+                                        "(hashtextextended(:key,0)&4294967295) "
+                                        "AND l.objsubid=1 AND l.pid<>:holder)"
+                                    ),
+                                    {"key": agent + ":" + HOOK, "holder": blocker_pid},
+                                )
+                                if waiting:
+                                    gate_pid = await conn.scalar(
+                                        text(
+                                            "SELECT l.pid FROM pg_locks l "
+                                            "JOIN pg_database d ON d.oid=l.database "
+                                            "WHERE d.datname=current_database() "
+                                            "AND l.locktype='advisory' AND l.granted "
+                                            "AND l.classid::bigint="
+                                            "((hashtextextended(:key,0)>>32)&4294967295) "
+                                            "AND l.objid::bigint="
+                                            "(hashtextextended(:key,0)&4294967295) "
+                                            "AND l.objsubid=1 AND l.pid<>:holder"
+                                        ),
+                                        {"key": "hook-source:" + agent, "holder": blocker_pid},
+                                    )
+                                    assert gate_pid is not None
+                                    assert gate_pid != blocker_pid
+                                    assert not task.done()
+                                    assert await conn.scalar(
+                                        text("SELECT pg_terminate_backend(:pid)"),
+                                        {"pid": gate_pid},
+                                    )
+                                    break
+                            await asyncio.sleep(0.01)
+                response = await asyncio.wait_for(task, 5)
+                assert response.status_code == 503, response.text
+                assert await state(app, agent) == before
+            finally:
+                if task is not None and not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                await observer.dispose()
+
+    asyncio.run(asyncio.wait_for(scenario(), 25))
