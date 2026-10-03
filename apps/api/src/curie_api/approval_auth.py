@@ -17,7 +17,9 @@ from urllib.parse import urlsplit
 
 from fastapi import Cookie, Depends, Header, HTTPException, Request, Response, status
 
-from . import adapter_principal, approval_principal, crud
+from curie_api.crud import console as crud_console
+
+from . import adapter_principal, approval_principal
 from .auth import require_api_key
 from .config import get_settings
 from .deps import SessionDep
@@ -83,7 +85,7 @@ async def authenticate_console_session(
 
     if not token:
         return None
-    row = await crud.live_console_session(session, token)
+    row = await crud_console.live_console_session(session, token)
     if row is None or row.subject is None or not row.subject.strip():
         return None
     return AuthenticatedApprovalPrincipal(

@@ -19,17 +19,19 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from curie_api.github_factory import (
+    IGNORED,
+    Facts,
+    admission_result,
+    delivery_uuid,
+    ignored,
+)
+from curie_api.schemas.deployments import WebhookResult
+
 from . import workitem_dispatch
 from .config import Settings
 from .factory_reply_target import feedback_url
-from .github_factory import (
-    _IGNORED,
-    _admission_result,
-    _delivery_uuid,
-    _Facts,
-    _ignored,
-    lock_issue,
-)
+from .github_factory import lock_issue
 from .github_factory_events import mentions_login
 from .github_review_audit import claim_review_delivery, settle_review_delivery
 from .github_review_events import (
@@ -41,14 +43,13 @@ from .github_review_events import (
 from .github_review_store import feedback_provenance
 from .github_review_truth import BoundReviewLineage, verify_feedback_truth
 from .models import ThreadPublicationLineage, WorkItem
-from .schemas import WebhookResult
 from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
 
 _MAX_OBJECTIVE = 65536
 # Payload-shape refusals the review ingress also treats as ignorable.
-_REVIEW_IGNORED = _IGNORED | {
+_REVIEW_IGNORED = IGNORED | {
     "unsupported_action",
     "non_actionable_review",
     "empty_feedback",
@@ -218,7 +219,7 @@ async def admit_parsed_feedback(
     objective = _objective(feedback, settings, work_item.repo_full_name)
     if len(objective) > _MAX_OBJECTIVE:
         raise FeedbackIgnored("feedback_too_large")
-    facts = _Facts(
+    facts = Facts(
         agent_id=work_item.agent_id,
         kind="github",
         address=work_item.repo_full_name,
@@ -232,7 +233,7 @@ async def admit_parsed_feedback(
         request_id=uuid.uuid5(uuid.NAMESPACE_URL, feedback.event_id),
     )
     result = await workitem_dispatch.admit_revision(session, facts)
-    return _admission_result(result, facts.request_id)
+    return admission_result(result, facts.request_id)
 
 
 async def handle_factory_review_delivery(
@@ -247,20 +248,20 @@ async def handle_factory_review_delivery(
 ) -> WebhookResult:
     """Admit, ignore, or refuse one signed review delivery on a factory PR."""
 
-    parsed_delivery = _delivery_uuid(delivery_id)
+    parsed_delivery = delivery_uuid(delivery_id)
     audit, conflict = await claim_review_delivery(
         session, delivery_id=parsed_delivery, event=event, body=body, payload=payload
     )
     if conflict:
         await session.commit()
-        return _ignored("delivery_identity_conflict")
+        return ignored("delivery_identity_conflict")
     if audit.status == "accepted":
         await session.commit()
         return WebhookResult(status="factory_duplicate")
     if audit.status in {"ignored", "rejected"}:
         assert audit.reason is not None
         await session.commit()
-        return _ignored(audit.reason)
+        return ignored(audit.reason)
     try:
         feedback = parse_feedback(
             event, payload, delivery_id, github_html_base=settings.github_html_base
@@ -279,7 +280,7 @@ async def handle_factory_review_delivery(
         settle_review_delivery(audit, disposition, exc.code)
         await session.commit()
         logger.info("factory review delivery ignored: %s", exc.code)
-        return _ignored(exc.code)
+        return ignored(exc.code)
     if outcome.status == "factory_ignored":
         code = outcome.errors[0]["code"] if outcome.errors else "ignored"
         settle_review_delivery(audit, "ignored" if code in _REVIEW_IGNORED else "rejected", code)

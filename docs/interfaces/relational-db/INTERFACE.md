@@ -110,7 +110,7 @@ is a judgement call, not something derivable from the tree.
    sibling `FOR UPDATE SKIP LOCKED` statements in the same module) so concurrent
    workers do not block on one another's in-flight claim. The API uses the same
    clause on other claim paths
-   (`apps/api/src/curie_api/crud.py::claim_resume_row`,
+   (`apps/api/src/curie_api/crud/approvals.py::claim_resume_row`,
    `apps/api/src/curie_api/resumereconciler.py::ResumeReconciler`). A second
    engine that honors the models but not this skip-locked claim would serialize
    those loops.

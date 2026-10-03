@@ -2787,7 +2787,7 @@ def test_ci_detail_shares_the_bounded_credential_slots(
 
     from curie_api import workitem_outcomes
 
-    assert workitem_outcomes._mint_ci_token is not None
+    assert workitem_outcomes.mint_ci_token is not None
     for _ in range(workitem_outcomes.CI_CREDENTIAL_SLOTS + 1):
         failed, _ = _observe_detail(
             monkeypatch, _detail_handler(), creds=_FakeCreds(error=GitHubAppError("boom"))

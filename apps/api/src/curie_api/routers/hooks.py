@@ -73,7 +73,11 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from .. import crud, hook_signing
+from curie_api.crud import channels as crud_channels
+from curie_api.crud import workspaces as crud_workspaces
+from curie_api.graveyardwatcher import text
+
+from .. import hook_signing
 from ..config import get_settings
 from ..delivery import (
     backlog_reservation,
@@ -85,7 +89,6 @@ from ..delivery import (
     take_backlog_slot,
 )
 from ..deps import SessionDep
-from ..graveyardwatcher import _text
 from ..hook_partition import (
     HOOK_NAME,
     PartitionError,
@@ -219,11 +222,11 @@ async def _landed_turn(client: redis.Redis, stream: str, held: str) -> QueuedTur
     _entry_id, fields_raw = entries[0]
     # Keys decode because the API's client is built without `decode_responses`;
     # a `decode_responses=True` client (tests) already hands back str.
-    fields = {_text(name): value for name, value in (fields_raw or {}).items()}
+    fields = {text(name): value for name, value in (fields_raw or {}).items()}
     payload = fields.get(STREAM_PAYLOAD_FIELD)
     if payload is None:
         return None
-    return parse_queued_turn(_text(payload))
+    return parse_queued_turn(text(payload))
 
 
 async def _duplicate_receipt(
@@ -476,7 +479,7 @@ async def ingest_hook(
         # identity for Slack and the adapter slug for any other kind, and an
         # omitted one means what it means to every reader -- the default Slack
         # identity, or the agent's single route on a non-Slack pair.
-        # `crud.matching_bindings` is the one matching rule every reader of a
+        # `crud.channels.matching_bindings` is the one matching rule every reader of a
         # route shares; `agent.channels` is already loaded, so this calls it
         # directly rather than issuing a fresh query.
         if adapter is not None:
@@ -484,7 +487,7 @@ async def ingest_hook(
                 refuse_undeclared(kind, route_identity(kind, adapter))
             except ValueError as exc:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-        matches = crud.matching_bindings(agent.channels, kind, address, adapter)
+        matches = crud_channels.matching_bindings(agent.channels, kind, address, adapter)
         if not matches:
             unbound = "this agent has no binding for the selected kind and address"
             if adapter is not None:
@@ -512,7 +515,7 @@ async def ingest_hook(
 
     thread_id = conversation_id or hook_conversation_id(agent.id, hook, partition)
     if mapping.selects_workspace and mapping.repository is not None:
-        existing = await crud.get_thread_workspace(
+        existing = await crud_workspaces.get_thread_workspace(
             session, agent_id=agent.id, conversation_id=thread_id
         )
         if (
@@ -577,7 +580,7 @@ async def ingest_hook(
                         headers={"Retry-After": str(settings.hook_backlog_window_s)},
                     )
                 if mapping.selects_workspace and mapping.repository is not None:
-                    await crud.select_thread_workspace(
+                    await crud_workspaces.select_thread_workspace(
                         session,
                         agent_id=agent.id,
                         deployment_id=None,
@@ -697,7 +700,7 @@ async def ingest_hook(
                 raise
         held = await client.get(key)
         if held is not None:
-            current = _text(held)
+            current = text(held)
             return await _duplicate_receipt(
                 client, settings.runs_stream, current, response, event_id, tool_access
             )

@@ -3,7 +3,7 @@
 Answers one question: *what credential may this installation use to read
 repository X?* Everything about how that credential is then applied — the
 `x-access-token` basic header, keeping it out of `argv` and out of
-`.git/config` — stays in `gitflow._clone_credential_env`, unchanged.
+`.git/config` — stays in `gitflow.clone_credential_env`, unchanged.
 
 Two paths, in order:
 

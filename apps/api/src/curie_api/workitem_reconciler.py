@@ -23,7 +23,9 @@ from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
-from . import factory_ci, factory_label_reconcile, factory_notices, factory_poll_intake, workitems
+from curie_api.workitems import lifecycle
+
+from . import factory_ci, factory_label_reconcile, factory_notices, factory_poll_intake
 from .config import Settings
 from .models import ExecutionRequest, Publication, WorkItem
 from .workitem_dispatch import (
@@ -170,7 +172,7 @@ class WorkItemReconciler:
 
     async def _expire_waiting(self) -> None:
         async with self._sessionmaker() as session:
-            now = await workitems._database_now(session)
+            now = await lifecycle.database_now(session)
             overdue = (
                 await session.execute(
                     select(
@@ -189,14 +191,14 @@ class WorkItemReconciler:
             ).all()
         for row in overdue:
             async with self._sessionmaker() as session:
-                result = await workitems.expire_waiting(
+                result = await lifecycle.expire_waiting(
                     session,
                     work_item_id=row.work_item_id,
                     request_id=row.id,
                     expected_work_item_version=row.work_item_version,
                     expected_request_version=row.version,
                 )
-            if isinstance(result, workitems.WorkItemOutcome):
+            if isinstance(result, lifecycle.WorkItemOutcome):
                 logger.warning(
                     "work item request %s expired waiting for capacity after %d deferrals",
                     row.id,
@@ -205,7 +207,7 @@ class WorkItemReconciler:
 
     async def _request_deadline_cancellations(self) -> None:
         async with self._sessionmaker() as session:
-            now = await workitems._database_now(session)
+            now = await lifecycle.database_now(session)
             rows = (
                 await session.execute(
                     select(
@@ -224,7 +226,7 @@ class WorkItemReconciler:
             ).all()
         for row in rows:
             async with self._sessionmaker() as session:
-                await workitems.request_execution_deadline_cancellation(
+                await lifecycle.request_execution_deadline_cancellation(
                     session,
                     work_item_id=row.work_item_id,
                     request_id=row.id,
@@ -235,7 +237,7 @@ class WorkItemReconciler:
     async def _request_owner_lost_cancellations(self) -> None:
         ttl = timedelta(seconds=self._settings.work_item_runtime_ttl_seconds)
         async with self._sessionmaker() as session:
-            now = await workitems._database_now(session)
+            now = await lifecycle.database_now(session)
             rows = (
                 await session.execute(
                     select(
@@ -273,7 +275,7 @@ class WorkItemReconciler:
             ).all()
         for row in rows:
             async with self._sessionmaker() as session:
-                await workitems.request_owner_lost_cancellation(
+                await lifecycle.request_owner_lost_cancellation(
                     session,
                     work_item_id=row.work_item_id,
                     request_id=row.id,
@@ -284,7 +286,7 @@ class WorkItemReconciler:
     async def _settle_overdue_cancellations(self) -> None:
         settle_seconds = self._settings.work_item_cancel_settle_seconds
         async with self._sessionmaker() as session:
-            now = await workitems._database_now(session)
+            now = await lifecycle.database_now(session)
             rows = (
                 await session.execute(
                     select(
@@ -310,14 +312,14 @@ class WorkItemReconciler:
             ).all()
         for row in rows:
             async with self._sessionmaker() as session:
-                result = await workitems.settle_overdue_cancellation(
+                result = await lifecycle.settle_overdue_cancellation(
                     session,
                     work_item_id=row.work_item_id,
                     request_id=row.id,
                     expected_request_version=row.version,
                     settle_seconds=settle_seconds,
                 )
-            if isinstance(result, workitems.WorkItemOutcome):
+            if isinstance(result, lifecycle.WorkItemOutcome):
                 logger.warning(
                     "work item request %s cancellation settled after %ds "
                     "without a worker teardown receipt",
@@ -336,8 +338,8 @@ class WorkItemReconciler:
             ).all()
         for work_item_id in ids:
             async with self._sessionmaker() as session:
-                now = await workitems._database_now(session)
-                await workitems.admit_pending_readmit(
+                now = await lifecycle.database_now(session)
+                await lifecycle.admit_pending_readmit(
                     session,
                     work_item_id=work_item_id,
                     wait_deadline=now
@@ -371,8 +373,8 @@ class WorkItemReconciler:
             ).all()
         for work_item_id in queued_ids:
             async with self._sessionmaker() as session:
-                now = await workitems._database_now(session)
-                await workitems.admit_next_revision(
+                now = await lifecycle.database_now(session)
+                await lifecycle.admit_next_revision(
                     session,
                     work_item_id=work_item_id,
                     wait_deadline=now
@@ -399,11 +401,11 @@ class WorkItemReconciler:
             return True
 
         client: httpx.AsyncClient | None = None
-        gated: list[workitems.PublicationSettlement] = []
+        gated: list[lifecycle.PublicationSettlement] = []
         try:
             for _ in range(self._settings.work_item_batch_limit):
                 async with self._sessionmaker() as session:
-                    settlement = await workitems.claim_publication_settlement(
+                    settlement = await lifecycle.claim_publication_settlement(
                         session, exclude=frozenset(skip)
                     )
                     if settlement is None:
@@ -411,7 +413,7 @@ class WorkItemReconciler:
                         break
                     skip.add(settlement.request_id)
                     if settlement.cause != "completed":
-                        await workitems.fail_execution(
+                        await lifecycle.fail_execution(
                             session,
                             work_item_id=settlement.work_item_id,
                             request_id=settlement.request_id,

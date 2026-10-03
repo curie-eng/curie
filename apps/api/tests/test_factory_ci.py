@@ -685,16 +685,16 @@ def test_an_outside_python_layout_never_reports_a_required_python_ci_reason(
 
 
 def test_without_a_policy_no_python_path_is_unselected() -> None:
-    assert factory_ci._unselected_python_path([_OUTSIDE_PATH], None) is None
-    assert factory_ci._unselected_python_path(["examples/coder/foo.py"], None) is None
+    assert factory_ci.unselected_python_path([_OUTSIDE_PATH], None) is None
+    assert factory_ci.unselected_python_path(["examples/coder/foo.py"], None) is None
 
 
 def test_the_curie_policy_still_refuses_an_unselected_path() -> None:
     assert (
-        factory_ci._unselected_python_path(["examples/coder/foo.py"], curie_python_ci())
+        factory_ci.unselected_python_path(["examples/coder/foo.py"], curie_python_ci())
         == "examples/coder/foo.py"
     )
-    assert factory_ci._unselected_python_path([_PYTHON_PATH], curie_python_ci()) is None
+    assert factory_ci.unselected_python_path([_PYTHON_PATH], curie_python_ci()) is None
     verdict = _decide(
         _detail(_actions_run(_PYTHON_AGGREGATE)),
         180,
@@ -710,11 +710,11 @@ def custom_python_ci() -> factory_ci.PythonCiPolicy:
 
 
 def test_a_custom_policy_selects_only_its_paths() -> None:
-    assert factory_ci._unselected_python_path(["src/widget.py"], custom_python_ci()) is None
-    assert factory_ci._unselected_python_path(["srcx/widget.py"], custom_python_ci()) == (
+    assert factory_ci.unselected_python_path(["src/widget.py"], custom_python_ci()) is None
+    assert factory_ci.unselected_python_path(["srcx/widget.py"], custom_python_ci()) == (
         "srcx/widget.py"
     )
-    assert factory_ci._unselected_python_path([_PYTHON_PATH], custom_python_ci()) == _PYTHON_PATH
+    assert factory_ci.unselected_python_path([_PYTHON_PATH], custom_python_ci()) == _PYTHON_PATH
 
 
 def test_a_custom_policy_requires_its_own_check_name() -> None:

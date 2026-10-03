@@ -18,7 +18,16 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from . import crud, factory_base, workitem_dispatch
+from curie_api.crud import channels as crud_channels
+from curie_api.schemas.deployments import WebhookResult
+from curie_api.workitems.lifecycle import (
+    GITHUB_CHANNEL_KIND,
+    WorkItemConflict,
+    WorkItemOutcome,
+    github_reply_route,
+)
+
+from . import factory_base, workitem_dispatch
 from .config import Settings
 from .factory_base import BaseRefusal
 from .factory_notices import mark_status_comment_stale
@@ -43,15 +52,13 @@ from .models import (
     WorkItem,
 )
 from .repo_full_name import repo_url_path
-from .schemas import WebhookResult
 from .workitem_dispatch import DispatchConflict
-from .workitems import GITHUB_CHANNEL_KIND, WorkItemConflict, WorkItemOutcome, github_reply_route
 from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
 
 _CHANNEL_KIND = GITHUB_CHANNEL_KIND
-_IGNORED = {
+IGNORED = {
     "unsupported_action",
     "unsupported_event",
     "ordinary_comment",
@@ -83,7 +90,7 @@ _IGNORED = {
 
 
 @dataclass(frozen=True)
-class _Facts:
+class Facts:
     agent_id: uuid.UUID
     kind: str
     address: str
@@ -109,7 +116,7 @@ class VerifiedIssue:
     repo_path: str
 
 
-def _delivery_uuid(delivery_id: str) -> uuid.UUID:
+def delivery_uuid(delivery_id: str) -> uuid.UUID:
     try:
         delivery = uuid.UUID(delivery_id)
     except (ValueError, TypeError, AttributeError):
@@ -119,7 +126,7 @@ def _delivery_uuid(delivery_id: str) -> uuid.UUID:
     return delivery
 
 
-def _ignored(code: str) -> WebhookResult:
+def ignored(code: str) -> WebhookResult:
     return WebhookResult(status="factory_ignored", errors=[{"code": code}])
 
 
@@ -272,7 +279,7 @@ async def _binding(session: AsyncSession, notice: FactoryNotice) -> AgentChannel
     # `Agent.repo_full_name` join is a CORRECTNESS check (the pair's row
     # belongs to some OTHER agent's repo, e.g. a stale rename), not what
     # narrows multiplicity. `_CHANNEL_KIND` is `GITHUB_CHANNEL_KIND`, never
-    # Slack, and this notice names no adapter, so `crud.matching_bindings`
+    # Slack, and this notice names no adapter, so `crud.channels.matching_bindings`
     # with `adapter=None` keeps every row -- shared with every other reader
     # of a route rather than a fourth copy of the same rule.
     rows = list(
@@ -286,7 +293,7 @@ async def _binding(session: AsyncSession, notice: FactoryNotice) -> AgentChannel
             )
         )
     )
-    matches = crud.matching_bindings(rows, _CHANNEL_KIND, notice.repo_full_name, None)
+    matches = crud_channels.matching_bindings(rows, _CHANNEL_KIND, notice.repo_full_name, None)
     if not matches:
         raise FactoryRefused("binding_missing")
     if len(matches) > 1:
@@ -300,7 +307,7 @@ async def _binding(session: AsyncSession, notice: FactoryNotice) -> AgentChannel
     return matches[0]
 
 
-def _facts(notice: FactoryNotice, binding: AgentChannel, settings: Settings) -> _Facts:
+def _facts(notice: FactoryNotice, binding: AgentChannel, settings: Settings) -> Facts:
     base = settings.github_clone_base.rstrip("/")
     objective = f"{base}/{notice.repo_full_name}/issues/{notice.issue_number}"
     if notice.disposition == "mention":
@@ -308,7 +315,7 @@ def _facts(notice: FactoryNotice, binding: AgentChannel, settings: Settings) -> 
     kind, address, reply_conversation_id = github_reply_route(
         notice.repo_full_name, notice.issue_number
     )
-    return _Facts(
+    return Facts(
         agent_id=binding.agent_id,
         kind=kind,
         address=address,
@@ -335,7 +342,7 @@ async def work_item_for(
     return found
 
 
-def _admission_result(
+def admission_result(
     result: WorkItemOutcome | WorkItemConflict | DispatchConflict,
     request_id: uuid.UUID,
 ) -> WebhookResult:
@@ -348,9 +355,9 @@ def _admission_result(
             return WebhookResult(status="factory_readmit_pending")
         return WebhookResult(status="factory_admitted")
     code = result.code
-    if code in _IGNORED:
-        return _ignored(code)
-    return _ignored(code)
+    if code in IGNORED:
+        return ignored(code)
+    return ignored(code)
 
 
 async def _has_open_pr(session: AsyncSession, item: WorkItem) -> bool:
@@ -452,7 +459,7 @@ async def admit_notice(
             result = await workitem_dispatch.admit_revision(admission, facts)
         else:
             result = await workitem_dispatch.readmit(admission, facts)
-        return _admission_result(result, facts.request_id)
+        return admission_result(result, facts.request_id)
 
 
 async def record_base_label_notice(
@@ -469,7 +476,7 @@ async def record_base_label_notice(
     ):
         raise FactoryRefused("identity_mismatch")
     await _record_label(session, item, verified, settings)
-    return _ignored("base_label_recorded")
+    return ignored("base_label_recorded")
 
 
 async def cancel_notice(session: AsyncSession, notice: FactoryNotice) -> WebhookResult:
@@ -492,14 +499,14 @@ async def _cancel(session: AsyncSession, notice: FactoryNotice) -> WebhookResult
     )
     if isinstance(result, WorkItemConflict) and result.code == "stale_version":
         if result.work_item_version is None:
-            return _ignored("stale_version")
+            return ignored("stale_version")
         result = await workitem_dispatch.cancel(
             session,
             work_item_id=item.id,
             expected_version=result.work_item_version,
         )
     if isinstance(result, WorkItemConflict):
-        return _ignored(result.code)
+        return ignored(result.code)
     if result.replayed:
         return WebhookResult(status="factory_duplicate")
     status = None if result.request is None else result.request.status
@@ -521,7 +528,7 @@ async def _with_label_event(
     webhook header.
     """
 
-    from .factory_label_reconcile import _get_all, _last_label_event, _Unavailable
+    from curie_api.factory_label_reconcile import Unavailable, get_all, last_label_event
 
     try:
         token = await run_in_threadpool(
@@ -537,16 +544,16 @@ async def _with_label_event(
     repo_path = f"/repos/{repo_url_path(notice.repo_full_name)}"
     label = notice.label or settings.github_factory_label
     try:
-        events = await _get_all(
+        events = await get_all(
             client,
             api=api,
             token=token,
             path=f"{repo_path}/issues/{notice.issue_number}/events",
             params={},
         )
-    except _Unavailable:
+    except Unavailable:
         raise FeedbackUnavailable("label_events_unavailable") from None
-    event = _last_label_event(events, label)
+    event = last_label_event(events, label)
     if event is None or type(event.get("id")) is not int:
         raise FeedbackUnavailable("label_events_unavailable")
     if event.get("performed_via_github_app") is not None:
@@ -569,7 +576,7 @@ async def handle_factory_delivery(
 ) -> WebhookResult:
     """Admit, ignore, or cancel one signed issue delivery. One issue stays one WorkItem."""
 
-    parsed_delivery = _delivery_uuid(delivery_id)
+    parsed_delivery = delivery_uuid(delivery_id)
     audit, conflict = await claim_review_delivery(
         session,
         delivery_id=parsed_delivery,
@@ -579,14 +586,14 @@ async def handle_factory_delivery(
     )
     if conflict:
         await session.commit()
-        return _ignored("delivery_identity_conflict")
+        return ignored("delivery_identity_conflict")
     if audit.status == "accepted":
         await session.commit()
         return WebhookResult(status="factory_duplicate")
     if audit.status in {"ignored", "rejected"}:
         assert audit.reason is not None
         await session.commit()
-        return _ignored(audit.reason)
+        return ignored(audit.reason)
     try:
         notice = parse_factory_event(
             event,
@@ -614,16 +621,16 @@ async def handle_factory_delivery(
     except FeedbackIgnored as exc:
         if exc.code == "invalid_delivery":
             raise HTTPException(400, {"code": exc.code}) from None
-        disposition = "ignored" if exc.code in _IGNORED else "rejected"
+        disposition = "ignored" if exc.code in IGNORED else "rejected"
         settle_review_delivery(audit, disposition, exc.code)
         await session.commit()
         logger.info("factory delivery ignored: %s", exc.code)
-        return _ignored(exc.code)
+        return ignored(exc.code)
     if outcome.status == "factory_ignored":
         code = "ignored"
         if outcome.errors:
             code = outcome.errors[0]["code"]
-        disposition = "ignored" if code in _IGNORED else "rejected"
+        disposition = "ignored" if code in IGNORED else "rejected"
         settle_review_delivery(audit, disposition, code)
     else:
         settle_review_delivery(audit, "accepted")

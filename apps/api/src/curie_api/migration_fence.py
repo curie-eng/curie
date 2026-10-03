@@ -38,7 +38,7 @@ Two things are exposed:
    **The order is `agent_channels` THEN `approvals`, and it is chosen for the
    writers.** One `LOCK TABLE` over two tables is not simultaneous: PostgreSQL
    takes them in list order. Every writer that touches both tables takes them
-   in that same order -- `crud.delete_agent` deletes the agent's
+   in that same order -- `crud.agents.delete_agent` deletes the agent's
    `agent_channels` rows and then the agent, whose cascade reaches `approvals`,
    and publication create writes the binding before the approval. Fencing
    `approvals` first let the fence hold `approvals` while such a writer held
@@ -94,7 +94,7 @@ AUDIT = "approval_audit_entries"
 
 #: Locked in this order by every revision that fences, so two of them can never
 #: deadlock against each other -- and `agent_channels` FIRST, because every
-#: writer that touches both tables (`crud.delete_agent`, publication create)
+#: writer that touches both tables (`crud.agents.delete_agent`, publication create)
 #: takes them in that order. See the module docstring for the reader cycle this
 #: order cannot exclude and why deadlock detection resolving it is safe.
 FENCED_TABLES = (CHANNELS, APPROVALS)

@@ -3,7 +3,16 @@
 from aci_protocol import EvalJob
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from .. import crud
+from curie_api.crud import agents as crud_agents
+from curie_api.crud import deployments as crud_deployments
+from curie_api.crud import versions as crud_versions
+from curie_api.schemas.evals import (
+    EvalMatrix,
+    EvalReportResult,
+    EvalTriggerRequest,
+    EvalTriggerResult,
+)
+
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import EvalQueueDep, GitHubReporterDep, LangfuseDep, SessionDep
@@ -12,12 +21,6 @@ from ..evals import build_matrix
 from ..github_checks import GitHubReportError
 from ..models import Environment
 from ..repo_full_name import InvalidRepoFullName
-from ..schemas import (
-    EvalMatrix,
-    EvalReportResult,
-    EvalTriggerRequest,
-    EvalTriggerResult,
-)
 from ..wirebody import EvalReportBody
 
 router = APIRouter(
@@ -33,19 +36,19 @@ async def trigger_eval(
     # enqueue the SAME EvalJob onto curie:evals, minus the push-only
     # gate. This does NOT parse the eval-case format (worker/CLI concern); it
     # only resolves and emits agent_id/version_id/sha/suite/bundle_ref.
-    agent = await crud.get_agent(session, body.agent_id)
+    agent = await crud_agents.get_agent(session, body.agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
 
     if body.version_id is not None:
-        version = await crud.get_version(session, body.version_id)
+        version = await crud_versions.get_version(session, body.version_id)
         if version is None or version.agent_id != agent.id:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, "version not found for this agent"
             )
         sha = version.commit_sha or version.bundle_sha256
     else:
-        deployment = await crud.get_active_deployment(
+        deployment = await crud_deployments.get_active_deployment(
             session, agent.id, Environment.dev
         )
         if deployment is None:
@@ -53,7 +56,7 @@ async def trigger_eval(
                 status.HTTP_404_NOT_FOUND,
                 "agent has no active dev deployment to evaluate",
             )
-        version = await crud.get_version(session, deployment.version_id)
+        version = await crud_versions.get_version(session, deployment.version_id)
         if version is None:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, "deployed version not found"

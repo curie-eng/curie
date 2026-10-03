@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 _monotonic = time.monotonic
 
 
-def _text(value: Any) -> str:
+def text(value: Any) -> str:
     """Decode a Valkey value to str. The API's client is created without
     ``decode_responses``, so ids and field maps come back as ``bytes``; a
     ``decode_responses=True`` client (tests) already yields ``str``."""
@@ -63,15 +63,15 @@ class GraveyardWatcher:
     async def seed_cursor(self) -> None:
         """Set the cursor to the current tail so only NEW dead-letters alert."""
         entries = await self._valkey.xrevrange(self._stream, count=1) or []
-        self._cursor = _text(entries[0][0]) if entries else "0-0"
+        self._cursor = text(entries[0][0]) if entries else "0-0"
 
     async def scan_once(self) -> int:
         """Alert every dead-letter after the cursor and advance it. Returns the
         count alerted this pass."""
         entries = await self._valkey.xrange(self._stream, min=f"({self._cursor}", max="+") or []
         for entry_id_raw, fields_raw in entries:
-            entry_id = _text(entry_id_raw)
-            fields = {_text(k): _text(v) for k, v in (fields_raw or {}).items()}
+            entry_id = text(entry_id_raw)
+            fields = {text(k): text(v) for k, v in (fields_raw or {}).items()}
             self._alert(entry_id, fields)
             self._cursor = entry_id
         return len(entries)

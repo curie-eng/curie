@@ -10,12 +10,16 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, status
 from starlette.concurrency import run_in_threadpool
 
-from .. import bundles, crud, deploy
+from curie_api.crud import agents as crud_agents
+from curie_api.crud import deployments as crud_deployments
+from curie_api.crud import versions as crud_versions
+from curie_api.schemas.versions import BundleOut
+
+from .. import bundles, deploy
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
 from ..models import AgentVersion
-from ..schemas import BundleOut
 
 # Chunk size for the bounded read below; arbitrary, just small enough that a
 # rejected oversized upload never holds more than one chunk's worth of the
@@ -39,7 +43,7 @@ _CONTENT_TYPES = (
 async def _load_version(
     session: SessionDep, agent_id: uuid.UUID, version_id: uuid.UUID
 ) -> AgentVersion:
-    version = await crud.get_version(session, version_id)
+    version = await crud_versions.get_version(session, version_id)
     if version is None or version.agent_id != agent_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "version not found")
     return version
@@ -138,10 +142,10 @@ async def upload_bundle(
     # because the object is not stored yet at this point. Placed after
     # `validate_archive` so a malformed bundle still reports its own validation
     # errors first, and before `store_bundle` so a refusal writes no object and
-    # leaves `bundle_ref` null -- `crud.attach_bundle` commits immediately, so a
+    # leaves `bundle_ref` null -- `crud.versions.attach_bundle` commits immediately, so a
     # check placed after it would already be live.
-    if await crud.version_has_active_deployment(session, version_id):
-        agent = await crud.get_agent(session, agent_id)
+    if await crud_deployments.version_has_active_deployment(session, version_id):
+        agent = await crud_agents.get_agent(session, agent_id)
         if agent is None:  # pragma: no cover -- the version lookup above proves it
             raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
         try:

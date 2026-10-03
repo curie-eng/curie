@@ -648,7 +648,9 @@ def test_null_subject_console_session_cannot_be_an_approval_principal(
                     {
                         "id": uuid.uuid4(),
                         "code_hash": crud_console.hash_console_credential(code),
-                        "expires_at": datetime.now(UTC).replace(tzinfo=None) + crud_console.LOGIN_CODE_TTL,
+                        "expires_at": (
+                            datetime.now(UTC).replace(tzinfo=None) + crud_console.LOGIN_CODE_TTL
+                        ),
                     },
                 )
                 await session.commit()

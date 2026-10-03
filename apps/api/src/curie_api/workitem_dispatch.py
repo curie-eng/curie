@@ -13,7 +13,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
-from . import crud, workitems
+from curie_api.crud import channels as crud_channels
+from curie_api.workitems import lifecycle
+from curie_api.workitems.lifecycle import (
+    ExecutionRequestSnapshot,
+    WorkItemConflict,
+    WorkItemOutcome,
+    WorkItemSnapshot,
+    database_now,
+    lock_request,
+    lock_request_by_id,
+    lock_work_item,
+    outcome,
+    record_runtime_termination_where,
+    reload_request,
+    reload_work_item,
+    start_execution_where,
+    terminalize_execution,
+)
+
 from .config import get_settings
 from .models import Agent, AgentChannel, ExecutionRequest, Publication, WorkItem
 from .threadkeys import (
@@ -22,22 +40,6 @@ from .threadkeys import (
     pre_identity_thread_key_for,
     route_thread_key,
     route_thread_key_matches,
-)
-from .workitems import (
-    ExecutionRequestSnapshot,
-    WorkItemConflict,
-    WorkItemOutcome,
-    WorkItemSnapshot,
-    _database_now,
-    _lock_request,
-    _lock_request_by_id,
-    _lock_work_item,
-    _outcome,
-    _record_runtime_termination,
-    _reload_request,
-    _reload_work_item,
-    _start_execution,
-    _terminalize_execution,
 )
 from .workspace_policy import repository_is_allowed
 
@@ -210,7 +212,7 @@ async def _write_snapshot(
             updated_at=func.clock_timestamp(),
         )
     )
-    row = await _reload_request(session, request_id)
+    row = await reload_request(session, request_id)
     if not _snapshot_matches(row, facts):
         return await _refuse(
             session, "identity_mismatch", request_id=request_id
@@ -221,10 +223,10 @@ async def _write_snapshot(
 async def _replay_existing(
     session: AsyncSession, request: ExecutionRequest, facts: Any, adapter: str | None
 ) -> WorkItemOutcome | DispatchConflict:
-    work_item = await _lock_work_item(session, request.work_item_id)
+    work_item = await lock_work_item(session, request.work_item_id)
     if work_item is None:
         return await _refuse(session, "not_found", request_id=request.id)
-    locked = await _lock_request(
+    locked = await lock_request(
         session, work_item_id=work_item.id, request_id=request.id
     )
     if locked is None:
@@ -250,7 +252,7 @@ async def _replay_existing(
             work_item_id=work_item.id,
             request_id=locked.id,
         )
-    return await _outcome(session, work_item, locked, replayed=True)
+    return await outcome(session, work_item, locked, replayed=True)
 
 
 async def _admission_refusal(
@@ -259,7 +261,7 @@ async def _admission_refusal(
     """The binding that authorizes this admission, or the refusal.
 
     Every caller below reuses THIS binding for the rest of its own
-    transaction rather than re-resolving `crud.binding_for_route`: under
+    transaction rather than re-resolving `crud.channels.binding_for_route`: under
     Postgres's default READ COMMITTED isolation, a second read in the same
     transaction sees any rebind already committed since the first, so
     re-resolving could key the work item by a binding other than the one
@@ -276,10 +278,10 @@ async def _admission_refusal(
     # on the pair is not this work item's; two of this agent's routes on one
     # pair are ambiguous, which admission refuses rather than picking one.
     try:
-        binding = await crud.binding_for_route(
+        binding = await crud_channels.binding_for_route(
             session, facts.kind, None, facts.address, agent_id=facts.agent_id
         )
-    except crud.AmbiguousRoute:
+    except crud_channels.AmbiguousRoute:
         logger.warning("work item admission for agent %s is ambiguous", facts.agent_id)
         binding = None
     if binding is None or binding.agent_id != facts.agent_id:
@@ -342,8 +344,8 @@ async def admit_revision(
         return await _refuse(
             session, "identity_mismatch", work_item_id=work_item.id
         )
-    now = await _database_now(session)
-    requested = await workitems.create_revision_request(
+    now = await database_now(session)
+    requested = await lifecycle.create_revision_request(
         session,
         work_item_id=work_item.id,
         request_id=facts.request_id,
@@ -360,8 +362,8 @@ async def admit_revision(
     written = await _write_snapshot(session, facts.request_id, facts)
     if isinstance(written, DispatchConflict):
         return written
-    reloaded = await _reload_work_item(session, work_item.id)
-    return await _outcome(session, reloaded, written, replayed=requested.replayed)
+    reloaded = await reload_work_item(session, work_item.id)
+    return await outcome(session, reloaded, written, replayed=requested.replayed)
 
 
 async def readmit(
@@ -393,8 +395,8 @@ async def readmit(
         return await _refuse(
             session, "identity_mismatch", work_item_id=work_item.id
         )
-    now = await _database_now(session)
-    readmitted = await workitems.readmit(
+    now = await database_now(session)
+    readmitted = await lifecycle.readmit(
         session,
         work_item_id=work_item.id,
         request_id=facts.request_id,
@@ -412,14 +414,14 @@ async def readmit(
     written = await _write_snapshot(session, facts.request_id, facts)
     if isinstance(written, DispatchConflict):
         return written
-    reloaded = await _reload_work_item(session, work_item.id)
-    return await _outcome(session, reloaded, written)
+    reloaded = await reload_work_item(session, work_item.id)
+    return await outcome(session, reloaded, written)
 
 
 async def _admit_new(
     session: AsyncSession, facts: Any, adapter: str | None
 ) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
-    created = await workitems.create_or_get_work_item(
+    created = await lifecycle.create_or_get_work_item(
         session,
         github_repository_id=facts.github_repository_id,
         github_issue_number=facts.github_issue_number,
@@ -432,11 +434,11 @@ async def _admit_new(
     )
     if isinstance(created, WorkItemConflict):
         return created
-    now = await _database_now(session)
+    now = await database_now(session)
     wait_deadline = now + timedelta(
         seconds=get_settings().work_item_wait_budget_seconds
     )
-    requested = await workitems.create_execution_request(
+    requested = await lifecycle.create_execution_request(
         session,
         work_item_id=created.work_item.id,
         request_id=facts.request_id,
@@ -457,8 +459,8 @@ async def _admit_new(
     written = await _write_snapshot(session, requested.request.id, facts)
     if isinstance(written, DispatchConflict):
         return written
-    work_item = await _reload_work_item(session, created.work_item.id)
-    return await _outcome(
+    work_item = await reload_work_item(session, created.work_item.id)
+    return await outcome(
         session, work_item, written, replayed=requested.replayed
     )
 
@@ -550,10 +552,10 @@ async def _lock_pair(
     )
     if found is None:
         return await _refuse(session, "not_found", request_id=request_id)
-    work_item = await _lock_work_item(session, found.work_item_id)
+    work_item = await lock_work_item(session, found.work_item_id)
     if work_item is None:
         return await _refuse(session, "not_found", request_id=request_id)
-    request = await _lock_request(
+    request = await lock_request(
         session, work_item_id=work_item.id, request_id=request_id
     )
     if request is None:
@@ -605,7 +607,7 @@ async def acquire(
             work_item_id=work_item.id,
             request_id=request.id,
         )
-    now = await _database_now(session)
+    now = await database_now(session)
     if now >= deadline:
         return await _refuse(
             session,
@@ -691,7 +693,7 @@ async def defer(
     reason: str,
     capacity: bool,
 ) -> DeferResult | DispatchConflict:
-    request = await _lock_request_by_id(session, request_id)
+    request = await lock_request_by_id(session, request_id)
     if request is None:
         return await _refuse(session, "not_found", request_id=request_id)
     if request.status != "waiting":
@@ -707,7 +709,7 @@ async def defer(
             _generation_refusal(generation, request.dispatch_generation),
             request_id=request.id,
         )
-    now = await _database_now(session)
+    now = await database_now(session)
     if (
         request.acquire_owner != owner
         or request.acquired_generation != generation
@@ -753,7 +755,7 @@ async def defer(
     )
     if changed_id is None:
         return await _refuse(session, "not_dispatchable", request_id=request.id)
-    request = await _reload_request(session, request.id)
+    request = await reload_request(session, request.id)
     result = DeferResult(
         dispatch_generation=request.dispatch_generation,
         not_before=request.dispatch_not_before,
@@ -775,7 +777,7 @@ async def start(
     if isinstance(locked, DispatchConflict):
         return locked
     work_item, request = locked
-    now = await _database_now(session)
+    now = await database_now(session)
     if (
         request.acquire_owner != owner
         or request.acquired_generation != generation
@@ -790,7 +792,7 @@ async def start(
         )
     settings = get_settings()
     ttl = timedelta(seconds=settings.work_item_runtime_ttl_seconds)
-    result = await _start_execution(
+    result = await start_execution_where(
         session,
         work_item_id=work_item.id,
         request_id=request.id,
@@ -821,9 +823,9 @@ async def start(
             request_id=result.request_id,
         )
     assert result.request is not None
-    row = await _reload_request(session, result.request.id)
+    row = await reload_request(session, result.request.id)
     assert row.execution_deadline is not None
-    remaining = (row.execution_deadline - await _database_now(session)).total_seconds()
+    remaining = (row.execution_deadline - await database_now(session)).total_seconds()
     return StartResult(
         runtime_epoch=row.runtime_epoch,
         execution_deadline=row.execution_deadline,
@@ -845,7 +847,7 @@ def _map_start_conflict(result: WorkItemConflict) -> RefusalCode:
 async def heartbeat(
     session: AsyncSession, request_id: uuid.UUID, *, runtime_epoch: int
 ) -> HeartbeatResult | DispatchConflict:
-    request = await _lock_request_by_id(session, request_id)
+    request = await lock_request_by_id(session, request_id)
     if request is None:
         return await _refuse(session, "not_found", request_id=request_id)
     if request.status not in {"running", "cancellation_requested"}:
@@ -862,7 +864,7 @@ async def heartbeat(
             request_id=request.id,
             status=request.status,
         )
-    now = await _database_now(session)
+    now = await database_now(session)
     if (
         request.runtime_heartbeat_expires_at is not None
         and now >= request.runtime_heartbeat_expires_at
@@ -888,7 +890,7 @@ async def heartbeat(
                 updated_at=func.clock_timestamp(),
             )
         )
-        request = await _reload_request(session, request.id)
+        request = await reload_request(session, request.id)
     work_item = await session.scalar(
         select(WorkItem).where(WorkItem.id == request.work_item_id)
     )
@@ -911,7 +913,7 @@ async def hold_for_approval(
     This sets that lease to the execution deadline. It does not finish the request.
     """
 
-    request = await _lock_request_by_id(session, request_id)
+    request = await lock_request_by_id(session, request_id)
     if request is None:
         return await _refuse(session, "not_found", request_id=request_id)
     if request.status != "running" or request.runtime_epoch != runtime_epoch:
@@ -921,7 +923,7 @@ async def hold_for_approval(
             request_id=request.id,
             status=request.status,
         )
-    now = await _database_now(session)
+    now = await database_now(session)
     if request.execution_deadline is None or now >= request.execution_deadline:
         return await _refuse(
             session,
@@ -950,7 +952,7 @@ async def hold_for_approval(
             request_id=request.id,
             status=request.status,
         )
-    request = await _reload_request(session, request.id)
+    request = await reload_request(session, request.id)
     work_item = await session.scalar(select(WorkItem).where(WorkItem.id == request.work_item_id))
     result = HeartbeatResult(
         status=request.status,
@@ -978,7 +980,7 @@ def _not_awaiting_publication() -> ColumnElement[bool]:
     # publication loop and the CI gate, not to runtime owner loss.
     return ~exists().where(
         Publication.execution_request_id == ExecutionRequest.id,
-        Publication.status.in_((*workitems._IN_FLIGHT_PUBLICATION, "succeeded")),
+        Publication.status.in_((*lifecycle.IN_FLIGHT_PUBLICATION, "succeeded")),
     )
 
 
@@ -1044,7 +1046,7 @@ async def declare_owner_lost(
             request_id=request.id,
             status=request.status,
         )
-    now = await _database_now(session)
+    now = await database_now(session)
     held = (
         request.runtime_heartbeat_expires_at is not None
         and request.runtime_heartbeat_expires_at == request.execution_deadline
@@ -1054,7 +1056,7 @@ async def declare_owner_lost(
         select(Publication.id)
         .where(
             Publication.execution_request_id == request.id,
-            Publication.status.in_((*workitems._IN_FLIGHT_PUBLICATION, "succeeded")),
+            Publication.status.in_((*lifecycle.IN_FLIGHT_PUBLICATION, "succeeded")),
         )
         .limit(1)
     )
@@ -1100,7 +1102,7 @@ async def declare_owner_lost(
             request_id=request.id,
             status=request.status,
         )
-    request = await _reload_request(session, request.id)
+    request = await reload_request(session, request.id)
     result = OwnerLostResult(status=request.status, terminal_cause=request.terminal_cause)
     await session.commit()
     return result
@@ -1145,7 +1147,7 @@ async def finish(
             request_id=request.id,
             status=request.status,
         )
-    now = await _database_now(session)
+    now = await database_now(session)
     if (
         request.runtime_heartbeat_expires_at is not None
         and now >= request.runtime_heartbeat_expires_at
@@ -1157,7 +1159,7 @@ async def finish(
             request_id=request.id,
             status=request.status,
         )
-    result = await _terminalize_execution(
+    result = await terminalize_execution(
         session,
         work_item_id=work_item.id,
         request_id=request.id,
@@ -1207,7 +1209,7 @@ def _unconfirmed_settle_teardown() -> ColumnElement[bool]:
 async def claim_termination(
     session: AsyncSession, request_id: uuid.UUID, *, owner: str
 ) -> TerminationClaim | DispatchConflict:
-    request = await _lock_request_by_id(session, request_id)
+    request = await lock_request_by_id(session, request_id)
     if request is None:
         return await _refuse(session, "not_found", request_id=request_id)
     settled_teardown = (
@@ -1222,7 +1224,7 @@ async def claim_termination(
             request_id=request.id,
             status=request.status,
         )
-    now = await _database_now(session)
+    now = await database_now(session)
     heartbeat_live = (
         request.runtime_heartbeat_expires_at is not None
         and request.runtime_heartbeat_expires_at > now
@@ -1262,7 +1264,7 @@ async def claim_termination(
                 status=request.status,
             )
         return await _refuse(session, "duplicate", request_id=request.id)
-    request = await _reload_request(session, request.id)
+    request = await reload_request(session, request.id)
     claimed = TerminationClaim(runtime_epoch=request.runtime_epoch)
     await session.commit()
     return claimed
@@ -1287,7 +1289,7 @@ async def record_termination(
             request_id=request.id,
             status=request.status,
         )
-    result = await _record_runtime_termination(
+    result = await record_runtime_termination_where(
         session,
         work_item_id=work_item.id,
         request_id=request.id,
@@ -1314,7 +1316,7 @@ async def cancel(
     work_item_id: uuid.UUID,
     expected_version: int,
 ) -> WorkItemOutcome | WorkItemConflict:
-    return await workitems.request_cancellation(
+    return await lifecycle.request_cancellation(
         session,
         work_item_id=work_item_id,
         expected_work_item_version=expected_version,
@@ -1523,14 +1525,14 @@ async def load_execute_wake(
             session, work_item.agent_id, work_item.conversation_id
         )
         try:
-            binding = await crud.binding_for_route(
+            binding = await crud_channels.binding_for_route(
                 session,
                 request.reply_kind,
                 adapter,
                 request.reply_address,
                 agent_id=work_item.agent_id,
             )
-        except crud.AmbiguousRoute:
+        except crud_channels.AmbiguousRoute:
             logger.warning(
                 "execute wake for request %s names an ambiguous route", request.id
             )

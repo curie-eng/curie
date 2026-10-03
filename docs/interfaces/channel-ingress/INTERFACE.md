@@ -175,7 +175,7 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   different adapter kinds.
   `curie-cluster-message` is reserved for the built-in cluster-message relay
   (`apps/worker/src/curie_worker/reply_sink.py::_ClusterMessageReplyAdapter`) and is refused
-  on an operator binding by `apps/api/src/curie_api/schemas.py::ChannelBindingWrite`.
+  on an operator binding by `apps/api/src/curie_api/schemas/channels.py::ChannelBindingWrite`.
 
 ## Implementations today
 
@@ -354,9 +354,9 @@ incomplete adapter coverage and conformance.
   just at the channel edges: the agents table carried a `slack_channel` column, and agent
   create/update validated it as a Slack channel id, so binding any other channel kind took a
   schema change. The binding is now a neutral `{kind, address}` object
-  (`apps/api/src/curie_api/schemas.py::ChannelBinding`) on its own table
+  (`apps/api/src/curie_api/schemas/channels.py::ChannelBinding`) on its own table
   (`apps/api/src/curie_api/models.py::AgentChannel`), and the write gate is kind-dispatched
-  (`apps/api/src/curie_api/schemas.py::_validate_channel_binding`): a registered kind
+  (`apps/api/src/curie_api/schemas/channels.py::validate_channel_binding`): a registered kind
   validates on its own address shape, an unregistered one on a generic non-empty rule, so a
   new kind binds with no schema change. Still no multi-channel adapter framework (#27) — the
   restraint stands; only the Slack-shaped assumption is gone.
@@ -366,7 +366,7 @@ incomplete adapter coverage and conformance.
   silently selecting one another's binding.
 - **Still leaks — registered address shapes.** Slack is the only registered kind in
   `_CHANNEL_ADDRESS_SHAPES`
-  (`apps/api/src/curie_api/schemas.py::_CHANNEL_ADDRESS_SHAPES`); Discord and email
+  (`apps/api/src/curie_api/schemas/channels.py::_CHANNEL_ADDRESS_SHAPES`); Discord and email
   bind under the generic non-empty rule. There is still no multi-channel adapter
   framework (#27). The routing pair removes the binding ambiguity; it does not by
   itself give other kinds a registered address shape.

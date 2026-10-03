@@ -926,7 +926,7 @@ async def _deliver(
                 (comments_path, 1, _SECOND_LIST_OFFSET, "issue"),
             ]
     for path, start, offset, listed in scans:
-        existing = await _find_marker(client, api, path, headers, marker, start_page=start)
+        existing = await find_marker(client, api, path, headers, marker, start_page=start)
         if existing.refusal is not None:
             return ("refused", existing.refusal)
         if existing.unavailable:
@@ -1037,7 +1037,7 @@ async def _post(
     return ("posted", str(payload["id"]))
 
 
-async def _find_marker(
+async def find_marker(
     client: httpx.AsyncClient,
     api: str,
     path: str,
@@ -1125,7 +1125,7 @@ async def upsert_issue_notice(
     """
 
     comments_path = f"{repo_path}/issues/{issue_number}/comments"
-    found = await _find_marker(
+    found = await find_marker(
         client,
         api,
         comments_path,

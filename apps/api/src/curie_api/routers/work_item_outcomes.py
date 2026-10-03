@@ -13,11 +13,13 @@ import uuid
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
-from .. import crud, factory_usage, workitem_outcomes
+from curie_api.crud import agents as crud_agents
+from curie_api.schemas.workitems import WorkItemOutcomeList, WorkItemOutcomeOut, WorkItemUsageOut
+
+from .. import factory_usage, workitem_outcomes
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep
-from ..schemas import WorkItemOutcomeList, WorkItemOutcomeOut, WorkItemUsageOut
 
 router = APIRouter(
     prefix="/work-items",
@@ -36,7 +38,7 @@ async def list_work_items(
     limit: int = Query(50, ge=1, le=200),
 ) -> WorkItemOutcomeList:
     response.headers["Cache-Control"] = "no-store"
-    if agent_id is not None and await crud.get_agent(session, agent_id) is None:
+    if agent_id is not None and await crud_agents.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
     items, truncated = await workitem_outcomes.load_outcomes(
         session, agent_id=agent_id, limit=limit, settings=get_settings()

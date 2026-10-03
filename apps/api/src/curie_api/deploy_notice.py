@@ -21,11 +21,12 @@ from sqlalchemy import delete, func, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import crud
+from curie_api.crud import agents as crud_agents
+from curie_api.schemas.deployments import WebhookResult
+
 from .config import Settings
 from .gitflow import environment_for_ref
 from .models import Agent, AgentChannel, Deployment, DeployNoticeOutbox, Environment
-from .schemas import WebhookResult
 
 logger = logging.getLogger(__name__)
 
@@ -140,21 +141,21 @@ class DeployNoticeQueue:
             # Rejected after the push resolved its target: that agent alone.
             # One repository builds several agents (ADR-0091), and a sibling's
             # channel can be a different audience.
-            agent = await crud.get_agent(session, result.agent_id)
+            agent = await crud_agents.get_agent(session, result.agent_id)
             agents = [agent] if agent is not None else []
         elif result.status == "rejected":
-            agents = await crud.get_agents_by_repo(session, full_name)
+            agents = await crud_agents.get_agents_by_repo(session, full_name)
             if not agents and any(
                 error.get("code") == "git.repository_case_mismatch"
                 for error in (result.errors or [])
             ):
-                agents = await crud.get_agents_by_repo_casefold(session, full_name)
+                agents = await crud_agents.get_agents_by_repo_casefold(session, full_name)
         else:
             if result.agent_id is None:
                 return 0
             if not await _changes_the_active_version(session, result):
                 return 0
-            agent = await crud.get_agent(session, result.agent_id)
+            agent = await crud_agents.get_agent(session, result.agent_id)
             agents = [agent] if agent is not None else []
 
         environment = result.environment or environment_for_ref(ref, settings)

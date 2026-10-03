@@ -35,7 +35,7 @@ from fastapi import Response
 # The API's Valkey client is built without `decode_responses`, so values come
 # back as bytes; `_text` is the package's named, documented decode for exactly
 # that.
-from .graveyardwatcher import _text
+from curie_api.graveyardwatcher import text
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +254,7 @@ async def enqueue_owned(
         transport_value or "",
     )
     enqueued, current = result
-    return bool(enqueued), _text(current)
+    return bool(enqueued), text(current)
 
 
 async def take_backlog_slot(

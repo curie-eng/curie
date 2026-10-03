@@ -227,7 +227,9 @@ def test_two_sessions_with_a_stale_unclaimed_record_cannot_both_claim_undo(
                 assert first.undone_at is None and second.undone_at is None
                 winner = await crud_actions.claim_action_undo(first_session, first, actor="U-first")
                 await first_session.commit()
-                loser = await crud_actions.claim_action_undo(second_session, second, actor="U-second")
+                loser = await crud_actions.claim_action_undo(
+                    second_session, second, actor="U-second"
+                )
                 await second_session.commit()
                 async with sessions() as check_session:
                     stored = await check_session.get(AgentAction, action_id)

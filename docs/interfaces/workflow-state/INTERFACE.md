@@ -179,8 +179,8 @@ and `edit_memory`
 `apps/api/src/curie_api/routers/memory.py::create_memory`,
 `apps/api/src/curie_api/routers/memory.py::edit_memory`) and
 `apps/api/src/curie_api/routers/memory.py::delete_memory` all `select(WorkflowStateEntry)`
-against the `memory` namespace, and the router imports the state module's private
-`apps/api/src/curie_api/routers/state.py::_enforce_caps` to reuse the size caps rather
+against the `memory` namespace, and the router imports the state module's public
+`apps/api/src/curie_api/routers/state.py::enforce_caps` to reuse the size caps rather
 than inheriting them from a route. That import is deliberate (the state module documents
 it as the reason `RESERVED_NAMESPACES` is a literal there and not an import back from
 `routers.memory`), but the consequence for this seam is concrete: a second state backend

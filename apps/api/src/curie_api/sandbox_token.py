@@ -31,20 +31,20 @@ from typing import Any
 _PREFIX = "sbx"
 
 
-def _b64url(raw: bytes) -> str:
+def b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
-def _b64url_decode(seg: str) -> bytes:
+def b64url_decode(seg: str) -> bytes:
     pad = "=" * (-len(seg) % 4)
     return base64.urlsafe_b64decode(seg + pad)
 
 
-def _signature(api_key: str, signing_input: str) -> str:
+def signature(api_key: str, signing_input: str) -> str:
     digest = hmac.new(
         api_key.encode(), signing_input.encode(), hashlib.sha256
     ).digest()
-    return _b64url(digest)
+    return b64url(digest)
 
 
 _RESERVED_CLAIMS = frozenset({"agent", "scope", "exp"})
@@ -77,9 +77,9 @@ def mint(
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
-    payload_seg = _b64url(payload)
+    payload_seg = b64url(payload)
     signing_input = f"{_PREFIX}.{payload_seg}"
-    return f"{signing_input}.{_signature(api_key, signing_input)}"
+    return f"{signing_input}.{signature(api_key, signing_input)}"
 
 
 def decode(
@@ -96,7 +96,7 @@ def decode(
         return None
     if prefix != _PREFIX:
         return None
-    expected_sig = _signature(api_key, f"{_PREFIX}.{payload_seg}")
+    expected_sig = signature(api_key, f"{_PREFIX}.{payload_seg}")
     try:
         signature_ok = hmac.compare_digest(sig_seg, expected_sig)
     except TypeError:
@@ -104,7 +104,7 @@ def decode(
     if not signature_ok:
         return None
     try:
-        payload = json.loads(_b64url_decode(payload_seg))
+        payload = json.loads(b64url_decode(payload_seg))
     except (ValueError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):

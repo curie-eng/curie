@@ -12,6 +12,8 @@ import uuid
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
+from curie_api.schemas.deployments import WebhookResult
+
 from ..config import get_settings
 from ..deps import EvalQueueDep, SessionDep, StoreDep
 from ..gitflow import log_push_outcome, process_push, verify_signature
@@ -31,7 +33,6 @@ from ..github_review_events import (
 )
 from ..github_review_store import admit_feedback, hold_feedback
 from ..models import GitHubReviewFeedback
-from ..schemas import WebhookResult
 from ..wirebody import read_bounded_body
 
 logger = logging.getLogger(__name__)

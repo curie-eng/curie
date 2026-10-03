@@ -31,7 +31,21 @@ from opentelemetry.trace import SpanKind
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import adapter_principal, approval_principal, crud
+from curie_api.crud import approvals as crud_approvals
+from curie_api.crud import channels as crud_channels
+from curie_api.schemas.approvals import (
+    AdapterPrincipalMint,
+    AdapterPrincipalOut,
+    AdapterPrincipalRotate,
+    ApprovalAuditOut,
+    ApprovalCreateOut,
+    ApprovalOut,
+    ApprovalPrincipalMint,
+    ApprovalPrincipalOut,
+    ApprovalResolve,
+)
+
+from .. import adapter_principal, approval_principal
 from ..admission import admit
 from ..approval_auth import (
     ApprovalPrincipalDep,
@@ -48,17 +62,6 @@ from ..resumequeue import (
     approval_trace_context,
     build_expiry_resume_turn,
     build_resume_turn,
-)
-from ..schemas import (
-    AdapterPrincipalMint,
-    AdapterPrincipalOut,
-    AdapterPrincipalRotate,
-    ApprovalAuditOut,
-    ApprovalCreateOut,
-    ApprovalOut,
-    ApprovalPrincipalMint,
-    ApprovalPrincipalOut,
-    ApprovalResolve,
 )
 from ..wirebody import ApprovalRequestBody
 
@@ -157,7 +160,7 @@ async def mint_adapter_principal(
     """
 
     requested = frozenset(data.binding_ids)
-    if await crud.existing_channel_binding_ids(session, requested) != requested:
+    if await crud_channels.existing_channel_binding_ids(session, requested) != requested:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "every binding_id must name an existing channel binding",
@@ -183,7 +186,7 @@ async def rotate_adapter_principal(
     an adapter left serving nothing gets 401, as an unusable credential would.
     """
 
-    remaining = await crud.existing_channel_binding_ids(session, claims.bindings)
+    remaining = await crud_channels.existing_channel_binding_ids(session, claims.bindings)
     if not remaining:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
@@ -223,25 +226,25 @@ async def create_approval(
 
     A request for an approval a person rejected in this thread, raised with no
     person asking since, is refused with 409 and audited on the rejected record
-    (#2885, ``crud.find_rejected_reraise``). Decided here rather than in the
+    (#2885, ``crud.approvals.find_rejected_reraise``). Decided here rather than in the
     runner, so a sandbox cannot talk its way past it.
     """
 
     traceparent = canonicalize_traceparent(
         request.headers.get(TRACEPARENT_STREAM_FIELD)
     )
-    rejected = await crud.find_rejected_reraise(session, data)
+    rejected = await crud_approvals.find_rejected_reraise(session, data)
     # An existing row for this dedupe_key is a replay of a request this route
     # already accepted, so the idempotent 200 below still owns it.
-    if rejected is not None and await crud.get_approval_by_dedupe_key(
+    if rejected is not None and await crud_approvals.get_approval_by_dedupe_key(
         session, data.dedupe_key
     ) is None:
         raise await _refuse_rejected_reraise(session, data, rejected)
     try:
-        approval = await crud.create_approval(session, data, traceparent=traceparent)
+        approval = await crud_approvals.create_approval(session, data, traceparent=traceparent)
     except IntegrityError as exc:
         await session.rollback()
-        existing = await crud.get_approval_by_dedupe_key(session, data.dedupe_key)
+        existing = await crud_approvals.get_approval_by_dedupe_key(session, data.dedupe_key)
         if existing is None:  # raced with a delete; surface the conflict as-is
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "approval violates a uniqueness constraint"
@@ -249,7 +252,7 @@ async def create_approval(
         response.status_code = status.HTTP_200_OK
         approval = existing
     result = ApprovalCreateOut.model_validate(approval)
-    result.requested_by = await crud.approval_display_requester(session, approval)
+    result.requested_by = await crud_approvals.approval_display_requester(session, approval)
     return result
 
 
@@ -283,7 +286,7 @@ async def _refuse_rejected_reraise(
         f"rejected by {rejected_by}{when}, and nobody has asked for it since. Nothing "
         "was done. To raise it again, a person must ask for it in this thread."
     )
-    await crud.append_approval_audit(
+    await crud_approvals.append_approval_audit(
         session,
         approval_id=rejected_id,
         action="reraise_refused",
@@ -338,7 +341,7 @@ async def list_approvals(
     """List approvals, newest first. The platform key sees every row; an
     adapter principal sees only approvals routed to a binding it serves."""
 
-    approvals = await crud.list_approvals(
+    approvals = await crud_approvals.list_approvals(
         session,
         status=status_filter,
         agent_id=agent_id,
@@ -362,7 +365,7 @@ async def list_approvals(
     dependencies=[Depends(require_api_key)],
 )
 async def get_approval(approval_id: uuid.UUID, session: SessionDep) -> ApprovalOut:
-    approval = await crud.get_approval(session, approval_id)
+    approval = await crud_approvals.get_approval(session, approval_id)
     if approval is None:
         raise _approval_not_found()
     return ApprovalOut.model_validate(approval)
@@ -377,10 +380,10 @@ async def get_approval_audit(approval_id: uuid.UUID, session: SessionDep) -> lis
     """The approval's audit trail (#247), oldest first: every resolution
     attempt with the authorizer snapshot that counted or refused it."""
 
-    approval = await crud.get_approval(session, approval_id)
+    approval = await crud_approvals.get_approval(session, approval_id)
     if approval is None:
         raise _approval_not_found()
-    entries = await crud.list_approval_audit(session, approval_id)
+    entries = await crud_approvals.list_approval_audit(session, approval_id)
     return [ApprovalAuditOut.model_validate(e) for e in entries]
 
 
@@ -413,14 +416,14 @@ async def _admit_adapter_answer(session: AsyncSession, approval: Approval, sende
     """
 
     try:
-        row = await crud.binding_for_route(
+        row = await crud_channels.binding_for_route(
             session,
             approval.reply_kind or "",
             approval.reply_adapter,
             approval.reply_channel,
             agent_id=approval.agent_id,
         )
-    except crud.AmbiguousRoute:
+    except crud_channels.AmbiguousRoute:
         # The served check matched the asking route exactly, so this cannot
         # select two rows; if it ever does, no single list can be read and the
         # answer is refused rather than admitted.
@@ -460,13 +463,13 @@ async def resolve_approval(
     The winner's response is sent only after the resume turn is enqueued.
     """
 
-    approval = await crud.get_approval(session, approval_id)
+    approval = await crud_approvals.get_approval(session, approval_id)
     if approval is None:
         raise _approval_not_found()
     # An adapter may resolve only approvals it serves (ADR-0154), by the same
     # predicate that filters its list. Unserved reads exactly as a missing row,
     # before any authorization or audit, so it is not an existence oracle.
-    if principal.kind == "adapter" and not await crud.approval_served_by(
+    if principal.kind == "adapter" and not await crud_approvals.approval_served_by(
         session, approval, principal.adapter_bindings
     ):
         raise _approval_not_found()
@@ -474,7 +477,7 @@ async def resolve_approval(
 
     # The route binding is read fresh at resolve time (#420), so revoking an
     # approver takes effect on the next click rather than at the next restart.
-    binding = await crud.get_approval_route_binding(session, approval)
+    binding = await crud_approvals.get_approval_route_binding(session, approval)
     if principal.kind == "adapter" and card_on_requesting_surface(approval, binding):
         await _admit_adapter_answer(session, approval, principal.subject)
     approver_set = approver_sets(approval, binding)
@@ -498,7 +501,7 @@ async def resolve_approval(
         # The audit log (#247): every authorization-relevant event, with the
         # authorizer snapshot that counted (or refused) the actor, and the
         # membership evidence it decided on (#420).
-        await crud.append_approval_audit(
+        await crud_approvals.append_approval_audit(
             session,
             approval_id=approval_id,
             action=action,
@@ -528,7 +531,7 @@ async def resolve_approval(
                 "operation": "expire",
             },
         ):
-            expired = await crud.expire_approval(session, approval_id)
+            expired = await crud_approvals.expire_approval(session, approval_id)
         # None means a concurrent resolution won the CAS before the expiry did;
         # fall through to the claim below, which will lose and report the winner.
         if expired is not None:
@@ -573,7 +576,7 @@ async def resolve_approval(
                 # NULL and the reconciler re-enqueues it past its grace horizon.
                 # This is the sole recovery path for an expiry wake -- a flipped
                 # record is no longer pending, so no later sweep re-selects it.
-                await crud.mark_approval_resumed(session, approval_id)
+                await crud_approvals.mark_approval_resumed(session, approval_id)
             except Exception:
                 # Reset the session before raising: the mark inside the try is a
                 # DB write, so its failure leaves this session in
@@ -623,7 +626,7 @@ async def resolve_approval(
             "operation": "resolve",
         },
     ):
-        claimed = await crud.claim_approval_resolution(
+        claimed = await crud_approvals.claim_approval_resolution(
             session,
             approval_id,
             decision=data.decision,
@@ -631,7 +634,7 @@ async def resolve_approval(
             note=data.note,
         )
     if claimed is None:
-        current = await crud.get_approval(session, approval_id)
+        current = await crud_approvals.get_approval(session, approval_id)
         if current is None:
             raise _approval_not_found()
         if current.status == ApprovalStatus.expired:
@@ -691,7 +694,7 @@ async def resolve_approval(
         if not get_settings().resume_reconciler_enabled:
             raise
         return ApprovalOut.model_validate(claimed)
-    await crud.mark_approval_resumed(session, approval_id)
+    await crud_approvals.mark_approval_resumed(session, approval_id)
     logger.info(
         "approval %s %s by %s; resume turn enqueued (%s)",
         approval_id,

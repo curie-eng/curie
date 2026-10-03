@@ -140,6 +140,10 @@ jobs:
           python-version: "3.13"
       - name: Sync workspace
         run: uv sync
+      - name: API private import boundaries
+        run: |
+          uv run python3 scripts/check-private-imports.py --self-test
+          uv run python3 scripts/check-private-imports.py
       # Docs-only diffs still run ruff/mypy/docs/alembic/wire-lock above. Reuse
       # ignored_prefixes from .github/e2e-selection.yaml so a guides edit does
       # not boot postgres; packages/, apps/, runner/, examples/tests/, cli,

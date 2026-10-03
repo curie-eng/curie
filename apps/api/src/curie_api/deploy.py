@@ -16,10 +16,12 @@ import plugin_format
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from . import bundles, crud
+from curie_api.crud import versions as crud_versions
+from curie_api.schemas.versions import BundleOut
+
+from . import bundles
 from .config import Settings, get_settings
 from .models import AgentVersion
-from .schemas import BundleOut
 from .storage import ObjectStore
 
 
@@ -148,7 +150,7 @@ def _quoted(names: Iterable[str]) -> str:
     ``repr`` rather than bare text so a padded or oddly cased key is VISIBLE in
     the error: both runtime consumers of this map (``kernel.py``'s
     ``(approval_routes or {}).get(route_name)`` and
-    ``crud.get_approval_route_binding``) do an exact dict lookup, so `" ops "`
+    ``crud.approvals.get_approval_route_binding``) do an exact dict lookup, so `" ops "`
     binds nothing and the operator has to be able to see why.
     """
 
@@ -202,7 +204,7 @@ async def revalidate_stored_bundle(
     (unsafe entries, uncompressed-size and compression-ratio caps) via
     ``plugin_format.check_archive_bounds``, which extracts nothing -- cheap
     enough to run on every deploy/promote. Called before a version becomes
-    deployable (``crud.create_deployment_row``'s callers), so a legacy bundle
+    deployable (``crud.deployments.create_deployment_row``'s callers), so a legacy bundle
     that predates these caps, or was stored under looser ones, fails here with
     a clear ``BundleTooLarge`` instead of only surfacing once some sandbox
     substrate tries to fetch and extract it.
@@ -276,7 +278,7 @@ def _raise_if_routes_unbound(
     protects are exact dict lookups (see ``_quoted``). A ``declared`` of ``None``
     is the reader's poison value and refuses. A ``routes`` that is not a dict
     (a direct JSONB write) counts as no bindings, mirroring
-    ``crud.get_approval_route_binding``'s ``isinstance(..., dict)`` guard rather
+    ``crud.approvals.get_approval_route_binding``'s ``isinstance(..., dict)`` guard rather
     than raising. A bound route no bundle declares is never an error: the join is
     one directional, and pre-binding ahead of a bundle bump is supported (AC2).
     """
@@ -350,7 +352,7 @@ async def store_bundle(
     key = f"bundles/{agent_id}/{version.id}{extension}"
     digest = hashlib.sha256(data).hexdigest()
     await store.put(key, data, content_type)
-    await crud.attach_bundle(session, version, key, digest)
+    await crud_versions.attach_bundle(session, version, key, digest)
     return BundleOut(
         version_id=version.id,
         bundle_ref=key,

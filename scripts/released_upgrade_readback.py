@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from curie_api import models
-from curie_api.schemas import AgentOut
+from curie_api.routers.agents import AgentOut
 from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine

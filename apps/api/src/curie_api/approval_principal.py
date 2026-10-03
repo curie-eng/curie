@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass
 from typing import Literal
 
-from .sandbox_token import _b64url, _b64url_decode, _signature
+from curie_api.sandbox_token import b64url, b64url_decode, signature
 
 _PREFIX = "apr"
 APPROVE_SCOPE = "approval.resolve"
@@ -84,9 +84,9 @@ def mint(
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
-    payload_seg = _b64url(payload)
+    payload_seg = b64url(payload)
     signing_input = f"{_PREFIX}.{payload_seg}"
-    return f"{signing_input}.{_signature(signing_key, signing_input)}"
+    return f"{signing_input}.{signature(signing_key, signing_input)}"
 
 
 def unverified_kind(token: str) -> PrincipalKind | None:
@@ -99,7 +99,7 @@ def unverified_kind(token: str) -> PrincipalKind | None:
 
     try:
         prefix, payload_seg, _sig_seg = token.split(".")
-        payload = json.loads(_b64url_decode(payload_seg))
+        payload = json.loads(b64url_decode(payload_seg))
     except (ValueError, AttributeError, TypeError, json.JSONDecodeError):
         return None
     if prefix != _PREFIX or not isinstance(payload, dict):
@@ -128,7 +128,7 @@ def verify_claims(
         return None
     if prefix != _PREFIX:
         return None
-    expected_sig = _signature(signing_key, f"{_PREFIX}.{payload_seg}")
+    expected_sig = signature(signing_key, f"{_PREFIX}.{payload_seg}")
     try:
         signature_ok = hmac.compare_digest(sig_seg, expected_sig)
     except TypeError:
@@ -136,7 +136,7 @@ def verify_claims(
     if not signature_ok:
         return None
     try:
-        payload = json.loads(_b64url_decode(payload_seg))
+        payload = json.loads(b64url_decode(payload_seg))
     except (ValueError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict) or set(payload) != {
