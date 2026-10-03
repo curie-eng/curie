@@ -2384,8 +2384,9 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     from aci_protocol import QueuedTurn, ReplyHandle
     from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
     from claude_agent_sdk.types import PermissionResultDeny
-    from curie_runner.approval import build_approval_gate, build_can_use_tool
+    from curie_runner.approval import build_approval_gate
     from curie_runner.fake import FakeModelSession
+    from curie_runner.harness.claude.approval import build_can_use_tool
     from curie_runner.otel import RunTracer
     from curie_runner.server import create_app as create_runner_app
     from curie_runner.session import SessionRunner

@@ -16,7 +16,7 @@ list that ``memory.py`` still loads) and ``guidance`` (``{"text": ...}``, the
 operator's replacement for ``DEFAULT_GUIDANCE``).
 
 The model writes facts through three tools on the platform ``curie`` server:
-``remember``, ``update`` and ``forget`` (built in ``approval.py``, which owns
+``remember``, ``update`` and ``forget`` (built in ``harness/claude/approval.py``, which owns
 that server; this module stays free of the harness SDK). The runner mounts them only when the
 worker set a channel memory ref and memory writes are on for the agent. With
 writes off the channel facts are still read, and ``WRITES_OFF_NOTICE`` takes the
