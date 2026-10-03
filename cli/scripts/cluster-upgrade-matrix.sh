@@ -693,7 +693,40 @@ EOF
         else
             log "failed helm status stopped the next upgrade"
         fi
-        rm -f "$state/status_fail"
+        rm -f "$state/status_fail" "$state/rolled" "$logf" "$state/statuses"
+        printf 'Active' >"$state/phase"
+        printf 'deployed\n' >"$state/statuses"
+        local errexit_out
+        errexit_out="$probe/errexit.out"
+        (
+            set +e
+            settle_helm_operation
+            false
+            printf 'continued:%s\n' "$?"
+        ) >"$errexit_out"
+        if [[ "$(cat "$errexit_out")" != "continued:1" ]]; then
+            log "self-test: settlement turned errexit back on before the expected upgrade failure"
+            failed=1
+        else
+            log "settlement left a disabled errexit disabled"
+        fi
+        rm -f "$state/lookup_fail" "$logf"
+        touch "$state/lookup_fail"
+        errexit_out="$probe/errexit-on.out"
+        set +e
+        (
+            set -e
+            settle_helm_operation
+            echo "next:$-:$?" >&2
+            printf 'continued\n'
+        ) >"$errexit_out"
+        set -e
+        if grep -q continued "$errexit_out"; then
+            log "self-test: a settle failure did not stop a caller that has errexit on"
+            failed=1
+        else
+            log "a settle failure still stops a caller that has errexit on"
+        fi
         NAMESPACE="$saved_ns"
         KUBECONFIG_FILE="$saved_kube"
         export PATH="$saved_path"
@@ -746,15 +779,13 @@ helm_ns() {
 
 # Prints the phase and returns 0 when the namespace exists, 2 when it is
 # absent, and 1 when kubectl itself fails. Absence is NotFound only. A
-# connection error must not look like a missing namespace.
+# connection error must not look like a missing namespace. Status is captured
+# in an AND/OR list so this does not change the caller's errexit setting.
 lookup_namespace() {
     local err rc out
     err="$(mktemp)"
-    set +e
     out="$(kubectl --kubeconfig "$KUBECONFIG_FILE" get namespace "$NAMESPACE" \
-        -o jsonpath='{.status.phase}' 2>"$err")"
-    rc=$?
-    set -e
+        -o jsonpath='{.status.phase}' 2>"$err")" && rc=0 || rc=$?
     if (( rc == 0 )); then
         printf '%s' "$out"
         rm -f "$err"
@@ -774,10 +805,7 @@ lookup_namespace() {
 read_helm_settle_status() {
     local err rc raw
     err="$(mktemp)"
-    set +e
-    raw="$(helm_ns status "$RELEASE" -o json 2>"$err")"
-    rc=$?
-    set -e
+    raw="$(helm_ns status "$RELEASE" -o json 2>"$err")" && rc=0 || rc=$?
     if (( rc != 0 )); then
         if grep -qi 'release: not found' "$err"; then
             rm -f "$err"
@@ -800,15 +828,12 @@ except Exception:
 # removed it. A Terminating namespace that finishes inside the wait is created
 # again. A lookup or create failure is returned to the caller.
 ensure_namespace() {
-    local phase rc wait_s deadline poll
+    local phase rc wait_s deadline poll err
     wait_s="${CURIE_HELM_SETTLE_WAIT_SECONDS:-30}"
     poll="${CURIE_HELM_SETTLE_POLL_SECONDS:-1}"
     deadline=$((SECONDS + wait_s))
     while true; do
-        set +e
-        phase="$(lookup_namespace)"
-        rc=$?
-        set -e
+        phase="$(lookup_namespace)" && rc=0 || rc=$?
         if (( rc == 1 )); then
             return 1
         fi
@@ -825,12 +850,8 @@ ensure_namespace() {
         sleep "$poll"
     done
     log "creating namespace $NAMESPACE"
-    local err
     err="$(mktemp)"
-    set +e
-    kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace "$NAMESPACE" 2>"$err"
-    rc=$?
-    set -e
+    kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace "$NAMESPACE" 2>"$err" && rc=0 || rc=$?
     if (( rc != 0 )); then
         log "namespace create failed: $(tr '\n' ' ' <"$err")"
         rm -f "$err"
@@ -852,10 +873,7 @@ settle_helm_operation() {
     deadline=$((SECONDS + wait_s))
     st=""
     while true; do
-        set +e
-        st="$(read_helm_settle_status)"
-        rc=$?
-        set -e
+        st="$(read_helm_settle_status)" && rc=0 || rc=$?
         if (( rc != 0 )); then
             return "$rc"
         fi
@@ -875,10 +893,7 @@ settle_helm_operation() {
     recover_helm_lock
     deadline=$((SECONDS + wait_s))
     while true; do
-        set +e
-        st="$(read_helm_settle_status)"
-        rc=$?
-        set -e
+        st="$(read_helm_settle_status)" && rc=0 || rc=$?
         if (( rc != 0 )); then
             return "$rc"
         fi
