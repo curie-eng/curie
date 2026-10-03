@@ -44,19 +44,30 @@ from curie_e2e_connector.contract import (
     REFUSAL_BUILD_POD_SECURITY,
     REFUSAL_BUILD_TIMEOUT,
     REFUSAL_ENVIRONMENT_CLOSING,
-    REFUSAL_ENVIRONMENT_REQUIRED,
     REFUSAL_MISCONFIGURED,
-    REFUSAL_NOT_OWNED,
     REFUSAL_REGISTRY_NOT_CONFIGURED,
     STAGING_TAG_PREFIX,
 )
-from curie_e2e_connector.kube import ClusterApi, ClusterError, checked_request, ensure_object
+from curie_e2e_connector.kube import (
+    DNS_LABEL,
+    JOB_DEADLINE_GRACE_S,
+    JOB_TTL_S,
+    ClusterApi,
+    ClusterError,
+    checked_request,
+    container_statuses,
+    delete_quietly,
+    ensure_object,
+    job_pods,
+    job_state,
+    terminated_state,
+)
 from curie_e2e_connector.namespace import (
     Caller,
     Install,
     namespace_name,
-    owned_by,
     require_caller,
+    require_environment,
     run_labels,
 )
 from curie_e2e_connector.registry import (
@@ -85,9 +96,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_SOURCE_HOSTS = ("github.com",)
 _MIN_TIMEOUT = 60
 _MAX_TIMEOUT = 3600
-# Polling stops this long after the Job's own activeDeadlineSeconds.
-_DEADLINE_GRACE_S = 30
-_JOB_TTL_S = 600
 _REASON_LIMIT = 1000
 _MIN_REDACTED = 4
 
@@ -95,7 +103,6 @@ _PATH_SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
 _PLATFORM = re.compile(r"^[a-z0-9]+/[a-z0-9]+(/[a-z0-9]+)?$")
 _SOURCE_PATH = re.compile(r"^/[A-Za-z0-9._/-]+$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
-_DNS_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 _BUILD_ID = re.compile(r"^[a-z0-9]{1,16}$")
 
 
@@ -189,7 +196,7 @@ class BuildRequest:
         if (
             not isinstance(name, str)
             or not NAME_COMPONENT.fullmatch(name)
-            or not _DNS_LABEL.fullmatch(name)
+            or not DNS_LABEL.fullmatch(name)
         ):
             raise _refuse("name", "must be a lowercase DNS label")
         return cls(
@@ -259,7 +266,7 @@ def build_image(
     secrets_to_redact = _credential_strings(push_text) | _credential_strings(cache_text)
 
     namespace = namespace_name(install, caller)
-    _require_environment(cluster, install, caller, namespace)
+    _require_build_environment(cluster, install, caller)
     repo = namespace_repository(config.registry, namespace, request.name)
     labels = run_labels(install, caller)
     _admit(cluster, namespace, repo, labels)
@@ -317,7 +324,7 @@ def build_image(
                 f"{config.timeout_seconds}s"
             )
         succeeded, reason, message = status
-        pods = _job_pods(cluster, namespace, job)
+        pods = job_pods(cluster, namespace, job)
         if succeeded:
             digest = _pushed_digest(pods, repo)
             return {"images": [{"name": repo, "digest": digest}]}
@@ -330,36 +337,21 @@ def build_image(
         raise ClusterError(f"{REFUSAL_BUILD_FAILED}: {_redact(detail, secrets_to_redact)}")
     finally:
         if delete_job:
-            _delete_quietly(
+            delete_quietly(
                 cluster,
                 f"/apis/batch/v1/namespaces/{namespace}/jobs/{job}?propagationPolicy=Background",
                 "the build Job",
             )
         for secret_name in created:
-            _delete_quietly(
+            delete_quietly(
                 cluster, f"/api/v1/namespaces/{namespace}/secrets/{secret_name}", "a build Secret"
             )
         for secret_name in uncertain:
             _delete_if_built_by(cluster, namespace, secret_name, job)
 
 
-def _require_environment(
-    cluster: ClusterApi, install: Install, caller: Caller, namespace: str
-) -> None:
-    code, payload = checked_request(cluster, "GET", f"/api/v1/namespaces/{namespace}")
-    status = payload.get("status")
-    phase = status.get("phase") if isinstance(status, dict) else None
-    if code == 404 or (code == 200 and phase == "Terminating"):
-        raise ClusterError(
-            f"{REFUSAL_ENVIRONMENT_REQUIRED}: call env_create first; this run has no live namespace"
-        )
-    if code != 200:
-        raise ClusterError(f"the test cluster did not answer a namespace read ({code})")
-    metadata = payload.get("metadata")
-    if not isinstance(metadata, dict) or not owned_by(install, caller, metadata):
-        raise ClusterError(
-            f"{REFUSAL_NOT_OWNED}: image_build acts only in the namespace this run created"
-        )
+def _require_build_environment(cluster: ClusterApi, install: Install, caller: Caller) -> None:
+    metadata = require_environment(cluster, install, caller, "image_build")
     labels = metadata.get("labels")
     if isinstance(labels, dict) and labels.get(POD_SECURITY_LABEL) == "restricted":
         raise ClusterError(
@@ -591,7 +583,7 @@ def _job_body(
         "spec": {
             "backoffLimit": 0,
             "activeDeadlineSeconds": config.timeout_seconds,
-            "ttlSecondsAfterFinished": _JOB_TTL_S,
+            "ttlSecondsAfterFinished": JOB_TTL_S,
             "template": {
                 "metadata": {"labels": labels},
                 "spec": {
@@ -630,7 +622,7 @@ def _poll(
     """Return ``(succeeded, reason, message)``, or None at the connector deadline."""
 
     start = clock()
-    limit = start + config.timeout_seconds + _DEADLINE_GRACE_S
+    limit = start + config.timeout_seconds + JOB_DEADLINE_GRACE_S
     path = f"/apis/batch/v1/namespaces/{namespace}/jobs/{job}"
     while True:
         code, payload = checked_request(cluster, "GET", path)
@@ -639,7 +631,7 @@ def _poll(
             raise ClusterError(f"{REFUSAL_BUILD_FAILED}: the environment was removed")
         if code != 200:
             raise ClusterError(f"the test cluster did not answer a build Job read ({code})")
-        state = _job_state(payload.get("status"))
+        state = job_state(payload.get("status"))
         if state is not None:
             return state
         if clock() >= limit:
@@ -647,55 +639,12 @@ def _poll(
         sleep(config.poll_seconds)
 
 
-def _job_state(status: Any) -> tuple[bool, str, str] | None:
-    if not isinstance(status, dict):
-        return None
-    conditions = status.get("conditions")
-    for item in conditions if isinstance(conditions, list) else []:
-        if not isinstance(item, dict) or item.get("status") != "True":
-            continue
-        reason = str(item.get("reason") or "")
-        message = str(item.get("message") or "")
-        if item.get("type") == "Failed":
-            return False, reason, message
-        if item.get("type") == "Complete":
-            return True, reason, message
-    if isinstance(status.get("succeeded"), int) and status["succeeded"] > 0:
-        return True, "", ""
-    if isinstance(status.get("failed"), int) and status["failed"] > 0:
-        return False, "", ""
-    return None
-
-
-def _job_pods(cluster: ClusterApi, namespace: str, job: str) -> list[dict[str, Any]]:
-    selector = urllib.parse.quote(f"job-name={job}", safe="")
-    code, payload = checked_request(
-        cluster, "GET", f"/api/v1/namespaces/{namespace}/pods?labelSelector={selector}"
-    )
-    if code != 200:
-        return []
-    items = payload.get("items")
-    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
-
-
-def _statuses(pod: dict[str, Any], key: str) -> list[dict[str, Any]]:
-    status = pod.get("status")
-    found = status.get(key) if isinstance(status, dict) else None
-    return [item for item in found if isinstance(item, dict)] if isinstance(found, list) else []
-
-
-def _terminated(container: dict[str, Any]) -> dict[str, Any] | None:
-    state = container.get("state")
-    terminated = state.get("terminated") if isinstance(state, dict) else None
-    return terminated if isinstance(terminated, dict) else None
-
-
 def _pushed_digest(pods: list[dict[str, Any]], repo: str) -> str:
     for pod in pods:
-        for container in _statuses(pod, "containerStatuses"):
+        for container in container_statuses(pod, "containerStatuses"):
             if container.get("name") != "push":
                 continue
-            terminated = _terminated(container)
+            terminated = terminated_state(container)
             message = terminated.get("message") if terminated else None
             if not isinstance(message, str):
                 continue
@@ -711,8 +660,8 @@ def _failure_reason(pods: list[dict[str, Any]]) -> str:
     by_name: dict[str, dict[str, Any]] = {}
     for pod in pods:
         for key in ("initContainerStatuses", "containerStatuses"):
-            for container in _statuses(pod, key):
-                terminated = _terminated(container)
+            for container in container_statuses(pod, key):
+                terminated = terminated_state(container)
                 name = container.get("name")
                 if terminated is not None and isinstance(name, str):
                     by_name.setdefault(name, terminated)
@@ -757,7 +706,7 @@ def _redact(text: str, secrets: set[str]) -> str:
 def _delete_if_built_by(cluster: ClusterApi, namespace: str, name: str, job: str) -> None:
     """Delete Secret ``name`` only if it exists and carries this build's label.
 
-    Best effort like ``_delete_quietly``: never masks the error being raised.
+    Best effort like ``delete_quietly``: never masks the error being raised.
     Logs never name the Secret, only that cleanup of one failed.
     """
 
@@ -783,20 +732,4 @@ def _delete_if_built_by(cluster: ClusterApi, namespace: str, name: str, job: str
             "e2e build cleanup left a Secret in namespace=%s: it is not this build's", namespace
         )
         return
-    _delete_quietly(cluster, path, "a build Secret")
-
-
-def _delete_quietly(cluster: ClusterApi, path: str, what: str) -> None:
-    """Best effort cleanup that never masks the error being raised.
-
-    ``what`` is a fixed description; the log never carries the path, which can
-    name a credential Secret.
-    """
-
-    try:
-        code, _payload = cluster.request("DELETE", path)
-    except ClusterError:
-        logger.warning("e2e build cleanup could not reach the cluster to delete %s", what)
-        return
-    if not (200 <= code < 300 or code == 404):
-        logger.warning("e2e build cleanup was refused deleting %s (%s)", what, code)
+    delete_quietly(cluster, path, "a build Secret")
