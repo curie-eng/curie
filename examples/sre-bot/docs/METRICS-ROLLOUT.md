@@ -82,6 +82,43 @@ the Collector metrics pipeline, Prometheus flags, and `/api/v1/rules` against
 the evidence class you are claiming. Do not delete persistent volumes as part
 of a routine rollback.
 
+## Alloy log-collection alerts
+
+The shipped Prometheus scrapes each Alloy DaemonSet pod on `/metrics`; a
+load-balanced Alloy Service would hide one broken node behind a healthy one.
+The two per-pod rules retain the `namespace`, `pod`, and `node` labels. Check
+the observed target and rules without reading private log bodies:
+
+```bash
+kubectl get pods -n observability -l app.kubernetes.io/instance=alloy -o wide
+kubectl get daemonset -n observability alloy -o yaml
+kubectl port-forward -n observability svc/prometheus-server 9090:80 &
+curl -fsS 'http://localhost:9090/api/v1/query?query=up%7Bjob%3D%22kubernetes-pods%22%2Cnamespace%3D%22observability%22%7D'
+curl -fsS 'http://localhost:9090/api/v1/alerts'
+```
+
+`CurieAlloyNoActiveLogFiles` means Prometheus can scrape a pod, but that
+pod's file source has zero active files or no active-file metric for 10
+minutes. Check whether the node is running Docker or a CRI runtime, the
+installed Alloy parser and host log mounts, and the pod's permissions.
+A pod Prometheus cannot scrape is `CurieAlloyScrapeMissing`, not this alert.
+
+`CurieAlloyLogDeliveryStopped` means the same pod read lines in the last
+15 minutes but its Loki writer sent none, sustained for 5 minutes. The send
+window has to empty first, so it fires about 20 minutes after the last
+successful send. Check `loki.write`, network egress and Loki availability.
+An attached collector with no new lines is quiet and does not trigger this
+alert. In a disposable environment, prove inactive → pending → firing by
+generating a unique test log line while disabling only an owned receiver,
+allowing at least 20 minutes; restore it and confirm the alert clears. Do not
+disrupt the permanent soak to test the rule.
+
+`CurieAlloyScrapeMissing` means the Alloy DaemonSet wants more pods than
+Prometheus scrapes with `up == 1`, for 10 minutes. The per-pod rules above
+cannot see a pod that is not scraped, so this is the page for a pod that is
+not running, a blocked metrics port, or a lost scrape annotation. Compare
+`kubectl get daemonset -n observability alloy` with the `up` query above.
+
 ## Correlation without private bodies
 
 High-cardinality identity belongs in logs and traces, not metric labels. See

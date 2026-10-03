@@ -2,7 +2,10 @@
 
 Date: 2026-09-27
 
-Status: Draft
+Status: Accepted
+
+Accepted with explicit maintainer approval from Brian Conn in the pull request
+that published this status, before implementation.
 
 This ADR extends [ADR-0168](0168-one-installation-hosts-several-bot-identities.md)
 decision 7. It does not supersede it: admission by `admits:` stays exactly as

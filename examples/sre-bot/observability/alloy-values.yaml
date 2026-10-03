@@ -2,6 +2,10 @@ crds:
   create: false
 controller:
   type: daemonset
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: /metrics
+    prometheus.io/port: "12345"
   volumes:
     extra:
       - name: alloy-data

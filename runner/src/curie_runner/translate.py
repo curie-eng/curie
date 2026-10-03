@@ -28,6 +28,7 @@ from aci_protocol import (
     SessionStatus,
     SideEffectFlag,
     TextDelta,
+    ToolAccess,
     ToolNote,
 )
 from claude_agent_sdk import (
@@ -134,6 +135,10 @@ def _is_credit_exhausted(error: str, provider_text: str) -> bool:
 class TurnState:
     """Mutable per-turn state threaded through translation."""
 
+    # The turn's tool access (RUNNER-TOOL-ACCESS-3). Under ``READ_ONLY`` the
+    # approval and publication requests below are never captured: the calls
+    # are refused before they execute, so there is no request to report.
+    tool_access: ToolAccess | None = None
     side_effect_emitted: bool = False
     error_classification: str | None = None
     # The summary passed to the approval-request tool (ADR-0010), captured off
@@ -174,10 +179,16 @@ class TurnState:
     # conversation transcript (#20/#1902); left None for failure, budget, auth,
     # and idle outcomes so those turns are not persisted as history.
     final_text: str | None = None
+    # The prompt this turn sent the harness, recorded as the turn's user message
+    # so the history shows which message carried this boot's attachments
+    # (#3691). None until the turn queries; the inbound text is then the default.
+    prompt_text: str | None = None
     # Ordered provider-neutral messages captured from the harness stream for
     # durable replay. The inbound user message is prepended by SessionRunner;
     # this list holds assistant output and user-shaped tool results.
     history_messages: list[ConversationMessage] = field(default_factory=list)
+    # Opaque identity from an observed provider message_start, history only.
+    assistant_group: str | None = field(default=None, repr=False)
     # Call id -> tool name, for side-effecting calls whose result has not arrived
     # yet. A tool result lands on a LATER message, so the name has to be
     # remembered to attribute it, and the id is what joins the two frames of one
@@ -213,6 +224,20 @@ class TurnState:
     # field: the session turns it into a fail-closed classified failure, because
     # a publication the runner cannot record must not look like a clean turn.
     publication_unrecorded: str | None = None
+    # Call id -> live tool name for EVERY call seen this turn (#3486), read-only
+    # ones included, unlike ``pending_actions``. Popped by the result that
+    # closes the call, so a result for an id this turn never saw, or a second
+    # result for one id, finds nothing.
+    open_tool_calls: dict[str, str] = field(default_factory=dict)
+    # (call id, live tool name, ``is_error is True``, CLI unknown-tool marker)
+    # for each result that closed a call
+    # in ``open_tool_calls``, in arrival order (#3486). Wire-level facts only,
+    # never the result's content. Captured here, counted in
+    # ``SessionRunner._observe_tool_results``: the same split as
+    # ``publication_calls``, and for the same reason.
+    tool_results: list[tuple[str, str, bool, bool]] = field(default_factory=list)
+    # How many of ``tool_results`` the session has already counted.
+    tool_results_observed: int = 0
 
 
 def translate_message(
@@ -303,18 +328,20 @@ def _translate_assistant(
             # Every tool call is evidence for the false-completion check (#517),
             # including the approval-request tool below and read-only tools.
             state.tool_call_count += 1
+            state.open_tool_calls[block.id] = block.name
             if gen is not None:
                 # The SDK block says only that a tool interval should be
                 # inferred. It is not proof this runner executed the tool.
                 gen.tool_use(block.id, block.name)
-            if block.name == PLATFORM_PUBLISH_TOOL_NAME:
+            # @spec RUNNER-TOOL-ACCESS-3: a read-only turn captures no request.
+            if block.name == PLATFORM_PUBLISH_TOOL_NAME and state.tool_access is None:
                 # Wire-level capture only (#2294). The session decides what to
                 # do with it; recording it here would put gate state in a
                 # deliberately pure module.
                 state.publication_calls.append(
                     (block.id, block.input if isinstance(block.input, dict) else {})
                 )
-            if block.name == APPROVAL_TOOL_NAME:
+            if block.name == APPROVAL_TOOL_NAME and state.tool_access is None:
                 # A policy gate fired (ADR-0010). Capture the summary (and the
                 # optional route, #247) at the wire level so the real path
                 # (executed in-process tool) and the fake path (scripted
@@ -373,6 +400,11 @@ def _translate_user(
     a repository on the wire. A side-effecting call is different -- its reply is
     the only place a connector can report what the call did to the world, which is
     what makes the action recordable at all (ADR-0117).
+
+    Every result that closes a call seen this turn is also noted on
+    ``state.tool_results`` (#3486): the call id, tool name, whether ``is_error``
+    is True, and an exact CLI unknown-tool envelope marker. The marker alone
+    is insufficient provenance; the session checks the SDK init catalog too.
     """
 
     if isinstance(message.content, str):
@@ -385,6 +417,19 @@ def _translate_user(
             continue
         if gen is not None:
             gen.tool_result(block.tool_use_id, failed=bool(block.is_error))
+        called = state.open_tool_calls.pop(block.tool_use_id, None)
+        if called is not None:
+            # Only True is an error: the CLI reports a successful MCP call as
+            # None and a failed one as True (#3486).
+            # The CLI's exact unknown-tool envelope is only a candidate here:
+            # an MCP server can return identical text. The session also needs
+            # the CLI init catalog to prove this name was never advertised.
+            unknown_marker = block.content == (
+                f"<tool_use_error>Error: No such tool available: {called}</tool_use_error>"
+            )
+            state.tool_results.append(
+                (block.tool_use_id, called, block.is_error is True, unknown_marker)
+            )
         tool = state.pending_actions.pop(block.tool_use_id, None)
         if tool is None:
             # Read-only, or a result for a call this turn never saw, or a second

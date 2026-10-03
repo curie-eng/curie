@@ -112,6 +112,7 @@ class OneAgentTwoBindings:
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         return {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
@@ -214,6 +215,7 @@ class RecordingSubstrate:
         agent_name: str | None = None,
         runner_resources: dict[str, Any] | None = None,
         fresh_only: bool = False,
+        caller_run: str | None = None,
     ) -> Any:
         handle = self._inner.claim(
             thread_key,
@@ -221,6 +223,7 @@ class RecordingSubstrate:
             agent_name=agent_name,
             runner_resources=runner_resources,
             fresh_only=fresh_only,
+            caller_run=caller_run,
         )
         self.claims.append((thread_key, handle.sandbox_name))
         return handle
@@ -231,8 +234,11 @@ class RecordingSubstrate:
         *,
         env: dict[str, str] | None = None,
         agent_name: str | None = None,
+        caller_run: str | None = None,
     ) -> Any:
-        handle = self._inner.resume(thread_key, env=env, agent_name=agent_name)
+        handle = self._inner.resume(
+            thread_key, env=env, agent_name=agent_name, caller_run=caller_run
+        )
         self.claims.append((thread_key, handle.sandbox_name))
         return handle
 

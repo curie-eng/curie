@@ -35,6 +35,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
+from .approval_wording import approval_display
 from .db import SCHEMA, Base
 from .repo_full_name import normalize_repo_full_name
 
@@ -470,6 +471,11 @@ class Approval(Base):
     # The human-readable statement of what needs approval, from the run's
     # approval request (the ACI final's approval_summary).
     summary: Mapped[str]
+    @property
+    def display_summary(self) -> str:
+        """Computed presentation; grants still bind to the stored exact fields."""
+        return approval_display(self.summary, self.granted_tool, self.granted_arguments)
+
     # The reply handle of the requesting turn, replayed onto the resume turn so
     # the resumed run streams into the same placeholder message.
     #
@@ -666,6 +672,16 @@ class WorkItem(Base):
             "AND readmit_objective IS NOT NULL)",
             name="work_items_readmit_ck",
         ),
+        CheckConstraint(
+            "(base_branch IS NULL AND base_source IS NULL AND base_commit IS NULL) OR "
+            "(base_branch IS NOT NULL AND base_source IS NOT NULL "
+            "AND base_commit IS NOT NULL)",
+            name="work_items_base_ck",
+        ),
+        CheckConstraint(
+            "base_source IS NULL OR base_source IN ('label', 'default')",
+            name="work_items_base_source_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -696,6 +712,19 @@ class WorkItem(Base):
     )
     readmit_requester: Mapped[str | None] = mapped_column(Text, default=None)
     readmit_objective: Mapped[str | None] = mapped_column(Text, default=None)
+    # The base resolved for that deferred relabel (ADR 0186). It replaces the
+    # recorded base only when the replacement request is admitted.
+    readmit_base_branch: Mapped[str | None] = mapped_column(Text, default=None)
+    readmit_base_source: Mapped[str | None] = mapped_column(Text, default=None)
+    readmit_base_commit: Mapped[str | None] = mapped_column(Text, default=None)
+    # The base resolved at admission and frozen for every later run (ADR
+    # 0186). All three are NULL on a legacy row, which uses the repository
+    # default branch. ``base_label_ignored`` is the branch a later ``base:``
+    # label names when it disagrees with the recorded one.
+    base_branch: Mapped[str | None] = mapped_column(Text, default=None)
+    base_source: Mapped[str | None] = mapped_column(Text, default=None)
+    base_commit: Mapped[str | None] = mapped_column(Text, default=None)
+    base_label_ignored: Mapped[str | None] = mapped_column(Text, default=None)
     version: Mapped[int] = mapped_column(default=1, server_default="1")
     next_sequence: Mapped[int] = mapped_column(default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(
@@ -1628,11 +1657,16 @@ class AgentAction(Base):
         platform would then offer an undo it cannot honor. Deny-by-default falls
         out of this: a third-party tool that reports neither a prior state nor a
         target lands on ``False`` without anyone declaring anything.
+
+        ``post_state`` is required too: the undo route compares the live resource
+        against it and refuses without it, so a row lacking it is not one an undo
+        can be granted on.
         """
 
         return (
             self.status == ActionStatus.succeeded
             and self.prior_state is not None
+            and self.post_state is not None
             and self.target is not None
             and self.undone_at is None
         )
@@ -1984,6 +2018,39 @@ class PrincipalTeam(Base):
     )
 
 
+class FactoryPollCursor(Base):
+    """One repository's factory poll cursors and conditional-request tags (#3745)."""
+
+    __tablename__ = "factory_poll_cursors"
+    __table_args__ = (
+        CheckConstraint(
+            "repository_id IS NULL OR repository_id > 0",
+            name="factory_poll_cursors_repository_id_ck",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(etags) = 'object'",
+            name="factory_poll_cursors_etags_object_ck",
+        ),
+    )
+
+    repo_full_name: Mapped[str] = mapped_column(Text, primary_key=True)
+    repository_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    comments_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    review_comments_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    reviews_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    etags: Mapped[dict[str, Any]] = mapped_column(JSONB,
+        nullable=False, server_default=text("'{}'::jsonb"), default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 # A secret-store reference, never a value (#2909): ``env:NAME`` or
 # ``k8s-secret:name/key``. The DB CHECK and the API's 422 both use it.
 PROVIDER_REFERENCE_PATTERN = (
@@ -2013,7 +2080,16 @@ def _provider_reference_check(column: str) -> CheckConstraint:
 
 
 class ProviderInstallation(Base):
-    """One connected external account, such as one Slack workspace (#2909, ADR 0155 step 4).
+    """One channel identity: a bot speaking through one connected account.
+
+    #2909, ADR 0166 step 4, as amended by ADR 0168 decision 1: "An identity is
+    a provider installation." ``name`` is unique within the provider and tenant
+    and is what a binding's ``adapter`` names (decision 3): one Slack workspace
+    with two bots is two rows sharing one ``external_account_id`` but never a
+    ``name``. ``attributes`` holds whatever that provider's identity needs
+    beyond the fixed columns -- for Slack, the app-token reference alongside
+    ``credential_ref``'s bot-token reference, and later the team, app and bot
+    user ids once something resolves them.
 
     ``credential_ref`` and ``webhook_verification_ref`` point into the
     deployment's secret store; the CHECKs hold them to the reference grammar
@@ -2048,8 +2124,8 @@ class ProviderInstallation(Base):
         UniqueConstraint(
             "tenant_id",
             "provider",
-            "external_account_id",
-            name="provider_installations_tenant_provider_external_key",
+            "name",
+            name="provider_installations_tenant_provider_name_key",
         ),
         # Target of identity_links' tenant-scoped foreign key (#2910).
         UniqueConstraint("tenant_id", "id", name="provider_installations_tenant_id_id_key"),
@@ -2060,11 +2136,19 @@ class ProviderInstallation(Base):
         ForeignKey(f"{SCHEMA}.tenants.id", name="provider_installations_tenant_id_fkey")
     )
     provider: Mapped[str] = mapped_column(String)
+    # Unique with (tenant_id, provider); what a binding's `adapter` names
+    # (ADR 0168 decision 3). "default" is the one identity an install need not
+    # name explicitly.
+    name: Mapped[str] = mapped_column(String, default="default", server_default="default")
     external_account_id: Mapped[str] = mapped_column(String)
     display_name: Mapped[str | None] = mapped_column(default=None)
     credential_ref: Mapped[str | None] = mapped_column(default=None)
     scopes: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
     webhook_verification_ref: Mapped[str | None] = mapped_column(default=None)
+    # Provider-specific identity details that don't fit a fixed column (ADR
+    # 0168 decision 1): for Slack, today just the app-token reference; later,
+    # once something resolves them, the team/app/bot user ids.
+    attributes: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default="{}")
     status: Mapped[str] = mapped_column(String, default="connected", server_default="connected")
     installed_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), default=None

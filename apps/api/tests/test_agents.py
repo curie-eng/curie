@@ -751,9 +751,10 @@ def test_the_published_agent_update_has_no_channel_property_at_all() -> None:
 
     read = schemas["AgentOut"]["properties"]["channels"]
     assert read.get("type") == "array", read
-    # Still the binding object, one element type: this cannot be satisfied by
-    # loosening the read surface to a bare list of anything.
-    assert json.dumps(read).count("#/components/schemas/ChannelBinding") == 1, read
+    # Still the binding READ object, one element type: this cannot be satisfied
+    # by loosening the read surface to a bare list of anything, nor by pointing
+    # it at the neutral pair or the write model, which share its name prefix.
+    assert read.get("items") == {"$ref": "#/components/schemas/ChannelBindingOut"}, read
 
 
 @pytest.fixture
@@ -1336,7 +1337,7 @@ def test_malformed_stored_route_addresses_remain_readable_for_repair(
         "managers": {
             "resolution": {"kind": "slack", "address": "#legacy-resolution"},
             "notification": {"kind": "email", "address": "bad address"},
-            "approvers": {"group": "not-a-group", "users": ["not-a-user"]},
+            "approvers": {"group": "not-a-group", "users": ["not-a-user"], "emails": None},
         }
     }
 
@@ -1387,7 +1388,7 @@ def test_agent_approval_routes_with_approvers_round_trip(
         "managers": {
             "resolution": _slack("C0EXAMPLE1"),
             "notification": None,
-            "approvers": {"group": "S000000G1", "users": None},
+            "approvers": {"group": "S000000G1", "users": None, "emails": None},
         }
     }
 
@@ -1411,6 +1412,7 @@ def test_agent_approval_routes_with_approvers_round_trip(
             "approvers": {
                 "group": None,
                 "users": ["U000000U1", "W000000E1"],
+                "emails": None,
             },
         }
     }
@@ -1441,6 +1443,7 @@ def test_agent_approval_routes_accepts_both_users_and_group(
     assert created.json()["approval_routes"]["managers"]["approvers"] == {
         "group": "S000000G2",
         "users": ["U000000U2"],
+        "emails": None,
     }
 
 

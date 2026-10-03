@@ -34,8 +34,8 @@ use crate::chat::{
 use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
 use crate::queue::{
-    self, connect, diagnostics, eval_case_turn, queue_thread_reset, speak_as, synthetic_turn,
-    thread_key_for_turn, xadd,
+    self, connect, diagnostics, eval_case_turn, name_relay_identity, queue_thread_reset, speak_as,
+    synthetic_turn, thread_key_for_turn, xadd,
 };
 use crate::state::{save_turn, TurnContext, TurnVerb};
 
@@ -75,6 +75,10 @@ pub const DEFAULT_API_KEY: &str = "curie-dev-key";
 ///
 /// Mirrors the rule already settled in `ops.rs::resolve_up_credentials`,
 /// `local.rs::model_mode_from_env`, and `secrets.rs::save_value`.
+///
+/// The per-install key `curie local up` stores (#3557) is NOT substituted here:
+/// the parser does not know where the request goes. `ApiClient::new` swaps the
+/// sentinel for the stored key, and only for a loopback destination.
 pub fn api_key_or_default(raw: &str) -> Result<String, String> {
     Ok(resolve_api_key(raw, env::var("CURIE_API_KEY").ok()))
 }
@@ -741,9 +745,12 @@ fn cluster_relay_page_outcome(
 
 /// One disconnected cluster turn plus the opaque API bucket the worker will
 /// write. The normal Slack binding coordinates stay intact so agent resolution
-/// does not diverge; only reply delivery selects the reserved built-in adapter.
+/// does not diverge; only reply delivery selects the reserved built-in adapter,
+/// and a named binding's identity rides in `reply_handle.identity`
+/// (INGRESS-CANARY-1).
 fn cluster_relay_turn(
     channel: &str,
+    identity: Option<&str>,
     opts: &MessageOpts,
     conversation_id: &str,
 ) -> (QueuedTurn, uuid::Uuid) {
@@ -761,7 +768,7 @@ fn cluster_relay_turn(
         .as_mut()
         .expect("cluster relay turns are targeted")
         .adapter = Some(CLUSTER_MESSAGE_RELAY_ADAPTER.to_string());
-    (turn, reply_ref)
+    (name_relay_identity(turn, identity), reply_ref)
 }
 
 struct ClusterRelayObservation {
@@ -965,8 +972,7 @@ fn refuse_named_route(
          the installation's default bot, so it would reach a different binding"
     ))
     .with_fix(format!(
-        "drive this agent with `eval --agent {agent}`, which sends through the reply stub, or \
-         mention the `{identity}` bot in Slack"
+        "drive this agent with `eval --agent {agent}`, or mention the `{identity}` bot in Slack"
     ))
     .into())
 }
@@ -998,25 +1004,6 @@ fn refuse_named_route_for_cluster_connected(
         agent.unwrap_or_default(),
         channel,
         "the connected Slack transport",
-    )
-}
-
-/// The named-route refusal for `message_cluster`'s disconnected relay lane
-/// (the missing-carrier compatibility control #1817 requires, which always
-/// speaks as the installation's default bot). Factored out so a test can reach
-/// it without a live cluster, and a mutant that drops the call site there goes
-/// red.
-/// @spec ADR-0168 d8.
-fn refuse_named_route_for_relay(
-    identity: Option<&str>,
-    agent: Option<&str>,
-    channel: &str,
-) -> Result<()> {
-    refuse_named_route(
-        identity,
-        agent.unwrap_or_default(),
-        channel,
-        "the disconnected cluster relay",
     )
 }
 
@@ -1143,8 +1130,8 @@ pub fn dry_run_lines(opts: &MessageOpts, _advertise_host: &str) -> Vec<String> {
     ));
     if opts.agent.is_some() {
         lines.push(
-            "a named identity's route is refused here: both the disconnected relay and the \
-             connected Slack transport speak as the installation's default bot"
+            "a named binding's identity rides the relay turn as reply_handle.identity; the \
+             connected Slack transport speaks as the installation's default bot and refuses it"
                 .to_string(),
         );
     }
@@ -2437,6 +2424,37 @@ async fn hint_channel(
     deadline: Instant,
     budget: Duration,
 ) -> String {
+    hint_channel_with_cluster_plumbing(opts, verb, turn_channel, id, deadline, budget, async {
+        let fullname = crate::ops::release_fullname(&opts.namespace, &opts.release).await;
+        start_port_forward(
+            &port_forward_command(
+                &opts.namespace,
+                &fullname,
+                "api",
+                opts.api_local_port,
+                API_REMOTE_PORT,
+            ),
+            opts.api_local_port,
+            "api",
+        )
+        .await
+    })
+    .await
+}
+
+/// Keep cluster plumbing lazy so its startup and child share the lookup scope.
+async fn hint_channel_with_cluster_plumbing<F>(
+    opts: &MessageOpts,
+    verb: TurnVerb,
+    turn_channel: &str,
+    id: &str,
+    deadline: Instant,
+    budget: Duration,
+    cluster_plumbing: F,
+) -> String
+where
+    F: std::future::Future<Output = Result<(tokio::process::Child, u16)>>,
+{
     let lookup = async {
         // The port-forward guard is bound HERE, in the enclosing async block,
         // and deliberately NOT inside the cluster match arm. `start_port_forward`
@@ -2465,20 +2483,7 @@ async fn hint_channel(
                 local_api_base(opts.api_url.as_deref()),
             ),
             TurnVerb::Cluster => {
-                let fullname = crate::ops::release_fullname(&opts.namespace, &opts.release).await;
-                let (api_pf, api_local_port) = start_port_forward(
-                    &port_forward_command(
-                        &opts.namespace,
-                        &fullname,
-                        "api",
-                        opts.api_local_port,
-                        API_REMOTE_PORT,
-                    ),
-                    opts.api_local_port,
-                    "api",
-                )
-                .await
-                .ok()?;
+                let (api_pf, api_local_port) = cluster_plumbing.await.ok()?;
                 (Some(api_pf), format!("http://127.0.0.1:{api_local_port}"))
             }
         };
@@ -3490,7 +3495,6 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     // deployed agent via a short-lived API port-forward (#766). Shared with
     // the connected path.
     let (channel, agent_hint, identity) = resolve_cluster_channel(&opts, &fullname).await?;
-    refuse_named_route_for_relay(identity.as_deref(), agent_hint.as_deref(), &channel)?;
     ui.plumbing(&format!("routing to channel {channel}"));
 
     // The worker self-dials the in-cluster API; this distinct loopback tunnel is
@@ -3517,7 +3521,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     );
     let mut conn = connect(&valkey_url).await?;
     let (channel, thread_ts, _) = resolve_targets(Some(&channel), opts.thread.as_deref());
-    let (event, reply_ref) = cluster_relay_turn(&channel, &opts, &thread_ts);
+    let (event, reply_ref) = cluster_relay_turn(&channel, identity.as_deref(), &opts, &thread_ts);
     let stream_id = xadd(&mut conn, &opts.stream, &event).await?;
     ui.plumbing(&format!(
         "enqueued {} on {} as {stream_id}",
@@ -3586,7 +3590,12 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
             persist_turn_quietly(&opts, TurnVerb::Cluster, &channel, &thread_ts);
             // The API resume queue preserves this turn's reply handle, so keep
             // polling the same opaque bucket through any approval resolution.
-            match approval_id {
+            // A named relay turn is the exception (#3683): its resume does not
+            // carry the identity yet, so it would resolve the channel's default
+            // binding, and the bucket would print that agent's answer. Park it
+            // the way an unparseable approval id is parked.
+            let follow_resume = identity.is_none();
+            match approval_id.filter(|_| follow_resume) {
                 Some(id) => {
                     let remaining = Duration::from_secs(opts.timeout_secs)
                         .saturating_sub(wait_started.elapsed());
@@ -4020,7 +4029,7 @@ async fn run_eval_turns(
                             .as_mut()
                             .expect("eval turns are targeted")
                             .adapter = Some(CLUSTER_MESSAGE_RELAY_ADAPTER.to_string());
-                        (event, Some(reply_ref))
+                        (name_relay_identity(event, identity), Some(reply_ref))
                     }
                 };
                 // The worker claims under quote(kind):quote(channel):quote(conversation_id),
@@ -5132,14 +5141,6 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
             .await
             .context("listing agents through the api port-forward")?;
         let route = select_agent_route(&agents, agent, opts.channel.as_deref())?;
-        // Cluster eval replies come back through the message relay, which
-        // speaks only as the default identity (ADR-0168 d8).
-        refuse_named_route(
-            route.identity.as_deref(),
-            agent,
-            &route.channel,
-            "the cluster message relay",
-        )?;
         (route.channel, route.identity)
     } else {
         let channel = match opts.channel.as_deref() {
@@ -6260,205 +6261,134 @@ mod tests {
         }
     }
 
-    // ─── #1531 finding 3, cluster arm: degradation without a leaked child ────
-    //
-    // Everything above drives `TurnVerb::Local`, whose tier dispatch is a plain
-    // base URL. The CLUSTER arm reaches the API through a short-lived
-    // `kubectl port-forward` child instead, and until now no automated test
-    // entered it at all. The test below covers its FAILURE path only: the
-    // forward cannot start, so the lookup has no answer. The SUCCESS path,
-    // where the forward binds and the GET returns a card channel, needs a live
-    // cluster with a real release in it and is therefore recorded separately as
-    // tier evidence rather than asserted here.
-
-    /// The namespace and release this test's cluster-tier `MessageOpts` name.
-    ///
-    /// Deliberately values no real deployment would ever use, because the leak
-    /// assertion counts processes by these strings. A developer running an
-    /// unrelated `kubectl port-forward` against a real release on the same box
-    /// must not be counted by that scan, must not be killed, and must not be
-    /// able to fail this test.
-    const HINT_CLUSTER_NAMESPACE: &str = "curie-hint-1531-absent-namespace";
-    const HINT_CLUSTER_RELEASE: &str = "curie-hint-1531-absent-release";
-
-    /// A cluster-tier turn. There is no `api_url` to point anywhere, unlike
-    /// [`hint_opts`]: on this tier the namespace and release ARE the dispatch,
-    /// since they are what [`port_forward_command`] renders into the child's
-    /// argv. The local port is likewise a value nothing else on the box is
-    /// expected to hold, so a real forward is never disturbed.
-    fn hint_cluster_opts() -> MessageOpts {
-        MessageOpts {
-            api_key: HINT_API_KEY.to_string(),
-            namespace: HINT_CLUSTER_NAMESPACE.to_string(),
-            release: HINT_CLUSTER_RELEASE.to_string(),
-            api_local_port: 18531,
-            local: false,
-            ..MessageOpts::default()
-        }
-    }
-
-    /// The `svc/<release>-api` argument [`port_forward_command`] builds for
-    /// [`hint_cluster_opts`]: the token that identifies a child THIS test
-    /// caused, and nothing else.
-    fn hint_cluster_forward_target() -> String {
-        format!("svc/{HINT_CLUSTER_RELEASE}-api")
-    }
-
-    /// How many live processes carry both this test's namespace and its
-    /// `svc/<release>-api` target on their command line.
-    ///
-    /// A count, never a kill: the assertion compares this before and after, so
-    /// an unrelated pre existing forward cancels out instead of failing the
-    /// test, and no process this test did not start is ever signalled.
-    ///
-    /// A zombie has an EMPTY `cmdline` in `/proc`, so a child that has already
-    /// exited but is still awaiting reap is not counted. That is what keeps the
-    /// assertion free of reap timing flake: the question is whether a forward is
-    /// still RUNNING, not whether its slot is cleared.
-    #[cfg(target_os = "linux")]
-    fn hint_cluster_port_forwards() -> usize {
-        let target = hint_cluster_forward_target();
-        let Ok(entries) = std::fs::read_dir("/proc") else {
-            return 0;
-        };
-        entries
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
-                    return false;
-                };
-                // `/proc` separates argv with NUL; joining on spaces makes the
-                // needles read like the argv `port_forward_command` renders.
-                let argv = String::from_utf8_lossy(&raw).replace('\0', " ");
-                argv.contains(HINT_CLUSTER_NAMESPACE) && argv.contains(&target)
-            })
-            .count()
-    }
-
-    /// The same count where there is no `/proc` to walk. `pgrep -f` matches the
-    /// same space joined argv, and a box with neither `/proc` nor `pgrep`
-    /// answers zero on both sides of the call, which leaves the delta assertion
-    /// true rather than falsely red.
-    #[cfg(not(target_os = "linux"))]
-    fn hint_cluster_port_forwards() -> usize {
-        let Ok(out) = std::process::Command::new("pgrep")
-            .arg("-f")
-            .arg(hint_cluster_forward_target())
-            .output()
-        else {
-            return 0;
-        };
-        out.stdout
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .count()
-    }
-
-    /// The cluster arm degrades to the turn channel when the port forward cannot
-    /// start, stays inside its budget, and leaves no `kubectl port-forward`
-    /// child behind ON THAT PATH.
-    ///
-    /// The input is always "the forward did not bind", in every environment this
-    /// test can run in, and the contract is identical in each, so none of them
-    /// is skipped: a developer box whose `kubectl` has no current context errors
-    /// out at once, CI where `kubectl` is not on PATH fails the spawn, and a box
-    /// with a live cluster still has no such namespace as
-    /// [`HINT_CLUSTER_NAMESPACE`].
-    ///
-    /// What it covers:
-    ///
-    /// 1. DEGRADATION (#1531 finding 3). The hint tells a human where the
-    ///    approval card was posted. A cluster whose API cannot be reached knows
-    ///    nothing about the card, so it must print exactly what the hint printed
-    ///    before this change. A wrong or empty channel sends the operator to the
-    ///    wrong place, which is the failure #1531 exists to remove.
-    /// 2. BOUND. The lookup runs INSIDE the resume wait, so a cluster arm that
-    ///    sat on `start_port_forward` would freeze a terminal on a turn whose
-    ///    durable approval is already fine.
-    /// 3. NO CHILD LEFT BEHIND on the failed-bind path: a spawn that somehow
-    ///    outlives a bind that failed would show up as a nonzero delta.
-    ///
-    /// What it does NOT cover, said plainly so no reader takes more from it than
-    /// it gives. Because `start_port_forward` always ERRORS here, no guard is
-    /// ever constructed, and the child count is zero on both sides of the call.
-    /// The guard's drop on the SUCCESS path -- which is the #751/#766 regression
-    /// class proper -- is therefore untested by this test: hoisting the guard out
-    /// of the lookup, leaking it with `std::mem::forget`, or dropping
-    /// `kill_on_drop` would all still pass here, because none of them can run.
-    /// That property rests on the live cluster verification this ticket requires
-    /// (`pgrep -f "kubectl port-forward"` empty after a turn that actually bound
-    /// one), and nothing in `cargo test` can stand in for it.
-    ///
-    /// Mutations it does catch: replacing the degraded arm with the card channel
-    /// unwrapped, or with an empty string, fails assertion 1; deleting the
-    /// wrapping `tokio::time::timeout` so `start_port_forward`'s own 15 second
-    /// readiness deadline governs fails assertion 2, and a lookup that hangs
-    /// outright is caught by the outer harness timeout.
+    /// A stalled private executable drives the real readiness wait without
+    /// depending on kubectl, DNS, or a cluster. Each trial must spend its lookup
+    /// budget, return the turn channel, and kill the PID the shim recorded.
+    /// Removing the shared timeout fails the outer harness; removing
+    /// `kill_on_drop` leaves that known child alive and fails cleanup.
     #[tokio::test]
     async fn the_cluster_arm_degrades_without_leaking_a_port_forward() {
-        let opts = hint_cluster_opts();
-        let before = hint_cluster_port_forwards();
-
-        let started = Instant::now();
-        // The same harness safety net the local stall tests use, and wider than
-        // the budget under test on purpose: an implementation that lost its
-        // bound would otherwise hang CI instead of failing it.
-        let resolved = tokio::time::timeout(
-            HINT_CHANNEL_LOOKUP_BUDGET * 3,
-            hint_channel(
-                &opts,
-                TurnVerb::Cluster,
-                HINT_TURN_CHANNEL,
-                HINT_APPROVAL_ID,
-                hint_far_deadline(),
-                HINT_CHANNEL_LOOKUP_BUDGET,
-            ),
-        )
-        .await
-        .expect(
-            "the cluster lookup never returned within three budgets against a cluster it cannot \
-             reach, so nothing is bounding it: a real turn would sit here forever",
-        );
-        let elapsed = started.elapsed();
-
-        assert_eq!(
-            resolved, HINT_TURN_CHANNEL,
-            "a cluster whose API cannot be reached is 'no answer', and no answer \
-             means the hint prints exactly what it printed before this change"
-        );
-        assert!(
-            !resolved.is_empty(),
-            "the cluster hint must never report an empty card location; its \
-             unreachable-API fallback is the requesting channel"
-        );
-        // A forward that cannot bind fails at once on every environment listed
-        // above, so anything near the budget means the failure is being waited
-        // on rather than absorbed, and the bound is named rather than a literal
-        // so it tracks the constant if that is ever retuned.
-        assert!(
-            elapsed < HINT_CHANNEL_LOOKUP_BUDGET,
-            "the cluster lookup must stay inside its budget so it can never \
-             extend the resume wait; took {elapsed:?}"
-        );
-
-        // The kill is delivered on drop, so give the kernel a moment to land it
-        // before concluding a child survived (the same poll the abandoned docker
-        // child test uses).
-        let mut after = hint_cluster_port_forwards();
-        for _ in 0..100 {
-            if after <= before {
-                break;
+        fn child_running(pid: libc::pid_t) -> bool {
+            #[cfg(target_os = "linux")]
+            {
+                proc_state(pid as u32).is_some_and(|state| !matches!(state, 'Z' | 'X'))
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            after = hint_cluster_port_forwards();
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Signal zero probes only this PID and does not deliver a signal.
+                unsafe { libc::kill(pid, 0) == 0 }
+            }
         }
-        assert!(
-            after <= before,
-            "the cluster lookup leaked a `kubectl port-forward` for \
-             {} (before {before}, after {after}); an orphaned forward is the \
-             #751/#766 regression class, and this lookup runs once per gate",
-            hint_cluster_forward_target()
-        );
+
+        struct RecordedChildCleanup(PathBuf);
+
+        impl Drop for RecordedChildCleanup {
+            fn drop(&mut self) {
+                let Some(pid) = std::fs::read_to_string(&self.0)
+                    .ok()
+                    .and_then(|recorded| recorded.trim().parse::<libc::pid_t>().ok())
+                    .filter(|pid| *pid > 0)
+                else {
+                    return;
+                };
+                if child_running(pid) {
+                    // The private shim execs sleep with this recorded PID. Keep a
+                    // failed assertion from stranding its child on the host.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        std::fs::read_to_string("/proc/self/stat").expect("process state must be readable");
+
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let script = temp.path().join("stalled-port-forward");
+        crate::test_executable::install(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 60\n");
+        let opts = MessageOpts {
+            api_key: HINT_API_KEY.to_string(),
+            local: false,
+            ..MessageOpts::default()
+        };
+        let budget = Duration::from_millis(100);
+
+        for trial in 0..50 {
+            let pidfile = temp.path().join(format!("{trial}.pid"));
+            let _cleanup = RecordedChildCleanup(pidfile.clone());
+            let cmd = OpsCommand::new(
+                script.to_str().expect("shim path is UTF 8"),
+                vec![plain(pidfile.to_str().expect("PID file path is UTF 8"))],
+            );
+            let mut plumbing = Box::pin(start_port_forward(&cmd, opts.api_local_port, "api"));
+
+            // Confirm startup before measuring cancellation. Move the same owned
+            // future into the helper so its timeout must drop the real child.
+            let pid = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    tokio::select! {
+                        result = &mut plumbing => {
+                            panic!("trial {trial}: stalled shim returned before cancellation: {result:?}");
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                                .ok()
+                                .and_then(|recorded| recorded.trim().parse::<libc::pid_t>().ok())
+                                .filter(|pid| *pid > 0)
+                            {
+                                break pid;
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the shim must record its PID before the lookup starts");
+            assert!(
+                child_running(pid),
+                "trial {trial}: shim must be alive before cancellation"
+            );
+
+            let started = Instant::now();
+            let resolved = tokio::time::timeout(
+                Duration::from_secs(1),
+                hint_channel_with_cluster_plumbing(
+                    &opts,
+                    TurnVerb::Cluster,
+                    HINT_TURN_CHANNEL,
+                    HINT_APPROVAL_ID,
+                    hint_far_deadline(),
+                    budget,
+                    plumbing,
+                ),
+            )
+            .await
+            .expect("the cluster lookup must return before the outer harness expires");
+            let elapsed = started.elapsed();
+
+            assert_eq!(
+                resolved, HINT_TURN_CHANNEL,
+                "trial {trial}: use the turn channel on expiry"
+            );
+            assert!(
+                !resolved.is_empty(),
+                "trial {trial}: the fallback must be nonempty"
+            );
+            assert!(
+                elapsed <= budget + Duration::from_millis(500),
+                "trial {trial}: lookup exceeded its budget plus scheduling margin: {elapsed:?}"
+            );
+
+            // The kernel may apply the drop signal after the helper returns.
+            let cleanup_deadline = Instant::now() + Duration::from_millis(500);
+            while child_running(pid) && Instant::now() < cleanup_deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                !child_running(pid),
+                "trial {trial}: lookup left child PID {pid} alive"
+            );
+        }
+        eprintln!("cluster hint cancellation passed 50 of 50 trials");
     }
 
     /// The probe is only honest if it filters on the service compose actually
@@ -6699,18 +6629,31 @@ mod tests {
         assert!(refuse_named_route_for_cluster_connected(None, Some("ops"), "C0EXAMPLE1").is_ok());
     }
 
+    // @spec INGRESS-CANARY-1
     #[test]
-    fn message_clusters_disconnected_relay_refuses_a_named_route() {
-        // #1817's retained compatibility lane: it always speaks as the
-        // installation's default bot, so a named identity must refuse here too.
-        let err =
-            refuse_named_route_for_relay(Some("ops-bot"), Some("ops"), "C0EXAMPLE1").unwrap_err();
-        let text = err.to_string();
-        assert!(
-            text.contains("ops-bot") && text.contains("the disconnected cluster relay"),
-            "{text}"
+    fn message_clusters_relay_turn_names_a_named_binding_and_keeps_the_relay() {
+        let opts = MessageOpts::default();
+        let (named, _) =
+            cluster_relay_turn("C0EXAMPLE1", Some("ops-bot"), &opts, "1700000000.000100");
+        let handle = named
+            .reply_handle
+            .as_ref()
+            .expect("a relay turn is targeted");
+        assert_eq!(
+            handle.adapter.as_deref(),
+            Some(CLUSTER_MESSAGE_RELAY_ADAPTER)
         );
-        assert!(refuse_named_route_for_relay(None, Some("ops"), "C0EXAMPLE1").is_ok());
+        assert_eq!(handle.identity.as_deref(), Some("ops-bot"));
+        let (default, _) = cluster_relay_turn("C0EXAMPLE1", None, &opts, "1700000000.000100");
+        let handle = default
+            .reply_handle
+            .as_ref()
+            .expect("a relay turn is targeted");
+        assert_eq!(
+            handle.adapter.as_deref(),
+            Some(CLUSTER_MESSAGE_RELAY_ADAPTER)
+        );
+        assert_eq!(handle.identity, None, "a default binding sends no identity");
     }
 
     // @spec ADR-0168 d8
@@ -7313,6 +7256,7 @@ mod tests {
             model: None,
             minimal: false,
             stack_image_env: Vec::new(),
+            stack_secret_env: Vec::new(),
         }
     }
 
@@ -7541,10 +7485,12 @@ mod tests {
             "a named agent must not be reported as channel C123: {lines:?}"
         );
         assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("a named identity's route is refused")),
-            "the plan must say a named identity is refused on cluster message: {lines:?}"
+            lines.iter().any(|l| l.contains("reply_handle.identity")),
+            "the plan must say a named identity rides the relay turn: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("is refused here")),
+            "the disconnected relay no longer refuses a named identity: {lines:?}"
         );
 
         // No --agent still prints the plain --channel line, unchanged.

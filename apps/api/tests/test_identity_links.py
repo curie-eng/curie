@@ -1,6 +1,6 @@
 """identity_links and resolve_principal (#2910, ADR 0155 step 5).
 
-Migration 0054 adds ``identity_links``: a provider-native id (a Slack user id)
+Migration 0075 adds ``identity_links``: a provider-native id (a Slack user id)
 on one provider installation, linked to exactly one subject -- a principal or a
 bot (an Agent). ``resolve_principal`` answers "which principal is this provider
 id?" by exact equality on ``(tenant, installation, native id)`` and nothing else:

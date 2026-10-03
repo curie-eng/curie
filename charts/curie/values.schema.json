@@ -1,6 +1,18 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
+  "definitions": {
+    "computePodDisruptionBudget": {
+      "type": "object",
+      "description": "Optional PodDisruptionBudget for a compute-plane Deployment (issue #1574). minAvailable, when set, replaces maxUnavailable. A budget allowing zero voluntary disruptions at the configured replica count needs allowBlockingDrain: true; the template refuses it otherwise.",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "maxUnavailable": {"type": "integer", "minimum": 0},
+        "minAvailable": {"type": "integer", "minimum": 0},
+        "allowBlockingDrain": {"type": "boolean"}
+      }
+    }
+  },
   "properties": {
     "config": {
       "type": "object",
@@ -19,6 +31,7 @@
     "api": {
       "type": "object",
       "properties": {
+        "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"},
         "approvalChatAttesterSecret": {
           "type": "string",
           "minLength": 1,
@@ -36,7 +49,17 @@
         },
         "githubFactoryIngressEnabled": {
           "type": "boolean",
-          "description": "Opt-in gate for signed GitHub issue admission. The API validates the App credentials, label, mention login, allowlist, and non-default webhook secret at boot."
+          "description": "Opt-in gate for GitHub issue admission. Poll mode does not require a webhook secret. Webhook mode requires a non-default webhook secret. The API also validates the App credentials, label, mention login, and allowlist at boot."
+        },
+        "githubFactoryIntake": {
+          "type": "string",
+          "enum": ["poll", "webhook"],
+          "description": "Factory intake mode. poll is the default and reads GitHub on an interval. webhook keeps signed deliveries and the missed-label backstop."
+        },
+        "githubFactoryPollIntervalSeconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Seconds between factory poll passes when intake is poll. Must be a positive finite number. Default 45."
         },
         "githubFactoryLabel": {
           "type": "string",
@@ -51,6 +74,64 @@
           "minimum": 1,
           "maximum": 10800,
           "description": "Seconds a published factory run waits on its pull request's CI, from the push. The execution deadline still caps it."
+        },
+        "githubFactoryBases": {
+          "type": "object",
+          "description": "Bases a factory ticket may start from and target, keyed by owner/name. A repository without an entry may only use its default branch.",
+          "propertyNames": {
+            "pattern": "^[^/]+/[^/]+$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["bases"],
+            "properties": {
+              "bases": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[^\\s-][^\\s]*$"
+                }
+              },
+              "default_base": {
+                "type": ["string", "null"],
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "githubFactoryPythonCi": {
+          "type": "object",
+          "description": "Required Python CI per repository, keyed by owner/name. A repository without an entry is judged on its own checks.",
+          "propertyNames": {
+            "pattern": "^[^/]+/[^/]+$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["check", "paths"],
+            "properties": {
+              "check": {
+                "type": "string",
+                "minLength": 1
+              },
+              "paths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[^/].*[^/]$|^[^/]$"
+                }
+              },
+              "pendingCheckPrefix": {
+                "type": ["string", "null"],
+                "minLength": 1
+              }
+            }
+          }
         },
         "githubFactoryMention": {
           "type": "string",
@@ -69,6 +150,13 @@
     "worker": {
       "type": "object",
       "properties": {
+        "maxConcurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256,
+          "description": "Turns one worker runs at once (issue #760), rendered as CURIE_WORKER_MAX_CONCURRENCY. The worker refuses the same range at boot."
+        },
+        "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"},
         "claimTimeoutSeconds": {
           "type": "number",
           "exclusiveMinimum": 0,
@@ -87,17 +175,28 @@
           "maximum": 31536000,
           "description": "Seconds a route suspended awaiting an approval pins its sandbox. Must be greater than 0 and at most 31536000 (one year). Integer rather than number for the same reason as routeTtlSeconds: a YAML float renders through `| quote` as scientific notation for larger values (ci/github-app-credential-assertions.sh:11)."
         },
+        "streamRetention": {
+          "type": ["object", "null"],
+          "properties": {
+            "minAgeSeconds": {
+              "type": "integer",
+              "minimum": 3600,
+              "maximum": 31536000,
+              "description": "Seconds a settled stream entry is kept before the worker trims it (ADR 0184). At least 3600, above the three-hour delivery budget ceiling, and at most 31536000 (one year). Integer for the same reason as routeTtlSeconds."
+            }
+          }
+        },
         "deliveryBudgetSeconds": {
           "type": "integer",
           "minimum": 60,
           "maximum": 10800,
-          "description": "Overall wall-clock deadline for one delivery (ADR-0131). Below 60s a budget cannot cover claim + one runner request + settle; at most 10800s (three hours, #3071). The rendered termination grace follows it: max(terminationGracePeriodSeconds, this + deliveryShutdownReserveSeconds)."
+          "description": "Overall wall-clock deadline for one delivery (ADR-0131). The shipped default is 10800, equal to the factory maximum execution deadline. Below 60s a budget cannot cover claim + one runner request + settle; at most 10800s (three hours, #3071). The rendered termination grace follows it: max(terminationGracePeriodSeconds, this + deliveryShutdownReserveSeconds). runnerTotalTimeoutSeconds must be no greater than deliveryBudgetSeconds."
         },
         "runnerTotalTimeoutSeconds": {
           "type": "number",
           "exclusiveMinimum": 0,
           "maximum": 10800,
-          "description": "Positive per-request ceiling for runner work, at most 10800 seconds. Must be no greater than worker.deliveryBudgetSeconds; the worker template enforces this cross-field relationship at render time."
+          "description": "Positive per-request ceiling for runner work. The shipped default is 10800, equal to the factory maximum execution deadline, and at most 10800 seconds. Must be no greater than worker.deliveryBudgetSeconds; the worker template enforces this cross-field relationship at render time."
         },
         "deliveryLeaseTtlSeconds": {
           "type": "integer",
@@ -184,6 +283,10 @@
             "reconcileMaxAttempts": {"type": "integer", "minimum": 1, "maximum": 100},
             "jobActiveDeadlineSeconds": {"type": "integer", "minimum": 1, "maximum": 86400},
             "gitCommandTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+            "protectedPaths": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1, "maxLength": 512}
+            },
             "githubHttpsCidrs": {
               "type": "array",
               "minItems": 1,
@@ -191,6 +294,18 @@
             }
             }
           }
+      }
+    },
+    "ui": {
+      "type": "object",
+      "properties": {
+        "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"}
+      }
+    },
+    "dispatcher": {
+      "type": "object",
+      "properties": {
+        "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"}
       }
     },
     "agentSandbox": {
@@ -211,6 +326,26 @@
             }
           }
         }
+      }
+    },
+    "e2eConnector": {
+      "type": "object",
+      "description": "Factory side of the end to end connector (ADR 0176 decisions 1 to 3, issue #3244).",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "namespacePrefix": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?-$"},
+        "ownerLabel": {
+          "type": "object",
+          "properties": {
+            "key": {"type": "string", "minLength": 1},
+            "value": {"type": "string"}
+          }
+        },
+        "serviceAccount": {"type": "string"},
+        "serviceAccountNamespace": {"type": "string"},
+        "workerClusterRole": {"type": "string"},
+        "ttlSeconds": {"type": "integer", "minimum": 60, "maximum": 86400},
+        "podSecurity": {"type": "string", "enum": ["baseline", "restricted"]}
       }
     },
     "e2eConnectorIdentity": {

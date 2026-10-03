@@ -144,8 +144,7 @@ def test_a_persons_slack_turn_carries_a_chain_bound_capability(make_harness) -> 
             assert record.update_count == 0
             assert (record.turn_generation, record.active_generation) == (1, 0)
             assert any(
-                env is not None and env.get(ELIGIBILITY_ENV) == "1"
-                for env in h.fake_k8s.claim_envs
+                env is not None and env.get(ELIGIBILITY_ENV) == "1" for env in h.fake_k8s.claim_envs
             )
             route_record = h.substrate._affinity.get(_thread_key_for(ev))  # noqa: SLF001
             assert route_record is not None
@@ -200,9 +199,7 @@ def test_an_ineligible_turn_carries_no_capability(make_harness, overrides: dict[
                 assert _header(headers, URL_HEADER) is None
                 assert _header(headers, TOKEN_HEADER) is None
                 assert _header(headers, GENERATION_HEADER) is None
-            assert all(
-                env is None or ELIGIBILITY_ENV not in env for env in h.fake_k8s.claim_envs
-            )
+            assert all(env is None or ELIGIBILITY_ENV not in env for env in h.fake_k8s.claim_envs)
             progress_id = progress_id_for(_thread_key_for(ev), ev.event_id)
             assert await ProgressStore(h.async_redis, h.config).read(progress_id) is None
             route_record = h.substrate._affinity.get(_thread_key_for(ev))  # noqa: SLF001
@@ -242,9 +239,7 @@ def test_a_factory_execution_carries_no_turn_progress_capability(make_harness) -
                 assert _header(headers, URL_HEADER) is None
                 assert _header(headers, TOKEN_HEADER) is None
                 assert _header(headers, GENERATION_HEADER) is None
-            assert all(
-                env is None or ELIGIBILITY_ENV not in env for env in h.fake_k8s.claim_envs
-            )
+            assert all(env is None or ELIGIBILITY_ENV not in env for env in h.fake_k8s.claim_envs)
 
     asyncio.run(go())
 
@@ -256,9 +251,7 @@ def test_a_kernel_without_a_progress_store_sends_no_capability(make_harness) -> 
 
             assert h.runner.event_headers
             assert _capability(h) == (None, None, None)
-            assert all(
-                env is None or ELIGIBILITY_ENV not in env for env in h.fake_k8s.claim_envs
-            )
+            assert all(env is None or ELIGIBILITY_ENV not in env for env in h.fake_k8s.claim_envs)
 
     asyncio.run(go())
 
@@ -593,3 +586,30 @@ def test_warm_sandbox_adoption_fences_progress_eligibility_in_both_directions(
     )
     env = {ELIGIBILITY_ENV: "1"} if requested else {}
     assert _boots_differently(handle, env) is must_replace
+
+
+def test_a_runner_booted_for_another_run_is_replaced() -> None:
+    """@spec ADR-0178 d3: a sandbox belongs to one run."""
+
+    run_a = "11111111-1111-4111-8111-111111111111"
+    run_b = "33333333-3333-4333-8333-333333333333"
+
+    def handle(caller_run: str | None) -> SandboxHandle:
+        return SandboxHandle(
+            thread_key="slack:C0EXAMPLE1:t",
+            claim_name="claim",
+            sandbox_name="sandbox",
+            namespace="curie",
+            service_fqdn="sandbox.curie.svc",
+            port=8080,
+            session_id="session",
+            carries_caller_token=True,
+            caller_run=caller_run,
+        )
+
+    env = {"CURIE_CONNECTOR_CALLER_TOKEN": "cct.present"}
+    assert _boots_differently(handle(run_a), env, caller_run=run_b) is True
+    assert _boots_differently(handle(run_a), env, caller_run=None) is True
+    assert _boots_differently(handle(run_a), env, caller_run=run_a) is False
+    assert _boots_differently(handle(None), env, caller_run=run_a) is True
+    assert _boots_differently(handle(None), {}, caller_run=None) is False

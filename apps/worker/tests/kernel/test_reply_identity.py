@@ -85,6 +85,7 @@ class _TripleBinding:
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+    **_: object,
     ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
@@ -260,6 +261,9 @@ class _CiWorkItems:
 
     async def finish(self, request_id: uuid.UUID, **kwargs: object) -> None:
         self.finishes.append((request_id, kwargs))
+
+    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+        return "acme widgets issue 7", f"wir.capability-for-{request_id}"
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
         async def record(*_args: object, **_kwargs: object) -> None:

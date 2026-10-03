@@ -27,10 +27,10 @@ from aci_protocol import (
     TextDelta,
     TurnSource,
 )
+from channel_protocol import work_item_events
 from curie_worker import kernel as kernel_module
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.workitem_dispatch import (
-    WORK_ITEM_CI_RE,
     WorkItemAcquireGrant,
     WorkItemConflict,
     WorkItemRunning,
@@ -131,6 +131,7 @@ class _Workspace:
             env=kwargs.get("env"),
             agent_name=kwargs.get("agent_name"),
             workspace_repo=kwargs.get("repo_full_name"),
+            caller_run=kwargs.get("caller_run"),
         )
         return SimpleNamespace(handle=handle, prepared=None)
 
@@ -179,6 +180,9 @@ class _WorkItems:
         self.calls.append("finish")
         self.finishes.append((request_id, kwargs))
 
+    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+        return "acme widgets issue 7", f"wir.capability-for-{request_id}"
+
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
         async def record(*_args: object, **_kwargs: object) -> None:
             self.calls.append(name)
@@ -207,7 +211,10 @@ def _ci_turn(request_id: uuid.UUID, round_: int = 2, *, text: str | None = None)
 # --- event id namespace ------------------------------------------------------------
 
 
-@pytest.mark.parametrize("round_", [2, 3])
+CI_ROUNDS = range(work_item_events.CI_FIRST_FIX_ROUND, work_item_events.CI_MAX_ROUNDS + 1)
+
+
+@pytest.mark.parametrize("round_", CI_ROUNDS)
 def test_ci_event_ids_parse_as_the_ci_kind(round_: int) -> None:
     request_id = uuid.uuid4()
     parsed = parse_work_item_event_id(f"work-item-{request_id}-ci-{round_}")
@@ -215,10 +222,29 @@ def test_ci_event_ids_parse_as_the_ci_kind(round_: int) -> None:
     assert parsed.kind == "ci"
     assert parsed.request_id == request_id
     assert parsed.generation == round_
-    assert WORK_ITEM_CI_RE.fullmatch(f"work-item-{request_id}-ci-{round_}") is not None
 
 
-@pytest.mark.parametrize("suffix", ["ci-1", "ci-4", "ci-02", "ci-", "ci-2x", "ci", "cI-2"])
+def test_the_worker_parser_agrees_with_the_shared_parser() -> None:
+    request_id = uuid.uuid4()
+    event_ids = [
+        work_item_events.execute_event_id(request_id, 1),
+        work_item_events.execute_event_id(request_id, 12),
+        work_item_events.terminate_event_id(request_id),
+        *(work_item_events.ci_event_id(request_id, round_) for round_ in CI_ROUNDS),
+    ]
+    for event_id in event_ids:
+        shared = work_item_events.parse_work_item_event_id(event_id)
+        worker = parse_work_item_event_id(event_id)
+        assert shared is not None and worker is not None
+        assert worker.request_id == shared.request_id
+        assert worker.kind == shared.kind
+        assert worker.generation == shared.number
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["ci-1", f"ci-{work_item_events.CI_MAX_ROUNDS + 1}", "ci-02", "ci-", "ci-2x", "ci", "cI-2"],
+)
 def test_out_of_range_or_malformed_ci_ids_do_not_parse(suffix: str) -> None:
     assert parse_work_item_event_id(f"work-item-{uuid.uuid4()}-{suffix}") is None
 

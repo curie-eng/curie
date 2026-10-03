@@ -88,6 +88,7 @@ class PostgresPublicationStore:
         self._engine = engine
         self._table = f'"{schema}".publications'
         self._requests = f'"{schema}".execution_requests'
+        self._work_items = f'"{schema}".work_items'
         self._approvals = f'"{schema}".approvals'
         self._lineages = f'"{schema}".thread_publication_lineages'
         self._lease_owner = lease_owner
@@ -354,10 +355,13 @@ class PostgresPublicationStore:
                            AND e.status = 'running'
                      )
                    ) AS owner_running,
-                   p.open_as_draft, p.branch_prefix
+                   p.open_as_draft, p.branch_prefix,
+                   w.base_branch AS base_ref
               FROM {self._table} p
               JOIN {self._approvals} a ON a.id = p.approval_id
               JOIN {self._lineages} l ON l.id = p.lineage_id
+              LEFT JOIN {self._requests} er ON er.id = p.execution_request_id
+              LEFT JOIN {self._work_items} w ON w.id = er.work_item_id
              WHERE p.patch_bytes IS NOT NULL
                AND p.status IN ('approved', 'launching', 'running')
                AND p.approval_card_reported_at IS NOT NULL
@@ -477,6 +481,7 @@ class PostgresPublicationStore:
             branch_prefix=(
                 str(row["branch_prefix"]) if row["branch_prefix"] is not None else None
             ),
+            base_ref=str(row["base_ref"]) if row["base_ref"] is not None else None,
         )
 
     async def is_terminal(self, publication_id: uuid.UUID) -> bool:

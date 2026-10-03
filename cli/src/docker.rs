@@ -2417,7 +2417,16 @@ impl ConnectorStartSpec {
         project: &str,
         plugin_dir: &std::path::Path,
         secret_values: &std::collections::BTreeMap<String, String>,
+        caller_public_key: Option<&str>,
     ) -> Result<Self> {
+        if crate::connector_build::is_hosted(spec) {
+            let key = caller_public_key.unwrap_or("").trim();
+            if key.is_empty() {
+                bail!(
+                    "hosted_connector_requires_caller_key: a hosted connector needs a caller public key"
+                );
+            }
+        }
         crate::connector_build::refuse_out_of_band_secrets(connector, spec)?;
         let subs = crate::connector_build::connector_substitutions(identity, connector, spec.port);
         let secret_names = crate::connector_build::declared_secret_names(spec);

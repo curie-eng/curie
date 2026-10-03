@@ -8,13 +8,17 @@ import email.utils
 import hashlib
 import json
 import logging
+import re
 import secrets
 import threading
 import time
+import urllib.parse
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal
+
+from channel_protocol import SettledOutcome
 
 from .agentmail import EGRESS_REFUSAL_ERROR, AgentMailClient, request
 from .config import MailAdapterConfig
@@ -59,6 +63,40 @@ def _is_caller_refusal(status: int, body: Any) -> bool:
         and isinstance(body, dict)
         and body.get("detail") == CALLER_NOT_ALLOWED_DETAIL
     )
+
+
+# -- approvals by email (ADR-0177) ---------------------------------------------
+#
+# A random single-use reference links a reply to the approval it answers. It is
+# not proof of identity: every reply quotes it, and anyone copied can see it.
+# Who may answer is the platform's decision (ADR-0177 amendment): the adapter carries the
+# sender its inbound gate verified, and the platform admits it only when the
+# binding's allowed_callers admit it and it is on the route's approver emails.
+APPROVAL_REF_PATTERN = re.compile(r"curie-approval-[A-Za-z0-9_-]{24}")
+# The ReplyAck ref of a rendered card, so the worker can settle this card later.
+APPROVAL_CARD_REF_PREFIX = "approval-card:"
+APPROVAL_INSTRUCTIONS = (
+    "To answer, reply to this email with APPROVE or REJECT on the first line. "
+    "Anything after it is your note. Only an approver listed for this request can answer."
+)
+APPROVAL_REF_LABEL = "Approval reference:"
+# The card field the worker names each of the route's listed approver addresses
+# with (ADR-0177 amendment A5; ``APPROVER_FIELD_LABEL`` in
+# ``curie_worker.approvals``). Read only to word the emails: who may answer is
+# still the platform's decision.
+APPROVER_FIELD_LABEL = "Approver"
+NOT_AN_APPROVER = "You are not an approver for this request."
+APPROVAL_NOTE_MAX_CHARS = 4000
+DECISIONS = {"APPROVE": "approved", "REJECT": "rejected"}
+APPROVAL_ACTOR_HEADER = "X-Curie-Approval-Actor"
+ADAPTER_PRINCIPAL_HEADER = "X-Curie-Adapter-Principal"
+# RFC 3834 section 5 (Auto-Submitted), plus the de facto markers vacation
+# responders and list managers set. Header names compare case-insensitively.
+_AUTO_PRECEDENCE = frozenset({"bulk", "junk", "list", "auto_reply"})
+_AUTO_REPLY_HEADERS = ("x-autoreply", "x-autorespond", "x-auto-response")
+_BOUNCE_LOCAL_PARTS = frozenset({"mailer-daemon", "postmaster"})
+
+AnswerOutcome = Literal["resolved", "not_an_answer", "retry"]
 
 
 def _poll_should_back_off(status: int) -> bool:
@@ -456,6 +494,10 @@ class MailAdapter:
             or full.get("html")
             or ""
         )
+        if self.config.adapter_principal:
+            handled = self._handle_approval_reply(message_id, conversation_id, sender, full)
+            if handled is not None:
+                return handled
         text = f"{message.get('subject') or ''}\n\n{body}"
         if len(text.encode("utf-8")) > self.config.max_body_bytes:
             self.state.settle_without_turn(message_id, "oversize")
@@ -602,6 +644,301 @@ class MailAdapter:
         )
         return "retry"
 
+    # -- approvals by email (ADR-0177) ---------------------------------------
+
+    def _handle_approval_reply(
+        self,
+        message_id: str,
+        conversation_id: str,
+        sender: str,
+        full: dict[str, Any],
+    ) -> bool | None:
+        """Handle a message in a thread this adapter rendered an approval in.
+
+        Returns None when the message is an ordinary turn: the thread has no
+        live approval and the message names no reference. Otherwise the message
+        is never a turn (ADR-0106): it is an answer, or it gets the instructions
+        back, and the return value is ``handle_inbound``'s.
+
+        A message counts as an answer only when all of these hold (ADR-0177
+        decision 5). The first two are established before this runs, in
+        ``handle_inbound``: the provider's SPF, DKIM and DMARC verdict with the
+        ``labels`` gate, then ``CURIE_MAIL_ALLOWED_SENDERS``, so a sender the
+        mailbox does not admit never reaches this (ADR-0177 amendment A2). Then:
+        it names a reference issued in this thread, that reference is still
+        live, the message was not sent automatically, and the first line of its
+        new text is one decision word. Who may answer is not decided here: the
+        verified sender is carried to the platform, which checks the binding's
+        ``allowed_callers`` and the route's approver emails.
+        """
+        refs = self.state.approval_refs_in(conversation_id)
+        if not refs:
+            return None
+        named = set(
+            APPROVAL_REF_PATTERN.findall(
+                " ".join(str(full.get(field) or "") for field in ("extracted_text", "text"))
+            )
+        )
+        matched = [ref for ref in refs if ref["reference"] in named]
+        live = [ref for ref in refs if ref["state"] == "live"]
+        if not matched and not live:
+            # Every approval in this thread is over: the conversation goes on.
+            return None
+        correlation = _correlation(message_id)
+        if _sent_automatically(full, sender):
+            # Never answer an auto-reply, an out-of-office or a bounce: a
+            # response invites a mail loop, and its words are nobody's decision.
+            logger.info("approval reply correlation=%s ignored: sent automatically", correlation)
+            self.state.settle_without_turn(message_id, "answered")
+            return True
+        ref = matched[-1] if matched else live[-1]
+        decision, note = _parse_decision(full) if matched else (None, None)
+        copies_in = decision is None and _brings_in_an_approver(ref, sender, full)
+        if ref["state"] == "live" and copies_in:
+            # ADR-0177 amendment A5: the requester did what the request email
+            # asked, replying all with a listed approver copied in. That
+            # approver now has the request; answering the requester back with
+            # the instructions would only suggest they got it wrong.
+            logger.info("approval reply correlation=%s copied in an approver", correlation)
+        elif not matched:
+            self._notify(message_id, APPROVAL_INSTRUCTIONS, correlation)
+        elif ref["state"] != "live":
+            self._notify(message_id, "This approval has already been answered.", correlation)
+        elif decision is None:
+            self._notify(message_id, APPROVAL_INSTRUCTIONS, correlation)
+        else:
+            # The bare address the inbound gate verified, lowercased, never the
+            # display name from the From header: that is the only part of it
+            # anyone vouched for, and the form the platform's lists are in.
+            outcome = self._carry_answer(
+                ref, _bare_address(sender), decision, note, message_id, full
+            )
+            if outcome == "retry":
+                # The platform could not be asked. Keep the message pending so
+                # the next pass carries the same answer again; resolve is
+                # resolve-once, so a repeat cannot decide twice.
+                return self.state.body_failed(message_id, abandon_after=BODY_ATTEMPT_MAX)
+        self.state.settle_without_turn(message_id, "answered")
+        return True
+
+    def _carry_answer(
+        self,
+        ref: dict[str, Any],
+        actor: str,
+        decision: str,
+        note: str | None,
+        message_id: str,
+        full: dict[str, Any],
+    ) -> AnswerOutcome:
+        """Resolve the approval with the adapter's credential and the sender as actor.
+
+        The platform decides. A win reopens the asking message's reply owner so
+        the resumed turn can answer on it, and remembers this message and who is
+        on it: the follow-up, sent when the card is settled whatever ended the
+        approval, goes to everyone on the winning answer (ADR-0177 amendment A5).
+        """
+        url = (
+            f"{self.config.api_base_url.rstrip('/')}/approvals/"
+            f"{urllib.parse.quote(ref['approval_id'], safe='')}/resolve"
+        )
+        body: dict[str, Any] = {"decision": decision}
+        if note:
+            body["note"] = note
+        result = request(
+            "POST",
+            url,
+            body,
+            {ADAPTER_PRINCIPAL_HEADER: self.config.adapter_principal, APPROVAL_ACTOR_HEADER: actor},
+            max_response_bytes=self.config.max_body_bytes,
+        )
+        correlation = _correlation(message_id)
+        logger.info("approval answer correlation=%s status=%s", correlation, result.status)
+        if result.status == 200:
+            self.state.record_approval_answer(
+                ref["reference"], message_id, sorted(self._participants(full))
+            )
+            self.state.set_approval_ref_state(ref["reference"], "answered")
+            self.state.reopen_reply(ref["conversation_id"], ref["reply_ref"])
+            return "resolved"
+        if result.status == 0 or result.status == 401 or result.status >= 500:
+            # 401 is this adapter's own credential lapsing: an operator re-mints
+            # it, and the pending answer then goes through, like CURIE_CHANNEL_TOKEN.
+            return "retry"
+        if result.status in (409, 410):
+            # Over, but not spent: the card's settlement still owes the one
+            # follow-up and must reopen the asking reply for the resumed turn.
+            # A lost 200 retried into a 409 lands here too, so a 409 records
+            # this message as the answer when none is recorded yet.
+            if result.status == 409:
+                self.state.record_approval_answer(
+                    ref["reference"], message_id, sorted(self._participants(full))
+                )
+            self.state.set_approval_ref_state(ref["reference"], "answered")
+            text = (
+                "This approval has already been answered."
+                if result.status == 409
+                else "This approval expired before it was answered."
+            )
+        elif _is_caller_refusal(result.status, result.body):
+            # The binding's allowed_callers do not admit this sender (ADR 0175
+            # decision 3): a refused caller gets nothing back, on an answer
+            # exactly as on a turn.
+            logger.info("approval answer correlation=%s refused: caller not allowed", correlation)
+            return "not_an_answer"
+        elif result.status == 403:
+            text = NOT_AN_APPROVER
+            if ref["approvers"]:
+                text += " " + _who_can_approve(ref["approvers"])
+        else:
+            text = "Your answer could not be accepted for this approval."
+        self._notify(message_id, text, correlation)
+        return "not_an_answer"
+
+    def _notify(self, message_id: str, text: str, correlation: str) -> None:
+        """Send one short reply to ``message_id``, best effort.
+
+        These are notices about an answer, not an agent's reply: a lost one is
+        a smaller wrong than a duplicate, so there is no durable retry.
+        """
+        status, _body = self.client.reply(message_id, text)
+        if not 200 <= status < 300:
+            logger.warning(
+                "approval notice correlation=%s not sent: status=%s", correlation, status
+            )
+
+    def record_approval_card(
+        self,
+        conversation_id: str,
+        approval_id: str,
+        text: str,
+        *,
+        requester: str = "",
+        approvers: Sequence[str] = (),
+    ) -> tuple[int, str | None]:
+        """Render an approval card into the pending reply, with a fresh reference.
+
+        The request says who can approve (ADR-0177 amendment A5): the route's
+        listed addresses, and whether any of them is on the thread already (the
+        requester, or the To or Cc of the asking message). When none is, it asks
+        the requester to reply all and copy one or more of them in. The request
+        is mailed reply all, so a listed approver copied on the asking message
+        receives it. Nobody off the thread is mailed.
+
+        Args:
+            conversation_id: the thread the card belongs to.
+            approval_id: the platform's approval id.
+            text: the card's text.
+            requester: the ``requested_by`` of the card, the asking sender.
+            approvers: the card's ``Approver`` fields; empty from a worker that
+                sends none, which keeps the generic instructions.
+
+        Returns:
+            The ack status and the card ref the worker keeps to settle this
+            card. Without an adapter principal the card is recorded as plain
+            text, exactly as before, and no ref is returned: nothing here could
+            carry an answer, so nothing invites one.
+        """
+        if not self.config.adapter_principal:
+            return self.record_text(conversation_id, None, text, append=True), None
+        refs = self.state.live_reply_refs(conversation_id)
+        if len(refs) != 1:
+            logger.info(
+                "approval card deferred: correlation=%s has %d live reply refs",
+                _correlation(conversation_id),
+                len(refs),
+            )
+            return 503, None
+        reply_ref = refs[0]
+        listed = _listed_addresses(approvers)
+        requester = _bare_address(requester)
+        reference = self.state.issue_approval_ref(
+            approval_id,
+            conversation_id,
+            reply_ref,
+            f"curie-approval-{secrets.token_urlsafe(18)}",
+            requester=requester,
+            approvers=listed,
+        )
+        instructions = APPROVAL_INSTRUCTIONS
+        if listed:
+            on_thread = self._on_thread(reply_ref, requester, listed)
+            instructions = _request_instructions(listed, on_thread)
+        card = f"{text}\n\n{instructions}\n{APPROVAL_REF_LABEL} {reference}"
+        status = self.record_text(conversation_id, reply_ref, card, append=True)
+        if status != 200:
+            return status, None
+        return 200, f"{APPROVAL_CARD_REF_PREFIX}{approval_id}"
+
+    def settle_approval_card(self, card_ref: str, settled: SettledOutcome) -> int:
+        """Send the one follow-up for a settled card and spend its reference.
+
+        A sent email cannot be edited, so settling is a short reply in the
+        thread (ADR-0177 decision 6). The asking message's reply owner is
+        reopened first, so the resumed turn's answer can follow it.
+        """
+        approval_id = card_ref[len(APPROVAL_CARD_REF_PREFIX) :]
+        ref = self.state.approval_ref_for(approval_id)
+        if ref is None or not self.state.claim_approval_settlement(ref["reference"]):
+            # Unknown, already spent, or another delivery holds the send.
+            return 200
+        self.state.reopen_reply(ref["conversation_id"], ref["reply_ref"])
+        # Read again under the claim: a send counted by an earlier settlement
+        # that failed part way is not made twice.
+        ref = self.state.approval_ref_for(approval_id) or ref
+        if settled.decision is None:
+            text = "This approval expired before anyone answered it."
+        else:
+            text = f"This request was {settled.decision}"
+            if settled.resolver:
+                text += f" by {settled.resolver}"
+            text += "."
+            if settled.note:
+                text += f"\n\nNote: {settled.note}"
+        sends = _follow_up_sends(ref)
+        for index, (message_id, reply_all) in enumerate(sends):
+            if index < ref["follow_ups_sent"]:
+                continue
+            status, _body = self.client.reply(message_id, text, reply_all=reply_all)
+            if not 200 <= status < 300:
+                logger.warning(
+                    "approval follow-up correlation=%s failed: status=%s",
+                    _correlation(approval_id),
+                    status,
+                )
+                self.state.release_approval_settlement(ref["reference"])
+                return 502
+            self.state.record_follow_ups_sent(ref["reference"], index + 1)
+        self.state.set_approval_ref_state(ref["reference"], "spent")
+        return 200
+
+    def _participants(self, full: dict[str, Any]) -> set[str]:
+        """The bare addresses on one message, From, To and Cc, without this inbox."""
+        found: set[str] = set()
+        for field in ("from", "to", "cc"):
+            value = full.get(field)
+            for entry in value if isinstance(value, list) else [value]:
+                address = _bare_address(str(entry or ""))
+                if address:
+                    found.add(address)
+        found.discard(self.config.agentmail_inbox.strip().lower())
+        return found
+
+    def _on_thread(self, reply_ref: str, requester: str, listed: list[str]) -> list[str] | None:
+        """The listed approvers already on the asking message, or None if unknown.
+
+        The requester is on the thread by definition. The rest comes from the
+        asking message's To and Cc, read from the provider; when it cannot be
+        read and the requester is not listed, the answer is unknown, and the
+        request is worded so it holds either way.
+        """
+        status, full = self.client.get_message(reply_ref)
+        if status == 200 and isinstance(full, dict):
+            present = self._participants(full) | {requester}
+            return [address for address in listed if address in present]
+        if requester in listed:
+            return [requester]
+        return None
+
     # -- egress -------------------------------------------------------------
 
     def record_text(
@@ -613,8 +950,27 @@ class MailAdapter:
         append: bool = False,
     ) -> int:
         """Persist text against the exact reply ref; return the HTTP ack status."""
+        return self.record_text_at(conversation_id, reply_ref, text, append=append)[0]
+
+    def record_text_at(
+        self,
+        conversation_id: str,
+        reply_ref: str | None,
+        text: str | None,
+        *,
+        append: bool = False,
+    ) -> tuple[int, str | None]:
+        """``record_text``, also naming the ref the text was recorded at.
+
+        Text with no ``reply_ref`` lands on the conversation's one live reply
+        owner. Naming it lets the ack hand that ref back, so the worker keeps
+        the rest of the turn, and its completion, on the same message. That is
+        how a resumed approval turn, which drops the replayed placeholder to
+        answer after the card (ADR-0179 decision 3), is still mailed as a reply
+        to the asking message. None when nothing was recorded.
+        """
         if not conversation_id or not text:
-            return 200
+            return 200, None
         chosen_ref = reply_ref
         if not chosen_ref:
             refs = self.state.live_reply_refs(conversation_id)
@@ -624,7 +980,7 @@ class MailAdapter:
                     _correlation(conversation_id),
                     len(refs),
                 )
-                return 503
+                return 503, None
             chosen_ref = refs[0]
         outcome = self.state.record_text(
             conversation_id,
@@ -634,14 +990,14 @@ class MailAdapter:
             max_bytes=self.config.max_reply_bytes,
         )
         if outcome == "too_large":
-            return 413
+            return 413, None
         if outcome == "missing":
             logger.info(
                 "reply update deferred: no active admitted owner for correlation=%s",
                 _correlation(f"{conversation_id}\0{chosen_ref}"),
             )
-            return 503
-        return 200
+            return 503, None
+        return 200, chosen_ref
 
     def thread_carries(self, conversation_id: str, event_id: str) -> bool | None:
         status, thread = self.client.get_thread(conversation_id)
@@ -755,7 +1111,12 @@ class MailAdapter:
                     _correlation(event_id),
                 )
                 return 502
-            status, response = self.client.reply(reply_ref, body)
+            # The request email goes to everyone on the asking message, so a
+            # listed approver copied there receives it (ADR-0177 amendment A5).
+            # Every other reply, the resumed answer included, goes to the
+            # sender, which on that message is the requester.
+            reply_all = self.state.live_approval_on(conversation_id, reply_ref)
+            status, response = self.client.reply(reply_ref, body, reply_all=reply_all)
             if (
                 status == 0
                 and isinstance(response, dict)
@@ -795,6 +1156,139 @@ class MailAdapter:
 
 def _labels(message: dict[str, Any]) -> list[str]:
     return [str(label).strip().lower() for label in (message.get("labels") or [])]
+
+
+def _listed_addresses(approvers: Iterable[str]) -> list[str]:
+    """The card's approver addresses: bare, lowercased, once each, in order."""
+    seen: dict[str, None] = {}
+    for entry in approvers:
+        address = _bare_address(entry)
+        if "@" in address:
+            seen.setdefault(address, None)
+    return list(seen)
+
+
+def _who_can_approve(listed: list[str]) -> str:
+    """One sentence naming who can approve and how to bring them in."""
+    if len(listed) == 1:
+        return f"Only {listed[0]} can approve it. Reply all to this email and add {listed[0]}."
+    return (
+        f"Only these addresses can approve it: {', '.join(listed)}. Reply all to this email "
+        "and add one or more of them, as many as you like."
+    )
+
+
+def _request_instructions(listed: list[str], on_thread: list[str] | None) -> str:
+    """How to answer, worded for who is on the thread (ADR-0177 amendment A5).
+
+    Args:
+        listed: the route's listed approver addresses, never empty.
+        on_thread: the listed addresses already on the thread, or None when
+            the asking message could not be read.
+
+    Returns:
+        The instructions placed above the reference in the request email.
+    """
+    answer = (
+        "with APPROVE or REJECT on the first line. Anything after it is the note. "
+        "The first answer decides, and it is final."
+    )
+    if on_thread:
+        return (
+            f"Who can approve: {', '.join(listed)}.\n"
+            f"Already on this thread and able to answer: {', '.join(on_thread)}.\n"
+            f"To answer, reply all to this email {answer}"
+        )
+    if on_thread is None:
+        lead = "If none of the people who can approve is on this thread yet:"
+    else:
+        lead = "Nobody on this thread can approve this request yet."
+    return (
+        f"{lead} {_who_can_approve(listed)}\n"
+        f"Anyone listed who is on the thread can then answer by replying all {answer}"
+    )
+
+
+def _brings_in_an_approver(ref: dict[str, Any], sender: str, full: dict[str, Any]) -> bool:
+    """Whether a non-answer from someone not listed copies a listed approver in."""
+    listed = set(ref.get("approvers") or [])
+    if not listed or _bare_address(sender) in listed:
+        return False
+    copied = set()
+    for field in ("to", "cc"):
+        value = full.get(field)
+        for entry in value if isinstance(value, list) else [value]:
+            copied.add(_bare_address(str(entry or "")))
+    return bool(listed & copied)
+
+
+def _follow_up_sends(ref: dict[str, Any]) -> list[tuple[str, bool]]:
+    """Where a settled card's outcome goes: (message to reply to, reply all).
+
+    Reply all to the message that carried the winning answer, so the approver
+    and everyone on it see who decided. When no email answered it (expiry, or
+    an answer this adapter did not carry), reply all to the asking message. If
+    the requester is not on the winning message, because the approver replied
+    to the bot alone, they also get the outcome as a direct reply to the asking
+    message, whose sender they are (ADR-0177 amendment A5).
+    """
+    asking = str(ref["reply_ref"])
+    answer = ref.get("answer_message_id")
+    if not answer or answer == asking:
+        return [(asking, True)]
+    sends = [(str(answer), True)]
+    requester = ref.get("requester") or ""
+    if not requester or requester not in set(ref.get("answer_participants") or []):
+        sends.append((asking, False))
+    return sends
+
+
+def _sent_automatically(full: dict[str, Any], sender: str) -> bool:
+    """Whether a message was sent by software rather than a person.
+
+    Fails closed: a message whose headers the provider did not return cannot
+    be shown to be a person's, so it is treated as automatic. AgentMail
+    documents ``headers`` as an optional map from string to string
+    (https://docs.agentmail.to/api-reference/inboxes/messages/get).
+    """
+    headers = full.get("headers")
+    if not isinstance(headers, dict):
+        return True
+    lowered = {str(key).lower(): str(value).strip().lower() for key, value in headers.items()}
+    auto_submitted = lowered.get("auto-submitted")
+    if auto_submitted is not None and auto_submitted != "no":
+        return True
+    if any(name in lowered for name in _AUTO_REPLY_HEADERS):
+        return True
+    if lowered.get("precedence") in _AUTO_PRECEDENCE:
+        return True
+    if lowered.get("content-type", "").startswith("multipart/report"):
+        return True
+    if lowered.get("return-path") == "<>":
+        return True
+    return _bare_address(sender).partition("@")[0] in _BOUNCE_LOCAL_PARTS
+
+
+def _parse_decision(full: dict[str, Any]) -> tuple[str | None, str | None]:
+    """The decision on the first line of the NEW text, and the rest as the note.
+
+    Only ``extracted_text``: AgentMail strips "quoted history and trailing
+    boilerplate" from it (https://www.agentmail.to/docs/messages), so a decision
+    word that appears only inside the quoted request is never read as an
+    answer. A message without it has no new text this can trust.
+    """
+    new_text = full.get("extracted_text")
+    if not isinstance(new_text, str):
+        return None, None
+    lines = new_text.strip().splitlines()
+    if not lines:
+        return None, None
+    word = lines[0].strip().rstrip(".!").strip().upper()
+    decision = DECISIONS.get(word)
+    if decision is None:
+        return None, None
+    note = "\n".join(lines[1:]).strip()[:APPROVAL_NOTE_MAX_CHARS]
+    return decision, note or None
 
 
 def _bare_address(from_header: str) -> str:

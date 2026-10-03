@@ -1,8 +1,8 @@
-"""Wall-clock budget for the required cluster upgrade matrix (#2823).
+"""@spec CI-UPGRADE-MATRIX-BUDGET: selected outcomes gate; timing warns.
 
 The helper is the consumer path the `e2e-required` job will run: it reads a
-GitHub Actions jobs payload, writes a job summary, and exits nonzero when the
-shared image build job plus the longest matrix run exceeds 20 minutes.
+GitHub Actions jobs payload and writes a job summary. A duration above 20
+minutes warns but does not fail an otherwise successful matrix.
 
 The jobs JSON shape is the documented
 `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs` response
@@ -167,7 +167,7 @@ def test_under_budget_shared_build_plus_matrix_run_passes_and_writes_seconds(
     assert "::notice" in completed.stdout
 
 
-def test_over_budget_shared_build_plus_matrix_run_fails_and_writes_seconds(tmp_path: Path) -> None:
+def test_over_budget_shared_build_plus_matrix_run_warns_and_writes_seconds(tmp_path: Path) -> None:
     payload = _payload(
         _images_job(180),
         _job(
@@ -183,14 +183,15 @@ def test_over_budget_shared_build_plus_matrix_run_fails_and_writes_seconds(tmp_p
     )
     completed = _run(tmp_path, payload)
     output = completed.stdout + completed.stderr
-    assert completed.returncode != 0, output
+    assert completed.returncode == 0, output
     summary = _summary(tmp_path)
     assert "1920" in summary
     assert "180" in summary
     assert "1680" in summary
     assert "1200" in summary
     assert "over budget" in summary.lower()
-    assert "::error" in completed.stdout
+    assert "::warning" in completed.stdout
+    assert "::error" not in completed.stdout
 
 
 def test_unexpanded_skipped_matrix_job_is_not_a_shard(tmp_path: Path) -> None:
@@ -255,7 +256,7 @@ def test_exactly_budget_is_within_budget(tmp_path: Path) -> None:
     assert "within budget" in _summary(tmp_path).lower()
 
 
-def test_one_second_over_budget_fails(tmp_path: Path) -> None:
+def test_one_second_over_budget_warns(tmp_path: Path) -> None:
     payload = _payload(
         _images_job(200),
         _job(
@@ -265,8 +266,9 @@ def test_one_second_over_budget_fails(tmp_path: Path) -> None:
         ),
     )
     completed = _run(tmp_path, payload)
-    assert completed.returncode != 0
+    assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "over budget" in _summary(tmp_path).lower()
+    assert "::warning" in completed.stdout
 
 
 def test_full_shard_job_over_budget_still_passes_when_build_plus_run_is_inside(

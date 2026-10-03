@@ -61,7 +61,7 @@
 #       That combination used to reach the worker and CrashLoopBackOff it on
 #       the `WorkerConfig` boot check; the derived grace makes it impossible.
 #   (k) RUNNER CEILING, positive and negative: the shipped worker env contains
-#       CURIE_RUNNER_TOTAL_TIMEOUT_S=600 exactly once; 1700 under an 1800-second
+#       CURIE_RUNNER_TOTAL_TIMEOUT_S=10800 exactly once; 1700 under an 1800-second
 #       delivery budget renders and reaches the worker; equality at 600, a
 #       fractional 0.5-second ceiling, and the inclusive 1800 case render
 #       with coherent delivery budgets. The schema refuses 0 and 10800.1,
@@ -72,7 +72,7 @@
 #       output. This is the cross-field negative JSON Schema cannot express.
 #   (l) LADDER CONSUMER CONTRACT, positive and negative: the actual cluster
 #       reply-timeout helper reads the rendered worker Deployment through an
-#       external kubectl stub. Defaults yield 600 + 60 = 660 seconds and a
+#       external kubectl stub. Defaults yield 10800 + 60 = 10860 seconds and a
 #       900-second chart override yields 960. Missing, duplicate, nonliteral,
 #       or out-of-range delivery-budget entries (outside 60 through 10800) are
 #       refused with the helper's diagnostic. This is chart and CLI consumer coverage only. A separate
@@ -81,7 +81,7 @@
 #   (m) RETAINED extraEnv TIMEOUT, positive: a v0.8.4-era worker.extraEnv
 #       override of CURIE_RUNNER_TOTAL_TIMEOUT_S=1700 must not duplicate the
 #       first-class env. The rendered worker keeps exactly one copy at the
-#       first-class default (600) and still emits a non-colliding extraEnv
+#       first-class default (10800) and still emits a non-colliding extraEnv
 #       entry. This is the 2026-09-04 soak: retained extraEnv plus first-class
 #       timeout made Kubernetes reject the worker patch (#2097).
 #   (n) THREE-HOUR CEILING (#3071): budget and runner ceiling at 10800 render
@@ -189,10 +189,10 @@ deploys = [
 if len(deploys) != 1:
     raise SystemExit(f"expected exactly one worker Deployment, rendered {len(deploys)}")
 got = deploys[0]["spec"]["template"]["spec"].get("terminationGracePeriodSeconds")
-if type(got) is not int or got != 1860:
+if type(got) is not int or got != 10860:
     raise SystemExit(
         "worker terminationGracePeriodSeconds rendered "
-        f"{got!r}, expected integer 1860"
+        f"{got!r}, expected integer 10860"
     )
 PY
 
@@ -223,6 +223,76 @@ if type(grace) is not int or grace < required:
         f"CURIE_DELIVERY_BUDGET_S + CURIE_DELIVERY_SHUTDOWN_RESERVE_S "
         f"({budget} + {reserve} = {required}): a draining worker would be "
         "SIGKILLed before it could settle"
+    )
+PY
+
+# The shipped ceiling, the schema maxima, and the factory maximum execution
+# deadline are one number. The snippet reads those sources; it does not pin a
+# literal, so a later coordinated change still has to move them together.
+IFS= read -r -d '' WORKER_CEILING_CONSISTENCY_PY <<'PY' || true
+import json, re, sys
+from pathlib import Path
+import yaml
+
+chart = Path(sys.argv[1])
+repo = chart.parent.parent
+values = yaml.safe_load((chart / "values.yaml").read_text())
+worker = values["worker"]
+budget = worker["deliveryBudgetSeconds"]
+runner = worker["runnerTotalTimeoutSeconds"]
+schema = json.loads((chart / "values.schema.json").read_text())
+props = schema["properties"]["worker"]["properties"]
+budget_max = props["deliveryBudgetSeconds"]["maximum"]
+runner_max = props["runnerTotalTimeoutSeconds"]["maximum"]
+models = (repo / "apps/api/src/curie_api/models.py").read_text()
+match = re.search(r"^MAX_EXECUTION_DEADLINE_SECONDS\s*=\s*(\d+)\s*$", models, re.M)
+if match is None:
+    raise SystemExit("MAX_EXECUTION_DEADLINE_SECONDS assignment was not found")
+deadline = int(match.group(1))
+numbers = {
+    "values.yaml worker.deliveryBudgetSeconds": budget,
+    "values.yaml worker.runnerTotalTimeoutSeconds": runner,
+    "values.schema.json deliveryBudgetSeconds maximum": budget_max,
+    "values.schema.json runnerTotalTimeoutSeconds maximum": runner_max,
+    "MAX_EXECUTION_DEADLINE_SECONDS": deadline,
+}
+bad = [name for name, value in numbers.items() if type(value) is not int]
+if bad:
+    raise SystemExit(
+        "expected integers, got "
+        + ", ".join(f"{name}={numbers[name]!r}" for name in bad)
+    )
+if len(set(numbers.values())) != 1:
+    raise SystemExit(
+        "delivery budget, runner ceiling, schema maxima, and factory maximum differ: "
+        + ", ".join(f"{name}={value}" for name, value in numbers.items())
+    )
+if runner > budget:
+    raise SystemExit(f"runner ceiling {runner} exceeds delivery budget {budget}")
+docs = [d for d in yaml.safe_load_all(open(sys.argv[2])) if d]
+deploys = [
+    d for d in docs
+    if d.get("kind") == "Deployment"
+    and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "worker"
+]
+if len(deploys) != 1:
+    raise SystemExit(f"expected exactly one worker Deployment, rendered {len(deploys)}")
+env = {}
+for container in deploys[0]["spec"]["template"]["spec"]["containers"]:
+    for entry in container.get("env", []):
+        env[entry["name"]] = entry.get("value")
+rendered_budget = int(env["CURIE_DELIVERY_BUDGET_S"])
+rendered_runner = int(env["CURIE_RUNNER_TOTAL_TIMEOUT_S"])
+if rendered_budget != budget or rendered_runner != budget:
+    raise SystemExit(
+        "rendered worker ceiling does not match the shared factory maximum "
+        f"{budget}: CURIE_DELIVERY_BUDGET_S={rendered_budget}, "
+        f"CURIE_RUNNER_TOTAL_TIMEOUT_S={rendered_runner}"
+    )
+if rendered_runner > rendered_budget:
+    raise SystemExit(
+        f"rendered runner ceiling {rendered_runner} exceeds "
+        f"rendered delivery budget {rendered_budget}"
     )
 PY
 
@@ -437,16 +507,19 @@ fi
 if ! msg="$(python3 -c "$WORKER_GRACE_COVERS_BUDGET_PY" "$DEFAULT_RENDER" 2>&1)"; then
   fail a "$msg"
 fi
+if ! msg="$(python3 -c "$WORKER_CEILING_CONSISTENCY_PY" "$CHART" "$DEFAULT_RENDER" 2>&1)"; then
+  fail a "$msg"
+fi
 assert_env a -- \
   CURIE_CLAIM_TIMEOUT_SECONDS=90 \
   CURIE_ROUTE_TTL_SECONDS=3600 \
   CURIE_SUSPENDED_ROUTE_TTL_SECONDS=86400 \
-  CURIE_DELIVERY_BUDGET_S=600 \
-  CURIE_RUNNER_TOTAL_TIMEOUT_S=600 \
+  CURIE_DELIVERY_BUDGET_S=10800 \
+  CURIE_RUNNER_TOTAL_TIMEOUT_S=10800 \
   CURIE_DELIVERY_LEASE_TTL_S=45 \
   CURIE_DELIVERY_LEASE_HEARTBEAT_S=10 \
   CURIE_DELIVERY_SHUTDOWN_RESERVE_S=60 \
-  CURIE_TERMINATION_GRACE_PERIOD_S=1860
+  CURIE_TERMINATION_GRACE_PERIOD_S=10860
 
 # (b)
 assert_env b \
@@ -527,6 +600,7 @@ assert_env i --set worker.routeTtlSeconds=null -- CURIE_ROUTE_TTL_SECONDS=
 J_POSITIVE="$TMP/j-positive.yaml"
 if ! helm template curie "$CHART" \
   --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.runnerTotalTimeoutSeconds=1800 \
   --set worker.terminationGracePeriodSeconds=1860 \
   >"$J_POSITIVE" 2>&1; then
   fail j "the render FAILED on a raised budget with a matching grace; it must succeed
@@ -539,6 +613,7 @@ fi
 J_DERIVED="$TMP/j-derived.yaml"
 if ! helm template curie "$CHART" \
   --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.runnerTotalTimeoutSeconds=1800 \
   --set worker.terminationGracePeriodSeconds=1800 \
   >"$J_DERIVED" 2>&1; then
   fail j "the render FAILED on deliveryBudgetSeconds=1800 with terminationGracePeriodSeconds=1800; grace must be derived as max(configured, budget + reserve)
@@ -562,6 +637,7 @@ PY
   || fail j "worker terminationGracePeriodSeconds rendered $J_GRACE for budget 1800 + reserve 60 with configured grace 1800, expected 1860"
 assert_env j \
   --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.runnerTotalTimeoutSeconds=1800 \
   --set worker.terminationGracePeriodSeconds=1800 \
   -- \
   CURIE_TERMINATION_GRACE_PERIOD_S=1860
@@ -640,10 +716,12 @@ done
 assert_ladder_helper_present
 L_DEFAULT_JSON="$TMP/l-default-worker.json"
 render_worker_deployment_json "$L_DEFAULT_JSON"
-assert_ladder_reply_timeout "$L_DEFAULT_JSON" 660
+assert_ladder_reply_timeout "$L_DEFAULT_JSON" 10860
 
 L_CUSTOM_JSON="$TMP/l-custom-worker.json"
-render_worker_deployment_json "$L_CUSTOM_JSON" --set worker.deliveryBudgetSeconds=900
+render_worker_deployment_json "$L_CUSTOM_JSON" \
+  --set worker.deliveryBudgetSeconds=900 \
+  --set worker.runnerTotalTimeoutSeconds=900
 assert_ladder_reply_timeout "$L_CUSTOM_JSON" 960
 
 for mutation_and_fragment in \

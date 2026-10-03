@@ -48,7 +48,8 @@ rules:
     cli/src/ops: [released-upgrade]
     packages: [skill, local, local-release, cluster]
     examples: [skill, local, local-release, cluster]
-  ignored_prefixes:
+  # Root documentation filenames are exact paths, never directory ignores.
+  ignored_exact:
     AGENTS.md: []
     ARCHITECTURE.md: []
     CLAUDE.md: []
@@ -61,13 +62,15 @@ rules:
     SECURITY.md: []
     SUPPORT.md: []
     TRADEMARKS.md: []
-    docs: []
     llms.txt: []
+  ignored_prefixes:
+    docs: []
     apps/ui: []
     apps/dispatcher: []
     scripts: []
-    # Edits to the released-upgrade jobs select nothing either. Dispatch CI on
-    # the branch to run them before merge.
+    # The revision-based selector inspects ci.yaml hunks and runs the full
+    # released-upgrade tier when one of its upgrade jobs changes. Other
+    # workflow edits stay ignored; path-only requests cannot inspect hunks.
     .github/workflows: []
     .github/e2e-selection.yaml: []
     tools: []

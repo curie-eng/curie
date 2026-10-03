@@ -178,6 +178,13 @@ class _RedactingRootHandlerProxy(logging.Handler):
         for delegate in tuple(logging.getLogger().handlers):
             if delegate is self or getattr(delegate, "_curie_dynamic_propagation", False):
                 continue
+            # The library backstop is a root handler. Copying a service record
+            # onto the Curie JSON or OTEL handler would emit the same line twice.
+            # Unmarked root handlers, including pytest capture, still get a copy.
+            if getattr(delegate, "_curie_json_service", None) is not None or getattr(
+                delegate, "_curie_otel_handler", False
+            ):
+                continue
             # pytest and embedders may temporarily attach the same capture
             # handler to the named logger and root. Logger.callHandlers already
             # invoked the direct copy, so mirroring it again would duplicate.
@@ -267,3 +274,68 @@ def configure_service_logging(
         logger.removeHandler(proxy)
         proxy.close()
     return logger
+
+
+def install_library_log_backstop(
+    *,
+    service_name: str,
+    logger_provider: LoggerProvider | None,
+) -> None:
+    """Attach one WARNING backstop to root without taking the root logger over.
+
+    Library loggers propagate by default. Root level, propagate, and every
+    handler that is not this backstop stay as the embedder left them. A
+    propagation proxy on root would emit every root record twice.
+    """
+
+    root = logging.getLogger()
+    json_handler = next(
+        (
+            handler
+            for handler in root.handlers
+            if isinstance(handler, _RedactingJsonHandler)
+            and getattr(handler, "_curie_library_backstop", False)
+        ),
+        None,
+    )
+    if json_handler is not None:
+        # A later caller may have replaced sys.stderr. Assign directly so
+        # setStream does not flush a capture stream that is already closed.
+        # The formatter service name stays as the first bootstrap set it.
+        json_handler.stream = sys.stderr
+    else:
+        json_handler = _RedactingJsonHandler(sys.stderr)
+        json_handler.setFormatter(_JsonFormatter(service_name))
+        json_handler.addFilter(RedactingLogFilter())
+        json_handler.setLevel(logging.WARNING)
+        json_handler._curie_library_backstop = True  # type: ignore[attr-defined]
+        json_handler._curie_json_service = service_name  # type: ignore[attr-defined]
+        root.addHandler(json_handler)
+
+    existing_otel = [
+        handler
+        for handler in root.handlers
+        if getattr(handler, "_curie_library_backstop", False)
+        and getattr(handler, "_curie_otel_handler", False)
+    ]
+    wanted_provider = id(logger_provider) if logger_provider is not None else None
+    for handler in existing_otel:
+        if (
+            logger_provider is None
+            or getattr(handler, "_curie_logger_provider", None) != wanted_provider
+            or not isinstance(handler, _OtelRedactingLogHandler)
+        ):
+            root.removeHandler(handler)
+            handler.close()
+    if logger_provider is not None and not any(
+        getattr(handler, "_curie_library_backstop", False)
+        and getattr(handler, "_curie_logger_provider", None) == wanted_provider
+        for handler in root.handlers
+    ):
+        otel_handler = _OtelRedactingLogHandler(
+            level=logging.WARNING, logger_provider=logger_provider
+        )
+        otel_handler._curie_library_backstop = True  # type: ignore[attr-defined]
+        otel_handler._curie_otel_handler = True  # type: ignore[attr-defined]
+        otel_handler._curie_logger_provider = wanted_provider  # type: ignore[attr-defined]
+        root.addHandler(otel_handler)

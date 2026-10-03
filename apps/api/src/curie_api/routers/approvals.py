@@ -29,13 +29,16 @@ from curie_telemetry import (
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from opentelemetry.trace import SpanKind
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import adapter_principal, approval_principal, crud
+from ..admission import admit
 from ..approval_auth import (
     ApprovalPrincipalDep,
     platform_key_or_adapter,
     require_adapter_principal,
 )
+from ..approvers import card_on_requesting_surface
 from ..auth import require_api_key, require_platform_key
 from ..authorizer import authorize_approval
 from ..config import get_settings
@@ -51,6 +54,7 @@ from ..schemas import (
     AdapterPrincipalOut,
     AdapterPrincipalRotate,
     ApprovalAuditOut,
+    ApprovalCreateOut,
     ApprovalOut,
     ApprovalPrincipalMint,
     ApprovalPrincipalOut,
@@ -201,7 +205,7 @@ def _expired(approval: Approval) -> bool:
 
 @router.post(
     "",
-    response_model=ApprovalOut,
+    response_model=ApprovalCreateOut,
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_api_key)],
 )
@@ -210,7 +214,7 @@ async def create_approval(
     request: Request,
     session: SessionDep,
     response: Response,
-) -> ApprovalOut:
+) -> ApprovalCreateOut:
     """Create a pending approval; idempotent on ``dedupe_key``.
 
     A redelivered worker turn that re-requests the same approval gets the
@@ -243,8 +247,10 @@ async def create_approval(
                 status.HTTP_409_CONFLICT, "approval violates a uniqueness constraint"
             ) from exc
         response.status_code = status.HTTP_200_OK
-        return ApprovalOut.model_validate(existing)
-    return ApprovalOut.model_validate(approval)
+        approval = existing
+    result = ApprovalCreateOut.model_validate(approval)
+    result.requested_by = await crud.approval_display_requester(session, approval)
+    return result
 
 
 async def _refuse_rejected_reraise(
@@ -378,6 +384,60 @@ async def get_approval_audit(approval_id: uuid.UUID, session: SessionDep) -> lis
     return [ApprovalAuditOut.model_validate(e) for e in entries]
 
 
+# The channel port's refusal detail (``routers.channels.CALLER_NOT_ALLOWED_DETAIL``),
+# restated rather than imported so this router does not depend on that one. An
+# adapter already reads it as "refused for good, send nothing back" (ADR 0175
+# decision 3), on an answer exactly as on a turn.
+CALLER_NOT_ALLOWED_DETAIL = "caller_not_allowed"
+
+
+async def _admit_adapter_answer(session: AsyncSession, approval: Approval, sender: str) -> None:
+    """Refuse an adapter's answer from a sender the asking binding does not admit.
+
+    ADR-0177 amendment A2: the inbound allowlist comes before any approval logic.
+    An answer carried by an adapter comes from the conversation that asked, so
+    the binding that took that conversation's turns decides, through the one
+    admission check (``admission.admit``, ADR 0175), whether its sender may use
+    the bot at all. Only then is the approver set read. A refusal writes no
+    audit row, as a refused turn writes nothing: it is a log line naming the
+    binding, never the sender.
+
+    Args:
+        session: the request's database session.
+        approval: the served approval, whose card is in the asking conversation.
+        sender: the actor the adapter reports, the sender it verified.
+
+    Raises:
+        HTTPException: 403 ``caller_not_allowed`` when the binding's
+            ``allowed_callers`` do not admit ``sender``.
+    """
+
+    try:
+        row = await crud.binding_for_route(
+            session,
+            approval.reply_kind or "",
+            approval.reply_adapter,
+            approval.reply_channel,
+            agent_id=approval.agent_id,
+        )
+    except crud.AmbiguousRoute:
+        # The served check matched the asking route exactly, so this cannot
+        # select two rows; if it ever does, no single list can be read and the
+        # answer is refused rather than admitted.
+        row = None
+        refused = True
+    else:
+        refused = row is None or not admit(row, [sender]).allowed
+    if refused:
+        logger.info(
+            "approval answer refused approval=%s binding=%s reason=%s",
+            approval.id,
+            row.id if row is not None else None,
+            CALLER_NOT_ALLOWED_DETAIL,
+        )
+        raise HTTPException(status.HTTP_403_FORBIDDEN, CALLER_NOT_ALLOWED_DETAIL)
+
+
 @router.post("/{approval_id}/resolve", response_model=ApprovalOut)
 async def resolve_approval(
     approval_id: uuid.UUID,
@@ -415,6 +475,8 @@ async def resolve_approval(
     # The route binding is read fresh at resolve time (#420), so revoking an
     # approver takes effect on the next click rather than at the next restart.
     binding = await crud.get_approval_route_binding(session, approval)
+    if principal.kind == "adapter" and card_on_requesting_surface(approval, binding):
+        await _admit_adapter_answer(session, approval, principal.subject)
     approver_set = approver_sets(approval, binding)
     # Release the pooled DB connection before the membership lookup. A
     # group-bound set performs a Slack HTTP call (up to the client timeout), and

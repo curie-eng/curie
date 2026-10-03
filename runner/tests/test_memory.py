@@ -209,6 +209,8 @@ def test_session_runner_remember_appends_with_provenance() -> None:
 
     store = _Recording()
     runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
         tracer=RunTracer(None),
@@ -370,6 +372,8 @@ def test_session_runner_consolidate_memory() -> None:
         [MemoryRecord(content="dup"), MemoryRecord(content="dup"), MemoryRecord(content="keep")]
     )
     runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
         tracer=RunTracer(None),

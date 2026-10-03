@@ -1897,7 +1897,6 @@ impl LiveHost {
     /// this overlay. A cold release dry-run keeps only target-dependent checks
     /// pending; retained configuration checks still run.
     fn compute_pre_mutation(&mut self) {
-        self.chart_refusal = self.chart_pin_refusal();
         match self.retained_overlay() {
             Ok(Some((overlay, schema_plan))) => {
                 self.overlay = Some(overlay);
@@ -1906,6 +1905,54 @@ impl LiveHost {
             Ok(None) => {}
             Err(error) => self.config_refusal = Some(format!("{error:#}")),
         }
+        if self.current.is_some() && self.config_refusal.is_none() {
+            let caller_configured = self
+                .overlay
+                .as_deref()
+                .and_then(|overlay| serde_json::from_str::<serde_json::Value>(overlay).ok())
+                .is_some_and(|values| {
+                    let nonblank = |pointer: &str| {
+                        values
+                            .pointer(pointer)
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|value| !value.trim().is_empty())
+                    };
+                    nonblank("/connectorCaller/existingSecret")
+                        || (nonblank("/connectorCaller/signingKey")
+                            && nonblank("/connectorCaller/verifyKey"))
+                });
+            if !caller_configured {
+                let mut args = vec![
+                    plain("cluster"),
+                    plain("up"),
+                    plain("--namespace"),
+                    plain(&self.opts.common.namespace),
+                    plain("--release"),
+                    plain(&self.opts.common.release),
+                ];
+                if let Ok(context) = std::env::var("HELM_KUBECONTEXT") {
+                    if !context.trim().is_empty() {
+                        args.push(plain("--context"));
+                        args.push(plain(context));
+                    }
+                }
+                if self.opts.chart.pending_release().is_none() {
+                    args.push(plain("--chart"));
+                    args.push(plain(self.chart_ref()));
+                }
+                let corrective = OpsCommand::new("curie", args).display();
+                self.config_refusal = Some(format!(
+                    "connector_caller_pair_required: installed release must record a nonblank \
+                     connectorCaller.existingSecret or both connectorCaller.signingKey and \
+                     connectorCaller.verifyKey; run sealed `{corrective}` without --dev to \
+                     generate a missing pair before retrying upgrade. To repair a partial pair, \
+                     add `--set connectorCaller.existingSecret=<secret-name>` or supply both \
+                     connectorCaller.signingKey and connectorCaller.verifyKey"
+                ));
+                return;
+            }
+        }
+        self.chart_refusal = self.chart_pin_refusal();
         if self.opts.forward_only {
             match merge_forward_only(self.overlay.as_deref()) {
                 Ok(overlay) => self.overlay = Some(overlay),
@@ -2177,7 +2224,8 @@ impl LiveHost {
     }
 
     /// R7: read the retained overlay, migrate it (#2299) and keep the result.
-    /// `Ok(None)` means nothing was retained -- a first install.
+    /// `Ok(None)` means no values were returned; the installed version still
+    /// distinguishes an empty release from a first install.
     fn retained_overlay(&self) -> Result<Option<(String, String)>> {
         let values_cmd = OpsCommand::new(
             "helm",

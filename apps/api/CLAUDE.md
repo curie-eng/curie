@@ -74,6 +74,18 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   its shared Valkey attempt budget. It cannot create publication or approval
   state or redeem repository credentials. State and other scoped credentials
   do not authorize comparison, and `ppc` authorizes no other route.
+- **The factory issue read is a scoped credential exception (ADR 0187).**
+  `POST /work-items/issue-read` accepts only the API issued `wir` capability
+  in `X-Curie-Issue-Read`. Its sole scope is `work_item.issue_read`, and it
+  names one execution request and its WorkItem's repository and issue. The
+  worker mints it at sandbox boot through
+  `POST /v1/internal/work-items/issue-read/context` using its internal worker
+  credential. The read refuses any other repository or issue, re-checks that
+  the request is still running before its deadline and that its WorkItem is
+  not cancelled, then reads the issue and its comments with a freshly minted
+  App installation token and returns them verbatim. It stores nothing.
+  State and other scoped credentials do not authorize it, and `wir`
+  authorizes no other route.
 - **Git-flow never calls the GitHub API.** `gitflow.py` builds the bundle by
   archiving the pushed sha directly from the repo over the git protocol (bare
   repos in tests, the real remote in production). This keeps the flow
@@ -95,7 +107,8 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   clone, a **prod-branch** push looks up a stored bundle for that sha across
   every agent bound to the repository (ADR-0091), fetches its bytes from the
   object store, and reads `deploy.yaml` out of them to route the push; it
-  still only creates a new `Deployment` row. A prod promote of an
+  creates the target agent's own `Version` row when needed, pointing to the
+  same stored object, and creates a new `Deployment` row. A prod promote of an
   already-bundled sha therefore needs no access to the git remote -- which
   matters because the platform's GitHub credential can expire or be revoked
   without stopping webhook delivery (#1211). A **dev-branch** push is not

@@ -65,9 +65,14 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
 **Inbound** — a discriminated union on `kind` (`parse_inbound` decodes it):
 
 - `Event` = `{kind: "event", type: "message"|"job"|"eval_case", text, user, ts,
-  session_id?, history_ref?, publication_context?}`. The session and history
-  fields are nullable strings. The platform may attach a publication context
-  to a managed factory turn; other producers omit it.
+  session_id?, history_ref?, publication_context?, tool_access?}`. The session
+  and history fields are nullable strings. The platform may attach a
+  publication context to a managed factory turn; other producers omit it.
+  `tool_access` is null or `"read-only"` (TOOL-ACCESS in the
+  [seam contract](./INTERFACE.md)). A server that does not enforce it must not
+  advertise it under `tool_access` on `/status` and `/v1/status`; a worker that
+  implements TOOL-ACCESS-6 then refuses to send it such a turn rather than
+  letting it run unrestricted.
 - `Interrupt` = `{kind: "interrupt", reason}`
 
 **Outbound** — a discriminated union on `type`, each carrying `version`
@@ -79,8 +84,11 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
   idle-awaiting-input, classified-failure}`
 - `ErrorEvent` → `error` `{version, message, classification?}`
 - `SideEffectFlag` → `side_effect_flag` `{version, tool?, detail?, call_id?,
-  arguments?, result?, failed?}`, emitted once when a side-effecting call is
-  made and once when its result arrives, joined on `call_id` (ADR-0117)
+  arguments?, result?, failed?, redacted?}`, emitted once when a side-effecting
+  call is made and once when its result arrives, joined on `call_id` (ADR-0117).
+  Set `redacted: true` when you scrubbed anything inside `result`: a consumer
+  then treats the reported state as unrestorable rather than replaying a
+  placeholder
 
 **Version gate (strict producer, tolerant consumer).** Your producer emits its
 **exact build `PROTOCOL_VERSION`** (currently `0.5.3`) on every outbound event and

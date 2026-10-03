@@ -28,6 +28,7 @@ from .events import (
     SessionStatus,
     SideEffectFlag,
     TextDelta,
+    ToolAccess,
     ToolNote,
 )
 from .service_config import (
@@ -353,8 +354,15 @@ mod tests {
             session_id: None,
             history_ref: None,
             publication_context: None,
+            // TOOL-ACCESS-1: the enum's wire spelling round-trips too.
+            tool_access: Some(ToolAccess::ReadOnly),
+            memory_token: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
+        assert!(encoded.contains(r#""tool_access":"read-only""#));
+        // TOOL-ACCESS-2: an unknown value is refused, never read as None.
+        let unknown = encoded.replace(r#""read-only""#, r#""read-mostly""#);
+        assert!(serde_json::from_str::<InboundMessage>(&unknown).is_err());
         let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
         assert_eq!(message, decoded);
     }
@@ -471,6 +479,9 @@ def render_rust() -> str:
             tuple(m.value for m in TurnSource),
             default=TurnSource.SLACK.value,
         ),
+        # No default variant: ToolAccess is only referenced as Option<ToolAccess>
+        # (QueuedTurn.tool_access, Event.tool_access), whose default is None.
+        _string_enum("ToolAccess", tuple(m.value for m in ToolAccess)),
         _struct(Budget),
         _struct(OtelConfig),
         _struct(SessionConfig),

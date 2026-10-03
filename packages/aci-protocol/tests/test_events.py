@@ -405,6 +405,25 @@ def test_side_effect_flag_fields_are_optional_for_an_older_producer() -> None:
     assert decoded.arguments is None
     assert decoded.result is None
     assert decoded.failed is None
+    assert decoded.redacted is None
+
+
+def test_side_effect_flag_says_when_its_result_was_redacted() -> None:
+    """A scrubbed snapshot is not a restore, so the frame says it was scrubbed (#1873).
+
+    Optional like the fields above, so a reader that predates it still decodes
+    the frame; it only has to be present when something was replaced.
+    """
+
+    decoded = _OUTBOUND.validate_python(
+        {
+            "type": "side_effect_flag",
+            "version": "0.5.8",
+            "result": {"prior": {"token": "[REDACTED:held_secret]"}},
+            "redacted": True,
+        }
+    )
+    assert decoded.redacted is True
 
 
 def test_two_frames_of_one_call_are_joinable_by_call_id() -> None:

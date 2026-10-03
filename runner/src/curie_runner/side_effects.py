@@ -39,12 +39,13 @@ from collections.abc import Iterable
 # reports a phase to the status card and acts on nothing (#3464). So is the
 # deliberate ``progress`` tool (ADR 0130): it reports task state to the
 # platform and acts on nothing, so it is never a side effect and never on the
-# turn's receipt.
+# turn's receipt. The factory ``get_issue`` (ADR 0187) only reads its own issue.
 PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = frozenset(
     {
         "mcp__curie__request_approval",
         "mcp__curie__report_progress",
         "mcp__curie__progress",
+        "mcp__curie__get_issue",
     }
 )
 

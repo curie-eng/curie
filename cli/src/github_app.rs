@@ -19,9 +19,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
 
 use crate::ops::{
     helm_history_cmd, parse_helm_history, plain, require_on_path, resolve_existing_secret_ref,
@@ -1103,35 +1101,21 @@ async fn create_sandbox_inner(
     );
     let body = serde_norway::to_string(&recovery_manifest)
         .context("could not serialize a sandbox recovery object")?;
-    let mut child = tokio::process::Command::new("kubectl")
-        .args([
-            "create",
-            "-n",
-            ownership.namespace,
-            "-f",
-            "-",
-            &format!("--request-timeout={KUBECTL_REQUEST_TIMEOUT}"),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("failed to invoke `kubectl`; is it on PATH?")?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("could not open kubectl stdin for sandbox recovery")?;
-    stdin
-        .write_all(body.as_bytes())
+    let create = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("create"),
+            plain("-n"),
+            plain(ownership.namespace),
+            plain("-f"),
+            plain("-"),
+            plain(format!("--request-timeout={KUBECTL_REQUEST_TIMEOUT}")),
+        ],
+    );
+    let (ok, _stdout, _stderr) = crate::ops::run_capture_with_stdin(&create, body.as_bytes())
         .await
         .context("could not send a sandbox recovery object to kubectl")?;
-    drop(stdin);
-    let output = child
-        .wait_with_output()
-        .await
-        .context("could not wait for kubectl sandbox recovery")?;
-    if !output.status.success() {
+    if !ok {
         anyhow::bail!("kubectl could not recreate {} {}", object.kind, object.name);
     }
     Ok(())
@@ -1539,7 +1523,7 @@ struct GitHubAppJwtClaims {
 /// `apps/api/src/curie_api/github_app.py`): RS256, `iss` = App id, `iat`
 /// backdated 60s, `exp` 480s. The two cannot share code across Python/Rust;
 /// the constants and claim names are the sibling.
-fn sign_app_jwt(app_id: &str, pem: &str) -> Result<String> {
+pub(crate) fn sign_app_jwt(app_id: &str, pem: &str) -> Result<String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|err| {
@@ -2230,7 +2214,7 @@ fn is_github_app_id(value: &str) -> bool {
 /// regression than the false-positive this function exists to close -- so any
 /// label ending in `PRIVATE KEY` is accepted as long as BEGIN and END agree on
 /// it.
-fn is_pem_private_key(body: &str) -> bool {
+pub(crate) fn is_pem_private_key(body: &str) -> bool {
     let marker_label = |line: &str, marker: &str| -> Option<String> {
         line.trim()
             .strip_prefix(marker)?

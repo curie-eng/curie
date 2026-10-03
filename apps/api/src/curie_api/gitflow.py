@@ -67,8 +67,14 @@ class CommitNotOnBranch(GitFlowError):
 
 
 def verify_signature(secret: str, body: bytes, header: str | None) -> bool:
-    """Constant-time check of GitHub's X-Hub-Signature-256 over the raw body."""
+    """Constant-time check of GitHub's X-Hub-Signature-256 over the raw body.
 
+    A blank secret is not a signing key. Reject it before HMAC so an empty
+    shared key cannot authenticate a delivery.
+    """
+
+    if not secret.strip():
+        return False
     if not header or not header.startswith("sha256="):
         return False
     expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()

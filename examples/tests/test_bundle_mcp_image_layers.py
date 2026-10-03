@@ -18,6 +18,7 @@ _INSTALL_BY_COMMAND = {
     ),
     "slack-mcp": "RUN npm install -g @zencoderai/slack-mcp-server@0.0.1",
 }
+_DARK_FACTORY_PNPM_INSTALL = "RUN npm install -g --ignore-scripts pnpm@9.15.9"
 
 _PLATFORM_ABSENT = (
     "@modelcontextprotocol/server-github",
@@ -53,7 +54,7 @@ def _declared_commands() -> dict[str, set[str]]:
     return declared
 
 
-def _runner_layer_errors(text: str, commands: set[str]) -> list[str]:
+def _runner_layer_errors(text: str, commands: set[str], bundle_name: str) -> list[str]:
     lines = _instruction_lines(text)
     errors: list[str] = []
     arg_lines = [line for line in lines if line.startswith("ARG ")]
@@ -64,6 +65,8 @@ def _runner_layer_errors(text: str, commands: set[str]) -> list[str]:
         errors.append("FROM must be exactly FROM ${CURIE_RUNNER_IMAGE}")
     npm_lines = [line for line in lines if line.startswith("RUN npm")]
     expected = {_INSTALL_BY_COMMAND[command] for command in commands}
+    if bundle_name == "dark-factory":
+        expected.add(_DARK_FACTORY_PNPM_INSTALL)
     if set(npm_lines) != expected or len(npm_lines) != len(expected):
         errors.append(f"RUN npm lines {npm_lines!r} != {sorted(expected)!r}")
     npm_at = [index for index, line in enumerate(lines) if line.startswith("RUN npm")]
@@ -80,13 +83,12 @@ def _runner_layer_errors(text: str, commands: set[str]) -> list[str]:
 
 def test_bundle_mcp_servers_are_installed_by_bundle_runner_layers() -> None:
     declared = _declared_commands()
-    assert set(declared) == {"github-issues", "dark-factory", "mean-tester"}
+    assert set(declared) == {"github-issues", "mean-tester"}
     assert declared["github-issues"] == {"mcp-server-github"}
-    assert declared["dark-factory"] == {"mcp-server-github"}
     assert declared["mean-tester"] == {"slack-mcp", "mcp-server-github"}
     for name, commands in declared.items():
         text = (EXAMPLES / name / "runner.Dockerfile").read_text()
-        assert _runner_layer_errors(text, commands) == []
+        assert _runner_layer_errors(text, commands, name) == []
     platform = (EXAMPLES.parent / "runner" / "Dockerfile").read_text()
     for needle in _PLATFORM_ABSENT:
         assert needle not in platform
@@ -96,10 +98,24 @@ def test_bundle_mcp_servers_are_installed_by_bundle_runner_layers() -> None:
         "ARG CURIE_RUNNER_IMAGE=curie-runner:dev",
         1,
     )
-    assert _runner_layer_errors(defaulted_arg, {"mcp-server-github"})
+    assert _runner_layer_errors(defaulted_arg, {"mcp-server-github"}, "github-issues")
     tagged_from = github_issues.replace(
         "FROM ${CURIE_RUNNER_IMAGE}",
         "FROM curie-runner:dev",
         1,
     )
-    assert _runner_layer_errors(tagged_from, {"mcp-server-github"})
+    assert _runner_layer_errors(tagged_from, {"mcp-server-github"}, "github-issues")
+    unauthorized_pnpm = github_issues.replace(
+        "USER 1000:1000", f"{_DARK_FACTORY_PNPM_INSTALL}\nUSER 1000:1000", 1
+    )
+    assert _runner_layer_errors(
+        unauthorized_pnpm, {"mcp-server-github"}, "github-issues"
+    )
+    dark_factory = (EXAMPLES / "dark-factory" / "runner.Dockerfile").read_text()
+    # The factory reads its issue through the platform (ADR 0187); its layer
+    # carries toolchains only.
+    assert _runner_layer_errors(dark_factory, set(), "dark-factory") == []
+    unpinned_pnpm = dark_factory.replace(
+        _DARK_FACTORY_PNPM_INSTALL, "RUN npm install -g --ignore-scripts pnpm"
+    )
+    assert _runner_layer_errors(unpinned_pnpm, set(), "dark-factory")

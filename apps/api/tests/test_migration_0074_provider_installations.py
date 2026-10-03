@@ -1,4 +1,4 @@
-"""Migration 0072 adds curie.provider_installations (#2909)."""
+"""Migration 0074 adds curie.provider_installations (#2909)."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ NAMED_CONSTRAINTS = {
     "provider_installations_disconnected_at_ck",
     "provider_installations_credential_ref_ck",
     "provider_installations_webhook_verification_ref_ck",
-    "provider_installations_tenant_provider_external_key",
+    "provider_installations_tenant_provider_name_key",
     "provider_installations_tenant_id_fkey",
     "provider_installations_installer_fkey",
 }
@@ -66,23 +66,23 @@ def _constraint_names() -> set[str]:
     return {row["conname"] for row in rows}
 
 
-def test_0072_revises_0071() -> None:
+def test_0074_revises_0073() -> None:
     script = ScriptDirectory.from_config(_config())
-    revision = script.get_revision("0072")
+    revision = script.get_revision("0074")
     assert revision is not None
-    assert revision.down_revision == "0071"
+    assert revision.down_revision == "0073"
 
 
-def test_0072_round_trip_creates_and_drops_provider_installations(
+def test_0074_round_trip_creates_and_drops_provider_installations(
     isolated_migration_db: None,
 ) -> None:
     config = _config()
     command.upgrade(config, "head")
     assert _regclass("provider_installations") is not None
     try:
-        command.downgrade(config, "0071")
+        command.downgrade(config, "0073")
         assert _regclass("provider_installations") is None
-        # The FK targets from 0051 and 0071 must outlive the downgrade.
+        # The FK targets from 0051 (tenants) and 0057 (principals) must outlive the downgrade.
         assert _regclass("tenants") is not None
         assert _regclass("principals") is not None
     finally:

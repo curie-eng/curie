@@ -1,8 +1,8 @@
-"""Migration 0073 adds curie.identity_links (#2910, ADR 0155 step 5).
+"""Migration 0075 adds curie.identity_links (#2910, ADR 0155 step 5).
 
 It also adds ``UNIQUE (tenant_id, id)`` on provider_installations as the target
 of the link's composite tenant FK. The downgrade removes both and leaves the
-0072 tables (provider_installations, principals) in place.
+0074 tables (provider_installations, principals) in place.
 """
 
 from __future__ import annotations
@@ -72,14 +72,14 @@ def _index(name: str) -> dict[str, Any] | None:
     return rows[0] if rows else None
 
 
-def test_0073_revises_0072() -> None:
+def test_0075_revises_0074() -> None:
     script = ScriptDirectory.from_config(_config())
-    revision = script.get_revision("0073")
+    revision = script.get_revision("0075")
     assert revision is not None
-    assert revision.down_revision == "0072"
+    assert revision.down_revision == "0074"
 
 
-def test_0073_round_trip_creates_and_drops_identity_links(
+def test_0075_round_trip_creates_and_drops_identity_links(
     isolated_migration_db: None,
 ) -> None:
     config = _config()
@@ -87,10 +87,10 @@ def test_0073_round_trip_creates_and_drops_identity_links(
     assert _regclass("identity_links") is not None
     assert INSTALLATION_TENANT_KEY in _constraint_names("provider_installations")
     try:
-        command.downgrade(config, "0072")
+        command.downgrade(config, "0074")
         assert _regclass("identity_links") is None
         assert INSTALLATION_TENANT_KEY not in _constraint_names("provider_installations")
-        # The FK targets from 0052/0072 must outlive the downgrade.
+        # The FK targets from 0057/0074 must outlive the downgrade.
         assert _regclass("provider_installations") is not None
         assert _regclass("principals") is not None
         assert _regclass("tenants") is not None

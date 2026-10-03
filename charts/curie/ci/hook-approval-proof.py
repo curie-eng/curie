@@ -617,7 +617,7 @@ class Proof:
         if result.get("deployment", {}).get("status") != "active":
             raise ProofError("proof deployment is not active")
 
-    def signer_prepare(self, payload: dict[str, Any]) -> tuple[bytes, str, str]:
+    def signer_prepare(self, payload: dict[str, Any]) -> tuple[bytes, str, str, str]:
         repo_root = Path(__file__).resolve().parents[3]
         api_source = str(repo_root / "apps" / "api" / "src")
         sys.path.insert(0, api_source)
@@ -641,19 +641,27 @@ class Proof:
             raise ProofError("could not load the Alertmanager signer fixture")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        previous = os.environ.get("CURIE_HOOK_SECRET")
-        os.environ["CURIE_HOOK_SECRET"] = secret
+        environment = {
+            "CURIE_HOOK_SECRET": secret,
+            "CURIE_HOOK_URL": (
+                f"{self.api_url}/hooks/{self.agent_id}/{HOOK}?"
+                + urllib.parse.urlencode({"kind": "slack", "address": CHANNEL})
+            ),
+        }
+        previous = {name: os.environ.get(name) for name in environment}
+        os.environ.update(environment)
         try:
-            body, signature, delivery = module.prepare(payload)
+            body, signature, delivery, timestamp = module.prepare(payload)
         finally:
-            if previous is None:
-                os.environ.pop("CURIE_HOOK_SECRET", None)
-            else:
-                os.environ["CURIE_HOOK_SECRET"] = previous
-        return body, signature, delivery
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        return body, signature, delivery, timestamp
 
     def post_hook(
-        self, body: bytes, signature: str, delivery: str
+        self, body: bytes, signature: str, delivery: str, timestamp: str
     ) -> dict[str, Any]:
         path = (
             f"/hooks/{self.agent_id}/{HOOK}?"
@@ -667,6 +675,7 @@ class Proof:
                 "Content-Type": "application/json",
                 "X-Curie-Signature-256": signature,
                 "X-Curie-Delivery-Id": delivery,
+                "X-Curie-Timestamp": timestamp,
             },
             use_platform_key=False,
             expected={200},
@@ -1016,8 +1025,8 @@ class Proof:
                     }
                 ],
             }
-            body, signature, delivery = self.signer_prepare(alert)
-            first = self.post_hook(body, signature, delivery)
+            body, signature, delivery, timestamp = self.signer_prepare(alert)
+            first = self.post_hook(body, signature, delivery, timestamp)
             if first["duplicate"] is not False:
                 raise ProofError("first signed hook delivery was reported as duplicate")
             event_id = str(first["event_id"])
@@ -1128,7 +1137,17 @@ class Proof:
                 raise ProofError("transcript does not contain exactly one awaiting approval turn")
             self.assert_audit(self.audit(approval_id), ["denied", "resolved"])
 
-            duplicate = self.post_hook(body, signature, delivery)
+            # A real upstream retry re-signs with a fresh timestamp: the approval
+            # round trip above can outlast the signed timestamp window, and the
+            # dedupe receipt, not the old signature, is what makes it a duplicate.
+            retry_body, retry_signature, retry_delivery, retry_timestamp = (
+                self.signer_prepare(alert)
+            )
+            if retry_body != body or retry_delivery != delivery:
+                raise ProofError("re-signed retry changed the body or delivery id")
+            duplicate = self.post_hook(
+                retry_body, retry_signature, retry_delivery, retry_timestamp
+            )
             if duplicate.get("duplicate") is not True:
                 raise ProofError("retried signed hook was not reported as duplicate")
             for field in ("event_id", "stream_id", "conversation_id"):

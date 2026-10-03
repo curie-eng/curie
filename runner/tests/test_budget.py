@@ -67,6 +67,8 @@ def _run(runner: SessionRunner, event: Event) -> list:
 def _runner(script, ceiling: int) -> tuple[SessionRunner, FakeModelSession]:
     fake = FakeModelSession(lambda: script)
     runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
         session_factory=lambda: fake,
         ceiling=ceiling,
         tracer=RunTracer(None),

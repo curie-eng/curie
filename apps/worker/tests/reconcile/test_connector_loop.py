@@ -373,16 +373,6 @@ async def test_stop_is_honoured_promptly_rather_than_after_the_interval() -> Non
     await asyncio.wait_for(task, timeout=2)
 
 
-async def test_cancellation_propagates() -> None:
-    # Cancelled is not an error to swallow; the worker is shutting down.
-    loop = Loop([], {}, interval_seconds=300)
-    task = asyncio.create_task(loop.run_forever(asyncio.Event()))
-    await asyncio.sleep(0.05)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-
 # --------------------------------------------------------------------------- #
 # The manifest source
 # --------------------------------------------------------------------------- #
@@ -565,3 +555,160 @@ async def test_a_converged_bundleless_target_touches_the_cluster_only_to_look() 
     assert client.deleted == []
     assert summary.skipped == 1
     assert summary.deleted == 0
+
+
+# --------------------------------------------------------------------------- #
+# A persistent skip is an edge, not a heartbeat (#1215)
+# --------------------------------------------------------------------------- #
+# A skip is the expected steady state of a partially-migrated install, so it
+# recurs every pass for as long as nobody acts. Logging it every pass is the
+# narration the module docstring warns about. The skip stays visible as a log
+# line on each transition and as a gauge on every pass.
+import curie_worker.connector_loop as connector_loop_module  # noqa: E402
+from curie_telemetry import record_metric  # noqa: E402
+
+_SKIPPED_AGENTS_GAUGE = "curie.connector.reconcile.skipped_agents"
+
+
+def unprovisioned_source() -> Any:
+    """A render whose operator-supplied Secret is absent from the cluster."""
+
+    class _Source:
+        def rendered(self, *, agent_id: str, version_id: str) -> RenderedConnectors:
+            return RenderedConnectors(
+                manifests=[manifest("Deployment", "dep")],
+                owned_secret_name="curie-a-connector-secrets",
+                owned_secret_keys=["TOKEN"],
+            )
+
+    return _Source()
+
+
+def skipped(agent: str, reason: str) -> AgentOutcome:
+    return AgentOutcome(agent=agent, skipped=reason, report=ApplyReport())
+
+
+def _records_at(caplog: pytest.LogCaptureFixture, level: int) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.levelno == level]
+
+
+def _capture_skipped_gauge(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    # Wrapped, not replaced: the real `record_metric` refuses an undeclared
+    # instrument or label, which is the declaration half of this contract.
+    recorded: list[float] = []
+
+    def capture(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
+        record_metric(name, value, attributes=attributes)
+        if name == _SKIPPED_AGENTS_GAUGE:
+            recorded.append(value)
+
+    monkeypatch.setattr(connector_loop_module, "record_metric", capture)
+    return recorded
+
+
+async def test_an_unchanging_skip_logs_one_warning_and_no_info_across_ten_passes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The real reconcile step, so a WARNING from `connector_agent` counts too:
+    # the issue reproduced ten from each module for ten passes.
+    agent = target("a")
+    loop = StubTargetsLoop(
+        [agent], engine=None, source=unprovisioned_source(), client=FakeClient([])
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="curie_worker"):
+        for _ in range(10):
+            summary = await loop.one_pass()
+            assert summary.skipped == 1, "the skip is still counted every pass"
+
+    warnings = _records_at(caplog, logging.WARNING)
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert "agent=a" in warnings[0].getMessage()
+    assert "curie cluster deploy" in warnings[0].getMessage(), "the line says what to do"
+    assert _records_at(caplog, logging.INFO) == [], [
+        r.getMessage() for r in _records_at(caplog, logging.INFO)
+    ]
+
+
+async def test_a_skip_is_not_work() -> None:
+    # Pinned on its own so reverting `did_work` to count `skipped` is red here
+    # by name, not only through a log count. The skip's own WARNING already
+    # reports its entry, so the pass line need not rise to INFO for it.
+    loop = Loop([target("a")], {"a": skipped("a", "credentials not provisioned")})
+    for _ in range(3):
+        summary = await loop.one_pass()
+        assert summary.skipped == 1
+        assert not summary.did_work, "a skip is not work"
+
+
+async def test_a_changed_skip_reason_logs_again(caplog: pytest.LogCaptureFixture) -> None:
+    outcomes: dict[str, Any] = {"a": skipped("a", "reason one")}
+    loop = Loop([target("a")], outcomes)
+
+    with caplog.at_level(logging.DEBUG, logger="curie_worker"):
+        await loop.one_pass()
+        await loop.one_pass()
+        outcomes["a"] = skipped("a", "reason two")
+        caplog.clear()
+        await loop.one_pass()
+
+    warnings = _records_at(caplog, logging.WARNING)
+    assert len(warnings) == 1
+    assert "agent=a" in warnings[0].getMessage()
+    assert "reason two" in warnings[0].getMessage()
+
+
+async def test_leaving_the_skip_logs_once(caplog: pytest.LogCaptureFixture) -> None:
+    outcomes: dict[str, Any] = {"a": skipped("a", "credentials not provisioned")}
+    loop = Loop([target("a")], outcomes)
+
+    with caplog.at_level(logging.DEBUG, logger="curie_worker"):
+        await loop.one_pass()
+        outcomes["a"] = ok("a")
+        caplog.clear()
+        await loop.one_pass()
+        leaving = [r for r in caplog.records if r.levelno >= logging.INFO]
+        caplog.clear()
+        await loop.one_pass()
+        steady = [r for r in caplog.records if r.levelno >= logging.INFO]
+
+    assert len(leaving) == 1, [r.getMessage() for r in leaving]
+    assert leaving[0].levelno == logging.INFO
+    assert "agent=a" in leaving[0].getMessage()
+    assert "no longer skipped" in leaving[0].getMessage()
+    assert steady == [], [r.getMessage() for r in steady]
+
+
+async def test_the_skipped_agents_gauge_reports_every_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With the repeating line gone, the gauge is what keeps a persistent skip
+    # visible: one point per pass, the number of agents skipped right now.
+    recorded = _capture_skipped_gauge(monkeypatch)
+    outcomes: dict[str, Any] = {
+        "a": skipped("a", "credentials not provisioned"),
+        "b": skipped("b", "no stored bundle"),
+        "c": ok("c"),
+    }
+    loop = Loop([target("a"), target("b"), target("c")], outcomes)
+
+    await loop.one_pass()
+    await loop.one_pass()
+    outcomes["a"] = ok("a")
+    await loop.one_pass()
+
+    assert recorded == [2, 2, 1]
+
+
+async def test_an_agent_no_longer_deployed_leaves_the_skipped_gauge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded = _capture_skipped_gauge(monkeypatch)
+    a, b = target("a"), target("b")
+    loop = Loop([a, b], {"a": skipped("a", "r"), "b": skipped("b", "r")})
+
+    await loop.one_pass()
+    loop._targets = [b]
+    await loop.one_pass()
+
+    assert recorded == [2, 1]

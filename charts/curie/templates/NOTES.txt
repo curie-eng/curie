@@ -95,7 +95,9 @@ Preflights:
       kubectl logs -n {{ .Release.Namespace }} job/{{ include "curie.fullname" . }}-preflight-avx
 {{- end }}
 {{- if .Values.preflights.networkPolicyProbe.enabled }}
-  - NetworkPolicy-enforcement probe runs on demand:
+  - WARNING: a successful install does not prove NetworkPolicy enforcement.
+    Until this probe passes, treat sandbox network isolation as unverified.
+    Run the NetworkPolicy-enforcement probe now:
       helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
       kubectl logs -n {{ .Release.Namespace }} job/{{ include "curie.fullname" . }}-netpol-probe
 {{- end }}
@@ -137,6 +139,10 @@ Kernel isolation (gVisor, security.gvisor.mode={{ $gvisorMode }}):
 
 Sandbox capacity (resourceQuota vs. node allocatable):
 {{- include "curie.sandboxCapacity.notes" (dict "fits" $cap.fits "ceiling" $cap.ceiling "cpu" $perSandbox.cpu "memory" $perSandbox.memory "fullname" (include "curie.fullname" .) "namespace" .Release.Namespace) }}
+{{- if .Values.worker.deploy }}
+{{- $workerMaxConcurrency := dig "maxConcurrency" 16 .Values.worker }}
+  - Worker turn slots: worker.replicas {{ .Values.worker.replicas }} x worker.maxConcurrency {{ $workerMaxConcurrency }} = {{ mul (int64 .Values.worker.replicas) (int64 $workerMaxConcurrency) }} concurrent turns; the sandbox quota admits {{ $cap.ceiling }}.
+{{- end }}
 {{- end }}
 {{- end }}
 {{- end }}

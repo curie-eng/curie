@@ -49,6 +49,13 @@ helm template alloy grafana/alloy \
   --version 1.11.1 \
   --namespace observability \
   -f "$ASSETS/alloy-values.yaml" >"$TMP/alloy.yaml"
+# The Docker-runtime variant is what the CLI's render_alloy_values writes; the
+# Rust test alloy_docker_variant_matches_ci_fixture keeps this fixture equal to
+# it, so the gate never re-implements the rewrite.
+helm template alloy grafana/alloy \
+  --version 1.11.1 \
+  --namespace observability \
+  -f "$SCRIPT_DIR/fixtures/alloy-docker-values.yaml" >"$TMP/alloy-docker.yaml"
 helm template prometheus prometheus-community/prometheus \
   --version "$PROMETHEUS_CHART_VERSION" \
   --namespace observability \
@@ -79,6 +86,7 @@ python3 - \
   "$TMP/grafana.yaml" \
   "$TMP/loki.yaml" \
   "$TMP/alloy.yaml" \
+  "$TMP/alloy-docker.yaml" \
   "$TMP/prometheus.yaml" \
   "$TMP/prometheus-second-source.yaml" \
   "$ASSETS/tempo.yaml" \
@@ -101,6 +109,7 @@ import yaml
     grafana_path,
     loki_path,
     alloy_path,
+    alloy_docker_path,
     prometheus_path,
     prometheus_second_source_path,
     tempo_path,
@@ -295,10 +304,25 @@ assert "/var/lib/alloy" in host_paths, "Alloy positions must use durable hostPat
 alloy_content = at(alloy_values, "alloy", "configMap", "content")
 assert "stage.cri" in alloy_content, "Alloy must parse containerd CRI log lines"
 assert "/var/log/pods/" in alloy_content, "Alloy must discover Kubernetes pod logs"
+docker_docs = load_docs(alloy_docker_path)
+docker_config = next(doc for doc in docker_docs if doc.get("kind") == "ConfigMap")
+assert "stage.docker { }" in docker_config["data"]["config.alloy"], (
+    "Docker runtime must render the Docker parser into Alloy's ConfigMap"
+)
+docker_daemonset = next(doc for doc in docker_docs if doc.get("kind") == "DaemonSet")
+docker_paths = [
+    volume.get("hostPath", {}).get("path")
+    for volume in docker_daemonset["spec"]["template"]["spec"]["volumes"]
+]
+assert "/var/lib/docker/containers" in docker_paths, (
+    "Docker runtime must mount the real container-log host path"
+)
 
 assert at(prometheus_values, "alertmanager", "enabled") is False
 assert at(prometheus_values, "prometheus-pushgateway", "enabled") is False
-assert at(prometheus_values, "configmapReload", "prometheus", "enabled") is False
+assert at(prometheus_values, "configmapReload", "prometheus", "enabled") is True, (
+    "Prometheus must reload chart-managed rule ConfigMap changes without a manual restart"
+)
 assert_quantity(at(prometheus_values, "server", "persistentVolume", "size"), "8Gi", "Prometheus PVC")
 assert "storageClass" not in at(prometheus_values, "server", "persistentVolume"), (
     "Prometheus must defer storage class selection to the cluster default"
@@ -579,6 +603,38 @@ server_configs = [
 ]
 assert len(server_configs) == 1, f"expected one Prometheus config, found {len(server_configs)}"
 scrape_configs = at(server_configs[0], "scrape_configs")
+
+# The real Alloy DaemonSet pod, not its Service, must enter the shipped
+# namespace-scoped pod scrape job. A healthy but empty collector cannot be
+# detected by Prometheus if this annotation/render boundary is absent.
+alloy_daemonsets = [doc for doc in alloy_docs if doc.get("kind") == "DaemonSet"]
+assert len(alloy_daemonsets) == 1, "Alloy must render one DaemonSet"
+alloy_annotations = at(alloy_daemonsets[0], "spec", "template", "metadata").get("annotations") or {}
+assert alloy_annotations.get("prometheus.io/scrape") == "true", (
+    "Alloy pods must opt in to the shipped Prometheus pod scrape"
+)
+assert alloy_annotations.get("prometheus.io/path") == "/metrics"
+assert alloy_annotations.get("prometheus.io/port") == "12345"
+pod_jobs = [job for job in scrape_configs if job.get("job_name") == "kubernetes-pods"]
+assert len(pod_jobs) == 1, "Prometheus must render one kubernetes-pods scrape job"
+pod_job = pod_jobs[0]
+assert any(
+    config.get("role") == "pod"
+    and discovery_scope(config) == {RELEASE_NAMESPACE}
+    for config in pod_job.get("kubernetes_sd_configs", [])
+), "Alloy pod scrape must stay within the observability namespace"
+alloy_target = {
+    "__address__": "10.0.0.7:12345",
+    "__meta_kubernetes_namespace": RELEASE_NAMESPACE,
+    "__meta_kubernetes_pod_name": "alloy-example",
+    "__meta_kubernetes_pod_node_name": "node-example",
+    "__meta_kubernetes_pod_annotation_prometheus_io_scrape": alloy_annotations["prometheus.io/scrape"],
+    "__meta_kubernetes_pod_annotation_prometheus_io_path": alloy_annotations["prometheus.io/path"],
+    "__meta_kubernetes_pod_annotation_prometheus_io_port": alloy_annotations["prometheus.io/port"],
+}
+assert apply_relabel(alloy_target, pod_job.get("relabel_configs", [])) is not None, (
+    "the rendered kubernetes-pods job must retain the annotated Alloy pod"
+)
 
 if mutation == "scrape-namespace":
     for job in scrape_configs:
@@ -1018,6 +1074,7 @@ REQUIRED_ALERTS = {
     "CurieReplyDeliveryRefused",
     "CurieChannelTokenRotationFailed",
     "CurieMailAdapterNotReady",
+    "CurieConnectorToolErrors",
     "CurieRootDiskPressure",
     "CurieRootInodesLow",
     "CurieNodeMemoryHeadroomLow",

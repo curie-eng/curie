@@ -46,7 +46,8 @@ just the address.
 ```
 
 That is a complete and correct answer. Reversibility is deny-by-default: a reply
-that carries no `prior` produces a record marked not-undoable, and the receipt
+that is missing any of `prior`, `post` or `target` produces a record marked
+not-undoable, and the receipt
 shows your sentence where an undo control would have been. A third-party MCP
 server nobody wrote a connector for lands in exactly this case without anyone
 declaring anything.

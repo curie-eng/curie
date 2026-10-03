@@ -50,6 +50,19 @@ in code now:
   a past-SLA record flips to expired (410) and now also enqueues the expiry resume turn
   (#412, below) so the late resolver's dead end no longer strands the session. Creation is
   idempotent on `dedupe_key` (the triggering event id).
+- **Break-glass recovery, off by default (landed, #2753).** A second, separately
+  mounted surface (`apps/api/src/curie_api/routers/approval_recovery.py::recover_approval`,
+  `POST /approvals/{id}/recover`) settles a stranded approval as `rejected`. A session
+  approval then wakes its session on the ordinary resume path. A publication approval
+  wakes nothing: recovery settles its publication as denied instead. It is not the resolve path: it never calls the
+  authorizer or consults route membership. It authenticates with the platform key, takes
+  the operator principal only to name the actor, and refuses with 403 unless
+  `approval_recovery_enabled` (`CURIE_APPROVAL_RECOVERY_ENABLED`,
+  `api.approvalRecovery.enabled`) is set. When enabled, any platform-key holder can reject
+  any pending approval installation-wide, including ones the ordinary path could resolve.
+  The status change and its audit row commit in one transaction, and a retry with the same
+  `recovery_key` returns the recorded outcome without enqueueing again. The read-only
+  `GET /approvals/identity-report` sits on the same router and needs only the platform key.
 - **No re-raise after a rejection (landed, #2885).** `POST /approvals` refuses, with 409
   code `approval.rejected_in_thread` (frozen with the worker in
   `tests/vectors/approval-reraise-refusal.json`), a request for an approval a person
@@ -442,18 +455,23 @@ Slack feature.
   vouches for a Slack ID (ADR-0106), so an adapter naming a listed ID proves nothing
   ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)'s separate finding). The authenticated subject must appear in the selected set.
 
-- **`RequesterOnly`** ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md), `approvers.py`), the set for a card shown in a non-Slack
-  conversation, such as an email thread. The selector picks it when the card went to the
-  conversation that asked (a routeless approval, or a route in `requesting_surface` mode,
-  `apps/api/src/curie_api/approvers.py::card_on_requesting_surface`) and that conversation is not Slack. It
-  admits one actor, the approval's `author`, and only through an `adapter` principal: the
-  resolve route has already checked that the adapter serves the binding the card went to
-  (`apps/api/src/curie_api/crud.py::_approval_served`), and no `chat`, `console` or `operator` principal is
-  eligible, whatever subject it names. It is a confirmation step by the requester, not a
-  second person's sign-off, and an interim until approvers are principals linked to every
-  channel identity (ADR-0166, #2910). A route that lists approvers and lands on a non-Slack
-  conversation is escalated by the worker when the approval is raised; approvers added to
-  such a route while an approval pends make it admit nobody (`InvalidApprovers`).
+- **`EmailApprovers`** ([ADR-0177 amendment](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md#amendment-email-approver-lists), `approvers.py`), the set for a card shown in an email
+  thread whose route lists `approvers.emails`. The selector picks it when the card went to
+  the conversation that asked (a route in `requesting_surface` mode,
+  `apps/api/src/curie_api/approvers.py::card_on_requesting_surface`) and that conversation is email. It
+  admits an actor whose address is on the list, compared lowercase, and only through an
+  `adapter` principal: the resolve route has already checked that the adapter serves the
+  binding the card went to (`apps/api/src/curie_api/crud.py::_approval_served`) and that the
+  binding's `allowed_callers` admit the sender (`apps/api/src/curie_api/routers/approvals.py::_admit_adapter_answer`,
+  ADR 0175), and no `chat`, `console` or `operator` principal is eligible, whatever subject
+  it names. The person who asked is admitted only if their address is listed. An empty
+  list admits nobody.
+- **`NoVerifiableApprovers`** ([ADR-0177 amendment](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md#amendment-email-approver-lists), `approvers.py`), the set for every other card in a
+  non-Slack conversation: a routeless approval, a route that lists no `emails`, a route that
+  lists only Slack approvers, and any non-email channel. It admits nobody, as
+  `undetermined`. The worker escalates an email approval with no `emails` when it is
+  raised, so this set meets only an approval pending from before that rule or one whose
+  route was rewritten while it pended.
 
 Platform-RBAC remains the epic's fourth set and is not built.
 
@@ -511,13 +529,16 @@ conversation that asked, on whatever channel that is, the way a routeless approv
 already goes. Anything else beside `mode`, a mix of the mode and a fixed target, or a
 `notification` on such a route is refused by the API writer, by the CLI's route file
 reader and again by the worker's parse of the stored row. Who may answer follows the
-channel the card lands on: Slack keeps the sets above, and any other channel takes
-`RequesterOnly`. The card is answered only where it is shown.
+channel the card lands on: Slack keeps the sets above, an email thread takes
+`EmailApprovers` from the route's `emails`, and anything else admits nobody. The card is
+answered only where it is shown. `emails` is refused on a fixed target, and a Slack card
+never reads it.
 
 ```
 approval_routes: {
   "confirm": {
-    "resolution": {"mode": "requesting_surface"}   # no notification allowed
+    "resolution": {"mode": "requesting_surface"},   # no notification allowed
+    "approvers": {"emails": ["approver@example.com"]}   # read only on an email card
   }
 }
 ```
@@ -551,8 +572,10 @@ An approval with a NULL `agent_id` that nonetheless names a route falls under th
 rule and is refused too — `get_approval_route_binding` returns a bare None for every miss,
 and the split is on whether the approval named a route, not on why the binding is missing.
 An approval that names NO route never had a narrower set to lose and keeps channel
-membership. The recovery from a stuck approval is to restore the binding, after which it
-resolves normally; nothing is lost.
+membership. The ordinary recovery from a stuck approval is to restore the binding, after
+which it resolves normally; nothing is lost. When the binding cannot be restored, an
+operator on an installation with `approval_recovery_enabled` can reject the approval
+through break-glass recovery (Current contract), which is audited and only ever rejects.
 
 ### The three ports
 
@@ -629,7 +652,13 @@ tool call under any asserted identity. ADR-0033 (#410) closed the sandbox-key ga
 minting a scoped, agent-bound `state` token that only the state router accepts. ADR-0106
 closes the remaining caller-assertion gap: the resolve endpoint now accepts only a
 dispatcher-attested `chat` token, a live subject-bound Console session, or a signed
-subject-bound `operator` token. The platform key alone resolves nothing. A
+subject-bound `operator` token. On the ordinary resolve path the platform key alone
+resolves nothing. Break-glass recovery is the exception: when an operator enables
+`approval_recovery_enabled`, the platform key plus any operator principal for attribution
+can reject any pending approval installation-wide, bypassing the authorizer. That blast
+radius is accepted rather than fenced, so the setting stays off by default and every use
+lands in the audit trail in the same transaction as its effect. Recovery cannot approve,
+and the sandbox's scoped token cannot reach it. A
 notification transport credential likewise confers no resolution capability: the
 notification contains no interaction, and this contract exposes no second-channel resolver.
 The runtime `PreToolUse` hook (`build_approval_hook`, #1852) is the first interceptor
@@ -654,9 +683,10 @@ names. Where the card went is read from the record, not the current route: re-po
 route after the ask neither moves the card nor hands the approval to the new target's
 adapter, and approvers added meanwhile make a non-Slack card admit nobody. The record
 keeps the card's address but not its kind, so a non-Slack asking address shaped like a
-Slack channel ID is read as a possible Slack card, which no adapter may answer. On a
-non-Slack conversation the `RequesterOnly` set then admits the sender it names only when
-that sender is the approval's author.
+Slack channel ID is read as a possible Slack card, which no adapter may answer. On an
+email conversation the binding's `allowed_callers` are checked first, with a refusal that
+writes no audit row, and the `EmailApprovers` set then admits the sender it names only when
+that address is on the route's `emails`.
 Historical assertion-era rows remain visibly unauthenticated with a null principal kind.
 An audit row may truthfully show the same principal as requester and approver: that says
 one authenticated member confirmed their own request, not that a second person reviewed it.
@@ -668,3 +698,4 @@ one authenticated member confirmed their own request, not that a second person r
 - **ADR(s):** [ADR-0010](../../adr/0010-approval-gates-and-human-in-the-loop.md) — Approval gates and human-in-the-loop (Accepted); grounds this intended line, including the authorizer sequence (channel membership first, then user-group, explicit user-list, platform-RBAC). [ADR-0034](../../adr/0034-approval-authorizers-resolve-membership-in-the-api.md) — Approval authorizers resolve membership in the API (Accepted); adds the user-group and user-list sets, the API-resident membership lookup, the scoped fail-closed rule, and fresh-read binding resolution. Supersedes ADR-0010's framing of those four as `Authorizer` implementations: they are approver SETS behind one authorizer, and platform-RBAC becomes the fourth set. [ADR-0106](../../adr/0106-an-approver-is-an-authenticated-principal.md) — An approver is an authenticated principal (Accepted); removes caller-asserted resolver identity/channel, makes membership the boundary even for the requester, limits operators to explicit users, and lets Console subjects pass through the same membership sets their authenticated identity can satisfy. Composes with [ADR-0003](../../adr/0003-stateless-first-rehydrate-on-resume.md) (stateless-first suspend/resume, the pause mechanism).
 - **Additional ADR:** [ADR-0154](../../adr/0154-adapter-principal-with-a-scoped-credential.md): Adapter principal with a scoped credential (Accepted); adds the adapter authentication boundary and restricts adapter principals to explicit-user routes.
 - **Additional ADR:** [ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md): An approval is answered where it was asked, including by email (Accepted); adds the `requesting_surface` route mode and the requester-only set for non-Slack cards, and refuses adapter principals on every Slack approver set.
+- **Additional ADR:** [ADR-0177 amendment](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md#amendment-email-approver-lists): email approver lists (2026-10-01); replaces ADR-0177's requester-only set with the route's approver `emails`, checked after the binding's `allowed_callers`.

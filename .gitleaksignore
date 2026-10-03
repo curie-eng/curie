@@ -141,3 +141,10 @@ de945b33ecb0930990c5af669c52d26b6fa2cfd3:apps/ui/src/views/obs/RealMetrics.tsx:g
 fc211a288aad285277413e684e96fbae063d27cf:cli/tests/surfaces_verb.rs:discord-client-id:203
 9b91df65bd4f578353af6d75358594fcedf01183:cli/tests/surfaces_verb.rs:discord-client-id:203
 a7c60011eb9aeac392845e3c3bcc0fd1a4b4dc19:cli/tests/surfaces_verb.rs:discord-client-id:203
+
+# Made-up key-shaped strings in the outbound redactor's block-break tests
+# (#3694): `sk-proj-1234567890abcd` and `sk-` + `proj0123456789abcdefXYZ` exist
+# to prove a block break never splits a key the redactor must catch. They are
+# not credentials.
+a95919ccfb6e368497c613d358721dcdc18ac7e6:runner/tests/test_redact.py:generic-api-key:724
+a95919ccfb6e368497c613d358721dcdc18ac7e6:runner/tests/test_redact.py:generic-api-key:734

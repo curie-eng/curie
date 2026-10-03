@@ -28,6 +28,17 @@ refusing: a per-request id disables idempotency silently, and a content digest
 makes an identical payload undeliverable forever, because a delivery receipt
 deliberately never expires. Refusing names the header and is fixed in the
 upstream's configuration.
+
+**The delivery context is signed with the body (#3554).** The signature covers
+``X-Curie-Timestamp``, ``X-Curie-Delivery-Id``, the decoded hook name, the parsed
+``tool_access`` policy and the raw body (see ``hook_signing``). A captured
+request cannot change its receipt namespace or add or remove a policy
+restriction. A timestamp outside ``hook_signing.TOLERANCE_S`` is refused with
+the same 401 as a bad signature. These defenses meet cleanly:
+inside the window a retry that reuses its id is deduplicated, because a delivery
+receipt is written without an expiry once enqueued (``delivery._ENQUEUE_SCRIPT``)
+and so outlives every window; outside it, the request is refused before the
+receipt is ever consulted.
 """
 
 from __future__ import annotations
@@ -44,6 +55,7 @@ from aci_protocol import (
     STREAM_PAYLOAD_FIELD,
     QueuedTurn,
     ReplyHandle,
+    ToolAccess,
     TurnSource,
     parse_queued_turn,
 )
@@ -64,10 +76,11 @@ from sqlalchemy.orm import selectinload
 from .. import crud, hook_signing
 from ..config import get_settings
 from ..delivery import (
+    backlog_reservation,
     claim_delivery,
     duplicate_stream_id,
     enqueue_owned,
-    release_claim,
+    settle_failed_delivery,
     sha16,
     take_backlog_slot,
 )
@@ -98,10 +111,6 @@ _CLAIM_PREFIX = "curie:hook"
 # route to discover which agent ids exist.
 _AUTH_DETAIL = "missing or invalid signature"
 
-# The header an upstream names its delivery with.
-_DELIVERY_HEADER = "X-Curie-Delivery-Id"
-
-
 class HookAccepted(BaseModel):
     """The hook receipt. ``duplicate`` says whether THIS request enqueued.
 
@@ -120,15 +129,20 @@ class HookAccepted(BaseModel):
     partition value, or the operator may have changed the pointer since, and
     either would name a thread the queued turn never landed on.
 
-    It is None when the landing thread is not knowable from this request: a
-    pending twin still mid-flight, a stream an operator has trimmed, or the 202
-    no-claim case where this request enqueued nothing and nothing is yet known.
+    It is None on an ordinary 202 pending/no-claim receipt, which attests no
+    accepted turn. An unavailable completed turn or a restricted pending retry
+    returns 409 because its original tool policy cannot be verified.
+
+    ``tool_access`` is the queued policy, not proof of worker support, runner
+    execution or delivery. A completed duplicate must match the original policy.
     """
 
     event_id: str
     stream_id: str | None
     duplicate: bool
     conversation_id: str | None
+    # Proof of the queued policy only, never worker/runner capability or delivery.
+    tool_access: ToolAccess | None = None
 
 
 def _hook_text(hook: str, body: bytes, outcome: MappingOutcome | None = None) -> str:
@@ -173,10 +187,8 @@ def _hook_text(hook: str, body: bytes, outcome: MappingOutcome | None = None) ->
     )
 
 
-async def _landed_conversation_id(
-    client: redis.Redis, stream: str, held: str
-) -> str | None:
-    """The conversation id of the turn a held claim already enqueued.
+async def _landed_turn(client: redis.Redis, stream: str, held: str) -> QueuedTurn | None:
+    """The original turn a held claim already enqueued.
 
     Read back from the stream rather than recomputed, and the reason is the very
     property that makes the claim correct: the claim key is DELIBERATELY
@@ -194,7 +206,7 @@ async def _landed_conversation_id(
             request is mid-flight, otherwise the stream id of its entry.
 
     Returns:
-        The queued turn's conversation id, or None when it is not knowable --
+        The queued turn, or None when it is not knowable --
         the claim is still ``pending:``, or the entry is gone because an operator
         trimmed the stream.
     """
@@ -211,7 +223,50 @@ async def _landed_conversation_id(
     payload = fields.get(STREAM_PAYLOAD_FIELD)
     if payload is None:
         return None
-    return parse_queued_turn(_text(payload)).conversation_id
+    return parse_queued_turn(_text(payload))
+
+
+async def _duplicate_receipt(
+    client: redis.Redis,
+    stream: str,
+    current: str,
+    response: Response,
+    event_id: str,
+    tool_access: ToolAccess | None,
+) -> HookAccepted:
+    """Attest the first delivery's policy, never relabel it from a retry.
+
+    An ordinary pending retry retains the existing 202 acknowledgement, which
+    attests no accepted turn. A restricted retry cannot use that unknown policy
+    as evidence. Once enqueued, unavailable original data also cannot prove the
+    policy, even when this retry asks for ordinary access.
+    """
+    if current.startswith("pending:") and tool_access is None:
+        return HookAccepted(
+            event_id=event_id,
+            stream_id=duplicate_stream_id(current, response),
+            duplicate=True,
+            conversation_id=None,
+            tool_access=None,
+        )
+    original = await _landed_turn(client, stream, current)
+    if original is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "hook delivery tool access cannot be verified from the original turn",
+        )
+    if original.tool_access != tool_access:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "hook delivery tool access differs from the original turn",
+        )
+    return HookAccepted(
+        event_id=event_id,
+        stream_id=duplicate_stream_id(current, response),
+        duplicate=True,
+        conversation_id=original.conversation_id,
+        tool_access=original.tool_access,
+    )
 
 
 async def _load_agent(session: SessionDep, agent_id: uuid.UUID) -> Agent | None:
@@ -236,6 +291,7 @@ def _mint_turn(
     conversation_id: str,
     placeholder: str | None,
     outcome: MappingOutcome | None = None,
+    tool_access: ToolAccess | None = None,
 ) -> QueuedTurn:
     """Build the ``QueuedTurn`` a verified hook delivery becomes.
 
@@ -268,6 +324,7 @@ def _mint_turn(
         author=f"hook:{hook}",
         text=_hook_text(hook, body, outcome),
         source=TurnSource.WEBHOOK,
+        tool_access=tool_access,
         reply_handle=ReplyHandle(
             kind=binding.kind,
             channel=binding.address,
@@ -291,10 +348,20 @@ async def ingest_hook(
     adapter: str | None = None,
     conversation_id: str | None = None,
     placeholder: str | None = None,
+    tool_access: ToolAccess | None = None,
     x_curie_signature_256: Annotated[str | None, Header()] = None,
     x_curie_delivery_id: Annotated[str | None, Header()] = None,
+    x_curie_timestamp: Annotated[str | None, Header()] = None,
 ) -> HookAccepted:
     """Verify one hook delivery and enqueue it as a turn.
+
+    ``tool_access=read-only`` opts into the existing TOOL-ACCESS contract.
+    Before requesting it, the operator must verify homogeneous worker artifacts
+    implementing TOOL-ACCESS-6 and compatible runner artifacts. This API does
+    not discover worker support; an old worker can discard the field. The
+    implementing worker checks the exact target runner before dispatch. Omission
+    preserves ordinary hooks, including approvals. The receipt proves only the
+    queued policy, not runtime enforcement or successful reply delivery.
 
     Order, and why each step sits where it does:
 
@@ -305,7 +372,10 @@ async def ingest_hook(
        refused without the server ever HMAC-ing it;
     3. the agent row, which unavoidably precedes authentication here (see the
        module docstring);
-    4. the SIGNATURE over the raw body;
+    4. the SIGNATURE over the timestamp, delivery id, decoded hook name, parsed
+       requested policy and raw body, with the timestamp required and inside
+       ``hook_signing.TOLERANCE_S``; a missing delivery id is verified as the
+       empty string, so an absent id is only reported to a caller who could sign;
     5. the delivery id, checked after authentication so an unsigned caller learns
        nothing about what this route wants;
     6. the optional explicit reply TARGET, after authentication so malformed
@@ -323,9 +393,7 @@ async def ingest_hook(
         )
 
     settings = get_settings()
-    raw = await read_bounded_body(
-        request, settings.hook_max_body_bytes, subject="hook body"
-    )
+    raw = await read_bounded_body(request, settings.hook_max_body_bytes, subject="hook body")
 
     agent = await _load_agent(session, agent_id)
     # One refusal for "no such agent" and for "bad signature": a caller that can
@@ -335,13 +403,21 @@ async def ingest_hook(
     secret = hook_signing.derive(
         settings.api_key, agent_id=str(agent.id), generation=agent.hook_generation
     )
-    if not hook_signing.verify(secret, raw, x_curie_signature_256):
+    if not hook_signing.verify(
+        secret,
+        timestamp=x_curie_timestamp,
+        delivery_id=x_curie_delivery_id or "",
+        hook=hook,
+        tool_access=tool_access.value if tool_access is not None else None,
+        body=raw,
+        header=x_curie_signature_256,
+    ):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
 
     if not x_curie_delivery_id:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            f"{_DELIVERY_HEADER} is required: this ingress is at-least-once, so a "
+            f"{hook_signing.DELIVERY_HEADER} is required: this ingress is at-least-once, so a "
             "stable upstream id is what keeps a retried delivery from running the "
             "agent twice",
         )
@@ -467,163 +543,174 @@ async def ingest_hook(
     owner = f"pending:{pysecrets.token_hex(16)}"
     client: redis.Redis = request.app.state.valkey
 
+    reservation = backlog_reservation(
+        key_prefix=f"{_CLAIM_PREFIX}:backlog:{agent.id}",
+        window_s=settings.hook_backlog_window_s,
+    )
+    preserve_quota = False
+
     # Two attempts, not a loop: the second exists only for the narrow case where
     # the claim key expired between our failed `SET NX` and the `GET` that would
     # have named its owner.
     for _attempt in range(2):
         if await claim_delivery(client, key, owner, settings.channel_delivery_lease_s):
-            if not await take_backlog_slot(
-                client,
-                key_prefix=f"{_CLAIM_PREFIX}:backlog:{agent.id}",
-                limit=settings.hook_backlog_limit,
-                window_s=settings.hook_backlog_window_s,
-            ):
-                # Metered per AGENT, not per hook: the thing worth bounding is how
-                # much work one agent's upstreams can create, and per-hook quotas
-                # would let a source multiply its allowance by inventing names.
-                await release_claim(client, key, owner)
-                logger.warning(
-                    "hook ingress refused event_id=%s: agent backlog quota of %d "
-                    "per %ds exceeded",
-                    event_id,
-                    settings.hook_backlog_limit,
-                    settings.hook_backlog_window_s,
-                )
-                raise HTTPException(
-                    status.HTTP_429_TOO_MANY_REQUESTS,
-                    "too many new hook deliveries for this agent; retry later",
-                    headers={"Retry-After": str(settings.hook_backlog_window_s)},
-                )
-            if mapping.selects_workspace and mapping.repository is not None:
-                await crud.select_thread_workspace(
-                    session,
-                    agent_id=agent.id,
-                    deployment_id=None,
-                    conversation_id=thread_id,
-                    repo_full_name=mapping.repository,
-                    selected_by=f"hook:{hook}",
-                    revision=mapping.revision,
-                )
-            turn = _mint_turn(
-                agent,
-                binding,
-                hook,
-                event_id,
-                raw,
-                conversation_id=thread_id,
-                placeholder=placeholder,
-                outcome=mapping,
-            )
-            carrier: dict[str, str] = {}
-            enqueue_error: Exception | None = None
-            enqueue_result: tuple[bool, str] | None = None
-            with operation_span(
-                "curie.queue.enqueue",
-                kind=SpanKind.PRODUCER,
-                attributes={"service.name": "curie-api", "source": "api"},
-            ) as span:
-                inject_trace_context(carrier)
-                try:
-                    enqueue_result = await enqueue_owned(
-                        client,
-                        key=key,
-                        stream=settings.runs_stream,
-                        owner=owner,
-                        payload=turn.model_dump_json(),
-                        payload_field=STREAM_PAYLOAD_FIELD,
-                        lease_s=settings.channel_delivery_lease_s,
-                        transport_field=(
-                            TRACEPARENT_STREAM_FIELD
-                            if TRACEPARENT_STREAM_FIELD in carrier
-                            else None
-                        ),
-                        transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+            try:
+                if not await take_backlog_slot(
+                    client,
+                    reservation=reservation,
+                    limit=settings.hook_backlog_limit,
+                ):
+                    # Metered per AGENT, not per hook: the thing worth bounding is how
+                    # much work one agent's upstreams can create, and per-hook quotas
+                    # would let a source multiply its allowance by inventing names.
+                    preserve_quota = True
+                    logger.warning(
+                        "hook ingress refused event_id=%s: agent backlog quota "
+                        "of %d per %ds exceeded",
+                        event_id,
+                        settings.hook_backlog_limit,
+                        settings.hook_backlog_window_s,
                     )
-                except Exception as exc:
-                    enqueue_error = exc
-                    span.set_status(StatusCode.ERROR)
-                    span.add_event("queue.enqueue.failed", {"outcome": "failure"})
-                else:
-                    assert enqueue_result is not None
-                    span.add_event(
-                        "queue.enqueued" if enqueue_result[0] else "queue.duplicate",
-                        {"outcome": "success" if enqueue_result[0] else "pending"},
+                    raise HTTPException(
+                        status.HTTP_429_TOO_MANY_REQUESTS,
+                        "too many new hook deliveries for this agent; retry later",
+                        headers={"Retry-After": str(settings.hook_backlog_window_s)},
                     )
-            if enqueue_error is not None:
-                record_metric(
-                    "curie.queue.enqueue",
-                    attributes={
-                        "service.name": "curie-api",
-                        "source": "api",
-                        "outcome": "failure",
-                    },
-                )
-                raise enqueue_error
-            assert enqueue_result is not None
-            enqueued, current = enqueue_result
-            if enqueued:
-                record_metric(
-                    "curie.queue.enqueue",
-                    attributes={
-                        "service.name": "curie-api",
-                        "source": "api",
-                        "outcome": "success",
-                    },
-                )
-                record_metric(
-                    "curie.turn.accepted",
-                    attributes={
-                        "service.name": "curie-api",
-                        "source": "api",
-                        "outcome": "accepted",
-                    },
-                )
-                # The conversation id is here because it is the operator's only
-                # server-side record of which thread a delivery landed on. There
-                # is no verb that resets every partition of one hook, so a
-                # partition is reset by its full id, and this line plus the
-                # receipt are the two places that id is shown.
-                logger.info(
-                    "hook ingress enqueued event_id=%s stream_id=%s hook=%s "
-                    "conversation_id=%s",
-                    event_id,
-                    current,
+                if mapping.selects_workspace and mapping.repository is not None:
+                    await crud.select_thread_workspace(
+                        session,
+                        agent_id=agent.id,
+                        deployment_id=None,
+                        conversation_id=thread_id,
+                        repo_full_name=mapping.repository,
+                        selected_by=f"hook:{hook}",
+                        revision=mapping.revision,
+                    )
+                turn = _mint_turn(
+                    agent,
+                    binding,
                     hook,
-                    turn.conversation_id,
+                    event_id,
+                    raw,
+                    conversation_id=thread_id,
+                    placeholder=placeholder,
+                    outcome=mapping,
+                    tool_access=tool_access,
                 )
-                return HookAccepted(
-                    event_id=event_id,
-                    stream_id=current,
-                    duplicate=False,
-                    conversation_id=turn.conversation_id,
+                carrier: dict[str, str] = {}
+                enqueue_error: Exception | None = None
+                enqueue_result: tuple[bool, str] | None = None
+                with operation_span(
+                    "curie.queue.enqueue",
+                    kind=SpanKind.PRODUCER,
+                    attributes={"service.name": "curie-api", "source": "api"},
+                ) as span:
+                    inject_trace_context(carrier)
+                    try:
+                        enqueue_result = await enqueue_owned(
+                            client,
+                            key=key,
+                            stream=settings.runs_stream,
+                            owner=owner,
+                            payload=turn.model_dump_json(),
+                            payload_field=STREAM_PAYLOAD_FIELD,
+                            lease_s=settings.channel_delivery_lease_s,
+                            transport_field=(
+                                TRACEPARENT_STREAM_FIELD
+                                if TRACEPARENT_STREAM_FIELD in carrier
+                                else None
+                            ),
+                            transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+                        )
+                    except Exception as exc:
+                        enqueue_error = exc
+                        span.set_status(StatusCode.ERROR)
+                        span.add_event("queue.enqueue.failed", {"outcome": "failure"})
+                    else:
+                        assert enqueue_result is not None
+                        span.add_event(
+                            "queue.enqueued" if enqueue_result[0] else "queue.duplicate",
+                            {"outcome": "success" if enqueue_result[0] else "pending"},
+                        )
+                if enqueue_error is not None:
+                    record_metric(
+                        "curie.queue.enqueue",
+                        attributes={
+                            "service.name": "curie-api",
+                            "source": "api",
+                            "outcome": "failure",
+                        },
+                    )
+                    raise enqueue_error
+                assert enqueue_result is not None
+                enqueued, current = enqueue_result
+                if enqueued:
+                    record_metric(
+                        "curie.queue.enqueue",
+                        attributes={
+                            "service.name": "curie-api",
+                            "source": "api",
+                            "outcome": "success",
+                        },
+                    )
+                    record_metric(
+                        "curie.turn.accepted",
+                        attributes={
+                            "service.name": "curie-api",
+                            "source": "api",
+                            "outcome": "accepted",
+                        },
+                    )
+                    # The conversation id is here because it is the operator's only
+                    # server-side record of which thread a delivery landed on. There
+                    # is no verb that resets every partition of one hook, so a
+                    # partition is reset by its full id, and this line plus the
+                    # receipt are the two places that id is shown.
+                    logger.info(
+                        "hook ingress enqueued event_id=%s stream_id=%s hook=%s conversation_id=%s",
+                        event_id,
+                        current,
+                        hook,
+                        turn.conversation_id,
+                    )
+                    return HookAccepted(
+                        event_id=event_id,
+                        stream_id=current,
+                        duplicate=False,
+                        conversation_id=turn.conversation_id,
+                        tool_access=turn.tool_access,
+                    )
+                # Not `turn.conversation_id`: this request enqueued nothing, so the thread
+                # the delivery landed on is the one the WINNING turn named, whatever
+                # partition this body derives.
+                return await _duplicate_receipt(
+                    client, settings.runs_stream, current, response, event_id, tool_access
                 )
-            # Not `turn.conversation_id`: this request enqueued nothing, so the thread
-            # the delivery landed on is the one the WINNING turn named, whatever
-            # partition this body derives.
-            return HookAccepted(
-                event_id=event_id,
-                stream_id=duplicate_stream_id(current, response),
-                duplicate=True,
-                conversation_id=await _landed_conversation_id(
-                    client, settings.runs_stream, current
-                ),
-            )
+            except BaseException:
+                await settle_failed_delivery(
+                    client,
+                    key=key,
+                    owner=owner,
+                    reservation=reservation,
+                    preserve_quota=preserve_quota,
+                )
+                raise
         held = await client.get(key)
         if held is not None:
             current = _text(held)
-            return HookAccepted(
-                event_id=event_id,
-                stream_id=duplicate_stream_id(current, response),
-                duplicate=True,
-                conversation_id=await _landed_conversation_id(
-                    client, settings.runs_stream, current
-                ),
+            return await _duplicate_receipt(
+                client, settings.runs_stream, current, response, event_id, tool_access
             )
 
     # Both attempts found the key absent after failing to claim it. Someone is
     # mid-flight; answering "come back" is honest and never a second XADD. The
     # conversation id is None for the same reason the stream id is: nothing has
     # been enqueued that this request can name.
+    if tool_access is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "hook delivery tool access cannot be verified from the original turn",
+        )
     response.status_code = status.HTTP_202_ACCEPTED
     return HookAccepted(
         event_id=event_id,

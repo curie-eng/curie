@@ -49,7 +49,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.web import WebClient
 
-from .conftest import FakeSocketClient, OfflineIdentity, _authorize
+from .conftest import FakeAdmissionApi, FakeSocketClient, OfflineIdentity, _authorize
 from .test_approval_note_dialog import (
     _CARD_MESSAGE,
     CARD_CHANNEL,
@@ -708,11 +708,13 @@ def test_an_app_built_without_an_identity_client_makes_no_network_call(
     redis_client: redis.Redis,
     config: DispatcherConfig,
     offline_identity: list[OfflineIdentity],
+    admission_api: FakeAdmissionApi,
 ) -> None:
     """The shared harness default: ``build_app`` with no ``identity_client``
     must not POST to the configured API. The API is a real listening loopback
     socket, so a lookup that escaped the conftest stub would show up as an
-    accepted connection."""
+    accepted connection. The caller-list gate (ADR 0175) talks to its own fake
+    API, so the socket counts identity traffic only."""
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(8)
@@ -720,16 +722,16 @@ def test_an_app_built_without_an_identity_client_makes_no_network_call(
     try:
         api_url = f"http://127.0.0.1:{listener.getsockname()[1]}"
         cfg = config.model_copy(update={"api_base_url": api_url})
-        # Keep admission on its own fake API while observing identity traffic.
-        admission = build_admission(config, redis_client)
         app = build_app(
             cfg,
-            admission=admission,
             web_client=_web_client(),
             redis_client=redis_client,
             authorize=_authorize,
             resolver=ScriptedResolver(
                 ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
+            ),
+            admission=build_admission(
+                config.model_copy(update={"api_base_url": admission_api.url}), redis_client
             ),
         )
         sock = FakeSocketClient()

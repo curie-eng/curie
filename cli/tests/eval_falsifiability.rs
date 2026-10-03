@@ -171,6 +171,59 @@ fn no_committed_case_passes_against_a_null_agent() {
     );
 }
 
+/// #3043's deterministic polarity mutation proof. A tester that ignores every
+/// exchange and always emits one verdict must satisfy exactly the cases whose
+/// known-good exemplars carry that verdict. This pins both sides of the
+/// mutation: matching-polarity cases prove the mutant output is parseable,
+/// while opposite-polarity cases make the suite red.
+#[test]
+fn mean_tester_suite_rejects_constant_verdict_mutants() {
+    let suite = discover_suites()
+        .into_iter()
+        .find_map(|(name, suite)| (name == "mean-tester").then_some(suite))
+        .expect("the committed mean-tester suite is discovered");
+    let exemplars = fixtures().exemplars;
+    let mutants = [
+        (
+            "always PASS",
+            "1 PASS · 0 FAIL · 0 UNCLEAR",
+            "mutant @ recorded (no spec) — round 1/1: 1 PASS · 0 FAIL · 0 UNCLEAR",
+        ),
+        (
+            "always FAIL",
+            "0 PASS · 1 FAIL · 0 UNCLEAR",
+            "mutant @ recorded (no spec) — round 1/1: 0 PASS · 1 FAIL · 0 UNCLEAR",
+        ),
+    ];
+
+    for (name, verdict, output) in mutants {
+        let mut matching = 0;
+        let mut opposite = 0;
+        for case in &suite.cases {
+            let key = case_key(&suite.name, case);
+            let exemplar = exemplars
+                .get(&key)
+                .unwrap_or_else(|| panic!("missing known-good exemplar for {key}"));
+            let should_pass = exemplar.contains(verdict);
+            if should_pass {
+                matching += 1;
+            } else {
+                opposite += 1;
+            }
+            assert_eq!(
+                turn_passes(case, &done_turn(output)),
+                should_pass,
+                "{name} had the wrong result for {key}; exemplar was {exemplar:?}"
+            );
+        }
+        assert!(
+            matching > 0,
+            "mean-tester has no {name} matching-polarity case"
+        );
+        assert!(opposite > 0, "mean-tester has no case that rejects {name}");
+    }
+}
+
 /// Control B -- negative, input-parrot agent (AC4). No committed case's grader
 /// may be satisfied by the case's own input verbatim, except the explicit
 /// baseline of cases that are input-satisfiable today. Catches the

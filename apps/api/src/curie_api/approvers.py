@@ -29,7 +29,7 @@ from typing import Any, Protocol
 from aci_protocol.turn import SLACK_KIND
 
 from .models import Approval
-from .schemas import SLACK_CHANNEL_ID
+from .schemas import EMAIL_KIND, SLACK_CHANNEL_ID
 
 # The audit vocabulary is FROZEN, and each set pins its own ``audit_name`` to the
 # class name it had before ADR-0034 turned it from an authorizer into a set. The
@@ -262,72 +262,133 @@ def card_on_requesting_surface(approval: Approval, binding: Any) -> bool:
     return True
 
 
-def answered_by_requester_only(approval: Approval, binding: Any) -> bool:
-    """Whether this approval's card is on a non-Slack surface (ADR-0177 decision 3).
+def shown_off_slack(approval: Approval, binding: Any) -> bool:
+    """Whether this approval's card is in a non-Slack conversation (ADR-0177 and its amendment).
 
-    Those cards are answered by the requester alone. A Slack card, wherever it
-    was shown, keeps Slack's approver sets (decision 2).
+    None of Slack's approver sets can be proven there. An email card is
+    answered only from the route's approver email list (``EmailApprovers``);
+    any other non-Slack card has no list it can verify (``NoVerifiableApprovers``).
+    A Slack card, wherever it was shown, keeps Slack's approver sets.
     """
 
     return approval.reply_kind != SLACK_KIND and card_on_requesting_surface(approval, binding)
 
 
-class RequesterOnly:
-    """The person who asked is the only approver (ADR-0177 decision 3).
+class EmailApprovers:
+    """A literal list of approver email addresses (ADR-0177 amendment).
 
-    The set for a card shown on a non-Slack channel, such as an email thread.
-    There the only identity anyone verified is the sender the channel's adapter
-    authenticated when the request came in, so that sender, carried back by the
-    same adapter, is the one actor admitted. It is a confirmation step, not a
-    second person's sign-off: ADR-0106 already lets an authorized requester
-    confirm their own action.
+    The set for a card shown in an email thread whose route lists ``emails``.
+    A member is a sender the serving mail adapter verified at its inbound gate
+    and carried back as the actor, whose address is on the list. The match is
+    exact apart from case: both sides are compared lowercase, the form the
+    schema stores and the mail adapter reports, so a near miss fails closed.
 
     Only an ``adapter`` principal is eligible. An operator, a console session and
-    a Slack click cannot prove they are the email sender who asked, so each is
-    refused before membership is read, whatever subject it names. The router
-    has already checked that the adapter serves the binding the card went to
-    (``crud._approval_served``), so "the serving adapter's sender" is the
-    conjunction of that check and this one.
+    a Slack click cannot prove they hold an email address, so each is refused
+    before membership is read, whatever address it names. The router has already
+    checked that the adapter serves the thread's binding
+    (``crud._approval_served``) and that the binding's ``allowed_callers``
+    admit the sender (ADR 0175), so "a verified, listed sender of the serving
+    adapter" is the conjunction of those checks and this one.
 
-    An interim until approvers are principals linked to every channel identity
-    (ADR-0166, #2910); then approver lists apply on every channel.
+    Pure config, like ``ExplicitUsers``: it never looks anything up. An empty
+    list admits nobody and says so as ``undetermined``: the schema refuses one,
+    so an empty list here is a row written around it, and that is a
+    configuration the platform cannot evaluate, not a verdict on the sender.
     """
 
-    # NEW vocabulary added by ADR-0177; see the audit-vocabulary note above.
-    audit_name = "RequesterOnly"
+    # NEW vocabulary added by the ADR-0177 amendment; see the audit-vocabulary note above.
+    audit_name = "EmailApproverList"
     operator_eligible = False
     console_eligible = False
     adapter_eligible = True
     chat_eligible = False
+    ineligible_reason = (
+        "on email, only an address on this approval's approver list may answer, "
+        "by replying in the thread where it was asked"
+    )
 
-    def __init__(self, author: str, surface_kind: str) -> None:
-        self._author = author
-        self._surface_kind = surface_kind
-        self.ineligible_reason = (
-            f"on {surface_kind}, only the person who asked may answer this approval, "
-            "by replying in the conversation where it was asked"
-        )
+    def __init__(self, emails: Sequence[str]) -> None:
+        self._emails = tuple(email.lower() for email in emails)
 
     async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
-        # Exact comparison: the adapter presents the sender exactly as it
-        # presented the author at ingress, so any normalization belongs there,
-        # once, and a near miss fails closed here.
-        is_requester = actor == self._author
+        if not self._emails:
+            return MembershipVerdict(
+                member=False,
+                undetermined=True,
+                reason=(
+                    "could not verify approvers: this approval's route lists no "
+                    "approver email addresses"
+                ),
+                evidence={"kind": "email_list", "emails": [], "actor_listed": False},
+            )
+        listed = actor.lower() in self._emails
         evidence: dict[str, Any] = {
-            "kind": "requester_only",
-            "surface_kind": self._surface_kind,
-            "actor_is_requester": is_requester,
+            "kind": "email_list",
+            "emails": list(self._emails),
+            "actor_listed": listed,
         }
-        if not is_requester:
+        if not listed:
             return MembershipVerdict(
                 member=False,
                 reason=(
-                    f"you are not an approver: on {self._surface_kind}, only the "
-                    "person who asked may answer this approval"
+                    "you are not an approver: this approval's route is bound to "
+                    "an explicit list of approver email addresses"
                 ),
                 evidence=evidence,
             )
         return MembershipVerdict(member=True, evidence=evidence)
+
+
+class NoVerifiableApprovers:
+    """A non-Slack card with no approver list that channel can verify: admits nobody.
+
+    ADR-0177 amendment A3 retires the requester-only default: an email card is
+    answered only from the route's ``emails``, and no other non-Slack channel
+    has a list yet. A routeless approval, a route declaring no ``emails``, a
+    route declaring only Slack approvers, and any non-email channel all land
+    here. The worker escalates these when they are raised, so this set meets
+    only an approval pending from before that rule, or one whose route was
+    rewritten while it pended.
+
+    Like ``UnboundRoute``, the configuration is the answer, not the principal,
+    so every kind is eligible and reads the same ``undetermined`` refusal, which
+    the authorizer denies without knowing this set exists.
+    """
+
+    # NEW vocabulary added by the ADR-0177 amendment; see the audit-vocabulary note above.
+    audit_name = "NoVerifiableApprovers"
+    operator_eligible = True
+    console_eligible = True
+    adapter_eligible = True
+    chat_eligible = True
+    ineligible_reason = None
+
+    def __init__(self, surface_kind: str, *, slack_declared: bool) -> None:
+        self._surface_kind = surface_kind
+        self._slack_declared = slack_declared
+
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
+        if self._surface_kind == EMAIL_KIND:
+            reason = (
+                "could not verify approvers: on email, only an address on the "
+                "approval's approver list may answer, and its route lists none"
+            )
+        else:
+            reason = (
+                f"could not verify approvers: {self._surface_kind} has no approver "
+                "list that can be verified"
+            )
+        return MembershipVerdict(
+            member=False,
+            undetermined=True,
+            reason=reason,
+            evidence={
+                "kind": "no_verifiable_approvers",
+                "surface_kind": self._surface_kind,
+                "slack_approvers_declared": self._slack_declared,
+            },
+        )
 
 
 class ApproverSetSelector(Protocol):

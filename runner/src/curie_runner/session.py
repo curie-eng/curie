@@ -25,6 +25,7 @@ import logging
 import time
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from dataclasses import replace
 
 import anyio
 from aci_protocol import (
@@ -33,11 +34,12 @@ from aci_protocol import (
     Final,
     Interrupt,
     SessionStatus,
+    ToolAccess,
     ToolNote,
     parse_ndjson_line,
     to_ndjson_line,
 )
-from claude_agent_sdk import AssistantMessage, ResultMessage
+from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage
 from curie_telemetry import record_metric
 from opentelemetry.context import Context
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
@@ -49,7 +51,7 @@ from .adapter import (
     StreamedToolUseBoundary,
     model_message_to_conversation,
 )
-from .approval import ApprovalGate
+from .approval import ApprovalGate, is_mcp_tool, platform_tool_names
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .history import (
     ApprovalContext,
@@ -60,6 +62,7 @@ from .history import (
     TranscriptStore,
     TurnRecord,
     close_suspended_tool_calls,
+    is_tool_result_message,
 )
 from .mcp_tool_capability import ConnectorAvailability, ConnectorCapabilityFailure
 from .memory import (
@@ -74,7 +77,14 @@ from .memory import (
 from .memory_facts import MemoryTurn
 from .otel import RunTracer, _GenerationSpan
 from .progress import ProgressActivity
+from .redact import OutboundRedactor
 from .side_effects import SideEffectClassifier
+from .tool_access import (
+    ENFORCED_TOOL_ACCESS,
+    TOOL_ACCESS_REFUSED_CLASSIFICATION,
+    TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+    TurnToolAccess,
+)
 from .translate import TurnState, translate_message
 from .turn_progress import ProgressCapability, TurnProgress
 from .usage_report import UsageSink
@@ -139,6 +149,21 @@ FALSE_COMPLETION_CLASSIFICATION = "false-completion"
 # error+final pair, because a publication request that produced no approval
 # record must never finalize looking like a clean turn.
 PUBLICATION_UNRECORDED_CLASSIFICATION = "publication-unrecorded"
+# Curie's own in-process tool names, for a tool result's ``origin`` (#3486).
+# Exact membership, as ``is_platform_owned_tool`` decides it (#2286), but over
+# the maximal set: a telemetry label grants nothing, so a ``curie-state`` name
+# counts as platform whether or not this session mounted that server.
+_PLATFORM_TOOL_NAMES = platform_tool_names(state_server_mounted=True)
+
+
+def _tool_result_origin(tool_name: str) -> str:
+    """``platform``, ``connector`` or ``builtin`` for a live tool name (#3486)."""
+
+    if tool_name in _PLATFORM_TOOL_NAMES:
+        return "platform"
+    if is_mcp_tool(tool_name):
+        return "connector"
+    return "builtin"
 
 
 def _is_auth_rejection(message: object) -> bool:
@@ -202,6 +227,9 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
     durable Approval record.
     """
 
+    if state.tool_access is not None:
+        # @spec RUNNER-TOOL-ACCESS-3: a restricted turn never pauses for a human.
+        return final
     runner_halted_the_turn = (
         state.approval_halt_requested and state.error_classification is None
     )
@@ -256,9 +284,11 @@ class SessionRunner:
         *,
         session_factory: SessionFactory,
         ceiling: int,
+        max_usd_per_day: float | None,
         tracer: RunTracer,
         classifier: SideEffectClassifier,
         trace_name: str,
+        held_secrets: frozenset[str],
         session_id: str | None = None,
         model: str | None = None,
         memory_store: MemoryStore | None = None,
@@ -277,8 +307,29 @@ class SessionRunner:
         primary_model: str | None = None,
         turn_progress: TurnProgress | None = None,
         memory_turn: MemoryTurn | None = None,
+        tool_access: TurnToolAccess | None = None,
+        attachment_notice: str | None = None,
     ) -> None:
         self._factory = session_factory
+        # The attachments this boot found, named on the first prompt sent
+        # (#3691): the worker boots a sandbox for every turn that carries a
+        # file, so that prompt is the message that carried them. Cleared once
+        # sent, so a later turn in this warm sandbox names none.
+        self._attachment_notice = attachment_notice
+        self._held_secrets = held_secrets
+        # The per-turn tool access every call decision reads (RUNNER-TOOL-ACCESS-2).
+        # None means this session cannot enforce one, so it refuses a restricted
+        # turn rather than run it unrestricted (RUNNER-TOOL-ACCESS-5).
+        self._tool_access = tool_access
+        # Whether this SDK session has sent an unrestricted prompt, an ordinary
+        # turn or any steer (RUNNER-TOOL-ACCESS-4). Such a prompt can leave
+        # work the CLI answers as turns of its own after this runner has moved
+        # on, so the session never again runs a restricted turn. Cleared only
+        # by a new SDK session (reset).
+        self._unrestricted_prompt_sent = False
+        # Whether a read-only prompt has been sent on this SDK session; the next
+        # unrestricted prompt then gets a fresh one (RUNNER-TOOL-ACCESS-11).
+        self._read_only_prompt_sent = False
         # Per-model token usage reported at the ResultMessage boundary (#3223);
         # None when no progress URL and token were injected.
         self._usage_reporter = usage_reporter
@@ -294,6 +345,7 @@ class SessionRunner:
         # None when the tool is not mounted (a factory execution).
         self._turn_progress = turn_progress
         self._ceiling = ceiling
+        self._max_usd_per_day = max_usd_per_day
         self._tracer = tracer
         self._classifier = classifier
         self._trace_name = trace_name
@@ -316,6 +368,10 @@ class SessionRunner:
         # blocked approval-required call here, and the turn's final is flipped
         # to awaiting-approval on the same override the policy gate uses.
         self._approval_gate = approval_gate
+        # The SDK's init catalog is the evidence a CLI unknown-tool result
+        # needs before it can be separated from a connector's own error text.
+        # None means no trustworthy catalog has arrived; fail closed to error.
+        self._advertised_tools: set[str] | None = None
         # The authority-free resume marker (#544, Decision A2): 'policy' when
         # this boot is resuming from a policy-gate approval. It confers no
         # capability -- it only arms the observe-only turn-end reconciliation.
@@ -457,6 +513,49 @@ class SessionRunner:
 
         return self._history_durable
 
+    @property
+    def enforced_tool_access(self) -> tuple[str, ...]:
+        """The tool access values this session enforces, for ``/status``.
+
+        @spec RUNNER-TOOL-ACCESS-5
+        """
+
+        if self._tool_access is None or self._unrestricted_prompt_sent:
+            return ()
+        return tuple(access.value for access in ENFORCED_TOOL_ACCESS)
+
+    def _tool_access_refusal(self, event: Event) -> tuple[str, str] | None:
+        """(message, classification) refusing ``event``'s restricted turn, or None."""
+
+        access = event.tool_access
+        if access is None:
+            return None
+        if access.value not in self.enforced_tool_access:
+            reason = (
+                "this session has sent an unrestricted prompt"
+                if self._tool_access is not None and self._unrestricted_prompt_sent
+                else "this runner does not enforce it"
+            )
+            return (
+                f"this session cannot enforce tool access {access.value!r} ({reason}); "
+                "the turn was not run",
+                TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+            )
+        if event.text.lstrip().startswith("/"):
+            return (
+                f"a {access.value} turn cannot start with a slash command, which can run "
+                "shell with no tool call; the turn was not run",
+                TOOL_ACCESS_REFUSED_CLASSIFICATION,
+            )
+        return None
+
+    @property
+    def live_tool_access(self) -> ToolAccess | None:
+        """The tool access of the live turn, or None when no turn is live."""
+
+        state = self._active_state
+        return state.tool_access if self._turn_open and state is not None else None
+
     async def remember(
         self,
         content: str,
@@ -495,7 +594,7 @@ class SessionRunner:
         if state.final_text is None:
             return
         messages = (
-            ConversationMessage(role="user", content=event.text),
+            ConversationMessage(role="user", content=state.prompt_text or event.text),
             *state.history_messages,
         )
         if (
@@ -649,6 +748,7 @@ class SessionRunner:
     async def start(self) -> None:
         """Create and connect the model session (rehydrating if configured)."""
 
+        self._advertised_tools = None
         self._session = self._factory()
         await self._session.connect()
         self._started = True
@@ -682,9 +782,13 @@ class SessionRunner:
         async with self._turn_lock:
             if self._session is not None:
                 await self._session.close()
+            self._advertised_tools = None
             self._session = self._factory()
             await self._session.connect()
             self._result_pending = False
+            # A new SDK session carries no earlier prompt (RUNNER-TOOL-ACCESS-4).
+            self._unrestricted_prompt_sent = False
+            self._read_only_prompt_sent = False
             self._interrupt_requested = False
             self._timeout_requested = False
             self._timeout_interrupt_settled = None
@@ -696,12 +800,40 @@ class SessionRunner:
             self._turn_ready = False
             self._status = SessionStatus.IDLE_AWAITING_INPUT
 
-    async def steer(self, text: str, *, event: Event | None = None) -> bool:
+    async def _replace_session(self) -> None:
+        """Close this SDK session and connect a fresh one, as reset does.
+
+        Only the session is replaced: the caller owns the turn lock and the
+        turn's own state. @spec RUNNER-TOOL-ACCESS-11
+        """
+
+        if self._session is not None:
+            await self._session.close()
+        self._advertised_tools = None
+        self._session = self._factory()
+        await self._session.connect()
+        # Anything the old session owed died with it.
+        self._result_pending = False
+        self._read_only_prompt_sent = False
+        logger.info(
+            "replaced the model session before an unrestricted prompt session=%s",
+            self._session_id,
+        )
+
+    async def steer(
+        self,
+        text: str,
+        *,
+        event: Event | None = None,
+        tool_access: ToolAccess | None = None,
+    ) -> bool:
         """Inject a follow-up message into the live turn without consuming output.
 
         Returns False when no turn is active (the finish-race boundary F1 owns:
         the caller falls back to opening a fresh turn). The steered output appears
-        on the already-open turn's NDJSON stream.
+        on the already-open turn's NDJSON stream. A steer under a different tool
+        access than the live turn's is refused the same way, so neither message
+        runs under the other's access (RUNNER-TOOL-ACCESS-4).
 
         ``event`` is the steered frame. When given, the memory tools' author is
         rebound to its sender before the model sees the text (#1461), exactly as
@@ -710,10 +842,20 @@ class SessionRunner:
 
         if self._session is None or not self._turn_open or not self._turn_ready:
             return False
+        if (
+            self._active_state is None
+            or self._active_state.tool_access is not None
+            or tool_access is not None
+        ):
+            # @spec RUNNER-TOOL-ACCESS-4: a restricted turn accepts no steer,
+            # and a restricted steer joins no turn.
+            return False
+        self._unrestricted_prompt_sent = True
         if event is not None and self._memory_turn is not None:
             self._memory_turn.begin(event)
         await self._session.query(text)
         if self._active_state is not None:
+            self._active_state.assistant_group = None
             self._active_state.history_messages.append(
                 ConversationMessage(role="user", content=text)
             )
@@ -813,6 +955,32 @@ class SessionRunner:
         held only while the turn is open.
         """
 
+        redactor = OutboundRedactor(self._held_secrets)
+        async with contextlib.aclosing(
+            self._run_turn(
+                event,
+                parent=parent,
+                turn_epoch=turn_epoch,
+                admission_required=admission_required,
+                progress=progress,
+            )
+        ) as stream:
+            async for line in stream:
+                for scrubbed in redactor.push(line):
+                    yield scrubbed
+            pending = redactor.finish()
+            if pending is not None:
+                yield pending
+
+    async def _run_turn(
+        self,
+        event: Event,
+        *,
+        parent: Context | None,
+        turn_epoch: str | None,
+        admission_required: bool,
+        progress: ProgressCapability | None,
+    ) -> AsyncGenerator[str]:
         if self._session is None:
             raise RuntimeError("session not started")
 
@@ -838,14 +1006,16 @@ class SessionRunner:
             # sent, so steer is refused and a stop is recorded without an SDK
             # interrupt that no query is there to receive.
             self._turn_ready = False
-            state = TurnState()
+            state = TurnState(tool_access=event.tool_access)
             self._active_state = state
             if self._memory_turn is not None:
                 self._memory_turn.begin(event)
             # A permission-gate block belongs to exactly one turn: clear any
             # prior turn's residue before the model runs (#245).
             if self._approval_gate is not None:
-                self._approval_gate.reset()
+                # @spec RUNNER-TOOL-ACCESS-10: a restricted turn leaves the boot
+                # grant for the next turn that may spend it.
+                self._approval_gate.reset(grant_eligible=event.tool_access is None)
                 self._approval_gate.bind_publication_context(event.publication_context)
             tracker = BudgetTracker(ceiling=self._ceiling)
             metric_outcome = "interrupted"
@@ -916,6 +1086,35 @@ class SessionRunner:
                                 )
                                 return
                             self._admission_gate = None
+                        access_refusal = self._tool_access_refusal(event)
+                        if access_refusal is not None:
+                            # @spec RUNNER-TOOL-ACCESS-4 RUNNER-TOOL-ACCESS-5
+                            # RUNNER-TOOL-ACCESS-9: a restricted turn this session
+                            # cannot enforce never reaches a connector or the
+                            # model; running it unrestricted is the one outcome
+                            # TOOL-ACCESS-4 exists to prevent.
+                            self._turn_open = False
+                            self._turn_ready = False
+                            self._status = SessionStatus.CLASSIFIED_FAILURE
+                            metric_outcome = "classified_failure"
+                            gen.finish_turn(
+                                interrupt_requested=False,
+                                classified_failure=True,
+                            )
+                            terminal_for_log = True
+                            yield to_ndjson_line(
+                                ErrorEvent(
+                                    message=access_refusal[0],
+                                    classification=access_refusal[1],
+                                )
+                            )
+                            yield to_ndjson_line(
+                                Final(
+                                    text="run refused",
+                                    status=SessionStatus.CLASSIFIED_FAILURE,
+                                )
+                            )
+                            return
                         if self._history_capacity_exceeded:
                             self._history_loss_observed = True
                             self._history_durable = False
@@ -932,6 +1131,12 @@ class SessionRunner:
                                     terminal_for_log = True
                                 yield line
                             return
+                        if event.tool_access is None and self._read_only_prompt_sent:
+                            # @spec RUNNER-TOOL-ACCESS-11: whatever a read-only
+                            # prompt left in the CLI (an answer still owed, a
+                            # turn a bundle hook woke) is discarded with its
+                            # session, so none of it can run unrestricted.
+                            await self._replace_session()
                         # Resynchronize before the turn is ready (#3425): steer is
                         # refused and a stop is only recorded, so nothing else
                         # can write to the SDK while the old turn is drained.
@@ -1145,6 +1350,9 @@ class SessionRunner:
                         int((time.monotonic() - start) * 1000),
                     )
                 self._active_state = None
+                if self._memory_turn is not None:
+                    # However the turn ended, its write credential ends with it.
+                    self._memory_turn.end()
                 if self._turn_progress is not None:
                     self._turn_progress.close()
                 if self._approval_gate is not None:
@@ -1245,8 +1453,20 @@ class SessionRunner:
         gen.query_observed()
         # The prompt text never reaches OTel (e2e ladder gate); record its size only.
         gen.observe_prompt(event.text)
+        if self._tool_access is not None:
+            # @spec RUNNER-TOOL-ACCESS-4: in force from this prompt until the next.
+            self._tool_access.begin(event.tool_access)
+        if event.tool_access is None:
+            self._unrestricted_prompt_sent = True
+        else:
+            self._read_only_prompt_sent = True
         self._result_pending = True
-        await self._session.query(event.text)
+        prompt = event.text
+        if self._attachment_notice is not None:
+            prompt = f"{event.text}\n\n{self._attachment_notice}"
+            self._attachment_notice = None
+        state.prompt_text = prompt
+        await self._session.query(prompt)
         async for message in self._session.receive_turn():
             if isinstance(message, ResultMessage):
                 self._result_pending = False
@@ -1260,6 +1480,8 @@ class SessionRunner:
                 continue
             if isinstance(message, PartialMessageBoundary):
                 gen.record_first_response_boundary()
+                if message.event_type == "message_start":
+                    state.assistant_group = message.assistant_group
                 continue
             if _is_auth_rejection(message):
                 # A rejected model credential is terminal: stop the live session
@@ -1275,15 +1497,28 @@ class SessionRunner:
                 for line in self._auth_halt_lines():
                     yield line
                 return
+            if isinstance(message, SystemMessage) and message.subtype == "init":
+                tools = message.data.get("tools")
+                self._advertised_tools = (
+                    set(tools)
+                    if isinstance(tools, list) and all(isinstance(name, str) for name in tools)
+                    else None
+                )
             history_message = model_message_to_conversation(message)
             if history_message is not None:
+                if history_message.role == "assistant":
+                    history_message = replace(
+                        history_message, assistant_group=state.assistant_group
+                    )
+                elif not is_tool_result_message(history_message):
+                    state.assistant_group = None
                 # Some harness streams echo the submitted user prompt before
                 # assistant output. The durable turn already prepends the exact
                 # inbound event, so drop only that leading duplicate.
                 if not (
                     not state.history_messages
                     and history_message.role == "user"
-                    and history_message.content == event.text
+                    and history_message.content == prompt
                 ):
                     state.history_messages.append(history_message)
             usage = getattr(message, "usage", None)
@@ -1324,6 +1559,9 @@ class SessionRunner:
             # (#2294). Never a task, and nothing is awaited between observing a
             # publication call and classifying the turn that made it.
             await self._observe_publication_calls(state)
+            # The tool result counter (#3486), on the same iteration: a held
+            # call's gate record is standing when its deny result arrives.
+            self._observe_tool_results(state)
             decided_result_final: Final | None = None
             if isinstance(message, AssistantMessage):
                 if self._primary_model is None:
@@ -1360,6 +1598,21 @@ class SessionRunner:
                 )
 
             for outbound in events:
+                if (
+                    isinstance(message, ResultMessage)
+                    and message.subtype == "error_max_budget_usd"
+                    and not budget_hit
+                    and isinstance(outbound, ErrorEvent)
+                    and outbound.classification == BUDGET_CLASSIFICATION
+                ):
+                    outbound = outbound.model_copy(
+                        update={
+                            "message": (
+                                "USD budget exceeded "
+                                f"(max_usd_per_day={self._max_usd_per_day})"
+                            )
+                        }
+                    )
                 if isinstance(outbound, ToolNote):
                     logger.info("tool call session=%s tool=%s", self._session_id, outbound.tool)
                 if isinstance(outbound, ErrorEvent):
@@ -1571,6 +1824,79 @@ class SessionRunner:
                 logger.debug(
                     "publication already recorded this turn session=%s",
                     self._session_id,
+                )
+
+    def _observe_tool_results(self, state: TurnState) -> None:
+        """Count every tool result that closed a call this turn (#3486).
+
+        ``is_error`` is the signal; no payload is parsed. The order matches
+        ``_merge_gate_block``, where an operator interrupt outranks an approval
+        halt. A result that is not an error is ``success``. An error after an
+        operator stop is ``cancelled``: the CLI answers the call it cut off
+        itself. An error on a call the approval gate held is
+        ``awaiting_approval``; a policy or grant-argument refusal is ``refused``.
+        Both match the exact call ID, so another call of the same tool can still
+        be counted independently. The CLI's exact unknown-tool envelope is
+        ``unavailable`` only when its init catalog never advertised the name;
+        without that corroboration, it remains ``error``. Anything else is ``error``, a turn
+        deadline included on purpose: a connector that holds a call until the
+        deadline is failing.
+
+        So a connector ``error`` is any is_error result on a non-platform
+        ``mcp__`` tool that the gate did not hold or refuse, no operator stop
+        cut off, and the catalog did not confirm unavailable. Each connector
+        error logs one WARNING naming the server and the tool,
+        because the metric may carry no identifier; the line never carries the
+        call's arguments or its result. Like ``_observe_publication_calls`` it
+        runs on every message and acts only on results it has not counted yet.
+        """
+
+        gate = self._approval_gate
+        while state.tool_results_observed < len(state.tool_results):
+            call_id, tool_name, errored, unknown_marker = state.tool_results[
+                state.tool_results_observed
+            ]
+            state.tool_results_observed += 1
+            if not errored:
+                outcome = "success"
+            elif self._interrupt_requested and not self._timeout_requested:
+                outcome = "cancelled"
+            elif self._tool_access is not None and call_id in self._tool_access.refused_call_ids:
+                # @spec RUNNER-TOOL-ACCESS-6: the read-only front refused this
+                # exact call before it ran, so its error result is the refusal
+                # and says nothing about the tool or its connector.
+                outcome = "refused"
+            elif gate is not None and call_id in gate.held_call_ids:
+                outcome = "awaiting_approval"
+            elif gate is not None and call_id in gate.refused_call_ids:
+                outcome = "refused"
+            elif (
+                unknown_marker
+                and self._advertised_tools is not None
+                and tool_name not in self._advertised_tools
+            ):
+                outcome = "unavailable"
+            else:
+                outcome = "error"
+            origin = _tool_result_origin(tool_name)
+            record_metric(
+                "curie.tool.result",
+                attributes={
+                    "service.name": "curie-runner",
+                    "source": "runner",
+                    "origin": origin,
+                    "outcome": outcome,
+                },
+            )
+            if origin == "connector" and outcome == "error":
+                # Split at the FIRST separator: a plugin server key is one
+                # token, and a tool name may itself contain ``__``.
+                server, _, tool = tool_name[len("mcp__") :].partition("__")
+                logger.warning(
+                    "connector tool error session=%s server=%s tool=%s",
+                    self._session_id,
+                    server,
+                    tool,
                 )
 
     def _has_unhandled_publication(self, state: TurnState) -> bool:
@@ -1919,7 +2245,10 @@ class SessionRunner:
         return [
             to_ndjson_line(
                 ErrorEvent(
-                    message="output token budget exceeded",
+                    message=(
+                        "output token budget exceeded "
+                        f"(max_output_tokens_per_run={self._ceiling})"
+                    ),
                     classification=BUDGET_CLASSIFICATION,
                 )
             ),
@@ -1975,7 +2304,8 @@ class SessionRunner:
             # runner crash would be reported as this instead of a retryable
             # runner-error. The DONE final's leading notice is the delivery.
             logger.error(
-                "declared connector capability failed session=%s connectors=%s credentials=%s",
+                "declared connector capability failed session=%s connectors=%s "
+                "credentials=%s diagnosis=%s",
                 self._session_id,
                 ",".join(failure.connector for failure in self._connector_failures),
                 ",".join(
@@ -1983,6 +2313,7 @@ class SessionRunner:
                     for failure in self._connector_failures
                     for name in failure.credential_names
                 ),
+                " ".join(failure.diagnostic_message() for failure in self._connector_failures),
             )
             self._connector_notice = " ".join(
                 failure.caller_message() for failure in self._connector_failures

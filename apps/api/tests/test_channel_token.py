@@ -5,7 +5,8 @@ T-C1. The `chn` token is the credential an ingress adapter presents at
 it (plan D6): `sandbox_token.mint` binds an `agent` claim, and an adapter is
 bound to a BINDING, not to an agent. Spike S3's rule -- "if the claim set must
 grow, escalate rather than widen the primitive" -- is why this module exists at
-all, so a test here also pins that `sandbox_token`'s own claim set did NOT grow.
+all, so a test here also pins that `sandbox_token`'s core claim set did NOT grow
+(ADR-0188 later allowed a binding only as an optional extra claim).
 
 The claims are `{channel_id, generation, scope, exp}` (plan D5, EB-C1):
 deliberately NOT `(kind, address)`. `crud.update_channel_binding` mutates the
@@ -300,26 +301,61 @@ def test_a_channel_token_is_not_a_platform_key_and_not_a_sandbox_token() -> None
     )
 
 
-def test_sandbox_token_was_not_widened_to_carry_a_binding() -> None:
-    """Plan D6, the rule that made this module exist rather than an extra claim.
+def test_state_token_carries_a_binding_only_as_an_optional_claim() -> None:
+    """Plan D6 and #1525, as revised by ADR-0188 for the memory namespace.
 
-    The cheap way to ship ingress auth is an optional `channel_id=None` on
-    `sandbox_token.mint`; that is exactly the widening spike S3 forbade, and it
-    would break the byte-identical api/worker twin test in a way that is easy to
-    "fix" by copying the drift across. Asserting the signature keeps the
-    decision, not just its current consequence.
+    #1525 rejected a binding claim on `sandbox_token` outright; that rejection
+    is why the `chn` token exists as a sibling rather than an extra claim.
+    ADR-0188 reverses it for memory only: `mint` may now carry extra claims
+    (`binding`, `memory`, ...), but only through an optional `claims` mapping.
+    What still holds, and is pinned here:
+
+    - the core claim set is unchanged: `agent`, `scope`, `exp` stay the only
+      required keywords, and `verify` still checks exactly those;
+    - a token minted without `claims` is byte-identical to the old three-claim
+      form, so the api/worker twin and its golden vector are not disturbed;
+    - the channel token was not folded into the sandbox token: `chn` keeps its
+      own `channel_id, generation, scope, exp` signature.
     """
 
-    assert list(inspect.signature(sandbox_token.mint).parameters) == [
-        "api_key",
-        "agent",
-        "scope",
-        "exp",
+    mint_params = inspect.signature(sandbox_token.mint).parameters
+    assert list(mint_params) == ["api_key", "agent", "scope", "exp", "claims"]
+    required_kw = [
+        name
+        for name, p in mint_params.items()
+        if p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is p.empty
     ]
+    assert required_kw == ["agent", "scope", "exp"]
+    assert mint_params["claims"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert mint_params["claims"].default is None
+
     assert list(inspect.signature(sandbox_token.verify).parameters) == [
         "token",
         "api_key",
         "agent",
         "scope",
         "now",
+    ]
+
+    # Without `claims`, the wire form is exactly the pre-ADR-0188 three-claim
+    # token, rebuilt here independently of the module.
+    agent = "00000000-0000-0000-0000-000000000001"
+    payload = json.dumps(
+        {"agent": agent, "scope": "state", "exp": EXP},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    payload_seg = base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+    signing_input = f"sbx.{payload_seg}"
+    sig = hmac.new(KEY.encode(), signing_input.encode(), hashlib.sha256).digest()
+    three_claim = f"{signing_input}.{base64.urlsafe_b64encode(sig).rstrip(b'=').decode()}"
+    assert sandbox_token.mint(KEY, agent=agent, scope="state", exp=EXP) == three_claim
+    assert sandbox_token.mint(KEY, agent=agent, scope="state", exp=EXP, claims=None) == three_claim
+
+    assert list(inspect.signature(mint).parameters) == [
+        "api_key",
+        "channel_id",
+        "generation",
+        "scope",
+        "exp",
     ]

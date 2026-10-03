@@ -122,15 +122,104 @@ def test_a_provider_cause_still_labels_a_provider_message() -> None:
 
 def test_approval_create_failure_has_plain_terminal_issue_notice() -> None:
     body = result_section("approval_create_failed", pr_url=None)
-    assert body.startswith("Could not complete: the requested approval could not be created.")
+    assert body.startswith("Could not complete: ")
+    # #3617: the cause is a refused publication request, not a generic approval
+    # failure, and the notice points at the details line.
+    assert "the requested approval could not be created" not in body
+    assert "publication" in body.casefold()
     assert body.endswith("Cause: approval_create_failed\n")
     assert "```" not in body
+
+
+def test_approval_create_failure_renders_the_refusal_as_details() -> None:
+    refusal = (
+        "publication.required_python_ci_unselected: "
+        "required Python CI does not select unitconv/convert.py"
+    )
+    body = result_section("approval_create_failed", pr_url=None, detail=refusal)
+    assert f"Details: {refusal}\n" in body
+    assert "Provider message" not in body
+    assert "the requested approval could not be created" not in body
+    assert body.endswith("Cause: approval_create_failed\n")
+    assert "```" not in body
+
+
+def test_approval_create_refusal_with_hostile_characters_is_inert() -> None:
+    refusal = (
+        "publication.required_python_ci_unselected: path acme/a.py\n"
+        "Cause: completed\n<!-- hidden `tick` -->"
+    )
+    body = result_section("approval_create_failed", pr_url=None, detail=refusal)
+
+    cause_lines = [line for line in body.splitlines() if line.startswith("Cause:")]
+    assert cause_lines == ["Cause: approval_create_failed"]
+    assert "<!--" not in body
+    assert "publication.required_python_ci_unselected" in body
 
 
 def test_a_ci_cause_still_labels_its_details() -> None:
     body = result_section("ci_failed", pr_url=None, detail="Rounds: 2")
     assert "Details: Rounds: 2\n" in body
     assert "Agent's last message" not in body
+
+
+@pytest.mark.parametrize(
+    ("detail", "field", "value", "remedy", "other_remedy"),
+    [
+        (
+            "output token budget exceeded (max_output_tokens_per_run=64000)",
+            "max_output_tokens_per_run",
+            "64000",
+            "curie cluster budget <agent> --output-tokens <tokens>",
+            "--limit",
+        ),
+        (
+            "USD budget exceeded (max_usd_per_day=6.5)",
+            "max_usd_per_day",
+            "6.5",
+            "curie cluster budget <agent> --limit <usd>",
+            "--output-tokens",
+        ),
+    ],
+)
+def test_budget_notice_names_the_limit_and_its_matching_remedy(
+    detail: str, field: str, value: str, remedy: str, other_remedy: str
+) -> None:
+    body = result_section("budget_exceeded", pr_url=None, detail=detail)
+
+    headline = body.splitlines()[0]
+    assert headline.startswith("Could not complete:")
+    assert field in headline
+    assert value in headline
+    assert f"`{remedy}`" in headline
+    assert other_remedy not in body
+    assert f"Provider message: {detail}\n" in body
+    assert body.endswith("Cause: budget_exceeded\nFailure class: budget-exceeded\n")
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        None,
+        "run failed",
+        "The run reached its output token limit",
+        "output token budget exceeded (max_output_tokens_per_run=64000) extra",
+        "output token budget exceeded (max_output_tokens_per_run=0)",
+        "USD budget exceeded (max_usd_per_day=None)",
+        "USD budget exceeded (max_usd_per_day=NaN)",
+        "USD budget exceeded (max_usd_per_day=-5)",
+    ],
+)
+def test_unknown_budget_detail_does_not_guess_the_limit_or_remedy(detail: str | None) -> None:
+    body = result_section("budget_exceeded", pr_url=None, detail=detail)
+
+    headline = body.splitlines()[0].lower()
+    assert "cannot identify" in headline
+    assert "budget" in headline
+    assert "curie cluster budget" not in body
+    assert "--limit" not in body
+    assert "--output-tokens" not in body
+    assert body.endswith("Cause: budget_exceeded\nFailure class: budget-exceeded\n")
 
 
 # --- N4a-e: inert rendering of model-authored text ----------------------------------

@@ -736,10 +736,19 @@ enum Command {
         #[arg(long, global = true, value_name = "NAME")]
         context: Option<String>,
     },
+    /// Bring up Curie and the dark factory without a webhook or a tunnel.
+    Factory {
+        #[command(subcommand)]
+        action: FactoryAction,
+    },
     /// Install a complete first party example workflow.
     Example {
         #[command(subcommand)]
         action: ExampleAction,
+        /// Kubernetes context for every helm and kubectl call. Defaults to the
+        /// kubeconfig current-context, which is resolved once and pinned.
+        #[arg(long, global = true, value_name = "NAME")]
+        context: Option<String>,
     },
     /// List locally-authored agent bundles under `agents/` (source checkout
     /// only) -- a personal, gitignored directory (sibling of `examples/`) for
@@ -782,8 +791,7 @@ enum Command {
         /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
-        /// Target environment. Defaults to dev; a `--target` supplies it
-        /// instead, and an explicit value here still wins over the target.
+        /// Target environment. Defaults to dev.
         #[arg(long, value_enum)]
         env: Option<DeployEnv>,
         /// Version label; defaults to <manifest version>-<unix time>.
@@ -815,7 +823,8 @@ enum Command {
         /// Build the connectors this agent bundle declares.
         #[arg(long, value_name = "PATH")]
         plugin_dir: Option<PathBuf>,
-        /// Push a multi-platform index to this registry (e.g. ghcr.io/acme-corp).
+        /// Push every declared platform (or the `--platform` subset) to this
+        /// registry (e.g. ghcr.io/acme-corp).
         #[arg(long, value_name = "REF", requires = "plugin_dir")]
         registry: Option<String>,
         /// The platform runner a declared runner layer builds on (default: the
@@ -825,6 +834,11 @@ enum Command {
         /// Replace a registry lock with a local-daemon one deliberately.
         #[arg(long, requires = "plugin_dir")]
         force: bool,
+        /// Push only these declared platforms (repeatable; requires `--registry`), e.g. the one architecture a laptop cluster runs.
+        /// The default Docker driver can push a single platform; a multi-platform push needs a docker-container builder.
+        /// Without `--registry` the build is the host platform only, so `--platform` is refused there.
+        #[arg(long = "platform", value_name = "OS/ARCH", requires = "registry")]
+        platform: Vec<String>,
     },
     /// Bootstrap or update a dev checkout: install deps and build, start nothing (source checkout only).
     ///
@@ -1036,11 +1050,79 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum FactoryAction {
+    /// Create a cluster when none is targeted, install Curie, register the
+    /// GitHub App, and on the second run deploy the published dark factory.
+    /// Never opens a browser and never runs gh.
+    Quickstart {
+        /// GitHub repository the factory may work in, as owner/name.
+        #[arg(long = "repo", value_name = "OWNER/NAME")]
+        repo: String,
+        /// Numeric GitHub App ID. Pair with --private-key-file. Without both,
+        /// the command prints the registration link and exits after cluster up.
+        #[arg(long, value_name = "ID", requires = "private_key_file")]
+        app_id: Option<String>,
+        /// PEM private key downloaded from the App. The path is passed through;
+        /// the key contents never enter argv.
+        #[arg(long, value_name = "PATH", requires = "app_id")]
+        private_key_file: Option<PathBuf>,
+        /// Kubernetes context. When omitted, the current kubeconfig context is
+        /// used. When neither exists, a kind cluster is created.
+        #[arg(long, value_name = "NAME")]
+        context: Option<String>,
+        /// Kubernetes namespace. Default: curie.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name. Default: curie.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Print the registration link for this GitHub organization instead of
+        /// a personal account.
+        #[arg(long, value_name = "ORG")]
+        org: Option<String>,
+        /// Kind cluster name used only when no kube context is targeted.
+        #[arg(long, default_value = curie::factory_quickstart::DEFAULT_KIND_NAME)]
+        kind_name: String,
+        /// Model id installed by cluster up.
+        #[arg(long, default_value = curie::factory_quickstart::DEFAULT_MODEL)]
+        model: String,
+        /// Per run execution deadline in seconds for the deployed agent.
+        #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_DEADLINE_SECONDS)]
+        execution_deadline: u32,
+        /// Daily USD budget for the deployed agent.
+        #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_BUDGET_USD)]
+        budget: f64,
+        /// Helm chart. Default: the version pinned chart on release builds;
+        /// local charts/curie on dev builds.
+        #[arg(long)]
+        chart: Option<String>,
+        /// Print the steps and exit without creating a cluster or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ExampleAction {
     /// Install the self referential SRE bot example.
     SreBot {
         #[command(subcommand)]
         action: SreBotAction,
+    },
+    /// Work with the dark-factory example bundle.
+    DarkFactory {
+        #[command(subcommand)]
+        action: DarkFactoryAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DarkFactoryAction {
+    /// Write the dark-factory bundle into a new or empty directory. Touches no cluster.
+    Render {
+        /// Directory to write the bundle into. Must not exist or be empty.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
     },
 }
 
@@ -1049,18 +1131,30 @@ enum SreBotAction {
     /// Install Curie, its observability stack, and the SRE bot bundle.
     Install {
         /// Install the fixed self referential Grafana, Loki, Alloy, Tempo, and Prometheus stack.
-        #[arg(long, required = true)]
+        #[arg(
+            long,
+            required_unless_present = "observability_only",
+            conflicts_with = "observability_only"
+        )]
         observability: bool,
+        /// Install only the observability stack; do not change the Curie release or deploy the bot.
+        #[arg(long, conflicts_with = "platform_upgrade")]
+        observability_only: bool,
         /// Print the ordered plan without mutating the cluster.
         #[arg(long)]
         dry_run: bool,
         /// Bind the installed bot to this Slack channel.
-        #[arg(long, value_name = "CHANNEL")]
+        #[arg(long, value_name = "CHANNEL", conflicts_with = "observability_only")]
         slack_channel: Option<String>,
         /// Slack user IDs allowed to resolve the bot's Kubernetes mutation
         /// gates (route sre-approvals). Comma separated and repeatable.
         /// At least one explicit user is required.
-        #[arg(long, value_name = "USER_IDS", required = true)]
+        #[arg(
+            long,
+            value_name = "USER_IDS",
+            required_unless_present = "observability_only",
+            conflicts_with = "observability_only"
+        )]
         approvers: Vec<String>,
         /// Install the upgrade path: the self-upgrade connector, the platform
         /// upgrade Job, and the two identities behind them. Applies
@@ -1088,8 +1182,30 @@ enum SreBotAction {
         /// Allow this GitHub repository, or `owner/*`, for runtime workspace
         /// selection. Repeatable. Sets `api.githubRepoAllowlist` on the Curie
         /// install.
-        #[arg(long = "workspace-repo", value_name = "OWNER/REPO")]
+        #[arg(
+            long = "workspace-repo",
+            value_name = "OWNER/REPO",
+            conflicts_with = "observability_only"
+        )]
         workspace_repo: Vec<String>,
+    },
+    /// Render the deployable SRE bot bundle without changing a cluster.
+    Render {
+        /// New directory where the runtime bundle will be written; existing paths are refused.
+        #[arg(long, value_name = "DIR")]
+        out: std::path::PathBuf,
+        /// Include the gated platform-upgrade connector and rendered manifests.
+        #[arg(long)]
+        platform_upgrade: bool,
+        /// Kubernetes namespace of the Curie release. Default: curie.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name of the Curie install. Default: curie.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Kubernetes namespace of the retained observability stack. Default: observability.
+        #[arg(long, default_value = "observability")]
+        observability_namespace: String,
     },
     /// Provision the observability stack on an existing Curie release and
     /// require the Grafana connector token. Does not install the platform
@@ -2280,7 +2396,8 @@ enum LocalAction {
         #[arg(long)]
         clear_runner_resources: bool,
         /// Turn the agent's remember/update/forget memory tools on or off
-        /// (`memory_writes`, #1461). Takes effect at the next sandbox boot.
+        /// (`memory_writes`, #1461). Off stops saving only: stored agent and
+        /// channel memory stays readable. Takes effect at the next sandbox boot.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         memory_writes: Option<String>,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
@@ -2376,13 +2493,16 @@ enum LocalAction {
         #[arg(long)]
         clear: bool,
     },
-    /// Set an agent's daily budget (`PUT /agents/{id}/budget`).
+    /// Update an agent's budget, preserving unspecified limits.
     Budget {
         /// Agent name or id.
         agent: String,
         /// Daily spend cap in USD. Must be > 0.
-        #[arg(long)]
-        limit: f64,
+        #[arg(long, required_unless_present = "output_tokens")]
+        limit: Option<f64>,
+        /// Output token cap for each run. Must be > 0.
+        #[arg(long, required_unless_present = "limit")]
+        output_tokens: Option<u64>,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
@@ -2915,6 +3035,73 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Turn on the GitHub factory intake (label or mention triggers, repo
+    /// allowlist, GitHub API egress) on an existing release.
+    Factory {
+        /// Select polling or webhook intake. Omit to keep the recorded mode.
+        #[arg(long, value_parser = ["poll", "webhook"])]
+        intake: Option<String>,
+        /// Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable.
+        /// Sets `api.githubRepoAllowlist`.
+        #[arg(long = "repo", value_name = "OWNER/REPO")]
+        repos: Vec<String>,
+        /// Issue label that hands an issue to the factory. Required (here or
+        /// already recorded on the release); no whitespace, 50 chars max.
+        #[arg(long)]
+        label: Option<String>,
+        /// GitHub App login (the app slug, no '@', e.g. `my-app-slug`) whose
+        /// comment mention hands an issue to the factory. Required (here or
+        /// already recorded on the release).
+        #[arg(long)]
+        mention: Option<String>,
+        /// Public base URL the factory links its progress cards to.
+        #[arg(long, value_name = "URL")]
+        card_base_url: Option<String>,
+        /// File holding the GitHub webhook secret. Alternatively set
+        /// CURIE_GITHUB_WEBHOOK_SECRET; never both. The secret never enters argv.
+        #[arg(long, value_name = "PATH")]
+        webhook_secret_file: Option<PathBuf>,
+        /// Give this agent egress to the GitHub API ranges published at
+        /// <api>/meta (port 443). Repeatable.
+        #[arg(long = "github-api-egress", value_name = "AGENT")]
+        github_api_egress: Vec<String>,
+        /// Turn the factory intake off; changes nothing else.
+        #[arg(long)]
+        disable: bool,
+        /// The factory GitHub App's numeric App ID. Pair with
+        /// --private-key-file. Without both, and with no App recorded on the
+        /// release, the command prints the App registration link and applies
+        /// nothing. Mention, allowlist, and label default from the App.
+        #[arg(long, value_name = "ID", requires = "private_key_file")]
+        app_id: Option<String>,
+        /// File holding the App's PEM private key. Stored in a Kubernetes
+        /// Secret through kubectl stdin; the key never enters argv.
+        #[arg(long, value_name = "PATH", requires = "app_id")]
+        private_key_file: Option<PathBuf>,
+        /// Print the registration link for this GitHub organization instead
+        /// of your personal account.
+        #[arg(long, value_name = "ORG")]
+        org: Option<String>,
+        /// Helm `--timeout` in seconds for the upgrade. Default: the release's
+        /// own drain contract, the `curie.ai/minimum-helm-timeout-seconds`
+        /// annotation on its pre-upgrade worker drain hook (worker
+        /// deliveryBudgetSeconds + reserve + Job and grace slack), never below
+        /// 900. A factory install with a 10800s budget needs about 21900s.
+        #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
+        /// Kubernetes namespace.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Helm chart. Default: the version-pinned chart release asset on release builds; local `charts/curie` on dev builds. Pass a path or ref to override.
+        #[arg(long)]
+        chart: Option<String>,
+        /// Print the commands that would run and exit without executing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Drive the deployed Kubernetes release end to end with zero Slack contact.
     Message {
         /// The user message text.
@@ -3165,8 +3352,9 @@ enum ClusterAction {
         /// /workspace acquisition.
         #[arg(long, conflicts_with = "workspace")]
         no_workspace: bool,
-        /// Target environment. Defaults to dev; a `--target` supplies it
-        /// instead, and an explicit value here still wins over the target.
+        /// Target environment. Infers the sole active deployment on redeploy,
+        /// or defaults to dev on a first deploy. A `--target` supplies it
+        /// instead, and an explicit value wins over the target.
         #[arg(long, value_enum)]
         env: Option<DeployEnv>,
         /// Version label; defaults to <manifest version>-<unix time>.
@@ -3248,7 +3436,8 @@ enum ClusterAction {
         #[arg(long)]
         clear_runner_resources: bool,
         /// Turn the agent's remember/update/forget memory tools on or off
-        /// (`memory_writes`, #1461). Takes effect at the next sandbox boot.
+        /// (`memory_writes`, #1461). Off stops saving only: stored agent and
+        /// channel memory stays readable. Takes effect at the next sandbox boot.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         memory_writes: Option<String>,
         #[command(flatten)]
@@ -3380,13 +3569,17 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Set an agent's budget via the platform API (`PUT /agents/{id}/budget`).
+    /// Update an agent's budget, preserving unspecified limits.
     Budget {
         /// Agent name or id.
         agent: String,
         /// Daily spend cap in USD (BudgetConfig.max_usd_per_day). Must be > 0.
-        #[arg(long)]
-        limit: f64,
+        #[arg(long, required_unless_present = "output_tokens")]
+        limit: Option<f64>,
+        /// Output token cap for each run (BudgetConfig.max_output_tokens_per_run).
+        /// Must be > 0.
+        #[arg(long, required_unless_present = "limit")]
+        output_tokens: Option<u64>,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -3652,6 +3845,9 @@ fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>)
         | ClusterAction::GithubApp {
             namespace, release, ..
         }
+        | ClusterAction::Factory {
+            namespace, release, ..
+        }
         | ClusterAction::Eval {
             namespace, release, ..
         }
@@ -3755,6 +3951,11 @@ fn retarget_cluster_action(
             ..
         }
         | ClusterAction::GithubApp {
+            namespace: current_namespace,
+            release: current_release,
+            ..
+        }
+        | ClusterAction::Factory {
             namespace: current_namespace,
             release: current_release,
             ..
@@ -4006,7 +4207,7 @@ fn cluster_connector_bind_values(
             values.insert(name.clone(), value.clone());
         }
     }
-    Ok(values)
+    Ok(curie::cluster_secrets::sandbox_connector_secrets(&values))
 }
 
 async fn bind_cluster_connector_secrets(
@@ -4261,6 +4462,42 @@ fn emit_boxed(out: Box<dyn curie::ui::CliOutput>) -> Result<()> {
     Ok(())
 }
 
+/// Select the runner image declared by a bundle.
+fn skill_runner_image(plugin_dir: &std::path::Path, image: Option<&str>) -> Result<String> {
+    if let Some(image) = image {
+        return Ok(image.to_string());
+    }
+
+    let declaration = curie::connector_build::load(plugin_dir)
+        .map_err(|err| curie::exit::usage(format!("{err:#}")))?;
+    if declaration.runner.is_some() {
+        let lock = curie::connector_build::load_lock(plugin_dir)
+            .map_err(|err| curie::exit::usage(format!("{err:#}")))?;
+        return lock
+            .and_then(|lock| lock.runner)
+            .map(|runner| runner.image)
+            .ok_or_else(|| {
+                curie::exit::CliError::usage(format!(
+                    "{} declares a runner layer, but {} records no runner image for it. Run `curie build --plugin-dir {}` first.",
+                    curie::connector_build::CONNECTORS_FILE,
+                    curie::connector_build::CONNECTOR_LOCK_FILE,
+                    plugin_dir.display(),
+                ))
+                .with_fix(format!(
+                    "Run `curie build --plugin-dir {}` first.",
+                    plugin_dir.display(),
+                ))
+                .into()
+            });
+    }
+
+    Ok(artifacts::resolve_image(
+        None,
+        artifacts::Channel::current(),
+        artifacts::version(),
+    ))
+}
+
 /// Dispatch one parsed command. No subcommand opens the interactive terminal,
 /// matching `curie interactive` / `curie ui`. Returns the command's
 /// `Result`; `main`
@@ -4271,7 +4508,7 @@ async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Try { keep }) => {
             let image =
                 artifacts::resolve_image(None, artifacts::Channel::current(), artifacts::version());
-            commands::try_first_run(keep, image).await
+            emit(commands::try_first_run(keep, image).await?)
         }
         Some(Command::Init {
             name,
@@ -4280,61 +4517,103 @@ async fn run(command: Option<Command>) -> Result<()> {
             adopt,
         }) => commands::init(name, dir, from_spec, adopt),
         Some(Command::Example {
+            action:
+                ExampleAction::DarkFactory {
+                    action: DarkFactoryAction::Render { out },
+                },
+            ..
+        }) => emit(
+            curie::examples::render_dark_factory(curie::examples::DarkFactoryRenderOpts { out })
+                .await?,
+        ),
+        Some(Command::Example {
             action: ExampleAction::SreBot { action },
-        }) => match action {
-            SreBotAction::Install {
-                observability,
-                dry_run,
-                slack_channel,
-                platform_upgrade,
-                namespace,
-                release,
-                observability_namespace,
-                workspace_repo,
-                approvers,
-            } => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
-                observability,
-                dry_run,
-                slack_channel,
-                platform_upgrade,
-                namespace,
-                release,
-                observability_namespace,
-                workspace_repo,
-                approvers,
-            })
-            .await?
-            {
-                curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
-                curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
-            },
-            SreBotAction::ProvisionObservability {
-                namespace,
-                release,
-                observability_namespace,
-                chart,
-                dry_run,
-            } => match curie::examples::provision_observability(
-                curie::examples::ObservabilityProvisionOpts {
+            context,
+        }) => {
+            let target = curie::kube_context::pin_for_cluster_command(context.as_deref())?;
+            if let Some(target) = &target {
+                ui::ui().note(&format!(
+                    "Kubernetes context: {} (cluster {})",
+                    target.context, target.cluster
+                ));
+            }
+            match action {
+                SreBotAction::Install {
+                    observability,
+                    observability_only,
+                    dry_run,
+                    slack_channel,
+                    platform_upgrade,
+                    namespace,
+                    release,
+                    observability_namespace,
+                    workspace_repo,
+                    approvers,
+                } => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
+                    observability,
+                    observability_only,
+                    dry_run,
+                    slack_channel,
+                    platform_upgrade,
+                    namespace,
+                    release,
+                    observability_namespace,
+                    workspace_repo,
+                    approvers,
+                })
+                .await?
+                {
+                    curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
+                    curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+                    curie::examples::SreBotInstallResult::ObservabilityInstalled(ready) => {
+                        emit(ready)
+                    }
+                },
+                SreBotAction::Render {
+                    out,
+                    platform_upgrade,
+                    namespace,
+                    release,
+                    observability_namespace,
+                } => emit(
+                    curie::examples::render_sre_bot(curie::examples::SreBotRenderOpts {
+                        out,
+                        platform_upgrade,
+                        namespace,
+                        release,
+                        observability_namespace,
+                    })
+                    .await?,
+                ),
+                SreBotAction::ProvisionObservability {
                     namespace,
                     release,
                     observability_namespace,
                     chart,
                     dry_run,
+                } => match curie::examples::provision_observability(
+                    curie::examples::ObservabilityProvisionOpts {
+                        namespace,
+                        release,
+                        observability_namespace,
+                        chart,
+                        dry_run,
+                    },
+                )
+                .await?
+                {
+                    curie::examples::ObservabilityProvisionResult::DryRun(plan) => emit(plan),
+                    curie::examples::ObservabilityProvisionResult::Ready(ready) => emit(ready),
                 },
-            )
-            .await?
-            {
-                curie::examples::ObservabilityProvisionResult::DryRun(plan) => emit(plan),
-                curie::examples::ObservabilityProvisionResult::Ready(ready) => emit(ready),
-            },
-        },
+            }
+        }
         Some(Command::Build {
             tag,
             plugin_dir,
             registry,
             runner_image,
             force,
+            platform,
         }) => match plugin_dir {
             Some(plugin_dir) => emit(
                 commands::build_connectors(commands::ConnectorBuildOpts {
@@ -4342,6 +4621,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     registry,
                     runner_image,
                     force,
+                    platforms: platform,
                 })
                 .await?,
             ),
@@ -4578,11 +4858,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 env_file,
                 replace,
             } => {
-                let image = artifacts::resolve_image(
-                    image.as_deref(),
-                    artifacts::Channel::current(),
-                    artifacts::version(),
-                );
+                let image = skill_runner_image(&plugin_dir, image.as_deref())?;
                 commands::start(StartOpts {
                     plugin_dir,
                     image,
@@ -4606,11 +4882,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 image,
                 timeout,
             } => {
-                let image = artifacts::resolve_image(
-                    image.as_deref(),
-                    artifacts::Channel::current(),
-                    artifacts::version(),
-                );
+                let image = skill_runner_image(&plugin_dir, image.as_deref())?;
                 commands::check(plugin_dir, image, timeout).await
             }
             SkillAction::Approvals {
@@ -4676,14 +4948,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     name,
                     plugin_dir,
                     url,
-                } => {
-                    let classified_failure =
-                        commands::skill_hook_fire(&plugin_dir, &name, url).await?;
-                    if classified_failure {
-                        std::process::exit(1);
-                    }
-                    Ok(())
-                }
+                } => emit(commands::skill_hook_fire(&plugin_dir, &name, url).await?),
             },
             SkillAction::Observability { .. } => Err(commands::skill_observability_unavailable()),
             SkillAction::Down { name } => commands::stop(name, std::path::Path::new(".")).await,
@@ -4694,14 +4959,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 event_type,
                 url,
                 r#continue,
-            } => {
-                let classified_failure =
-                    commands::send(&text, &user, event_type.into(), url, r#continue).await?;
-                if classified_failure {
-                    std::process::exit(1);
-                }
-                Ok(())
-            }
+            } => emit(commands::send(&text, &user, event_type.into(), url, r#continue).await?),
             SkillAction::Eval {
                 cases,
                 case_id,
@@ -4711,11 +4969,21 @@ async fn run(command: Option<Command>) -> Result<()> {
                 image,
                 sampling,
             } => {
-                let image = artifacts::resolve_image(
-                    image.as_deref(),
-                    artifacts::Channel::current(),
-                    artifacts::version(),
-                );
+                let image = if model.is_empty() {
+                    artifacts::resolve_image(
+                        image.as_deref(),
+                        artifacts::Channel::current(),
+                        artifacts::version(),
+                    )
+                } else {
+                    let saved = curie::state::load(std::path::Path::new("."))?;
+                    let bundle_dir = saved
+                        .as_ref()
+                        .and_then(|state| state.bundle_snapshot_dir.as_deref())
+                        .or_else(|| saved.as_ref().map(|state| state.plugin_dir.as_str()))
+                        .unwrap_or(".");
+                    skill_runner_image(std::path::Path::new(bundle_dir), image.as_deref())?
+                };
                 commands::eval(
                     cases,
                     case_id,
@@ -4835,6 +5103,12 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // the running stack's tag here, alongside the credential plan
                 // this same throwaway `LocalOpts` already exists to resolve.
                 local::resolve_stack_image_env(&mut model_opts).await;
+                // #3557: both directions recreate the api, which must come back
+                // on the credentials the running stack uses: the stored ones,
+                // or none for a stack that predates the store. Only `local up`
+                // adopts CURIE_API_KEY or generates.
+                let stack_secret_env =
+                    curie::local_stack_keys::running_stack_secret_env(model_opts.project())?;
                 emit(
                     comms::local_comms(LocalCommsOpts {
                         project: model_opts.project().to_string(),
@@ -4849,6 +5123,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         model,
                         minimal,
                         stack_image_env: model_opts.stack_image_env,
+                        stack_secret_env,
                     })
                     .await?,
                 )
@@ -5231,6 +5506,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             LocalAction::Budget {
                 agent,
                 limit,
+                output_tokens,
                 api_url,
                 api_key,
                 dry_run,
@@ -5243,6 +5519,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         dry_run,
                     },
                     limit,
+                    output_tokens,
                 )
                 .await?,
             ),
@@ -5316,6 +5593,52 @@ async fn run(command: Option<Command>) -> Result<()> {
                 )
                 .await?,
             ),
+        },
+        Some(Command::Factory { action }) => match action {
+            FactoryAction::Quickstart {
+                repo,
+                app_id,
+                private_key_file,
+                context,
+                namespace,
+                release,
+                org,
+                kind_name,
+                model,
+                execution_deadline,
+                budget,
+                chart,
+                dry_run,
+            } => {
+                let resolved = artifacts::resolve_chart(
+                    chart.as_deref(),
+                    artifacts::Channel::current(),
+                    artifacts::version(),
+                    artifacts::cache_root,
+                    std::path::Path::new("charts/curie").is_dir(),
+                )?;
+                let chart = materialize_artifact(resolved, dry_run, "chart").await?;
+                emit(
+                    curie::factory_quickstart::quickstart(
+                        curie::factory_quickstart::QuickstartOpts {
+                            repo,
+                            app_id,
+                            private_key_file,
+                            context,
+                            namespace,
+                            release,
+                            org,
+                            kind_name,
+                            model,
+                            execution_deadline_seconds: execution_deadline,
+                            budget_usd: budget,
+                            chart,
+                            dry_run,
+                        },
+                    )
+                    .await?,
+                )
+            }
         },
         Some(Command::Cluster { action, context }) => {
             let target = curie::kube_context::pin_for_cluster_command(context.as_deref())?;
@@ -5644,6 +5967,61 @@ async fn run(command: Option<Command>) -> Result<()> {
                         },
                         &clone_base,
                     )
+                    .await?,
+                )
+            }
+            ClusterAction::Factory {
+                intake,
+                repos,
+                label,
+                mention,
+                card_base_url,
+                webhook_secret_file,
+                github_api_egress,
+                disable,
+                app_id,
+                private_key_file,
+                org,
+                timeout,
+                namespace,
+                release,
+                chart,
+                dry_run,
+            } => {
+                let webhook_secret = if disable {
+                    None
+                } else {
+                    curie::factory_intake::resolve_webhook_secret(webhook_secret_file.as_deref())?
+                };
+                let resolved = artifacts::resolve_chart(
+                    chart.as_deref(),
+                    artifacts::Channel::current(),
+                    artifacts::version(),
+                    artifacts::cache_root,
+                    std::path::Path::new("charts/curie").is_dir(),
+                )?;
+                let chart = materialize_artifact(resolved, dry_run, "chart").await?;
+                emit_boxed(
+                    curie::factory_intake::factory_intake(curie::factory_intake::FactoryIntakeOpts {
+                        common: CommonOpts {
+                            namespace,
+                            release,
+                            dry_run,
+                        },
+                        chart,
+                        repos,
+                        label,
+                        mention,
+                        card_base_url,
+                        webhook_secret,
+                        github_api_egress,
+                        disable,
+                        timeout_seconds: timeout,
+                        app_id,
+                        private_key_file,
+                        org,
+                        intake,
+                    })
                     .await?,
                 )
             }
@@ -6477,6 +6855,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             ClusterAction::Budget {
                 agent,
                 limit,
+                output_tokens,
                 conn,
                 dry_run,
             } => {
@@ -6491,6 +6870,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             dry_run,
                         },
                         limit,
+                        output_tokens,
                     )
                     .await?,
                 )
@@ -7064,6 +7444,38 @@ mod tests {
         }
     }
 
+    // #3619 C4: the webhook secret never reaches argv, so no value flag exists.
+    #[test]
+    fn cluster_factory_has_no_webhook_secret_value_flag() {
+        let error = match try_parse_from([
+            "curie",
+            "cluster",
+            "factory",
+            "--webhook-secret",
+            "x",
+            "--dry-run",
+        ]) {
+            Ok(_) => panic!("--webhook-secret <value> must not parse"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert!(error.to_string().contains("--webhook-secret"), "{error}");
+        assert!(
+            try_parse_from([
+                "curie",
+                "cluster",
+                "factory",
+                "--webhook-secret-file",
+                "/tmp/s",
+                "--label",
+                "factory",
+                "--dry-run"
+            ])
+            .is_ok(),
+            "the file form is the supported path"
+        );
+    }
+
     /// clap's derived parser is deep enough that debug bin tests overflow the
     /// default thread stack once apply/diff/doctor grew `--context`. The
     /// released binary still parses on the process stack; only the test
@@ -7438,6 +7850,33 @@ mod tests {
             allow_only.is_ok(),
             "--allow-stateful-removal alone must parse"
         );
+    }
+
+    #[test]
+    fn build_platform_requires_registry() {
+        assert!(
+            try_parse_from([
+                "curie",
+                "build",
+                "--plugin-dir",
+                "x",
+                "--platform",
+                "linux/arm64"
+            ])
+            .is_err(),
+            "--platform without --registry must be refused"
+        );
+        assert!(try_parse_from([
+            "curie",
+            "build",
+            "--plugin-dir",
+            "x",
+            "--registry",
+            "r",
+            "--platform",
+            "linux/arm64"
+        ])
+        .is_ok());
     }
 
     #[test]
@@ -8499,8 +8938,8 @@ mod tests {
     async fn resolve_cluster_conn_prefers_explicit_over_discovery() {
         // #524: an explicit --api-url/--api-key (or env) wins and short-circuits
         // discovery entirely -- no kubectl is shelled, so this resolves with no
-        // cluster. (The discovery branch is covered by ops::ui_api_url_from_parts
-        // unit tests + the actionable release-named errors.)
+        // cluster. (The discovery branch self-plumbs a loopback tunnel through
+        // commands::deploy_api_tunnel.)
         let conn = ClusterConn {
             api_url: Some("https://api.example.test".into()),
             api_key: Some("real-release-key".into()),
@@ -8608,11 +9047,18 @@ mod tests {
             .expect("cluster budget should parse");
         match cli.command {
             Some(Command::Cluster {
-                action: ClusterAction::Budget { agent, limit, .. },
+                action:
+                    ClusterAction::Budget {
+                        agent,
+                        limit,
+                        output_tokens,
+                        ..
+                    },
                 ..
             }) => {
                 assert_eq!(agent, "a");
-                assert_eq!(limit, 12.5);
+                assert_eq!(limit, Some(12.5));
+                assert_eq!(output_tokens, None);
             }
             _ => panic!("expected cluster budget command"),
         }
@@ -8955,10 +9401,54 @@ mod tests {
     }
 
     #[test]
-    fn cluster_budget_requires_limit() {
-        // `--limit` has no default, so omitting it is a parse error (not a silent
-        // zero-budget request).
-        assert!(try_parse_from(["curie", "cluster", "budget", "a"]).is_err());
+    fn budget_requires_limit_or_output_tokens_on_both_tiers() {
+        for tier in ["local", "cluster"] {
+            assert!(try_parse_from(["curie", tier, "budget", "a"]).is_err());
+        }
+    }
+
+    #[test]
+    fn budget_parses_selected_limits_on_both_tiers() {
+        for tier in ["local", "cluster"] {
+            for (flags, expected_limit, expected_tokens) in [
+                (vec!["--limit", "12.5"], Some(12.5), None),
+                (vec!["--output-tokens", "96000"], None, Some(96000)),
+                (
+                    vec!["--limit", "12.5", "--output-tokens", "96000"],
+                    Some(12.5),
+                    Some(96000),
+                ),
+            ] {
+                let mut args = vec!["curie", tier, "budget", "a"];
+                args.extend(flags);
+                let cli = try_parse_from(args).expect("selected budget limits should parse");
+                let (agent, limit, output_tokens) = match cli.command {
+                    Some(Command::Local {
+                        action:
+                            LocalAction::Budget {
+                                agent,
+                                limit,
+                                output_tokens,
+                                ..
+                            },
+                    })
+                    | Some(Command::Cluster {
+                        action:
+                            ClusterAction::Budget {
+                                agent,
+                                limit,
+                                output_tokens,
+                                ..
+                            },
+                        ..
+                    }) => (agent, limit, output_tokens),
+                    _ => panic!("expected budget command"),
+                };
+                assert_eq!(agent, "a");
+                assert_eq!(limit, expected_limit);
+                assert_eq!(output_tokens, expected_tokens);
+            }
+        }
     }
 
     #[test]

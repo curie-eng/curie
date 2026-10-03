@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import curie_worker.binding as binding_module
-from aci_protocol import Final, SessionStatus, TextDelta
+from aci_protocol import Final, SessionStatus, TextDelta, ToolAccess
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import (
     BUDGET_ENV,
@@ -74,6 +74,7 @@ class StubBinding:
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+    **_: object,
     ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
@@ -104,6 +105,7 @@ class RealBootEnvBinding(StubBinding):
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+    **_: object,
     ) -> dict[str, str]:
         resolver = BindingResolver.__new__(BindingResolver)
         resolver._config = WorkerConfig()
@@ -293,6 +295,34 @@ def test_eval_isolate_turn_claims_without_ambient_memory(make_harness) -> None:
             assert plain_env is not None
             assert "CURIE_MEMORY_REF" in plain_env
             assert "CURIE_MEMORY_TOKEN" in plain_env
+
+    asyncio.run(go())
+
+
+def test_slack_channel_claim_marks_the_boot_env_channel_bound(make_harness) -> None:
+    """A slack claim with kind and address emits CURIE_CHANNEL_BOUND=1.
+
+    A direct boot without those coordinates omits the key. The flag is the
+    turn binding, not a second channel detector.
+    """
+
+    async def go() -> None:
+        agent_id = uuid.uuid4()
+        resolved = _resolved(agent_id, bundle="bundles/x.zip")
+        binding = RealBootEnvBinding({("slack", "C0EXAMPLE1"): resolved})
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            await h.kernel.process_event(
+                _qevent("hi", channel="C0EXAMPLE1", thread="thread-1")
+            )
+            claim_env = h.fake_k8s.claim_envs[-1]
+            assert claim_env is not None
+            assert claim_env["CURIE_CHANNEL_BOUND"] == "1"
+
+        resolver = BindingResolver.__new__(BindingResolver)
+        resolver._config = WorkerConfig()  # type: ignore[attr-defined]
+        plain = resolver.boot_env(resolved, "thread-1")
+        assert "CURIE_CHANNEL_BOUND" not in plain
 
     asyncio.run(go())
 
@@ -798,6 +828,28 @@ def test_fresh_thread_non_matching_message_runs_a_normal_turn(make_harness) -> N
             assert len(h.fake_k8s.claim_envs) == 1
             assert h.sink.last_text != _GREET
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_a_read_only_greeting_is_never_answered_from_the_pack(make_harness) -> None:
+    # @spec WORKER-TOOL-ACCESS-3: the canned reply would answer a probe with no
+    # runner at all, so a restricted turn goes to the runner like any other.
+    async def go() -> None:
+        packs = {"greeting": {"enabled": True, "phrases": ["hi", "hello"], "reply": _GREET}}
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs(packs)})
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="MODEL", status=DONE)]
+            h.runner.tool_access_enforced = ["read-only"]
+            ev = _qevent("hi", channel="C-bound", thread="tGreetReadOnly").model_copy(
+                update={"tool_access": ToolAccess.READ_ONLY}
+            )
+
+            await h.kernel.process_event(ev)
+
+            assert h.sink.last_text == "MODEL"
+            assert h.runner.opened == ["hi"]
+            assert h.runner.event_bodies[0]["tool_access"] == "read-only"
 
     asyncio.run(go())
 

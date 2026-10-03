@@ -1,7 +1,7 @@
 ---
 seam: CLI output (agent-facing `--json`)
 kind: CLEAN
-impls: 58 outputs behind one trait
+impls: 65 outputs behind one trait
 grade: not separately graded
 epics:
   - "#456"
@@ -13,7 +13,7 @@ order: 18
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 58 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 65 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -65,7 +65,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 
 ## Implementations today
 
-58 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
+65 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 - **`DryRunPlan`** (`cli/src/ui.rs`) — the generic `--dry-run` plan; JSON is
   `{"dry_run":true,"plan":[lines]}` and the human render is the same lines verbatim,
@@ -90,11 +90,11 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 - **`cli/src/local.rs`**, **`cli/src/ops/up.rs`**, **`cli/src/ops/upgrade.rs`**, and **`cli/src/ops/verbs.rs`**, the operator verbs, one output per
   verb per tier: `LocalUpOutput`, `LocalRebuildOutput`, `LocalStatusOutput`,
   `LocalDownOutput`; `ClusterUpOutput`, `ClusterUpgradeOutput`, `ClusterStatusOutput`, `ClusterDownOutput`,
-  `ClusterRollbackOutput`.
+  `ClusterRollbackOutput`; `LintValuesOutput` in `cli/src/ops/lint_values.rs`.
 - **`cli/src/message.rs`**: `MessageDryRunOutput` and `MessageOutcomeOutput`, the
   multi-variant outcome whose covered variant set the enum-variant walk derives (see
   Known leakage).
-- **`cli/src/examples.rs`**: `ObservabilityProvisionOutput`, the receipt that Secret `curie-grafana-connector` holds a token. The JSON names the secret and the key. It never includes the token.
+- **`cli/src/examples.rs`**: `ObservabilityProvisionOutput`, the receipt that Secret `curie-grafana-connector` holds a token (never the token value); `ObservabilityOnlyOutput`, which reports the stack namespace without claiming the Curie release changed; `SreBotRenderOutput`, which reports the new bundle directory; and `DarkFactoryRenderOutput`, which reports the rendered dark-factory bundle directory, the published runner layer `runner_image` its lock records (or `null`), and a `runner_note` naming the `curie build` to run when no layer is published for the CLI's version.
 - **`cli/src/installation.rs`**: `ApplyOutput`, `DiffOutput`.
 - **`cli/src/observability.rs`**: `ObservabilityOutput`, `ObservabilityRunsOutput`,
   `ObservabilityRunOutput`, `ObservabilityMetricsOutput` — the tier-aware
@@ -102,9 +102,9 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   and cluster tiers resolve their own `Endpoint` values and return *the same* output
   type, so tier parity is structural rather than two hand-aligned printers. That
   module is a deliberate leaf and never bypasses `CliOutput`.
-- **One output each** in `cli/src/channel_token.rs` (`ChannelTokenOutput`),
+- **Other module outputs** in `cli/src/channel_token.rs` (`ChannelTokenOutput`),
   `cli/src/comms.rs` (`CommsOutput`), `cli/src/doctor.rs`
-  (`DoctorOutput`), `cli/src/github_app.rs` (`GithubAppOutput`), `cli/src/guide.rs`
+  (`DoctorOutput`), `cli/src/factory_intake.rs` (`FactoryIntakeOutput`), `cli/src/factory_app.rs` (`FactoryAppRegistrationOutput`, `FactoryAppSetupOutput`), `cli/src/factory_quickstart.rs` (`QuickstartOutput`), `cli/src/github_app.rs` (`GithubAppOutput`), `cli/src/guide.rs`
   (`GuideOutput`), `cli/src/migrate_store.rs` (`MigrateStoreOutput`),
   `cli/src/release_accept.rs` (`ReleaseAcceptOutput`), `cli/src/seal.rs`
   (`SealOutput`), and `cli/src/secrets.rs` (`SecretsListOutput`).
@@ -126,10 +126,13 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   syntactic call-site inventory, not a type-level proof that *every* verb returns
   a `CliOutput`.
 - **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
-  longer schema-free: there are 58 committed schemas under `cli/schema/` with an
+  longer schema-free: there are 63 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
   against real `to_json()` output across 79 tests in `cli/tests/json_contract.rs`.
+  The dark factory render receipt uses schema version 2. Its `runner_image`
+  and `runner_note` fields are required and accept a string or `null`; the
+  binary render tests validate the actual receipt against the committed schema.
   Every `CliOutput` enum variant is also validated against its mapped schema by
   `cli/tests/cli_output_variants.rs`. Its sample registry is checked against a
   `syn` walk (`cli/tests/support/enum_variants.rs`) that derives enum and variant

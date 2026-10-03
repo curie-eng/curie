@@ -408,6 +408,8 @@ def test_a_failing_commit_status_is_a_failure_even_with_green_check_runs(
     turns = _ci_turns(published["id"])
     assert [t["event_id"] for t in turns] == [f"work-item-{published['id']}-ci-2"]
     assert "ci/jenkins" in turns[0]["text"]
+    # A commit status is not an Actions job, so nothing is rerun (#3741).
+    assert sink.reruns == []
 
 
 def test_no_checks_within_the_grace_period_completes_with_a_note(admitted: Any) -> None:
@@ -1010,6 +1012,7 @@ def test_relabel_during_the_ci_wait_cancels_then_readmits(admitted: Any) -> None
     assert _terminal(number) == ("running", None)
 
     github.labels = [LABEL]
+    github.advance_label_event(number)
     again = _post(
         client,
         "issues",
@@ -1053,6 +1056,7 @@ def test_relabel_during_a_fix_turn_waits_for_the_old_request_to_settle(
     assert len(_ci_turns(published["id"])) == 1
 
     github.labels = [LABEL]
+    github.advance_label_event(number)
     again = _post(
         client,
         "issues",
@@ -1547,3 +1551,263 @@ def test_pending_ci_shows_publish_done_and_wait_for_ci_in_progress(admitted: Any
     assert _phases(request_id)[-1] == ("wait_ci", None)
     assert "- [ ] **Wait for CI** (in progress)" in _body(sink, request_id)
     assert _terminal(number) == ("running", None)
+
+
+# --- #3741: rerun a failed Actions job once before wait_ci -------------------------
+
+
+def _actions_failure(
+    name: str,
+    run_id: int,
+    started_at: str,
+    *,
+    conclusion: str = "failure",
+) -> dict[str, Any]:
+    run = check_run(name, conclusion=conclusion, run_id=run_id, started_at=started_at)
+    run["app"] = {"slug": "github-actions"}
+    # The check run's details URL carries the workflow run id GitHub reruns.
+    # https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
+    run["details_url"] = f"https://github.com/{REPO}/actions/runs/{run_id}/job/{run_id}"
+    return run
+
+
+def _phase_notes(request_id: uuid.UUID) -> list[str | None]:
+    return [
+        row["note"]
+        for row in _rows(
+            "SELECT note FROM curie.execution_request_phase_reports "
+            "WHERE execution_request_id = :id ORDER BY id",
+            {"id": request_id},
+        )
+    ]
+
+
+def test_a_transient_actions_failure_passes_on_rerun_without_an_implementer_round(
+    admitted: Any,
+) -> None:
+    """A flake is rerun once at the same head and never reaches the implementer.
+
+    GitHub re-runs one job with POST /repos/{owner}/{repo}/actions/jobs/{job_id}/rerun
+    and answers 201 Created.
+    https://docs.github.com/en/rest/actions/workflow-jobs#re-run-a-job-from-a-workflow-run
+    """
+
+    _client, _github, sink = admitted
+    number = 9810
+    job_id = 88101
+    failed = _actions_failure("Chart render assertions", job_id, "2026-10-01T00:00:00Z")
+    passed = _actions_failure(
+        "Chart render assertions",
+        job_id,
+        "2026-10-01T00:05:00Z",
+        conclusion="success",
+    )
+    sink.ci_scripts = {HEAD_A: [ci_entry(failed), ci_entry(passed)]}
+    sink.rerun_status = 201
+    published = _published(_client, _github, sink, number)
+    request_id = published["id"]
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert _ci_turns(request_id) == []
+    assert sink.reruns == [job_id]
+    assert factory_ci_note(request_id) == "Reran failed Actions jobs once at this head."
+    assert _phases(request_id) == [("wait_ci", None)]
+
+    _reconcile()
+
+    assert sink.reruns == [job_id]
+    assert _ci_turns(request_id) == []
+    assert _terminal(number) == ("completed", "completed")
+
+
+def factory_ci_note(request_id: uuid.UUID) -> str | None:
+    notes = [note for note in _phase_notes(request_id) if note]
+    return notes[-1] if notes else None
+
+
+def test_a_persistent_actions_failure_reaches_the_implementer_after_one_rerun(
+    admitted: Any,
+) -> None:
+    """The same head is rerun once. A new failure after that is round 2 of 3."""
+
+    _client, _github, sink = admitted
+    number = 9811
+    first_job = 88111
+    next_job = 88112
+    started = "2026-10-01T00:00:00Z"
+    rerun_started = "2026-10-01T00:06:00Z"
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(_actions_failure("unit-tests", first_job, started)),
+            ci_entry(_actions_failure("unit-tests", first_job, started)),
+            ci_entry(_actions_failure("unit-tests", first_job, rerun_started)),
+        ],
+        HEAD_B: [
+            ci_entry(_actions_failure("unit-tests", next_job, "2026-10-01T01:00:00Z")),
+            ci_entry(_actions_failure("unit-tests", next_job, "2026-10-01T01:06:00Z")),
+        ],
+    }
+    sink.rerun_status = 201
+    published = _published(_client, _github, sink, number)
+    request_id = published["id"]
+
+    _reconcile()
+    assert sink.reruns == [first_job]
+    assert _ci_turns(request_id) == []
+
+    # The pre-rerun failure is still what GitHub is showing. Do not ask again.
+    _reconcile()
+    assert sink.reruns == [first_job]
+    assert _ci_turns(request_id) == []
+    assert _terminal(number) == ("running", None)
+
+    _reconcile()
+    turns = _ci_turns(request_id)
+    assert [turn["event_id"] for turn in turns] == [f"work-item-{request_id}-ci-2"]
+    assert "Curie wait_ci round 2 of 3:" in turns[0]["text"]
+    assert sink.reruns == [first_job]
+
+    _attach_fix(
+        published["work_item_id"],
+        request_id,
+        revision=2,
+        head_sha=HEAD_B,
+        title="Fix the widget parser off-by-one",
+        paths=["src/widget.txt"],
+    )
+    _reconcile()
+    assert sink.reruns == [first_job, next_job]
+    assert len(_ci_turns(request_id)) == 1
+
+    _reconcile()
+    turns = _ci_turns(request_id)
+    assert [turn["event_id"] for turn in turns] == [
+        f"work-item-{request_id}-ci-2",
+        f"work-item-{request_id}-ci-3",
+    ]
+    assert "Curie wait_ci round 3 of 3:" in turns[1]["text"]
+    assert sink.reruns == [first_job, next_job]
+
+
+def test_a_refused_actions_rerun_falls_back_to_the_implementer_round(
+    admitted: Any,
+) -> None:
+    """A 403 from the rerun endpoint keeps today's continuation and records why.
+
+    https://docs.github.com/en/rest/actions/workflow-jobs#re-run-a-job-from-a-workflow-run
+    """
+
+    _client, _github, sink = admitted
+    number = 9812
+    job_id = 88121
+    sink.ci_script = [
+        ci_entry(_actions_failure("unit-tests", job_id, "2026-10-01T00:00:00Z"))
+    ]
+    sink.rerun_status = 403
+    published = _published(_client, _github, sink, number)
+    request_id = published["id"]
+
+    _reconcile()
+
+    assert sink.reruns == [job_id]
+    turns = _ci_turns(request_id)
+    assert [turn["event_id"] for turn in turns] == [f"work-item-{request_id}-ci-2"]
+    assert "Curie wait_ci round 2 of 3:" in turns[0]["text"]
+    assert factory_ci_note(request_id) == "CI rerun refused: github_forbidden."
+
+    _reconcile()
+
+    assert sink.reruns == [job_id]
+    assert len(_ci_turns(request_id)) == 1
+
+
+def test_an_accepted_rerun_is_not_posted_again_when_a_later_run_retries(
+    admitted: Any,
+) -> None:
+    """A 201 is kept when a second workflow run returns 500."""
+
+    _client, _github, sink = admitted
+    number = 9813
+    first = _actions_failure("unit-tests", 88131, "2026-10-01T00:00:00Z")
+    second = _actions_failure("lint", 88132, "2026-10-01T00:00:00Z")
+    sink.ci_script = [ci_entry(first, second)]
+    sink.rerun_statuses = [201, 500, 201]
+    published = _published(_client, _github, sink, number)
+
+    _reconcile()
+    # The second workflow run answered 500. Its id is recorded, then the batch stops.
+    assert sink.reruns == [88131, 88132]
+    assert _ci_turns(published["id"]) == []
+
+    _reconcile()
+    # Only the run that was not accepted is posted again.
+    assert sink.reruns == [88131, 88132, 88132]
+    assert _ci_turns(published["id"]) == []
+
+
+def test_an_outstanding_rerun_times_out_without_an_implementer_round(
+    admitted: Any,
+) -> None:
+    """The pre-rerun failure does not spend a wait_ci round when the budget ends."""
+
+    _client, _github, sink = admitted
+    number = 9814
+    job_id = 88141
+    sink.ci_script = [ci_entry(_actions_failure("unit-tests", job_id, "2026-10-01T00:00:00Z"))]
+    sink.rerun_status = 201
+    published = _published(_client, _github, sink, number)
+    request_id = published["id"]
+
+    _reconcile()
+    assert sink.reruns == [job_id]
+    assert _ci_turns(request_id) == []
+
+    _reconcile_later(1300)
+
+    assert _ci_turns(request_id) == []
+    assert sink.reruns == [job_id]
+    assert _terminal(number) == ("failed", "ci_timeout")
+    assert "Reason: ci_rerun_outstanding" in _body(sink, request_id)
+
+
+def test_a_mixed_rerun_records_both_the_request_and_the_refusal(admitted: Any) -> None:
+    """One accepted run and one 403 both show up on the phase report."""
+
+    _client, _github, sink = admitted
+    number = 9815
+    sink.ci_script = [
+        ci_entry(
+            _actions_failure("unit-tests", 88151, "2026-10-01T00:00:00Z"),
+            _actions_failure("lint", 88152, "2026-10-01T00:00:00Z"),
+        )
+    ]
+    sink.rerun_statuses = [201, 403]
+    published = _published(_client, _github, sink, number)
+
+    _reconcile()
+
+    assert sink.reruns == [88151, 88152]
+    assert _ci_turns(published["id"]) == []
+    notes = [note for note in _phase_notes(published["id"]) if note]
+    assert "Reran failed Actions jobs once at this head." in notes
+    assert "CI rerun refused: github_forbidden." in notes
+
+
+def test_a_dropped_rerun_response_is_not_posted_again(admitted: Any) -> None:
+    """A lost response may already have been accepted, so the run is not resent."""
+
+    _client, _github, sink = admitted
+    number = 9816
+    job_id = 88161
+    sink.ci_script = [ci_entry(_actions_failure("unit-tests", job_id, "2026-10-01T00:00:00Z"))]
+    sink.rerun_status = 201
+    sink.lost_response_paths.add(f"/repos/{REPO}/actions/runs/{job_id}/rerun-failed-jobs")
+    published = _published(_client, _github, sink, number)
+
+    _reconcile()
+    _reconcile()
+
+    assert sink.reruns == [job_id]
+    assert _ci_turns(published["id"]) == []

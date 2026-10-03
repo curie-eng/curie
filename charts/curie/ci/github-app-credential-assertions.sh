@@ -22,15 +22,32 @@ fail() { echo "FAIL [$1] $2" >&2; exit 1; }
 VALUES_FILE="$(mktemp)"
 trap 'rm -f "$VALUES_FILE"' EXIT
 
-render() { helm template curie "$CHART" "$@" -s templates/api.yaml; }
+render() { helm template credential-check "$CHART" "$@" -s templates/api.yaml -s templates/secrets.yaml; }
 
-env_block() {
-  python3 - "$1" <<'PY'
+check_reference() {
+  python3 - "$1" "$2" "$3" <<'PYREF'
 import sys, yaml
-doc = [d for d in yaml.safe_load_all(sys.argv[1]) if d and d.get("kind") == "Deployment"][0]
-env = doc["spec"]["template"]["spec"]["containers"][0]["env"]
-print(yaml.safe_dump({e["name"]: e for e in env}))
-PY
+docs = [d for d in yaml.safe_load_all(sys.argv[1]) if d]
+try:
+    deployments = [d for d in docs if d['kind'] == 'Deployment' and d['metadata']['labels'].get('app.kubernetes.io/component') == 'api']
+    assert len(deployments) == 1, 'expected one API Deployment'
+    container = next(c for c in deployments[0]['spec']['template']['spec']['containers'] if c['name'] == 'api')
+    entries = [e for e in container['env'] if e['name'] == 'GITHUB_APP_PRIVATE_KEY']
+    assert len(entries) == 1, 'expected exactly one GITHUB_APP_PRIVATE_KEY env'
+    entry = entries[0]
+    assert 'value' not in entry, 'private key must reference a Secret'
+    reference = entry['valueFrom']['secretKeyRef']
+    name = sys.argv[2]
+    if name == 'managed':
+        secrets = [d for d in docs if d['kind'] == 'Secret' and 'githubAppPrivateKey' in d.get('stringData', {})]
+        assert len(secrets) == 1, 'expected one rendered managed credential Secret'
+        name = secrets[0]['metadata']['name']
+    assert reference['name'] == name, f"Secret name {reference['name']!r} != {name!r}"
+    assert reference['key'] == sys.argv[3], f"Secret key {reference['key']!r} != {sys.argv[3]!r}"
+except (AssertionError, KeyError, StopIteration, TypeError) as exc:
+    print(f'FAIL [credential reference] {exc}', file=sys.stderr)
+    sys.exit(1)
+PYREF
 }
 
 # (a) The App ID is emitted as a quoted string, never a bare number.
@@ -79,20 +96,20 @@ if value != "":
     sys.exit(1)
 PY
 
-# (d) Default path reads from the chart's own Secret.
+# (d) Default path references the managed Secret rendered in the same release.
 OUT="$(render --set api.githubAppPrivateKey=X)"
-env_block "$OUT" | grep -A 4 'GITHUB_APP_PRIVATE_KEY' | grep -q 'githubAppPrivateKey' \
-  || fail d "default path must read key githubAppPrivateKey from the chart Secret"
+check_reference "$OUT" managed githubAppPrivateKey
 
-# (e) BYO path references the named Secret instead.
-OUT="$(render --set api.githubAppExistingSecret=my-gh-app)"
-env_block "$OUT" | grep -q 'my-gh-app' || fail e "githubAppExistingSecret was not referenced"
-env_block "$OUT" | grep -q 'privateKey' || fail e "the default BYO key name was not used"
+# (e) BYO name and key must belong to GITHUB_APP_PRIVATE_KEY, not another env.
+OUT="$(render --set api.githubAppExistingSecret=example-app-key)"
+check_reference "$OUT" example-app-key privateKey
+OUT="$(render --set api.githubAppExistingSecret=example-app-key \
+  --set api.githubAppExistingSecretKey=customPemKey)"
+check_reference "$OUT" example-app-key customPemKey
 
-# (f) BYO wins over an inline value, so a leftover inline key cannot silently
-#     shadow the Secret an operator deliberately pointed at.
-OUT="$(render --set api.githubAppExistingSecret=my-gh-app --set api.githubAppPrivateKey=STALE)"
-env_block "$OUT" | grep -q 'my-gh-app' \
-  || fail f "githubAppExistingSecret must win over an inline githubAppPrivateKey"
+# (f) BYO wins even with a stale inline key; retain the custom key selection.
+OUT="$(render --set api.githubAppExistingSecret=example-app-key \
+  --set api.githubAppExistingSecretKey=customPemKey --set api.githubAppPrivateKey=STALE)"
+check_reference "$OUT" example-app-key customPemKey
 
 echo "github-app-credential-assertions: all six assertions passed"

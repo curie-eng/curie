@@ -78,7 +78,7 @@ _UNFENCED_BUDGET_S = 86_400.0
 # compares the consumer name the range form returns. The summary form
 # (``IDLE 0 - + 1 <consumer>``) looks equivalent and is not: it pages the
 # consumer's whole pending list and ``COUNT 1`` answers about its OLDEST entry,
-# not the one being fenced. The runs lane holds up to ``max_concurrency`` (16)
+# not the one being fenced. The runs lane holds up to ``max_concurrency`` (16 by default)
 # entries per consumer, so that form would grant a lease whenever the consumer
 # owned ANY pending entry -- silently defeating the fence it exists to enforce.
 #

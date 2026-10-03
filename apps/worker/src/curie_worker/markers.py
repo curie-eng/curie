@@ -62,6 +62,10 @@ from .reply_sink import ProviderEgressRefusedError, TargetRoute
 
 DoneMarkerValue = Literal["1", "history_capacity"]
 
+# The longest a per-turn memory credential lives: ``binding.SANDBOX_TOKEN_TTL_SECONDS``
+# (not imported: binding imports this package's config, and the value is tiny).
+_MEMORY_STEER_TURNS_TTL_S = 24 * 60 * 60
+
 # Stored fields of the completion hash. The done flag is its OWN field rather
 # than a value inside the record JSON so it can be set in the same MULTI as the
 # done marker: a read-modify-write of the JSON could not be atomic with it, and
@@ -243,6 +247,44 @@ class Markers:
     def __init__(self, redis: Redis, config: WorkerConfig) -> None:
         self._redis = redis
         self._config = config
+
+    async def push_steer_memory_turns(
+        self, agent_id: uuid.UUID, live_turn: str, turns: Sequence[tuple[uuid.UUID, str]]
+    ) -> None:
+        """Hand a steer's memory turn claims to the live turn it joined (#3776).
+
+        ``live_turn`` names the runner turn the steer landed in. The attempt
+        that owns that turn drains them when it ends. The TTL is the longest a
+        turn credential lives, so an owner that never drains leaves nothing
+        behind once the credentials have expired anyway."""
+
+        if not turns:
+            return
+        key = self._config.memory_steer_turns_key(str(agent_id), live_turn)
+        values = [json.dumps([str(agent), turn]) for agent, turn in turns]
+        async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.rpush(key, *values)
+            pipe.expire(key, _MEMORY_STEER_TURNS_TTL_S)
+            await pipe.execute()
+
+    async def drain_steer_memory_turns(
+        self, agent_id: uuid.UUID, live_turn: str
+    ) -> list[tuple[uuid.UUID, str]]:
+        """Take every memory turn claim steered into one live turn."""
+
+        key = self._config.memory_steer_turns_key(str(agent_id), live_turn)
+        async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.lrange(key, 0, -1)
+            pipe.delete(key)
+            raw, _ = await pipe.execute()
+        turns: list[tuple[uuid.UUID, str]] = []
+        for item in raw or []:
+            try:
+                agent, turn = json.loads(_as_str(item) or "")
+                turns.append((uuid.UUID(agent), str(turn)))
+            except (ValueError, TypeError):
+                continue
+        return turns
 
     async def is_terminal(self, event_id: str) -> bool:
         """Has this event ALREADY been handled to a terminal state?

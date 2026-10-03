@@ -38,6 +38,7 @@ from .preflight import (
     check_api_reachable,
     check_slack_channel_capabilities,
 )
+from .socket_presence import SocketPresence
 from .supervisor import BackoffPolicy, Supervisor, SupervisorGroup
 
 
@@ -65,10 +66,15 @@ def _socket_mode_connector(
     *,
     logger: logging.Logger,
     slack_identity: str | None,
+    presence: SocketPresence,
 ) -> Callable[[], SocketModeConnection]:
     def connect() -> SocketModeConnection:
         return SocketModeConnection(
-            app, credentials.app_token, logger=logger, slack_identity=slack_identity
+            app,
+            credentials.app_token,
+            logger=logger,
+            slack_identity=slack_identity,
+            presence=presence,
         )
 
     return connect
@@ -94,7 +100,9 @@ def build_identity_connections(
     preflight leaves one survivor of a larger count, that survivor still names
     itself.
     """
-    several = (declared_count if declared_count is not None else len(identities)) > 1
+    configured = declared_count if declared_count is not None else len(identities)
+    several = configured > 1
+    presence = SocketPresence(configured=configured)
     backoff = BackoffPolicy(
         initial_seconds=config.backoff_initial_seconds,
         max_seconds=config.backoff_max_seconds,
@@ -130,6 +138,7 @@ def build_identity_connections(
             credentials,
             logger=logger,
             slack_identity=credentials.name if several else None,
+            presence=presence,
         )
         supervisor = Supervisor(
             connect,

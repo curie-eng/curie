@@ -12,6 +12,7 @@ dependencies = [
     "curie-dispatcher",
     "curie-discord-adapter",
     "curie-mail-adapter",
+    "curie-e2e-connector",
     "curie-worker",
     "curie-runner",
     "curie-telemetry",
@@ -32,6 +33,7 @@ members = [
     "apps/dispatcher",
     "adapters/discord",
     "apps/mail-adapter",
+    "apps/e2e-connector",
     "apps/worker",
     "runner",
     "tools/doclint",
@@ -48,6 +50,7 @@ curie-api = { workspace = true }
 curie-dispatcher = { workspace = true }
 curie-discord-adapter = { workspace = true }
 curie-mail-adapter = { workspace = true }
+curie-e2e-connector = { workspace = true }
 curie-worker = { workspace = true }
 curie-runner = { workspace = true }
 curie-telemetry = { workspace = true }
@@ -86,6 +89,7 @@ root_packages = [
     "curie_dispatcher",
     "curie_discord_adapter",
     "curie_mail_adapter",
+    "curie_e2e_connector",
     "curie_runner",
     "curie_telemetry_schema",
     # The frozen contract packages (#961). Outside the graph, no contract could
@@ -133,7 +137,7 @@ forbidden_modules = ["curie_worker", "kubernetes", "sqlalchemy", "redis", "boto3
 # direction that is hardest to see in review.
 name = "The platform never imports a harness SDK"
 type = "forbidden"
-source_modules = ["curie_api", "curie_worker", "curie_dispatcher", "curie_discord_adapter", "curie_mail_adapter"]
+source_modules = ["curie_api", "curie_worker", "curie_dispatcher", "curie_discord_adapter", "curie_mail_adapter", "curie_e2e_connector"]
 forbidden_modules = ["claude_agent_sdk"]
 
 [[tool.importlinter.contracts]]
@@ -178,6 +182,7 @@ testpaths = [
     "apps/api/tests",
     "apps/dispatcher/tests",
     "apps/mail-adapter/tests",
+    "apps/e2e-connector/tests",
     # The Discord adapter's tests sat in no collection root above, and the
     # string "discord" appears in no .github/workflows file, so they ran
     # nowhere in CI (#2358). A telemetry test in a suite CI never collects is
@@ -257,6 +262,7 @@ mypy_path = [
     "apps/dispatcher/src",
     "adapters/discord/src",
     "apps/mail-adapter/src",
+    "apps/e2e-connector/src",
     "apps/worker/src",
     "runner/src",
     "tools/doclint/src",
@@ -273,6 +279,7 @@ files = [
     "apps/dispatcher/src",
     "adapters/discord/src",
     "apps/mail-adapter/src",
+    "apps/e2e-connector/src",
     "apps/worker/src",
     "runner/src",
     "tools/doclint/src",

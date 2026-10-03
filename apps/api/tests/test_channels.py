@@ -958,6 +958,110 @@ def test_an_endpoint_or_adapter_in_the_body_is_ignored(
     assert "attacker" not in turn.model_dump_json()
 
 
+def test_the_attachment_references_an_adapter_posts_reach_the_queued_turn(
+    channels_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """ADR-0153 decisions 1 and 2 (#3678).
+
+    The worker resolves `QueuedTurn.attachments` and nothing else, so a
+    reference the ingress accepts and drops reads downstream exactly like a
+    message that carried no file. `TurnIn` is `extra="ignore"`, which is why the
+    drop answered 200: this asserts the reference arrives on the stream, with
+    the adapter's own id untouched, because only that adapter can resolve it.
+    """
+
+    _bind(
+        channels_client,
+        auth_headers,
+        name="attachment-ingress",
+        channel=_email_channel("files@example.test"),
+    )
+    token = _mint(channels_client, auth_headers, kind="email", address="files@example.test")
+
+    resp = _post_turn(
+        channels_client,
+        token,
+        _turn(
+            "email",
+            "files@example.test",
+            attachments=[
+                {
+                    "id": "msg-1/att-1",
+                    "name": "Status report.pdf",
+                    "mime_type": "application/pdf",
+                    "size_bytes": 2048,
+                },
+                {"id": "msg-1/att-2", "name": "notes.txt"},
+            ],
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+
+    (turn,) = _turns_on(valkey, runs_stream)
+    assert [(ref.id, ref.name, ref.mime_type, ref.size_bytes) for ref in turn.attachments] == [
+        ("msg-1/att-1", "Status report.pdf", "application/pdf", 2048),
+        ("msg-1/att-2", "notes.txt", None, None),
+    ], "the ingress accepted attachment references and queued a turn without them"
+
+
+def test_a_turn_body_without_attachments_still_queues_an_empty_list(
+    channels_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """ADR-0153 decision 1's default. An adapter written before the field omits
+    it, and that body must stay valid and mean "no files"."""
+
+    _bind(
+        channels_client,
+        auth_headers,
+        name="attachment-less-ingress",
+        channel=_email_channel("plain@example.test"),
+    )
+    token = _mint(channels_client, auth_headers, kind="email", address="plain@example.test")
+
+    resp = _post_turn(channels_client, token, _turn("email", "plain@example.test"))
+    assert resp.status_code == 200, resp.text
+
+    (turn,) = _turns_on(valkey, runs_stream)
+    assert turn.attachments == []
+
+
+def test_an_attachment_reference_without_an_id_is_refused_not_dropped(
+    channels_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """The negative for the test above. `Attachment` requires `id` and `name`: a
+    reference with no id resolves to nothing. Before ADR-0153 the whole key was
+    ignored, so this answered 200 and enqueued a turn; now the adapter author
+    hears about it on the first attempt and nothing is enqueued."""
+
+    _bind(
+        channels_client,
+        auth_headers,
+        name="malformed-attachment",
+        channel=_email_channel("broken@example.test"),
+    )
+    token = _mint(channels_client, auth_headers, kind="email", address="broken@example.test")
+
+    resp = _post_turn(
+        channels_client,
+        token,
+        _turn("email", "broken@example.test", attachments=[{"name": "no-id.pdf"}]),
+    )
+    assert resp.status_code == 422, resp.text
+    assert _turns_on(valkey, runs_stream) == []
+
+
 def test_a_token_minted_for_one_binding_is_refused_for_another(
     channels_client: TestClient,
     auth_headers: dict[str, str],

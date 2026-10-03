@@ -13,7 +13,11 @@ from typing import Any
 
 import pytest
 from curie_api.config import get_settings
-from curie_api.runner_resources import validate_runner_resources
+from curie_api.runner_resources import (
+    RunnerResourcesError,
+    quota_refusal,
+    validate_runner_resources,
+)
 
 # The chart block the operator sends. Every key is required when the field is set.
 _VALID: dict[str, Any] = {
@@ -34,6 +38,24 @@ _FULL_QUOTA: dict[str, str] = {
     "CURIE_SANDBOX_QUOTA_REQUESTS_MEMORY": "2Gi",
     "CURIE_SANDBOX_QUOTA_LIMITS_CPU": "2",
     "CURIE_SANDBOX_QUOTA_LIMITS_MEMORY": "4Gi",
+}
+
+# The same quota with a decimal core value (#3719). `resourceQuota.hard.requestsCpu:
+# "2.5"` is a valid Kubernetes quantity the chart renders into the env setting
+# unchanged, and it means the same as 2500m.
+_FRACTIONAL_QUOTA: dict[str, str] = {
+    "CURIE_SANDBOX_QUOTA_REQUESTS_CPU": "2.5",
+    "CURIE_SANDBOX_QUOTA_REQUESTS_MEMORY": "2Gi",
+    "CURIE_SANDBOX_QUOTA_LIMITS_CPU": "4",
+    "CURIE_SANDBOX_QUOTA_LIMITS_MEMORY": "4Gi",
+}
+
+# Same shape as _FRACTIONAL_QUOTA for quota_refusal's keyword arguments.
+_FRACTIONAL_QUOTA_ARGS: dict[str, str] = {
+    "requests_cpu": "2.5",
+    "requests_memory": "2Gi",
+    "limits_cpu": "4",
+    "limits_memory": "4Gi",
 }
 
 
@@ -130,6 +152,95 @@ def test_validate_runner_resources_stores_stripped_quantities() -> None:
     assert stored is not None
     assert stored["requests"]["cpu"] == "500m"
     assert stored["limits"]["memory"] == "2Gi"
+
+
+def test_quota_refusal_accepts_decimal_cpu_quota_for_a_fitting_override() -> None:
+    # AC #3719: a decimal core quota (2.5, and the smaller 0.5) is a valid
+    # Kubernetes quantity and compares in millicores, so it behaves exactly
+    # like its millicore spelling.
+    fitting = _resources()  # 500m requested of the cpu quota.
+    assert quota_refusal(fitting, **_FRACTIONAL_QUOTA_ARGS) is None
+    # The decimal core compares equal to its millicore spelling.
+    millicore_quota = dict(_FRACTIONAL_QUOTA_ARGS, requests_cpu="2500m")
+    assert quota_refusal(fitting, **millicore_quota) is None
+    half_core: dict[str, str] = dict(_FRACTIONAL_QUOTA_ARGS, requests_cpu="0.5", limits_cpu="1")
+    under_half = _resources()
+    under_half["requests"]["cpu"] = "500m"
+    assert quota_refusal(under_half, **half_core) is None
+
+
+def test_quota_refusal_refuses_an_oversized_override_against_a_decimal_quota() -> None:
+    over = _resources()
+    over["requests"]["cpu"] = "3000m"
+    # The block's own limit must stay above the request or the shape check
+    # refuses first; 3000m requested of a 2.5-core quota is the oversized case.
+    over["limits"]["cpu"] = "4"
+    refusal = quota_refusal(over, **_FRACTIONAL_QUOTA_ARGS)
+    assert refusal is not None
+    assert "cpu request 3000m cannot fit sandbox quota hard 2.5" in refusal
+    assert "lower the override or raise resourceQuota.hard" in refusal
+
+
+def test_quota_refusal_names_the_setting_for_an_unparseable_quota_value() -> None:
+    # An invalid quota value is an operator configuration error, so the refusal
+    # names the quota setting and never reads as a problem with the request.
+    with pytest.raises(RunnerResourcesError) as exc:
+        quota_refusal(_resources(), **dict(_FRACTIONAL_QUOTA_ARGS, requests_cpu="2x"))
+    message = str(exc.value)
+    assert "CURIE_SANDBOX_QUOTA_REQUESTS_CPU" in message
+    assert "'2x'" in message
+    with pytest.raises(RunnerResourcesError) as exc:
+        quota_refusal(_resources(), **dict(_FRACTIONAL_QUOTA_ARGS, requests_memory="2Xi"))
+    assert "CURIE_SANDBOX_QUOTA_REQUESTS_MEMORY" in str(exc.value)
+
+
+def test_quota_refusal_accepts_the_bare_point_decimal_forms() -> None:
+    # ".5" and "2." are valid Kubernetes quantities, so the quota side accepts
+    # them; the override grammar keeps refusing its own stricter spellings.
+    point_five: dict[str, str] = dict(_FRACTIONAL_QUOTA_ARGS, requests_cpu=".5", limits_cpu="2")
+    half = _resources()  # requests.cpu 500m, exactly the .5-core quota.
+    assert quota_refusal(half, **point_five) is None
+    over_half = _resources()
+    over_half["requests"]["cpu"] = "600m"
+    refusal = quota_refusal(over_half, **point_five)
+    assert refusal is not None
+    assert "cpu request 600m cannot fit sandbox quota hard .5" in refusal
+
+    trailing_point: dict[str, str] = dict(_FRACTIONAL_QUOTA_ARGS, requests_cpu="2.")
+    under_two = _resources()
+    under_two["requests"]["cpu"] = "1500m"
+    assert quota_refusal(under_two, **trailing_point) is None
+
+
+def test_quota_refusal_compares_a_huge_millicore_quota_exactly() -> None:
+    # 9007199254740993 is the first integer float cannot hold, so this pins
+    # the quota comparison to exact integer arithmetic: an override equal to
+    # its quota fits, and one millicore above it is refused.
+    huge = "9007199254740993"
+    quota: dict[str, str] = dict(_FRACTIONAL_QUOTA_ARGS, requests_cpu=f"{huge}m")
+    equal = _resources()
+    equal["requests"]["cpu"] = f"{huge}m"
+    assert quota_refusal(equal, **quota) is None
+    above = _resources()
+    above["requests"]["cpu"] = f"{int(huge) + 1}m"
+    refusal = quota_refusal(above, **quota)
+    assert refusal is not None
+    assert f"cpu request {int(huge) + 1}m cannot fit sandbox quota hard {huge}m" in refusal
+
+
+def test_override_cpu_grammar_still_refuses_decimal_values() -> None:
+    # Only the quota side widened (#3719). An override cpu like "2.5" in the
+    # request body is refused as before, through both the shape check and the
+    # quota preflight.
+    fractional = _resources()
+    fractional["requests"]["cpu"] = "2.5"
+    fractional["limits"]["cpu"] = "4"
+    with pytest.raises(RunnerResourcesError) as exc:
+        validate_runner_resources(fractional)
+    assert "cpu quantity '2.5' is not a whole number of cores or millicores" in str(exc.value)
+    with pytest.raises(RunnerResourcesError) as exc:
+        quota_refusal(fractional, **_FRACTIONAL_QUOTA_ARGS)
+    assert "cpu quantity '2.5' is not a whole number of cores or millicores" in str(exc.value)
 
 
 def test_created_agent_runner_resources_is_null(
@@ -230,6 +341,59 @@ def test_quota_refuses_over_cpu_and_stores_within_quota(
         assert stored.status_code == 200, stored.text
         assert stored.json()["runner_resources"] == within
         assert _read(client, auth_headers, agent["id"])["runner_resources"] == within
+    finally:
+        get_settings.cache_clear()
+
+
+def test_decimal_quota_stores_a_fitting_override_and_refuses_an_oversized_one(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    try:
+        # #3719: `resourceQuota.hard.requestsCpu: "2.5"` is a valid Kubernetes
+        # quantity, so an override inside it (500m of 2500m) must be stored,
+        # and only an override that exceeds it refused.
+        _set_quota(monkeypatch, dict(_FRACTIONAL_QUOTA))
+        agent = _create_agent(client, auth_headers, "rr-quota-decimal")
+        within = _resources()
+        stored = _patch(client, auth_headers, agent["id"], {"runner_resources": within})
+        assert stored.status_code == 200, stored.text
+        assert stored.json()["runner_resources"] == within
+        assert _read(client, auth_headers, agent["id"])["runner_resources"] == within
+
+        over = _resources()
+        over["requests"]["cpu"] = "3000m"
+        over["limits"]["cpu"] = "4"
+        refused = _patch(client, auth_headers, agent["id"], {"runner_resources": over})
+        assert refused.status_code == 422, refused.text
+        detail = _detail_text(refused)
+        assert "cpu request 3000m cannot fit sandbox quota hard 2.5" in detail
+        assert _read(client, auth_headers, agent["id"])["runner_resources"] == within
+    finally:
+        get_settings.cache_clear()
+
+
+def test_decimal_quota_still_refuses_a_decimal_override_value(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    try:
+        # The quota side widened, not the override grammar: a cpu of "2.5" in
+        # the request body is refused as before, even under a decimal quota.
+        _set_quota(monkeypatch, dict(_FRACTIONAL_QUOTA))
+        agent = _create_agent(client, auth_headers, "rr-quota-decimal-override")
+        fractional = _resources()
+        fractional["requests"]["cpu"] = "2.5"
+        fractional["limits"]["cpu"] = "4"
+        refused = _patch(client, auth_headers, agent["id"], {"runner_resources": fractional})
+        assert refused.status_code == 422, refused.text
+        detail = _detail_text(refused)
+        assert "cpu quantity '2.5' is not a whole number of cores or millicores" in detail
+        assert _read(client, auth_headers, agent["id"])["runner_resources"] is None
     finally:
         get_settings.cache_clear()
 

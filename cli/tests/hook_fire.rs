@@ -176,6 +176,94 @@ fn dry_run_does_not_call_the_api() {
 }
 
 #[test]
+fn hook_fire_paths_percent_encode_agent_segments() {
+    // Agent names may hold `#` (which truncates a raw-format path) or `?`
+    // (which leaks into the query string); the plain name is the unchanged
+    // control (#3731).
+    let cases: [(&str, &str); 3] = [
+        ("a#b", "a%23b"),
+        ("a?x=1", "a%3Fx=1"),
+        ("acme-bot", "acme-bot"),
+    ];
+    for (agent, encoded) in cases {
+        let fire_path = format!("/agents/{encoded}/hooks/nightly-cleanup/fire");
+        let run_path = format!(
+            "/agents/{encoded}/hooks/nightly-cleanup/runs/22222222-2222-4222-8222-222222222222"
+        );
+
+        // The fire request and the run poll both hit the encoded path.
+        let server = fire_server(true);
+        let output = run_in(
+            &[
+                "--json",
+                "local",
+                "hook",
+                "fire",
+                agent,
+                "nightly-cleanup",
+                "--api-url",
+                &server.base_url,
+                "--api-key",
+                TEST_API_KEY,
+                "--wait-secs",
+                "5",
+            ],
+            &[],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{agent}: {}",
+            describe(&output)
+        );
+        let recorded = server.recorded();
+        let posted = recorded
+            .iter()
+            .find(|request| request.method == "POST")
+            .unwrap_or_else(|| panic!("{agent}: no fire request was recorded"));
+        assert_eq!(posted.path, fire_path, "{agent}: fire path");
+        let polled = recorded
+            .iter()
+            .find(|request| request.method == "GET")
+            .unwrap_or_else(|| panic!("{agent}: no poll request was recorded"));
+        assert_eq!(polled.path, run_path, "{agent}: poll path");
+
+        // The dry-run plan shows the same encoded path and makes no request.
+        let server = fire_server(true);
+        let output = run_in(
+            &[
+                "--json",
+                "local",
+                "hook",
+                "fire",
+                agent,
+                "nightly-cleanup",
+                "--dry-run",
+                "--api-url",
+                &server.base_url,
+                "--api-key",
+                TEST_API_KEY,
+            ],
+            &[],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{agent}: {}",
+            describe(&output)
+        );
+        let value = one_object(&output);
+        let expected_line = format!("POST {}{fire_path}", server.base_url);
+        let plan = value["plan"].as_array().cloned().unwrap_or_default();
+        assert!(plan.contains(&json!(expected_line)), "{agent}: {value}");
+        assert!(
+            server.recorded().is_empty(),
+            "{agent}: dry run called the API"
+        );
+    }
+}
+
+#[test]
 fn cluster_fire_uses_the_explicit_api() {
     let server = fire_server(false);
     let output = run_in(

@@ -10,7 +10,7 @@
 #
 # apps/ui/Dockerfile.dockerignore (BuildKit honors <dockerfile>.dockerignore over
 # the context-root one) trims the root context to the UI plus that one
-# cross-package tree.
+# cross-package tree and the shared wording vector.
 FROM node:22.23.2-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS build
 WORKDIR /app
 # Pin pnpm explicitly: package.json has no packageManager field, so corepack
@@ -28,6 +28,7 @@ RUN pnpm install --frozen-lockfile
 # at their repo-relative paths so `../../packages/...` resolves from apps/ui.
 WORKDIR /app
 COPY packages/aci-protocol/generated ./packages/aci-protocol/generated
+COPY tests/vectors/user-action-wording.json ./tests/vectors/user-action-wording.json
 COPY apps/ui ./apps/ui
 WORKDIR /app/apps/ui
 RUN pnpm build

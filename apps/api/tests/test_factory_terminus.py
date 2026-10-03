@@ -416,6 +416,25 @@ class _GitHubComments(BaseHTTPRequestHandler):
             present.update(names)
             self._send(200, [{"name": value} for value in sorted(present)])
             return
+        rerun = re.fullmatch(
+            rf"/repos/{re.escape(REPO)}/actions/runs/([0-9]+)/rerun-failed-jobs", path
+        )
+        if rerun is not None:
+            # Re-run failed jobs in one workflow run. 201 Created on success.
+            # Default 403 so a suite that does not opt in keeps today's path.
+            # https://docs.github.com/en/rest/actions/workflow-runs#re-run-failed-jobs-from-a-workflow-run
+            run_id = int(rerun.group(1))
+            server.reruns.append(run_id)
+            server.requests.append(("POST", path, None))
+            if path in server.lost_response_paths:
+                server.lost_response_paths.discard(path)
+                self.close_connection = True
+                return
+            status = (
+                server.rerun_statuses.pop(0) if server.rerun_statuses else server.rerun_status
+            )
+            self._send(status, {} if status == 201 else {"message": "refused"})
+            return
         server.requests.append(("POST", path, payload.get("body", "")))
         if server.by_path:
             refused = server.refuse_paths.get(path)
@@ -468,6 +487,10 @@ class _CommentServer(ThreadingHTTPServer):
         self.ci_cursor: dict[str, int] = {}
         self.ci_observations: list[str] = []
         self.annotations: dict[int, list[dict[str, Any]]] = {}
+        # #3741. 403 matches a token with no Actions write permission.
+        self.rerun_status = 403
+        self.rerun_statuses: list[int] = []
+        self.reruns: list[int] = []
 
         # Statuses the next PATCHes answer with instead of editing (#3077).
         self.patch_statuses: list[int] = []
@@ -495,45 +518,56 @@ class _CommentServer(ThreadingHTTPServer):
 
 
 @pytest.fixture
-def comments(monkeypatch: pytest.MonkeyPatch) -> Any:
+def comments(monkeypatch: pytest.MonkeyPatch, clean_db: None) -> Any:
+    """@spec apps/api/README.md#factory-test-isolation"""
     server = _CommentServer()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    host, port = server.server_address
-    monkeypatch.setenv("GITHUB_API_URL", f"http://{host}:{port}")
-    monkeypatch.setenv("CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS", "30")
-    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
-    monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
-    monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
-    monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
-    monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "true")
-    monkeypatch.setenv("GITHUB_FACTORY_LABEL", LABEL)
-    monkeypatch.setenv("GITHUB_FACTORY_MENTION", "curie")
-    monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
-    monkeypatch.setenv("GITHUB_APP_ID", "51")
-    monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", "example-private-key")
-    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "example-factory-hmac-secret")
-    monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
-    monkeypatch.setenv("GITHUB_TOKEN", "")
-    monkeypatch.setenv("INTERNAL_WORKER_TOKEN", "factory-terminus-worker")
-    monkeypatch.setenv("RUNS_STREAM", f"test:curie:terminus:{uuid.uuid4().hex}")
-    get_settings.cache_clear()
-    monkeypatch.setattr(
-        "curie_api.factory_notices.credentials_for",
-        lambda _settings: _Credentials(),
-    )
-    monkeypatch.setattr(
-        "curie_api.github_factory.credentials_for",
-        lambda _settings: _Credentials(),
-    )
-    monkeypatch.setattr(
-        "curie_api.workitem_outcomes.credentials_for",
-        lambda _settings: _Credentials(),
-    )
-    yield server
-    server.shutdown()
-    thread.join(timeout=5)
-    get_settings.cache_clear()
+    try:
+        host, port = server.server_address
+        monkeypatch.setenv("GITHUB_API_URL", f"http://{host}:{port}")
+        monkeypatch.setenv("CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS", "30")
+        monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
+        monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
+        monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
+        monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
+        monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "true")
+        # These tests drive signed deliveries. Poll mode would also read the
+        # GitHub stand in on every reconciler pass.
+        monkeypatch.setenv("GITHUB_FACTORY_INTAKE", "webhook")
+        monkeypatch.setenv("GITHUB_FACTORY_LABEL", LABEL)
+        monkeypatch.setenv("GITHUB_FACTORY_MENTION", "curie")
+        monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
+        monkeypatch.setenv("GITHUB_APP_ID", "51")
+        monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", "example-private-key")
+        monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "example-factory-hmac-secret")
+        monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
+        monkeypatch.setenv("GITHUB_TOKEN", "")
+        monkeypatch.setenv("INTERNAL_WORKER_TOKEN", "factory-terminus-worker")
+        monkeypatch.setenv("RUNS_STREAM", f"test:curie:terminus:{uuid.uuid4().hex}")
+        get_settings.cache_clear()
+        monkeypatch.setattr(
+            "curie_api.factory_notices.credentials_for",
+            lambda _settings: _Credentials(),
+        )
+        monkeypatch.setattr(
+            "curie_api.github_factory.credentials_for",
+            lambda _settings: _Credentials(),
+        )
+        monkeypatch.setattr(
+            "curie_api.workitem_outcomes.credentials_for",
+            lambda _settings: _Credentials(),
+        )
+        yield server
+    finally:
+        try:
+            _clear_ci_keys()
+        finally:
+            try:
+                server.shutdown()
+                thread.join(timeout=5)
+            finally:
+                get_settings.cache_clear()
 
 
 @pytest.fixture
@@ -575,6 +609,29 @@ def _rows(statement: str, params: dict[str, Any] | None = None) -> list[dict[str
     return asyncio.run(go())
 
 
+def _clear_ci_keys() -> None:
+    """@spec apps/api/README.md#factory-test-isolation
+
+    The disposable database records this fixture's requests. Other workers
+    share Valkey, so only these exact request namespaces belong to cleanup.
+    """
+
+    import redis
+
+    request_ids = [str(row["id"]) for row in _rows("SELECT id FROM curie.execution_requests")]
+    if not request_ids:
+        return
+    client = redis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
+    try:
+        for request_id in request_ids:
+            for prefix in ("curie:work-item:ci", "curie:work-item:ci-rerun"):
+                keys = list(client.scan_iter(f"{prefix}:{request_id}:*"))
+                if keys:
+                    client.delete(*keys)
+    finally:
+        client.close()
+
+
 def _request(number: int) -> dict[str, Any]:
     rows = _rows(
         "SELECT r.id, r.status, r.terminal_cause, r.version, w.id AS work_item_id, "
@@ -600,6 +657,7 @@ def _notices(request_id: uuid.UUID) -> list[dict[str, Any]]:
 
 def _label(client: Any, github: GitHubAPI, number: int) -> None:
     github.issue_number = number
+    github.advance_label_event(number)
     response = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "factory_admitted"

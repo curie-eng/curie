@@ -91,6 +91,338 @@
       "title": "Author",
       "type": "object"
     },
+    "ConnectorBuild": {
+      "additionalProperties": false,
+      "description": "Where a connector's image comes FROM, when the bundle carries its source.\n\nADR 0113: an operator should not have to build an image, put it somewhere\npullable, and paste a reference back into the bundle by hand. The bundle\ndeclares the build input -- which is what a reviewer can actually read in a\nsource change -- and `curie build` records what it resolved to in\n``connectors.lock.yaml``. The digest never appears here.",
+      "properties": {
+        "context": {
+          "title": "Context",
+          "type": "string"
+        },
+        "dockerfile": {
+          "default": "Dockerfile",
+          "title": "Dockerfile",
+          "type": "string"
+        },
+        "platforms": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Platforms",
+          "type": "array"
+        }
+      },
+      "required": [
+        "context",
+        "platforms"
+      ],
+      "title": "ConnectorBuild",
+      "type": "object"
+    },
+    "ConnectorLockEntry": {
+      "additionalProperties": false,
+      "description": "The resolved identity of one built connector.\n\nStrict for the same reason ``ConnectorSpec`` is: this is Curie's own file\nwith no external producer, so an unrecognised key is a mistake, and a\nplausible one -- an operator who writes `digest:` beside `image:` believes\nthey pinned something they did not.",
+      "properties": {
+        "delivery": {
+          "enum": [
+            "registry",
+            "local-daemon"
+          ],
+          "title": "Delivery",
+          "type": "string"
+        },
+        "image": {
+          "title": "Image",
+          "type": "string"
+        },
+        "platforms": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Platforms",
+          "type": "array"
+        },
+        "source_digest": {
+          "title": "Source Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "image",
+        "delivery",
+        "platforms",
+        "source_digest"
+      ],
+      "title": "ConnectorLockEntry",
+      "type": "object"
+    },
+    "ConnectorLockFile": {
+      "additionalProperties": false,
+      "description": "The parsed ``connectors.lock.yaml``.",
+      "properties": {
+        "connectors": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ConnectorLockEntry"
+          },
+          "title": "Connectors",
+          "type": "object"
+        },
+        "runner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunnerLockEntry"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "version": {
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "version"
+      ],
+      "title": "ConnectorLockFile",
+      "type": "object"
+    },
+    "ConnectorSpec": {
+      "additionalProperties": false,
+      "description": "One declared connector. Exactly one of ``image``, ``build`` or ``url``.\n\nStrict, unlike the rest of this package. The leniency mandate exists because\nreal Claude Code plugin bundles carry keys this MVP does not model, and\nrejecting them would reject valid bundles. ``connectors.yaml`` is not a\nClaude Code artifact -- it is Curie's own file with no external producer, so\nan unrecognised key is a typo, and silently ignoring it would mean a\nconnector that renders subtly wrong with no diagnostic.",
+      "properties": {
+        "admits": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Admits"
+        },
+        "args": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Args",
+          "type": "array"
+        },
+        "bearer_secret": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bearer Secret"
+        },
+        "build": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConnectorBuild"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Env",
+          "type": "object"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Headers",
+          "type": "object"
+        },
+        "image": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Image"
+        },
+        "port": {
+          "default": 8000,
+          "title": "Port",
+          "type": "integer"
+        },
+        "sealed_secrets": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Sealed Secrets",
+          "type": "object"
+        },
+        "secret_files": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Secret Files",
+          "type": "object"
+        },
+        "secrets": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/SecretRef"
+              }
+            ]
+          },
+          "title": "Secrets",
+          "type": "array"
+        },
+        "unhosted_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unhosted Url"
+        },
+        "url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Url"
+        }
+      },
+      "title": "ConnectorSpec",
+      "type": "object"
+    },
+    "ConnectorsFile": {
+      "additionalProperties": false,
+      "description": "The parsed ``connectors.yaml``.",
+      "properties": {
+        "connectors": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ConnectorSpec"
+          },
+          "title": "Connectors",
+          "type": "object"
+        },
+        "runner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunnerSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "ConnectorsFile",
+      "type": "object"
+    },
+    "DeployTarget": {
+      "additionalProperties": false,
+      "description": "One named destination for this bundle.",
+      "properties": {
+        "agent": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Agent"
+        },
+        "connectors": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Connectors"
+        },
+        "env": {
+          "default": "dev",
+          "title": "Env",
+          "type": "string"
+        },
+        "identity": {
+          "default": "default",
+          "title": "Identity",
+          "type": "string"
+        },
+        "slack_channel": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Slack Channel"
+        }
+      },
+      "title": "DeployTarget",
+      "type": "object"
+    },
+    "DeployTargetsFile": {
+      "additionalProperties": false,
+      "description": "The parsed ``deploy.yaml``.",
+      "properties": {
+        "targets": {
+          "additionalProperties": {
+            "$ref": "#/$defs/DeployTarget"
+          },
+          "title": "Targets",
+          "type": "object"
+        }
+      },
+      "title": "DeployTargetsFile",
+      "type": "object"
+    },
     "HookDefinition": {
       "additionalProperties": true,
       "description": "One hook action inside a matcher's ``hooks`` list.\n\nThe Claude Code plugin ``hooks`` shape: a single action of a given ``type``.\nToday only ``type: \"command\"`` exists (run a shell command); ``command`` is\nrequired for it. Kept lenient so a future hook type still validates, but the\ndeploy-time validator (``validate.py``) enforces that a ``command`` hook\nactually carries a command so a malformed guardrail is caught before ship.",
@@ -501,6 +833,94 @@
         "name"
       ],
       "title": "PluginManifest",
+      "type": "object"
+    },
+    "RunnerLockEntry": {
+      "additionalProperties": false,
+      "description": "The resolved identity of the bundle's runner layer (ADR 0173).\n\n``image`` is the built layer and ``base`` the platform runner it was built\non; both must be digests of ``delivery``'s shape, checked in\n``resolve_runner_image``.",
+      "properties": {
+        "base": {
+          "title": "Base",
+          "type": "string"
+        },
+        "delivery": {
+          "enum": [
+            "registry",
+            "local-daemon"
+          ],
+          "title": "Delivery",
+          "type": "string"
+        },
+        "image": {
+          "title": "Image",
+          "type": "string"
+        },
+        "platforms": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Platforms",
+          "type": "array"
+        },
+        "source_digest": {
+          "title": "Source Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "image",
+        "base",
+        "delivery",
+        "platforms",
+        "source_digest"
+      ],
+      "title": "RunnerLockEntry",
+      "type": "object"
+    },
+    "RunnerSpec": {
+      "additionalProperties": false,
+      "description": "The bundle's own runner layer, built on the platform runner (ADR 0173).\n\nSource only: the bundle declares where the layer is built from and\n``curie build`` records what it built to in ``connectors.lock.yaml``, so no\n``image:`` key exists here to be silently preferred over the lock.",
+      "properties": {
+        "build": {
+          "$ref": "#/$defs/ConnectorBuild"
+        }
+      },
+      "required": [
+        "build"
+      ],
+      "title": "RunnerSpec",
+      "type": "object"
+    },
+    "SecretRef": {
+      "additionalProperties": false,
+      "description": "A credential that already exists in the cluster (#1163).\n\nCurie renders a ``secretKeyRef`` at it and never reads the value, so the\ndeploy identity does not need access to the credential at all. Rotation\nstops requiring a deploy: update the Secret, restart the connector.",
+      "properties": {
+        "from_secret": {
+          "title": "From Secret",
+          "type": "string"
+        },
+        "key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Key"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "from_secret"
+      ],
+      "title": "SecretRef",
       "type": "object"
     },
     "SkillFrontmatter": {

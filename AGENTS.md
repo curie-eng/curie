@@ -1,5 +1,14 @@
 # AGENTS.md - Curie
 
+**Public information boundary — applies before every publication.** Never put
+real customer or downstream deployment information into this public upstream
+repository or its public records. This includes files, commit messages, branch
+and tag names, PRs, issues, comments, releases, and CI logs or artifacts. Use
+anonymous roles and obvious placeholders, including when explaining a fix,
+citing a live test, or recording provenance. Review the exact outgoing content
+before committing, pushing, or posting; a green secret scan is not clearance.
+See "This repo is PUBLIC" below for the full rule.
+
 Agent instructions for this repo. Start with [`README.md`](README.md) for what
 the product is and how to run it, and [`ARCHITECTURE.md`](ARCHITECTURE.md) for
 the component diagram, the message-flow sequence (Slack mention -> dispatcher ->
@@ -43,6 +52,15 @@ before editing there, in addition to this file.
 
 The Python packages are one **uv workspace** (root `pyproject.toml`); ruff,
 mypy, and pytest are configured at the root and run across all members.
+
+## Parallel work
+
+At intake, identify independent tasks and their real dependencies. Start
+disjoint implementation, review, and verification concurrently in separate
+worktrees with isolated test resources; do not wait for one PR's CI or merge
+before starting work that is otherwise ready. Keep shared-file ownership and
+merge or deployment dependencies sequential. After a prerequisite merges,
+retarget its dependent PR promptly and rerun the required gates before merging.
 
 ## Verify commands (per package)
 
@@ -294,7 +312,8 @@ cargo test
 ```
 The Rust CI job sets `CI_REQUIRE_VALKEY_TESTS` and starts Valkey, so Valkey-backed
 tests execute in CI. Contributors need a reachable Valkey, such as the compose
-Valkey, for equivalent local coverage.
+Valkey, for equivalent local coverage. The Python pytest shards likewise set
+`CI_REQUIRE_POSTGRES_TESTS`, so `pg_connect_or_skip` fails rather than skips there.
 If `cargo fmt`/`clippy` report a missing component: `rustup component add rustfmt clippy`.
 
 **UI:** `cd apps/ui && pnpm install && pnpm lint && pnpm typecheck && pnpm test && pnpm e2e`.
@@ -433,8 +452,11 @@ instance id, an internal hostname. Those are not secrets in the rotate-it
 sense, which is exactly what makes them worse: **you cannot rotate away a
 disclosure of where your infrastructure lives.**
 
-So: docs, ADRs, tests, and fixtures use PLACEHOLDER values. Describe the shape
-of a real thing, never its value.
+So: every public example and explanation uses PLACEHOLDER values. Describe
+technical behavior and requirements without identifying the customer or
+private deployment that supplied them. This includes customer and organization
+names, engagements, private requirements or operational details, agent and
+deployment names, repository references, and infrastructure identifiers.
 
 | instead of | write |
 |---|---|
@@ -444,29 +466,46 @@ of a real thing, never its value.
 | an internal hostname | `grafana.example.com` |
 | a real agent/deployment name | `acme-bot`, `acme-dev` |
 | a downstream repo or its issues | "the first adopting agent repo" |
+| a customer or engagement name | "a customer", "a prospective engagement" |
+| a named customer's live test | "a live deployment test" |
 
-The last two rows are easy to overlook because a name is not a secret. It is
-still an identifier: a real bot name in a public docstring says what this
-company runs and what it is called, and a real repo slug says where. Use
+Customer, agent and repository names are easy to overlook because a name is
+not a secret. It still identifies who uses the platform and where. Use
 `acme-*` for names and `acme-corp/acme-bot` when a fixture needs a repo slug.
 
-**Name no downstream repository in committed files.** This repo is the
-platform; the repos that *use* it are somebody's private deployment, including
-our own. So no owner-qualified repo slug, no owner-qualified issue link, no
-branch or workflow path that only exists over there -- not in prose, not in a
-citation, not in a test fixture. A bare `#123` is this repo's own tracker and is
-fine.
+**Scope: every public upstream surface, with no metadata exception.** The
+rule applies to tracked files (including docs, ADRs, tests, and fixtures),
+commit subjects and bodies, branch and tag names, PR and issue titles and
+bodies, review comments, discussions, release notes, and CI logs and artifacts.
+It applies to manually written and agent-generated content equally. Do not
+copy private input, test transcripts, screenshots, or tool output into any of
+these surfaces without anonymizing it first.
 
-**Scope: tracked file content, and nothing else.** Cross-repo references are
-how you *operate* a downstream deployment -- an issue that says which repo it
-came from, a PR that links the two, a commit message that names the branch it
-fixes. That is normal practice and this rule does not touch it. gitleaks only
-reads file content in diffs; it does not scan commit messages, issue bodies, or
-PR descriptions, so nothing here gates that workflow. (Those surfaces are
-world-readable too on a public repo, so the same judgment applies -- but it is
-judgment, not a gate, and cross-repo linking is often worth it.) What this rule
-protects is the checked-in corpus: the docs, ADRs, and fixtures a stranger
-clones and reads years from now.
+**Name no real customer or downstream deployment on these surfaces.** This
+repo is the platform; its adopters include private deployments, including our
+own. No customer names, owner-qualified downstream repo slugs or issue links,
+or private branch, workflow, channel, host, or deployment identifiers. A bare
+`#123` referring to this repo's tracker is fine. Describing a fix, citing live
+verification, establishing provenance, and cross-repo coordination are not
+exceptions. Keep private coordination in a private destination; publish only
+an anonymized technical account here. Redacting names alone is insufficient
+if the remaining combination of details identifies the customer or deployment.
+
+**Required publication check:** before committing, pushing, opening or editing
+a PR or issue, posting a comment, or publishing a release:
+
+1. Review the exact outgoing text and attachments, including commit subjects
+   and bodies and any branch or tag names being pushed. For a branch push,
+   inspect every outgoing commit, not only the tip.
+2. Remove customer and downstream identifiers and private operational details.
+   Preserve the technical finding using roles and obvious placeholders. Do not
+   reproduce a leaked identifier to explain its removal.
+3. Check titles, bodies, links, quoted evidence, screenshots, logs and artifacts
+   as well as the file diff. Suppress or sanitize private tool output before
+   allowing it into public CI logs or uploaded artifacts.
+4. Run the applicable repository checks and review uncovered information
+   manually. If uncertain whether a detail is public and safe, omit it or
+   anonymize it; do not publish it pending clarification.
 
 When an ADR or a comment needs to cite that history as evidence, describe the
 role and keep the finding: "the first adopting agent repo ran a hand-written
@@ -477,11 +516,21 @@ itself (`curie-eng/curie`, and `curie-eng/agentos`, its former name).
 `example.com` is reserved for documentation (RFC 2606) and `*.svc.cluster.local`
 names no real host, so both are fine.
 
-This is enforced by `.gitleaks.toml`, which extends the default rules with
-identifier patterns and allowlists the placeholders above. If a check fires on
-something genuinely fake that the allowlist misses, add it to the allowlist with
-a reason -- do not annotate the line with `gitleaks:allow` to silence it, since
-that hides the next real one.
+`.gitleaks.toml` extends the default secret rules with patterns for Slack ids,
+AWS account ids, EC2 instance ids, internal hostnames, downstream repo slugs in
+this organization, and owner-qualified issue references. These patterns cover
+the shapes and allowlists defined in that file, not every possible identifier.
+
+**Scanner coverage is narrower than this rule.** The current gitleaks workflow
+scans file changes; it does not scan commit messages, PRs, issues, or other
+public metadata. Customer, engagement, agent and deployment names also have no
+scanner rule. Review all of these explicitly before publication and use the
+placeholders above. A green scan never waives this rule or proves that all
+private information is absent.
+
+If a check fires on something genuinely fake that the allowlist misses, add it
+to the allowlist with a reason -- do not annotate the line with `gitleaks:allow`
+to silence it, since that hides the next real one.
 
 **Redacting an identifier is a permitted edit to an Accepted ADR.**
 [ADR 0045](docs/adr/0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)
@@ -495,19 +544,19 @@ meaning, change nothing else.
 **Why the rule exists:** an ADR and its tests were once written using a live
 workspace's Slack channel ids as the worked example, purely because those were
 the values in front of the author. It read as perfectly normal documentation.
-The agent-name and repo-slug rows have a sharper history, and it is the reason
-they now have a gate instead of only a paragraph. The morning of 2026-07-31 a
-commit swept real agent names out of nine files and added the `acme-*` row
+The agent-name and repo-slug rows have a sharper history, which led to a repo
+slug gate and an explicit review requirement for agent names. The morning of
+2026-07-31 a commit swept real agent names out of nine files and added the `acme-*` row
 above. **Five hours later** an ADR drafted that same afternoon cited the
 downstream repo by slug and issue number, and three hours after that a test
 fixture hard-coded the slug again. The rule was not stale or unknown -- it had
 just been applied, by the same hands, that day.
 
-Two things let that happen, and both are fixed above. The agent-name row was
-the only row in the table with no gitleaks rule behind it: Slack ids, AWS
-accounts, EC2 ids and hostnames were all gated, names were prose. And a repo
-slug was not in the table at all, so a pass that scrubbed *names* had no reason
-to look at `owner/repo`.
+Two gaps let that happen. Agent names had no gitleaks rule behind them, and
+still require review: Slack ids, AWS accounts, EC2 ids and hostnames were gated,
+but names were prose. Repo slugs were absent from the table, so a pass that
+scrubbed *names* had no reason to look at `owner/repo`. The table and repo-slug
+gate now address that second gap; they do not add a scanner rule for agent names.
 
 The deeper trap is that a slug in an ADR does not feel like a leaked value. It
 feels like **sourcing** -- "this decision is justified because that repo had to
@@ -532,8 +581,11 @@ change is safe.
 
 If your task needs a change to either package: **stop, do not work around it, and
 open a GitHub issue or raise it in your PR** -- a contract change must land as
-its own reviewed, backward-compatible change first, before dependent lanes
-proceed. This also applies whenever an adopted component (Langfuse, Agent
+its own reviewed, backward-compatible PR before dependent lanes merge or
+deploy. Once that contract PR is open with a pinned head, dependent lanes may
+develop and verify in parallel in separate worktrees and draft stacked PRs;
+they must retarget to the release branch and rerun required gates after the
+contract lands. This also applies whenever an adopted component (Langfuse, Agent
 Sandbox, Bolt) cannot do what a spec claims: stop and raise it with the evidence
 rather than silently diverging.
 

@@ -13,7 +13,7 @@ import asyncio
 import functools
 import sys
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +22,7 @@ import pytest
 from aci_protocol import (
     ErrorEvent,
     Final,
+    OutboundEvent,
     QueuedTurn,
     ReplyHandle,
     SessionStatus,
@@ -38,7 +39,7 @@ from curie_worker.approvals import (
 )
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.kernel import ThreadBusyError
-from curie_worker.runner_client import RunnerWorkspaceSnapshot
+from curie_worker.runner_client import RunnerWorkspaceSnapshot, TurnStream
 from curie_worker.workspace import WorkspaceSelectionRefused
 
 # importlib import mode does not add the test root to sys.path.
@@ -134,6 +135,7 @@ class ReviewBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         assert (kind, address) == ("slack", CHANNEL)
         return {
@@ -590,6 +592,7 @@ def test_verified_review_records_history_capacity_in_terminal_marker(
 
 def test_review_cancellation_releases_started_response_without_publication(
     make_harness,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def exercise() -> None:
         turn = _review_turn()
@@ -603,12 +606,23 @@ def test_review_cancellation_releases_started_response_without_publication(
             hold = asyncio.Event()
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="working")]
+            response_reading = asyncio.Event()
+            real_iterate = TurnStream.__aiter__
+
+            def iterate_turn(stream: TurnStream) -> AsyncIterator[OutboundEvent]:
+                response_reading.set()
+                return real_iterate(stream)
+
+            monkeypatch.setattr(TurnStream, "__aiter__", iterate_turn)
             task = asyncio.create_task(h.kernel.process_event(turn))
             try:
-                await _wait_until(lambda: h.runner.turn_active)
+                # Begin cancellation only after lock cleanup has handed the
+                # real response to the stream consumer's cleanup context.
+                await asyncio.wait_for(response_reading.wait(), timeout=5)
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    async with asyncio.timeout(10):
+                        await task
                 await _wait_until(lambda: not h.runner.turn_active)
                 assert len(api.reserve_calls) == 1
                 assert api.creates == []

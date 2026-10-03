@@ -22,9 +22,12 @@ frozen validator gets a chance to mis-attribute it.
 """
 
 import json
+import logging
 import os
-from collections.abc import Mapping
+import re
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any, cast
 
 from aci_protocol import BootEnv
 from claude_agent_sdk import SdkPluginConfig
@@ -34,6 +37,53 @@ from plugin_format import (
     resolve_manifest,
     validate_bundle,
 )
+
+# The SDK's skill-name check is private, and the SDK is pinned only ``>=``, so a
+# later release may move or rename it. When it is gone, use the local copy below.
+_sdk_validate_skill_name: Callable[[str], None] | None
+try:
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        _validate_skill_name as _sdk_validate_skill_name,
+    )
+except ImportError:
+    _sdk_validate_skill_name = None
+
+logger = logging.getLogger(__name__)
+
+# A copy of ``_validate_skill_name`` in claude_agent_sdk 0.2.159
+# (``claude_agent_sdk/_internal/transport/subprocess_cli.py``). It rejects the names
+# the SDK rejects; a test pins the two together while the SDK still ships its own.
+_SKILL_NAME_INVALID_CHARS = re.compile(r"[(),\x00-\x1f\x7f-\x9f\ufeff]")
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def _local_validate_skill_name(name: str) -> None:
+    """Raise ``ValueError`` if ``name`` cannot ride in a ``Skill(name)`` rule."""
+
+    if not name.strip():
+        raise ValueError("Skill names must be non-empty strings")
+    if _SURROGATE_RE.search(name):
+        raise ValueError(f"Invalid skill name {name!r}: contains a surrogate code point")
+    if name != name.strip():
+        raise ValueError(f"Invalid skill name {name!r}: leading or trailing whitespace")
+    if _SKILL_NAME_INVALID_CHARS.search(name):
+        raise ValueError(
+            f"Invalid skill name {name!r}: parentheses, commas, control characters,"
+            " and byte-order marks are not allowed"
+        )
+    if name == "*":
+        raise ValueError("Invalid skill name '*': wildcards are not allowed")
+    if name.endswith((":*", " *")):
+        raise ValueError(f"Invalid skill name {name!r}: wildcard-suffix names are not allowed")
+    if name.startswith("/"):
+        raise ValueError(f"Invalid skill name {name!r}: skill names may not start with '/'")
+    if "\\\\" in name:
+        raise ValueError(f"Invalid skill name {name!r}: consecutive backslashes are not allowed")
+    if name.endswith("\\"):
+        raise ValueError(f"Invalid skill name {name!r}: names may not end with a backslash")
+
+
+_validate_skill_name: Callable[[str], None] = _sdk_validate_skill_name or _local_validate_skill_name
 
 BUNDLE_CONFIG_NAME = "curie.bundle.json"
 
@@ -204,3 +254,125 @@ def load_plugins(
         raise PluginBundleError(f"invalid plugin bundle at {root}: {detail}")
 
     return [SdkPluginConfig(type="local", path=str(root))]
+
+
+# The CLI's own name for a plugin-loaded MCP server, ``plugin:<bundle>:<server>``.
+# The SDK normalizes it to the live prefix ``mcp__plugin_<bundle>_<server>__``,
+# which is ``plugin_format.approval_policy.effective_tool_prefix`` -- so a server
+# mounted under this key publishes exactly the tool names toolPolicy, the approval
+# gates and the capability probe already expect (verified on CLI 2.1.281).
+_PLUGIN_ROOT_PLACEHOLDER = "${CLAUDE_PLUGIN_ROOT}"
+
+
+def bundle_mcp_servers(plugin_dir: str | None) -> dict[str, Any]:
+    """The bundle's own declared MCP servers, keyed as the CLI keys plugin servers.
+
+    The runner sets ``strict_mcp_config`` (#2899) so ambient project ``.mcp.json``,
+    user and plugin-marketplace servers never load beside the ones Curie mounts.
+    The CLI applies that to ``--plugin-dir`` servers too: under strict mode a
+    bundle's plugin servers silently stop registering. So the runner mounts them
+    itself on ``--mcp-config``, under the same ``plugin:<bundle>:<server>`` name
+    the plugin loader would have used, reading the same two declaration surfaces
+    (the manifest's inline ``mcpServers`` and the root ``.mcp.json``) that
+    ``plugin_format.approval_policy.declared_mcp_server_names`` reads.
+
+    ``${CLAUDE_PLUGIN_ROOT}`` is the one variable the plugin loader supplies that
+    the ``--mcp-config`` path does not, so it is substituted here and exported to
+    a stdio server's env. Every other ``${VAR}`` is left for the CLI, which
+    expands ``--mcp-config`` entries from the session env exactly as it expands a
+    plugin's. Call only after ``load_plugins`` has validated the bundle; a
+    malformed declaration was already refused there.
+    """
+
+    if not plugin_dir:
+        return {}
+    root = Path(plugin_dir)
+    manifest_path = resolve_manifest(root)
+    if manifest_path is None:
+        return {}
+    manifest = PluginManifest.model_validate(json.loads(manifest_path.read_text(encoding="utf-8")))
+    declarations: list[object] = []
+    if isinstance(manifest.mcpServers, dict):
+        declarations.append(manifest.mcpServers)
+    root_mcp = root / ".mcp.json"
+    if root_mcp.is_file():
+        declarations.append(json.loads(root_mcp.read_text(encoding="utf-8")))
+
+    plugin_root = str(root)
+    servers: dict[str, Any] = {}
+    for payload in declarations:
+        if not isinstance(payload, dict):
+            continue
+        declared = payload.get("mcpServers", payload)
+        if not isinstance(declared, dict):
+            continue
+        for name, config in declared.items():
+            if not isinstance(config, dict):
+                continue
+            entry = cast("dict[str, object]", _substitute_plugin_root(config, plugin_root))
+            if isinstance(entry.get("command"), str):
+                raw_env = entry.get("env")
+                env = dict(raw_env) if isinstance(raw_env, dict) else {}
+                env.setdefault("CLAUDE_PLUGIN_ROOT", plugin_root)
+                entry["env"] = env
+            servers[f"plugin:{manifest.name}:{name}"] = entry
+    return servers
+
+
+def bundle_skill_names(plugin_dir: str | None) -> list[str]:
+    """The bundle's own skills, named as the CLI names plugin skills (#3766).
+
+    The runner passes this list as the SDK ``skills`` option so the model's
+    skill listing holds only the bundle's skills, not the Claude Code CLI's
+    built-in ones (ADR-0189). The CLI names a plugin skill
+    ``<manifest name>:<dir>`` after its directory, not its frontmatter
+    ``name``, and loads only ``skills/<dir>/SKILL.md`` one level down, so the
+    list follows the same rule (verified on CLI 2.1.281). Sorted, so the list
+    is deterministic. No bundle, or a bundle without skills, gives ``[]``. Call
+    only after ``load_plugins`` has validated the bundle.
+
+    The bundle validator only warns about odd folder names, but the SDK raises
+    ``ValueError`` while building the CLI command for a name it cannot carry in
+    a ``Skill(<name>)`` rule (a comma, a parenthesis, edge whitespace and so
+    on). One such folder would stop the whole session at connect, so each name
+    goes through the SDK's own check, and a rejected folder is skipped with a
+    warning that names it. Calling the SDK's check keeps the accepted set
+    exactly what the installed SDK accepts.
+    """
+
+    if not plugin_dir:
+        return []
+    root = Path(plugin_dir)
+    manifest_path = resolve_manifest(root)
+    if manifest_path is None:
+        return []
+    manifest = PluginManifest.model_validate(json.loads(manifest_path.read_text(encoding="utf-8")))
+    skills_dir = root / "skills"
+    if not skills_dir.is_dir():
+        return []
+    names: list[str] = []
+    for entry in sorted(skills_dir.iterdir(), key=lambda path: path.name):
+        if not (entry.is_dir() and (entry / "SKILL.md").is_file()):
+            continue
+        name = f"{manifest.name}:{entry.name}"
+        try:
+            _validate_skill_name(name)
+        except ValueError as exc:
+            logger.warning(
+                "skipping bundle skill folder %r: the agent SDK cannot pass its name (%s)",
+                entry.name,
+                exc,
+            )
+            continue
+        names.append(name)
+    return names
+
+
+def _substitute_plugin_root(value: object, plugin_root: str) -> object:
+    if isinstance(value, str):
+        return value.replace(_PLUGIN_ROOT_PLACEHOLDER, plugin_root)
+    if isinstance(value, list):
+        return [_substitute_plugin_root(item, plugin_root) for item in value]
+    if isinstance(value, dict):
+        return {key: _substitute_plugin_root(item, plugin_root) for key, item in value.items()}
+    return value

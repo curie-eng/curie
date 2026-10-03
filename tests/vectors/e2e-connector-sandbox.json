@@ -1,0 +1,20 @@
+{
+  "connector_name": "e2e",
+  "sentinel_image": "curie-e2e-connector",
+  "kubeconfig_secret": "E2E_CLUSTER_KUBECONFIG",
+  "kubeconfig_mount": "/secrets/kubeconfig",
+  "withheld_from_sandbox": ["E2E_CLUSTER_KUBECONFIG"],
+  "run_header": "X-Curie-Run",
+  "work_item_header": "X-Curie-Work-Item",
+  "owner_label": "curietech.ai/e2e-owner",
+  "run_label": "curietech.ai/e2e-run",
+  "work_item_label": "curietech.ai/e2e-work-item",
+  "expires_annotation": "curietech.ai/e2e-expires-at",
+  "pod_security_label": "pod-security.kubernetes.io/enforce",
+  "pod_security_level": "baseline",
+  "refusal_not_configured": "e2e_connector_not_configured",
+  "refusal_misconfigured": "e2e_connector_misconfigured",
+  "refusal_not_owned": "e2e_namespace_not_owned",
+  "refusal_no_run": "e2e_run_identity_required",
+  "server_module": "curie_e2e_connector"
+}

@@ -402,6 +402,7 @@ async def readmit(
         + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
         objective=facts.objective,
         requester=facts.requester,
+        base=getattr(facts, "base", None),
     )
     if isinstance(readmitted, WorkItemConflict):
         return readmitted
@@ -426,6 +427,8 @@ async def _admit_new(
         agent_id=facts.agent_id,
         repo_full_name=facts.repo_full_name,
         conversation_id=_facts_conversation(facts, adapter),
+        # Factory admission resolves a base (ADR 0186); other callers do not.
+        base=getattr(facts, "base", None),
     )
     if isinstance(created, WorkItemConflict):
         return created
@@ -959,9 +962,14 @@ async def hold_for_approval(
 
 
 def _not_approval_hold() -> ColumnElement[bool]:
-    # hold_for_approval parks the lease at exactly the execution deadline.
-    return ExecutionRequest.runtime_heartbeat_expires_at.is_distinct_from(
-        ExecutionRequest.execution_deadline
+    # hold_for_approval parks the lease at exactly the execution deadline. A
+    # hold protects the request only while that deadline is still in the
+    # future; once it passes, the run is reclaimable as an orphan (#3564).
+    return or_(
+        ExecutionRequest.runtime_heartbeat_expires_at.is_distinct_from(
+            ExecutionRequest.execution_deadline
+        ),
+        ExecutionRequest.execution_deadline <= func.clock_timestamp(),
     )
 
 
@@ -977,7 +985,7 @@ def _not_awaiting_publication() -> ColumnElement[bool]:
 async def list_runtime_owners(
     session: AsyncSession, *, limit: int, after: uuid.UUID | None = None
 ) -> list[RuntimeOwnerRow]:
-    """Running requests with a live runtime owner, approval holds excluded.
+    """Running requests with a live runtime owner, unexpired approval holds excluded.
 
     Ordered by id so a caller pages with `after` set to the last id it saw.
     """
@@ -1036,9 +1044,11 @@ async def declare_owner_lost(
             request_id=request.id,
             status=request.status,
         )
+    now = await _database_now(session)
     held = (
         request.runtime_heartbeat_expires_at is not None
         and request.runtime_heartbeat_expires_at == request.execution_deadline
+        and now < request.execution_deadline
     )
     awaiting_publication = await session.scalar(
         select(Publication.id)
