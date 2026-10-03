@@ -343,6 +343,23 @@ def _event_termination(
     return None
 
 
+def _extension_body(kind: str, metadata: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
+    """A full extensions-group object body of ``kind``."""
+
+    return {
+        "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
+        "kind": kind,
+        "metadata": metadata,
+        "spec": spec,
+    }
+
+
+def _owner_ref(api_version: str, kind: str, name: str, uid: str) -> dict[str, str]:
+    """An ownerReference with no ``controller`` or ``blockOwnerDeletion``."""
+
+    return {"apiVersion": api_version, "kind": kind, "name": name, "uid": uid}
+
+
 class KubernetesSandboxClient:
     """SandboxClient against a real cluster (kubeconfig or in-cluster auth)."""
 
@@ -414,12 +431,7 @@ class KubernetesSandboxClient:
         return owned_pool
 
     def _put_extension(self, plural: str, name: str, kind: str, spec: dict[str, Any]) -> None:
-        body = {
-            "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
-            "kind": kind,
-            "metadata": {"name": name},
-            "spec": spec,
-        }
+        body = _extension_body(kind, {"name": name}, spec)
         try:
             self._api.get_namespaced_custom_object(
                 EXT_GROUP, EXT_VERSION, self._namespace, plural, name
@@ -454,21 +466,11 @@ class KubernetesSandboxClient:
 
         names = claim_object_names(claim)
         source_name = self._pool_template_name(pool)
-        try:
-            source = self._api.get_namespaced_custom_object(
-                EXT_GROUP,
-                EXT_VERSION,
-                self._namespace,
-                "sandboxtemplates",
-                source_name,
-                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
-            )
-        except k8s_client.ApiException as exc:
-            if exc.status == 404:
-                raise ValueError(f"source template {source_name} is missing") from exc
-            raise
+        source_spec = self._source_template_spec(
+            source_name, request_timeout_seconds=_CLAIM_PREPARATION_TIMEOUT_S
+        )
         spec = claim_template_spec(
-            source.get("spec") or {},
+            source_spec,
             secret_name=names.secret,
             token_names=sorted(tokens),
             runner_resources=runner_resources,
@@ -479,23 +481,18 @@ class KubernetesSandboxClient:
             EXT_VERSION,
             self._namespace,
             "sandboxtemplates",
-            {
-                "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
-                "kind": "SandboxTemplate",
-                "metadata": {"name": names.template, "labels": labels},
-                "spec": spec,
-            },
+            _extension_body("SandboxTemplate", {"name": names.template, "labels": labels}, spec),
             _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
         )
         try:
             # No controller or blockOwnerDeletion: either would need
             # ``finalizers`` RBAC the worker is not granted.
-            owner = {
-                "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
-                "kind": "SandboxTemplate",
-                "name": names.template,
-                "uid": created["metadata"]["uid"],
-            }
+            owner = _owner_ref(
+                f"{EXT_GROUP}/{EXT_VERSION}",
+                "SandboxTemplate",
+                names.template,
+                created["metadata"]["uid"],
+            )
             metadata = {"name": names.secret, "labels": labels, "ownerReferences": [owner]}
             # Token values are never logged; ``stringData`` is the only place
             # they are written.
@@ -515,12 +512,11 @@ class KubernetesSandboxClient:
                 EXT_VERSION,
                 self._namespace,
                 "sandboxwarmpools",
-                {
-                    "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
-                    "kind": "SandboxWarmPool",
-                    "metadata": {**metadata, "name": names.pool},
-                    "spec": {"replicas": 0, "sandboxTemplateRef": {"name": names.template}},
-                },
+                _extension_body(
+                    "SandboxWarmPool",
+                    {**metadata, "name": names.pool},
+                    {"replicas": 0, "sandboxTemplateRef": {"name": names.template}},
+                ),
                 _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
             )
         except Exception:
@@ -531,24 +527,35 @@ class KubernetesSandboxClient:
     def _pool_template_name(self, pool: str) -> str:
         """The template ``pool``'s ``sandboxTemplateRef`` names; a missing pool refuses."""
 
-        try:
-            obj = self._api.get_namespaced_custom_object(
-                EXT_GROUP,
-                EXT_VERSION,
-                self._namespace,
-                "sandboxwarmpools",
-                pool,
-                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
-            )
-        except k8s_client.ApiException as exc:
-            if exc.status == 404:
-                raise ValueError(f"source pool {pool} is missing") from exc
-            raise
+        obj = self._get(
+            EXT_GROUP,
+            EXT_VERSION,
+            "sandboxwarmpools",
+            pool,
+            request_timeout_seconds=_CLAIM_PREPARATION_TIMEOUT_S,
+        )
+        if obj is None:
+            raise ValueError(f"source pool {pool} is missing")
         ref = (obj.get("spec") or {}).get("sandboxTemplateRef") or {}
         name = ref.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError(f"source pool {pool} names no sandboxTemplateRef")
         return name
+
+    def _source_template_spec(self, name: str, *, request_timeout_seconds: float) -> dict[str, Any]:
+        """The spec of source template ``name``; a missing template refuses."""
+
+        obj = self._get(
+            EXT_GROUP,
+            EXT_VERSION,
+            "sandboxtemplates",
+            name,
+            request_timeout_seconds=request_timeout_seconds,
+        )
+        if obj is None:
+            raise ValueError(f"source template {name} is missing")
+        spec: dict[str, Any] = obj.get("spec") or {}
+        return spec
 
     def _rollback_delete(self, plural: str, name: str) -> None:
         """Delete one object a failed claim created; never mask the original error.
@@ -684,6 +691,7 @@ class KubernetesSandboxClient:
                 EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims", body
             )
             return
+        claim_created = False
         try:
             created = self._api.create_namespaced_custom_object(
                 EXT_GROUP,
@@ -693,35 +701,26 @@ class KubernetesSandboxClient:
                 body,
                 _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
             )
-        except Exception:
-            self._rollback_delete("sandboxtemplates", claim_template)
-            raise
-        # Hand the template (and through it the Secret and pool) to the claim,
-        # so garbage collection removes all three when the claim goes by any
-        # path. Until this lands only the reaper's template sweep covers them.
-        try:
+            claim_created = True
+            # Hand the template (and through it the Secret and pool) to the
+            # claim, so garbage collection removes all three when the claim
+            # goes by any path. Until this lands only the reaper's template
+            # sweep covers them.
+            owner = _owner_ref(
+                f"{EXT_GROUP}/{EXT_VERSION}", "SandboxClaim", name, created["metadata"]["uid"]
+            )
             self._api.patch_namespaced_custom_object(
                 EXT_GROUP,
                 EXT_VERSION,
                 self._namespace,
                 "sandboxtemplates",
                 claim_template,
-                {
-                    "metadata": {
-                        "ownerReferences": [
-                            {
-                                "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
-                                "kind": "SandboxClaim",
-                                "name": name,
-                                "uid": created["metadata"]["uid"],
-                            }
-                        ]
-                    }
-                },
+                {"metadata": {"ownerReferences": [owner]}},
                 _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
             )
         except Exception:
-            self._rollback_delete("sandboxclaims", name)
+            if claim_created:
+                self._rollback_delete("sandboxclaims", name)
             self._rollback_delete("sandboxtemplates", claim_template)
             raise
 

@@ -19,7 +19,12 @@ from typing import Any
 
 from aci_protocol import BootEnv
 
-from .resources import claim_resources_spec, resources_object_name
+from .resources import (
+    RESOURCES_POOL_SUFFIX,
+    RESOURCES_TEMPLATE_SUFFIX,
+    claim_resources_spec,
+    resources_object_name,
+)
 
 # The label every per-claim object carries, valued with the claim name. The
 # chart's cleanup and worker-secrets admission policies key on it, and the
@@ -48,13 +53,11 @@ CLAIM_TOKEN_ENVS: tuple[str, ...] = tuple(
 )
 
 _RUNNER_CONTAINER = "runner"
-_TEMPLATE_SUFFIX = "-resources"
-_POOL_SUFFIX = "-resources-pool"
 _SECRET_SUFFIX = "-tokens"
 # Kubernetes object names and label values are capped at 63 characters; the
 # pool carries the longest suffix.
 _MAX_NAME = 63
-_MAX_CLAIM = _MAX_NAME - len(_POOL_SUFFIX)
+_MAX_CLAIM = _MAX_NAME - len(RESOURCES_POOL_SUFFIX)
 
 
 @dataclass(frozen=True)
@@ -78,8 +81,8 @@ def claim_object_names(claim: str) -> ClaimObjectNames:
             "its per-claim object names would exceed 63"
         )
     return ClaimObjectNames(
-        template=resources_object_name("template", f"{claim}{_TEMPLATE_SUFFIX}"),
-        pool=resources_object_name("warmpool", f"{claim}{_POOL_SUFFIX}"),
+        template=resources_object_name("template", f"{claim}{RESOURCES_TEMPLATE_SUFFIX}"),
+        pool=resources_object_name("warmpool", f"{claim}{RESOURCES_POOL_SUFFIX}"),
         secret=f"{claim}{_SECRET_SUFFIX}",
     )
 

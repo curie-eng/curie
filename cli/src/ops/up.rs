@@ -8510,28 +8510,15 @@ fn namespace_inventory_cmd(namespace: &str, resource: &str) -> OpsCommand {
     )
 }
 
-const POD_SECURITY_ENFORCE_LABEL: &str = "pod-security.kubernetes.io/enforce";
-const POD_SECURITY_WARN_LABEL: &str = "pod-security.kubernetes.io/warn";
-const POD_SECURITY_AUDIT_LABEL: &str = "pod-security.kubernetes.io/audit";
-
 fn namespace_manifest(namespace: &str, release: &str) -> Result<Vec<u8>> {
     let mut labels = ownership_labels(release, namespace);
     // Every chart workload passes `baseline`, so it is enforced. Several
     // (clickhouse, postgres, valkey, some Jobs, the prewarm DaemonSet) still
     // fail `restricted`, so that level is warn and audit only: it surfaces
     // violations without rejecting pods.
-    if let Some(map) = labels.as_object_mut() {
-        for (key, level) in [
-            (POD_SECURITY_ENFORCE_LABEL, "baseline"),
-            (POD_SECURITY_WARN_LABEL, "restricted"),
-            (POD_SECURITY_AUDIT_LABEL, "restricted"),
-        ] {
-            map.insert(
-                key.to_string(),
-                serde_json::Value::String(level.to_string()),
-            );
-        }
-    }
+    labels["pod-security.kubernetes.io/enforce"] = "baseline".into();
+    labels["pod-security.kubernetes.io/warn"] = "restricted".into();
+    labels["pod-security.kubernetes.io/audit"] = "restricted".into();
     serde_json::to_vec(&serde_json::json!({
         "apiVersion": "v1",
         "kind": "Namespace",
