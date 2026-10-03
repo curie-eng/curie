@@ -89,9 +89,9 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0057 | [`cluster deploy` self-plumbs a port-forward so the generated key stays off the cleartext proxy](0057-cluster-deploy-self-plumbs-port-forward-for-generated-key.md) | Accepted |
 | 0058 | [A pushed tag is not release authority: ancestry, checks, and an approval environment gate publication](0058-tag-push-is-not-release-authority.md) | Accepted |
 | 0059 | [The sandbox is a bounded resource envelope; capacity is a tenant boundary](0059-sandbox-is-a-bounded-resource-envelope.md) | Accepted |
-| 0060 | [The harness is a declared package, not a class](0060-the-harness-is-a-declared-package.md) | Accepted |
-| 0061 | [The harness boundary is an out-of-process adapter, wire-compatible with Omnigent](0061-out-of-process-harness-boundary.md) | Draft |
-| 0062 | [Harness conformance has teeth](0062-harness-conformance-has-teeth.md) | Accepted |
+| 0060 | [The harness is a declared package, not a class](0060-the-harness-is-a-declared-package.md) | Superseded by [ADR 0140](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) |
+| 0061 | [The harness boundary is an out-of-process adapter, wire-compatible with Omnigent](0061-out-of-process-harness-boundary.md) | Draft; program stopped under [ADR 0140](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) before its prerequisite spike ran |
+| 0062 | [Harness conformance has teeth](0062-harness-conformance-has-teeth.md) | Superseded by [ADR 0140](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) |
 | 0063 | [Message-driven approval reply surface](0063-message-driven-approval-reply-surface.md) | Accepted |
 | 0064 | [Fail-forward cluster teardown](0064-fail-forward-cluster-teardown.md) | Accepted |
 | 0065 | [Tag protection, not the workflow gate, binds a write actor](0065-tag-protection-not-the-workflow-gate-binds-a-write-actor.md) | Accepted |
@@ -169,7 +169,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0137 | [Coding tools are built in and an initial repository URL selects the workspace](0137-coding-tools-are-built-in-and-an-initial-repository-url-selects-the-workspace.md) | Draft |
 | 0138 | [Provider-side web search is a default-on bundle capability](0138-provider-side-web-search-is-a-default-on-bundle-capability.md) | Proposed |
 | 0139 | [Bundle owners classify every vanilla MCP tool](0139-bundle-owners-classify-every-vanilla-mcp-tool.md) | Draft |
-| 0140 | [Curie supports one model harness until a second one exists](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) | Draft |
+| 0140 | [Curie supports one model harness until a second one exists](0140-curie-supports-one-model-harness-until-a-second-one-exists.md) | Accepted |
 | 0141 | [Admission pins the Jobs a connector token may create](0141-admission-pins-jobs-a-connector-token-may-create.md) | Draft |
 | 0142 | [Database compatibility is a release contract; migrations run in one upgrade phase](0142-database-compatibility-windows-and-a-single-upgrade-phase.md) | Accepted |
 | 0143 | [A coding thread owns one fenced pull request lineage](0143-thread-owned-pull-request-lineage.md) | Accepted |

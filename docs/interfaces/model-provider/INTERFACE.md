@@ -129,10 +129,8 @@ hosts for Anthropic, OpenRouter, Zhipu, Moonshot, and DeepSeek.
   entry.
 - **Two mirrors of the non-forwardable-credential rule.** The runner is the authority
   for the `sk-ant-oat` prefix
-  (`runner/src/curie_runner/sdk_auth.py::OAUTH_TOKEN_PREFIX`), and it is already
-  declared per harness rather than hardcoded
-  (`runner/src/curie_runner/harness/contribution.py::AuthSpec`, field
-  `oauth_token_prefix`). Above the seam the CLI (`cli/src/commands.rs`) and the
+  (`runner/src/curie_runner/sdk_auth.py::OAUTH_TOKEN_PREFIX`). Above the seam
+  the CLI (`cli/src/commands.rs`) and the
   worker's Docker sandbox
   (`apps/worker/src/curie_worker/sandbox/docker.py::_OAUTH_TOKEN_PREFIX`) each
   re-declare the literal so they can decide whether to forward a credential into a
@@ -141,12 +139,20 @@ hosts for Anthropic, OpenRouter, Zhipu, Moonshot, and DeepSeek.
   `apps/worker/tests/sandbox/test_vector_credential_forwarding.py` and by the vector
   loop in the `cli/src/commands.rs` test module, so a lane that changes the rule
   without changing the file fails its own test. That gate makes the duplication safe,
-  not absent: a second harness declaring a different `oauth_token_prefix` would leave
-  both above-seam mirrors hardcoded to Claude's.
+  not absent: those mirrors remain tied to Claude credential policy.
 
 ## Cross-links
 
 - **Epic(s):** #24 — bring your own model (OpenRouter + native Anthropic-format endpoints), the seam's forward work; #46 (closed) — the Ollama local-model demo mode, which also exercises this base-URL-override + credential path.
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — core config seam, not one of the six swappable jobs.
-- **Harness declaration:** the credential shapes a harness accepts are declared, not assumed: `runner/src/curie_runner/harness/contribution.py::AuthSpec` carries `credential_env_keys` and `oauth_token_prefix`, and `build_spawn_env` is the hook the Claude harness wires to `resolve_sdk_env` (`runner/src/curie_runner/harness/claude.py::CLAUDE_CONTRIBUTION`). See [ADR-0060](../../adr/0060-the-harness-is-a-declared-package.md).
+
+**Harness declaration.** `build_spawn_env` is the hook the Claude
+contribution wires to `resolve_sdk_env`
+(`runner/src/curie_runner/harness/claude/__init__.py::CLAUDE_CONTRIBUTION`).
+Credential source names and OAuth policy belong to `sdk_auth.py`, including
+`DEFAULT_CREDENTIAL_ENV_KEYS`
+(`runner/src/curie_runner/sdk_auth.py::DEFAULT_CREDENTIAL_ENV_KEYS`), which
+runner boot uses for credential redaction. There is no `AuthSpec` manifest
+field. See [ADR 0140](../../adr/0140-curie-supports-one-model-harness-until-a-second-one-exists.md).
+
 - **ADR(s):** [ADR-0009](../../adr/0009-per-agent-connector-auth.md) — per-agent secrets and connector credentials (the model credential is the one credential the platform resolves today, via prefix mapping in `sdk_auth.py`); [ADR-0048](../../adr/0048-declared-model-wire-protocol-and-credential-keys.md) — the endpoint's wire protocol and the credential's source env var are declared rather than assumed.

@@ -16,7 +16,11 @@ import mcp.types as mcp_types
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from curie_runner.approval import ISSUE_TOOL_NAME, build_approval_server, is_platform_owned_tool
+from curie_runner.approval import (
+    ISSUE_TOOL_NAME,
+    is_platform_owned_tool,
+)
+from curie_runner.harness.claude.approval import build_approval_server
 from curie_runner.issue_read import (
     CAPABILITY_HEADER,
     ISSUE_READ_TOKEN_ENV,

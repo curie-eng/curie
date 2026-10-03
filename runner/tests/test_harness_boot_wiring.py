@@ -93,10 +93,10 @@ def test_only_an_eligible_boot_mounts_the_progress_tool_and_prompt(
 ) -> None:
     import anyio
     import mcp.types as mcp_types
+    from curie_runner.tool_names import TURN_PROGRESS_TOOL
     from curie_runner.turn_progress import (
         PROGRESS_PREAMBLE,
         TURN_PROGRESS_ELIGIBILITY_ENV,
-        TURN_PROGRESS_TOOL,
     )
 
     async def tool_names(runner: object) -> set[str]:

@@ -32,6 +32,8 @@ from curie_runner.approval import (
     APPROVAL_SERVER_NAME,
     ApprovalGate,
     build_approval_gate,
+)
+from curie_runner.harness.claude.approval import (
     build_approval_hook,
     build_approval_server,
     build_can_use_tool,
@@ -756,7 +758,8 @@ def test_live_permission_gate_pauses_awaiting_approval() -> None:
     approval-required is intercepted by can_use_tool (never executed) and the
     turn ends awaiting-approval with the blocked call in the summary."""
 
-    from curie_runner.approval import ApprovalGate, build_can_use_tool
+    from curie_runner.approval import ApprovalGate
+    from curie_runner.harness.claude.approval import build_can_use_tool
 
     gate = ApprovalGate(required=frozenset({"Bash"}))
     options = build_options(
@@ -1285,8 +1288,8 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
     """A suspended real tool call resumes once, then its one-shot grant expires."""
     from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
     from curie_runner import session as session_module
-    from curie_runner.approval import (
-        ApprovalGate,
+    from curie_runner.approval import ApprovalGate
+    from curie_runner.harness.claude.approval import (
         build_approval_hook,
         build_can_use_tool,
     )
@@ -1735,7 +1738,7 @@ def test_save_claim_ignores_refusals_and_negations(reply: str) -> None:
 )
 def test_live_compound_request_saves_or_does_not_claim_to() -> None:
     from curie_runner.__main__ import _compose_system_prompt
-    from curie_runner.approval import build_memory_tools
+    from curie_runner.harness.claude.approval import build_memory_tools
     from curie_runner.memory_facts import DEFAULT_GUIDANCE, MemoryTurn
 
     channel_store = _InProcessFactsStore()

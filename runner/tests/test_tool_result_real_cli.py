@@ -46,6 +46,8 @@ from curie_runner.adapter import ClaudeAgentSession, build_options
 from curie_runner.approval import (
     ApprovalGate,
     build_approval_gate,
+)
+from curie_runner.harness.claude.approval import (
     build_approval_hook,
     build_can_use_tool,
 )

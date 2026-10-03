@@ -27,9 +27,13 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import PermissionResultDeny, ToolPermissionContext
 from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
-from curie_runner.approval import ApprovalGate, build_approval_hook, build_can_use_tool
+from curie_runner.approval import ApprovalGate
 from curie_runner.config import RunnerConfig
 from curie_runner.fake import FakeModelSession
+from curie_runner.harness.claude.approval import (
+    build_approval_hook,
+    build_can_use_tool,
+)
 from curie_runner.session import SessionRunner
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 from starlette.requests import Request

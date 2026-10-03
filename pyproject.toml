@@ -75,9 +75,9 @@ dev = [
 ]
 
 [tool.importlinter]
-# ADR 0140 keeps the current harness boundaries and ratchets the 16 existing
-# runner modules that import the Claude SDK. The platform, frozen contracts and
-# harness port remain free of the SDK. New runner modules cannot import it.
+# ADR 0140 keeps the current harness boundaries and ratchets the 15 remaining
+# legacy runner SDK importers. Only the Claude harness package may add imports.
+# The platform, frozen contracts, harness port and approval gate stay SDK free.
 root_packages = [
     "curie_api",
     "curie_worker",
@@ -179,7 +179,7 @@ allow_indirect_imports = true
 ignore_imports = [
     "curie_runner.__main__ -> claude_agent_sdk",
     "curie_runner.adapter -> claude_agent_sdk",
-    "curie_runner.approval -> claude_agent_sdk",
+    "curie_runner.harness.claude.** -> claude_agent_sdk",
     "curie_runner.check -> claude_agent_sdk",
     "curie_runner.fake -> claude_agent_sdk",
     "curie_runner.hooks -> claude_agent_sdk",
@@ -194,6 +194,16 @@ ignore_imports = [
     "curie_runner.turn_progress -> claude_agent_sdk",
     "curie_runner.usage_report -> claude_agent_sdk",
 ]
+
+
+[[tool.importlinter.contracts]]
+# Approval decisions must remain free of the SDK through every dependency,
+# including shared tool identities. This gate intentionally checks indirect
+# imports separately from the legacy direct import ratchet.
+name = "The approval gate stays free of the harness SDK"
+type = "forbidden"
+source_modules = ["curie_runner.approval"]
+forbidden_modules = ["claude_agent_sdk"]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
