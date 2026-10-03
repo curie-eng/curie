@@ -81,6 +81,7 @@ from .sandbox import (
     SubstrateConfig,
     SuspendedThreadError,
 )
+from .schema_startup import assert_worker_schema
 from .sibling_turns import build_sibling_limit
 from .slack_tokens import slack_bot_tokens
 from .stream_retention import StreamRetention, build_stream_retention
@@ -1001,6 +1002,8 @@ def _build_publication_loop(
 
 
 async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
+    await assert_worker_schema(config)
     rt = build(config, env)
 
     loop = asyncio.get_running_loop()
