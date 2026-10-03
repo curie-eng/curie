@@ -223,6 +223,74 @@ wins over this auto carve-out.
   {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- /*
+Given dict "cidr" (an egress CIDR) and "root" (the chart context), return the
+comma-separated private ranges that CIDR STRICTLY contains (#3842): same
+family, candidate prefix longer than the CIDR's, and equal on the CIDR's top
+prefix bits. Candidates are IPv4 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16,
+172.16.0.0/12, 192.168.0.0/16; IPv6 fc00::/7, fe80::/10; plus every
+security.networkPolicy.clusterCidrs entry of the same family (pod and service
+CIDRs outside those ranges). curie.egress.ipBlockRules appends these to every
+ipBlock's except list, so a broad route (0.0.0.0/0, a /1 split, ::/0) can no
+longer reach cluster-internal or VPC-private peers, while a narrow entry equal
+to or inside a private range gets nothing and stays the re-allow path for a
+private peer. "" for an unparseable CIDR (syntax is validated elsewhere).
+*/ -}}
+{{- define "curie.privateExcept" -}}
+{{- $out := list -}}
+{{- $parts := splitList "/" (trim (printf "%v" .cidr)) -}}
+{{- $v4re := "^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$" -}}
+{{- if and (eq (len $parts) 2) (regexMatch "^(0|[1-9][0-9]{0,2})$" (index $parts 1)) -}}
+{{- $ip := index $parts 0 -}}
+{{- $prefix := int (index $parts 1) -}}
+{{- $isV6 := contains ":" $ip -}}
+{{- $candidates := list -}}
+{{- if $isV6 -}}
+  {{- $candidates = list "fc00::/7" "fe80::/10" -}}
+{{- else -}}
+  {{- $candidates = list "10.0.0.0/8" "100.64.0.0/10" "169.254.0.0/16" "172.16.0.0/12" "192.168.0.0/16" -}}
+{{- end -}}
+{{- range $c := .root.Values.security.networkPolicy.clusterCidrs | default list -}}
+  {{- $c = trim (printf "%v" $c) -}}
+  {{- if and (eq (contains ":" $c) $isV6) (not (has $c $candidates)) -}}
+    {{- $candidates = append $candidates $c -}}
+  {{- end -}}
+{{- end -}}
+{{- if $isV6 -}}
+  {{- $got := include "curie.ipv6Hextets" $ip | trim -}}
+  {{- if and $got (le $prefix 128) -}}
+    {{- range $c := $candidates -}}
+      {{- $cp := splitList "/" $c -}}
+      {{- if and (eq (len $cp) 2) (regexMatch "^(0|[1-9][0-9]{0,2})$" (index $cp 1)) -}}
+        {{- $want := include "curie.ipv6Hextets" (index $cp 0) | trim -}}
+        {{- if and $want (gt (int (index $cp 1)) $prefix) (le (int (index $cp 1)) 128) -}}
+          {{- if eq (include "curie.ipv6PrefixMatch" (dict "got" (splitList "," $got) "want" (splitList "," $want) "prefix" $prefix) | trim) "true" -}}
+            {{- $out = append $out $c -}}
+          {{- end -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- else if and (regexMatch $v4re $ip) (le $prefix 32) -}}
+  {{- $net := include "curie.ipv4ToInt" $ip | int64 -}}
+  {{- $block := int64 1 -}}
+  {{- range until (sub 32 $prefix | int) -}}{{- $block = mul $block 2 -}}{{- end -}}
+  {{- range $c := $candidates -}}
+    {{- $cp := splitList "/" $c -}}
+    {{- if and (eq (len $cp) 2) (regexMatch $v4re (index $cp 0)) (regexMatch "^(0|[1-9][0-9]{0,2})$" (index $cp 1)) -}}
+      {{- $cprefix := int (index $cp 1) -}}
+      {{- if and (gt $cprefix $prefix) (le $cprefix 32) -}}
+        {{- $cnet := include "curie.ipv4ToInt" (index $cp 0) | int64 -}}
+        {{- if eq (div $cnet $block) (div $net $block) -}}
+          {{- $out = append $out $c -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- join "," $out -}}
+{{- end -}}
 {{/*
 Validate one BYO endpoint egress entry (rustfs.egress, rustfs.stsEgress,
 otelCollector.egress, api.egress, agentSandbox.connectorEgress.<agent>,
@@ -345,6 +413,38 @@ name concrete ports with no endPort, and `except: []` is refused.
 {{- end -}}
 {{- if and .Values.agentSandbox.deploy .Values.security.networkPolicy.enabled }}
 {{- $np := .Values.security.networkPolicy }}
+{{- /* clusterCidrs feed curie.privateExcept, which carves them out of every
+       broad runner route; an unparseable or default-route entry would either be
+       silently skipped or except the whole route, so refuse it here (#3842). */}}
+{{- if and $np.clusterCidrs (not (kindIs "slice" $np.clusterCidrs)) }}
+{{- fail "security.networkPolicy.clusterCidrs must be a list of CIDR strings" }}
+{{- end }}
+{{- range $np.clusterCidrs }}
+{{- $cc := trim (printf "%v" .) }}
+{{- $ccParts := splitList "/" $cc }}
+{{- if ne (len $ccParts) 2 }}
+{{- fail (printf "security.networkPolicy.clusterCidrs entry %q is not a CIDR" $cc) }}
+{{- end }}
+{{- if not (regexMatch "^(0|[1-9][0-9]{0,2})$" (index $ccParts 1)) }}
+{{- fail (printf "security.networkPolicy.clusterCidrs entry %q has an invalid prefix length" $cc) }}
+{{- end }}
+{{- $ccIp := index $ccParts 0 }}
+{{- $ccPrefix := int (index $ccParts 1) }}
+{{- if lt $ccPrefix 1 }}
+{{- fail (printf "security.networkPolicy.clusterCidrs entry %q has prefix 0; list the pod or service CIDR, not a default route" $cc) }}
+{{- end }}
+{{- if contains ":" $ccIp }}
+{{- $ccHex := include "curie.ipv6Hextets" $ccIp | trim }}
+{{- if or (gt $ccPrefix 128) (eq $ccHex "") }}
+{{- fail (printf "security.networkPolicy.clusterCidrs entry %q is not a valid IPv6 CIDR" $cc) }}
+{{- end }}
+{{- if hasPrefix "0,0,0,0,0,65535," $ccHex }}
+{{- fail (printf "security.networkPolicy.clusterCidrs entry %q is IPv4-mapped IPv6; list the IPv4 CIDR instead" $cc) }}
+{{- end }}
+{{- else if or (gt $ccPrefix 32) (not (regexMatch "^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$" $ccIp)) }}
+{{- fail (printf "security.networkPolicy.clusterCidrs entry %q is not a valid IPv4 CIDR" $cc) }}
+{{- end }}
+{{- end }}
 {{- $apiExternal := include "curie.runner.apiIsExternal" . | trim }}
 {{- $otlpExternal := include "curie.runner.otlpIsExternal" . | trim }}
 {{/*
@@ -462,7 +562,7 @@ spec:
       {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
   policyTypes: [Egress]
   egress:
-    {{- include "curie.egress.ipBlockRules" .Values.otelCollector.egress | trim | nindent 4 }}
+    {{- include "curie.egress.ipBlockRules" (dict "entries" .Values.otelCollector.egress "root" $) | trim | nindent 4 }}
 {{- end }}
 {{- end }}
 {{- else }}
@@ -497,7 +597,7 @@ spec:
       {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
   policyTypes: [Egress]
   egress:
-    {{- include "curie.egress.ipBlockRules" .Values.otelCollector.egress | trim | nindent 4 }}
+    {{- include "curie.egress.ipBlockRules" (dict "entries" .Values.otelCollector.egress "root" $) | trim | nindent 4 }}
 {{- end }}
 {{- end }}
 {{- if .Values.api.deploy }}
@@ -562,7 +662,7 @@ spec:
       {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
   policyTypes: [Egress]
   egress:
-    {{- include "curie.egress.ipBlockRules" .Values.api.egress | trim | nindent 4 }}
+    {{- include "curie.egress.ipBlockRules" (dict "entries" .Values.api.egress "root" $) | trim | nindent 4 }}
 {{- end }}
 {{- end }}
 {{- else }}
@@ -603,7 +703,7 @@ spec:
       {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
   policyTypes: [Egress]
   egress:
-    {{- include "curie.egress.ipBlockRules" .Values.api.egress | trim | nindent 4 }}
+    {{- include "curie.egress.ipBlockRules" (dict "entries" .Values.api.egress "root" $) | trim | nindent 4 }}
 {{- end }}
 {{- end }}
 {{- if or .Values.agentSandbox.runner.bundleFetch.enabled .Values.agentSandbox.runner.workspace.enabled }}
@@ -670,7 +770,7 @@ spec:
       {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
   policyTypes: [Egress]
   egress:
-    {{- include "curie.egress.ipBlockRules" (concat (.Values.rustfs.egress | default list) (.Values.rustfs.stsEgress | default list)) | trim | nindent 4 }}
+    {{- include "curie.egress.ipBlockRules" (dict "entries" (concat (.Values.rustfs.egress | default list) (.Values.rustfs.stsEgress | default list)) "root" $) | trim | nindent 4 }}
 {{- end }}
 {{- end }}
 {{- if .Values.inference.deploy }}
@@ -719,7 +819,7 @@ spec:
 {{- include "curie.egress.allowedEgressEntry" . }}
 {{- end }}
   egress:
-    {{- include "curie.egress.ipBlockRules" $np.allowedEgress | trim | nindent 4 }}
+    {{- include "curie.egress.ipBlockRules" (dict "entries" $np.allowedEgress "root" $) | trim | nindent 4 }}
 {{- end }}
 {{- /* Per-agent egress: connectorEgress (connector hosts) and registryEgress
        (package registries such as npm or PyPI, #3083). Both are closed unless
@@ -751,7 +851,7 @@ spec:
       curietech.ai/agent: {{ $agent | quote }}
   policyTypes: [Egress]
   egress:
-    {{- include "curie.egress.ipBlockRules" $entries | trim | nindent 4 }}
+    {{- include "curie.egress.ipBlockRules" (dict "entries" $entries "root" $) | trim | nindent 4 }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -769,13 +869,15 @@ spec:
     matchLabels:
       {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
   policyTypes: [Ingress]
-  # The worker dials the claimed sandbox on the ACI port; allow ingress to it
-  # from within the release namespace only.
+  # Only this release's worker pods dial the claimed sandbox on the ACI port
+  # (#3842; ADR-0122 "Out of scope" flagged the old namespace-wide peer as wider
+  # than intended). A bare podSelector is same-namespace by construction.
+  # Kubelet readiness probes come from the node, which NetworkPolicy admits.
   ingress:
     - from:
-        - namespaceSelector:
+        - podSelector:
             matchLabels:
-              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+              {{- include "curie.selectorLabels" (dict "root" . "component" "worker") | nindent 14 }}
       ports:
         - { protocol: TCP, port: {{ .Values.agentSandbox.runner.port }} }
 {{- end }}

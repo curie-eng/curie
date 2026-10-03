@@ -1,7 +1,7 @@
 """The channel ingress API (ADR-0096 phase 2, #1459).
 
 Three endpoints, and every request/response model they use lives here rather
-than in ``schemas.py``:
+than in ``schemas.channels``:
 
 - ``POST /channels/token`` (platform key, or an adapter principal serving the
   binding, ADR-0154) mints a ``chn`` token over a binding ROW's id plus a
@@ -67,7 +67,15 @@ from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 
-from .. import adapter_principal, channel_token, crud
+from curie_api.crud import channels as crud_channels
+
+# The API's Valkey client is built without `decode_responses`, so values come
+# back as bytes; `text` is the package's named, documented decode for exactly
+# that, and this router is not the place for a seventh copy of the expression.
+from curie_api.graveyardwatcher import text
+from curie_api.schemas.channels import ChannelBinding
+
+from .. import adapter_principal, channel_token
 from ..admission import AdmissionDecision, admit
 from ..approval_auth import platform_key_or_adapter
 from ..auth import require_api_key, verify_platform_key
@@ -83,13 +91,7 @@ from ..delivery import (
     take_backlog_slot,
 )
 from ..deps import SessionDep
-
-# The API's Valkey client is built without `decode_responses`, so values come
-# back as bytes; `_text` is the package's named, documented decode for exactly
-# that, and this router is not the place for a seventh copy of the expression.
-from ..graveyardwatcher import _text
 from ..models import AgentChannel
-from ..schemas import ChannelBinding
 from ..wirebody import read_bounded_body
 
 logger = logging.getLogger(__name__)
@@ -143,7 +145,7 @@ _MAX_ADMISSION_CALLERS = 10
 class ChannelTokenRequest(ChannelBinding):
     """Mint request: the binding pair to scope the token to, plus its lifetime.
 
-    Subclasses `ChannelBinding` so the SAME `_validate_channel_binding` the
+    Subclasses `ChannelBinding` so the SAME `validate_channel_binding` the
     agents API runs judges the pair here (E11). Two write paths cannot drift
     into two rules -- that drift is how #143 happened -- and an operator reads
     the identical message from either endpoint.
@@ -160,7 +162,7 @@ class ChannelTokenRequest(ChannelBinding):
     # caller that predates it -- CLI, UI, the e2e proof -- keeps minting
     # exactly as before: an omission resolves through `route_identity` to the
     # default Slack identity, or to a non-Slack pair's one route; a pair
-    # holding several answers 409 (`crud.AmbiguousRoute`). Not validated as a slug here the
+    # holding several answers 409 (`crud.channels.AmbiguousRoute`). Not validated as a slug here the
     # way `ChannelBindingWrite.adapter` is: this field NAMES a route to look
     # up, it never gets written to one, so there is no config-map-key shape
     # for a caller-supplied value to violate.
@@ -205,7 +207,7 @@ class AdmissionIn(ChannelBinding):
     """One admission question from the Slack dispatcher (ADR 0175 decision 2).
 
     Subclasses `ChannelBinding` so the route pair is judged by the same
-    `_validate_channel_binding` every other binding surface runs. `adapter`
+    `validate_channel_binding` every other binding surface runs. `adapter`
     names the identity half of the route (ADR-0168 decision 3), resolved
     exactly as `POST /channels/token` resolves it: omitted means the default
     Slack identity. `callers` is every id the channel reports for the caller;
@@ -280,19 +282,19 @@ async def _resolve_binding(
 
     The kind too, never the address alone: one address can be bound under two
     kinds, and resolving on the address would let one kind's adapter reach the
-    other kind's agent. Delegates to `crud.binding_for_route` (ADR-0168
+    other kind's agent. Delegates to `crud.channels.binding_for_route` (ADR-0168
     decision 3), which narrows to `adapter`'s RESOLVED identity -- an omitted
     Slack adapter still means the default app -- and answers a pair holding
     several routes under an omitted non-Slack adapter with a 409 here.
     """
 
     try:
-        return await crud.binding_for_route(session, kind, adapter, address)
-    except crud.AmbiguousRoute as exc:
+        return await crud_channels.binding_for_route(session, kind, adapter, address)
+    except crud_channels.AmbiguousRoute as exc:
         raise _ambiguous(exc) from exc
 
 
-def _ambiguous(exc: crud.AmbiguousRoute) -> HTTPException:
+def _ambiguous(exc: crud_channels.AmbiguousRoute) -> HTTPException:
     return HTTPException(status.HTTP_409_CONFLICT, str(exc))
 
 
@@ -377,10 +379,10 @@ async def mint_channel_token(
         # principal serving neither route how many the pair holds, so it
         # reads as unserved too.
         try:
-            unlocked_row = await crud.binding_for_route(
+            unlocked_row = await crud_channels.binding_for_route(
                 session, data.kind, data.adapter, data.address
             )
-        except crud.AmbiguousRoute:
+        except crud_channels.AmbiguousRoute:
             unlocked_row = None
         if unlocked_row is None or unlocked_row.id not in adapter.bindings:
             raise HTTPException(
@@ -390,13 +392,13 @@ async def mint_channel_token(
     # Locked, not the unlocked `_resolve_binding` the ingress uses: two concurrent
     # mints that both read N and both write N+1 would stamp the same generation
     # on two tokens, and neither rotation would revoke the other. `populate_existing`
-    # is the same load-bearing choice as `crud.lock_agent_bindings`. Only reached
+    # is the same load-bearing choice as `crud.channels.lock_agent_bindings`. Only reached
     # for a row the adapter (or the platform key) actually serves.
     try:
-        row = await crud.binding_for_route(
+        row = await crud_channels.binding_for_route(
             session, data.kind, data.adapter, data.address, for_update=True
         )
-    except crud.AmbiguousRoute as exc:
+    except crud_channels.AmbiguousRoute as exc:
         raise _ambiguous(exc) from exc
     if row is None:
         raise HTTPException(
@@ -827,7 +829,7 @@ async def ingest_turn(
                 raise
         held = await client.get(key)
         if held is not None:
-            return _duplicate(event_id, _text(held), response)
+            return _duplicate(event_id, text(held), response)
 
     response.status_code = status.HTTP_202_ACCEPTED
     return TurnAccepted(event_id=event_id, stream_id=None, duplicate=True)
@@ -859,14 +861,14 @@ async def check_admission(data: AdmissionIn, session: SessionDep) -> AdmissionOu
     call, unchanged by this ADR.
     """
 
-    row = await crud.binding_for_route(session, data.kind, data.adapter, data.address)
+    row = await crud_channels.binding_for_route(session, data.kind, data.adapter, data.address)
     decision = admit(row, data.callers)
     if not decision.allowed and row is not None:
         # The dispatcher counts its own refusal (`curie.turn.refused` with
         # service curie-dispatcher); counting it here too would double every
         # Slack refusal, so this side only logs the binding and reason.
         _record_refusal(row, decision, surface="admission", level=logging.DEBUG)
-    install_restricted = decision.restricted or await crud.any_binding_restricted(session)
+    install_restricted = decision.restricted or await crud_channels.any_binding_restricted(session)
     return AdmissionOut(
         allowed=decision.allowed,
         restricted=decision.restricted,

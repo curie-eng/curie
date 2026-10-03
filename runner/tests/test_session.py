@@ -2,7 +2,9 @@
 
 import asyncio
 import functools
+import json
 import logging
+from pathlib import Path
 
 import anyio
 import pytest
@@ -37,6 +39,27 @@ from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
+
+
+def test_fake_canned_turn_matches_the_shared_wire_vector() -> None:
+    expected = json.loads(
+        (Path(__file__).resolve().parents[2] / "tests/vectors/fake-canned-turn.json").read_text()
+    )
+
+    async def exercise() -> list[dict[str, object]]:
+        runner, _fake = _runner()
+        await runner.start()
+        try:
+            return [
+                json.loads(line)
+                async for line in runner.run_turn(
+                    Event(type="message", text="question", user="U", ts="1")
+                )
+            ]
+        finally:
+            await runner.close()
+
+    assert anyio.run(exercise) == expected
 
 
 class _ProviderStallSession:

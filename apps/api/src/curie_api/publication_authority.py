@@ -10,11 +10,12 @@ from typing import Any, Literal
 import httpx
 from starlette.concurrency import run_in_threadpool
 
+from curie_api.schemas.publications import PublicationLineageAdvance
+
 from .config import Settings
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .models import ThreadPublicationLineage
 from .repo_full_name import repo_url_path
-from .schemas import PublicationLineageAdvance
 
 
 class AuthorityRefused(RuntimeError):

@@ -15,10 +15,11 @@ import os
 import signal
 import socket
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, NoReturn, TypedDict
 
 import httpx
 import redis
@@ -51,6 +52,7 @@ from .cron_loop import BundleTriggerSource, CronSchedulerLoop
 from .dead_letter_alert import install_dead_letter_alerting
 from .delivery_lease import DeliveryLeaseStore
 from .deploy_notice import DeployNoticeConsumer
+from .e2e_reaper import E2EReaperLoop
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
@@ -134,6 +136,9 @@ class Runtime:
     publication_loop: PublicationReconcileLoop | None = None
     # None when the worker has no internal token and so no WorkItem client.
     orphan_sweeper: WorkItemOrphanSweeper | None = None
+    # None unless the end to end connector and the connector reconciler are
+    # both on (#3245).
+    e2e_reaper: E2EReaperLoop | None = None
     deploy_notice_consumer: DeployNoticeConsumer | None = None
     # Trims settled entries off the runs and eval streams (ADR 0184). Optional
     # only so a Runtime constructed elsewhere need not name it.
@@ -667,6 +672,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
             else None
         ),
         connector_loop=_build_connector_loop(config, engine),
+        e2e_reaper=_build_e2e_reaper(config, work_items),
         cron_loop=CronSchedulerLoop(
             engine=engine,
             redis=async_redis,
@@ -698,6 +704,7 @@ _SUPERVISED_OPERATIONS = frozenset(
         "connectors",
         "cron",
         "publications",
+        "e2e-reaper",
     }
 )
 
@@ -927,6 +934,80 @@ def _build_connector_loop(
     )
 
 
+def _build_e2e_reaper(
+    config: WorkerConfig, work_items: WorkItemDispatchClient | None
+) -> E2EReaperLoop | None:
+    """The end to end namespace reaper (#3245), or None when it is disabled.
+
+    It reads each agent's test cluster kubeconfig from the connector Secret,
+    which only the reconciler's Role lets the worker list, and it reads run
+    status through the WorkItem client, which needs the internal worker token.
+    The chart refuses to render the first misconfiguration. Either one is
+    logged rather than failing boot, because the rest of the worker is
+    unaffected, and the loop still runs with a cluster source that raises the
+    reason, without loading a kube config. Every pass then fails and
+    ``curie.e2e.reaper.last_success`` stays 0, so CurieE2EReaperStalled fires
+    instead of the reaper going silently missing.
+    """
+
+    if not config.e2e_reaper_enabled:
+        return None
+    from curie_e2e_connector.reaper import Scope
+
+    scope = Scope(
+        namespace_prefix=config.e2e_namespace_prefix,
+        owner_label_key=config.e2e_owner_label_key,
+        owner_label_value=config.e2e_owner_label_value,
+    )
+    if not config.connector_reconcile_enabled or work_items is None:
+        reason = (
+            "CURIE_E2E_CONNECTOR_ENABLED needs CURIE_CONNECTOR_RECONCILE for the "
+            "connector Secret list grant"
+            if not config.connector_reconcile_enabled
+            else "it reads run status with the internal worker token, and none is configured"
+        )
+        logger.error(
+            "e2e reaper cannot work: %s; end to end namespaces are left to their TTL "
+            "with nothing deleting them, and every pass fails",
+            reason,
+        )
+
+        def refuse_clusters() -> NoReturn:
+            raise RuntimeError(f"e2e reaper is misconfigured: {reason}")
+
+        async def refuse_status(_request_id: uuid.UUID) -> NoReturn:
+            raise RuntimeError(f"e2e reaper is misconfigured: {reason}")
+
+        return E2EReaperLoop(
+            clusters=refuse_clusters,
+            request_status=refuse_status,
+            scope=scope,
+            interval_s=config.e2e_reaper_interval_s,
+        )
+    from kubernetes import client as k8s_client
+    from kubernetes import config as k8s_config
+
+    from .e2e_reaper import connector_secret_clusters, request_status_lookup
+
+    # The same credential the connector reconciler loads (connector_k8s.py).
+    try:
+        k8s_config.load_incluster_config()
+    except k8s_config.ConfigException:
+        k8s_config.load_kube_config()
+    core = k8s_client.CoreV1Api()
+    return E2EReaperLoop(
+        clusters=lambda: connector_secret_clusters(
+            core,
+            namespace=config.connector_namespace,
+            release=config.connector_release,
+            timeout=30,
+        ),
+        request_status=request_status_lookup(work_items),
+        scope=scope,
+        interval_s=config.e2e_reaper_interval_s,
+    )
+
+
 def _build_publication_loop(
     config: WorkerConfig,
     env: Mapping[str, str],
@@ -1111,6 +1192,18 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
                     )
                 ]
                 if rt.connector_loop is not None
+                else []
+            ),
+            *(
+                [
+                    _supervise(
+                        "e2e-reaper",
+                        lambda: rt.e2e_reaper.run_forever(shutdown),  # type: ignore[union-attr]
+                        shutdown,
+                        **policy,
+                    )
+                ]
+                if getattr(rt, "e2e_reaper", None) is not None
                 else []
             ),
             *(

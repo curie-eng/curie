@@ -5,7 +5,7 @@ import uuid
 from datetime import UTC, datetime
 
 from curie_api.models import Approval
-from curie_api.schemas import ApprovalOut
+from curie_api.schemas.approvals import ApprovalOut
 
 
 def approval(summary: str, tool: str | None = None, arguments: dict | None = None) -> Approval:

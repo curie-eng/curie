@@ -419,6 +419,33 @@ An adapter must:
    `progress` before any answer path so a progress body never changes answer
    text.
 
+### Running the floor
+
+The floor is executable. `channel_protocol.conformance`
+(`packages/channel-protocol/src/channel_protocol/conformance.py`) ships fourteen
+checks covering ingress normalization, reply delivery, edit and buffered streaming,
+attachments, approval cards, progress, and error mapping. Wrap your adapter in a
+`ChannelAdapterSubject` and declare its `Capabilities`: kind, streaming mode (edit,
+buffered, silent or relay), ingress, authenticates, refuses_foreign_targets and
+serves_attachments. Then run every check
+`packages/channel-protocol/src/channel_protocol/conformance.py::applicable_checks`
+returns for that declaration. A check your declaration does not cover is not
+returned, never skipped.
+
+```python
+for check in applicable_checks(subject.capabilities):
+    await check.run(subject, CheckContext(validate_turn=my_validator))
+```
+
+In this repository, the suite in `tests/channel_conformance/` runs every check
+against Discord, the mail adapter, GitHub and the worker's `HttpReplyAdapter`, each
+driven through the worker's real `ReplySinkRouter`. Adding an adapter is one `_Entry`
+(its declared `Capabilities` plus a factory that opens the subject) in the `_ENTRIES`
+table of `tests/channel_conformance/subjects.py`, which feeds the `REGISTRY` the
+tests parametrize over. If you build a third-party relay, drive your egress through
+the worker's `HttpReplyAdapter` so header names and statuses are proven across the
+real wire.
+
 ## Related
 
 - [`docs/interfaces/channel-ingress/INTERFACE.md`](../interfaces/channel-ingress/INTERFACE.md): the seam

@@ -32,12 +32,25 @@ import httpx
 import pytest
 import redis
 import redis.asyncio as aioredis
-from curie_api import approval_principal, crud, sandbox_token
+from curie_api import approval_principal, sandbox_token
 from curie_api.config import get_settings
+from curie_api.crud import (
+    approvals as crud_approvals,
+)
+from curie_api.crud import (
+    errors as crud_errors,
+)
+from curie_api.crud import (
+    lineages as crud_lineages,
+)
+from curie_api.crud import (
+    publications as crud_publications,
+)
 from curie_api.github_app import _RESOLVERS
 from curie_api.main import create_app
 from curie_api.resumequeue import ResumeQueue
-from curie_api.schemas import ChannelBindingWrite, PublicationCreate
+from curie_api.schemas.channels import ChannelBindingWrite
+from curie_api.schemas.publications import PublicationCreate
 from curie_api.sweeper import sweep_expired_approvals
 from curie_telemetry import record_metric
 from curie_test_support.valkey import connect_or_skip
@@ -812,7 +825,7 @@ def test_publication_create_is_atomic_private_and_idempotent(
     ],
 )
 def test_publication_create_rejects_noncanonical_or_oversized_text(field: str, value: str) -> None:
-    from curie_api.schemas import PublicationCreate
+    from curie_api.schemas.publications import PublicationCreate
 
     payload = _publication_payload(str(uuid.uuid4()))
     payload[field] = value
@@ -2050,7 +2063,7 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
     """The real publication insert is the card outbox; Slack never owns the turn ACK."""
 
     from aci_protocol import QueuedTurn, ReplyHandle, SessionStatus
-    from curie_api.schemas import PublicationCreate
+    from curie_api.schemas.publications import PublicationCreate
     from curie_worker.approvals import CreatedPublication, PublicationCreateRequest
     from curie_worker.behaviorpacks import BehaviorPacks
     from curie_worker.binding import ResolvedDeployment
@@ -2092,7 +2105,7 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
                 data = PublicationCreate.model_validate(request.to_json())
                 async def metadata_check() -> None:
                     return
-                publication, _ = await crud.create_publication(
+                publication, _ = await crud_publications.create_publication(
                     session, data, patch=data.decoded_patch(), metadata_check=metadata_check
                 )
                 return CreatedPublication(
@@ -2384,8 +2397,9 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     from aci_protocol import QueuedTurn, ReplyHandle
     from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
     from claude_agent_sdk.types import PermissionResultDeny
-    from curie_runner.approval import build_approval_gate, build_can_use_tool
+    from curie_runner.approval import build_approval_gate
     from curie_runner.fake import FakeModelSession
+    from curie_runner.harness.claude.approval import build_can_use_tool
     from curie_runner.otel import RunTracer
     from curie_runner.server import create_app as create_runner_app
     from curie_runner.session import SessionRunner
@@ -3282,14 +3296,14 @@ def test_publication_approval_is_never_in_the_owed_wake_worklist(
         try:
             async with sessionmaker() as session:
                 approval_id = uuid.UUID(publication["approval_id"])
-                ids = await crud.list_resolved_unresumed(
+                ids = await crud_approvals.list_resolved_unresumed(
                     session,
                     resolved_before=datetime.now(UTC).replace(tzinfo=None) + timedelta(days=1),
                     limit=100,
                 )
-                claim = await crud.claim_resume_row(session, approval_id)
+                claim = await crud_approvals.claim_resume_row(session, approval_id)
                 await session.rollback()
-                reopened = await crud.reopen_dead_lettered_resume(
+                reopened = await crud_approvals.reopen_dead_lettered_resume(
                     session,
                     approval_id,
                     dead_lettered_after=datetime.now(UTC).replace(tzinfo=None) + timedelta(days=1),
@@ -3339,7 +3353,7 @@ def test_expired_publication_settles_without_expiry_or_reconciler_wake(
                 count = await sweep_expired_approvals(
                     session, queue, now=past + timedelta(seconds=1)
                 )
-                ids = await crud.list_resolved_unresumed(
+                ids = await crud_approvals.list_resolved_unresumed(
                     session,
                     resolved_before=past + timedelta(days=1),
                     limit=100,
@@ -3673,7 +3687,7 @@ def test_terminal_patch_retention_reaps_bytes_but_keeps_public_metadata(
                     )
                 )
                 await session.commit()
-                return await crud.reap_terminal_publication_patches(
+                return await crud_publications.reap_terminal_publication_patches(
                     session,
                     terminal_before=old + timedelta(minutes=1),
                     limit=100,
@@ -6156,7 +6170,7 @@ def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
 ) -> None:
     """A row lock must refresh objects retained during earlier authority reads."""
     from curie_api.models import AgentChannel, Deployment, ThreadPublicationLineage
-    from curie_api.schemas import ReviewRevisionReserve
+    from curie_api.schemas.publications import ReviewRevisionReserve
     from sqlalchemy.ext.asyncio import AsyncSession
 
     client, truth, _ = review_lineage_app
@@ -6214,8 +6228,8 @@ def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
                 assert response.status_code == (204 if mutation == "deployment" else 200), (
                     response.text
                 )
-                with pytest.raises(crud.PublicationLineageConflict) as conflict:
-                    await crud.reserve_review_revision(
+                with pytest.raises(crud_errors.PublicationLineageConflict) as conflict:
+                    await crud_lineages.reserve_review_revision(
                         session,
                         ReviewRevisionReserve(
                             repository_id=9001,

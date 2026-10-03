@@ -1104,6 +1104,23 @@ class SandboxSubstrate:
             )
             deleted.append(claim.name)
         observed = {claim.name for claim in claims} - set(deleted)
+        # A claim carrying scoped tokens owns a per-claim template (and through
+        # it the token Secret and pool) only once ``create_claim`` patches the
+        # template's ownerReference to the claim (#3842). A worker crash
+        # between creating that template and the patch leaves it owned by
+        # nothing, so garbage collection never removes it or its Secret. Sweep
+        # those with the same cutoff as claims, keeping every claim still
+        # observed. Best effort: a failed sweep must not cost claim reaping or
+        # the inventory metric, and only the exception class is logged because
+        # the API error body can carry object detail.
+        try:
+            self._k8s.reap_claim_templates(keep=observed, created_before=cutoff)
+        except Exception as exc:  # noqa: BLE001 - a failed sweep retries next tick
+            logger.warning(
+                "sandbox claim-template sweep failed (%s); orphaned per-claim "
+                "templates are retried on the next tick",
+                type(exc).__name__,
+            )
         return deleted, observed
 
     # -- internals --------------------------------------------------------------

@@ -29,15 +29,16 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .config import get_settings
-from .models import ExecutionRequest, ExecutionRequestModelUsage
-from .schemas import (
+from curie_api.schemas.workitems import (
     WorkItemUsageModel,
     WorkItemUsageOut,
     WorkItemUsagePriceSource,
     WorkItemUsageRequest,
     WorkItemUsageRole,
 )
+
+from .config import get_settings
+from .models import ExecutionRequest, ExecutionRequestModelUsage
 
 logger = logging.getLogger(__name__)
 

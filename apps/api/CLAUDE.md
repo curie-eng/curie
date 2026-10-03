@@ -44,7 +44,7 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   `POST /channels/token` (only for a binding it serves; else 403),
   `GET /approvals` (filtered to approvals it serves) and
   `/approvals/{id}/resolve` (with `X-Curie-Approval-Actor`; unserved is 404).
-  Served is ONE predicate, `crud._approval_served`, for both. Presenting it
+  Served is ONE predicate, `crud.approvals._approval_served`, for both. Presenting it
   with the platform key or another resolver credential is 401, never a
   precedence choice. The resolver kinds are `chat`, `console`, `operator` and
   `adapter`; `operator` resolves only explicit-user routes, and no Slack approver

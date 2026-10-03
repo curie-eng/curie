@@ -12,13 +12,34 @@ import uuid
 from typing import Any, Literal, cast
 
 import httpx
+from aci_protocol import PublicationContext
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
-from .. import crud, factory_ci, factory_progress
+from curie_api.crud import agents as crud_agents
+from curie_api.crud import approvals as crud_approvals
+from curie_api.crud import deployments as crud_deployments
+from curie_api.crud import errors as crud_errors
+from curie_api.crud import lineages as crud_lineages
+from curie_api.crud import publication_queries as crud_publication_queries
+from curie_api.crud import publications as crud_publications
+from curie_api.crud import workspaces as crud_workspaces
+from curie_api.schemas.publications import (
+    PublicationContextMint,
+    PublicationCreate,
+    PublicationLineageAdvance,
+    PublicationLineageOut,
+    PublicationOut,
+    ReviewRevisionCancel,
+    ReviewRevisionOut,
+    ReviewRevisionReserve,
+)
+from curie_api.schemas.workspaces import RepositoryCredentialOut
+
+from .. import factory_ci, factory_progress
 from ..auth import (
     require_api_key,
     require_internal_worker_token,
@@ -48,18 +69,6 @@ from ..publication_truth import (
 )
 from ..repo_full_name import repo_url_path
 from ..repository_auth import resolve_repository_credential
-from ..schemas import (
-    PublicationContext,
-    PublicationContextMint,
-    PublicationCreate,
-    PublicationLineageAdvance,
-    PublicationLineageOut,
-    PublicationOut,
-    RepositoryCredentialOut,
-    ReviewRevisionCancel,
-    ReviewRevisionOut,
-    ReviewRevisionReserve,
-)
 from ..workspace_policy import credential_mode, repository_is_allowed
 from .publication_precheck import precheck_error
 
@@ -179,9 +188,13 @@ async def _publication_lineage_out(
 ) -> PublicationLineageOut:
     """Render the one safe private-state fact alongside public lineage data."""
 
-    has_pending_revision = await crud.publication_lineage_has_pending_revision(session, lineage)
-    has_pending_outcome = await crud.publication_lineage_has_pending_outcome(session, lineage)
-    visible_outcome_revision = await crud.publication_lineage_visible_outcome_revision(
+    has_pending_revision = await crud_lineages.publication_lineage_has_pending_revision(
+        session, lineage
+    )
+    has_pending_outcome = await crud_lineages.publication_lineage_has_pending_outcome(
+        session, lineage
+    )
+    visible_outcome_revision = await crud_lineages.publication_lineage_visible_outcome_revision(
         session, lineage
     )
     return PublicationLineageOut.model_validate(lineage).model_copy(
@@ -314,7 +327,7 @@ async def _refresh_publication_lineage_from_github(
         ) from exc
 
     if actual_head_sha != lineage.head_sha and (
-        await crud.publication_lineage_has_inflight_push(session, lineage)
+        await crud_lineages.publication_lineage_has_inflight_push(session, lineage)
     ):
         # The authorized revision may have pushed its exact commit while its
         # lineage CAS is still pending. Keep the durable expected head as the
@@ -324,13 +337,13 @@ async def _refresh_publication_lineage_from_github(
     expected_head_sha = lineage.head_sha
     if expected_head_sha is None:
         try:
-            lineage = await crud.initialize_publication_lineage_head(
+            lineage = await crud_lineages.initialize_publication_lineage_head(
                 session,
                 lineage,
                 expected_version=lineage.version,
                 head_sha=actual_head_sha,
             )
-        except crud.PublicationLineageConflict as exc:
+        except crud_errors.PublicationLineageConflict as exc:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 {"code": exc.code, "message": exc.message},
@@ -339,14 +352,14 @@ async def _refresh_publication_lineage_from_github(
     assert expected_head_sha is not None
     if remote_state in ("merged", "closed") and lineage.status == "open":
         try:
-            lineage = await crud.mark_publication_lineage_terminal(
+            lineage = await crud_lineages.mark_publication_lineage_terminal(
                 session,
                 lineage,
                 expected_version=lineage.version,
                 expected_head_sha=expected_head_sha,
                 state=remote_state,
             )
-        except crud.PublicationLineageConflict as exc:
+        except crud_errors.PublicationLineageConflict as exc:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 {"code": exc.code, "message": exc.message},
@@ -402,7 +415,7 @@ async def create_publication(
             path for paths in prior_paths for path in paths
         ] + data.changed_paths
         python_ci = factory_ci.python_ci_policy(settings, data.repo_full_name)
-        unselected = factory_ci._unselected_python_path(changed_paths, python_ci)
+        unselected = factory_ci.unselected_python_path(changed_paths, python_ci)
         if unselected is not None:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -411,7 +424,7 @@ async def create_publication(
                     "message": f"required Python CI does not select {unselected}",
                 },
             )
-        if factory_ci._python_paths(changed_paths):
+        if factory_ci.python_paths(changed_paths):
             try:
                 observations = await factory_progress.read_verification_observations(
                     session, data.work_item_request_id
@@ -479,7 +492,7 @@ async def create_publication(
             or data.title is None
             or data.body is None
         ):
-            raise crud.PublicationLineageConflict(
+            raise crud_errors.PublicationLineageConflict(
                 "publication.metadata_context_required",
                 "metadata-only publication requires a current factory observation",
             )
@@ -523,13 +536,13 @@ async def create_publication(
         ):
             raise PublicationPrecheckRefused
         if (metadata.title, metadata.body) == (data.title, data.body):
-            raise crud.PublicationLineageConflict(
+            raise crud_errors.PublicationLineageConflict(
                 "publication.no_change",
                 "neither files nor pull request metadata changed",
             )
 
     try:
-        publication, created = await crud.create_publication(
+        publication, created = await crud_publications.create_publication(
             session,
             data,
             patch=patch,
@@ -552,9 +565,9 @@ async def create_publication(
                 "message": "current pull request metadata could not be verified",
             },
         ) from exc
-    except crud.PublicationReplayConflict as exc:
+    except crud_errors.PublicationReplayConflict as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except crud.PublicationLineageConflict as exc:
+    except crud_errors.PublicationLineageConflict as exc:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             {"code": exc.code, "message": exc.message},
@@ -584,7 +597,7 @@ async def get_publication_lineage(
     session: SessionDep,
 ) -> PublicationLineageOut:
     try:
-        lineage = await crud.get_thread_publication_lineage(
+        lineage = await crud_lineages.get_thread_publication_lineage(
             session,
             deployment_id=deployment_id,
             conversation_id=conversation_id,
@@ -613,10 +626,10 @@ async def advance_publication_lineage(
 ) -> PublicationLineageOut:
     settings = get_settings()
     try:
-        publication = await crud.get_publication(session, publication_id)
+        publication = await crud_publication_queries.get_publication(session, publication_id)
         if publication is None or publication.lineage is None:
             raise LookupError("publication lineage not found")
-        conflict = crud.publication_lineage_outcome_conflict(
+        conflict = crud_lineages.publication_lineage_outcome_conflict(
             publication,
             publication.lineage,
             data,
@@ -630,7 +643,7 @@ async def advance_publication_lineage(
             settings,
             request.app.state.http_client,
         )
-        lineage = await crud.advance_publication_lineage(
+        lineage = await crud_lineages.advance_publication_lineage(
             session,
             publication_id,
             data,
@@ -672,7 +685,7 @@ async def advance_publication_lineage(
         ) from None
     except LookupError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except crud.PublicationLineageConflict as exc:
+    except crud_errors.PublicationLineageConflict as exc:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             {"code": exc.code, "message": exc.message},
@@ -708,13 +721,13 @@ async def _replay_held_review_feedback(
 
 @router.get("", response_model=list[PublicationOut])
 async def list_publications(session: SessionDep, limit: int = 100) -> list[PublicationOut]:
-    rows = await crud.list_publications(session, limit=min(max(limit, 1), 200))
+    rows = await crud_publication_queries.list_publications(session, limit=min(max(limit, 1), 200))
     return [PublicationOut.model_validate(row) for row in rows]
 
 
 @router.get("/{publication_id}", response_model=PublicationOut)
 async def get_publication(publication_id: uuid.UUID, session: SessionDep) -> PublicationOut:
-    publication = await crud.get_publication(session, publication_id)
+    publication = await crud_publication_queries.get_publication(session, publication_id)
     if publication is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "publication not found")
     return PublicationOut.model_validate(publication)
@@ -745,13 +758,13 @@ async def redeem_publication_credential(
     response: Response,
 ) -> RepositoryCredentialOut:
     response.headers["Cache-Control"] = "no-store"
-    publication = await crud.get_publication(session, publication_id)
+    publication = await crud_publication_queries.get_publication(session, publication_id)
     repo = publication.repo_full_name if publication is not None else None
     deployment_id = publication.deployment_id if publication is not None else None
 
     async def refused(code: int, detail: str | dict[str, str]) -> None:
         audit_detail = detail if isinstance(detail, str) else detail["message"]
-        await crud.append_credential_redemption_audit(
+        await crud_publications.append_credential_redemption_audit(
             session,
             purpose="publication_push",
             outcome="refused",
@@ -780,8 +793,8 @@ async def redeem_publication_credential(
             status.HTTP_409_CONFLICT,
             "publication must be approved before a write credential can be redeemed",
         )
-    deployment = await crud.get_deployment(session, publication.deployment_id)
-    approval = await crud.get_approval(session, publication.approval_id)
+    deployment = await crud_deployments.get_deployment(session, publication.deployment_id)
+    approval = await crud_approvals.get_approval(session, publication.approval_id)
     if deployment is None or approval is None:
         await refused(status.HTTP_409_CONFLICT, "publication workspace binding is absent")
     assert deployment is not None and approval is not None
@@ -798,7 +811,7 @@ async def redeem_publication_credential(
             "publication canonical workspace identity is absent",
         )
     assert workspace_conversation_id is not None
-    selected = await crud.get_thread_workspace(
+    selected = await crud_workspaces.get_thread_workspace(
         session,
         agent_id=deployment.agent_id,
         conversation_id=workspace_conversation_id,
@@ -813,7 +826,7 @@ async def redeem_publication_credential(
             status.HTTP_403_FORBIDDEN,
             "publication repository is no longer authorized for this thread",
         )
-    agent = await crud.get_agent(session, deployment.agent_id)
+    agent = await crud_agents.get_agent(session, deployment.agent_id)
     if not policy_still_authorizes(agent, approval):
         await refused(
             status.HTTP_409_CONFLICT,
@@ -822,7 +835,7 @@ async def redeem_publication_credential(
                 "message": "publication policy no longer authorizes this approval",
             },
         )
-    cancelled = await crud.publication_cancellation_conflict(
+    cancelled = await crud_publications.publication_cancellation_conflict(
         session,
         agent_id=deployment.agent_id,
         conversation_id=workspace_conversation_id,
@@ -837,7 +850,7 @@ async def redeem_publication_credential(
             resolve_repository_credential, repo, settings
         )
     except Exception as exc:
-        await crud.append_credential_redemption_audit(
+        await crud_publications.append_credential_redemption_audit(
             session,
             purpose="publication_push",
             outcome="refused",
@@ -851,7 +864,7 @@ async def redeem_publication_credential(
             "operator repository credential could not be resolved",
             headers={"Cache-Control": "no-store"},
         ) from exc
-    await crud.append_credential_redemption_audit(
+    await crud_publications.append_credential_redemption_audit(
         session,
         purpose="publication_push",
         outcome="issued",
@@ -913,9 +926,9 @@ async def reserve_review_revision(
 ) -> ReviewRevisionOut:
     response.headers["Cache-Control"] = "no-store"
     try:
-        row, lineage, created = await crud.reserve_review_revision(session, data)
+        row, lineage, created = await crud_lineages.reserve_review_revision(session, data)
         await session.commit()
-    except crud.PublicationLineageConflict as exc:
+    except crud_errors.PublicationLineageConflict as exc:
         await session.rollback()
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -938,7 +951,7 @@ async def cancel_review_revision(
 ) -> ReviewRevisionOut:
     response.headers["Cache-Control"] = "no-store"
     try:
-        row = await crud.cancel_review_revision(
+        row = await crud_lineages.cancel_review_revision(
             session,
             reservation_id,
             origin_key=data.origin_key,
@@ -956,7 +969,7 @@ async def cancel_review_revision(
             status.HTTP_404_NOT_FOUND,
             "review reservation not found",
         ) from None
-    except crud.PublicationLineageConflict as exc:
+    except crud_errors.PublicationLineageConflict as exc:
         await session.rollback()
         raise HTTPException(
             status.HTTP_409_CONFLICT,

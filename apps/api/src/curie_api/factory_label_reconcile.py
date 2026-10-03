@@ -30,6 +30,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.concurrency import run_in_threadpool
 
+from curie_api.workitems.lifecycle import GITHUB_CHANNEL_KIND
+
 from . import github_factory
 from .config import Settings
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
@@ -38,7 +40,6 @@ from .github_review_events import FeedbackIgnored, FeedbackUnavailable, human_se
 from .github_review_truth import get_github_json, github_headers
 from .models import Agent, AgentChannel
 from .repo_full_name import InvalidRepoFullName, normalize_repo_full_name, repo_url_path
-from .workitems import GITHUB_CHANNEL_KIND
 from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
@@ -48,14 +49,14 @@ _PER_PAGE = 100
 _MAX_PAGES = 50
 
 
-class _Unavailable(Exception):
+class Unavailable(Exception):
     """GitHub could not answer; try the repository again next pass."""
 
 
-async def _get_all(
+async def get_all(
     client: httpx.AsyncClient, *, api: str, token: str, path: str, params: dict[str, Any]
 ) -> list[Any]:
-    """Every page of one listing, in GitHub's order, or _Unavailable."""
+    """Every page of one listing, in GitHub's order, or Unavailable."""
 
     items: list[Any] = []
     for page in range(1, _MAX_PAGES + 1):
@@ -67,23 +68,23 @@ async def _get_all(
                 follow_redirects=False,
             )
         except httpx.HTTPError:
-            raise _Unavailable(path) from None
+            raise Unavailable(path) from None
         if response.status_code != 200:
-            raise _Unavailable(path)
+            raise Unavailable(path)
         try:
             result = response.json()
         except ValueError:
-            raise _Unavailable(path) from None
+            raise Unavailable(path) from None
         if not isinstance(result, list):
-            raise _Unavailable(path)
+            raise Unavailable(path)
         items.extend(result)
         if len(result) < _PER_PAGE:
             return items
     # A partial listing could hide the newest label event; decide nothing.
-    raise _Unavailable(path)
+    raise Unavailable(path)
 
 
-def _parse_time(value: Any) -> datetime | None:
+def parse_time(value: Any) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
@@ -93,7 +94,7 @@ def _parse_time(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
-def _last_label_event(events: list[Any], label: str) -> dict[str, Any] | None:
+def last_label_event(events: list[Any], label: str) -> dict[str, Any] | None:
     """The newest ``labeled`` event for this label, or None."""
 
     found: dict[str, Any] | None = None
@@ -121,7 +122,7 @@ def label_event_delivery_id(repository_id: int, issue_number: int, event_id: int
     )
 
 
-async def _bound_repositories(session: AsyncSession) -> list[str]:
+async def bound_repositories(session: AsyncSession) -> list[str]:
     rows = await session.scalars(
         select(AgentChannel.address)
         .join(Agent, Agent.id == AgentChannel.agent_id)
@@ -144,7 +145,7 @@ async def reconcile_missed_labels(
     """Admit labeled open issues with no WorkItem. Returns how many were admitted."""
 
     async with sessionmaker() as session:
-        repositories = await _bound_repositories(session)
+        repositories = await bound_repositories(session)
     admitted = 0
     for repository in repositories:
         try:
@@ -155,7 +156,7 @@ async def reconcile_missed_labels(
             continue
         try:
             admitted += await _reconcile_repository(sessionmaker, settings, client, repo, now)
-        except _Unavailable as exc:
+        except Unavailable as exc:
             logger.info("factory label reconcile for %s deferred: %s unavailable", repo, exc)
         except (GitHubAppError, GitHubInstallationRefused, ValueError):
             logger.info("factory label reconcile for %s deferred: no installation", repo)
@@ -180,8 +181,8 @@ async def _reconcile_repository(
     )
     repository_id = repository.get("id")
     if type(repository_id) is not int or repository_id <= 0:
-        raise _Unavailable(repo_path)
-    issues = await _get_all(
+        raise Unavailable(repo_path)
+    issues = await get_all(
         client,
         api=api,
         token=token,
@@ -208,20 +209,20 @@ async def _reconcile_repository(
     admitted = 0
     for number in missing:
         try:
-            events = await _get_all(
+            events = await get_all(
                 client,
                 api=api,
                 token=token,
                 path=f"{repo_path}/issues/{number}/events",
                 params={},
             )
-        except _Unavailable:
+        except Unavailable:
             # One unreadable issue must not hold up the rest of the repository.
             continue
-        event = _last_label_event(events, label)
+        event = last_label_event(events, label)
         if event is None or type(event.get("id")) is not int:
             continue
-        labeled_at = _parse_time(event.get("created_at"))
+        labeled_at = parse_time(event.get("created_at"))
         if labeled_at is None or labeled_at > now - grace:
             # A delivery may still be in flight; let it land first.
             continue

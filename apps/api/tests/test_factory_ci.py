@@ -20,7 +20,7 @@ from typing import Any
 import pytest
 from channel_protocol import work_item_events
 from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
-from curie_api import factory_ci, workitems
+from curie_api import factory_ci
 from curie_api.config import Settings
 from curie_api.workitem_outcomes import CiDetail
 from pydantic import ValidationError
@@ -155,14 +155,6 @@ def test_bounds_are_the_planned_constants() -> None:
     assert factory_ci.CI_MAX_ROUNDS == 3
     assert set(factory_ci.PERMANENT_UNREADABLE) == set(PERMANENT)
     assert set(factory_ci.TRANSIENT) == set(TRANSIENT)
-
-
-def test_ci_causes_match_the_literal_set_in_workitems() -> None:
-    assert factory_ci.CI_CAUSES == frozenset({"ci_failed", "ci_timeout", "ci_unverified"})
-    assert "ci_fix_unpublished" not in factory_ci.CI_CAUSES
-    source = inspect.getsource(workitems)
-    literal = re.search(r"\{\s*\"ci_failed\",\s*\"ci_timeout\",\s*\"ci_unverified\"\s*\}", source)
-    assert literal is not None, "workitems must keep the CI cause literal equal to CI_CAUSES"
 
 
 def test_continuation_event_id_is_the_worker_contract() -> None:
@@ -684,16 +676,16 @@ def test_an_outside_python_layout_never_reports_a_required_python_ci_reason(
 
 
 def test_without_a_policy_no_python_path_is_unselected() -> None:
-    assert factory_ci._unselected_python_path([_OUTSIDE_PATH], None) is None
-    assert factory_ci._unselected_python_path(["examples/coder/foo.py"], None) is None
+    assert factory_ci.unselected_python_path([_OUTSIDE_PATH], None) is None
+    assert factory_ci.unselected_python_path(["examples/coder/foo.py"], None) is None
 
 
 def test_the_curie_policy_still_refuses_an_unselected_path() -> None:
     assert (
-        factory_ci._unselected_python_path(["examples/coder/foo.py"], curie_python_ci())
+        factory_ci.unselected_python_path(["examples/coder/foo.py"], curie_python_ci())
         == "examples/coder/foo.py"
     )
-    assert factory_ci._unselected_python_path([_PYTHON_PATH], curie_python_ci()) is None
+    assert factory_ci.unselected_python_path([_PYTHON_PATH], curie_python_ci()) is None
     verdict = _decide(
         _detail(_actions_run(_PYTHON_AGGREGATE)),
         180,
@@ -709,11 +701,11 @@ def custom_python_ci() -> factory_ci.PythonCiPolicy:
 
 
 def test_a_custom_policy_selects_only_its_paths() -> None:
-    assert factory_ci._unselected_python_path(["src/widget.py"], custom_python_ci()) is None
-    assert factory_ci._unselected_python_path(["srcx/widget.py"], custom_python_ci()) == (
+    assert factory_ci.unselected_python_path(["src/widget.py"], custom_python_ci()) is None
+    assert factory_ci.unselected_python_path(["srcx/widget.py"], custom_python_ci()) == (
         "srcx/widget.py"
     )
-    assert factory_ci._unselected_python_path([_PYTHON_PATH], custom_python_ci()) == _PYTHON_PATH
+    assert factory_ci.unselected_python_path([_PYTHON_PATH], custom_python_ci()) == _PYTHON_PATH
 
 
 def test_a_custom_policy_requires_its_own_check_name() -> None:

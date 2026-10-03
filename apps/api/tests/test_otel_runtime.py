@@ -358,7 +358,7 @@ def test_sweeper_failure_reports_age_since_prior_success_not_pass_duration(
 
         monkeypatch.setattr(sweeper_module, "sweep_expired_approvals", sweep)
         monkeypatch.setattr(
-            sweeper_module.crud,
+            sweeper_module.crud_publications,
             "reap_terminal_publication_patches",
             reap_terminal_publication_patches,
         )

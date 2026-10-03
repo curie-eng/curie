@@ -8,12 +8,7 @@ from typing import cast
 import pytest
 from curie_runner import CLAUDE_READONLY_TOOLS
 from curie_runner.harness.claude import CLAUDE_CONTRIBUTION
-from curie_runner.harness.contribution import (
-    AuthSpec,
-    BundleCompileResult,
-    HarnessContribution,
-    InstallSpec,
-)
+from curie_runner.harness.contribution import BundleCompileResult, HarnessContribution
 from curie_runner.harness.registry import (
     BUILTIN_HARNESS_CANONICAL_PATHS,
     ENTRY_POINT_GROUP,
@@ -51,11 +46,7 @@ def _fake_contribution(name: str, aliases: frozenset[str]) -> HarnessContributio
     return HarnessContribution(
         name=name,
         aliases=aliases,
-        image="fake-runner",
-        install=InstallSpec(),
-        auth=AuthSpec(credential_env_keys=(), oauth_token_prefix=None),
         readonly_tools=frozenset(),
-        model_override_env_keys=(),
         build_spawn_env=lambda env: None,
         compile_bundle=lambda plugin_dir: BundleCompileResult(plugins=[], system_prompt=None),
     )

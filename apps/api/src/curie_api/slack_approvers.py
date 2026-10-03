@@ -36,6 +36,9 @@ import httpx
 from aci_protocol.turn import DEFAULT_IDENTITY, slack_speaking_identity
 from pydantic import ValidationError
 
+from curie_api.schemas.approvals import ApprovalApprovers
+from curie_api.schemas.channels import EMAIL_KIND
+
 from .approvers import (
     ApproverSet,
     EmailApprovers,
@@ -49,7 +52,6 @@ from .approvers import (
 from .config import Settings
 from .identities import slack_bot_tokens
 from .models import Approval
-from .schemas import EMAIL_KIND, ApprovalApprovers
 from .slack_usergroups import SlackUserGroupClient
 from .usergroups import GroupMembershipSource, UserGroupLookupError
 
@@ -277,7 +279,7 @@ class SlackApproverSetSelector:
                 # ``binding is None`` and not ``not binding``: a route bound to
                 # ``{}`` is BOUND, the operator just declared nothing, and only
                 # ``None`` is absence. The truthiness test on ``approval.route``
-                # is deliberate too -- ``crud.get_approval_route_binding``
+                # is deliberate too -- ``crud.approvals.get_approval_route_binding``
                 # returns early on ``not approval.route``, so keying on
                 # ``is not None`` here would refuse a ``route=""`` approval that
                 # crud has already classified as routeless.

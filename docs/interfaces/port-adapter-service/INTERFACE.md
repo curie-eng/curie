@@ -88,7 +88,7 @@ generic endpoints as a plugin API:
 - **Binding and reply-route facts are server controlled.** A binding is the
   neutral `{kind, address}` pair (`ChannelBinding`) on `AgentChannel`; its write
   form also records the paired `endpoint` and `adapter` facts an operator sets at
-  bind time (`apps/api/src/curie_api/schemas.py::ChannelBindingWrite`). The
+  bind time (`apps/api/src/curie_api/schemas/channels.py::ChannelBindingWrite`). The
   generic reply edge receives neither route fact from adapter input. The worker
   builds its local `TargetRoute` from the resolved binding or a server-minted
   reply handle.
@@ -199,7 +199,7 @@ service is material:
 - **Fixed (#1459, ADR-0096) — authenticated ingress and the binding surface.**
   The agents table used to carry a literal `slack_channel` column and the API's
   validators rejected non-Slack-shaped ids. The neutral binding is now a
-  `{kind, address}` pair (`apps/api/src/curie_api/schemas.py::ChannelBinding`) on
+  `{kind, address}` pair (`apps/api/src/curie_api/schemas/channels.py::ChannelBinding`) on
   `AgentChannel`, and the channel router validates a scoped token against that
   binding's row id and generation before it enqueues a turn. The route facts
   (`endpoint`, `adapter`) come from the binding row rather than ingress input.

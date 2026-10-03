@@ -683,19 +683,19 @@ def _reconcile() -> None:
 def _reconcile_later(seconds: int) -> None:
     """Advance only the reconciler clock. Stored deadlines stay write-once."""
 
-    import curie_api.workitems as workitems
+    import curie_api.workitems.lifecycle as workitems
 
-    original = workitems._database_now
+    original = workitems.database_now
 
     async def later(session: AsyncSession) -> Any:
         real = await original(session)
         return real + timedelta(seconds=seconds)
 
-    workitems._database_now = later
+    workitems.database_now = later
     try:
         _reconcile()
     finally:
-        workitems._database_now = original
+        workitems.database_now = original
 
 
 def _observe_termination(client: Any, request_id: uuid.UUID) -> None:

@@ -12,13 +12,13 @@ session resumes down its timeout branch (ADR-0003) and the channel placeholder
 updates.
 
 Concurrency and idempotency (why unattended sweeping is safe): the flip is
-``crud.expire_approval``'s conditional UPDATE guarded on ``status = pending``, so
+``crud.approvals.expire_approval``'s conditional UPDATE guarded on ``status = pending``, so
 for one record exactly one writer wins -- one replica's sweeper, or a racing
 resolver -- and every loser gets None back and neither audits nor enqueues. This
 pending-guarded CAS is what guarantees a single wakeup: only the flip winner
 ever enqueues.
 
-A successful enqueue is recorded with ``crud.mark_approval_resumed`` (#418), the
+A successful enqueue is recorded with ``crud.approvals.mark_approval_resumed`` (#418), the
 same enqueue-first-then-mark ordering the resolve path uses: a NULL
 ``resumed_at`` on a flipped record means the wake never reached the stream, and
 the resume reconciler (#411) re-enqueues it past its grace horizon. That is the
@@ -49,7 +49,9 @@ from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import crud
+from curie_api.crud import approvals as crud_approvals
+from curie_api.crud import publications as crud_publications
+
 from .config import get_settings
 from .resumequeue import (
     ResumeQueue,
@@ -67,7 +69,7 @@ async def observe_pending_approvals(
     """Publish authoritative fleet inventory; observation never gates a sweep."""
 
     try:
-        count, oldest = await crud.pending_approval_inventory(session)
+        count, oldest = await crud_approvals.pending_approval_inventory(session)
     except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         logger.warning("pending approval telemetry observation failed (%s)", type(exc).__name__)
         return
@@ -107,7 +109,7 @@ async def sweep_expired_approvals(
     """
 
     now = now or datetime.now(UTC).replace(tzinfo=None)
-    lapsed = await crud.list_expired_pending_approvals(session, now=now, limit=limit)
+    lapsed = await crud_approvals.list_expired_pending_approvals(session, now=now, limit=limit)
     # Read ids and private parents into plain values up front: the per-record
     # rollback below expires every ORM instance in this shared session, so
     # reading record fields lazily in a later iteration would trigger an
@@ -128,12 +130,12 @@ async def sweep_expired_approvals(
                     "operation": "expire",
                 },
             ):
-                expired = await crud.expire_approval(session, approval_id)
+                expired = await crud_approvals.expire_approval(session, approval_id)
             if expired is None:
                 # A concurrent resolver or another replica's sweeper won the CAS;
                 # the winner owns the audit and enqueue. No side effects here.
                 continue
-            await crud.append_approval_audit(
+            await crud_approvals.append_approval_audit(
                 session,
                 approval_id=expired.id,
                 action="expired",
@@ -154,7 +156,7 @@ async def sweep_expired_approvals(
             # Enqueue-first-then-mark: only a wake that actually reached the
             # stream is written off. The mark's ``resumed_at IS NULL`` guard
             # makes a race with the reconciler a no-op rather than a conflict.
-            await crud.mark_approval_resumed(session, expired.id)
+            await crud_approvals.mark_approval_resumed(session, expired.id)
             record_metric(
                 "curie.approval.lifecycle",
                 attributes={
@@ -244,7 +246,7 @@ async def run_expiry_sweeper(
             try:
                 async with sessionmaker() as session:
                     await sweep_expired_approvals(session, resume_queue)
-                    await crud.reap_terminal_publication_patches(
+                    await crud_publications.reap_terminal_publication_patches(
                         session,
                         terminal_before=datetime.now(UTC).replace(tzinfo=None)
                         - timedelta(seconds=publication_patch_retention_seconds),

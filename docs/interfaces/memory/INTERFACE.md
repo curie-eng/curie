@@ -208,7 +208,7 @@ change.
   runner's `runner/src/curie_runner/memory.py::MEMORY_LOG_KEY`), re-declares the
   `{content, provenance}` item shape in
   `apps/api/src/curie_api/routers/memory.py::_records_of`, and borrows the state
-  router's size caps (`apps/api/src/curie_api/routers/state.py::_enforce_caps`).
+  router's size caps (`apps/api/src/curie_api/routers/state.py::enforce_caps`).
   Its consumers are the CLI (`cli/src/api.rs`, behind `curie local memory` /
   `curie local memory --add` and `curie cluster memory` /
   `curie cluster memory --add`) and the console (`apps/ui/src/api/client.ts`). Unlike

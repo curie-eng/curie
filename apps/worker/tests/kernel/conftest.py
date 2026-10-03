@@ -18,8 +18,8 @@ import os
 import socket
 import threading
 import uuid
-from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -54,12 +54,12 @@ from curie_worker.config import WorkerConfig
 from curie_worker.kernel.core import Kernel
 from curie_worker.markers import Markers
 from curie_worker.reply_sink import TargetRoute
+from curie_worker.run import _substrate_config
 from curie_worker.runner_client import RunnerClient
 from curie_worker.sandbox import (
     AffinityStore,
     QuotaRejection,
     SandboxSubstrate,
-    SubstrateConfig,
 )
 from curie_worker.sandbox.types import ClaimView, SandboxView
 from curie_worker.threadlock import ThreadLock
@@ -449,6 +449,7 @@ class FakeK8s:
     unschedulable_message: str | None = None
     termination: Any | None = None
     termination_queries: list[str] = field(default_factory=list)
+    template_reaps: list[tuple[set[str], datetime]] = field(default_factory=list)
     # OPT-IN per-sandbox runner ports, pre-started by the harness fixture (see
     # ``per_sandbox_runners``). Empty (the default) is the shared-runner world
     # every existing test lives in: every sandbox gets ``port=None`` and dials
@@ -550,6 +551,10 @@ class FakeK8s:
                 assert view is not None
                 out.append(view)
         return out
+
+    def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
+        self.template_reaps.append((set(keep), created_before))
+        return []
 
     def get_sandbox(
         self, name: str, *, request_timeout_seconds: float
@@ -1014,6 +1019,7 @@ async def kernel_harness(
     sink: object | None = None,
     runner_app: web.Application | None = None,
     claim_timeout_seconds: float = 3.0,
+    substrate_env: Mapping[str, str] | None = None,
     per_sandbox_runners: int = 0,
     hook_runs: object | None = None,
     sibling_limit_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
@@ -1076,11 +1082,11 @@ async def kernel_harness(
             pressure_client=pressure_async_redis,
             key_prefix=names["sandbox_prefix"],
         ),
-        SubstrateConfig(
+        replace(
+            _substrate_config({"CURIE_ROUTE_TTL_SECONDS": "60", **(substrate_env or {})}),
             namespace="test-ns",
             warm_pool="test-pool",
             runner_port=fleet_port,
-            route_ttl_seconds=60,
             claim_timeout_seconds=claim_timeout_seconds,
             poll_interval_seconds=0.005,
             key_prefix=names["sandbox_prefix"],
@@ -1127,6 +1133,8 @@ async def kernel_harness(
             workspace_factory(substrate) if workspace_factory else None
         ),  # type: ignore[arg-type]
         card_store=card_store,
+        route_ttl_seconds=substrate._config.route_ttl_seconds,
+        suspended_route_ttl_seconds=substrate._config.suspended_route_ttl_seconds,
         **({"hook_runs": hook_runs} if hook_runs is not None else {}),
         **(
             {"sibling_limit": sibling_limit_factory(async_redis, config)}

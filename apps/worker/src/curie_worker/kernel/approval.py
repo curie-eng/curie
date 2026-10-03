@@ -944,7 +944,7 @@ async def _pause_for_approval(
     # own transport. A route-bound channel has no such thread and is policy,
     # not a per-turn reply: it posts top-level over the worker's configured
     # Slack transport, because ``ApprovalRouteBinding.resolution`` is
-    # Slack-only by construction (``schemas.py`` validates the explicit
+    # Slack-only by construction (``schemas.approvals`` validates the explicit
     # pair), and the authorizer proves membership of that channel through a
     # verified Slack card click. Notification transport never feeds this
     # comparison or these route fields.

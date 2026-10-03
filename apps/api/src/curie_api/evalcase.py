@@ -21,7 +21,7 @@ import json
 import re
 from typing import Any
 
-from .schemas import EvalCaseOut, GraderOut
+from curie_api.schemas.evals import EvalCaseOut, GraderOut
 
 # The expected-output snippet is capped so a promoted grader keys off a salient
 # line rather than an entire multi-paragraph answer (which would rarely match on

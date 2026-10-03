@@ -31,8 +31,8 @@ from collections.abc import Callable
 from typing import Any
 
 import asyncpg
-from curie_api import crud
 from curie_api.config import get_settings
+from curie_api.crud import channels as crud_channels
 from sqlalchemy import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -272,7 +272,7 @@ def test_the_conflict_lookup_runs_with_the_row_locks_still_held(
     mover = _create_agent(client, auth_headers, "savepoint-mover", "C0EXAMPLE1")
     _create_agent(client, auth_headers, "savepoint-owner", "C0EXAMPLE2")
     observed: list[str] = []
-    real: Callable[..., Any] = crud.agent_id_for_route
+    real: Callable[..., Any] = crud_channels.agent_id_for_route
 
     async def probe_then_answer(
         session: AsyncSession, kind: str, adapter: str | None, address: str
@@ -288,7 +288,7 @@ def test_the_conflict_lookup_runs_with_the_row_locks_still_held(
         answer: uuid.UUID | None = await real(session, kind, adapter, address)
         return answer
 
-    monkeypatch.setattr(crud, "agent_id_for_route", probe_then_answer)
+    monkeypatch.setattr(crud_channels, "agent_id_for_route", probe_then_answer)
 
     refused = client.patch(
         f"/agents/{mover}/channels",

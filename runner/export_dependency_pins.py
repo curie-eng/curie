@@ -1,4 +1,9 @@
-"""Export the runner's recursive registry dependency closure from uv.lock."""
+"""Export the runner's recursive registry dependency closure from uv.lock.
+
+Each line is `name==version [; marker] --hash=sha256:...` with every wheel and
+sdist hash the lock records, for `pip install --require-hashes`. A registry
+record without valid sha256 hashes is refused.
+"""
 
 from __future__ import annotations
 
@@ -32,6 +37,32 @@ def _package_name(package: dict[str, Any], context: str) -> str:
     return normalized
 
 
+_SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def _registry_hashes(package: dict[str, Any], name: str) -> list[str]:
+    """Return the sorted, unique sha256 of every wheel and sdist of a package."""
+    records: list[Any] = []
+    wheels = package.get("wheels", [])
+    if not isinstance(wheels, list):
+        raise InvalidLock(f"uv.lock registry package {name} wheels must be a list")
+    records.extend(wheels)
+    if "sdist" in package:
+        records.append(package["sdist"])
+
+    hashes: set[str] = set()
+    for record in records:
+        value = record.get("hash") if isinstance(record, dict) else None
+        if not isinstance(value, str) or not _SHA256.fullmatch(value):
+            raise InvalidLock(
+                f"uv.lock registry package {name} has a malformed sha256 hash"
+            )
+        hashes.add(value)
+    if not hashes:
+        raise InvalidLock(f"uv.lock registry package {name} must record hashes")
+    return sorted(hashes)
+
+
 def _runner_dependency_pins(lock: dict[str, Any]) -> list[str]:
     packages = _require_package_records(lock)
     package_by_name: dict[str, dict[str, Any]] = {}
@@ -46,6 +77,7 @@ def _runner_dependency_pins(lock: dict[str, Any]) -> list[str]:
         raise InvalidLock("uv.lock must contain exactly one curie-runner record")
 
     pins: dict[str, str] = {}
+    pin_hashes: dict[str, list[str]] = {}
     reachable_conditions: dict[str, set[frozenset[str]]] = {}
     traversed_states: dict[
         str, set[tuple[frozenset[str], frozenset[str]]]
@@ -90,6 +122,7 @@ def _runner_dependency_pins(lock: dict[str, Any]) -> list[str]:
                     f"uv.lock registry package {name} must declare a version"
                 )
             pins[name] = version
+            pin_hashes[name] = _registry_hashes(package, name)
 
         def visit_dependencies(
             dependencies: Any, dependency_context: str
@@ -174,8 +207,9 @@ def _runner_dependency_pins(lock: dict[str, Any]) -> list[str]:
     requirements: list[str] = []
     for name, version in sorted(pins.items()):
         conditions = reachable_conditions[name]
+        hash_options = "".join(f" --hash={value}" for value in pin_hashes[name])
         if frozenset() in conditions:
-            requirements.append(f"{name}=={version}")
+            requirements.append(f"{name}=={version}{hash_options}")
             continue
 
         path_markers: list[str] = []
@@ -192,7 +226,7 @@ def _runner_dependency_pins(lock: dict[str, Any]) -> list[str]:
             combined_marker = " or ".join(
                 f"({path_marker})" for path_marker in path_markers
             )
-        requirements.append(f"{name}=={version} ; {combined_marker}")
+        requirements.append(f"{name}=={version} ; {combined_marker}{hash_options}")
 
     return requirements
 

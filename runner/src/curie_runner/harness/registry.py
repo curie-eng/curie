@@ -102,6 +102,10 @@ class UnknownHarnessError(RuntimeError):
     """Raised when a requested harness name (or alias) is not registered."""
 
 
+class UnsupportedHarnessError(RuntimeError):
+    """Raised when runner boot selects a harness Curie does not support."""
+
+
 def _check_guards(ep: EntryPoint) -> None:
     module_path = ep.value.split(":", 1)[0]
     if "." not in module_path:

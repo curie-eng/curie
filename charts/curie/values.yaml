@@ -122,6 +122,11 @@ e2eConnector:
   workerClusterRole: ""
   ttlSeconds: 3600
   podSecurity: baseline
+  # How often the worker's reaper (#3245) deletes namespaces past their TTL or
+  # whose run has finished. Enabling e2eConnector needs
+  # worker.connectorReconciler.enabled: the reaper reads the kubeconfig from
+  # the connector Secret through the reconciler's Secret list grant.
+  reaperIntervalSeconds: 60
 
 # ---------------------------------------------------------------------------
 # PriorityClass (ADR-0059 decision 5): ranks the platform -- worker, api,
@@ -1143,16 +1148,16 @@ grafanaConnector:
 #   - ui         static React SPA served by nginx, proxying /api to the API
 #
 # IMAGE DEFAULTS: every app image defaults to the GHCR package the Release
-# workflow publishes. The `tag` is left EMPTY so it resolves to the chart
-# `appVersion` (see Chart.yaml) -- an immutable, per-release version tag rather
-# than the mutable `latest`. That makes installs deterministic and rollback-able:
-# the same chart version always renders the same image ref (`helm template` shows
-# `...-api:<appVersion>`, not `:latest`). For the strongest guarantee set `digest`
-# to a `sha256:...` content digest instead (it wins over `tag` and pins by digest,
-# verifiable via `cosign verify-attestation` / `gh attestation verify`); the
-# Release workflow prints each published image's digest. `pullPolicy: Always` on
-# an immutable ref is a cheap no-op that still self-heals a node that cached a
-# same-named ref, so it is kept.
+# workflow publishes. In this source tree `tag` is left EMPTY so it resolves to
+# the chart `appVersion` (see Chart.yaml) -- an immutable, per-release version
+# tag rather than the mutable `latest`. The released chart asset differs: it
+# ships each first-party image's `digest` set to the signed index digest that
+# release built. `digest` wins over `tag`, so to run a different tag from the
+# released chart, clear that image's digest too (for example
+# `--set api.image.tag=X --set api.image.digest=`). Verify signatures and
+# attestations as described in docs/release-verification.md.
+# `pullPolicy: Always` on an immutable ref is a cheap no-op that still
+# self-heals a node that cached a same-named ref, so it is kept.
 # The repo and its packages are public, so NO imagePullSecret is needed by
 # default; the `imagePullSecrets` plumbing stays for private forks. For offline
 # dev/e2e use values-dev.yaml, which repoints each image at a locally-built,
@@ -2802,6 +2807,9 @@ agentSandbox:
     serviceAccount:
       create: true
       # The runner does not call the K8s API, so its token is not mounted.
+      # Must stay false: the chart refuses any other value at render, and runner
+      # template admission refuses a worker-written template that mounts a
+      # ServiceAccount token (#3842).
       automountToken: false
       # Extra annotations on the runner ServiceAccount. The key-free object
       # store path (#1325) binds the bundle-fetch IAM role here, e.g.
@@ -2812,7 +2820,18 @@ agentSandbox:
       # Scope that role to the bundle bucket, read-only: NetworkPolicy selects
       # pods and not containers, so an identity the bundle-fetch init container
       # can reach is also reachable by the runner, which is prompt-injectable.
+      # The chart refuses a role ARN equal to the api, worker, or langfuse
+      # ServiceAccount's role ARN (#3842). It cannot see the role's IAM policy
+      # or an EKS Pod Identity association, so scoping the role stays yours.
       annotations: {}
+    # Runner template admission (#3842). The worker's SandboxTemplate writes are
+    # admitted only with images the chart itself renders into a runner template:
+    # the runner image, each agentSandbox.runnerImages digest, and the
+    # bundleFetch images when bundleFetch is enabled. List any other image the
+    # worker may write here. Each entry must match ^[A-Za-z0-9][A-Za-z0-9._/:@-]*$
+    # or the render fails naming this key.
+    admission:
+      extraImages: []
 
 # ---------------------------------------------------------------------------
 # Security rails. The four security-boundary rails shipped ON by default. They
@@ -2846,12 +2865,28 @@ security:
     # (169.254.169.254, fd00:ec2::254). `except: []` is refused, an explicit
     # except must cover those addresses, and an IPv4-mapped range such as
     # ::ffff:0:0/96 is refused because no except can carve it.
+    # Every entry (and every BYO egress list) also excepts each private range it
+    # STRICTLY contains: 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16,
+    # 172.16.0.0/12, 192.168.0.0/16, fc00::/7, fe80::/10 and the clusterCidrs
+    # below (#3842). So 0.0.0.0/0 on 443 reaches public model APIs but not pods,
+    # Services or VPC hosts. To let the runner reach a private peer (a private
+    # model endpoint, say), list its narrow CIDR as its own entry, e.g.
+    # 10.20.0.5/32: an entry equal to or inside a private range gets no private
+    # except, and NetworkPolicy allows are additive.
     allowedEgress: []
     #  - cidr: 160.79.104.0/23           # e.g. api.anthropic.com
     #    ports: [{ protocol: TCP, port: 443 }]
-    # Also restrict ingress to the runner ACI port from inside the cluster. The
-    # worker dials the claimed sandbox, so ingress is allowed from the release
-    # namespace only. Egress policies do not affect ingress; this adds the lock.
+    # Pod and Service CIDRs that sit OUTSIDE the private ranges above (for
+    # example a cluster using 198.18.0.0/15 or public space for pods). Every
+    # broad runner route that strictly contains one excepts it, like the
+    # built-in private ranges. Each entry must be a valid IPv4 or IPv6 CIDR with
+    # prefix 1 or longer, not IPv4-mapped. Empty by default: most clusters use
+    # private pod and Service ranges already covered.
+    clusterCidrs: []
+    # Also restrict ingress to the runner ACI port from inside the cluster. Only
+    # this release's worker pods dial the claimed sandbox, so ingress is allowed
+    # from those pods only (#3842). Egress policies do not affect ingress; this
+    # adds the lock.
     lockIngress: true
   # Rail: default-deny ingress + scoped-allow around the data tier (Postgres,
   # RustFS, ClickHouse, Valkey). The backing stores hold every credential and all

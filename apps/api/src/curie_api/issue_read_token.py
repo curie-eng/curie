@@ -15,7 +15,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .sandbox_token import _b64url, _b64url_decode, _signature
+from curie_api import sandbox_token
+from curie_api.sandbox_token import b64url, b64url_decode
 
 _PREFIX = "wir"
 
@@ -39,8 +40,8 @@ def mint(api_key: str, claims: IssueReadClaims) -> str:
     payload = json.dumps(
         claims.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
     ).encode()
-    signed = f"{_PREFIX}.{_b64url(payload)}"
-    return f"{signed}.{_signature(api_key, signed)}"
+    signed = f"{_PREFIX}.{b64url(payload)}"
+    return f"{signed}.{sandbox_token.signature(api_key, signed)}"
 
 
 def verify_claims(token: str, api_key: str) -> IssueReadClaims | None:
@@ -51,10 +52,10 @@ def verify_claims(token: str, api_key: str) -> IssueReadClaims | None:
     try:
         prefix, payload, signature = token.split(".")
         if prefix != _PREFIX or not hmac.compare_digest(
-            signature, _signature(api_key, f"{prefix}.{payload}")
+            signature, sandbox_token.signature(api_key, f"{prefix}.{payload}")
         ):
             return None
-        claims = IssueReadClaims.model_validate_json(_b64url_decode(payload))
+        claims = IssueReadClaims.model_validate_json(b64url_decode(payload))
     except (ValueError, TypeError, ValidationError):
         return None
     now = time.time()

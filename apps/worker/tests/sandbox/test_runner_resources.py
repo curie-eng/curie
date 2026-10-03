@@ -33,18 +33,27 @@ gate the client applies to a name before it is recorded.
 
 from __future__ import annotations
 
+import asyncio
 import copy
-from collections.abc import Iterator
+import json
+import os
+import uuid
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
-from curie_worker.binding import _RESOLVE_AGENT_SQL, _RESOLVE_SQL
+from curie_test_support.postgres import pg_connect_or_skip
+from curie_worker.binding import BindingResolver
+from curie_worker.config import WorkerConfig
 from curie_worker.sandbox.docker import RunnerHardening
 from curie_worker.sandbox.resources import (
     docker_limit_args,
     prepare_resources_claim,
     resources_object_name,
 )
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 _AGENT = "acme-a"
 _OVERRIDE: dict[str, Any] = {
@@ -370,26 +379,104 @@ def test_second_override_updates_the_worker_template_and_records_no_sandbox() ->
     assert "sandbox" not in set(_keys(warm_pools))
 
 
-def test_model_settings_for_selects_runner_resources() -> None:
-    import inspect
+@asynccontextmanager
+async def _resource_binding() -> AsyncIterator[
+    tuple[BindingResolver, AsyncEngine, str, uuid.UUID]
+]:
+    source_schema = os.environ.get("TEST_DB_SCHEMA", "curie")
+    schema = f"resource_binding_{uuid.uuid4().hex}"
+    engine = create_async_engine(
+        os.environ.get(
+            "TEST_DATABASE_URL",
+            "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres",
+        )
+    )
+    agent_id, version_id, deployment_id = (uuid.uuid4() for _ in range(3))
+    schema_created = False
+    try:
+        await pg_connect_or_skip(engine)
+        async with engine.begin() as conn:
+            await conn.execute(text(f"CREATE SCHEMA {schema}"))
+            for table in ("agents", "agent_channels", "agent_versions", "deployments"):
+                await conn.execute(
+                    text(
+                        f"CREATE TABLE {schema}.{table} "
+                        f"(LIKE {source_schema}.{table} INCLUDING DEFAULTS)"
+                    )
+                )
+            await conn.execute(
+                text(
+                    f"INSERT INTO {schema}.agents (id, name, model, thinking, runner_resources) "
+                    "VALUES (:id, 'acme-resource-test', 'acme-model', 'high', "
+                    "CAST(:resources AS jsonb))"
+                ),
+                {"id": agent_id, "resources": json.dumps(_OVERRIDE)},
+            )
+            await conn.execute(
+                text(
+                    f"INSERT INTO {schema}.agent_versions "
+                    "(id, agent_id, version_label, bundle_ref, created_by) "
+                    "VALUES (:id, :agent_id, 'v1', 's3://bundles/acme.tar.gz', 'test')"
+                ),
+                {"id": version_id, "agent_id": agent_id},
+            )
+            await conn.execute(
+                text(
+                    f"INSERT INTO {schema}.deployments "
+                    "(id, agent_id, version_id, environment, status) "
+                    "VALUES (:id, :agent_id, :version_id, 'dev', 'active')"
+                ),
+                {"id": deployment_id, "agent_id": agent_id, "version_id": version_id},
+            )
+            await conn.execute(
+                text(
+                    f"INSERT INTO {schema}.agent_channels (id, agent_id, kind, address, adapter) "
+                    "VALUES (:id, :agent_id, 'slack', 'C0EXAMPLE1', 'default')"
+                ),
+                {"id": uuid.uuid4(), "agent_id": agent_id},
+            )
+        schema_created = True
+        yield BindingResolver(engine, WorkerConfig(db_schema=schema)), engine, schema, agent_id
+    finally:
+        try:
+            if schema_created:
+                async with engine.begin() as conn:
+                    await conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        finally:
+            await engine.dispose()
 
-    from curie_worker.binding import BindingResolver
 
-    source = inspect.getsource(BindingResolver.model_settings_for)
-    assert "runner_resources" in source
+def test_agent_resource_reads_return_the_stored_override_and_null_default() -> None:
+    async def go() -> None:
+        async with _resource_binding() as (resolver, engine, schema, agent_id):
+            assert await resolver.model_settings_for(agent_id) == (
+                "acme-model", "high", _OVERRIDE
+            )
+            assert await resolver.runner_resources_for(agent_id) == _OVERRIDE
+            assert await resolver.model_settings_for(uuid.uuid4()) == (None, None, None)
+            assert await resolver.runner_resources_for(uuid.uuid4()) is None
+            async with engine.begin() as conn:
+                await conn.execute(text(f"UPDATE {schema}.agents SET runner_resources = NULL"))
+            assert await resolver.model_settings_for(agent_id) == ("acme-model", "high", None)
+            assert await resolver.runner_resources_for(agent_id) is None
+
+    asyncio.run(go())
 
 
-def test_runner_resources_are_read_apart_from_deployment_resolution() -> None:
-    # Resolution SQL stays runnable on schemas that predate the column.
-    # The claim path reads the override through runner_resources_for.
-    import inspect
+def test_deployment_resolution_works_without_the_resource_override_column() -> None:
+    async def go() -> None:
+        async with _resource_binding() as (resolver, engine, schema, agent_id):
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(f"ALTER TABLE {schema}.agents DROP COLUMN runner_resources")
+                )
+            bound = await resolver.resolve("slack", "default", "C0EXAMPLE1")
+            targetless = await resolver.resolve_agent(agent_id)
+            assert bound is not None and targetless is not None
+            assert bound.agent_id == targetless.agent_id == agent_id
+            assert bound.bundle_ref == targetless.bundle_ref == "s3://bundles/acme.tar.gz"
 
-    from curie_worker.binding import BindingResolver
-
-    assert "a.runner_resources" not in _RESOLVE_SQL
-    assert "a.runner_resources" not in _RESOLVE_AGENT_SQL
-    source = inspect.getsource(BindingResolver.runner_resources_for)
-    assert "runner_resources" in source
+    asyncio.run(go())
 
 
 def test_docker_limit_args_uses_the_hardening_defaults_when_resources_are_absent() -> None:

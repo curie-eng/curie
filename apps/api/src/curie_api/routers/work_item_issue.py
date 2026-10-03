@@ -8,6 +8,14 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+from curie_api.schemas.workitems import (
+    IssueReadComment,
+    IssueReadContext,
+    IssueReadContextMint,
+    IssueReadRequest,
+    IssueReadResult,
+)
+
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import SessionDep
@@ -20,13 +28,6 @@ from ..issue_read import (
     read_issue_authority,
 )
 from ..issue_read_token import IssueReadClaims, mint, verify_claims
-from ..schemas import (
-    IssueReadComment,
-    IssueReadContext,
-    IssueReadContextMint,
-    IssueReadRequest,
-    IssueReadResult,
-)
 
 router = APIRouter(prefix="/work-items", tags=["work-items"])
 internal_router = APIRouter(prefix="/v1/internal/work-items", tags=["internal-work-items"])

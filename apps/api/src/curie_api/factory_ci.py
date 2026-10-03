@@ -20,7 +20,7 @@ decides with the pure ``decide``:
   request with a ``Could not complete:`` notice. Unreadable CI is never success.
 
 No network call runs under a row lock. Every write is fenced to the observed
-publication and head (``workitems.settle_ci_verdict`` / ``hold_for_ci_fix``),
+publication and head (``workitems.lifecycle.settle_ci_verdict`` / ``hold_for_ci_fix``),
 and a Valkey claim keeps each round to at most one continuation.
 """
 
@@ -47,7 +47,9 @@ from curie_telemetry.redact import redact_text
 from sqlalchemy import TIMESTAMP, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import factory_progress, workitem_outcomes, workitems
+from curie_api.workitems import lifecycle
+
+from . import factory_progress, workitem_outcomes
 from .config import Settings
 from .models import ExecutionRequest, Publication, ThreadPublicationLineage, WorkItem
 from .repo_full_name import entry_for_repo, repo_url_path
@@ -267,11 +269,11 @@ def _matches_path_prefix(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(f"{prefix}/")
 
 
-def _python_paths(changed_paths: Sequence[str]) -> list[str]:
+def python_paths(changed_paths: Sequence[str]) -> list[str]:
     return [path for path in changed_paths if path.endswith(".py")]
 
 
-def _unselected_python_path(
+def unselected_python_path(
     changed_paths: Sequence[str], policy: PythonCiPolicy | None
 ) -> str | None:
     """The first Python path the repository's required CI does not select.
@@ -284,7 +286,7 @@ def _unselected_python_path(
     return next(
         (
             path
-            for path in _python_paths(changed_paths)
+            for path in python_paths(changed_paths)
             if not any(_matches_path_prefix(path, prefix) for prefix in policy.paths)
         ),
         None,
@@ -356,13 +358,13 @@ def decide(
     Python change on the repository's own checks like any other change.
     """
 
-    unselected_path = _unselected_python_path(changed_paths, python_ci)
+    unselected_path = unselected_python_path(changed_paths, python_ci)
     if unselected_path is not None:
         return Verdict(
             kind="unverified",
             reason=f"required_python_ci_unselected: {unselected_path}",
         )
-    requires_python_ci = python_ci is not None and bool(_python_paths(changed_paths))
+    requires_python_ci = python_ci is not None and bool(python_paths(changed_paths))
 
     ci_deadline = min(published_at + timedelta(seconds=ci_wait_seconds), execution_deadline)
     expired = now >= ci_deadline
@@ -700,7 +702,7 @@ class _Facts:
 
 
 async def _load(
-    session: AsyncSession, settlement: workitems.PublicationSettlement
+    session: AsyncSession, settlement: lifecycle.PublicationSettlement
 ) -> _Facts | None:
     request = await session.get(ExecutionRequest, settlement.request_id)
     work_item = await session.get(WorkItem, settlement.work_item_id)
@@ -781,7 +783,7 @@ async def gate(
     valkey: redis.Redis,
     settings: Settings,
     client: httpx.AsyncClient,
-    settlement: workitems.PublicationSettlement,
+    settlement: lifecycle.PublicationSettlement,
     *,
     owner: str,
     next_poll: dict[uuid.UUID, datetime],
@@ -799,7 +801,7 @@ async def gate(
 
     async with sessionmaker() as session:
         facts = await _load(session, settlement)
-        now = await workitems._database_now(session)
+        now = await lifecycle.database_now(session)
         # Keep the loaded snapshots; nothing is locked or written here.
         session.expunge_all()
         await session.rollback()
@@ -818,9 +820,9 @@ async def gate(
     latest = facts.publications[-1]
     observed_sha = lineage.head_sha
     changed_paths = _publication_changed_paths(facts.publications)
-    changed_python_paths = _python_paths(changed_paths)
+    changed_python_paths = python_paths(changed_paths)
     python_ci = python_ci_policy(settings, lineage.repo_full_name or work_item.repo_full_name)
-    unselected_path = _unselected_python_path(changed_paths, python_ci)
+    unselected_path = unselected_python_path(changed_paths, python_ci)
     preflight_verdict: Verdict | None = None
     if unselected_path is not None:
         preflight_verdict = Verdict(
@@ -866,7 +868,7 @@ async def gate(
         metadata_only = not latest.changed_paths and latest.base_sha == observed_sha
         fresh_after = latest.metadata_updated_at if metadata_only else None
         async with sessionmaker() as session:
-            now = await workitems._database_now(session)
+            now = await lifecycle.database_now(session)
             await session.rollback()
         head_sha = detail.head_sha or observed_sha or ""
         if metadata_only and fresh_after is None:
@@ -952,7 +954,7 @@ async def gate(
         }[verdict.kind]
         text = tried_summary(facts.publications, verdict, pr_url)
     async with sessionmaker() as session:
-        result = await workitems.settle_ci_verdict(
+        result = await lifecycle.settle_ci_verdict(
             session,
             work_item_id=settlement.work_item_id,
             request_id=settlement.request_id,
@@ -964,7 +966,7 @@ async def gate(
             cause=cause,
             detail=text,
         )
-    return "settled" if isinstance(result, workitems.WorkItemOutcome) else "waiting"
+    return "settled" if isinstance(result, lifecycle.WorkItemOutcome) else "waiting"
 
 
 @dataclass(frozen=True)
@@ -1233,9 +1235,9 @@ async def _post_missing_runs(
     """
 
     head_sha = lineage.head_sha
-    if not isinstance(head_sha, str) or not workitem_outcomes._SHA_RE.fullmatch(head_sha):
+    if not isinstance(head_sha, str) or not workitem_outcomes.SHA_RE.fullmatch(head_sha):
         return _ActionsRerun("refused", "no_head_sha")
-    minted, refused = await workitem_outcomes._mint_ci_token(
+    minted, refused = await workitem_outcomes.mint_ci_token(
         lineage, work_item, settings, head_sha
     )
     if refused is not None:
@@ -1483,7 +1485,7 @@ async def _continue(
         return "fixing"
     try:
         async with sessionmaker() as session:
-            held = await workitems.hold_for_ci_fix(
+            held = await lifecycle.hold_for_ci_fix(
                 session,
                 work_item_id=work_item.id,
                 request_id=request.id,

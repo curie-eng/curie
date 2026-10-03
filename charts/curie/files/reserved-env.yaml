@@ -20,6 +20,11 @@ worker:
   CURIE_DELIVERY_LEASE_HEARTBEAT_S: worker.deliveryLeaseHeartbeatSeconds
   CURIE_DELIVERY_LEASE_TTL_S: worker.deliveryLeaseTtlSeconds
   CURIE_DELIVERY_SHUTDOWN_RESERVE_S: worker.deliveryShutdownReserveSeconds
+  CURIE_E2E_CONNECTOR_ENABLED: e2eConnector.enabled
+  CURIE_E2E_NAMESPACE_PREFIX: e2eConnector.namespacePrefix
+  CURIE_E2E_OWNER_LABEL_KEY: e2eConnector.ownerLabel.key
+  CURIE_E2E_OWNER_LABEL_VALUE: e2eConnector.ownerLabel.value
+  CURIE_E2E_REAPER_INTERVAL_S: e2eConnector.reaperIntervalSeconds
   CURIE_FAKE_MODEL: agentSandbox.runner.fakeModel
   CURIE_HEARTBEAT_FILE: the chart-managed heartbeat path (remove this override)
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken

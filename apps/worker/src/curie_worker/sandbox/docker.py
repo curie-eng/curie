@@ -575,6 +575,11 @@ class DockerSandboxClient:
                 views.append(view)
         return views
 
+    def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
+        # Docker creates no claim-scoped templates; tokens ride the container env.
+        del keep, created_before
+        return []
+
     # -- sandbox lifecycle ----------------------------------------------------
 
     def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None:

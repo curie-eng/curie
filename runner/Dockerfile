@@ -48,12 +48,18 @@ WORKDIR /app
 # not layer placement). --no-deps keeps the closure on those exact pins;
 # local workspace projects are installed by path after the source copy so
 # they resolve to the copied trees, not same-named PyPI distributions.
+#
+# Hash-checked (#3843): the exporter emits every sha256 uv.lock records for each
+# package, and pip runs under --require-hashes, so it refuses any artifact whose
+# hash is not in uv.lock. pip itself comes from a hashed, pinned requirements
+# file instead of an unhashed --upgrade.
 COPY uv.lock ./uv.lock
 COPY runner/export_dependency_pins.py ./runner/export_dependency_pins.py
+COPY runner/pip-requirements.txt ./runner/pip-requirements.txt
 RUN python3 -m venv /app/.venv \
-    && /app/.venv/bin/pip install --no-cache-dir --upgrade pip \
-    && python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \
-    && /app/.venv/bin/pip install --no-cache-dir --no-deps -r /tmp/runner-dependency-pins.txt
+    && /app/.venv/bin/pip install --no-cache-dir --require-hashes -r runner/pip-requirements.txt
+RUN python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \
+    && /app/.venv/bin/pip install --no-cache-dir --require-hashes --no-deps -r /tmp/runner-dependency-pins.txt
 
 # The five source trees the runner needs: the two frozen workspace packages,
 # the shared telemetry implementation and schema, and the runner itself.

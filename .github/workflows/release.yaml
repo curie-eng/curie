@@ -114,7 +114,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade, github-activity-github]
         platform: [linux/amd64, linux/arm64]
         include:
           - name: runner
@@ -144,6 +144,11 @@ jobs:
           - name: sre-bot-self-upgrade
             context: examples/sre-bot/connectors/self-upgrade
             dockerfile: examples/sre-bot/connectors/self-upgrade/Dockerfile
+          # The github-activity bundle's read-only GitHub connector. Unpublished,
+          # a cluster install of that bundle has no tools at all.
+          - name: github-activity-github
+            context: examples/github-activity/connectors/github
+            dockerfile: examples/github-activity/connectors/github/Dockerfile
           - platform: linux/amd64
             runner: ubuntu-latest
             arch: amd64
@@ -222,6 +227,13 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           tags: ghcr.io/${{ github.repository_owner }}/curie-${{ matrix.name }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          # BuildKit stores a per-platform SPDX SBOM and max-mode SLSA provenance
+          # as attestation manifests in the pushed index. `imagetools create` in
+          # the merge job carries them into the multi-arch index (verified
+          # locally: merging two per-arch pushes yields 2 platform manifests and
+          # 2 unknown/unknown attestation manifests). Same in every build job.
+          sbom: true
+          provenance: mode=max
           cache-from: type=gha,scope=${{ matrix.name }}-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}-${{ matrix.arch }}
       - name: Export digest
@@ -241,6 +253,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     name: Merge ${{ matrix.name }} manifest
     needs: [build]
     # A skip propagates through the WHOLE ancestor graph, not just the direct
@@ -257,7 +271,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade, github-activity-github]
     steps:
       - name: Download digests
         id: download_digests
@@ -327,6 +341,37 @@ jobs:
           # shellcheck disable=SC2046  # intentional word-splitting: expand -t <tag> flags and the digest ref list into separate args
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf 'ghcr.io/${{ github.repository_owner }}/curie-${{ matrix.name }}@sha256:%s ' *)
+      - name: Resolve the index digest
+        id: index
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          # The shared sha tag can be moved by an overlapping run for the same
+          # commit, so it is never read back. The dry run prints the exact index
+          # bytes this run pushed (command substitution strips the trailing
+          # newline the registry body does not have), so their sha256 is the
+          # pushed digest. Inspecting by digest fails closed if that stops holding.
+          # shellcheck disable=SC2046  # intentional word-splitting: expand the digest ref list into separate args
+          index_json=$(docker buildx imagetools create --dry-run $(printf 'ghcr.io/${{ github.repository_owner }}/curie-${{ matrix.name }}@sha256:%s ' *))
+          digest="sha256:$(printf '%s' "$index_json" | sha256sum | cut -d' ' -f1)"
+          docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/curie-${{ matrix.name }}@${digest}" >/dev/null
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      # Keyless signing with this run's OIDC identity: no long-lived key exists,
+      # and the chart job verifies the signature against this workflow before it
+      # pins the digest. Runs on every main/next push and every tag, so the
+      # signing path is exercised continuously, not first at release time.
+      # Signing and attesting are not acquisition steps, so neither is retried
+      # (retry eligibility rule in the build job).
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign the image
+        run: cosign sign --yes "ghcr.io/${{ github.repository_owner }}/curie-${{ matrix.name }}@${{ steps.index.outputs.digest }}"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/curie-${{ matrix.name }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
       - name: Inspect image
         run: |
           docker buildx imagetools inspect ghcr.io/${{ github.repository_owner }}/curie-${{ matrix.name }}:${{ steps.meta.outputs.version }}
@@ -427,6 +472,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           tags: ghcr.io/${{ github.repository_owner }}/curie-worker-local
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          sbom: true
+          provenance: mode=max
           cache-from: type=gha,scope=worker-local-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=worker-local-${{ matrix.arch }}
       - name: Export digest
@@ -446,6 +493,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     name: Merge worker-local manifest
     needs: [worker-local-build]
     # Same ancestor-graph skip again (#787); both arch legs must have pushed
@@ -521,6 +570,32 @@ jobs:
           # shellcheck disable=SC2046  # intentional word-splitting: expand -t <tag> flags and the digest ref list into separate args
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf 'ghcr.io/${{ github.repository_owner }}/curie-worker-local@sha256:%s ' *)
+      - name: Resolve the index digest
+        id: index
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          # The shared sha tag can be moved by an overlapping run for the same
+          # commit, so it is never read back. The dry run prints the exact index
+          # bytes this run pushed (command substitution strips the trailing
+          # newline the registry body does not have), so their sha256 is the
+          # pushed digest. Inspecting by digest fails closed if that stops holding.
+          # shellcheck disable=SC2046  # intentional word-splitting: expand the digest ref list into separate args
+          index_json=$(docker buildx imagetools create --dry-run $(printf 'ghcr.io/${{ github.repository_owner }}/curie-worker-local@sha256:%s ' *))
+          digest="sha256:$(printf '%s' "$index_json" | sha256sum | cut -d' ' -f1)"
+          docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/curie-worker-local@${digest}" >/dev/null
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      # Keyless signing and a pushed build provenance attestation, as in merge.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign the image
+        run: cosign sign --yes "ghcr.io/${{ github.repository_owner }}/curie-worker-local@${{ steps.index.outputs.digest }}"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/curie-worker-local
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
       - name: Inspect image
         run: |
           docker buildx imagetools inspect ghcr.io/${{ github.repository_owner }}/curie-worker-local:${{ steps.meta.outputs.version }}
@@ -618,6 +693,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           tags: ghcr.io/${{ github.repository_owner }}/curie-dark-factory-runner
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          sbom: true
+          provenance: mode=max
           cache-from: type=gha,scope=dark-factory-runner-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=dark-factory-runner-${{ matrix.arch }}
       - name: Export digest
@@ -637,6 +714,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     name: Merge dark factory runner layer manifest
     needs: [dark-factory-runner-build]
     # Same ancestor-graph skip again (#787).
@@ -713,11 +792,39 @@ jobs:
           # shellcheck disable=SC2046  # intentional word-splitting: expand -t <tag> flags and the digest ref list into separate args
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf 'ghcr.io/${{ github.repository_owner }}/curie-dark-factory-runner@sha256:%s ' *)
+      - name: Resolve the index digest
+        id: index
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          # The shared sha tag can be moved by an overlapping run for the same
+          # commit, so it is never read back. The dry run prints the exact index
+          # bytes this run pushed (command substitution strips the trailing
+          # newline the registry body does not have), so their sha256 is the
+          # pushed digest. Inspecting by digest fails closed if that stops holding.
+          # shellcheck disable=SC2046  # intentional word-splitting: expand the digest ref list into separate args
+          index_json=$(docker buildx imagetools create --dry-run $(printf 'ghcr.io/${{ github.repository_owner }}/curie-dark-factory-runner@sha256:%s ' *))
+          digest="sha256:$(printf '%s' "$index_json" | sha256sum | cut -d' ' -f1)"
+          docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/curie-dark-factory-runner@${digest}" >/dev/null
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      # Keyless signing and a pushed build provenance attestation, as in merge.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign the image
+        run: cosign sign --yes "ghcr.io/${{ github.repository_owner }}/curie-dark-factory-runner@${{ steps.index.outputs.digest }}"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/curie-dark-factory-runner
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
       - name: Record the published digest
         run: |
           ref="ghcr.io/${{ github.repository_owner }}/curie-dark-factory-runner:${{ steps.meta.outputs.version }}"
           docker buildx imagetools inspect "$ref"
-          digest=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | jq -er .digest)
+          # Every tag names the one index pushed above, so this is the digest
+          # just signed and attested.
+          digest="${{ steps.index.outputs.digest }}"
           echo "Dark factory runner layer: \`${ref}\` -> \`${digest}\`" >> "$GITHUB_STEP_SUMMARY"
 
   cli-binaries:
@@ -859,8 +966,12 @@ jobs:
 
   chart:
     name: Package chart and release compose
-    needs: [authorize-release]
-    if: startsWith(github.ref, 'refs/tags/v') && needs.authorize-release.result == 'success'
+    # Needs merge so it can verify and pin the images it packages. On the tag
+    # path authorize-release and build both succeed, so no skip propagates and
+    # plain `needs:` semantics apply (unlike merge's #787 case); a failed or
+    # cancelled merge leg stops the chart.
+    needs: [authorize-release, merge]
+    if: startsWith(github.ref, 'refs/tags/v') && needs.authorize-release.result == 'success' && needs.merge.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -871,6 +982,30 @@ jobs:
       - name: Resolve version
         id: ver
         run: echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      # The released chart pins every first-party image by the digest this run
+      # built and signed, so it deploys exactly those bytes rather than whatever
+      # a mutable tag points at later. Each signature is verified against this
+      # workflow's identity before its digest is written. The source tree keeps
+      # `digest: ""`; only the packaged copy is pinned. Overriding an image tag
+      # on the released chart therefore requires clearing its digest too.
+      - name: Verify and pin the release image digests
+        run: |
+          set -euo pipefail
+          version="${{ steps.ver.outputs.v }}"
+          args=()
+          for name in api dispatcher mail-adapter worker ui runner; do
+            repo="ghcr.io/${{ github.repository_owner }}/curie-${name}"
+            digest=$(docker buildx imagetools inspect "${repo}:${version}" --format '{{json .Manifest}}' | jq -er .digest)
+            cosign verify \
+              --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${repo}@${digest}" >/dev/null
+            echo "${name}: verified ${repo}@${digest}"
+            args+=(--image "${name}=${repo}@${digest}")
+          done
+          python3 release/pin_chart_digests.py --values charts/curie/values.yaml "${args[@]}"
       - name: Package chart
         run: |
           version="${{ steps.ver.outputs.v }}"
@@ -882,10 +1017,10 @@ jobs:
           mkdir -p dist
           python3 compose/generate_release_compose.py --version "${version}" > dist/compose.release.yaml
       # The chart and the compose file are deployment manifests, so these SBOMs
-      # inventory the packaged artifact itself. The dependency graph of what they
-      # pin lives in the curie-* images, which do NOT carry SBOMs or provenance
-      # today -- that is #62, still open. Do not read this as coverage existing
-      # elsewhere; it does not yet.
+      # inventory the packaged manifests themselves. The images they pin carry
+      # their own per-platform SBOM and provenance attestations, a cosign
+      # signature, and a GitHub build provenance attestation (see
+      # docs/release-verification.md).
       - name: Generate the chart SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:

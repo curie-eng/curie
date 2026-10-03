@@ -18,18 +18,20 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from .. import bundles, crud
-from ..auth import require_api_key
-from ..config import get_settings
-from ..db import SCHEMA
-from ..deps import SessionDep, StoreDep
-from ..schemas import (
+from curie_api.crud import agents as crud_agents
+from curie_api.schemas.schedules import (
     AgentSchedulesOut,
     ScheduleControlOut,
     ScheduleHookOut,
     ScheduleListOut,
     ScheduleOutcome,
 )
+
+from .. import bundles
+from ..auth import require_api_key
+from ..config import get_settings
+from ..db import SCHEMA
+from ..deps import SessionDep, StoreDep
 from ..storage import ObjectStore
 
 _OUTCOMES: dict[str, ScheduleOutcome] = {
@@ -119,7 +121,7 @@ def _cron_hooks(raw: list[Any]) -> list[tuple[str, str, str]]:
     return found
 
 
-def _read_triggers(data: bytes) -> list[Any]:
+def read_triggers(data: bytes) -> list[Any]:
     settings = get_settings()
     with tempfile.TemporaryDirectory() as tmp:
         bundles.extract_and_validate(
@@ -133,15 +135,15 @@ def _read_triggers(data: bytes) -> list[Any]:
     return declared if isinstance(declared, list) else []
 
 
-async def _resolve_agent(session: AsyncSession, raw: str) -> Any:
+async def resolve_agent(session: AsyncSession, raw: str) -> Any:
     parsed: uuid.UUID | None
     try:
         parsed = uuid.UUID(raw)
     except ValueError:
         parsed = None
-    agent = await crud.get_agent(session, parsed) if parsed is not None else None
+    agent = await crud_agents.get_agent(session, parsed) if parsed is not None else None
     if agent is None:
-        agent = await crud.get_agent_by_name(session, raw)
+        agent = await crud_agents.get_agent_by_name(session, raw)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     return agent
@@ -184,7 +186,7 @@ async def _hooks_for(
         return [], None
     try:
         data = await store.get(bundle_ref)
-        declared = await run_in_threadpool(_read_triggers, data)
+        declared = await run_in_threadpool(read_triggers, data)
     except Exception:  # noqa: BLE001 - existing broad catch retained
         return [], _UNREADABLE
     latest = await _latest(session, agent_id)
@@ -216,7 +218,7 @@ async def list_schedules(
 ) -> ScheduleListOut:
     """Cron hooks on each in-force deployment, newest slot first in the record."""
 
-    selected = None if agent is None else await _resolve_agent(session, agent)
+    selected = None if agent is None else await resolve_agent(session, agent)
     rows = await _in_force(session, None if selected is None else selected.id)
     if selected is not None and not rows:
         return ScheduleListOut(
@@ -245,13 +247,13 @@ async def list_schedules(
 
 
 async def _named_hook(session: AsyncSession, store: ObjectStore, raw_agent: str, name: str) -> Any:
-    agent = await _resolve_agent(session, raw_agent)
+    agent = await resolve_agent(session, raw_agent)
     rows = await _in_force(session, agent.id)
     if not rows or rows[0]["bundle_ref"] is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "schedule not found")
     try:
         data = await store.get(rows[0]["bundle_ref"])
-        declared = await run_in_threadpool(_read_triggers, data)
+        declared = await run_in_threadpool(read_triggers, data)
     except Exception as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, _UNREADABLE) from exc
     if name not in {hook_name for hook_name, _, _ in _cron_hooks(declared)}:

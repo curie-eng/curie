@@ -22,11 +22,11 @@ import uuid
 from typing import Any
 
 import pytest
-from curie_api import crud
 from curie_api.config import get_settings
+from curie_api.crud import actions as crud_actions
 from curie_api.models import AgentAction
 from curie_api.routers.actions import undo_action
-from curie_api.schemas import ActionUndo
+from curie_api.schemas.actions import ActionUndo
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -225,9 +225,11 @@ def test_two_sessions_with_a_stale_unclaimed_record_cannot_both_claim_undo(
                 second = await second_session.get(AgentAction, action_id)
                 assert first is not None and second is not None
                 assert first.undone_at is None and second.undone_at is None
-                winner = await crud.claim_action_undo(first_session, first, actor="U-first")
+                winner = await crud_actions.claim_action_undo(first_session, first, actor="U-first")
                 await first_session.commit()
-                loser = await crud.claim_action_undo(second_session, second, actor="U-second")
+                loser = await crud_actions.claim_action_undo(
+                    second_session, second, actor="U-second"
+                )
                 await second_session.commit()
                 async with sessions() as check_session:
                     stored = await check_session.get(AgentAction, action_id)

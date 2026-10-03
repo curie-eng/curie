@@ -43,10 +43,12 @@ from curie_runner.approval import (
     APPROVAL_TOOL_NAME,
     ApprovalGate,
     build_approval_gate,
-    build_approval_hook,
-    build_can_use_tool,
     policy_disallowed_tools,
     resolve_approval_policy,
+)
+from curie_runner.harness.claude.approval import (
+    build_approval_hook,
+    build_can_use_tool,
 )
 from mcp import Tool
 from mcp.types import ToolAnnotations
@@ -614,7 +616,7 @@ def test_a_tool_the_platform_adds_later_is_exempt_without_a_second_list(
     # COLLECT whenever the product hunks are reversed, and a collection error is
     # not attributable to any one test. The fix-pin verifier refuses that, and
     # so should a reader trying to tell which assertion actually bit.
-    from curie_runner.state import STATE_TOOL_NAMES
+    from curie_runner.tool_names import STATE_TOOL_NAMES
 
     gate = _production_sre_gate(managed_workspace=False)
 

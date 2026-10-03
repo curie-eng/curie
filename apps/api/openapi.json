@@ -746,7 +746,7 @@
       },
       "AdmissionIn": {
         "additionalProperties": false,
-        "description": "One admission question from the Slack dispatcher (ADR 0175 decision 2).\n\nSubclasses `ChannelBinding` so the route pair is judged by the same\n`_validate_channel_binding` every other binding surface runs. `adapter`\nnames the identity half of the route (ADR-0168 decision 3), resolved\nexactly as `POST /channels/token` resolves it: omitted means the default\nSlack identity. `callers` is every id the channel reports for the caller;\nany one of them on the list admits.",
+        "description": "One admission question from the Slack dispatcher (ADR 0175 decision 2).\n\nSubclasses `ChannelBinding` so the route pair is judged by the same\n`validate_channel_binding` every other binding surface runs. `adapter`\nnames the identity half of the route (ADR-0168 decision 3), resolved\nexactly as `POST /channels/token` resolves it: omitted means the default\nSlack identity. `callers` is every id the channel reports for the caller;\nany one of them on the list admits.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -3179,7 +3179,7 @@
       },
       "ChannelTokenRequest": {
         "additionalProperties": false,
-        "description": "Mint request: the binding pair to scope the token to, plus its lifetime.\n\nSubclasses `ChannelBinding` so the SAME `_validate_channel_binding` the\nagents API runs judges the pair here (E11). Two write paths cannot drift\ninto two rules -- that drift is how #143 happened -- and an operator reads\nthe identical message from either endpoint.",
+        "description": "Mint request: the binding pair to scope the token to, plus its lifetime.\n\nSubclasses `ChannelBinding` so the SAME `validate_channel_binding` the\nagents API runs judges the pair here (E11). Two write paths cannot drift\ninto two rules -- that drift is how #143 happened -- and an operator reads\nthe identical message from either endpoint.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -12916,7 +12916,7 @@
         ]
       },
       "post": {
-        "description": "Create a pending approval; idempotent on ``dedupe_key``.\n\nA redelivered worker turn that re-requests the same approval gets the\nexisting record back (200) instead of forking a second pending record for\none human decision.\n\nA request for an approval a person rejected in this thread, raised with no\nperson asking since, is refused with 409 and audited on the rejected record\n(#2885, ``crud.find_rejected_reraise``). Decided here rather than in the\nrunner, so a sandbox cannot talk its way past it.",
+        "description": "Create a pending approval; idempotent on ``dedupe_key``.\n\nA redelivered worker turn that re-requests the same approval gets the\nexisting record back (200) instead of forking a second pending record for\none human decision.\n\nA request for an approval a person rejected in this thread, raised with no\nperson asking since, is refused with 409 and audited on the rejected record\n(#2885, ``crud.approvals.find_rejected_reraise``). Decided here rather than in the\nrunner, so a sandbox cannot talk its way past it.",
         "operationId": "create_approval_approvals_post",
         "parameters": [
           {

@@ -43,9 +43,9 @@ kernel and the eval consumer distinguish lanes by exception type.
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import shutil
+import subprocess
 import tempfile
 import time
 import urllib.error
@@ -56,6 +56,7 @@ from typing import Any
 
 import pytest
 import yaml
+from curie_runner import __main__ as runner_boot
 from curie_worker.attachments import (
     ATTACHMENTS_REF_ENV,
     AttachmentLimits,
@@ -87,33 +88,38 @@ def _repo_root() -> Path:
 
 
 def _runner_attachments_dir() -> str:
-    """``curie_runner.__main__.ATTACHMENTS_DIR``, read from source not imported.
-
-    Read as text on purpose. Importing ``curie_runner.__main__`` pulls in the
-    agent SDK and an aiohttp app at import time, and the worker package has no
-    business importing the runner. The constant is a compiled-in literal, so the
-    source is the authority either way.
-    """
-
-    source = (_repo_root() / "runner" / "src" / "curie_runner" / "__main__.py").read_text()
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Assign):
-            continue
-        if not any(isinstance(t, ast.Name) and t.id == "ATTACHMENTS_DIR" for t in node.targets):
-            continue
-        value = node.value
-        if isinstance(value, ast.Call) and value.args and isinstance(value.args[0], ast.Constant):
-            return str(value.args[0].value)
-    pytest.fail("curie_runner.__main__ declares no ATTACHMENTS_DIR = Path(...) literal")
+    return str(runner_boot.ATTACHMENTS_DIR)
 
 
-def _chart_attachments_mount_path() -> str:
-    values = yaml.safe_load((_repo_root() / "charts" / "curie" / "values.yaml").read_text())
-    attachments = values["agentSandbox"]["runner"].get("attachments")
-    assert attachments is not None, (
-        "charts/curie/values.yaml declares no agentSandbox.runner.attachments"
+def _chart_attachments_mount_paths(*, worker_enabled: bool, runner_enabled: bool) -> list[str]:
+    rendered = subprocess.run(
+        [
+            "helm",
+            "template",
+            "acme",
+            str(_repo_root() / "charts" / "curie"),
+            "--set",
+            f"worker.attachments.enabled={str(worker_enabled).lower()}",
+            "--set",
+            f"agentSandbox.runner.attachments.enabled={str(runner_enabled).lower()}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    return str(attachments["mountPath"])
+    templates = [
+        document
+        for document in yaml.safe_load_all(rendered.stdout)
+        if document is not None and document.get("kind") == "SandboxTemplate"
+    ]
+    assert templates, "the chart must render a runner template to exercise attachment mounts"
+    return [
+        str(mount["mountPath"])
+        for document in templates
+        for container in document["spec"]["podTemplate"]["spec"]["containers"]
+        for mount in container.get("volumeMounts", [])
+        if mount["name"] == "attachments"
+    ]
 
 
 # --- the one mocked collaborator: the presigned object store -----------------
@@ -488,7 +494,12 @@ def test_the_mount_path_agrees_with_the_runner_and_the_chart(
     """
 
     runner_dir = _runner_attachments_dir()
-    chart_dir = _chart_attachments_mount_path()
+    # The lane ships disabled. Exercise the mount produced when an operator
+    # enables both the worker capability and its sandbox side gate.
+    chart_mounts = _chart_attachments_mount_paths(worker_enabled=True, runner_enabled=True)
+    assert chart_mounts, "the rendered runner template must mount inbound attachments"
+    assert len(set(chart_mounts)) == 1, "every rendered runner must read the same attachment mount"
+    chart_dir = chart_mounts[0]
     assert chart_dir == runner_dir, (
         f"charts/curie/values.yaml mounts {chart_dir!r} but curie_runner reads {runner_dir!r}"
     )
@@ -509,6 +520,18 @@ def test_the_mount_path_agrees_with_the_runner_and_the_chart(
         f"the docker driver mounts attachments at {container_path!r} while the "
         f"runner probes {runner_dir!r} and the chart mounts {chart_dir!r}"
     )
+
+
+@pytest.mark.parametrize(
+    ("worker_enabled", "runner_enabled"),
+    [(False, True), (True, False), (False, False)],
+)
+def test_disabling_either_attachment_gate_omits_the_rendered_runner_mount(
+    worker_enabled: bool, runner_enabled: bool
+) -> None:
+    assert _chart_attachments_mount_paths(
+        worker_enabled=worker_enabled, runner_enabled=runner_enabled
+    ) == []
 
 
 def test_the_signed_reference_never_reaches_the_runner_container(

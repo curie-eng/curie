@@ -36,11 +36,9 @@ class RunnerConfig:
     # loudly instead of being silently dropped on every turn. The vocabulary is
     # this lane's (curie_runner.thinking), not the boot contract's.
     thinking: dict[str, Any] | None
-    # The harness whose contribution manifest drives this runner (ADR-0060,
-    # #844): read from the runner-local CURIE_HARNESS knob (default the
-    # built-in Claude), NOT a BootEnv contract key -- the same runner-local read
-    # pattern as false_completion_check below. ``__main__`` resolves this name
-    # through the harness registry; an unregistered selection fails the boot.
+    # Internal harness selection (ADR 0140), read from CURIE_HARNESS rather than
+    # the frozen BootEnv contract. __main__ admits only Claude and its existing
+    # aliases, and refuses every other name before registry discovery.
     harness: str
     max_turns: int
     # Where this sandbox's hosted connectors live (ADR-0086, #1118). Absent as
@@ -166,8 +164,8 @@ class RunnerConfig:
         # reachable on a hand-run local runner.
         false_completion_raw = env.get("CURIE_FALSE_COMPLETION_CHECK", "")
         false_completion_check = false_completion_raw.strip().lower() in ("1", "true", "yes")
-        # Runner-local harness selection (ADR-0060, #844), not a BootEnv key:
-        # empty/unset selects the built-in Claude harness.
+        # Internal harness selection (ADR 0140), not a BootEnv key.
+        # Empty or unset selects the supported Claude harness.
         harness = env.get("CURIE_HARNESS", "").strip() or DEFAULT_HARNESS
         disallowed_tools = tuple(
             name.strip()

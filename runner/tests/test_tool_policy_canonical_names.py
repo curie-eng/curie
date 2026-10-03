@@ -23,11 +23,13 @@ import anyio
 from claude_agent_sdk.types import PermissionResultDeny, ToolPermissionContext
 from curie_runner.approval import (
     ApprovalGate,
-    build_approval_hook,
-    build_can_use_tool,
     canonical_tool_name,
     is_mcp_tool,
     policy_disallowed_tools,
+)
+from curie_runner.harness.claude.approval import (
+    build_approval_hook,
+    build_can_use_tool,
 )
 from plugin_format import ToolPolicy
 

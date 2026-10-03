@@ -42,20 +42,22 @@ from opentelemetry.trace import SpanKind
 from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
 
-from .. import crud
-from ..approval_auth import ApprovalPrincipalDep
-from ..auth import require_platform_key
-from ..config import get_settings
-from ..deps import ResumeQueueDep, SessionDep
-from ..models import AgentChannel, Approval, ApprovalAuditEntry, ApprovalStatus
-from ..resumequeue import approval_trace_context, build_resume_turn
-from ..schemas import (
+from curie_api.crud import approvals as crud_approvals
+from curie_api.crud import errors as crud_errors
+from curie_api.schemas.approvals import (
     ApprovalIdentityFactsOut,
     ApprovalIdentityReportOut,
     ApprovalRecover,
     ApprovalRecoveryOut,
     ApprovalReplyIdentityDeclaration,
 )
+
+from ..approval_auth import ApprovalPrincipalDep
+from ..auth import require_platform_key
+from ..config import get_settings
+from ..deps import ResumeQueueDep, SessionDep
+from ..models import AgentChannel, Approval, ApprovalAuditEntry, ApprovalStatus
+from ..resumequeue import approval_trace_context, build_resume_turn
 
 logger = logging.getLogger(__name__)
 
@@ -266,10 +268,10 @@ async def recover_approval(
     nobody could reason about.
     """
 
-    approval = await crud.get_approval(session, approval_id)
+    approval = await crud_approvals.get_approval(session, approval_id)
     if approval is None:
         raise _not_found()
-    recorded = await crud.find_recovery_audit(session, data.recovery_key)
+    recorded = await crud_approvals.find_recovery_audit(session, data.recovery_key)
     if recorded is not None:
         return _replayed_recovery(approval, recorded, data.recovery_key)
     stored_parent = approval_trace_context(approval)
@@ -285,7 +287,7 @@ async def recover_approval(
             parent=stored_parent,
             attributes={"service.name": "curie-api", "operation": "recover"},
         ):
-            recovered = await crud.recover_approval_atomic(
+            recovered = await crud_approvals.recover_approval_atomic(
                 session,
                 approval_id,
                 reason=data.reason,
@@ -295,7 +297,7 @@ async def recover_approval(
                 principal_kind=principal.kind,
                 facts=facts,
             )
-    except crud.PublicationSettlementConflict as exc:
+    except crud_errors.PublicationSettlementConflict as exc:
         # The approval's publication moved between the read and the settlement.
         # The whole transaction rolled back, so the approval is untouched and a
         # retry is safe -- which is exactly what this 409 tells the operator.
@@ -306,10 +308,10 @@ async def recover_approval(
         # The CAS lost. A concurrent request under the same key may have won
         # it, in which case this is a replay; otherwise the row was settled by
         # something else and this key never recorded an outcome.
-        current = await crud.reread_approval(session, approval_id)
+        current = await crud_approvals.reread_approval(session, approval_id)
         if current is None:
             raise _not_found()
-        recorded = await crud.find_recovery_audit(session, data.recovery_key)
+        recorded = await crud_approvals.find_recovery_audit(session, data.recovery_key)
         if recorded is not None:
             return _replayed_recovery(current, recorded, data.recovery_key)
         raise HTTPException(
@@ -328,7 +330,7 @@ async def recover_approval(
         # Publication outcomes are reported by the worker through the stored
         # reply route; no model wake is owed and none is enqueued.
         await resume_queue.enqueue(build_resume_turn(recovered), parent=stored_parent)
-        await crud.mark_approval_resumed(session, approval_id)
+        await crud_approvals.mark_approval_resumed(session, approval_id)
     return _recovery_out(recovered, data.recovery_key)
 
 

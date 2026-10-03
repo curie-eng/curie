@@ -533,6 +533,68 @@ serverFiles:
                 curie_worker_supervised_restart_total with outcome give_up
                 is present. The named operation stopped restarting and stays
                 down until the worker pod restarts.
+          # The two reaper alerts below, and what covers each failure. The
+          # worker records curie_e2e_reaper_last_success_seconds every
+          # interval while the reaper task lives. A slow pass keeps reporting
+          # its stale timestamp and is never cancelled or overlapped, so a
+          # live worker with a stuck pass is CurieE2EReaperStalled.
+          # A crashed task is CurieWorkerSupervisedRestartLoop, then
+          # CurieWorkerSupervisedTaskParked with operation e2e-reaper, which
+          # holds while the worker lives. A dead worker is
+          # CurieCoreWorkloadNotReady and CurieApplicationMetricsAbsent,
+          # neither of which has a window. CurieE2EReaperSignalAbsent is the
+          # backstop for a series that stops with none of those firing.
+          - alert: CurieE2EReaperStalled
+            # End to end namespace reaper (#3245, ADR 0176 decision 4). The
+            # gauge is the unix time of the last clean sweep and reads 0 until
+            # one succeeds, so a reaper that never worked pages too.
+            expr: |
+              time() - max_over_time(curie_e2e_reaper_last_success_seconds[6h]) > 900
+            for: 5m
+            labels:
+              severity: page
+              component: curie-e2e
+            annotations:
+              summary: The end to end namespace reaper has not completed a sweep in 15 minutes
+              description: >-
+                curie_e2e_reaper_last_success_seconds is more than 900 seconds
+                old. Expired and finished end to end namespaces are not being
+                deleted, and their quota on the test cluster is not being
+                released.
+          - alert: CurieE2EReaperSignalAbsent
+            # The timestamp stops being exported at all: the worker task died
+            # or the worker stopped running it. CurieE2EReaperStalled then sees
+            # no series and cannot fire. An installation that never exported
+            # it has nothing in the last 7 days and stays quiet.
+            expr: |
+              max(max_over_time(curie_e2e_reaper_last_success_seconds[7d]))
+              unless
+              max(max_over_time(curie_e2e_reaper_last_success_seconds[15m]))
+            for: 5m
+            labels:
+              severity: page
+              component: curie-e2e
+            annotations:
+              summary: The end to end namespace reaper stopped reporting
+              description: >-
+                curie_e2e_reaper_last_success_seconds was reported in the last
+                7 days but not in the last 15 minutes. The worker task that deletes
+                expired end to end namespaces is not running.
+          - alert: CurieE2EExpiredNamespacesAccumulating
+            # Keys on overdue, not expired: a healthy reaper always sees a few
+            # namespaces just past their TTL between sweeps.
+            expr: |
+              curie_e2e_namespaces_overdue > 0
+            for: 15m
+            labels:
+              severity: page
+              component: curie-e2e
+            annotations:
+              summary: End to end namespaces more than 10 minutes past their TTL are still on the test cluster
+              description: >-
+                curie_e2e_namespaces_overdue has stayed above 0 for 15 minutes.
+                Namespaces past their TTL are not being removed, so their quota
+                on the test cluster is not released.
           - alert: CurieReplyDeliveryRefused
             expr: |
               increase(

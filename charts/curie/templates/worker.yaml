@@ -60,15 +60,32 @@ rules:
     resources: ["resourcequotas"]
     verbs: ["get"]
   {{- if .Values.agentSandbox.deploy }}
-  # Per-agent runner resources (#3209). get reads the chart template. create
-  # and patch write only the worker-owned copy. list and delete stay absent.
-  # The ValidatingAdmissionPolicy in runner-resources-admission.yaml is rendered
-  # on the same condition and refuses any name that is not that copy, so this
-  # grant cannot rewrite the shared template. Kubernetes older than 1.30 fails
-  # that template, which fails this render before the grant is installed.
+  # Per-agent runner resources (#3209) and per-claim token templates (#3842).
+  # get reads the chart template and the source warm pool. create and patch
+  # write only worker-owned copies. Templates also need delete (rollback of a
+  # half-built per-claim set) and list (the reaper sweep of per-claim templates
+  # whose claim is gone); warm pools are never listed or deleted by the worker,
+  # because Kubernetes GC removes a per-claim pool with its template.
+  # The ValidatingAdmissionPolicies in runner-resources-admission.yaml render on
+  # the same condition: they refuse any name that is not a worker-owned copy,
+  # any template shape the chart does not render, and any delete of a template
+  # without the curietech.ai/sandbox-claim label, so this grant cannot rewrite
+  # or remove the shared template. Kubernetes older than 1.30 fails that
+  # template, which fails this render before the grant is installed.
   - apiGroups: ["extensions.agents.x-k8s.io"]
-    resources: ["sandboxtemplates", "sandboxwarmpools"]
+    resources: ["sandboxtemplates"]
+    verbs: ["get", "create", "patch", "list", "delete"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxwarmpools"]
     verbs: ["get", "create", "patch"]
+  # Per-claim token Secret (#3842): the claim's scoped tokens reach the runner
+  # by secretKeyRef instead of riding the SandboxClaim spec. create only; no
+  # get, list, or watch, so this grant cannot read any Secret back. The
+  # worker-secrets admission policy admits only an Opaque `*-tokens` Secret
+  # carrying curietech.ai/sandbox-claim in this namespace.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
   {{- end }}
   # The worker reads the exact sandbox pod for capacity and stream failure
   # diagnosis. It lists only events for that named pod after a stream drop.
@@ -375,6 +392,27 @@ spec:
               value: {{ include "curie.name" . | quote }}
             - name: CURIE_CONNECTOR_RECONCILE_INTERVAL_S
               value: {{ .Values.worker.connectorReconciler.intervalSeconds | quote }}
+{{- end }}
+{{- $e2e := .Values.e2eConnector }}
+{{- if $e2e.enabled }}
+{{- if not .Values.worker.connectorReconciler.enabled }}
+{{- fail "e2eConnector.enabled requires worker.connectorReconciler.enabled: the end to end namespace reaper reads the test cluster kubeconfig from the connector Secret through the reconciler's Secret list grant" }}
+{{- end }}
+            # End to end namespace reaper (#3245, ADR 0176 decision 4). The same
+            # scope the API hands env_create, so the worker deletes only what
+            # the connector creates. It reads the test cluster kubeconfig from
+            # each agent's connector Secret through the reconciler's Secret
+            # list grant; nothing new is mounted.
+            - name: CURIE_E2E_CONNECTOR_ENABLED
+              value: "true"
+            - name: CURIE_E2E_NAMESPACE_PREFIX
+              value: {{ $e2e.namespacePrefix | quote }}
+            - name: CURIE_E2E_OWNER_LABEL_KEY
+              value: {{ $e2e.ownerLabel.key | quote }}
+            - name: CURIE_E2E_OWNER_LABEL_VALUE
+              value: {{ $e2e.ownerLabel.value | quote }}
+            - name: CURIE_E2E_REAPER_INTERVAL_S
+              value: {{ $e2e.reaperIntervalSeconds | quote }}
 {{- end }}
             - name: LANGFUSE_HOST
               value: {{ include "curie.langfuse.url" . }}

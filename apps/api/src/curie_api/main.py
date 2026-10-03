@@ -26,7 +26,9 @@ from fastapi import FastAPI, HTTPException, Request
 from opentelemetry.trace import SpanKind, StatusCode
 from starlette.routing import Match
 
-from . import __version__, crud
+from curie_api.crud import agents as crud_agents
+
+from . import __version__
 from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
 from .db import create_engine, create_sessionmaker
@@ -414,7 +416,7 @@ def create_app() -> FastAPI:
         try:
             async with asyncio.timeout(2):
                 async with request.app.state.sessionmaker() as session:
-                    await crud.list_agents(session)
+                    await crud_agents.list_agents(session)
         except Exception:  # noqa: BLE001 - existing broad catch retained
             raise HTTPException(
                 status_code=503,

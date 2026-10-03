@@ -31,18 +31,21 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from sqlalchemy import Text, cast, delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import crud, sandbox_token, state_mutation, threadkeys, transcripts
-from ..auth import require_internal_worker_token, verify_platform_key
-from ..config import get_settings
-from ..deps import SessionDep
-from ..models import ThreadTranscript, WorkflowStateEntry
-from ..schemas import (
+from curie_api.crud import agents as crud_agents
+from curie_api.crud import channels as crud_channels
+from curie_api.schemas.state import (
     MemoryTurnClosedIn,
     StateAppendIn,
     StateEntryOut,
     StateEntryPut,
     StateNamespaceOut,
 )
+
+from .. import sandbox_token, state_mutation, threadkeys, transcripts
+from ..auth import require_internal_worker_token, verify_platform_key
+from ..config import get_settings
+from ..deps import SessionDep
+from ..models import ThreadTranscript, WorkflowStateEntry
 from ..transcripts import TRANSCRIPT_NAMESPACE
 from ..transcripts import json_size as _json_size
 
@@ -69,7 +72,7 @@ STATE_APP_SCOPE = "state.app"
 
 # Namespaces owned by the memory (#264) and history (#20) ports; the narrow
 # app-scoped (bundle) token may not touch them. Literals rather than an import
-# because ``routers.memory`` imports ``_enforce_caps`` from THIS module (a real
+# because ``routers.memory`` imports ``enforce_caps`` from THIS module (a real
 # import cycle otherwise). Mirrors the runner client's ``RESERVED_NAMESPACES``
 # (``runner/src/curie_runner/state.py``) and ``memory.MEMORY_NAMESPACE`` /
 # the history transcript key -- a bundle wanting durable memory uses the remember
@@ -436,12 +439,12 @@ async def _binding_scope(
     No caller here NAMES an adapter -- the state API has no such parameter --
     and an agent's rows on one pair share this one scope whichever identity
     holds them, so this checks for any row of THIS agent on the pair rather
-    than resolving the default identity's route the way `crud.binding_for_route`
+    than resolving the default identity's route the way `crud.channels.binding_for_route`
     does for a turn (an identity-narrowed read would 404 every named-identity
     binding's own state).
     """
 
-    if not await crud.agent_holds_channel_pair(session, agent_id, kind, address):
+    if not await crud_channels.agent_holds_channel_pair(session, agent_id, kind, address):
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, f"this agent has no {kind}:{address} binding"
         )
@@ -525,7 +528,7 @@ async def _namespace_exists(
     return found is not None
 
 
-async def _enforce_caps(
+async def enforce_caps(
     session: AsyncSession,
     agent_id: uuid.UUID,
     scope: str | None,
@@ -746,14 +749,14 @@ async def _put_state(
 ) -> StateEntryOut:
     # Unknown agent is a 404 (the FK would also reject, but this is the clear
     # signal). expected_version opts into compare-and-set.
-    if await crud.get_agent(session, agent_id) is None:
+    if await crud_agents.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     if namespace == TRANSCRIPT_NAMESPACE:
         row = await transcripts.put(
             session, agent_id, scope, key, data.value, data.expected_version
         )
         return _transcript_out(row)
-    await _enforce_caps(session, agent_id, scope, namespace, key, data.value)
+    await enforce_caps(session, agent_id, scope, namespace, key, data.value)
     entry = await _get_entry_locked(session, agent_id, scope, namespace, key)
     if entry is None:
         if data.expected_version is not None:
@@ -865,7 +868,7 @@ async def _append_state(
     value must already be an array, else the append is a 409. Subject to the
     same per-value and per-namespace size caps as a put.
     """
-    if await crud.get_agent(session, agent_id) is None:
+    if await crud_agents.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     if namespace == TRANSCRIPT_NAMESPACE:
         row = await transcripts.append(
@@ -875,7 +878,7 @@ async def _append_state(
     entry = await _get_entry_locked(session, agent_id, scope, namespace, key)
     if entry is None:
         new_value = [data.item]
-        await _enforce_caps(
+        await enforce_caps(
             session, agent_id, scope, namespace, key, new_value, reserve_bytes=data.reserve_bytes
         )
         entry = WorkflowStateEntry(
@@ -889,7 +892,7 @@ async def _append_state(
                 "cannot append: stored value is not a JSON array",
             )
         new_value = [*entry.value, data.item]
-        await _enforce_caps(
+        await enforce_caps(
             session, agent_id, scope, namespace, key, new_value, reserve_bytes=data.reserve_bytes
         )
         entry.value = new_value

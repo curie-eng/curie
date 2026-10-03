@@ -366,6 +366,17 @@ stale-version conflict test (match the CAS pattern in
 bounded delivery + dead-letter from the shared transport; a lane without a
 delivery cap is a bug.
 
+## Test policy
+
+1. Test behavior through the nearest executable boundary. Assert outcomes and state transitions rather than source names, syntax or implementation structure.
+2. Cross artifact contracts use shared inputs and expected outputs under `tests/vectors`. Every reader exercises its own production parser or behavior against the same vector.
+3. Text pins are permitted only for security configuration that cannot be executed by the test. Each pin names the issue requiring it.
+4. Do not pin prompt wording. Test the claimed capability with graded evals and a falsifiable control.
+5. File readers fail closed on missing, unreadable or malformed required inputs. Test those failures alongside valid input.
+6. Infrastructure tests may skip locally when their prerequisites are absent, but never in CI. Required verification treats unavailable infrastructure as an error.
+7. Harnesses use production wiring. Do not copy builder arguments or substitute private fields to prove configuration reaches its consumer.
+8. A text pin expires when a behavioral test covers its contract. Delete the pin and name the covering test in the change description.
+
 ## The dev stack: compose.dev.yaml
 
 The compose stack now has two profiles. `full` brings up the whole backing
@@ -652,7 +663,9 @@ as a whole; remembered only):
   cannot share code because the worker does not import the API package at
   runtime; the worker maps each code to its own prose and treats an unmapped
   code as an invalid refusal response (#2684).
-  [gate: `apps/worker/tests/test_workspace.py::test_selection_refusal_codes_match_the_apis_emissions`]
+  [vector: `tests/vectors/workspace-selection-refusal.json`]
+  [gate: `apps/api/tests/test_workspace_control_plane.py::test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe`]
+  [gate: `apps/worker/tests/test_workspace.py::test_internal_workspace_selection_409_maps_machine_code_not_detail_prose`]
 - real SDK vs fake model session in the runner (`FakeModelSession`,
   `runner/src/curie_runner/fake.py`).
   [by construction: `runner/src/curie_runner/adapter.py::ModelSession`]

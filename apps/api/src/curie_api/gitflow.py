@@ -30,13 +30,17 @@ from plugin_format.deploy_targets import DeployTargetsFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from . import bundles, crud, deploy
+from curie_api.crud import agents as crud_agents
+from curie_api.crud import deployments as crud_deployments
+from curie_api.crud import versions as crud_versions
+from curie_api.schemas.deployments import WebhookResult
+
+from . import bundles, deploy
 from .config import Settings
 from .evalqueue import EvalQueue, now_iso
 from .github_app import credentials_for
 from .models import GIT_FLOW_CREATED_BY, Agent, AgentVersion, Environment
 from .repo_full_name import InvalidRepoFullName, repo_url_path
-from .schemas import WebhookResult
 from .storage import ObjectStore
 
 logger = logging.getLogger(__name__)
@@ -162,7 +166,7 @@ def _origins_match(requested: str, trusted: str) -> bool:
         return False
 
 
-def _clone_credential_env(
+def clone_credential_env(
     trusted_url: str, settings: Settings, *, repo_full_name: str, credentials: Any = None
 ) -> dict[str, str]:
     """Git config env that authenticates the clone, or empty if not applicable.
@@ -210,7 +214,7 @@ def _git_failure_detail(
     The old message interpolated the exception, whose repr is the argv and an
     exit code: 'returned non-zero exit status 128' told an operator nothing, and
     the actual reason was discarded despite being captured. argv is credential-
-    free by construction here (see ``_clone_credential_env``), but the tail is
+    free by construction here (see ``clone_credential_env``), but the tail is
     bounded anyway so a hostile remote cannot flood the response.
     """
 
@@ -256,7 +260,7 @@ def verify_push_origin(
         # today only by transitivity, and a misconfigured `github_clone_base`
         # must fail as a deployment configuration error, not be reported as a
         # forged push. Never interpolate the credential here; this URL never
-        # carries one (see `_clone_credential_env`), but keep it that way.
+        # carries one (see `clone_credential_env`), but keep it that way.
         raise GitFlowError(
             f"configured github_clone_base produces a clone url outside the "
             f"allowed schemes {settings.git_allowed_schemes!r}: {trusted_url!r}"
@@ -302,7 +306,7 @@ def clone_and_archive(
         "GIT_ALLOW_PROTOCOL": "file:https:http",
         "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_TERMINAL_PROMPT": "0",
-        **_clone_credential_env(
+        **clone_credential_env(
             trusted_url, settings, repo_full_name=repo_full_name, credentials=credentials
         ),
     }
@@ -457,13 +461,13 @@ async def process_push(
     # several on purpose: a dev bot and a prod bot are the same bundle on two
     # channels. Which one THIS push deploys to comes from the bundle's
     # deploy.yaml, so the bundle has to be fetched before the agent is known.
-    repo_agents = await crud.get_agents_by_repo(session, full_name)
+    repo_agents = await crud_agents.get_agents_by_repo(session, full_name)
     # The second clause is unreachable in practice (the lookup's predicate is
     # `Agent.repo_full_name == full_name` with a non-None argument); it exists
     # solely to narrow `str | None` to `str` for the origin derivation below.
     repo_agents = [a for a in repo_agents if a.repo_full_name is not None]
     if not repo_agents:
-        casing_matches = await crud.get_agents_by_repo_casefold(session, full_name)
+        casing_matches = await crud_agents.get_agents_by_repo_casefold(session, full_name)
         if casing_matches:
             return WebhookResult(
                 status="rejected",
@@ -627,9 +631,9 @@ async def process_push(
     except deploy.BundleInvalid as exc:
         return WebhookResult(status="rejected", errors=exc.errors)
 
-    named = _target_agent_name(targets, environment)
+    named = target_agent_name(targets, environment)
     named_elsewhere = (
-        await crud.get_agent_by_name(session, named)
+        await crud_agents.get_agent_by_name(session, named)
         if named and not any(a.name == named for a in repo_agents)
         else None
     )
@@ -642,7 +646,7 @@ async def process_push(
         # correct and is what an unmatched branch already does.
         return WebhookResult(status="ignored")
 
-    version = await crud.get_version_by_commit(
+    version = await crud_versions.get_version_by_commit(
         session, agent.id, after, created_by=GIT_FLOW_CREATED_BY
     )
     # Only a version whose bundle is actually stored may be reused for promote.
@@ -675,7 +679,7 @@ async def process_push(
             # redelivery still counts as a build. It is created here rather than
             # after the check because the refusal has to NAME a version, and
             # `deploy` builds the one message both envelopes render.
-            version = await crud.create_version_row(
+            version = await crud_versions.create_version_row(
                 session,
                 agent.id,
                 version_label=after[:12],
@@ -691,7 +695,7 @@ async def process_push(
         # gate below. `bundle_built` is `version.bundle_ref is None`, and it is
         # also what gates the eval fan-out: a version's eval-as-CI run happens
         # exactly once, on the delivery that builds its bundle. Both writers
-        # here -- `crud.attach_bundle` and `deploy.store_bundle` -- commit
+        # here -- `crud.versions.attach_bundle` and `deploy.store_bundle` -- commit
         # immediately, so a refusal arriving after either of them spends that
         # one chance: the operator binds the missing route, redelivers the same
         # sha, `bundle_built` is now false because the bundle is already stored,
@@ -727,7 +731,7 @@ async def process_push(
                 # an over-cap legacy sibling is refused here and is not attached
                 # (ADR-0059 decision 3).
                 return _rejected(exc, agent.id)
-            version = await crud.attach_bundle(
+            version = await crud_versions.attach_bundle(
                 session, version, str(sibling.bundle_ref), str(sibling.bundle_sha256)
             )
         else:
@@ -804,7 +808,7 @@ async def process_push(
             # even if the revalidation is ever moved or narrowed.
             return _rejected(exc, agent.id)
 
-    deployment = await crud.create_deployment_row(
+    deployment = await crud_deployments.create_deployment_row(
         session,
         agent.id,
         version.id,
@@ -1015,7 +1019,7 @@ def _read_stored_targets(archive: bytes, settings: Settings) -> DeployTargetsFil
     return _read_deploy_targets(bundles.extract_stored_bundle, archive, settings)
 
 
-def _target_agent_name(targets: DeployTargetsFile | None, environment: Environment) -> str | None:
+def target_agent_name(targets: DeployTargetsFile | None, environment: Environment) -> str | None:
     """The agent name this environment's target names, if exactly one does."""
 
     if targets is None:
@@ -1045,7 +1049,7 @@ async def _bundled_version_for_commit(
     after the clone it could have avoided. Keeping one function means the two
     can never disagree about what "already bundled" means.
 
-    ``repo_agents`` arrives in ``Agent.name`` order (``crud.get_agents_by_repo``
+    ``repo_agents`` arrives in ``Agent.name`` order (``crud.agents.get_agents_by_repo``
     orders it), so the version returned for a repository is deterministic.
 
     Note the truthiness test on ``bundle_ref``, not ``is not None``: a row whose
@@ -1057,7 +1061,7 @@ async def _bundled_version_for_commit(
     for candidate in repo_agents:
         if exclude_agent_id is not None and candidate.id == exclude_agent_id:
             continue
-        existing = await crud.get_version_by_commit(
+        existing = await crud_versions.get_version_by_commit(
             session, candidate.id, commit_sha, created_by=GIT_FLOW_CREATED_BY
         )
         if existing is not None and existing.bundle_ref:

@@ -115,8 +115,18 @@ worker_resources = {
     for rule in worker_role.get("rules") or []
     for resource in rule.get("resources") or []
 }
-if worker_resources & {"jobs", "configmaps", "secrets", "pods/log"}:
+if worker_resources & {"jobs", "configmaps", "pods/log"}:
     fail(f"main worker Role carries publication authority: {sorted(worker_resources)}")
+# Create-only secrets is the per-claim token grant (#3842), not publication
+# authority: publication needs get and delete, and create cannot read a Secret back.
+worker_secret_verbs = {
+    verb
+    for rule in worker_role.get("rules") or []
+    if "secrets" in (rule.get("resources") or [])
+    for verb in rule.get("verbs") or []
+}
+if worker_secret_verbs - {"create"}:
+    fail(f"main worker Role secrets must be create-only, got: {sorted(worker_secret_verbs)}")
 # The one pod grant is the exact-name read an unschedulable claim needs
 # (#3169); publication's pod authority is list plus pods/log.
 pod_verbs = {

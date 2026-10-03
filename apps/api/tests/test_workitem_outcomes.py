@@ -22,8 +22,11 @@ from typing import Any, cast
 import channel_protocol
 import httpx
 import pytest
-from curie_api import approval_principal, crud, factory_ci, workitems
+from aci_protocol import ApprovalRequest
+from curie_api import approval_principal, factory_ci
 from curie_api.config import get_settings
+from curie_api.crud import approvals as crud_approvals
+from curie_api.crud import lineages as crud_lineages
 from curie_api.github_app import (
     _RESOLVERS,
     GitHubAppError,
@@ -32,7 +35,7 @@ from curie_api.github_app import (
 from curie_api.main import create_app
 from curie_api.models import ExecutionRequest, WorkItem
 from curie_api.publication_authority import VerifiedPublicationIdentity
-from curie_api.schemas import ApprovalRequest, PublicationLineageAdvance
+from curie_api.schemas.publications import PublicationLineageAdvance
 from curie_api.workitem_dispatch import (
     acquire,
     admit,
@@ -45,6 +48,7 @@ from curie_api.workitem_dispatch import (
     start,
 )
 from curie_api.workitem_outcomes import derive_outcome
+from curie_api.workitems import lifecycle as workitems
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
 from sqlalchemy import text
@@ -748,7 +752,7 @@ def test_pending_tool_approval_on_the_reply_tuple_is_awaiting_approval(
     seeded = _completed(stack, agent)
 
     async def pend(session: AsyncSession) -> None:
-        await crud.create_approval(
+        await crud_approvals.create_approval(
             session,
             ApprovalRequest(
                 agent_id=uuid.UUID(agent["agent_id"]),
@@ -920,7 +924,7 @@ def test_verified_repository_identity_must_match_work_item_to_bind(
             {"id": uuid.UUID(publication["id"])},
         )
         assert version is not None
-        await crud.advance_publication_lineage(
+        await crud_lineages.advance_publication_lineage(
             session,
             uuid.UUID(publication["id"]),
             PublicationLineageAdvance(
@@ -2783,7 +2787,7 @@ def test_ci_detail_shares_the_bounded_credential_slots(
 
     from curie_api import workitem_outcomes
 
-    assert workitem_outcomes._mint_ci_token is not None
+    assert workitem_outcomes.mint_ci_token is not None
     for _ in range(workitem_outcomes.CI_CREDENTIAL_SLOTS + 1):
         failed, _ = _observe_detail(
             monkeypatch, _detail_handler(), creds=_FakeCreds(error=GitHubAppError("boom"))

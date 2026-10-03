@@ -49,14 +49,17 @@ all compile against the generated artifacts; none of them import the SDK.
 claude-agent-sdk-coupled: `runner/src/curie_runner/adapter.py` defines a
 `ModelSession` protocol and implements it with `ClaudeSDKClient` in
 streaming-input mode (native steer and interrupt), and `translate.py` maps SDK
-messages to ACI events. Above the session sits the declared-package layer from
-ADR-0060: a `HarnessContribution` manifest (name, image, install, auth,
-read-only tool set, spawn env) registered through the `curie.harness`
-entry-point group (`runner/src/curie_runner/harness/`), selected at boot via
-`CURIE_HARNESS` and defaulting to the built-in Claude contribution. Exactly
-one contribution exists today, so the registry is a guarded indirection around
-the same adapter; conformance checks for third-party contributions are pending
-(ADR-0062).
+messages to ACI events. Above the session sits `HarnessContribution`, whose
+fields are `name`, `aliases`, `readonly_tools`, `build_spawn_env`,
+`compile_bundle`, and `supports_structured_replay`. The `curie.harness` entry
+point registry retains guarded discovery, but the internal `CURIE_HARNESS`
+setting admits only Claude and its existing aliases at boot. Every other name
+is refused before discovery, including a registered nonClaude contribution.
+[ADR 0140](adr/0140-curie-supports-one-model-harness-until-a-second-one-exists.md)
+limits supported engines to Claude and stops the unfinished selector and
+conformance program until a real second engine exists. Approval policy stays
+in the core gate without SDK imports; its SDK callbacks and hook matchers live
+in `runner/src/curie_runner/harness/claude/approval.py`.
 
 **Swap (candidates: ADK, Codex, Strands, other Claude Agent SDK variants):**
 implement a new ACI server (an HTTP process that accepts `/v1/event`,
@@ -87,7 +90,7 @@ over OTLP-HTTP to the collector (`runner/src/curie_runner/otel.py`), and the
 collector is the single component that authenticates and forwards to Langfuse
 (`charts/curie/templates/otel-collector.yaml`, needed because Langfuse OTLP
 ingest is HTTP-only). On the read side the UI consumes only our API's schemas
-(`ObservationNode`, `MetricsSummary` in `apps/api/src/curie_api/schemas.py`).
+(`ObservationNode`, `MetricsSummary` in `apps/api/src/curie_api/schemas/observability.py`).
 
 **Current adapter:** `apps/api/src/curie_api/langfuse.py` (trace list, tree
 reconstruction from `parentObservationId`, metrics queries) plus

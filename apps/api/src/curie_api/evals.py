@@ -11,7 +11,7 @@ pivot is unit-testable off canned data.
 
 from typing import Any, Literal
 
-from .schemas import (
+from curie_api.schemas.evals import (
     EvalCell,
     EvalMatrix,
     EvalMatrixRow,

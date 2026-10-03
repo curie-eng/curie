@@ -26,8 +26,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 
+from curie_api.schemas.channels import normalize_caller_id
+
 from .models import AgentChannel
-from .schemas import normalize_caller_id
 
 
 class AdmissionReason(StrEnum):
@@ -70,7 +71,7 @@ def admit(binding: AgentChannel | None, caller_ids: Iterable[str]) -> AdmissionD
     request handling and log in their own words. Any one of the caller's ids
     matching an entry lets the caller in (a bot-sent Slack message is asked with
     both the sender and the bot id). Ids are compared in the binding kind's
-    comparison form (`schemas.normalize_caller_id`), the same form the list is
+    comparison form (`schemas.channels.normalize_caller_id`), the same form the list is
     stored in.
 
     Args:

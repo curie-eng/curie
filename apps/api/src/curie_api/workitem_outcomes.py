@@ -33,6 +33,16 @@ from curie_telemetry.redact import redact_text
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from curie_api.schemas.workitems import (
+    WorkItemCiOut,
+    WorkItemCorrectnessOut,
+    WorkItemOutcomeOut,
+    WorkItemOutcomeState,
+    WorkItemPrOut,
+    WorkItemPublicationOut,
+    WorkItemRequestOut,
+)
+
 from .config import Settings
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .models import (
@@ -43,15 +53,6 @@ from .models import (
     WorkItem,
 )
 from .repo_full_name import repo_url_path
-from .schemas import (
-    WorkItemCiOut,
-    WorkItemCorrectnessOut,
-    WorkItemOutcomeOut,
-    WorkItemOutcomeState,
-    WorkItemPrOut,
-    WorkItemPublicationOut,
-    WorkItemRequestOut,
-)
 
 OBJECTIVE_LIMIT = 512
 CHECK_RUNS_PAGE = 100
@@ -87,7 +88,7 @@ _FAILING_CONCLUSIONS = frozenset(
     {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
 )
 _PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
-_SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}")
+SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}")
 
 CiObservation = WorkItemCiOut
 
@@ -643,7 +644,7 @@ async def observe_ci(
     except TimeoutError:
         return _unavailable(
             "timeout",
-            head_sha if isinstance(head_sha, str) and _SHA_RE.fullmatch(head_sha) else None,
+            head_sha if isinstance(head_sha, str) and SHA_RE.fullmatch(head_sha) else None,
         )
 
 
@@ -693,7 +694,7 @@ def _mint_and_release(
             _CI_CREDENTIAL_GUARD.release()
 
 
-async def _mint_ci_token(
+async def mint_ci_token(
     lineage: Any, work_item: Any, settings: Settings, head_sha: str
 ) -> tuple[str | None, CiObservation | None]:
     """Mint a CI read token through the bounded credential slots.
@@ -741,9 +742,9 @@ async def _observe_ci(
     if lineage is None or lineage.pr_number is None:
         return CiObservation(state="not_applicable", reason="no_pull_request")
     head_sha = lineage.head_sha
-    if not isinstance(head_sha, str) or not _SHA_RE.fullmatch(head_sha):
+    if not isinstance(head_sha, str) or not SHA_RE.fullmatch(head_sha):
         return _unavailable("no_head_sha")
-    token, refused = await _mint_ci_token(lineage, work_item, settings, head_sha)
+    token, refused = await mint_ci_token(lineage, work_item, settings, head_sha)
     if refused is not None:
         return refused
     assert token is not None
@@ -903,13 +904,13 @@ async def observe_ci_detail(
 ) -> CiDetail:
     """Observe check runs, commit statuses and failing annotations for the head.
 
-    Shares ``observe_ci``'s bounded credential mint (``_mint_ci_token``). The
+    Shares ``observe_ci``'s bounded credential mint (``mint_ci_token``). The
     whole observation is bounded by ``CI_DETAIL_DEADLINE_SECONDS``; on expiry
     the caller is released with ``unavailable``/``timeout``.
     """
 
     raw = getattr(lineage, "head_sha", None) if lineage is not None else None
-    head_sha = raw if isinstance(raw, str) and _SHA_RE.fullmatch(raw) else None
+    head_sha = raw if isinstance(raw, str) and SHA_RE.fullmatch(raw) else None
     log_deadline = asyncio.get_running_loop().time() + CI_DETAIL_DEADLINE_SECONDS - 0.5
     try:
         return await asyncio.wait_for(
@@ -928,9 +929,9 @@ async def _observe_ci_detail(
     log_deadline: float,
 ) -> CiDetail:
     head_sha = getattr(lineage, "head_sha", None) if lineage is not None else None
-    if not isinstance(head_sha, str) or not _SHA_RE.fullmatch(head_sha):
+    if not isinstance(head_sha, str) or not SHA_RE.fullmatch(head_sha):
         return _detail_unavailable("no_head_sha", None)
-    token, refused = await _mint_ci_token(lineage, work_item, settings, head_sha)
+    token, refused = await mint_ci_token(lineage, work_item, settings, head_sha)
     if refused is not None:
         return _detail_unavailable(refused.reason or "github_error", head_sha)
     assert token is not None

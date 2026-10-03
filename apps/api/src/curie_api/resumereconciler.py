@@ -83,7 +83,8 @@ from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import crud
+from curie_api.crud import approvals as crud_approvals
+
 from .resumequeue import (
     ResumeQueue,
     approval_trace_context,
@@ -214,7 +215,7 @@ class ResumeReconciler:
             seconds=self._grace_seconds
         )
         async with self._sessionmaker() as session:
-            candidate_ids = await crud.list_resolved_unresumed(
+            candidate_ids = await crud_approvals.list_resolved_unresumed(
                 session, resolved_before=resolved_before, limit=self._batch_limit
             )
 
@@ -223,7 +224,7 @@ class ResumeReconciler:
             async with self._sessionmaker() as session:
                 try:
                     async with session.begin():
-                        approval = await crud.claim_resume_row(session, approval_id)
+                        approval = await crud_approvals.claim_resume_row(session, approval_id)
                         if approval is None:
                             # Another replica holds it, or it is already resumed;
                             # exit the txn block cleanly, releasing any lock.
@@ -267,7 +268,7 @@ class ResumeReconciler:
         never assume permanence. A row beyond the scan cap is picked up on a later
         pass as the graveyard trims.
 
-        Idempotency: ``crud.reopen_dead_lettered_resume`` only fires when the
+        Idempotency: ``crud.approvals.reopen_dead_lettered_resume`` only fires when the
         currently-marked ``resumed_at`` predates the row's dead-letter time, so a
         row that persists across passes cannot re-open a row already re-enqueued
         (its new ``resumed_at`` is newer). And a row already re-opened
@@ -295,7 +296,7 @@ class ResumeReconciler:
                 continue
             approval_id, dead_lettered_at = parsed
             async with self._sessionmaker() as session:
-                reopened = await crud.reopen_dead_lettered_resume(
+                reopened = await crud_approvals.reopen_dead_lettered_resume(
                     session, approval_id, dead_lettered_after=dead_lettered_at
                 )
             if reopened:

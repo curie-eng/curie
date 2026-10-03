@@ -430,12 +430,12 @@ _ROUTE_WHITESPACE = re.compile(r"\s")
 # ADR-0177 decision 1: the other form of a route's resolution. The card is shown
 # in the conversation that asked, on whatever channel that is, exactly as a
 # routeless approval's card already is. Mirrors the API's
-# ``ApprovalRequestingSurfaceTarget`` (``schemas.REQUESTING_SURFACE_MODE``).
+# ``ApprovalRequestingSurfaceTarget`` (``schemas.approvals.REQUESTING_SURFACE_MODE``).
 _REQUESTING_SURFACE = {"mode": "requesting_surface"}
 
 # ADR-0177 amendment: the channels whose approvals are answered from a route's approver
 # ``emails``. Only email today: the mail adapter's kind, and the API's
-# ``schemas.EMAIL_KIND``. A set rather than a comparison, because the question
+# ``schemas.channels.EMAIL_KIND``. A set rather than a comparison, because the question
 # the raise path asks is "does this channel read an email list", not "which
 # channel is this" (the reply seam stays kind-free, see test_reply_wire).
 _APPROVER_EMAIL_KINDS = frozenset({"email"})

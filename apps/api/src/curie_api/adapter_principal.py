@@ -24,7 +24,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from .sandbox_token import _b64url, _b64url_decode, _signature
+from curie_api.sandbox_token import b64url, b64url_decode, signature
 
 _PREFIX = "adp"
 _KIND = "adapter"
@@ -85,8 +85,8 @@ def mint(
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
-    signing_input = f"{_PREFIX}.{_b64url(payload)}"
-    return f"{signing_input}.{_signature(signing_key, signing_input)}"
+    signing_input = f"{_PREFIX}.{b64url(payload)}"
+    return f"{signing_input}.{signature(signing_key, signing_input)}"
 
 
 def _parse_bindings(value: object) -> frozenset[uuid.UUID] | None:
@@ -131,7 +131,7 @@ def verify(
         return None
     if prefix != _PREFIX:
         return None
-    expected_sig = _signature(signing_key, f"{_PREFIX}.{payload_seg}")
+    expected_sig = signature(signing_key, f"{_PREFIX}.{payload_seg}")
     try:
         signature_ok = hmac.compare_digest(sig_seg, expected_sig)
     except TypeError:
@@ -139,7 +139,7 @@ def verify(
     if not signature_ok:
         return None
     try:
-        payload = json.loads(_b64url_decode(payload_seg))
+        payload = json.loads(b64url_decode(payload_seg))
     except (ValueError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict) or set(payload) != _CLAIM_KEYS:

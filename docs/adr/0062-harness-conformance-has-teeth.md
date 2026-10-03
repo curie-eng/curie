@@ -2,7 +2,7 @@
 
 Date: 2026-07-21
 
-Status: Accepted
+Status: Superseded by [ADR 0140](0140-curie-supports-one-model-harness-until-a-second-one-exists.md)
 
 Realized by the import-linter contracts in `pyproject.toml`, run as
 `uv run lint-imports` in `.github/workflows/ci.yaml`, so a forbidden import fails

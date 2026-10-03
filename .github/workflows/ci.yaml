@@ -140,6 +140,10 @@ jobs:
           python-version: "3.13"
       - name: Sync workspace
         run: uv sync
+      - name: API private import boundaries
+        run: |
+          uv run python3 scripts/check-private-imports.py --self-test
+          uv run python3 scripts/check-private-imports.py
       # Docs-only diffs still run ruff/mypy/docs/alembic/wire-lock above. Reuse
       # ignored_prefixes from .github/e2e-selection.yaml so a guides edit does
       # not boot postgres; packages/, apps/, runner/, examples/tests/, cli,
@@ -1049,7 +1053,7 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-  # The two example connectors are the only images CI does not run, and the
+  # The example connectors are the only images CI does not run, and the
   # only ones release.yaml publishes for a second architecture. They are
   # validated here, build only, for both architectures: validating only amd64
   # leaves an arm64-only Dockerfile failure to appear for the first time during
@@ -1072,6 +1076,10 @@ jobs:
           - name: sre-bot-self-upgrade
             context: examples/sre-bot/connectors/self-upgrade
             dockerfile: examples/sre-bot/connectors/self-upgrade/Dockerfile
+            platforms: linux/amd64,linux/arm64
+          - name: github-activity-github
+            context: examples/github-activity/connectors/github
+            dockerfile: examples/github-activity/connectors/github/Dockerfile
             platforms: linux/amd64,linux/arm64
     steps:
       - uses: actions/checkout@v7
@@ -2294,6 +2302,19 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/runner-resources-assertions.sh
+      # Runner template admission (#3842). The worker's template and Secret
+      # writes are refused unless they keep the chart's shape: each denial must
+      # carry the policy's own message, and the same hostPath template from the
+      # cluster admin is admitted. Needs a real API server of 1.30 or newer.
+      # Every object is named from RUN_ID and verified gone on exit.
+      - name: Runner template admission refuses host escapes, token mounts, and unlisted images
+        env:
+          CURIE_ADMISSION_CONTEXT: kind-curie-e2e
+          RUN_ID: ${{ github.run_id }}${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/runner-template-admission-runtime.sh
       - name: Load the Postgres readiness fixture into the kind cluster
         run: kind load docker-image "curie-postgres-readiness:${GITHUB_SHA}" --name curie-e2e
       - name: Langfuse web waits for delayed Postgres without restarting
@@ -2331,6 +2352,9 @@ jobs:
       # undeclared control is blocked. Same non-vacuity gate as the mail
       # adapter check: a non-enforcing CNI FAILS, it does not skip. Own
       # namespace, so it neither reads nor disturbs the release above.
+      # It also holds a runner-labelled pod to the rendered policies for
+      # allowedEgress 0.0.0.0/0 and requires a private-range pod peer it reached
+      # under the pre-change shape to be refused (#3842 AC3).
       - name: Runner BYO egress enforces (not just rendered)
         run: bash scripts/check-runner-byo-egress.sh charts/curie
       - name: Dump cluster diagnostics on failure

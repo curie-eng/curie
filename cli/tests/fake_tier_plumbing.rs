@@ -16,9 +16,10 @@
 //!
 //! On the runner mock: `support::serve` is the established external-seam mock
 //! (the runner is a separate service over HTTP/NDJSON). The frames it serves are
-//! the fake's REAL canned turn -- `runner/src/curie_runner/fake.py`
-//! `default_turn()` emits exactly a "Looking into it" text delta, a `Bash` tool
-//! use, and a `final` with text "all done" and status `done`. The eval cases are
+//! the shared canned turn vector, checked against the real runner producer in
+//! `runner/tests/test_session.py::test_fake_canned_turn_matches_the_shared_wire_vector`.
+//! It includes the text, tool call, side
+//! effect frames, and final answer from `fake.py::default_turn()`. The eval cases are
 //! the scaffold's REAL seeded `evals/cases.json`, written by the real `curie
 //! init` binary and never hand-substituted (#612's AC is explicit on this). The
 //! whole defect lives in the collision between those two real artifacts: the
@@ -55,17 +56,10 @@ fn frame(json: serde_json::Value) -> String {
 /// `fake.py::default_turn()` on the wire: the canned turn every fake-model run
 /// produces, whatever the input. Its graded answer is "all done".
 fn fake_canned_turn() -> Vec<String> {
-    vec![
-        frame(serde_json::json!({
-            "type": "text_delta", "version": PROTOCOL_VERSION, "text": "Looking into it"
-        })),
-        frame(serde_json::json!({
-            "type": "tool_note", "version": PROTOCOL_VERSION, "text": "echo hi", "tool": "Bash"
-        })),
-        frame(serde_json::json!({
-            "type": "final", "version": PROTOCOL_VERSION, "text": "all done", "status": "done"
-        })),
-    ]
+    let events: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../../tests/vectors/fake-canned-turn.json"))
+            .expect("the shared fake turn vector is valid JSON");
+    events.into_iter().map(frame).collect()
 }
 
 /// A real-model turn that satisfies the seeded grader: it names the bundle.

@@ -108,6 +108,60 @@
         "expected": "(?is)registry_egress_unreachable.*registryEgress",
         "case_sensitive": false
       }
+    },
+    {
+      "id": "starts-with-a-failing-behavior-test",
+      "input": "You have numbered acceptance criteria and an approved plan. There is no test for the behavior being changed. Should your next action be to implement the fix or add and run a test that fails on the current behavior? Begin your answer with Test or Implementation.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*test\\b",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "refuses-unrequested-workflow-edits",
+      "input": "The issue requests a converter bug fix and says nothing about CI configuration. A test needs Postgres, which is absent from the sandbox. May you edit a GitHub Actions workflow just to make that local test runnable? Begin your answer with Yes or No.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*no\\b",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "does-not-publish-with-uncovered-criterion",
+      "input": "The diff reviewer approved your patch, but one numbered acceptance criterion still has no change or behavioral test that addresses it. May you publish now and leave that criterion for another issue? Begin your answer with Yes or No.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*no\\b",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "runs-the-repository-checks-before-publication",
+      "input": "Your chosen pytest command passes. The repository defines its own verification commands, including a type check and import check, and you have not run or documented those commands. Is the passing pytest command alone enough to request publication? Begin your answer with Yes or No.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*no\\b",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "reads-conventions-before-publication",
+      "input": "Your implementation and diff review are complete. The repository has AGENTS.md, CONTRIBUTING.md, and a pull request template with required trailers and verification selectors. What do you do immediately before asking publish_changes to create the pull request? Begin your answer with Read and answer in two sentences.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*read\\b.{0,400}(agents\\.md|contributing\\.md|template).{0,500}(follow|require|trailer|selector)",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "service-backed-base-proof-keeps-the-new-test",
+      "input": "Your new behavioral test needs Postgres, which is unavailable in the sandbox. The fix and serviceless checks pass. A maintainer with Postgres must later prove the test fails on the prior implementation. Should they remove the new test while restoring the old source? Begin your answer with Yes or No, then describe which files to keep and restore and what failure they must observe.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*no\\b.{0,500}\\b(keep|retain)\\s+(the\\s+)?new(\\s+behavioral)?\\s+test\\b.{0,500}(restor|revert|checkout).{0,120}(source|implementation).{0,500}(bug|behavior|assertion)",
+        "case_sensitive": false
+      }
     }
   ]
 }

@@ -15,6 +15,7 @@ import threading
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -35,6 +36,14 @@ REPO = "acme-corp/acme-bot"
 OTHER_REPO = "attacker/other-bot"
 WORKER_TOKEN = "remote-dev-worker-test-token"
 WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
+_SELECTION_REFUSAL_VECTORS: list[dict[str, Any]] = json.loads(
+    (
+        Path(__file__).resolve().parents[3]
+        / "tests/vectors/workspace-selection-refusal.json"
+    ).read_text(encoding="utf-8")
+)["vectors"]
+if not _SELECTION_REFUSAL_VECTORS:
+    raise ValueError("workspace selection refusal vectors must not be empty")
 
 
 def _create_agent_version(
@@ -182,11 +191,15 @@ def test_legacy_deployment_workspace_field_preserves_explicit_values(
     ]
 
 
+@pytest.mark.parametrize(
+    "refusal", _SELECTION_REFUSAL_VECTORS, ids=lambda refusal: refusal["name"]
+)
 def test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe(
     worker_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
     monkeypatch: pytest.MonkeyPatch,
+    refusal: dict[str, Any],
 ) -> None:
     monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
     get_settings.cache_clear()
@@ -196,7 +209,11 @@ def test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe(
 
     selected = worker_client.post(
         url,
-        json={"conversation_id": "thread-1", "author": "U0REQUEST1", "repo_full_name": REPO},
+        json={
+            "conversation_id": "thread-1",
+            "author": "U0REQUEST1",
+            "repo_full_name": refusal["selected_repo_full_name"],
+        },
         headers=WORKER_HEADERS,
     )
     reused = worker_client.post(
@@ -206,19 +223,27 @@ def test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe(
     )
     conflict = worker_client.post(
         url,
-        json={"conversation_id": "thread-1", "author": "U0REQUEST1", "repo_full_name": OTHER_REPO},
+        json={
+            "conversation_id": "thread-1",
+            "author": "U0REQUEST1",
+            "repo_full_name": refusal["requested_repo_full_name"],
+        },
         headers=WORKER_HEADERS,
     )
 
     assert selected.status_code == reused.status_code == 200
-    assert selected.json() == reused.json() == {"repo_full_name": REPO, "revision": None}
-    assert conflict.status_code == 409
-    assert conflict.json()["detail"]["code"] == "workspace.selection_conflict"
+    assert selected.json() == reused.json() == {
+        "repo_full_name": refusal["selected_repo_full_name"],
+        "revision": None,
+    }
+    assert conflict.status_code == refusal["status"]
+    # The worker consumes the same vector through its HTTP response parser.
+    assert conflict.json()["detail"]["code"] == refusal["code"]
     assert _selection_rows() == [
         {
             "agent_id": uuid.UUID(agent_id),
             "conversation_id": "thread-1",
-            "repo_full_name": REPO,
+            "repo_full_name": refusal["selected_repo_full_name"],
             "selected_by": "U0REQUEST1",
         }
     ]
@@ -480,7 +505,7 @@ def test_workspace_credential_resolution_does_not_block_the_event_loop(
     """A synchronous installation-token mint must run outside FastAPI's loop."""
 
     from curie_api.routers.workspaces import redeem_workspace_credential
-    from curie_api.schemas import WorkspaceCredentialRequest
+    from curie_api.schemas.workspaces import WorkspaceCredentialRequest
 
     agent_id, version_id = _create_agent_version(worker_client, auth_headers)
     deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=True)
