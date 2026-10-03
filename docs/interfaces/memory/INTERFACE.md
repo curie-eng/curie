@@ -147,8 +147,20 @@ There are two sandbox credentials, both `scope="state"` tokens:
   only when the agent has memory writes on, the turn names a binding and it is
   not eval-isolated, with claims `{binding, memory: "write", sender, turn}`.
   `sender` is the turn's `event.user`, or `<no person>`; `turn` is the queued
-  event id. It expires after the turn's remaining delivery budget (capped at
-  24 hours) plus 60 seconds. It rides the runner POST as `Event.memory_token`
+  event id plus a random suffix unique to each mint
+  (`apps/worker/src/curie_worker/kernel.py::Kernel._with_memory_token`), so a retry or
+  continuation carries its own claim. It expires at the turn's stream deadline,
+  capped at 24 hours, with no grace. When the attempt ends the worker reports
+  the turn closed (`BindingResolver.close_turn_memory`), and the API then
+  refuses writes with that claim before expiry
+  (`apps/api/src/curie_api/routers/state.py::_check_turn_open`); if it cannot
+  check the closed-turn record it answers 503 rather than accept the write. A
+  failed close leaves the credential valid until it expires. A steering
+  attempt does not close its own claim when it ends: it hands the claim through
+  Valkey to the live turn it joined, and that turn's owner closes it when the
+  live turn ends (`Kernel._close_memory_turns`). A steer whose runner did not
+  name its live turn is never closed and stays valid until it expires. It rides the
+  runner POST as `Event.memory_token`
   (MEMORY-TOKEN-1..3), never the env. The runner keeps it on
   `MemoryTurn.write_token`, and the tool stores present it, falling back to the
   env token when the event has none.
