@@ -54,6 +54,7 @@ from .delivery_lease import DeliveryLeaseStore
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
+from .hook_source_guard import CronHookSourceGuard
 from .kernel import Kernel, drain_pending_memory_closes
 from .killswitch import KillSwitch
 from .markers import Markers
@@ -697,6 +698,7 @@ def build(
         ),
         connector_loop=_build_connector_loop(config, engine),
         cron_loop=CronSchedulerLoop(
+            source_guard=CronHookSourceGuard(source_gate, engine),
             engine=engine,
             redis=async_redis,
             source=BundleTriggerSource(
