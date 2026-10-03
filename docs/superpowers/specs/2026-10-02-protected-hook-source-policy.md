@@ -166,6 +166,11 @@ raising/returning to `asyncio.run` is insufficient. Do not dispose gate/work
 engines under unjoined producers or claim successful termination/disposal or
 normal exception propagation after fatal exit. Fatal-path tests run only in
 an exclusively owned subprocess.
+Worker close budgets use observed task deadlines, not only cooperative timeout
+cancellation. If an owned worker closer remains live at its five-second
+deadline, use the same bounded fatal exit; do not detach it or report cleanup
+complete. A cooperative close error still attempts later independent resources
+and preserves the primary cause.
 
 ## API DTOs and credential lifecycle
 

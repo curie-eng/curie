@@ -21,10 +21,10 @@ or plugin contract changes; no sacred kernel/consumer/lock/marker edits.
 
 ## Active ownership dependencies
 
-The open [scheduler trace change #3895](https://github.com/curie-eng/curie/pull/3895)
-owns worker cron integration and its existing tests. Do not edit those paths
-until it lands; then refresh the base and reread its intent before producer
-integration. Do not merge, modify or message that pull request. Independent
+The landed [scheduler trace change #3895](https://github.com/curie-eng/curie/pull/3895)
+previously reserved worker cron integration and its existing tests. It merged
+as `b503459da`; the refreshed main base is `c886b17a5`. Its producer span and
+trace carrier remain part of the integrated ordinary enqueue path. Do not merge, modify or message that pull request. Independent
 shared helpers, API administration and ledger work can proceed in owned files;
 new isolated source-guard tests may be prepared without editing the existing
 cron suite. Mutations remain unavailable until the complete producer fences
@@ -67,9 +67,8 @@ real SELECT denial and deadline/cleanup behavior. An installed-wheel check with
 API absent proves shared resource/import closure; the real graph/catalog/chart
 checks prevent a source-tree-only success.
 
-Worker composition, startup, cron and its test files remain held until #3895
-actually merges and its landed ownership/intent is reviewed on a fresh base.
-Then independent new worker tests prove pre-build refusal before boot effects,
+The #3895 ownership hold has cleared after the actual merge and fresh-base
+review. Independent new worker tests now prove pre-build refusal before boot effects,
 bounded distinct gate-pool ownership, actual stop-before-dispose and cleanup
 failure/cancellation. Fatal timeout tests run only in an exclusively owned
 subprocess and do not claim normal exception propagation or successful disposal.
@@ -112,8 +111,11 @@ candidate image installation, actual schema head/minimum, upgrade and Helm
 metadata. Skill is not applicable while no runner loop, ACI event or bundle
 changes; cluster is not applicable without template/RBAC/substrate changes;
 live provider is not applicable without model/MCP/workspace/session capability
-changes; external integration is not applicable while delivery-v2 and third
-party shapes remain unchanged. Reclassify if scope reaches those surfaces.
+changes; factory is not applicable without factory/work-item execution changes.
+External integration is required by the current path-derived guard for the
+signed-hook ingress router; exercise actual delivery against the final
+candidate. Classify all seven tiers and do not substitute replayed fixtures
+for required live evidence. Reclassify if scope reaches further surfaces.
 
 Regenerate OpenAPI through the existing generator. Run affected API/worker
 suites, full Python baseline, schema/released upgrade, static/import/wire/docs
