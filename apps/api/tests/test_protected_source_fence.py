@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from typing import Any
@@ -294,3 +295,70 @@ def test_same_revision_cannot_replace_published_policy_fingerprint(source_store:
     assert fence.read(agents[0], "probe") == before
     assert fence.publish_ordinary(agents[0], "probe", generation, operation, "6" * 64)
     assert fence.read(agents[0], "probe") == before
+
+
+@pytest.mark.parametrize("method", ["read", "reserve"])
+@pytest.mark.parametrize("floor", [1.9, True, "-1", "9223372036854775808", "01"])
+def test_corrupt_stored_floor_refuses_before_read_or_idempotent_reservation(
+    source_store: Any, method: str, floor: Any
+) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-1; PROTECTED-HOOK-SOURCE-6."""
+    client, agents = source_store
+    source_fence_module = _source_fence_module()
+    fence = source_fence_module.SourceFence(client)
+    operation = str(uuid4())
+    key = f"protected:source:{agents[0]}:probe"
+    raw = json.dumps({"floor": floor, "operation_id": operation, "active": None})
+    client.set(key, raw)
+    try:
+        with pytest.raises(ValueError) as rejected:
+            if method == "read":
+                fence.read(agents[0], "probe")
+            else:
+                fence.reserve_and_revoke(agents[0], "probe", 1, operation, 1)
+        assert rejected.type.__name__ == "SourceFenceInvalid"
+    finally:
+        assert client.get(key) == raw
+
+
+@pytest.mark.parametrize("method", ["read", "reserve"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("generation", 1.9),
+        ("generation", True),
+        ("generation", "2"),
+        ("generation", "-1"),
+        ("generation", "01"),
+        ("operation_id", "00000000-0000-0000-0000-000000000000"),
+        ("policy_fingerprint", "invalid"),
+        ("mode", "unsupported"),
+    ],
+)
+def test_corrupt_active_binding_refuses_before_read_or_idempotent_reservation(
+    source_store: Any, method: str, field: str, value: Any
+) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-1; PROTECTED-HOOK-SOURCE-6."""
+    client, agents = source_store
+    source_fence_module = _source_fence_module()
+    fence = source_fence_module.SourceFence(client)
+    operation = str(uuid4())
+    active = {
+        "generation": "1",
+        "operation_id": operation,
+        "mode": "ordinary",
+        "policy_fingerprint": "8" * 64,
+    }
+    active[field] = value
+    key = f"protected:source:{agents[0]}:probe"
+    raw = json.dumps({"floor": "1", "operation_id": operation, "active": active})
+    client.set(key, raw)
+    try:
+        with pytest.raises(ValueError) as rejected:
+            if method == "read":
+                fence.read(agents[0], "probe")
+            else:
+                fence.reserve_and_revoke(agents[0], "probe", 1, operation, 1)
+        assert rejected.type.__name__ == "SourceFenceInvalid"
+    finally:
+        assert client.get(key) == raw
