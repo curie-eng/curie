@@ -34,8 +34,8 @@ from dataclasses import dataclass
 # The base64url/HMAC primitives, borrowed rather than copied. The sibling-module
 # decision above is about the CLAIMS and the mint/verify surface; these three
 # carry no claims at all, so there is no reason for a second copy of them. The
-# import direction is one-way -- `sandbox_token` is untouched, so its
-# byte-identical api/worker twin still holds.
+# import direction remains one way. The shared helpers have public names in
+# both sandbox_token copies, which retain identical source and behavior.
 from curie_api.sandbox_token import b64url, b64url_decode, signature
 
 _PREFIX = "chn"

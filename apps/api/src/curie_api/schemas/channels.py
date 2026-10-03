@@ -64,7 +64,7 @@ def _slack_shape_error(value: str) -> str:
 # a violation earns (ADR-0096, #1459).
 #
 # A kind ABSENT from this table is not rejected: it validates on the generic
-# rule in `_validate_channel_binding` instead. That fallback is what makes
+# rule in `validate_channel_binding` instead. That fallback is what makes
 # "an agent binds a non-Slack channel kind without schema changes" true rather
 # than aspirational -- a registry would put a code change in front of every new
 # adapter, which is the coupling ADR-0096 removes. Adding an entry here is how a
@@ -182,7 +182,7 @@ MAX_ALLOWED_CALLERS = 100
 # mail adapter sends the sender that way (`_bare_address` lowercases it).
 EMAIL_KIND = "email"
 # A Slack caller is a user (U), an enterprise-grid user (W) or a bot (B). Same
-# allowlist discipline as `_SLACK_USER_ID`, widened by exactly the bot prefix:
+# allowlist discipline as `SLACK_USER_ID`, widened by exactly the bot prefix:
 # the dispatcher asks with the bot id when a bot sent the message.
 _SLACK_CALLER_ID = re.compile(r"^[UWB][A-Z0-9]{7,}$")
 # One bare address: exactly one `@`, something on each side, and none of the

@@ -214,7 +214,7 @@ def _git_failure_detail(
     The old message interpolated the exception, whose repr is the argv and an
     exit code: 'returned non-zero exit status 128' told an operator nothing, and
     the actual reason was discarded despite being captured. argv is credential-
-    free by construction here (see ``_clone_credential_env``), but the tail is
+    free by construction here (see ``clone_credential_env``), but the tail is
     bounded anyway so a hostile remote cannot flood the response.
     """
 
@@ -260,7 +260,7 @@ def verify_push_origin(
         # today only by transitivity, and a misconfigured `github_clone_base`
         # must fail as a deployment configuration error, not be reported as a
         # forged push. Never interpolate the credential here; this URL never
-        # carries one (see `_clone_credential_env`), but keep it that way.
+        # carries one (see `clone_credential_env`), but keep it that way.
         raise GitFlowError(
             f"configured github_clone_base produces a clone url outside the "
             f"allowed schemes {settings.git_allowed_schemes!r}: {trusted_url!r}"

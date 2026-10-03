@@ -56,7 +56,7 @@ class Unavailable(Exception):
 async def get_all(
     client: httpx.AsyncClient, *, api: str, token: str, path: str, params: dict[str, Any]
 ) -> list[Any]:
-    """Every page of one listing, in GitHub's order, or _Unavailable."""
+    """Every page of one listing, in GitHub's order, or Unavailable."""
 
     items: list[Any] = []
     for page in range(1, _MAX_PAGES + 1):

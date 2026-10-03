@@ -52,6 +52,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from curie_api import models
+
+# This HEAD harness runs inside historical candidate environments, where the
+# router binds AgentOut across the supported released versions.
 from curie_api.routers.agents import AgentOut
 from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy import select

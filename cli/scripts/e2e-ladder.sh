@@ -2054,7 +2054,7 @@ if not isinstance(rows, list):
     print(repr(rows)[:400])
     sys.exit(0)
 # Validate EVERY row before filtering, and fail on any that is not a
-# DeploymentOut (apps/api/src/curie_api/schemas.py). Skipping malformed rows
+# DeploymentOut (apps/api/src/curie_api/schemas/deployments.py). Skipping malformed rows
 # inside the filter instead would be fail-open on an unexpected shape: a
 # response carrying the expected active row PLUS a null or a truncated object
 # would be silently reduced to the one good row and pass as proof that exactly

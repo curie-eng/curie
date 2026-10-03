@@ -1,7 +1,7 @@
 """The channel ingress API (ADR-0096 phase 2, #1459).
 
 Three endpoints, and every request/response model they use lives here rather
-than in ``schemas.py``:
+than in ``schemas.channels``:
 
 - ``POST /channels/token`` (platform key, or an adapter principal serving the
   binding, ADR-0154) mints a ``chn`` token over a binding ROW's id plus a
@@ -70,7 +70,7 @@ from sqlalchemy import select
 from curie_api.crud import channels as crud_channels
 
 # The API's Valkey client is built without `decode_responses`, so values come
-# back as bytes; `_text` is the package's named, documented decode for exactly
+# back as bytes; `text` is the package's named, documented decode for exactly
 # that, and this router is not the place for a seventh copy of the expression.
 from curie_api.graveyardwatcher import text
 from curie_api.schemas.channels import ChannelBinding
@@ -145,7 +145,7 @@ _MAX_ADMISSION_CALLERS = 10
 class ChannelTokenRequest(ChannelBinding):
     """Mint request: the binding pair to scope the token to, plus its lifetime.
 
-    Subclasses `ChannelBinding` so the SAME `_validate_channel_binding` the
+    Subclasses `ChannelBinding` so the SAME `validate_channel_binding` the
     agents API runs judges the pair here (E11). Two write paths cannot drift
     into two rules -- that drift is how #143 happened -- and an operator reads
     the identical message from either endpoint.
@@ -207,7 +207,7 @@ class AdmissionIn(ChannelBinding):
     """One admission question from the Slack dispatcher (ADR 0175 decision 2).
 
     Subclasses `ChannelBinding` so the route pair is judged by the same
-    `_validate_channel_binding` every other binding surface runs. `adapter`
+    `validate_channel_binding` every other binding surface runs. `adapter`
     names the identity half of the route (ADR-0168 decision 3), resolved
     exactly as `POST /channels/token` resolves it: omitted means the default
     Slack identity. `callers` is every id the channel reports for the caller;

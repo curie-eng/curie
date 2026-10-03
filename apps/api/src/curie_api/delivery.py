@@ -33,7 +33,7 @@ import redis.asyncio as redis
 from fastapi import Response
 
 # The API's Valkey client is built without `decode_responses`, so values come
-# back as bytes; `_text` is the package's named, documented decode for exactly
+# back as bytes; `text` is the package's named, documented decode for exactly
 # that.
 from curie_api.graveyardwatcher import text
 

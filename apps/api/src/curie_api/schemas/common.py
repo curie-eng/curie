@@ -60,7 +60,7 @@ def nullable_override_validator(field: str, examples: str) -> Callable[[str | No
         # agent's NEXT turn, long after the command that stored it exited 0.
         #
         # This is the API's job because the API is the gate every client passes
-        # through -- the same reasoning `_validate_channel_binding` states for
+        # through -- the same reasoning `validate_channel_binding` states for
         # itself ("the authoritative gate for every caller (UI, API, CLI)"). The
         # console already trimmed and the CLI did not, so the same paste stored
         # two different values depending on which surface an operator used;

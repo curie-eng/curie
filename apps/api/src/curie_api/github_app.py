@@ -207,7 +207,7 @@ class GitHubCredentials:
         """A credential able to read ``owner/repo``, or "" if none is configured.
 
         Returning "" rather than raising is deliberate: a public repository
-        needs no credential, and `_clone_credential_env` already treats an empty
+        needs no credential, and `clone_credential_env` already treats an empty
         token as "send no Authorization header".
         """
 

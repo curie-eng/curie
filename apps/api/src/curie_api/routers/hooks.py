@@ -276,7 +276,7 @@ async def _load_agent(session: SessionDep, agent_id: uuid.UUID) -> Agent | None:
     """Load the agent and every surface binding, or None."""
 
     # Annotated rather than returned bare: `session.scalar` is typed Any, and the
-    # local annotation is how the rest of this package pins it (see `crud.py` and
+    # local annotation is how the rest of this package pins it (see `crud/agents.py` and
     # `channels._resolve_binding`).
     agent: Agent | None = await session.scalar(
         select(Agent).where(Agent.id == agent_id).options(selectinload(Agent.channels))

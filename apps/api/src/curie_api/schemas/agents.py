@@ -115,7 +115,7 @@ def enforce_behavior_packs_size(config: BehaviorPacksConfig) -> None:
     Shared by both write paths (the PUT and the create) so the cap is a
     property of the config, not of one endpoint. Size is the serialized-JSON
     byte length of the whole config, the unit ``behavior_packs_max_bytes`` is
-    measured in (mirrors the durable-state ``_enforce_caps`` in state.py)."""
+    measured in (mirrors the durable-state ``enforce_caps`` in routers/state.py)."""
     limit = get_settings().behavior_packs_max_bytes
     size = len(json.dumps(config.model_dump(), separators=(",", ":")).encode("utf-8"))
     if size > limit:

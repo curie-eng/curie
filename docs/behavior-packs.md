@@ -39,7 +39,7 @@ worker.
 The substrate, end to end, minus the kernel call sites:
 
 - **Storage + API** (`apps/api`): a nullable `agents.behavior_packs` JSONB column
-  (migration `0005`), validated by `schemas.BehaviorPacksConfig`, accepted on
+  (migration `0005`), validated by `schemas.agents.BehaviorPacksConfig`, accepted on
   `POST /agents`, and read/written via `GET|PUT /agents/{id}/behavior-packs`
   (mirrors the budget control endpoints). NULL reads as all-off.
 - **Logic** (`apps/worker/src/curie_worker/behaviorpacks.py::sample_load`): `sample_load(packs, seed)`,

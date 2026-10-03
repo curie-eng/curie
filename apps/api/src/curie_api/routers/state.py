@@ -72,7 +72,7 @@ STATE_APP_SCOPE = "state.app"
 
 # Namespaces owned by the memory (#264) and history (#20) ports; the narrow
 # app-scoped (bundle) token may not touch them. Literals rather than an import
-# because ``routers.memory`` imports ``_enforce_caps`` from THIS module (a real
+# because ``routers.memory`` imports ``enforce_caps`` from THIS module (a real
 # import cycle otherwise). Mirrors the runner client's ``RESERVED_NAMESPACES``
 # (``runner/src/curie_runner/state.py``) and ``memory.MEMORY_NAMESPACE`` /
 # the history transcript key -- a bundle wanting durable memory uses the remember
