@@ -174,7 +174,8 @@ On cooperative paths retain the primary exception/cancellation; secondary
 cleanup failures produce safe diagnostics, and failure without a primary cause
 fails shutdown. Shield only an owned bounded cleanup task; do not detach
 unbounded work. If producer join expires, perform process-level fatal exit
-within one further second, preserving safe primary-cause diagnostics. Merely
+within one further second, preserving safe primary-cause diagnostics. Diagnostic
+errors or blocked log sinks must not prevent that fatal exit. Merely
 raising/returning to `asyncio.run` is insufficient. Do not dispose gate/work
 engines under unjoined producers or claim successful termination/disposal or
 normal exception propagation after fatal exit. Fatal-path tests run only in
