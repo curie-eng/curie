@@ -75,13 +75,9 @@ dev = [
 ]
 
 [tool.importlinter]
-# ADR-0062 (#844 Phase 2): harness conformance gets teeth. The full contract that
-# ADR-0062 asks for -- no `claude_agent_sdk` import ANYWHERE outside the Claude
-# harness package -- cannot pass yet: nine `curie_runner` modules still import the
-# SDK directly (adapter, approval, check, fake, hooks, plugin, session, state,
-# translate), and confining them is Phase 2's refactor. These two contracts gate
-# the boundaries that are ALREADY clean, so they cannot rot back before that
-# lands, and the third contract is added when it does.
+# ADR 0140 keeps the current harness boundaries and ratchets the 16 existing
+# runner modules that import the Claude SDK. The platform, frozen contracts and
+# harness port remain free of the SDK. New runner modules cannot import it.
 root_packages = [
     "curie_api",
     "curie_worker",
@@ -170,6 +166,34 @@ source_modules = [
     "curie_runner.harness.registry",
 ]
 forbidden_modules = ["claude_agent_sdk"]
+
+[[tool.importlinter.contracts]]
+# These are the current direct SDK edges. Indirect use remains possible while
+# the existing adapters stay in place, but a new importing module must live in
+# the Claude harness package rather than expanding this list (ADR 0140).
+name = "The runner adds no SDK imports outside the Claude harness"
+type = "forbidden"
+source_modules = ["curie_runner"]
+forbidden_modules = ["claude_agent_sdk"]
+allow_indirect_imports = true
+ignore_imports = [
+    "curie_runner.__main__ -> claude_agent_sdk",
+    "curie_runner.adapter -> claude_agent_sdk",
+    "curie_runner.approval -> claude_agent_sdk",
+    "curie_runner.check -> claude_agent_sdk",
+    "curie_runner.fake -> claude_agent_sdk",
+    "curie_runner.hooks -> claude_agent_sdk",
+    "curie_runner.issue_read -> claude_agent_sdk",
+    "curie_runner.mcp_argv -> claude_agent_sdk",
+    "curie_runner.plugin -> claude_agent_sdk",
+    "curie_runner.progress -> claude_agent_sdk",
+    "curie_runner.session -> claude_agent_sdk",
+    "curie_runner.state -> claude_agent_sdk",
+    "curie_runner.tool_access -> claude_agent_sdk",
+    "curie_runner.translate -> claude_agent_sdk",
+    "curie_runner.turn_progress -> claude_agent_sdk",
+    "curie_runner.usage_report -> claude_agent_sdk",
+]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
