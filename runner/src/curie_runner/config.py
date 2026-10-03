@@ -58,6 +58,12 @@ def require_serving_token(runner_token: str | None, *, allow_tokenless: bool) ->
     )
 
 
+# Claude Code built-ins that reach no one from a channel agent (#3336): the model
+# only burns a turn calling them, so a channel-bound turn drops them from the
+# catalogue.
+CHANNEL_HIDDEN_TOOLS: tuple[str, ...] = ("SendMessage", "PushNotification")
+
+
 @dataclass(frozen=True)
 class RunnerConfig:
     session: SessionConfig
@@ -150,6 +156,9 @@ class RunnerConfig:
     # The runner-local CURIE_RUNNER_ALLOW_TOKENLESS dev flag as parsed (#3821).
     # Only require_serving_token consumes it; a set token always wins.
     allow_tokenless: bool = False
+    # Whether this turn is bound to a channel, as the worker sent it (#3336).
+    # Absent or false keeps the catalogue unchanged.
+    channel_bound: bool = False
 
     @property
     def memory_writes_on(self) -> bool:
@@ -162,6 +171,19 @@ class RunnerConfig:
         if self.memory_writes is not None:
             return self.memory_writes
         return bool(self.channel_memory_ref)
+
+    @property
+    def catalogue_disallowed_tools(self) -> tuple[str, ...]:
+        """The tool names to remove from the model catalogue (#3336).
+
+        The operator list in order, plus the channel-hidden built-ins when the
+        turn is channel-bound.
+        """
+
+        if not self.channel_bound:
+            return self.disallowed_tools
+        extra = tuple(name for name in CHANNEL_HIDDEN_TOOLS if name not in self.disallowed_tools)
+        return (*self.disallowed_tools, *extra)
 
     @property
     def ceiling(self) -> int:
@@ -238,6 +260,7 @@ class RunnerConfig:
             allow_tokenless=allow_tokenless,
             connector_caller_token=boot.connector_caller_token,
             memory_writes=boot.memory_writes,
+            channel_bound=boot.channel_bound is True,
             memory_max_facts=(
                 boot.memory_max_facts
                 if boot.memory_max_facts is not None

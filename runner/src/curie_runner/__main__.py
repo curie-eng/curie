@@ -991,7 +991,7 @@ def build_runner(
             cwd=workspace_cwd,
             web_search_enabled=web_search_enabled,
             policy_disallowed_tools=policy_hidden_tools,
-            disallowed_tools=config.disallowed_tools,
+            disallowed_tools=config.catalogue_disallowed_tools,
         )
 
     sdk_generation = 0
@@ -1015,7 +1015,7 @@ def build_runner(
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
                 replay_messages=conversation_replay.messages,
-                disallowed_tools=config.disallowed_tools,
+                disallowed_tools=config.catalogue_disallowed_tools,
                 # The same holder the SDK tool closes over, so the scripted
                 # progress demo runs the real handler (ADR 0130).
                 turn_progress=turn_progress,
