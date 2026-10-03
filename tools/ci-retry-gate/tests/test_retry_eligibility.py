@@ -62,6 +62,11 @@ RETRY_ALLOWLIST = frozenset(
         ("release.yaml", "worker-local-merge", "Download digests"),
         ("release.yaml", "worker-local-merge", "Set up Buildx"),
         ("release.yaml", "worker-local-merge", "Log in to GHCR"),
+        ("release.yaml", "dark-factory-runner-build", "Set up Buildx"),
+        ("release.yaml", "dark-factory-runner-build", "Log in to GHCR"),
+        ("release.yaml", "dark-factory-runner-merge", "Download digests"),
+        ("release.yaml", "dark-factory-runner-merge", "Set up Buildx"),
+        ("release.yaml", "dark-factory-runner-merge", "Log in to GHCR"),
         ("release.yaml", "release", "Download built binaries"),
     }
 )

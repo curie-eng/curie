@@ -117,9 +117,18 @@ pub fn thread_key_for_turn(turn: &QueuedTurn) -> String {
         .reply_handle
         .as_ref()
         .expect("thread keys require a targeted turn");
+    // @spec WORKER-CANARY-3. A relay turn's `adapter` selects delivery and its
+    // `identity` selects the binding, so the worker scopes the thread by the
+    // identity: read it here, or an eval reset releases a key nothing claimed.
+    let adapter = match reply_handle.adapter.as_deref() {
+        Some(CLUSTER_MESSAGE_RELAY_ADAPTER) if reply_handle.kind == "slack" => {
+            reply_handle.identity.as_deref()
+        }
+        other => other,
+    };
     thread_key_for(
         &reply_handle.kind,
-        reply_handle.adapter.as_deref(),
+        adapter,
         &reply_handle.channel,
         &turn.conversation_id,
     )
@@ -184,6 +193,7 @@ pub fn synthetic_turn(
             placeholder: Some(placeholder.into()),
             endpoint,
             adapter,
+            identity: None,
         }),
         received_at: now_rfc3339(),
         // The CLI drives a turn on a person's behalf, so it is a message and not
@@ -197,6 +207,9 @@ pub fn synthetic_turn(
         // for the same reason `source` is.
         attachments: Vec::new(),
         hook_run: None,
+        // `local message` and `cluster message` send unrestricted turns; no CLI
+        // flag sets a tool access yet. Stated for the same reason `source` is.
+        tool_access: None,
     }
 }
 
@@ -206,6 +219,17 @@ pub fn synthetic_turn(
 pub fn speak_as(mut turn: QueuedTurn, identity: Option<&str>) -> QueuedTurn {
     if let (Some(identity), Some(handle)) = (identity, turn.reply_handle.as_mut()) {
         handle.adapter = Some(identity.to_string());
+    }
+    turn
+}
+
+/// Name the binding a cluster-message relay turn is for. The relay stays the
+/// turn's delivery adapter; the identity rides in `reply_handle.identity`, which
+/// the worker resolves the binding from. `None` (a default binding) sends none.
+/// @spec INGRESS-CANARY-1
+pub fn name_relay_identity(mut turn: QueuedTurn, identity: Option<&str>) -> QueuedTurn {
+    if let Some(handle) = turn.reply_handle.as_mut() {
+        handle.identity = identity.map(str::to_string);
     }
     turn
 }
@@ -637,10 +661,13 @@ mod tests {
                 // message, so it is always "slack" on this lane.
                 "source",
                 "text",
+                // TOOL-ACCESS-1: optional, and null on these unrestricted turns.
+                "tool_access",
             ]
         );
         assert_eq!(object["source"], "slack");
         assert!(object["hook_run"].is_null());
+        assert!(object["tool_access"].is_null());
         // channel and placeholder are nested in the channel-neutral reply_handle.
         assert_eq!(object["reply_handle"]["channel"], "C-SIM-x");
         assert_eq!(object["reply_handle"]["placeholder"], "1720000000.000200");
@@ -760,11 +787,13 @@ mod tests {
                 placeholder: Some("1720000000.000200".into()),
                 endpoint: None,
                 adapter: None,
+                identity: None,
             }),
             received_at: "2026-07-21T00:00:00Z".into(),
             source: TurnSource::Slack,
             attachments: Vec::new(),
             hook_run: None,
+            tool_access: None,
         };
         (stream_id.to_string(), payload_json(&turn).unwrap())
     }
@@ -843,6 +872,7 @@ mod tests {
         _comment: String,
         thread_reset_set: String,
         thread_reset_inflight_set: String,
+        thread_reset_result_prefix: String,
         thread_key_examples: Vec<ThreadKeyExample>,
     }
 
@@ -861,6 +891,12 @@ mod tests {
         assert_eq!(
             parsed.thread_reset_inflight_set,
             "curie:thread-reset-inflight"
+        );
+        // The CLI never reads a reset result itself (the API does); it only has
+        // to know the literal so the frozen name cannot drift unseen.
+        assert_eq!(
+            parsed.thread_reset_result_prefix,
+            "curie:thread-reset-result:"
         );
         assert!(
             !parsed.thread_key_examples.is_empty(),
@@ -924,6 +960,41 @@ mod tests {
         assert_eq!(
             thread_key_for("email", None, "agent@example.test", "thread/9"),
             "email:agent%40example.test:thread%2F9"
+        );
+    }
+
+    // @spec WORKER-CANARY-3. A relay turn keeps the relay as its delivery
+    // adapter and names its binding in `identity`; the worker scopes the thread
+    // by that identity, so the eval reset must SADD the same key.
+    #[test]
+    fn thread_key_for_turn_scopes_a_relay_turn_by_its_identity() {
+        let mut turn = eval_case_turn(
+            "slack",
+            "C0EXAMPLE1",
+            "U1",
+            "ping",
+            "1720000000.000100",
+            "1720000000.000200",
+            None,
+        );
+        let handle = turn
+            .reply_handle
+            .as_mut()
+            .expect("an eval turn is targeted");
+        handle.adapter = Some(CLUSTER_MESSAGE_RELAY_ADAPTER.to_string());
+        assert_eq!(
+            thread_key_for_turn(&turn),
+            "slack:C0EXAMPLE1:eval%3A1720000000.000100",
+            "no identity is the default binding"
+        );
+        let handle = turn
+            .reply_handle
+            .as_mut()
+            .expect("an eval turn is targeted");
+        handle.identity = Some("second-bot".to_string());
+        assert_eq!(
+            thread_key_for_turn(&turn),
+            "slack:second-bot:C0EXAMPLE1:eval%3A1720000000.000100"
         );
     }
 

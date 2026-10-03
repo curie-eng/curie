@@ -81,6 +81,7 @@ helm template t "$CHART" \
 # rather than a constant.
 helm template t "$CHART" \
   --set worker.deliveryBudgetSeconds=1800 \
+  --set worker.runnerTotalTimeoutSeconds=1800 \
   --set worker.terminationGracePeriodSeconds=2400 > "$TMP/raised.yaml"
 helm template t "$CHART" \
   --set worker.deliveryBudgetSeconds=60 \
@@ -221,11 +222,13 @@ if not failures:
         f"release backoffLimit is {release_spec.get('backoffLimit')!r}, expected > 0",
     )
     # The Job-level ceiling must sit ABOVE the gate's own wait, or Kubernetes
-    # kills the gate before it can answer and every upgrade fails.
+    # kills the gate before it can answer and every upgrade fails. 900 is the
+    # configured timeout floor, not the effective wait: the delivery budget
+    # plus reserve raises that wait above the floor.
     check(
         (drain_spec.get("activeDeadlineSeconds") or 0) > 900,
         f"drain activeDeadlineSeconds is {drain_spec.get('activeDeadlineSeconds')!r}, "
-        "expected greater than the 900s default drain wait",
+        "expected greater than 900",
     )
 
     for component, doc, mode in (
@@ -266,16 +269,16 @@ if not failures:
         for required in ("VALKEY_HOST", "VALKEY_PORT", "VALKEY_PASSWORD"):
             check(required in env, f"{component} is missing {required}")
         # Both Jobs build the same WorkerConfig. The roll hold is capped at the
-        # effective wait (#3127): min(quiesceTtlSeconds 1800, wait 900) = 900.
+        # effective wait (#3127): min(quiesceTtlSeconds 1800, wait 10860) = 1800.
         check(
-            env.get("CURIE_UPGRADE_DRAIN_TIMEOUT_S", {}).get("value") == "900",
+            env.get("CURIE_UPGRADE_DRAIN_TIMEOUT_S", {}).get("value") == "10860",
             f"{component} CURIE_UPGRADE_DRAIN_TIMEOUT_S is "
-            f"{env.get('CURIE_UPGRADE_DRAIN_TIMEOUT_S', {}).get('value')!r}, expected '900'",
+            f"{env.get('CURIE_UPGRADE_DRAIN_TIMEOUT_S', {}).get('value')!r}, expected '10860'",
         )
         check(
-            env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == "900",
+            env.get("CURIE_UPGRADE_QUIESCE_TTL_S", {}).get("value") == "1800",
             f"{component} CURIE_UPGRADE_QUIESCE_TTL_S is "
-            f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}, expected '900' "
+            f"{env.get('CURIE_UPGRADE_QUIESCE_TTL_S', {}).get('value')!r}, expected '1800' "
             "(min of quiesceTtlSeconds and the effective drain wait)",
         )
 
@@ -339,7 +342,7 @@ if env is not None:
 # The published minimum includes the actual drain Job deadline, the rendered
 # worker grace, and 60 seconds for scheduling and Helm operations.
 for path, label, expected_wait, expected_grace, expected_minimum in (
-    (default_path, "default", 900, 1860, 2940),
+    (default_path, "default", 10860, 10860, 21900),
     (raised_path, "raised-budget-and-grace", 1860, 2400, 4440),
 ):
     docs = load(path)

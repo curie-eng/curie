@@ -32,10 +32,50 @@ _ANSI_ESCAPE = re.compile(
     r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]"
 )
 
+# One failing line, matched per line after the runner timestamp is gone
+# (#3011): an error: prefix, a CLI `✗ error`, any Python exception's final
+# line, or a rung's own cluster:/local:/skill: diagnostic.
 _ERROR_LINE = re.compile(
-    r"(?:^|\n)(?:error: |AssertionError: |cluster: |local: |skill: ).+",
-    re.IGNORECASE,
+    r"^(?:✗ error\b|[\w.]*(?:error|exception): |cluster: |local: |skill: ).+",
+    re.IGNORECASE | re.MULTILINE,
 )
+# A Python exception's final line names the cause a later generic wrapper
+# (`Error: runner failed to become healthy`) only reports (#3011).
+_EXCEPTION_LINE = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception): .+", re.MULTILINE)
+_WRAPPER_LINE = re.compile(r"runner failed to become healthy")
+# A classified CLI error is identified by its class; the provider message
+# after it carries balances and ids that move between runs (#3011).
+_CLASSIFIED_ERROR = re.compile(r"^✗ error \[(?!unclassified\])[^\]]+\]: [^:]+")
+# GitHub prefixes every job-log line with the runner's timestamp (#3011).
+_RUNNER_TIMESTAMP = re.compile(
+    r"^\ufeff?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z ?", re.MULTILINE
+)
+_SECTION_HEADER = re.compile(r"^=== .+ ===$")
+_RUNNER_ERROR = "##[error]"
+_EXIT_CODE_ERROR = re.compile(r"^Process completed with exit code \d+\.?$")
+# Lines that never explain a failure: JSON, runner annotations, trap
+# cleanup, traceback frames, and indented sub-output such as an expected
+# `  Error: refusing to ...` or docker compose progress (#3011, #3365).
+_NOISE_LINE = re.compile(
+    r"^(?:[{\[]|##\[|cleanup: |Traceback \(most recent call last\)|\s|$)"
+)
+_VOLATILE = (
+    (re.compile(r"/tmp/tmp\.\w+"), "/tmp/<tmp>"),
+    (re.compile(r"\b\d{10}\.\d{6}\b"), "<ts>"),
+    (
+        re.compile(
+            r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+            re.IGNORECASE,
+        ),
+        "<id>",
+    ),
+    (re.compile(r"\b[0-9a-f]{12,}\b", re.IGNORECASE), "<id>"),
+    (re.compile(r"\(\d+(?:\.\d+)?s\)"), "(<n>s)"),
+    # Balances, counts and ports that move between otherwise identical runs.
+    (re.compile(r"\b\d{4,}\b"), "<n>"),
+)
+# A runaway line (a dumped span list) would make every rerun a new issue.
+_SIGNATURE_LIMIT = 240
 _KNOWN = (
     re.compile(
         r"image '[^']+' is required by compose\.release\.yaml[^\n]*"
@@ -208,20 +248,84 @@ def _log_note(job: dict[str, object]) -> str:
 
 
 def _signature_text(log: str) -> str:
+    section = _failing_section(log)
+    body = "\n".join(section)
     for pattern in _KNOWN:
-        match = pattern.search(log)
+        match = pattern.search(body)
         if not match:
             continue
         text = " ".join(match.group(0).split())
         if "skill up" in text.lower():
-            later = list(_ERROR_LINE.finditer(log[match.end() :]))
+            later = _last_error_line(body[match.end() :])
             if later:
-                return " ".join(later[-1].group(0).split())
-        return text
-    matches = list(_ERROR_LINE.finditer(log))
-    if matches:
-        return " ".join(matches[-1].group(0).split())
+                return _normalize(later)
+        return _normalize(text)
+    error = _last_error_line(body)
+    if error:
+        return _normalize(error)
+    fallback = _last_meaningful_line(section)
+    if fallback:
+        return _normalize(fallback)
     return "ladder job failed with no recognized error line"
+
+
+def _last_error_line(text: str) -> str:
+    """The last error line, unwrapped to its cause (#3011).
+
+    A runner health wrapper yields to the exception printed before it, and
+    a classified CLI error is cut to its class.
+    """
+    matches = list(_ERROR_LINE.finditer(text))
+    if not matches:
+        return ""
+    last = matches[-1]
+    if _WRAPPER_LINE.search(last.group(0)):
+        causes = list(_EXCEPTION_LINE.finditer(text, 0, last.start()))
+        if causes:
+            return causes[-1].group(0)
+    classified = _CLASSIFIED_ERROR.match(last.group(0).strip())
+    return classified.group(0) if classified else last.group(0)
+
+
+def _failing_section(log: str) -> list[str]:
+    """The lines of the section that failed (#3011).
+
+    Timestamps are stripped, everything after the first runner `##[error]`
+    (post-job cleanup) is cut, a trailing teardown section is dropped, and
+    what remains is scoped to its last `=== ... ===` section.
+    """
+    lines = [line.rstrip() for line in _RUNNER_TIMESTAMP.sub("", log).split("\n")]
+    for index, line in enumerate(lines):
+        if line.startswith(_RUNNER_ERROR):
+            lines = lines[: index + 1]
+            break
+    headers = [i for i, line in enumerate(lines) if _SECTION_HEADER.match(line)]
+    if headers and lines[headers[-1]].startswith("=== teardown"):
+        tail = [lines[-1]] if lines[-1].startswith(_RUNNER_ERROR) else []
+        lines = lines[: headers[-1]] + tail
+        headers.pop()
+    return lines[headers[-1] :] if headers else lines
+
+
+def _last_meaningful_line(section: list[str]) -> str:
+    """The last line that could explain the failure, header included (#3011)."""
+    for line in reversed(section):
+        if line.startswith(_RUNNER_ERROR):
+            message = line[len(_RUNNER_ERROR) :].strip()
+            if message and not _EXIT_CODE_ERROR.match(message):
+                return message
+            continue
+        if not _NOISE_LINE.match(line):
+            return line
+    return ""
+
+
+def _normalize(text: str) -> str:
+    """Collapse whitespace and mask per-run tokens so reruns dedup (#3011)."""
+    text = " ".join(text.split())
+    for pattern, replacement in _VOLATILE:
+        text = pattern.sub(replacement, text)
+    return text[:_SIGNATURE_LIMIT]
 
 
 def plan_issue_actions(

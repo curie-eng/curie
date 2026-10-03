@@ -93,6 +93,7 @@ from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text
 from .queue import claim_event, enqueue, release_event
 from .relevance import DropReason, Lane, classify, drop, missing_envelope_fields
+from .thread_context import SlackThreadContext
 
 if TYPE_CHECKING:
     from redis import Redis
@@ -381,6 +382,7 @@ def process_event(
     slack_identity: str,
     admission: AdmissionGate,
     bot_user_id: str | None = None,
+    bot_id: str | None = None,
     identity_bots: Mapping[str, str] | None = None,
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
@@ -405,6 +407,11 @@ def process_event(
 
     ``admission`` is the caller-list check (ADR 0175). It has no default, so
     no lane can start a turn without asking.
+
+    ``bot_user_id`` and ``bot_id`` are Bolt's authorized identity for this
+    request. Besides stripping the self-mention, they prove whether a thread's
+    root is this bot's own post, which a reply then quotes as untrusted context
+    (``thread_context``, spec slack-alert-followup-context).
 
     Returns the Valkey Stream id when a job was enqueued, or None when the event
     was refused. Every refusal is logged with its enumerated ``DropReason``.
@@ -475,6 +482,25 @@ def process_event(
             drop(log, DropReason.DUPLICATE_DELIVERY, event_id=delivery_id)
             return None
 
+        # NOT `event.get("text", "")`: a Block Kit or attachment-shaped post
+        # carries an empty or fallback-only top-level `text` and its real body in
+        # `blocks`/`attachments`, so that read emptied the turn while still
+        # burning a placeholder (#2006). `derive_text` returns a non-empty
+        # top-level text byte-identically, so existing enqueues are unchanged.
+        text = _strip_self_mention(derive_text(event), bot_user_id)
+        # @spec slack-alert-followup-context: Decision. After the claim, so a
+        # duplicate asks Slack nothing; before the placeholder, and it never
+        # raises, so the claim -> placeholder -> XADD order holds. A reply in a
+        # thread this bot rooted carries that root as untrusted context; every
+        # other message is returned unchanged.
+        text = SlackThreadContext(redis_client, web_client, config, logger=log).resolve(
+            event=event,
+            lane=lane,
+            bot_user_id=bot_user_id,
+            bot_id=bot_id,
+            text=text,
+        )
+
         return _mint_turn(
             web_client=web_client,
             redis_client=redis_client,
@@ -484,12 +510,7 @@ def process_event(
             slack_event_id=delivery_id,
             delivery_kind="slack event",
             author=author,
-            # NOT `event.get("text", "")`: a Block Kit or attachment-shaped post
-            # carries an empty or fallback-only top-level `text` and its real body in
-            # `blocks`/`attachments`, so that read emptied the turn while still
-            # burning a placeholder (#2006). `derive_text` returns a non-empty
-            # top-level text byte-identically, so existing enqueues are unchanged.
-            text=_strip_self_mention(derive_text(event), bot_user_id),
+            text=text,
             # Read from the SAME event and deliberately not from `derive_text`,
             # whose non-empty-text passthrough is byte-identical by decision
             # (#2006) and must stay that way. A comment plus an upload therefore
@@ -654,8 +675,9 @@ def register_handlers(
     identity_client: IdentityResolver | None = None,
 ) -> None:
     """Wire the app_mention, (direct-message) message, block-action, and
-    approval-card listeners. ``resolver`` (the approvals API client) is
-    injectable for tests; None builds the production client from config.
+    approval-card listeners. ``resolver`` (the approvals API client) and
+    ``identity_client`` (the principal lookup) are injectable for tests; None
+    builds the production client from config.
     ``slack_identity`` is the identity this app is; every turn either lane
     mints carries it. ``identity_bots`` is passed to both lanes' ``process_event``.
     ``admission`` is the caller-list gate (ADR 0175); None builds the production
@@ -690,6 +712,7 @@ def register_handlers(
             slack_identity=slack_identity,
             admission=admission_gate,
             bot_user_id=context.get("bot_user_id"),
+            bot_id=context.get("bot_id"),
             identity_bots=identity_bots,
             clock=clock,
             logger=logger,
@@ -724,6 +747,7 @@ def register_handlers(
             slack_identity=slack_identity,
             admission=admission_gate,
             bot_user_id=context.get("bot_user_id"),
+            bot_id=context.get("bot_id"),
             identity_bots=identity_bots,
             clock=clock,
             logger=logger,

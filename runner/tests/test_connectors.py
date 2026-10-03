@@ -739,10 +739,11 @@ def test_the_boot_path_mounts_nothing_for_a_third_party_mcp_json_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The pin on the WIRING rather than the helper, through a boot env the
-    # worker really renders. The bundle's own upstream must reach the SDK on the
-    # plugins channel -- the read-only bundle directory, loaded verbatim -- and
-    # must never appear on the platform `mcp_servers` channel, which is where
-    # the servers Curie hosts and derives URLs for ride.
+    # worker really renders. The bundle's own upstream stays the bundle's: it is
+    # never hosted or given a derived URL. Under strict_mcp_config (#2899) the
+    # CLI no longer loads plugin servers itself, so it rides `mcp_servers` under
+    # the plugin loader's own name, `plugin:<bundle>:<server>`, with its config
+    # verbatim -- never as a bare-named server Curie hosts.
     monkeypatch.delenv("CURIE_STATE_URL", raising=False)
     root = _bundle(tmp_path, HOSTED, mcp=UPSTREAM_MCP_JSON)
     config = _config_for(root, release="curie", agent="acme-dev", namespace="curie")
@@ -751,8 +752,9 @@ def test_the_boot_path_mounts_nothing_for_a_third_party_mcp_json_entry(
     mounted = options.mcp_servers
     # Exact, not `"github-upstream" not in mounted`: an extra key of any name is
     # a server Curie would be hosting that the bundle never declared to it.
-    assert set(mounted) == {APPROVAL_SERVER_NAME, "grafana"}
+    assert set(mounted) == {APPROVAL_SERVER_NAME, "grafana", "plugin:b:github-upstream"}
     assert "svc.cluster.local" in mounted["grafana"]["url"]
+    assert mounted["plugin:b:github-upstream"] == {"type": "http", "url": UPSTREAM}
 
     # The other half of "stays external": it is not dropped either. The SDK gets
     # the bundle directory itself, and the upstream entry in it is untouched.
@@ -838,9 +840,9 @@ def test_the_tool_policy_exemption_set_matches_what_the_boot_publishes(
     # The #2286 adversarial round. The toolPolicy exemption stopped being "any
     # name on a platform server's prefix" -- which also exempted every tool of
     # an ambient MCP server keyed `curie__extra` or `curie-state__extra`, since
-    # `strict_mcp_config` is off and the CLI loads ambient servers beside the
-    # ones the runner mounts -- and became exact membership in the set of names
-    # Curie's own servers publish.
+    # `strict_mcp_config` was then off (#2899 turned it on) and the CLI loaded
+    # ambient servers beside the ones the runner mounts -- and became exact
+    # membership in the set of names Curie's own servers publish.
     #
     # That makes a THIRD thing capable of drifting: the exemption set and the
     # tools actually registered. So it is pinned against the live tool list the
@@ -863,11 +865,32 @@ def test_the_tool_policy_exemption_set_matches_what_the_boot_publishes(
     assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
     # report_progress mounts only when the worker injected the progress env
     # (#3077); its name is exempt regardless, like an omitted request_approval.
-    from curie_runner.approval import PROGRESS_TOOL_NAME
+    # get_issue (ADR 0187) mounts only with the worker's issue read env.
+    from curie_runner.approval import ISSUE_TOOL_NAME, PROGRESS_TOOL_NAME
 
     assert _published_live_tool_names(mounted) == platform_tool_names(state_server_mounted=True) - {
-        PROGRESS_TOOL_NAME
+        PROGRESS_TOOL_NAME,
+        ISSUE_TOOL_NAME,
     }
+
+
+def test_a_work_item_boot_mounts_get_issue_and_exempts_it(tmp_path, monkeypatch) -> None:
+    # ADR 0187: an execution with a WorkItem boots with the API's issue read
+    # route and capability, and only that boot publishes get_issue.
+    from curie_runner.approval import ISSUE_TOOL_NAME, PROGRESS_TOOL_NAME, platform_tool_names
+
+    env = _boot_env(monkeypatch, tmp_path, "issue-read")
+    monkeypatch.setenv("CURIE_ISSUE_READ_URL", "http://api.example/work-items/issue-read")
+    monkeypatch.setenv("CURIE_ISSUE_READ_TOKEN", "wir.example-capability.signature")
+    mounted = _boot_options(
+        monkeypatch,
+        RunnerConfig.from_env(env),
+        potential_write=True,
+    ).mcp_servers
+
+    published = _published_live_tool_names(mounted)
+    assert ISSUE_TOOL_NAME in published
+    assert published == platform_tool_names(state_server_mounted=True) - {PROGRESS_TOOL_NAME}
 
 
 def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
@@ -893,9 +916,12 @@ def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
 
     assert set(mounted) == {APPROVAL_SERVER_NAME}
     published = _published_live_tool_names(mounted)
-    from curie_runner.approval import PROGRESS_TOOL_NAME
+    from curie_runner.approval import ISSUE_TOOL_NAME, PROGRESS_TOOL_NAME
 
-    assert published == platform_tool_names(state_server_mounted=False) - {PROGRESS_TOOL_NAME}
+    assert published == platform_tool_names(state_server_mounted=False) - {
+        PROGRESS_TOOL_NAME,
+        ISSUE_TOOL_NAME,
+    }
     assert not any(name.startswith(f"mcp__{STATE_SERVER_NAME}__") for name in published)
 
 
@@ -1117,8 +1143,9 @@ def test_build_runner_expands_the_bearer_and_drops_it_from_spawn_env(
 # The caller token header (ADR-0168 decision 7)
 #
 # The worker signs this sandbox's agent into CURIE_CONNECTOR_CALLER_TOKEN, and
-# each hosted connector's entry names it in X-Curie-Caller. The value stays a
-# placeholder that the MCP client expands from the sandbox env, and it goes
+# each hosted connector's entry names it in X-Curie-Caller. derive_mcp_servers
+# still writes the placeholder. The runner expands that placeholder in memory
+# and drops the env name before Bash or a hook can read it. The header goes
 # only to a Service Curie created: a remote or fallback URL is somebody else's
 # server.
 # --------------------------------------------------------------------------- #
@@ -1153,6 +1180,48 @@ def test_a_remote_connector_never_receives_the_caller_token(tmp_path: Path) -> N
     assert _CALLER_HEADER in servers["grafana"]["headers"]
 
 
+_GRANT_HEADER = "X-Curie-Connector-Grant"
+_GRANT_PLACEHOLDER = "${CURIE_CONNECTOR_TOOL_GRANT}"
+_GRANT_ENV = "CURIE_CONNECTOR_TOOL_GRANT"
+
+
+def test_a_hosted_connector_omits_the_grant_header_when_the_env_has_none(tmp_path: Path) -> None:
+    servers = derive_mcp_servers(_bundle(tmp_path, HOSTED), **SCOPE, caller_header=True, env={})
+    assert servers["grafana"]["headers"] == {
+        "Authorization": "Bearer ${T}",
+        _CALLER_HEADER: _CALLER_PLACEHOLDER,
+    }
+    assert _GRANT_HEADER not in servers["grafana"]["headers"]
+
+
+def test_a_hosted_connector_names_the_grant_placeholder_when_the_env_sets_it(
+    tmp_path: Path,
+) -> None:
+    sentinel = "ccg.payload.signature"
+    servers = derive_mcp_servers(
+        _bundle(tmp_path, HOSTED),
+        **SCOPE,
+        caller_header=True,
+        env={_GRANT_ENV: sentinel},
+    )
+    assert servers["grafana"]["headers"] == {
+        "Authorization": "Bearer ${T}",
+        _CALLER_HEADER: _CALLER_PLACEHOLDER,
+        _GRANT_HEADER: _GRANT_PLACEHOLDER,
+    }
+    assert sentinel not in json.dumps(servers)
+
+
+def test_a_remote_connector_never_receives_the_grant_header(tmp_path: Path) -> None:
+    root = _bundle(tmp_path, HOSTED + REMOTE.replace("connectors:\n", ""))
+    servers = derive_mcp_servers(
+        root, **SCOPE, caller_header=True, env={_GRANT_ENV: "ccg.payload.signature"}
+    )
+    assert servers["internal"] == {"type": "http", "url": "https://mcp.internal/mcp"}
+    assert _GRANT_HEADER not in servers["internal"]
+    assert servers["grafana"]["headers"][_GRANT_HEADER] == _GRANT_PLACEHOLDER
+
+
 def test_a_fallback_url_never_receives_the_caller_token(tmp_path: Path) -> None:
     servers = derive_mcp_servers(
         _bundle(tmp_path, HOSTED_WITH_FALLBACK),
@@ -1164,12 +1233,12 @@ def test_a_fallback_url_never_receives_the_caller_token(tmp_path: Path) -> None:
     assert servers["grafana"] == {"type": "http", "url": "http://host.docker.internal:8765/mcp"}
 
 
-def test_a_minted_token_reaches_the_session_and_stays_in_its_env(
+def test_a_minted_token_is_expanded_into_the_header_and_dropped_from_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The whole chain: worker render, RunnerConfig, the session's MCP servers.
-    # Unlike a hosted Bearer, the token is not dropped from the spawn env: the
-    # MCP client expands the header from it, and it names only this agent.
+    # The runner expands X-Curie-Caller in memory and removes the token from
+    # the spawn env so a Bash tool or hook cannot read it.
     monkeypatch.delenv("CURIE_STATE_URL", raising=False)
     config = _config_for(
         _bundle(tmp_path, GITHUB_POD_CREDENTIAL),
@@ -1179,7 +1248,10 @@ def test_a_minted_token_reaches_the_session_and_stays_in_its_env(
         caller_token="cct.payload.signature",
     )
     assert config.connector_caller_token == "cct.payload.signature"
-    spawn = {"CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature"}
+    spawn = {
+        "CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature",
+        "CURIE_MODEL": "claude-sonnet-5",
+    }
 
     async def probe(*_args: Any, **_kwargs: Any) -> McpToolCapabilityProbe:
         return McpToolCapabilityProbe(complete=True, has_potential_write_tool=False, tool_count=0)
@@ -1189,9 +1261,11 @@ def test_a_minted_token_reaches_the_session_and_stays_in_its_env(
     session = build_runner(config, fake_model=False, sdk_env=spawn)._factory()
     assert isinstance(session, _CapturedSession)
     assert session.options.mcp_servers["github"]["headers"] == {
-        _CALLER_HEADER: _CALLER_PLACEHOLDER
+        _CALLER_HEADER: "cct.payload.signature"
     }
-    assert spawn == {"CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature"}
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in spawn
+    assert spawn["CURIE_MODEL"] == "claude-sonnet-5"
+    assert "cct.payload.signature" not in spawn.values()
 
 
 def test_a_boot_without_a_token_hands_the_runner_none(tmp_path: Path) -> None:

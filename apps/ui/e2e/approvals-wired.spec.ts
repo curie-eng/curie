@@ -86,7 +86,8 @@ test("lists pending approvals and opens the detail with its audit trail", async 
   const detail = page.getByTestId("approval-detail");
   await expect(detail).toBeVisible();
   await expect(detail).toContainText("managers");
-  await expect(detail).toContainText("issue_refund");
+  await expect(detail).toContainText("issue refund");
+  await expect(detail).not.toContainText("issue_refund");
 });
 
 test("exchanges a login code before showing the immutable console principal", async ({ page }) => {
@@ -161,3 +162,21 @@ test("shows the pending empty state for a fresh workspace", async ({ page }) => 
   await openApprovalsTab(page);
   await expect(page.getByTestId("approvals")).toContainText("No pending approvals");
 });
+
+
+for (const legacy of [false, true]) {
+  test(`approval shows plain action and values with ${legacy ? "legacy" : "current"} API`, async ({ page }) => {
+    const summary = 'Tool call awaiting approval: mcp__acme__file_attachment {"file_name":"example.pdf"}';
+    await stubApprovals(page, [approval({
+      summary,
+      granted_tool: "mcp__acme__file_attachment",
+      ...(legacy ? {} : { display_summary: "Approve file attachment. File name: example.pdf" }),
+    })]);
+    await openApprovalsTab(page);
+    await expect(page.getByTestId("approval-summary")).toContainText("Approve file attachment. File name: example.pdf");
+    await page.getByTestId("approval-summary").click();
+    const detail = page.getByTestId("approval-detail");
+    await expect(detail).toContainText("example.pdf");
+    await expect(detail).not.toContainText("mcp__acme__file_attachment");
+  });
+}

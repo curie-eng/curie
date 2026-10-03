@@ -48,7 +48,7 @@ jobs:
       - name: Toolchain
         run: rustc --version
       - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: cli
       - name: Release build
@@ -332,7 +332,7 @@ jobs:
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
-        uses: azure/setup-helm@v5.0.1
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
       # GHA-layer-cached builds via a named buildx builder that is NOT made the
@@ -410,7 +410,7 @@ jobs:
       # node container sits on; its gateway is the host address the in-cluster
       # worker reaches the reply stub through, resolved below.
       - name: Create the kind cluster
-        uses: helm/kind-action@v1.15.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0

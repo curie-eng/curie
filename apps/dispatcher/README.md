@@ -28,6 +28,13 @@ unacked so Slack can retry another connection; that leave-unacked path is not an
 operator retry procedure. Disconnect the extra client instead of retrying from
 the non-owning side.
 
+The dispatcher warns in its log when a Socket Mode hello reports more connections
+than this client holds. Slack refreshes each connection every few hours, and
+slack_sdk opens the replacement before it closes the old socket, so the hello on
+the replacement counts two sockets that are both this client's. That hello does
+not warn. One that counts a third connection, or a second after a reconnect with
+nothing left open, does.
+
 ## What is ingested, and what is refused
 
 Ingest admits more than it used to (#2006). A message whose body lives in Block Kit
@@ -151,6 +158,37 @@ value; `dispatcher.extraEnv` still works as well. Runtime Slack proof requires
 an installed sender app and live delivery; the Bolt/Valkey tests alone do not
 establish that Slack delivered or that the worker answered.
 
+## Replies in a thread this bot rooted
+
+A hook's answer (an Alertmanager alert, say) is posted as a new channel-level
+message, while the hook's own turn runs under a synthetic conversation. A person
+who replies to that post opens a Slack thread keyed by the post's ts, which the
+worker treats as a new conversation, so on its own the reply reaches the model
+without the post it answers. The dispatcher closes that gap and nothing more
+(spec: `docs/superpowers/specs/2026-09-29-slack-alert-followup-context-design.md`).
+
+For a threaded `app_mention`, after the dedupe claim and before the placeholder,
+`thread_context.SlackThreadContext` reads the thread's root with
+`conversations.replies(limit=1)` and quotes it ahead of the person's text only
+when that root is this bot's own post: its `user` is Bolt's authorized bot user,
+or it has no `user` and carries Bolt's authorized `bot_id`. The quote is at most
+4,000 characters, XML-escaped with root slashes emitted as entities, inside a `<prior_assistant_reply>` block that
+says it is untrusted context and no authorization. Everything else about the
+turn is the person's: `source` stays `slack`, `author` the person, the
+conversation the Slack thread, and no hook state is copied. Slash neutralization
+makes repository-looking alert text inert even for an older worker during a
+rolling upgrade, while the person's own text is parsed unchanged.
+
+A reply whose `parent_user_id` names someone else asks Slack nothing and is
+unchanged, and so is a reply in a thread whose root turns out to be someone
+else's. When Slack said the parent is this bot's but the root cannot be read or
+verified, the reply instead carries a notice telling the agent not to infer or
+execute the earlier proposal and to ask for it to be restated. The answer about
+each root is cached in Valkey under a digest of the authorized bot user, bot
+ID, channel, and root timestamp, for
+`CURIE_THREAD_CONTEXT_TTL_SECONDS`, so a restart keeps it and a long thread
+reads Slack once; a root that is not this bot's is cached without its text.
+
 ## The queue seam (what the worker consumes)
 
 The dispatcher `XADD`s onto a Valkey Stream (`CURIE_STREAM`, default
@@ -234,6 +272,16 @@ declaring many.
 A cron-hook agent's approval destinations are not preflighted under `default`,
 since a cron trigger is not carried by the projection preflight reads.
 
+Whether the sockets are up is a metric, not only a log line. The connections
+report to the `curie.slack.socket.identities` gauge
+(`curie_slack_socket_identities` in Prometheus), which has two series per
+dispatcher: `state=configured`, the Slack identities it serves, and
+`state=connected`, those holding an open socket when sampled. It is sampled
+every 10 seconds from the SDK client itself, because slack_sdk's stale ping
+check closes a dead socket without calling any listener, and the heartbeat file
+keeps its mtime fresh either way. Alert when `connected` stays below
+`configured`. The gauge carries no identity attribute.
+
 ## Config surface (env vars)
 
 Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSettings`).
@@ -264,6 +312,8 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `CURIE_ADMISSION_CACHE_TTL_SECONDS` | `30.0` | how long a caller-list answer from the platform API counts (ADR 0175), and so how long a list change takes to apply in Slack; must be positive and finite |
 | `CURIE_ADMISSION_STALE_SECONDS` | `300.0` | how old an expired caller-list answer may be and still count while the API cannot answer; past it, with nothing cached, the caller is refused. Must be finite and at least the TTL |
 | `CURIE_ADMISSION_CACHE_PREFIX` | `curie:admission:` | Valkey key prefix for the persisted caller-list answers, so a restarted dispatcher keeps them; change it only when two installs share one Valkey |
+| `CURIE_THREAD_CONTEXT_CACHE_PREFIX` | `curie:slack-root-context:` | Valkey key prefix for the cached thread-root answers (see *Replies in a thread this bot rooted*); change it only when two installs share one Valkey |
+| `CURIE_THREAD_CONTEXT_TTL_SECONDS` | `2592000` | how long a cached thread-root answer is kept, 30 days by default to match the idle transcript window; must be positive |
 
 ### Boot preflights
 

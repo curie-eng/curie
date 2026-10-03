@@ -16,12 +16,14 @@ from aci_protocol import (
     ReplyHandle,
     TurnSource,
 )
+from channel_protocol.work_item_events import execute_event_id, terminate_event_id
+from curie_telemetry import record_metric
 from redis.exceptions import ResponseError
 from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
-from . import factory_ci, factory_label_reconcile, factory_notices, workitems
+from . import factory_ci, factory_label_reconcile, factory_notices, factory_poll_intake, workitems
 from .config import Settings
 from .models import ExecutionRequest, Publication, WorkItem
 from .workitem_dispatch import (
@@ -65,6 +67,7 @@ class WorkItemReconciler:
         self._ci_pass = 0
         # Monotonic time of the next missed-label listing (#3081).
         self._labels_due = 0.0
+        self._step_consecutive_failures: dict[str, int] = {}
 
     def _stream(self) -> str:
         return self._settings.runs_stream
@@ -114,20 +117,46 @@ class WorkItemReconciler:
             raise
 
     async def run_once(self) -> None:
-        await self._settle_publications()
-        await self._expire_waiting()
-        await self._request_deadline_cancellations()
-        await self._request_owner_lost_cancellations()
-        # Terminate wakes go out before the settle pass: a forced settle
-        # requires a published wake, so the worker was told to tear down.
-        await self._publish_terminate_wakes()
-        await self._settle_overdue_cancellations()
-        await self._readmit_pending()
-        await self._reconcile_missed_labels()
-        await self._sync_status_comments()
+        for name, step in (
+            ("settle_publications", self._settle_publications),
+            ("expire_waiting", self._expire_waiting),
+            ("request_deadline_cancellations", self._request_deadline_cancellations),
+            (
+                "request_owner_lost_cancellations",
+                self._request_owner_lost_cancellations,
+            ),
+            # A forced settle requires a published terminate wake, so the
+            # worker was told to tear down before the settle pass.
+            ("publish_terminate_wakes", self._publish_terminate_wakes),
+            ("settle_overdue_cancellations", self._settle_overdue_cancellations),
+            ("readmit_pending", self._readmit_pending),
+            ("reconcile_missed_labels", self._reconcile_missed_labels),
+            ("sync_status_comments", self._sync_status_comments),
+            ("redispatch_lapsed_acquisitions", self._redispatch_lapsed_acquisitions),
+            ("publish_execute_wakes", self._publish_execute_wakes),
+        ):
+            attributes = {"service.name": "curie-api", "step": name}
+            try:
+                await step()
+            except Exception:
+                logger.exception("work item reconciler step %s failed", name)
+                self._step_consecutive_failures[name] = (
+                    self._step_consecutive_failures.get(name, 0) + 1
+                )
+                record_metric(
+                    "curie.work_item.reconciler.step.failure", attributes=attributes
+                )
+            else:
+                self._step_consecutive_failures[name] = 0
+            record_metric(
+                "curie.work_item.reconciler.step.consecutive_failures",
+                self._step_consecutive_failures[name],
+                attributes=attributes,
+            )
+
+    async def _redispatch_lapsed_acquisitions(self) -> None:
         async with self._sessionmaker() as session:
             await redispatch_lapsed_acquisitions(session)
-        await self._publish_execute_wakes()
 
     async def run_forever(self) -> None:
         while True:
@@ -469,7 +498,10 @@ class WorkItemReconciler:
         """Admit labeled issues whose delivery GitHub never retried (#3081)."""
 
         settings = self._settings
-        interval = settings.github_factory_reconcile_interval_s
+        if settings.github_factory_intake == "poll":
+            interval = settings.github_factory_poll_interval_s
+        else:
+            interval = settings.github_factory_reconcile_interval_s
         if not settings.github_factory_ingress_enabled or interval <= 0:
             return
         clock = asyncio.get_running_loop().time()
@@ -477,9 +509,12 @@ class WorkItemReconciler:
             return
         self._labels_due = clock + interval
         async with httpx.AsyncClient(timeout=settings.github_app_timeout_seconds) as client:
-            await factory_label_reconcile.reconcile_missed_labels(
-                self._sessionmaker, settings, client, now=datetime.now(UTC)
-            )
+            if settings.github_factory_intake == "poll":
+                await factory_poll_intake.poll_once(self._sessionmaker, settings, client)
+            else:
+                await factory_label_reconcile.reconcile_missed_labels(
+                    self._sessionmaker, settings, client, now=datetime.now(UTC)
+                )
 
     async def _sync_status_comments(self) -> None:
         paused_for_upgrade = False
@@ -539,7 +574,7 @@ class WorkItemReconciler:
             )
             return None
         return QueuedTurn(
-            event_id=f"work-item-{request_id}-execute-{generation}",
+            event_id=execute_event_id(request_id, generation),
             conversation_id=request.reply_conversation_id,
             author=request.requester,
             text=request.objective,
@@ -563,7 +598,7 @@ class WorkItemReconciler:
             )
         for item in published:
             turn = QueuedTurn(
-                event_id=f"work-item-{item.request_id}-terminate",
+                event_id=terminate_event_id(item.request_id),
                 conversation_id=item.reply_conversation_id,
                 author=item.requester or "work-item",
                 text="terminate",

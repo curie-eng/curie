@@ -12,10 +12,10 @@ to many bots.
 
 ``provider_installations`` gains ``UNIQUE (tenant_id, id)`` as the target of
 the link's tenant-scoped foreign key, as ``principals_tenant_id_id_key`` is for
-0052. It cannot fail on existing rows because ``id`` is the primary key.
+0057. It cannot fail on existing rows because ``id`` is the primary key.
 
-Revision ID: 0073
-Revises: 0072
+Revision ID: 0075
+Revises: 0074
 Create Date: 2026-09-23
 """
 
@@ -25,8 +25,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0073"
-down_revision: str | None = "0072"
+revision: str = "0075"
+down_revision: str | None = "0074"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

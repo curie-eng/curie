@@ -39,6 +39,8 @@ def _result(text: str) -> ResultMessage:
 def _runner(script: list[object], *, check: bool) -> SessionRunner:
     session = FakeModelSession(lambda: script)
     return SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=10_000,
         tracer=RunTracer(None),

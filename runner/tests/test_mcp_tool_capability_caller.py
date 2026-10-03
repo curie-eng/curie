@@ -64,7 +64,15 @@ def _derived(url: str) -> dict[str, dict[str, Any]]:
 
 # @spec ADR-0168 d7
 def test_the_refusal_vector_names_the_header_the_runner_sends() -> None:
-    assert set(_REFUSAL) == {"comment", "header", "status", "content_type", "vectors"}
+    assert set(_REFUSAL) == {
+        "comment",
+        "header",
+        "status",
+        "content_type",
+        "unpaired",
+        "vectors",
+    }
+    assert set(_REFUSAL["unpaired"]) == {"why", "token", "refusal"}
     assert _REFUSAL["header"] == CALLER_HEADER
 
 
@@ -87,7 +95,10 @@ def test_a_refused_caller_is_reported_as_its_own_reason(vector: dict[str, Any]) 
         vector["refusal"],
     )
     message = failure.caller_message()
-    assert message.startswith("declared connector 'grafana' refused this sandbox: ")
+    assert message.startswith("Connected service access was refused.")
+    assert "grafana" not in message
+    assert "sandbox" not in message
+    assert "refused this sandbox" in failure.diagnostic_message()
     assert "cct.payload.signature" not in message
 
 

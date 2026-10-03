@@ -20,7 +20,7 @@ import asyncio
 from typing import Any
 
 import httpx
-from curie_api.approvers import ApproverSet, ExplicitUsers, MembershipVerdict
+from curie_api.approvers import ApproverSet, EmailApprovers, ExplicitUsers, MembershipVerdict
 from curie_api.authorizer import AuthzDecision, authorize_approval
 from curie_api.models import Approval
 from curie_api.slack_approvers import (
@@ -38,7 +38,7 @@ def _approval(*, author: str = "U_AE", channel: str = "C_MGRS") -> Approval:
         author=author,
         summary="Discount for ACME",
         # NOT NULL in the table; every real row names its asking kind, and a
-        # non-Slack one selects the requester-only set instead (ADR-0177).
+        # non-Slack one selects an email or no-approver set instead (ADR-0177 amendment).
         reply_kind="slack",
         reply_channel=channel,
         reply_placeholder="p-1",
@@ -746,3 +746,112 @@ def test_authorizer_fails_closed_when_the_slack_lookup_errors() -> None:
     assert decision.evidence["group"] == _GROUP
     assert decision.evidence["lookup_failed"] is True
     assert decision.evidence["error"]
+
+
+# --- ADR-0177 amendment: approver emails for a card shown in an email thread ---
+
+_INBOX = "bot@example.com"
+_EMAIL_APPROVER = "approver@example.com"
+_EMAIL_REQUESTER = "requester@example.com"
+_SURFACE = {"mode": "requesting_surface"}
+
+
+def _email_card(*, kind: str = "email", route: str | None = "confirm") -> Approval:
+    """An approval asked in ``kind``'s thread whose card was shown there."""
+
+    return Approval(
+        conversation_id="th-mail",
+        author=_EMAIL_REQUESTER,
+        summary="Send the quote",
+        reply_kind=kind,
+        reply_channel=_INBOX,
+        reply_placeholder=None,
+        dedupe_key="ev-mail",
+        route=route,
+        card_channel=_INBOX,
+    )
+
+
+def _listing(*emails: str) -> dict[str, Any]:
+    return {"resolution": _SURFACE, "approvers": {"emails": list(emails)}}
+
+
+def test_the_email_list_admits_a_listed_sender_from_an_adapter_only() -> None:
+    name, decision = _authorize(
+        _email_card(),
+        _EMAIL_APPROVER.upper(),
+        None,
+        binding=_listing(_EMAIL_APPROVER),
+        principal_kind="adapter",
+    )
+    assert (name, decision.allowed) == ("EmailApproverList", True)
+    for kind in ("operator", "console", "chat"):
+        name, decision = _authorize(
+            _email_card(),
+            _EMAIL_APPROVER,
+            _INBOX,
+            binding=_listing(_EMAIL_APPROVER),
+            principal_kind=kind,
+        )
+        assert (name, decision.allowed) == ("EmailApproverList", False), kind
+        assert decision.evidence == {
+            "kind": "principal_set_eligibility",
+            "principal_kind": kind,
+            "approver_set": "EmailApproverList",
+        }
+
+
+def test_the_email_list_refuses_the_requester_it_does_not_name() -> None:
+    _name, decision = _authorize(
+        _email_card(),
+        _EMAIL_REQUESTER,
+        None,
+        binding=_listing(_EMAIL_APPROVER),
+        principal_kind="adapter",
+    )
+    assert not decision.allowed
+    assert decision.evidence is not None and decision.evidence["actor_listed"] is False
+
+
+def test_an_empty_email_list_is_undetermined_not_a_verdict() -> None:
+    """The schema refuses an empty list; a set built around it must still fail
+    closed, and say the configuration stopped the sender."""
+
+    verdict = asyncio.run(EmailApprovers([]).contains(_EMAIL_APPROVER, None))
+    assert (verdict.member, verdict.undetermined) == (False, True)
+    assert "lists no approver email addresses" in verdict.reason
+
+
+def test_no_list_on_email_admits_nobody_not_the_requester() -> None:
+    """ADR-0177 amendment A3: routeless, a route without approvers, and a route
+    with only Slack approvers all admit nobody on an email card."""
+
+    for route, binding in (
+        (None, None),
+        ("confirm", {"resolution": _SURFACE}),
+        ("confirm", {"resolution": _SURFACE, "approvers": {"users": [_APPROVER]}}),
+    ):
+        name, decision = _authorize(
+            _email_card(route=route),
+            _EMAIL_REQUESTER,
+            None,
+            binding=binding,
+            principal_kind="adapter",
+        )
+        assert (name, decision.allowed) == ("NoVerifiableApprovers", False), binding
+        assert "its route lists none" in decision.reason
+
+
+def test_an_email_list_is_never_read_on_another_non_slack_channel() -> None:
+    """Only the mail adapter verifies an address. Another channel's adapter
+    naming a listed address proves nothing about it."""
+
+    name, decision = _authorize(
+        _email_card(kind="webchat"),
+        _EMAIL_APPROVER,
+        None,
+        binding=_listing(_EMAIL_APPROVER),
+        principal_kind="adapter",
+    )
+    assert (name, decision.allowed) == ("NoVerifiableApprovers", False)
+    assert "webchat has no approver list" in decision.reason

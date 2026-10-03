@@ -99,6 +99,7 @@ UNRESOLVABLE_WORKING_DIR = frozenset(
     {
         ("release.yaml", "merge", "Create manifest list and push"),
         ("release.yaml", "worker-local-merge", "Create manifest list and push"),
+        ("release.yaml", "dark-factory-runner-merge", "Create manifest list and push"),
     }
 )
 

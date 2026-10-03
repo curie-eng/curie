@@ -43,10 +43,13 @@ spec:
         {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 8 }}
-      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
       annotations:
+        {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
-      {{- end }}
+        {{- end }}
+        # Roll the API when the caller public key it renders into every hosted
+        # connector's proxy changes; see curie.connectorCallerChecksumSource.
+        checksum/connector-caller: {{ include "curie.connectorCallerChecksumSource" . | sha256sum }}
     spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
       {{- . | nindent 6 }}
@@ -183,15 +186,39 @@ spec:
             - name: CURIE_CONNECTOR_CALLER_PUBLIC_KEY
               valueFrom:
                 secretKeyRef:
-                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.connectorCaller.existingSecret "existingSecretKey" .Values.connectorCaller.verifyKeyKey "defaultKey" "connectorCallerVerifyKey") | nindent 18 }}
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" (get (.Values.connectorCaller | default dict) "existingSecret") "existingSecretKey" ((get (.Values.connectorCaller | default dict) "verifyKeyKey") | default "verifyKey") "defaultKey" "connectorCallerVerifyKey") | nindent 18 }}
             - name: CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY
-              value: {{ .Values.connectorCaller.previousVerifyKey | default "" | quote }}
+              value: {{ (get (.Values.connectorCaller | default dict) "previousVerifyKey") | default "" | quote }}
             - name: CURIE_CONNECTOR_PROXY_IMAGE
               value: {{ include "curie.image" (dict "repository" .Values.worker.image.repository "tag" .Values.worker.image.tag "digest" .Values.worker.image.digest "defaultTag" .Chart.AppVersion) | quote }}
             - name: CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY
               value: {{ .Values.worker.image.pullPolicy | quote }}
             - name: CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS
               value: {{ join "," $connectorProxyPullSecrets | quote }}
+            {{- $e2e := .Values.e2eConnector }}
+            {{- if and $e2e.enabled (or (not $e2e.ownerLabel.value) (not $e2e.serviceAccount) (not $e2e.serviceAccountNamespace) (not $e2e.workerClusterRole)) }}
+            {{- fail "e2eConnector.enabled requires ownerLabel.value, serviceAccount, serviceAccountNamespace, and workerClusterRole" }}
+            {{- end }}
+            - name: CURIE_E2E_CONNECTOR_ENABLED
+              value: {{ $e2e.enabled | quote }}
+            - name: CURIE_E2E_CONNECTOR_IMAGE
+              value: {{ include "curie.image" (dict "repository" .Values.worker.image.repository "tag" .Values.worker.image.tag "digest" .Values.worker.image.digest "defaultTag" .Chart.AppVersion) | quote }}
+            - name: CURIE_E2E_NAMESPACE_PREFIX
+              value: {{ $e2e.namespacePrefix | quote }}
+            - name: CURIE_E2E_OWNER_LABEL_KEY
+              value: {{ $e2e.ownerLabel.key | quote }}
+            - name: CURIE_E2E_OWNER_LABEL_VALUE
+              value: {{ $e2e.ownerLabel.value | quote }}
+            - name: CURIE_E2E_SERVICE_ACCOUNT
+              value: {{ $e2e.serviceAccount | quote }}
+            - name: CURIE_E2E_SERVICE_ACCOUNT_NAMESPACE
+              value: {{ $e2e.serviceAccountNamespace | quote }}
+            - name: CURIE_E2E_WORKER_CLUSTER_ROLE
+              value: {{ $e2e.workerClusterRole | quote }}
+            - name: CURIE_E2E_TTL_SECONDS
+              value: {{ $e2e.ttlSeconds | quote }}
+            - name: CURIE_E2E_POD_SECURITY
+              value: {{ $e2e.podSecurity | quote }}
             - name: CURIE_PUBLICATION_PATCH_MAX_BYTES
               value: {{ .Values.worker.publication.patchMaxBytes | quote }}
             - name: CURIE_PUBLICATION_RETENTION_SECONDS
@@ -220,6 +247,10 @@ spec:
               value: {{ .Values.api.githubReviewReconcilerIntervalSeconds | quote }}
             - name: GITHUB_FACTORY_INGRESS_ENABLED
               value: {{ .Values.api.githubFactoryIngressEnabled | quote }}
+            - name: GITHUB_FACTORY_INTAKE
+              value: {{ .Values.api.githubFactoryIntake | quote }}
+            - name: GITHUB_FACTORY_POLL_INTERVAL_S
+              value: {{ .Values.api.githubFactoryPollIntervalSeconds | quote }}
             - name: GITHUB_FACTORY_LABEL
               value: {{ .Values.api.githubFactoryLabel | quote }}
             - name: GITHUB_FACTORY_MENTION
@@ -228,6 +259,10 @@ spec:
               value: {{ .Values.api.githubFactoryCardBaseUrl | quote }}
             - name: GITHUB_FACTORY_CI_WAIT_S
               value: {{ .Values.api.githubFactoryCiWaitSeconds | quote }}
+            - name: GITHUB_FACTORY_PYTHON_CI
+              value: {{ .Values.api.githubFactoryPythonCi | default dict | toJson | quote }}
+            - name: GITHUB_FACTORY_BASES
+              value: {{ .Values.api.githubFactoryBases | default dict | toJson | quote }}
             - name: GITHUB_API_URL
               value: {{ .Values.api.githubApiUrl | quote }}
             # Outbound GitHub credential: the eval commit status AND the
@@ -270,6 +305,8 @@ spec:
               value: {{ .Values.api.logLevel | quote }}
             - name: ENVIRONMENT
               value: {{ .Values.api.environment | quote }}
+            - name: FORWARDED_ALLOW_IPS
+              value: ""
             - name: ORG_NAME
               value: {{ .Values.api.orgName | quote }}
             # Runner sandboxes are claimed in the release namespace (the
@@ -343,7 +380,7 @@ spec:
             # Per-thread conversation transcript cap in bytes (#3301).
             - name: TRANSCRIPT_MAX_THREAD_BYTES
               value: {{ .Values.api.transcriptMaxThreadBytes | int64 | quote }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson)) | nindent 12 }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (merge (dict "FORWARDED_ALLOW_IPS" "socket peer identity") (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson))) | nindent 12 }}
           ports:
             - name: http
               containerPort: 8000

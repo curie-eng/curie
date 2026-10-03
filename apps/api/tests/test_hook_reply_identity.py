@@ -8,9 +8,8 @@ selection is what it was before, and the turn replies as the route it selected.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -18,7 +17,7 @@ import pytest
 import redis
 from aci_protocol import QueuedTurn
 from curie_api.config import get_settings
-from curie_api.hook_signing import derive
+from curie_api.hook_signing import derive, sign
 from fastapi.testclient import TestClient
 
 TWO_IDENTITIES = json.dumps(
@@ -74,11 +73,23 @@ def _email(adapter: str) -> dict[str, str]:
 def _hook(client: TestClient, agent_id: str, query: str, delivery_id: str) -> Any:
     body = b"{}"
     secret = derive(get_settings().api_key, agent_id=agent_id, generation=0)
-    signature = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    timestamp = str(int(time.time()))
+    signature = sign(
+        secret,
+        timestamp=timestamp,
+        delivery_id=delivery_id,
+        hook="issues",
+        tool_access=None,
+        body=body,
+    )
     return client.post(
         f"/hooks/{agent_id}/issues?{query}",
         content=body,
-        headers={"X-Curie-Signature-256": signature, "X-Curie-Delivery-Id": delivery_id},
+        headers={
+            "X-Curie-Signature-256": signature,
+            "X-Curie-Delivery-Id": delivery_id,
+            "X-Curie-Timestamp": timestamp,
+        },
     )
 
 

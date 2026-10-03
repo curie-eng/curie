@@ -159,8 +159,23 @@ done
 default_render="$(helm template curie "$CHART" 2>/dev/null)"
 generic_template="$(require_resource "$default_render" SandboxTemplate curie-runner)"
 generic_pool="$(require_resource "$default_render" SandboxWarmPool curie-runner-pool)"
-forbid_text "$default_render" 'curie-agent-.*-(connector-secrets|runner|runner-pool)' \
-  "connector-specific resource rendered with no connectorSecrets"
+# Probe fixtures live inside a Job script, so inspect actual chart documents
+# rather than resource names embedded in that script's YAML string.
+printf '%s' "$default_render" | python3 -c '
+import re
+import sys
+
+import yaml
+
+for document in yaml.safe_load_all(sys.stdin):
+    if not document:
+        continue
+    name = document.get("metadata", {}).get("name", "")
+    kind = document.get("kind", "resource")
+    assert not re.fullmatch(r"curie-agent-.*-(connector-secrets|runner|runner-pool)", name), (
+        f"connector-specific {kind}/{name} rendered with no connectorSecrets"
+    )
+'
 [ "$generic_template" = "$(require_resource "$rendered" SandboxTemplate curie-runner)" ] \
   || fail "connectorSecrets changed the generic SandboxTemplate"
 [ "$generic_pool" = "$(require_resource "$rendered" SandboxWarmPool curie-runner-pool)" ] \
@@ -228,4 +243,251 @@ forbid_text "$shared_egress" '10.0.0.10/32|10.0.0.20/32' \
 forbid_text "$default_render" 'curie-agent-.*-allow-egress' \
   "per-agent egress policy rendered with no connectorEgress"
 
+# #3560: Claim 2 must exercise the chart's runner delivery path, including the
+# real runner security context, rather than manufacture a secret-reading Role.
+# Parse embedded fixture YAML as YAML and compare security fields with the
+# chart's ordinary template. Negative controls mutate the relevant boundaries.
+assert_probe_delivery() {
+  local release="$1"
+  local prefix="$2"
+  shift 2
+  local probe_render substrate_render
+  probe_render="$(helm template "$release" "$CHART" --namespace acme-probe \
+    --show-only templates/security-probe.yaml "$@" 2>/dev/null)"
+  substrate_render="$(helm template "$release" "$CHART" --namespace acme-probe \
+    --show-only templates/agent-sandbox.yaml "$@" 2>/dev/null)"
+  PROBE_RENDER="$probe_render" SUBSTRATE_RENDER="$substrate_render" \
+    PROBE_PREFIX="$prefix" PROBE_CHART="$CHART" python3 - <<'PY'
+import copy
+import os
+import re
+import textwrap
+from pathlib import Path
+
+import yaml
+
+
+def resource(documents, kind, name):
+    matches = [
+        document for document in documents
+        if document and document.get("kind") == kind
+        and document.get("metadata", {}).get("name") == name
+    ]
+    assert len(matches) == 1, f"expected one {kind}/{name}, found {len(matches)}"
+    return matches[0]
+
+
+prefix = os.environ["PROBE_PREFIX"]
+documents = list(yaml.safe_load_all(os.environ["PROBE_RENDER"]))
+job = resource(documents, "Job", f"{prefix}-security-probe")
+containers = job["spec"]["template"]["spec"]["containers"]
+probe = next(container for container in containers if container["name"] == "probe")
+script = "\n".join(probe["command"] + probe.get("args", []))
+embedded = re.search(r"<<['\"]?PROBE_SANDBOXES['\"]?[^\n]*\n(.*?)^\s*PROBE_SANDBOXES\s*$", script, re.M | re.S)
+assert embedded is not None, "probe must apply shared runner fixtures from PROBE_SANDBOXES"
+fixtures = list(yaml.safe_load_all(textwrap.dedent(embedded.group(1))))
+role = resource(documents, "Role", f"{prefix}-security-probe")
+substrate = list(yaml.safe_load_all(os.environ["SUBSTRATE_RENDER"]))
+ordinary = resource(substrate, "SandboxTemplate", f"{prefix}-runner")
+release_name = ordinary["spec"]["podTemplate"]["metadata"]["labels"]["app.kubernetes.io/instance"]
+temporary_policies = []
+for heredoc in re.finditer(r"<<EOF[^\n]*\n(.*?)^\s*EOF\s*$", script, re.M | re.S):
+    for document in yaml.safe_load_all(textwrap.dedent(heredoc.group(1))):
+        if document and document.get("kind") == "NetworkPolicy":
+            labels = document["spec"].get("podSelector", {}).get("matchLabels", {})
+            if "curie.io/egress-probe" not in labels:
+                temporary_policies.append(document)
+assert len(temporary_policies) == 1, "probe must create one temporary API policy for its fixture pods"
+temporary_policy = temporary_policies[0]
+source = (Path(os.environ["PROBE_CHART"]) / "templates/security-probe.yaml").read_text()
+assert 'include "curie.sandboxTemplate"' in source, "probe fixtures must use the shared sandbox helper"
+
+
+def runner(template):
+    return next(
+        container for container in template["spec"]["podTemplate"]["spec"]["containers"]
+        if container["name"] == "runner"
+    )
+
+
+def check_delivery(candidates):
+    assert sum(bool(doc) and doc.get("kind") == "SandboxTemplate" for doc in candidates) == 2, "probe needs two runner templates"
+    assert sum(bool(doc) and doc.get("kind") == "SandboxWarmPool" for doc in candidates) == 2, "probe needs two runner pools"
+    baseline = ordinary["spec"]["podTemplate"]["spec"]
+    for agent in ("sp-a", "sp-b"):
+        template_name = f"{prefix}-agent-{agent}-runner"
+        template = resource(candidates, "SandboxTemplate", template_name)
+        pool = resource(candidates, "SandboxWarmPool", f"{template_name}-pool")
+        assert pool["spec"]["sandboxTemplateRef"]["name"] == template_name, "fixture pool must select its own template"
+        assert pool["spec"]["replicas"] == 0, "probe fixtures must create runners through claims"
+        pod = template["spec"]["podTemplate"]
+        labels = pod["metadata"]["labels"]
+        assert labels["curietech.ai/agent"] == agent, "fixture runner must carry its own agent label"
+        assert labels.get("curie.io/security-probe") == prefix, "fixture runner must carry its probe label at creation"
+        for key, value in ordinary["spec"]["podTemplate"]["metadata"]["labels"].items():
+            assert labels.get(key) == value, "fixture runner must retain chart runner labels"
+        for field in ("serviceAccountName", "automountServiceAccountToken", "securityContext", "runtimeClassName"):
+            assert pod["spec"].get(field) == baseline.get(field), f"fixture runner changed chart {field}"
+        assert runner(template).get("securityContext") == runner(ordinary).get("securityContext"), "fixture runner changed chart container securityContext"
+        assert template["spec"].get("networkPolicyManagement") == ordinary["spec"].get("networkPolicyManagement"), "fixture runner changed chart NetworkPolicy management"
+        assert not any("projected" in volume or "secret" in volume for volume in pod["spec"].get("volumes", [])), "fixture runner must not add a credential or token volume"
+        env = runner(template)["env"]
+        keys = {"CURIE_SECURITY_PROBE_SECRET"}
+        if agent == "sp-b":
+            keys.add("CURIE_SECURITY_PROBE_B_ONLY")
+        entries = [entry for entry in env if entry["name"].startswith("CURIE_SECURITY_PROBE_")]
+        assert {entry["name"] for entry in entries} == keys and len(entries) == len(keys), "fixture runner must receive only its own sentinel keys"
+        for entry in entries:
+            assert entry == {
+                "name": entry["name"],
+                "valueFrom": {"secretKeyRef": {
+                    "name": f"{prefix}-agent-{agent}-connector-secrets",
+                    "key": entry["name"], "optional": False,
+                }},
+            }, "fixture runner sentinel must reference its own Secret"
+
+
+def check_privileges(rules):
+    fixture_secrets = {
+        f"{prefix}-agent-sp-a-connector-secrets",
+        f"{prefix}-agent-sp-b-connector-secrets",
+    }
+    secret_verbs = set()
+    for rule in rules:
+        resources = set(rule.get("resources", []))
+        verbs = set(rule.get("verbs", []))
+        assert "serviceaccounts/token" not in resources and "*" not in resources, "probe must not mint ServiceAccount tokens"
+        if resources & {"roles", "rolebindings", "clusterroles", "clusterrolebindings"}:
+            assert not verbs & {"create", "delete", "update", "patch", "bind", "escalate", "*"}, "probe must not manufacture credential RBAC"
+        if "pods" in resources:
+            assert not verbs & {"patch", "*"}, "probe must not patch pods"
+        if "secrets" in resources:
+            secret_verbs.update(verbs)
+            if verbs - {"create"}:
+                assert set(rule.get("resourceNames", [])) == fixture_secrets, "Secret reads and deletes must be scoped to fixture names"
+                assert verbs <= {"get", "delete"}, "fixture Secret grant must only read and delete"
+            if "create" in verbs:
+                assert verbs == {"create"} and not rule.get("resourceNames"), "Secret creation must use a separate unconstrained create grant"
+    assert {"create", "get", "delete"} <= secret_verbs, "probe must create, inspect and clean up fixture Secrets"
+
+
+def check_temporary_policy(candidate):
+    assert candidate["spec"].get("podSelector") == {
+        "matchLabels": {
+            "app.kubernetes.io/instance": release_name,
+            "curie.io/security-probe": "${prefix}",
+        },
+    }, "temporary API policy must select only this release's fixture pods"
+    assert candidate["spec"].get("policyTypes") == ["Egress"], "temporary API policy must only allow egress"
+
+
+def check_script(candidate):
+    commands = re.sub(r"\\\n\s*", " ", candidate)
+    assert not re.search(r"kubectl[^\n]*\b(?:create|delete)\s+(?:rolebindings?|roles?|serviceaccounts?|token)\b", commands), "probe must not create handwritten credential identities"
+    assert "kind: SandboxClaim" in candidate and "warmPoolRef:" in candidate, "probe must claim runner pools"
+    assert re.search(r"kubectl\s+wait[^\n]*condition=Ready[^\n]*sandboxclaim", commands, re.I), "probe must wait for real claim readiness"
+    assert re.search(r"kubectl\s+exec[^\n]*(?:-c\s+runner|--container(?:=|\s+)runner)", commands), "probe must inspect the claimed runner container"
+    assert "CURIE_SECURITY_PROBE_SECRET=AAA" in commands and "CURIE_SECURITY_PROBE_SECRET=BBB" in commands, "probe must create distinct values for the same sentinel key"
+    assert "CURIE_SECURITY_PROBE_B_ONLY=BBB" in commands, "probe must create the B only sentinel"
+    assert "CURIE_SECURITY_PROBE_B_ONLY" in candidate and "CURIE_SECURITY_PROBE_SECRET" in candidate, "runner assertion must inspect both sentinel keys"
+    cleanup = re.search(r"cleanup\(\)\s*\{(.*?)^\s*\}", candidate, re.M | re.S)
+    assert cleanup is not None and "trap cleanup EXIT" in candidate, "probe must install cleanup before claims"
+    body = re.sub(r"\\\n\s*", " ", cleanup.group(1))
+    for kind in ("sandboxclaim", "sandboxtemplate", "sandboxwarmpool", "secret", "networkpolicy"):
+        assert re.search(rf"kubectl\s+delete[^\n]*\b{kind}s?\b", body, re.I), f"probe cleanup must delete fixture {kind}"
+
+
+def must_reject(label, checker, value, message):
+    try:
+        checker(value)
+    except AssertionError as error:
+        assert message in str(error), f"{label} failed at the wrong boundary: {error}"
+    else:
+        raise AssertionError(f"negative control accepted {label}")
+
+
+check_delivery(fixtures)
+check_privileges(role["rules"])
+check_temporary_policy(temporary_policy)
+check_script(script)
+
+crossed = copy.deepcopy(fixtures)
+template_a = resource(crossed, "SandboxTemplate", f"{prefix}-agent-sp-a-runner")
+entry = next(entry for entry in runner(template_a)["env"] if entry["name"] == "CURIE_SECURITY_PROBE_SECRET")
+entry["valueFrom"]["secretKeyRef"]["name"] = f"{prefix}-agent-sp-b-connector-secrets"
+must_reject("crossed Secret reference", check_delivery, crossed, "reference its own Secret")
+
+leaked = copy.deepcopy(fixtures)
+template_a = resource(leaked, "SandboxTemplate", f"{prefix}-agent-sp-a-runner")
+template_b = resource(leaked, "SandboxTemplate", f"{prefix}-agent-sp-b-runner")
+runner(template_a)["env"].append(copy.deepcopy(next(entry for entry in runner(template_b)["env"] if entry["name"] == "CURIE_SECURITY_PROBE_B_ONLY")))
+must_reject("B only key leaked into A", check_delivery, leaked, "only its own sentinel keys")
+
+privileged = copy.deepcopy(role["rules"])
+privileged.append({"apiGroups": ["rbac.authorization.k8s.io"], "resources": ["roles", "rolebindings"], "verbs": ["create", "delete"]})
+must_reject("handwritten Role grant", check_privileges, privileged, "manufacture credential RBAC")
+must_reject("token mint grant", check_privileges, role["rules"] + [{"resources": ["serviceaccounts/token"], "verbs": ["create"]}], "must not mint ServiceAccount tokens")
+must_reject("unscoped Secret read", check_privileges, role["rules"] + [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]}], "scoped to fixture names")
+must_reject("pod patch grant", check_privileges, role["rules"] + [{"apiGroups": [""], "resources": ["pods"], "verbs": ["patch"]}], "must not patch pods")
+shared_policy = copy.deepcopy(temporary_policy)
+shared_policy["spec"]["podSelector"]["matchLabels"].pop("curie.io/security-probe")
+must_reject("policy missing unique probe selector", check_temporary_policy, shared_policy, "only this release's fixture pods")
+must_reject("Pod replacing claim", check_script, script.replace("kind: SandboxClaim", "kind: Pod"), "claim runner pools")
+print(f"  ok: {prefix} probe uses chart runner delivery and rejects isolation regressions")
+PY
+}
+
+assert_probe_delivery curie curie
+assert_probe_delivery acme acme-security \
+  --set fullnameOverride=acme-security \
+  --set security.gvisor.mode=require \
+  --set security.gvisor.runtimeClassName=acme-runsc \
+  --set agentSandbox.runner.hardening.runAsUser=1200 \
+  --set agentSandbox.runner.hardening.runAsGroup=1200 \
+  --set agentSandbox.runner.hardening.fsGroup=1200 \
+  --set agentSandbox.warmPool.replicas=2
+assert_probe_delivery curie curie \
+  --set agentSandbox.runner.fakeModel=false \
+  --set security.gvisor.mode=auto \
+  --set security.gvisor.runtimeClassName=acme-runsc
+
 echo "OK: per-agent connector-secret render assertions passed"
+
+# ADR 0176: the test cluster kubeconfig is a connector secret the sandbox must
+# not receive. A normal connector token still renders beside it.
+withheld="$(helm template curie "$CHART" \
+  --set-string 'agentSandbox.connectorSecrets.acme-a.GITHUB_PERSONAL_ACCESS_TOKEN=agent-a-sentinel' \
+  --set-string 'agentSandbox.connectorSecrets.acme-a.E2E_CLUSTER_KUBECONFIG=kubeconfig-sentinel' \
+  2>/dev/null)"
+withheld_secret="$(require_resource "$withheld" Secret curie-agent-acme-a-connector-secrets)"
+withheld_template="$(require_resource "$withheld" SandboxTemplate curie-agent-acme-a-runner)"
+require_text "$withheld_secret" 'GITHUB_PERSONAL_ACCESS_TOKEN: "agent-a-sentinel"' \
+  "withheld render dropped the ordinary connector secret"
+forbid_text "$withheld_secret" 'E2E_CLUSTER_KUBECONFIG|kubeconfig-sentinel' \
+  "sandbox Secret stored the test cluster kubeconfig"
+forbid_text "$withheld_template" 'E2E_CLUSTER_KUBECONFIG|kubeconfig-sentinel' \
+  "sandbox template referenced the test cluster kubeconfig"
+require_text "$withheld_template" 'name: GITHUB_PERSONAL_ACCESS_TOKEN' \
+  "sandbox template dropped the ordinary connector secret"
+
+stock_api="$(require_resource "$(helm template curie "$CHART" 2>/dev/null)" Deployment curie-api)"
+require_text "$stock_api" 'name: CURIE_E2E_CONNECTOR_ENABLED' \
+  "API lacks CURIE_E2E_CONNECTOR_ENABLED"
+require_text "$(grep -A1 'name: CURIE_E2E_CONNECTOR_ENABLED' <<<"$stock_api")" 'value: "false"' \
+  "e2e connector must be disabled on a stock install"
+
+if helm template curie "$CHART" --set e2eConnector.enabled=true >/dev/null 2>&1; then
+  fail "e2eConnector.enabled without the test cluster identity rendered"
+fi
+
+enabled_api="$(require_resource "$(helm template curie "$CHART" \
+  --set e2eConnector.enabled=true \
+  --set e2eConnector.ownerLabel.value=acme \
+  --set e2eConnector.serviceAccount=curie-e2e-connector \
+  --set e2eConnector.serviceAccountNamespace=test-system \
+  --set e2eConnector.workerClusterRole=curie-e2e-connector-namespace \
+  2>/dev/null)" Deployment curie-api)"
+require_text "$(grep -A1 'name: CURIE_E2E_CONNECTOR_ENABLED' <<<"$enabled_api")" 'value: "true"' \
+  "enabled install did not tell the API the test cluster is configured"
+require_text "$enabled_api" 'value: "acme"' \
+  "enabled install did not pass the owner label value"

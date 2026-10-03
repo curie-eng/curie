@@ -87,7 +87,7 @@ upgrade. The pre-upgrade drain Job publishes the required minimum in the
 `curie.ai/minimum-helm-timeout-seconds` annotation. For customized worker or
 drain budgets, use the annotation rendered from the same chart and values as
 the upgrade, and pass that value with an `s` suffix to `helm upgrade --timeout`.
-The default minimum is 2940 seconds. The chart derives it from the effective
+The default minimum is 21900 seconds. The chart derives it from the effective
 drain wait, 120 seconds for the Job, the effective worker termination grace,
 and 60 seconds for scheduling and Helm operations. Raising
 `worker.deliveryBudgetSeconds` raises both the effective drain wait and worker
@@ -425,6 +425,18 @@ exporter is available only when enabled. The chart default keeps metrics on
 overlay is not proof that a live Collector is exporting, and a disposable
 runtime proof is not proof the permanent soak overlay is deployed; see
 `examples/sre-bot/docs/METRICS-ROLLOUT.md`.
+
+The `awsemf` Collector exporter in contrib 0.119.0 rejects the
+`retry_on_failure` and `sending_queue` fields because they do not use
+exporterhelper. An operator can list an already configured `awsemf` exporter under
+`otelCollector.exportersWithoutExporterHelper`, with a nonblank reason naming
+the exporter and the Collector version whose schema was checked. Only that
+exporter is exempt from the chart's helper retry and queue requirements; the
+exporter's own durability controls remain the operator's responsibility. Helm
+rejects a stale or empty exemption, and refuses exemptions for other exporter
+types. Adding another exporter type requires a chart change and a schema/runtime
+proof for its native durability controls. All other network exporters still need
+the bounded retry and persistent queue configuration.
 
 Built-in exporter names (`otlphttp/langfuse`, `nop/logs`, `nop/metrics`, and
 `debug`) are reserved and cannot be overridden through `extraExporters`.
@@ -1118,6 +1130,25 @@ this toward production HA:
   to handle drains deliberately (scale up first, or delete the PDB for planned
   maintenance). Enable it only once you run multiple replicas or explicitly want
   drains gated.
+- **Optional compute-plane PodDisruptionBudgets (#1574).** The api, worker, ui
+  and dispatcher Deployments each carry a `<component>.podDisruptionBudget`
+  block, also OFF by default because every one ships at `replicas: 1`:
+
+  | Values key | Default | When enabled |
+  |---|---|---|
+  | `api.podDisruptionBudget` | `{enabled: false, maxUnavailable: 1}` | Bounds how many API pods a drain evicts at once. Raise `api.replicas` for it to protect anything. |
+  | `worker.podDisruptionBudget` | `{enabled: false, maxUnavailable: 1}` | Bounds how many workers a drain evicts at once. Each evicted worker still drains its in-flight turns inside its termination grace (ADR-0131). |
+  | `ui.podDisruptionBudget` | `{enabled: false, maxUnavailable: 1}` | Bounds how many UI pods a drain evicts at once. Raise `ui.replicas` for it to protect anything. |
+  | `dispatcher.podDisruptionBudget` | `{enabled: false, maxUnavailable: 1}` | Accepted only as `minAvailable: 1` with `allowBlockingDrain: true`. The dispatcher is one replica with strategy `Recreate` by design (#2944), so a budget that permits a disruption protects nothing and is refused. |
+
+  Setting `minAvailable` replaces `maxUnavailable`, since a `policy/v1` budget
+  carries exactly one of the two. A budget that allows zero voluntary
+  disruptions at the configured replica count (`minAvailable` at or above
+  `replicas`, or `maxUnavailable: 0`) blocks every drain of the node running
+  that pod, so the render refuses it unless `allowBlockingDrain: true` says
+  that is intended. Each budget selects exactly its own Deployment's pods,
+  which `ci/compute-pdb-assertions.sh` checks against every rendered pod
+  template.
 
 Production sizing (raise every `resources` block and persistence size, supply
 real secrets) is covered in **Production sizing** above; PDBs and BYO stores are
@@ -1137,6 +1168,18 @@ explicit `sizeLimit`:
 | `bundles` (fetched archive + extracted plugin dir) | `agentSandbox.runner.bundleFetch.sizeLimit` | `2Gi` |
 | `aws-config` (init only AWS CLI path addressing config) | `agentSandbox.runner.bundleFetch.awsConfigSizeLimit` | `16Mi` |
 | One per `agentSandbox.runner.hardening.writablePaths` entry (`/tmp`, `/home/runner` by default) | `agentSandbox.runner.hardening.writablePathSizeLimit` | `512Mi` |
+| `workspace` (the managed repository checkout at `/workspace`) | `agentSandbox.runner.workspace.sizeLimit`, or per agent `agentSandbox.workspaceSizeLimits.<agent>` | `1Gi`; per agent: none, the agent inherits the default |
+| `attachments` (one turn's inbound attachments) | `agentSandbox.runner.attachments.sizeLimit` | `512Mi` |
+
+`agentSandbox.workspaceSizeLimits` maps an agent name to that agent's workspace
+ceiling, for example `dark-factory: 24Gi`, so one build-heavy agent can compile
+in its checkout without enlarging every sandbox. Each listed agent gets its own
+SandboxTemplate and warm pool, and the worker routes that agent's claims there.
+A value must be a binary quantity (`Ki`, `Mi`, `Gi`, `Ti`); anything else fails
+render. The kubelet also counts `emptyDir` usage against the pod's
+`ephemeral-storage` limit, so that agent's runner `ephemeral-storage` limit must
+cover the workspace plus its home scratch, or the pod is evicted at the smaller
+bound. `ci/sandbox-emptydir-sizelimit-assertions.sh` pins the rendering.
 
 **This is a backstop, not an instantaneous cap.** `sizeLimit` is enforced by
 periodic kubelet measurement of the volume's usage, not a write-time quota, so a
@@ -1163,11 +1206,18 @@ sandbox and renders whenever an in-chart store is deployed.
 | Rail | What ships | Values |
 |---|---|---|
 | 1. Default-deny egress + metadata block | NetworkPolicies selecting `component: runner-sandbox`: default-deny egress, allow-DNS, an operator-declared egress allowlist, and (optional) ingress lock. Arbitrary internet AND `169.254.169.254` are denied by construction. | `security.networkPolicy.*` |
-| 2. Per-agent secret isolation | Least-privilege runner ServiceAccount (no secret get/list, token not mounted). The per-agent `resourceNames`-scoped Role is bound by the control plane per agent. | `agentSandbox.runner.serviceAccount.*` |
+| 2. Per agent secret isolation | Per agent SandboxTemplates inject connector credentials through `secretKeyRef` environment entries. The release runner ServiceAccount has no bound Role or mounted Kubernetes API token by default. The control plane does not create per agent Roles. | `agentSandbox.connectorSecrets`, `agentSandbox.runner.serviceAccount.*` |
 | 3. Non-root / read-only rootfs | Pod + container securityContext on the runner: `runAsNonRoot`, uid 1000, `readOnlyRootFilesystem`, drop ALL caps, no privilege escalation, RuntimeDefault seccomp, plus writable emptyDir scratch (`/tmp`, `/home/runner`) and `HOME`. | `agentSandbox.runner.hardening.*` |
 | 4. gVisor kernel isolation | `runtimeClassName` on runner pods, driven by the `security.gvisor.mode` tri-state (`auto`/`require`/`off`) + a preflight that fails the install if the RuntimeClass is missing or downgraded, firing in `require` (always) and in `auto` for real-model runs + an optional RuntimeClass object. | `security.gvisor.*`, `security.gvisorPreflight.*` |
 | 5. Data-tier ingress isolation | Per deployed store (Postgres, RustFS, ClickHouse, Valkey): a default-deny-ingress NetworkPolicy plus a scoped-allow that permits ingress on the store's ports ONLY from this release's app pods (`name`+`instance` label). Blocks any co-tenant pod from opening `Postgres:5432` etc. | `security.dataTierNetworkPolicy.*` |
 | 6. Tenant capacity ceiling | A `ResourceQuota` bounding aggregate cpu/memory and sandbox pod count (scoped to the sandbox PriorityClass; a scoped quota cannot constrain ephemeral-storage, so per-pod disk is bounded by the `LimitRange`/pod limits times the pod-count cap), plus a `LimitRange` supplying per-container defaults so a sandbox pod created outside this chart's own templates still inherits a ceiling. Renders whenever `agentSandbox.deploy: true`. | `resourceQuota.*`, `limitRange.*` |
+
+**Credential access.** A sandbox can inspect credentials injected into its own
+process, including any explicitly configured shared model credential. Operators
+who add credentials, mount a Kubernetes API token, or grant runner RBAC change
+the default boundary. Claim 2 of the security probe uses two real SandboxClaims
+and their bound runners to verify scoped connector delivery, absence of an API
+token, and explicit Kubernetes rejection of Secret GET and list requests.
 
 **Fail-closed egress.** `security.networkPolicy.allowedEgress` is EMPTY by
 default: a fresh install denies all egress except DNS until the operator declares
@@ -1231,14 +1281,15 @@ non-enforcing CNI.
 (default `auto`):
 
 - **`auto`** -- at install/upgrade time the chart looks up the `gvisor`
-  RuntimeClass. Present -> runner pods use it. Absent -> pods run without it and
-  `NOTES.txt` warns. Never blocks the install, so a bare install works on any
-  cluster. (Helm's `lookup` returns empty under `helm template`/--dry-run, so a
-  templated render always shows the no-gvisor shape.) This never-blocks behavior
-  applies to the fake-model default only; enabling a real model
-  (`fakeModel=false` or `inference.deploy`) under `auto` renders the blocking
+  RuntimeClass. A real model (`fakeModel=false` or `inference.deploy`) stamps
+  that class on runner pods even when lookup is empty, so `helm template`,
+  Argo CD, and Flux show the gVisor shape. That same path renders the blocking
   `preflight-gvisor` hook, so a runsc-less real-model install fails closed
-  instead of silently running on the host kernel.
+  instead of silently running on the host kernel. Fake-model auto still omits
+  the class when lookup is empty (a templated render shows the no-gvisor shape)
+  and `NOTES.txt` warns; when lookup finds the class, those pods use it. That
+  never-blocks path is the fake-model default, so a bare install works on any
+  cluster.
 - **`require`** -- always stamp the RuntimeClass AND run the `preflight-gvisor`
   hook, which blocks the install with a clear remediation if the runtimeclass is
   missing or downgraded to runc. The fail-hard production posture.
@@ -1365,6 +1416,12 @@ CURIE_E2E_IDENTITY_CONTEXT=<test cluster context> \
 ```
 
 It creates only objects named from its run id and deletes them on exit.
+
+## End to end connector on the factory cluster (ADR 0176)
+
+`e2eConnector.enabled` defaults to false. A factory bundle may declare a hosted connector named `e2e` (see `apps/e2e-connector/README.md`). While the flag is false the API renders no end to end connector and deploy is refused with `e2e_connector_not_configured`.
+
+Turn it on only when a separate test cluster already has the identity above. Set `serviceAccount`, `serviceAccountNamespace`, and `workerClusterRole` to that identity, and set `ownerLabel.value` to the same value the test cluster admission policy expects. The connector process uses the factory worker image. `E2E_CLUSTER_KUBECONFIG`, supplied with `curie secrets`, is mounted on the connector and is omitted from the sandbox template and from the per agent sandbox Secret.
 
 ## Uninstalling and CRD lifecycle
 
@@ -1666,6 +1723,15 @@ approval is the default. An operator can set one agent's publication policy to
 automatic, and publication still runs outside the sandbox. No GitHub credential
 is mounted into the sandbox.
 
+Publication refuses every change under `.github/`, including workflows,
+composite actions, and `CODEOWNERS`, plus any extra repository-relative path
+in `worker.publication.protectedPaths` (`CURIE_PUBLICATION_PROTECTED_PATHS`
+on the worker). The publication job pushes the branch to the base repository,
+not a fork, so a `push` or `pull_request` workflow in that repository runs
+the changed files with the repository's Actions secrets before a person
+reviews the pull request. Keep those secrets in GitHub environments that
+require reviewers.
+
 One allowed root `https://github.com/owner/repository` URL in the initial
 message establishes the thread's selection and causes the worker to acquire its
 managed workspace at claim time. An initial message without a repository URL
@@ -1893,10 +1959,24 @@ which selects the same pods on the server's own port. No rendered policy opens
 that port, so the caller also needs an ingress policy of your own naming it.
 
 `curie cluster up` generates the pair on a release that records none and
-re-supplies it on every upgrade, as it does the sealing keypair. `--dev`
-generates none, and neither does a plain `helm install` that sets no
-`connectorCaller` value: with no key the worker mints no token, the API renders
-no proxy, and each connector's NetworkPolicy is its only access check.
+re-supplies it on every upgrade, as it does the sealing keypair. `--dev` mints
+none. With `security.allowDevDefaults` exactly `true` (as `--dev` and
+`values-dev.yaml` set it) and neither half of the pair set, the chart ships the
+published dev pair (the 32-byte seed `curie-dev-connector-caller-seed!`),
+which, like every other published dev credential, is not production material.
+It is never written to the release values, so a later sealed `cluster up` sees
+no recorded pair and generates a fresh one. A plain `helm install` or `helm
+upgrade` that sets no `connectorCaller` value generates nothing. With no key
+the API refuses to render a hosted connector (`hosted_connector_requires_caller_key`,
+issue #3552), so `cluster deploy` of a bundle that hosts one fails until the
+release has a pair. The api and worker carry a `checksum/connector-caller`
+annotation of the effective public key and the Secret reference, so an upgrade
+that supplies or replaces the pair rolls them onto it. A hosted connector's
+proxy moves to a new key only when it is next rendered: the next `cluster
+deploy` of its agent, or the next pass when `worker.connectorReconciler` is on.
+Leaving dev mode with no replacement pair while the published one is live is
+refused, since running proxies would keep trusting it; supply a pair (or run
+`curie cluster up`), then redeploy each agent that hosts a connector.
 
 To bring your own pair, name a Secret holding both halves as standard base64:
 the 32-byte seed under `connectorCaller.signingKeyKey` (default `signingKey`)
@@ -1915,9 +1995,11 @@ connectorCaller:
 Only the worker receives the signing key, and only the API the public key.
 `cluster up` carries `existingSecret` forward as well.
 
-To rotate, set `connectorCaller.previousVerifyKey` to the current public key,
-set the new pair, and `kubectl rollout restart` the api and worker Deployments:
-neither pod template carries a checksum of this Secret. Tokens live 24 hours,
+To rotate, set `connectorCaller.previousVerifyKey` to the current public key
+and set the new pair; the upgrade rolls the api and worker. A pair kept in your
+own `existingSecret` and rotated in place under the same name and keys still
+needs a `kubectl rollout restart` of both Deployments, since the chart cannot
+read that Secret's content. Tokens live 24 hours,
 so clear `previousVerifyKey` a day later.
 
 The worker that signs the token, the runner that presents it in
@@ -1928,8 +2010,14 @@ one. Keep any agent-specific runner image on this release too.
 The first upgrade that gives the release a caller key rolls every hosted
 connector pod once, because its rendered Deployment gains the proxy. That is
 the `curie cluster up` upgrade of a release recording none. `curie cluster
-upgrade` generates no key, so it renders no proxy until a later `cluster up`
-or a key of your own. Upgrade note: a keep-alive Job that dialled the
+upgrade` generates no key and refuses an installed release unless its recorded
+values name a nonblank `connectorCaller.existingSecret` or supply both nonblank
+`connectorCaller.signingKey` and `connectorCaller.verifyKey`. The refusal names
+`connector_caller_pair_required` before drain, schema mutation or Helm apply,
+including dry run, same version and resume. Chart development defaults do not
+satisfy this recorded configuration requirement. Run the printed `curie cluster
+up` command without `--dev` to generate a missing pair; repair a partial pair
+by supplying both halves or a named Secret before retrying. Upgrade note: a keep-alive Job that dialled the
 connector Service now dials `<name>-direct`, keeping its port, because the
 connector Service lands on the proxy, which refuses a caller without a token.
 Its peer-ingress policy keeps naming the server's port.

@@ -75,6 +75,8 @@ def _runner(
     decision: str | None = None,
 ) -> SessionRunner:
     return SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
         session_factory=lambda: session,
         ceiling=0,
         tracer=RunTracer(None),

@@ -213,9 +213,12 @@ service is material:
   admits an adapter, since only the Slack dispatcher vouches for a Slack ID
   ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)'s separate finding).
 - **Fixed ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)): an approval is answered where it was asked.** An adapter
-  is served the approvals whose card went to one of its own bindings, and a
-  card shown on its channel is answered by the requester alone
-  (`apps/api/src/curie_api/approvers.py::RequesterOnly`). The platform half
+  is served the approvals whose card went to one of its own bindings. A card
+  shown in an email thread is answered only by a verified sender on the route's
+  approver `emails` ([ADR-0177 amendment](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md#amendment-email-approver-lists),
+  `apps/api/src/curie_api/approvers.py::EmailApprovers`), after the binding's
+  `allowed_callers` admit that sender; no other channel has a list yet, so its
+  cards admit nobody. The platform half
   needs nothing new on the wire: the worker already posts the card into the
   thread as a `ReplyPost` carrying a `ConfirmIntent` with the approval id, and
   settles it on resume with a `ReplyUpdate` carrying `settled`. An adapter that
@@ -223,11 +226,12 @@ service is material:
   "Reply with APPROVE or REJECT on the first line"), return a `ReplyAck.ref`
   for the card so the worker can settle it, keep a random single-use reference
   per approval, and accept a reply as an answer only when it passes the
-  adapter's sender checks, carries a live reference issued to that sender, was
+  adapter's sender checks, carries a live reference for that approval, was
   not sent automatically, and has one decision word on the first line above
-  any quote. It then calls resolve with its credential and the sender as the
-  actor, never starts a turn from an answer, and on the settled update sends
-  one short follow-up and spends the reference. Until an adapter does this,
+  any quote. It then calls resolve with its credential and the verified sender
+  address (never a display name) as the actor, lets the platform decide, never
+  starts a turn from an answer, and on the settled update sends one short
+  follow-up and spends the reference. Until an adapter does this,
   its approvals still only expire.
 - **No adapter declares the reply-wire version it decodes.** The manifest that
   would carry an adapter's targeted contract version is unbuilt, so the

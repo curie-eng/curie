@@ -103,6 +103,27 @@ e2eConnectorIdentity:
     value: ""
 
 # ---------------------------------------------------------------------------
+# End to end connector on the factory cluster (ADR 0176 decisions 1 to 3,
+# issue #3244). Off unless this installation has a separate test cluster.
+# The connector process runs here. The credential and the identity live on
+# the test cluster (e2eConnectorIdentity, installed only there).
+# ---------------------------------------------------------------------------
+e2eConnector:
+  enabled: false
+  namespacePrefix: "curie-e2e-"
+  ownerLabel:
+    key: "curietech.ai/e2e-owner"
+    # The test cluster release name. Required when enabled. It must equal
+    # e2eConnectorIdentity.ownerLabel.value on that cluster.
+    value: ""
+  # The test cluster service account installed by --e2e-connector-identity.
+  serviceAccount: ""
+  serviceAccountNamespace: ""
+  workerClusterRole: ""
+  ttlSeconds: 3600
+  podSecurity: baseline
+
+# ---------------------------------------------------------------------------
 # PriorityClass (ADR-0059 decision 5): ranks the platform -- worker, api,
 # dispatcher, the data tier (postgres, valkey, clickhouse, rustfs), and the
 # observability and UI tier (langfuse web/worker, the OTel collector, the UI,
@@ -1000,6 +1021,11 @@ otelCollector:
   # Network exporters must opt into bounded retry and a persistent file_storage
   # sending queue. The chart rejects an exporter that omits either protection.
   extraExporters: {}
+  # Only awsemf exporters may bypass exporterhelper validation on contrib
+  # 0.119.0. Map each configured awsemf name to a nonblank reason naming the
+  # exporter and checked Collector version. Other network exporters retain
+  # the bounded retry and queue requirements.
+  exportersWithoutExporterHelper: {}
   # Exporter names appended in order to the traces pipeline. Each name must
   # identify an exporter configured above or in extraExporters.
   extraPipelineExporters: []
@@ -1161,6 +1187,19 @@ api:
   #  - cidr: 192.0.2.11/32
   #    ports: [{ protocol: TCP, port: 443 }]
   replicas: 1
+  # Optional PodDisruptionBudget (#1574), off by default. At the shipped
+  # replicas: 1 the default maxUnavailable: 1 permits the one pod's eviction;
+  # it starts protecting something once api.replicas is raised. Set
+  # minAvailable to use it instead of maxUnavailable. A budget that allows zero
+  # voluntary disruptions at the configured replica count (minAvailable >=
+  # replicas, or maxUnavailable: 0) blocks every node drain, so the render
+  # refuses it unless allowBlockingDrain: true acknowledges that.
+  # See README "High availability and PodDisruptionBudgets".
+  podDisruptionBudget:
+    enabled: false
+    maxUnavailable: 1
+    # minAvailable: 1
+    allowBlockingDrain: false
   image:
     repository: ghcr.io/curie-eng/curie-api
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.
@@ -1178,14 +1217,15 @@ api:
     # `eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>`.
     annotations: {}
   # Deploy environment the API boots as (`dev` or `prod`), rendered as
-  # ENVIRONMENT on the api container. `prod` arms the API production boot gate,
-  # which refuses to start on the dev-default `apiKey`/`githubWebhookSecret`
-  # below -- so this backs up the render-time secret gate as defense in depth.
+  # ENVIRONMENT on the api container. The API refuses blank API keys in every
+  # environment. `prod` also refuses the published `apiKey`/`githubWebhookSecret`
+  # defaults below, backing up the render credential gate at boot.
   # Left at `dev` so a bare `helm install` and the dev overlays boot without
   # real secrets; set to `prod` (with real secrets) for a production install.
   environment: dev
-  # Single shared API key the UI and CLI authenticate with. Dev default; override
-  # (or point at an existingSecret) in any shared deployment.
+  # Single shared API key the UI and CLI authenticate with. Sealed installs
+  # generate and retain a key; a nonblank override replaces it. Blank values are
+  # refused. Dev mode keeps the published default.
   apiKey: curie-dev-key
   # Dedicated HMAC secret shared only by the Slack dispatcher (which attests a
   # click's authenticated user/channel) and API (which verifies it). It MUST
@@ -1220,9 +1260,16 @@ api:
   githubReviewIngressEnabled: false
   githubReviewReconcilerIntervalSeconds: 5
   # Signed factory issue intake is opt-in and separate from review feedback.
-  # When enabled, the API boot gate requires the App id and private key, a
-  # non-default webhook secret, a label, a mention login, and a repo allowlist.
+  # Polling is the default. A blank webhook secret disables signed deliveries.
+  # A configured secret permits signed deliveries in either mode. The published
+  # development secret is refused whenever factory intake is enabled.
+  # Sealed installs generate and retain a real secret unless one is configured.
+  # Webhook mode requires a real secret and keeps the missed label backstop.
+  # Either mode still requires the App id and private key, a label, a mention
+  # login, and a repo allowlist.
   githubFactoryIngressEnabled: false
+  githubFactoryIntake: poll
+  githubFactoryPollIntervalSeconds: 45
   githubFactoryLabel: ""
   githubFactoryMention: ""
   # Public https origin GitHub's image proxy fetches the live factory status card
@@ -1232,6 +1279,20 @@ api:
   # Seconds a published factory run waits on its pull request's CI, from the
   # push (#3162). The run's execution deadline still caps it. 1 to 10800.
   githubFactoryCiWaitSeconds: 1200
+  # Required Python CI per repository (#3617), keyed by owner/name (matched
+  # case-insensitively): {check, paths, pendingCheckPrefix}. A factory Python
+  # change must fall under `paths` and pass the `check` Actions check; shard
+  # jobs named with `pendingCheckPrefix` keep the run waiting for it. A
+  # repository without an entry is judged on its own checks. Rendered as JSON
+  # into GITHUB_FACTORY_PYTHON_CI; see docs/operations.md for curie-eng/curie.
+  githubFactoryPythonCi: {}
+  # Bases a factory ticket may start from and target (#3095, ADR 0186), keyed
+  # by owner/name: {bases: [branch, ...], default_base: branch}. A ticket picks
+  # one with a `base:<branch>` label; with none it uses default_base, or the
+  # repository default branch when default_base is unset. A repository without
+  # an entry may only use its default branch. Rendered as JSON into
+  # GITHUB_FACTORY_BASES.
+  githubFactoryBases: {}
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed
@@ -1467,6 +1528,18 @@ dispatcher:
   # For the same reason keep replicas at 1: each extra replica is another
   # client on the same tokens.
   replicas: 1
+  # Optional PodDisruptionBudget (#1574), off by default. The dispatcher is
+  # one replica with strategy Recreate by design (see replicas above), so a
+  # budget that permits a disruption protects nothing and the render refuses
+  # it. The only accepted budget is a blocking one, acknowledged:
+  # minAvailable: 1 with allowBlockingDrain: true, which makes every drain of
+  # the node running the dispatcher wait for an operator. See README "High
+  # availability and PodDisruptionBudgets".
+  podDisruptionBudget:
+    enabled: false
+    maxUnavailable: 1
+    # minAvailable: 1
+    allowBlockingDrain: false
   # Platform API the dispatcher resolves Slack approval clicks against. Empty
   # (the default) derives the in-chart API Service,
   # http://<fullname>-api:<api.service.port>. Set it to a full base URL to point
@@ -1801,6 +1874,31 @@ mailAdapter:
 worker:
   deploy: true
   replicas: 1
+  # Turns one worker runs at once (#760), rendered as
+  # CURIE_WORKER_MAX_CONCURRENCY; 1 through 256. Each running turn holds a
+  # sandbox, so replicas x maxConcurrency is how many sandboxes the workers can
+  # ask for at once. NOTES prints that product beside the sandbox quota
+  # ceiling (resourceQuota.hard): a product below the ceiling leaves quota
+  # unused, and one far above it turns the excess into capacity replies.
+  # When retained release values omit this key, the worker env and NOTES
+  # both use 16.
+  maxConcurrency: 16
+  # Optional PodDisruptionBudget (#1574), off by default. At the shipped
+  # replicas: 1 the default maxUnavailable: 1 permits the one pod's eviction;
+  # it starts protecting something once worker.replicas is raised. Set
+  # minAvailable to use it instead of maxUnavailable. A budget that allows zero
+  # voluntary disruptions at the configured replica count (minAvailable >=
+  # replicas, or maxUnavailable: 0) blocks every node drain, so the render
+  # refuses it unless allowBlockingDrain: true acknowledges that. The worker
+  # already drains in-flight turns inside its termination grace (ADR-0131); a
+  # budget bounds how many workers a drain evicts at once, not how each one
+  # stops.
+  # See README "High availability and PodDisruptionBudgets".
+  podDisruptionBudget:
+    enabled: false
+    maxUnavailable: 1
+    # minAvailable: 1
+    allowBlockingDrain: false
   # Floor for the worker's voluntary termination grace. The chart renders the
   # effective grace as max(this, deliveryBudgetSeconds +
   # deliveryShutdownReserveSeconds) (ADR-0131, #3071), so a raised budget
@@ -1854,9 +1952,10 @@ worker:
     cloneVolumeSize: 4Gi
     mountPath: /var/lib/curie/workspaces
   # Inbound channel attachments (#2567). The worker downloads a referenced file
-  # with the channel bot token, parks it in the private workspace bucket and
-  # mints a short-lived one-object read capability that the sandbox's
-  # attachments-init container redeems. These three numbers are ONE envelope
+  # with the channel bot token (Slack) or from the adapter that sent it, with
+  # that adapter's adapterCredentials secret (any other kind, ADR-0153), parks
+  # it in the private workspace bucket and mints a short-lived one-object read
+  # capability that the sandbox's attachments-init container redeems. These three numbers are ONE envelope
   # expressed twice: they become the worker's CURIE_ATTACHMENT_* env AND (for
   # maxFileBytes) the literal cap inside the rendered init-container program, so
   # the pod can never accept what the worker refused or refuse what it accepted.
@@ -1899,6 +1998,10 @@ worker:
     reconcileMaxAttempts: 10
     jobActiveDeadlineSeconds: 300
     gitCommandTimeoutSeconds: 120
+    # Repository-relative paths publication refuses in addition to `.github/`.
+    # Each entry matches that exact path and anything under it. The worker
+    # receives the list as a JSON array, so a path may contain a comma.
+    protectedPaths: []
     # GitHub publishes these address sets from https://api.github.com/meta.
     # Override for GitHub Enterprise or refresh when GitHub changes the set.
     githubHttpsCidrs:
@@ -2022,6 +2125,15 @@ worker:
   # is accepted by YAML, renders fine, and used to boot healthy and then hang
   # every turn while leaking a sandbox per attempt (#1388).
   suspendedRouteTtlSeconds: 86400
+  # Settled stream retention (ADR 0184, #1523). The worker trims entries every
+  # consumer group has acknowledged off curie:runs and curie:evals; Valkey runs
+  # noeviction, so without it every settled turn stays until writes are
+  # refused. minAgeSeconds keeps settled entries this long for inspection.
+  # Pending and undelivered entries are never trimmed, whatever their age.
+  # An integer from 3600 to 31536000; values.schema.json and the worker both
+  # refuse anything else.
+  streamRetention:
+    minAgeSeconds: 86400
   # Delivery budget and ownership lease (ADR-0131, #1971). One overall
   # wall-clock deadline and one renewable fenced owner per delivery, replacing
   # the old dead pair of a flat per-request HTTP timeout and a 900s idle-based
@@ -2033,13 +2145,20 @@ worker:
   # retry backoff, reclaim, and terminal cleanup. Must be between 60 and 10800
   # (three hours, #3071); values.schema.json enforces this at install/template
   # time and the worker's own validator enforces it again at boot.
-  deliveryBudgetSeconds: 600
+  #
+  # The shipped default is the factory maximum execution deadline (10800
+  # seconds, #3129) so a stock install does not cut a factory run at 600
+  # seconds. The agent execution deadline still defaults to 1800 and still
+  # bounds an unconfigured agent. Raising these defaults raises rendered
+  # termination grace to budget + reserve (10860) for every install.
+  deliveryBudgetSeconds: 10800
   # Positive per-request ceiling for runner work within the overall delivery
   # budget. Must be at most 10800 seconds and no greater than
   # deliveryBudgetSeconds; fractional seconds are supported. values.schema.json
   # enforces the scalar bounds and the worker template enforces the relationship
-  # at render time.
-  runnerTotalTimeoutSeconds: 600
+  # at render time. The shipped default is the same factory maximum execution
+  # deadline (10800 seconds, #3129) as deliveryBudgetSeconds.
+  runnerTotalTimeoutSeconds: 10800
   # How long the renewable ownership lease lives before it is considered
   # expired and transferable. Must span at least 3 heartbeat periods
   # (deliveryLeaseHeartbeatSeconds) so a single missed heartbeat never drops a
@@ -2095,7 +2214,8 @@ worker:
     # second drain Job allowance, the effective worker termination grace, and
     # 60 seconds for scheduling and Helm operations. The pre upgrade drain Job
     # publishes this minimum in curie.ai/minimum-helm-timeout-seconds. With the
-    # default values it is 900 + 120 + 1860 + 60 = 2940 seconds.
+    # default values it is effective wait 10860 + job allowance 120 + grace
+    # 10860 + 60 = 21900 seconds.
     timeoutSeconds: 900
     # How often the gate re-reads the in-flight set while waiting.
     pollIntervalSeconds: 5
@@ -2137,7 +2257,8 @@ worker:
   # What the receipt beneath a turn's reply shows (ADR-0180), rendered as
   # CURIE_TURN_RECEIPT. A turn that ran a tool outside the read-only allowlist
   # ends its reply with a "What I changed:" list of those actions (ADR-0117).
-  #   all       every action, each saying whether it can be undone (default)
+  #   all       every action, each saying whether restore information was
+  #             recorded (default)
   #   failures  only actions that reported failure, the ones a person must
   #             check before asking again; no receipt when nothing failed
   #   off       no receipt at all, even when an action failed
@@ -2220,6 +2341,19 @@ worker:
 ui:
   deploy: true
   replicas: 1
+  # Optional PodDisruptionBudget (#1574), off by default. At the shipped
+  # replicas: 1 the default maxUnavailable: 1 permits the one pod's eviction;
+  # it starts protecting something once ui.replicas is raised. Set
+  # minAvailable to use it instead of maxUnavailable. A budget that allows zero
+  # voluntary disruptions at the configured replica count (minAvailable >=
+  # replicas, or maxUnavailable: 0) blocks every node drain, so the render
+  # refuses it unless allowBlockingDrain: true acknowledges that.
+  # See README "High availability and PodDisruptionBudgets".
+  podDisruptionBudget:
+    enabled: false
+    maxUnavailable: 1
+    # minAvailable: 1
+    allowBlockingDrain: false
   # Platform API the UI's nginx reverse-proxies /api/ to. Empty (the default)
   # derives the in-chart API Service, http://<fullname>-api:<api.service.port>.
   # Set it to a full base URL to point at an API this chart did not deploy; that
@@ -2392,6 +2526,24 @@ agentSandbox:
   #   runnerImages:
   #     factory: ghcr.io/acme/factory-runner@sha256:<64 hex>
   runnerImages: {}
+  # Per-agent workspace ceiling (#3523): agent name -> the sizeLimit of that
+  # agent's `workspace` emptyDir, replacing agentSandbox.runner.workspace.sizeLimit
+  # (default 1Gi) for that agent only. Each listed agent gets its own
+  # SandboxTemplate and warm pool; every other agent keeps the runner default.
+  # A build-heavy agent needs this: a checkout of curie-eng/curie plus the cargo
+  # target directory of `cargo test` for cli/ outgrew a 10Gi workspace and the
+  # pod was evicted. emptyDir usage also counts against the pod's
+  # ephemeral-storage limit, so raise that agent's runner resources
+  # `ephemeral-storage` limit (runner.resources, or the agent's runner
+  # resources) to at least this value plus the home scratch.
+  #   workspaceSizeLimits:
+  #     dark-factory: 24Gi
+  workspaceSizeLimits: {}
+  # Agents that get a labeled sandbox template and warm pool so connector
+  # ingress can select curietech.ai/agent=<name>. A list of agent name strings.
+  # Empty by default. Agents already covered by connectorSecrets, registryEgress,
+  # runnerImages, or workspaceSizeLimits are unchanged.
+  poolAgents: []
   controller:
     # Installs the vendored kubernetes-sigs/agent-sandbox v0.5.0 controller
     # (namespace agent-sandbox-system, RBAC, webhook Service, Deployment with
@@ -2643,10 +2795,10 @@ agentSandbox:
     # forwards external names upstream, so real-model egress is unaffected. Set to
     # "" only with fully external S3 and a collector reached by IP or allowlist.
     dnsPolicy: ClusterFirst
-    # Rail 2: the runner ServiceAccount. Least privilege: no secret list/get on
-    # its own. The per-agent secret Role (resourceNames-scoped to that agent's
-    # credential Secret) is created per agent by the control plane, not the chart
-    # -- the chart ships the isolation MODEL, the control plane binds it per SA.
+    # Rail 2: the release runner ServiceAccount has no bound Role. Connector
+    # credentials enter each agent's template through secretKeyRef env entries;
+    # the control plane does not create per agent Roles. A runner can inspect
+    # credentials injected into its own process, including shared model keys.
     serviceAccount:
       create: true
       # The runner does not call the K8s API, so its token is not mounted.
@@ -2731,16 +2883,14 @@ security:
   gvisor:
     # Tri-state, default `auto`:
     #   auto    - at install/upgrade time the chart looks up the `runtimeClassName`
-    #             RuntimeClass. If present, runner pods run under it; if absent,
-    #             pods run with NO runtimeClassName (isolation OFF) and NOTES.txt
-    #             prints a prominent warning. NOTE: Helm's `lookup` returns empty
-    #             under `helm template`/--dry-run, so a templated render always
-    #             shows the no-gvisor shape. This graceful degradation applies ONLY
-    #             to the fake-model/dev default; enabling a real model
-    #             (agentSandbox.runner.fakeModel=false or local inference.deploy)
-    #             makes `auto` render the blocking enforcement preflight, so a
-    #             runsc-less real-model install fails closed instead of silently
-    #             running on the host kernel.
+    #             RuntimeClass. A real model (agentSandbox.runner.fakeModel=false
+    #             or inference.deploy) stamps that class even when lookup is empty
+    #             (helm template, Argo CD, Flux) and renders the blocking
+    #             enforcement preflight, so a runsc-less real-model install fails
+    #             closed instead of silently running on the host kernel. Fake-model
+    #             auto still omits the class when lookup is empty (NOTES.txt warns);
+    #             when lookup finds the class, those pods use it. That path never
+    #             blocks a bare install.
     #   require - always stamp the runtimeClassName AND run the enforcement
     #             preflight as a blocking hook; a missing or downgraded runtime
     #             fails the install (the fail-hard, production posture).

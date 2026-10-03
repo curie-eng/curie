@@ -524,19 +524,25 @@ def test_injected_runner_failure_does_not_depend_on_prompt_or_live_model() -> No
     )
     assert "$LOCAL_OTEL_ENDPOINT" not in inject, (
         "the OTel sink is a reachable HTTP server; pointing the model at it is "
-        "not an unreachable backend and a live credential can still succeed"
+        "not the terminal-error backend and a live credential can still succeed"
     )
-    assert "http://127.0.0.1:1" in inject, (
-        "the injected backend must be connection-refused on the runner's loopback, "
+    assert "start_local_model_error_provider || return 1" in inject
+    assert 'http://$LOCAL_MODEL_ERROR_PROVIDER_NAME:8081' in inject, (
+        "the injected backend must use the task-owned terminal-error provider, "
         "independent of CURIE_E2E_LIVE and of prompt text"
     )
     assert "export CURIE_FAKE_MODEL=0" in inject
+    names = re.search(r"LOCAL_FAILURE_ENV_NAMES=\((.*?)\)", source, re.S)
+    assert names is not None
     for key in ("CURIE_CREDENTIALS", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
         assert f'export {key}=""' in inject, (
             f"{key} must be blanked so a live OpenRouter/Anthropic credential cannot "
-            "skip the unreachable base-URL override"
+            "skip the terminal-error base-URL override"
         )
-        assert key in restore, f"restore must put {key} back for the healthy control"
+        assert key in names.group(1).split()
+    assert 'for key in "${LOCAL_FAILURE_ENV_NAMES[@]}"' in restore
+    assert 'printf -v "$key"' in restore
+    assert 'unset "$key"' in restore
 
     assert "SANDBOX_LABEL" in reap
     assert "docker rm -f" in reap
@@ -562,7 +568,13 @@ def _stub_docker_path(tmp_path: Path) -> tuple[Path, Path, Path]:
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
         'if [ "$1" = "ps" ]; then printf "fake-sandbox\\n"; exit 0; fi\n'
+        'if [ "$1" = "run" ]; then printf "owned-provider-id\\n"; exit 0; fi\n'
+        'if [ "$1" = "exec" ]; then printf "{}\\n"; exit 0; fi\n'
         'if [ "$1" = "inspect" ]; then\n'
+        '  if [ "$2" = "acme-model-error" ]; then exit 1; fi\n'
+        '  if [ "$2" = "owned-provider-id" ]; then\n'
+        '    printf "owned-provider-id acme-private-sink\\n"; exit 0\n'
+        '  fi\n'
         '  printf "OTEL_EXPORTER_OTLP_ENDPOINT=http://otel.example:4318\\n"\n'
         "  exit 0\n"
         "fi\n"
@@ -574,6 +586,7 @@ def _stub_docker_path(tmp_path: Path) -> tuple[Path, Path, Path]:
         "keys = [\n"
         '    "CURIE_FAKE_MODEL", "CURIE_MODEL_BASE_URL", "CURIE_MODEL_API_BACKEND",\n'
         '    "CURIE_CREDENTIALS", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",\n'
+        '    "ANTHROPIC_BASE_URL", "CURIE_MODEL_ENV_KEY", "ANTHROPIC_AUTH_TOKEN",\n'
         "]\n"
         "json.dump({k: os.environ.get(k) for k in keys}, open(sys.argv[1], \"w\"))\n"
         f"' \"{env_dir}/$n.json\"\n"
@@ -593,15 +606,33 @@ def test_inject_local_runner_failure_blanks_live_credentials_and_reaps(
     """Execute the real inject/restore helpers against a stub docker."""
 
     source = LADDER_PATH.read_text()
-    script = _shell_function(source, "ladder_compose")
+    script = "set -e\n" + _shell_function(source, "local_store_path")
+    script += _shell_function(source, "ladder_compose")
     script += _shell_function(source, "container_env_value")
     script += _shell_function(source, "reap_local_runner_sandboxes")
+    for name in (
+        "start_local_model_error_provider",
+        "local_model_error_provider_health",
+        "stop_local_model_error_provider",
+    ):
+        script += _shell_function(source, name)
     script += _shell_function(source, "inject_local_runner_failure")
     script += _shell_function(source, "restore_local_runner_health")
+    names = re.search(r"LOCAL_FAILURE_ENV_NAMES=\((.*?)\)", source, re.S)
+    assert names is not None
+    script += names.group(0) + "\n"
     script += """
 REPO_ROOT="$1"
-COMPOSE_PROJECT=curie
+COMPOSE_PROJECT=acme-private
 COMPOSE_FILES=("$REPO_ROOT/compose.dev.yaml")
+WORKDIR="$2"
+LOCAL_MODEL_ERROR_PROVIDER_NAME=acme-model-error
+LOCAL_MODEL_ERROR_PROVIDER_ID=""
+LOCAL_MODEL_ERROR_PROVIDER_OWNED=0
+LOCAL_OTEL_SINK_NAME=acme-private-sink
+RUNNER_IMAGE=acme-runner:example
+LOCAL_FAILURE_ENV_VALUES=()
+LOCAL_FAILURE_ENV_PRESENT=()
 SANDBOX_LABEL="curietech.ai/managed-by=curie-sandbox-substrate"
 LOCAL_OTEL_ENDPOINT="http://otel.example:4318"
 LIVE=1
@@ -617,9 +648,17 @@ restore_local_runner_health
         "ANTHROPIC_API_KEY": "sk-ant-example",
         "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-example",
         "LOCAL_OTEL_ENDPOINT": "http://otel.example:4318",
+        "CURIE_CONFIG_DIR": str(tmp_path / "private-config"),
+        "CURIE_DOCKER_NETWORK": "acme-private_runner",
+        "CURIE_RUNNER_IMAGE": "acme-runner:example",
+        "CURIE_MODEL_BASE_URL": "https://model.example.com",
+        "CURIE_MODEL_API_BACKEND": "responses",
+        "CURIE_MODEL_ENV_KEY": "ACME_MODEL_KEY",
+        "ANTHROPIC_AUTH_TOKEN": "example-auth-token",
     }
+    env.pop("ANTHROPIC_BASE_URL", None)
     result = subprocess.run(
-        ["bash", "-c", script, "bash", str(REPO_ROOT)],
+        ["bash", "-c", script, "bash", str(REPO_ROOT), str(tmp_path)],
         env=env,
         text=True,
         capture_output=True,
@@ -631,16 +670,28 @@ restore_local_runner_health
     injected = json.loads(env_files[0].read_text())
     restored = json.loads(env_files[-1].read_text())
     assert injected["CURIE_FAKE_MODEL"] == "0"
-    assert injected["CURIE_MODEL_BASE_URL"] == "http://127.0.0.1:1"
+    assert injected["CURIE_MODEL_BASE_URL"] == "http://acme-model-error:8081"
     assert injected["CURIE_MODEL_API_BACKEND"] == "messages"
     assert injected["CURIE_CREDENTIALS"] == ""
     assert injected["ANTHROPIC_API_KEY"] == ""
     assert injected["CLAUDE_CODE_OAUTH_TOKEN"] == ""
+    assert injected["ANTHROPIC_BASE_URL"] == ""
+    assert injected["CURIE_MODEL_ENV_KEY"] == ""
+    assert injected["ANTHROPIC_AUTH_TOKEN"] == ""
     docker_log = log.read_text()
     assert "label=curietech.ai/managed-by=curie-sandbox-substrate" in docker_log
-    assert "rm -f" in docker_log
+    assert "rm -f fake-sandbox" in docker_log
+    assert "rm -f owned-provider-id" in docker_log
+    assert "--network acme-private_runner" in docker_log
+    assert "--label curietech.ai/e2e-owner=acme-private-sink" in docker_log
+    assert "terminal-provider-error.py:ro" in docker_log
+    assert "--entrypoint python3 acme-runner:example" in docker_log
     assert restored["CURIE_FAKE_MODEL"] == "0"
-    assert restored["CURIE_MODEL_BASE_URL"] in (None, "")
+    assert restored["CURIE_MODEL_BASE_URL"] == "https://model.example.com"
+    assert restored["CURIE_MODEL_API_BACKEND"] == "responses"
+    assert restored["CURIE_MODEL_ENV_KEY"] == "ACME_MODEL_KEY"
+    assert restored["ANTHROPIC_AUTH_TOKEN"] == "example-auth-token"
+    assert restored["ANTHROPIC_BASE_URL"] is None
     assert restored["CURIE_CREDENTIALS"] == "sk-or-example"
     assert restored["ANTHROPIC_API_KEY"] == "sk-ant-example"
     assert restored["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-example"

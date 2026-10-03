@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
+from .subprocess_env import shell_and_hook_env
+
 MAX_PATCH_BYTES = 900_000
 _GIT_TIMEOUT_SECONDS = 30
 _SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
@@ -151,11 +153,10 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
             capture_output=True,
             timeout=_GIT_TIMEOUT_SECONDS,
             check=check,
-            env={
-                **os.environ,
-                "GIT_TERMINAL_PROMPT": "0",
-                "GIT_CONFIG_NOSYSTEM": "1",
-            },
+            env=shell_and_hook_env(
+                os.environ,
+                extra={"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1"},
+            ),
         )
     except FileNotFoundError as exc:
         raise WorkspaceSnapshotError(

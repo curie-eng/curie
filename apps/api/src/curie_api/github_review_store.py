@@ -20,7 +20,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import crud
 from .config import Settings
-from .delivery import enqueue_owned, take_backlog_slot
+from .delivery import backlog_reservation, enqueue_owned, take_backlog_slot
 from .factory_notices import _find_marker
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_review_audit import settle_review_delivery
@@ -45,6 +45,7 @@ from .models import (
 from .repo_full_name import repo_url_path
 from .schemas import BUILTIN_CLUSTER_MESSAGE_ADAPTER, ReviewRevisionReserve
 from .threadkeys import route_thread_key_matches
+from .wirebody import stored_turn_matches
 from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
@@ -588,9 +589,11 @@ class GitHubReviewReconciler:
                         if not row.quota_taken:
                             if not await take_backlog_slot(
                                 self._valkey,
-                                key_prefix=f"curie:github-review:backlog:{row.binding_id}",
+                                reservation=backlog_reservation(
+                                    key_prefix=f"curie:github-review:backlog:{row.binding_id}",
+                                    window_s=self._settings.channel_binding_backlog_window_s,
+                                ),
                                 limit=self._settings.channel_binding_backlog_limit,
-                                window_s=self._settings.channel_binding_backlog_window_s,
                             ):
                                 row.status, row.error_code = "refused", "binding_backlog_quota"
                                 row.version += 1
@@ -874,7 +877,7 @@ async def verify_queued_feedback(
     row = await session.get(GitHubReviewFeedback, turn.event_id)
     if row is None or row.status not in {"waiting", "queued", "reserved"}:
         raise FeedbackIgnored("feedback_not_executable")
-    if turn.model_dump(mode="json") != row.turn:
+    if not stored_turn_matches(turn, row.turn):
         raise FeedbackIgnored("feedback_turn_mismatch")
     if row.status == "waiting":
         # XADD may be durable while its SQL queued mark is still retrying.
@@ -930,7 +933,7 @@ async def reserve_queued_feedback(
     )
     if row is None or row.status not in {"waiting", "queued", "reserved"}:
         raise FeedbackIgnored("feedback_not_executable")
-    if turn.model_dump(mode="json") != row.turn:
+    if not stored_turn_matches(turn, row.turn):
         raise FeedbackIgnored("feedback_turn_mismatch")
     if row.status == "waiting":
         # XADD may be durable while its SQL queued mark is still retrying.
@@ -999,7 +1002,7 @@ async def record_feedback_refusal(
     if (
         row is not None
         and row.status in {"queued", "reserved"}
-        and turn.model_dump(mode="json") == row.turn
+        and stored_turn_matches(turn, row.turn)
         and row.error_code != reason
     ):
         row.error_code = reason

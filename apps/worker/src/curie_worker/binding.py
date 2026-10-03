@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import secrets
 import time
@@ -68,8 +69,16 @@ from collections.abc import Sequence
 from typing import Any
 from urllib.parse import quote
 
+import aiohttp
 from aci_protocol import BootEnv, Budget
-from aci_protocol.turn import SLACK_KIND, matching_routes
+from aci_protocol.slack_identities import IDENTITY_NAME_MAX_LENGTH, IDENTITY_NAME_PATTERN
+from aci_protocol.turn import (
+    CLUSTER_MESSAGE_ADAPTER,
+    DEFAULT_IDENTITY,
+    SLACK_KIND,
+    ReplyHandle,
+    matching_routes,
+)
 from plugin_format import is_reserved_boot_env_name
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -151,6 +160,10 @@ RESUMED_KIND_ENV = BootEnv.env_key("approval_resumed_kind")
 # scoped token, minted by the kernel's resume overlay per work-item execution.
 PROGRESS_URL_ENV = BootEnv.env_key("progress_url")
 PROGRESS_TOKEN_ENV = BootEnv.env_key("progress_token")
+# ADR 0187 factory issue read: the API route and the execution scoped
+# capability naming this execution's WorkItem issue, minted per boot.
+ISSUE_READ_URL_ENV = BootEnv.env_key("issue_read_url")
+ISSUE_READ_TOKEN_ENV = BootEnv.env_key("issue_read_token")
 # ADR-0076 Stone 3 (#889, epic #512): the resolved terminal decision
 # ('approved'/'rejected'/'expired') of the approval this resume boot is
 # resuming from, so the runner can stamp it on the turn's OTel span and close
@@ -167,12 +180,63 @@ DECISION_ENV = BootEnv.env_key("approval_decision")
 FALSE_COMPLETION_CHECK_ENV = "CURIE_FALSE_COMPLETION_CHECK"
 # the worker re-mints every turn; this only bounds a leaked-token window (ADR-0033)
 SANDBOX_TOKEN_TTL_SECONDS = 24 * 60 * 60
+# NULL agents.execution_deadline_seconds means this span. The API stamps the
+# same number at start (curie_api.models.DEFAULT_EXECUTION_DEADLINE_SECONDS).
+DEFAULT_EXECUTION_DEADLINE_SECONDS = 1800
+# #3776: the API route a turn's end is reported on, and how long that call may
+# take. Short: it runs as each attempt ends, and failing it only leaves the
+# credential to expire as it did before.
+CLOSED_TURNS_PATH = "/v1/internal/memory/closed-turns"
+_CLOSE_TURN_TIMEOUT = aiohttp.ClientTimeout(total=5)
+# ADR-0188: the ``sender`` claim of a turn with no person behind it (a job, an
+# eval). The runner renders the same string as "no author"
+# (``memory_facts.NO_PERSON``); ``tests/test_memory_fact_key_parity.py`` pins
+# the two.
+NO_PERSON = "<no person>"
 
 # #1909: local/cluster message-path eval stamps this prefix on conversation_id
 # so boot_env omits ambient agent memory. Frozen in
 # tests/vectors/eval-memory-isolation.json with the CLI copy. Kernel.py is
 # not in the loop: it already forwards conversation_id as thread_key.
 EVAL_ISOLATE_THREAD_PREFIX = "eval:"
+
+# @spec WORKER-CANARY-2: a declared Slack identity has a narrower shape than
+# the general binding adapter slug. Share its frozen name rule.
+_SLACK_IDENTITY = re.compile(IDENTITY_NAME_PATTERN)
+
+
+def _valid_slack_identity(identity: str) -> bool:
+    """@spec WORKER-CANARY-2: declared identity shape, excluding the relay name."""
+
+    return (
+        identity != CLUSTER_MESSAGE_ADAPTER
+        and len(identity) <= IDENTITY_NAME_MAX_LENGTH
+        and _SLACK_IDENTITY.fullmatch(identity) is not None
+    )
+
+
+def binding_adapter_for_handle(handle: ReplyHandle) -> str | None:
+    """@spec WORKER-CANARY-1 WORKER-CANARY-2: select the binding, not egress."""
+
+    if handle.kind != SLACK_KIND or handle.adapter != CLUSTER_MESSAGE_ADAPTER:
+        return handle.adapter
+    identity = handle.identity
+    if identity is None:
+        return DEFAULT_IDENTITY
+    if not _valid_slack_identity(identity):
+        raise ValueError("cluster-message identity must name a declared Slack identity")
+    return identity
+
+
+def _valid_slack_selector(kind: str, adapter: str | None) -> bool:
+    """@spec WORKER-CANARY-2: never treat an invalid selector as default."""
+
+    return (
+        kind != SLACK_KIND
+        or adapter is None
+        or adapter == CLUSTER_MESSAGE_ADAPTER
+        or _valid_slack_identity(adapter)
+    )
 
 
 def is_eval_isolate_thread(thread_key: str) -> bool:
@@ -215,6 +279,7 @@ def _parse_resume_event_id(event_id: str) -> uuid.UUID | None:
         return uuid.UUID(match.group(1))
     except ValueError:
         return None
+
 
 # The trailing `d.id DESC` carries no meaning of its own -- id order is not a
 # precedence rule and nothing may start reading one into it. It exists only to
@@ -382,8 +447,10 @@ class ResolvedDeployment(BaseModel):
     # to go stale.
     memory: bool = False
     # Whether the operator turned memory writes on for this agent (#1461,
-    # ADR-0167). On, a bound turn's runner gets its channel memory ref and
-    # mounts the remember/update/forget tools; off (the default), neither.
+    # ADR-0167). A bound turn's runner gets its channel memory ref either way,
+    # so stored facts stay readable (#3621); this flag rides with it as
+    # CURIE_MEMORY_WRITES and decides only whether the remember/update/forget
+    # tools mount. Off is the default.
     # Not selected by the resolver statements: the column arrives in migration
     # 0068 and resolution runs against older schemas, so the kernel reads it
     # with ``memory_writes_for`` and copies it on, as with runner_resources.
@@ -512,13 +579,9 @@ class BindingResolver:
         self._config = config
         # Table identifiers are not user input; the schema comes from config.
         self._sql = text(_RESOLVE_SQL.format(schema=config.db_schema))
-        self._undeployed_binding_sql = text(
-            _UNDEPLOYED_BINDING_SQL.format(schema=config.db_schema)
-        )
+        self._undeployed_binding_sql = text(_UNDEPLOYED_BINDING_SQL.format(schema=config.db_schema))
         self._resolve_agent_sql = text(_RESOLVE_AGENT_SQL.format(schema=config.db_schema))
-        self._address_identity_sql = text(
-            _ADDRESS_IDENTITY_SQL.format(schema=config.db_schema)
-        )
+        self._address_identity_sql = text(_ADDRESS_IDENTITY_SQL.format(schema=config.db_schema))
 
     async def resolve(
         self, kind: str, adapter: str | None, address: str
@@ -542,6 +605,9 @@ class BindingResolver:
         route-less binding would otherwise leave the other agent's row as the
         only match, and the turn would run as that agent.
         """
+        # @spec WORKER-CANARY-2: direct resolver callers also fail closed.
+        if not _valid_slack_selector(kind, adapter):
+            return None
         params = {"kind": kind, "address": address}
         async with self._engine.connect() as conn:
             if adapter is None and kind != SLACK_KIND:
@@ -580,6 +646,9 @@ class BindingResolver:
         miss. Returning this record never grants a runner boot: a route remains
         runnable only through ``ResolvedDeployment`` above.
         """
+        # @spec WORKER-CANARY-2: the diagnostic cannot name default either.
+        if not _valid_slack_selector(kind, adapter):
+            return None
         async with self._engine.connect() as conn:
             result = await conn.execute(
                 self._undeployed_binding_sql, {"kind": kind, "address": address}
@@ -839,10 +908,7 @@ class BindingResolver:
         This is a separate read from deployment resolution. Resolution runs in
         migration tests against schemas that predate the column.
         """
-        sql = text(
-            "SELECT runner_resources "
-            f"FROM {self._config.db_schema}.agents WHERE id = :id"
-        )
+        sql = text(f"SELECT runner_resources FROM {self._config.db_schema}.agents WHERE id = :id")
         async with self._engine.connect() as conn:
             result = await conn.execute(sql, {"id": agent_id})
             row = result.first()
@@ -866,6 +932,31 @@ class BindingResolver:
             result = await conn.execute(sql, {"id": agent_id})
             row = result.first()
         return bool(row is not None and row[0])
+
+    async def execution_deadline_seconds_for(self, agent_id: uuid.UUID) -> int:
+        """The agent's work item execution span, or the platform default.
+
+        A separate read, like ``memory_writes_for``, so a schema from before
+        the column still boots. A missing row, a null, or a read error uses
+        ``DEFAULT_EXECUTION_DEADLINE_SECONDS``.
+        """
+
+        sql = text(
+            f"SELECT execution_deadline_seconds FROM {self._config.db_schema}.agents WHERE id = :id"
+        )
+        try:
+            async with self._engine.connect() as conn:
+                result = await conn.execute(sql, {"id": agent_id})
+                row = result.first()
+        except Exception:  # noqa: BLE001 - a missing column still boots
+            logger.warning(
+                "execution deadline read failed agent=%s; using the platform default",
+                agent_id,
+            )
+            return DEFAULT_EXECUTION_DEADLINE_SECONDS
+        if row is None or row[0] is None:
+            return DEFAULT_EXECUTION_DEADLINE_SECONDS
+        return int(row[0])
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
@@ -920,6 +1011,9 @@ class BindingResolver:
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+        caller_run: str | None = None,
+        caller_work_item: str | None = None,
+        caller_exp_ceiling: int | None = None,
     ) -> dict[str, str]:
         """The env injected into the sandbox claim for a bound run.
 
@@ -968,15 +1062,16 @@ class BindingResolver:
         # opted every binding into one shared namespace, or this caller has no
         # binding to name (#1525 follow-up): a memory=False agent's bundle
         # composes ``/<namespace>/<key>`` onto whichever base it was handed
-        # here, unaware which shape it got -- the scoping decision lives
-        # entirely in which URL the worker minted, never in a credential claim
-        # (rejected alternative: widening ``sandbox_token`` -- it authenticates
-        # WHICH agent, and a partition key within that agent's own,
-        # already-fully-accessible store has no privilege to carry, so the API
-        # verifies it against ``agent_channels`` directly instead of trusting
-        # an opaque claim). Agent memory and history stay agent-wide either
-        # way; channel memory (below) is binding-scoped by design (ADR-0167,
-        # #1461) and is decided separately from this ``memory`` flag.
+        # here, unaware which shape it got. For general state the scoping
+        # decision lives in which URL the worker minted: a partition key within
+        # the agent's own store, which the API checks against
+        # ``agent_channels``. Memory is different (ADR-0188, which reverses the
+        # #1525 follow-up's rejection of a binding claim for memory): one
+        # channel's memory can hold a direct message, so the state token below
+        # carries a ``binding`` claim and the API holds it to that channel's
+        # memory. Agent memory and history stay agent-wide either way; channel
+        # memory (below) is binding-scoped by design (ADR-0167, #1461) and is
+        # decided separately from this ``memory`` flag.
         state_url = f"{base}/agents/{resolved.agent_id}/state"
         if not resolved.memory and kind is not None and address is not None:
             state_url = (
@@ -984,15 +1079,18 @@ class BindingResolver:
                 f"{quote(kind, safe='')}/{quote(address, safe='')}"
             )
         # Channel memory (#1461, ADR-0167): the agent's memory namespace scoped
-        # to this turn's binding, on the same store and read/written with the
-        # same broad memory token. Its presence is the runner's signal to mount
-        # the memory tools, so it is set only when the operator turned memory
-        # writes on and the turn names a binding. An eval-isolated turn carries
-        # no memory at all, so it gets none either.
+        # to this turn's binding, on the same store. The boot-env memory token
+        # only READS it (ADR-0188); a write needs the per-turn credential from
+        # ``turn_memory_token``, which rides the turn's ACI ``Event`` and never
+        # this env. Reading channel memory needs no switch, so
+        # the ref is set whenever the turn names a binding (#3621). Whether the
+        # agent may save to it is a separate flag, ``memory_writes`` (#3659),
+        # sent explicitly alongside the ref so the runner mounts the remember,
+        # update and forget tools only when the operator turned writes on. An
+        # eval-isolated turn carries no memory at all, so it gets neither.
         channel_memory_ref: str | None = None
         if (
-            resolved.memory_writes
-            and kind is not None
+            kind is not None
             and address is not None
             and not (isolate_memory or is_eval_isolate_thread(thread_key))
         ):
@@ -1003,8 +1101,11 @@ class BindingResolver:
         # Mint scoped tokens (ADR-0033, #410) for this agent. Two scopes, because
         # the memory/history loaders and the bundle reach DIFFERENT namespaces:
         #  - the broad ``state`` token backs the memory and history tokens, whose
-        #    loaders MUST read/write the reserved ``memory``/``transcript``
-        #    namespaces to rehydrate the agent across suspend/resume;
+        #    loaders MUST read the reserved ``memory`` namespace and read/write
+        #    ``transcript`` to rehydrate the agent across suspend/resume. Its
+        #    ADR-0188 claims narrow it on memory: ``binding`` names the one
+        #    channel whose memory it reaches (JSON null for a turn with no
+        #    channel), and ``memory: "read"`` makes it read-only there;
         #  - the narrow ``state.app`` token backs the bundle-facing state token,
         #    which the API state router refuses on those reserved namespaces
         #    (#249) -- so a skill cannot corrupt memory/history by composing the
@@ -1022,6 +1123,7 @@ class BindingResolver:
                 agent=str(resolved.agent_id),
                 scope="state",
                 exp=exp,
+                claims={"binding": _binding_claim(kind, address), "memory": "read"},
             )
             app_state_token = sandbox_token.mint(
                 self._config.api_key,
@@ -1035,10 +1137,15 @@ class BindingResolver:
         # the connector scope.
         connector_caller_token: str | None = None
         if self._config.connector_caller_signing_key.strip():
+            caller_exp = exp
+            if caller_exp_ceiling is not None:
+                caller_exp = min(caller_exp, int(caller_exp_ceiling))
             connector_caller_token = caller_token.mint(
                 self._config.connector_caller_signing_key,
                 agent=resolved.agent_name,
-                exp=exp,
+                exp=caller_exp,
+                run=caller_run,
+                work_item=caller_work_item,
             )
         env = BootEnv.render_worker(
             plugin_dir=self._config.bundle_plugin_dir,
@@ -1087,12 +1194,18 @@ class BindingResolver:
             history_token=state_token,
             memory_token=state_token,
             channel_memory_ref=channel_memory_ref,
+            # The writes switch rides only with a channel ref, as an explicit
+            # bool; without a ref there is nothing to write to.
+            memory_writes=(
+                bool(resolved.memory_writes) if channel_memory_ref is not None else None
+            ),
             # The general state store exposed to bundle code (#249): the NARROW
             # ``state.app`` token authorizes the URL -- refused on the reserved
             # memory/transcript namespaces server-side -- so the token is omitted
             # (and the URL still emitted) on the no-key fake/local path.
             state_url=state_url,
             state_token=app_state_token,
+            channel_bound=True if kind and address else None,
         )
         # #517/#669 opt-in false-completion check: NOT a BootEnv.render_worker
         # kwarg (it is deliberately kept out of the frozen ACI contract, see
@@ -1111,9 +1224,7 @@ class BindingResolver:
         # Runs AFTER the render so the reserved-name filter sees the rendered
         # keys, and stays the marker's sole writer -- see the
         # inject_connector_secrets docstring for the #457/#429 rationale.
-        inject_connector_secrets(
-            env, resolved.secrets, agent_label=resolved.agent_id
-        )
+        inject_connector_secrets(env, resolved.secrets, agent_label=resolved.agent_id)
         # #1909: default local/cluster eval is a static bundle-plus-cases gate.
         # Ambient durable memory is per-agent, so a fresh thread still loaded
         # it and could change a committed case. The CLI marks those turns with
@@ -1126,6 +1237,96 @@ class BindingResolver:
             env.pop(MEMORY_TOKEN_ENV, None)
             logger.info("eval isolate: omitted memory_ref for thread %s", thread_key)
         return env
+
+    def turn_memory_token(
+        self,
+        resolved: ResolvedDeployment,
+        *,
+        kind: str | None,
+        address: str | None,
+        thread_key: str,
+        sender: str,
+        turn: str,
+        ttl_s: float,
+    ) -> str | None:
+        """The per-turn memory write credential (ADR-0188), or None.
+
+        Sent as the turn's ``Event.memory_token`` (MEMORY-TOKEN-2), never in the
+        boot env: the boot-env token outlives the turn and so cannot name its
+        sender. A ``scope="state"`` token with ``{binding, memory: "write",
+        sender, turn}``; the API writes only fact keys with it, only on the
+        channel ``binding`` names, and stamps ``sender`` as the fact's author.
+
+        None unless there is a key to sign with, the agent has memory writes on,
+        the turn names a binding, and the thread is not eval-isolated (#1909).
+        The expiry is ``ttl_s``, the turn's own deadline, capped at the boot
+        token's lifetime, with no grace: the credential ends with the turn.
+        """
+
+        if not self._config.api_key or not resolved.memory_writes:
+            return None
+        binding = _binding_claim(kind, address)
+        if binding is None or is_eval_isolate_thread(thread_key):
+            return None
+        lifetime = min(math.ceil(max(0.0, ttl_s)), SANDBOX_TOKEN_TTL_SECONDS)
+        exp = int(time.time()) + lifetime
+        return sandbox_token.mint(
+            self._config.api_key,
+            agent=str(resolved.agent_id),
+            scope="state",
+            exp=exp,
+            claims={
+                "binding": binding,
+                "memory": "write",
+                "sender": sender.strip() or NO_PERSON,
+                "turn": turn,
+            },
+        )
+
+    async def close_turn_memory(self, agent_id: uuid.UUID, turn: str) -> None:
+        """Tell the API a turn has ended, so its memory write credential is
+        refused from now on rather than at its expiry (#3776).
+
+        The resolver mints the credential (``turn_memory_token``), so it retires
+        it, on the internal route with the worker token every other
+        ``/v1/internal`` call uses. Never raises: a failed close leaves the
+        credential to expire at the turn's deadline, as before. An older API
+        without the route answers 404, which is logged once, not as an error.
+        """
+
+        url = f"{self._config.api_base_url.rstrip('/')}{CLOSED_TURNS_PATH}"
+        try:
+            async with (
+                aiohttp.ClientSession(timeout=_CLOSE_TURN_TIMEOUT) as session,
+                session.post(
+                    url,
+                    json={"agent_id": str(agent_id), "turn": turn},
+                    headers={"X-Curie-Worker-Token": self._config.internal_worker_token},
+                ) as response,
+            ):
+                status = response.status
+        except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+            logger.warning("could not report memory turn %s as ended: %s", turn, type(exc).__name__)
+            return
+        if status == 404:
+            if not getattr(self, "_closed_turns_route_missing", False):
+                self._closed_turns_route_missing = True
+                logger.info(
+                    "the API has no closed-turns route (404); memory credentials "
+                    "stay usable until they expire"
+                )
+            return
+        if not 200 <= status < 300:
+            logger.warning("the API refused to end memory turn %s: HTTP %s", turn, status)
+
+
+def _binding_claim(kind: str | None, address: str | None) -> str | None:
+    """The ADR-0188 ``binding`` claim: ``"<kind>:<address>"``, unquoted, the same
+    string as the API's ``_binding_scope`` and
+    ``workflow_state_entries.binding_scope``; None when the turn names no
+    binding."""
+
+    return f"{kind}:{address}" if kind and address else None
 
 
 def apply_model_env(
@@ -1180,6 +1381,12 @@ def apply_model_env(
         env[FALSE_COMPLETION_CHECK_ENV] = "1"
 
 
+# ADR 0176 decision 2. The test cluster kubeconfig is a connector secret the
+# sandbox must not receive. Frozen with the CLI and the chart in
+# tests/vectors/e2e-connector-sandbox.json.
+SANDBOX_WITHHELD_CONNECTOR_SECRETS = frozenset({"E2E_CLUSTER_KUBECONFIG"})
+
+
 def inject_connector_secrets(
     env: dict[str, str],
     secrets: dict[str, str] | None,
@@ -1202,6 +1409,15 @@ def inject_connector_secrets(
     """
     injected_secret_keys: list[str] = []
     for name, value in (secrets or {}).items():
+        if name in SANDBOX_WITHHELD_CONNECTOR_SECRETS:
+            # The test cluster kubeconfig stays in the hosted connector.
+            # ADR 0176 decision 2. The marker must not name it either, or the
+            # k8s substrate would look for a sandbox secretKeyRef.
+            logger.warning(
+                "Dropping connector secret withheld from the sandbox "
+                "(never injected, never marked)"
+            )
+            continue
         if is_reserved_boot_env_name(name):
             logger.warning(
                 "Dropping connector secret with reserved boot-env name "

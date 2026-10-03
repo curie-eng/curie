@@ -296,7 +296,26 @@ def test_follow_ups_stay_in_the_testers_own_threads():
     # A follow-up the target's installation does not admit is not the agent's
     # failure: the root probe in the same thread was answered.
     verdicts = _section("Verdicts")
-    assert "not admitted" in verdicts and "UNCLEAR" in verdicts
+    text = " ".join(verdicts.split())
+    assert "not admitted" in text and "UNCLEAR" in text
+    assert "takes precedence over the timeout rule" in text
+    assert "first probe in the thread was answered promptly" in text
+    assert "follow-up has no reply or placeholder at all" in text
+
+
+def test_recorded_exchange_report_has_a_machine_readable_first_line():
+    recorded = _section("Judging a recorded exchange")
+    text = " ".join(recorded.split())
+    assert "no preamble or analysis before it" in text
+    assert (
+        "<target> @ recorded — round 1/1: <n> PASS · <n> FAIL · <n> UNCLEAR"
+        in recorded
+    )
+    assert (
+        "<target> @ recorded (no spec) — round 1/1: "
+        "<n> PASS · <n> FAIL · <n> UNCLEAR"
+        in recorded
+    )
 
 
 def test_every_probe_carries_the_campaign_id():
@@ -416,3 +435,121 @@ def test_continue_and_rerun_find_the_campaign_by_its_id():
     rerun = _section('"rerun"')
     assert "find the campaign's report by its id" in rerun
     assert "When the report cannot be found" in rerun
+
+
+def test_validator_fixed_suite_precedes_exploration_and_preserves_blocked_actions():
+    fixed = _section("Fixed acceptance suite")
+    for phrase in (
+        "acceptance/cases.json", "before invented probes", "MISSING", "MALFORMED",
+        "BLOCKED: slice 2", "Never rewrite an action case", "repeat index",
+        "criterion", "NOT RUN",
+    ):
+        assert phrase in fixed, phrase
+    planning = _section("Planning a campaign")
+    assert "Turn recorded action requests into questions" not in planning
+
+
+def test_validator_scenarios_grade_realistic_content_from_users_seat():
+    scenarios = _section("Scenario campaigns")
+    for phrase in (
+        "2–4", "long paragraphs", "deep inside", "numbers", "forgotten attachment",
+        "vague", "follow-ups", "BLOCKED: slice 2", "user's seat",
+        "permanent", "expected property", "prerequisite",
+    ):
+        assert phrase in scenarios, phrase
+
+
+def test_validator_ux_rules_have_context_and_no_false_go():
+    verdicts = _section("Verdicts")
+    for phrase in ("raw MCP", "schemas", "Still to come: none", "before approval",
+                   "explicitly asks", "quoted user content"):
+        assert phrase in verdicts, phrase
+    report = _section("Validation result")
+    for phrase in ("NO-GO", "UNCLEAR", "BLOCKED", "NOT RUN", "P0", "configuration diff",
+                   "post-deploy", "never full GO", "criterion"):
+        assert phrase in report, phrase
+
+
+def test_the_illustrative_acceptance_suite_has_a_separate_strict_schema():
+    suite = json.loads((BUNDLE / "acceptance/cases.json").read_text())
+    schema = json.loads((BUNDLE / "acceptance/schema.json").read_text())
+    assert suite["version"] == 1
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["version"] == {"const": 1}
+    assert len(suite["cases"]) >= 2
+    assert {c["mode"] for c in suite["cases"]} == {"read-or-ask", "action"}
+    case_schema = schema["$defs"]["case"]
+    assert case_schema["additionalProperties"] is False
+    required = {"id", "probe", "mode", "attachments", "expected_reply", "card_action",
+                "expected_state", "criterion", "priority", "repeat"}
+    assert set(case_schema["required"]) == required
+    assert case_schema["properties"]["repeat"]["minimum"] == 1
+    criteria = {c["id"] for c in suite["criteria"]}
+    assert len(criteria) == len(suite["criteria"])
+    assert len({c["id"] for c in suite["cases"]}) == len(suite["cases"])
+    for case in suite["cases"]:
+        assert set(case) == required
+        assert case["criterion"] in criteria
+        assert case["priority"] in {"P0", "P1"}
+        assert isinstance(case["repeat"], int) and case["repeat"] > 0
+        assert case["expected_reply"]
+
+
+def test_every_user_finding_has_a_permanent_grading_regression_and_controls():
+    indexed = {case["id"]: case for case in _cases()}
+    for number in range(1, 8):
+        case = indexed[f"validator-F{number}"]
+        assert _demanded(case["grader"]["expected"], "FAIL") == 1
+    for case_id in ("validator-plain-receipt", "validator-requested-technical-detail",
+                    "validator-storage-failure-honest", "validator-deep-number-found",
+                    "validator-no-evidence-unclear"):
+        assert case_id in indexed
+    assert _demanded(indexed["validator-requested-technical-detail"]["grader"]["expected"],
+                     "PASS") == 1
+    assert _demanded(indexed["validator-no-evidence-unclear"]["grader"]["expected"],
+                     "UNCLEAR") == 1
+    content = indexed["validator-F5"]["input"]
+    assert len(content) > 1500 and "$2.4M" in content and "$4.4M" in content
+
+
+def test_campaign_reads_spec_and_suite_at_the_commit_resolved_first():
+    start = _section("Starting a campaign")
+    commit = start.index("list_commits")
+    read = start.index("get_file_contents")
+    assert commit < read
+    assert "exact SHA as `ref`" in start
+    assert "never the moving branch" in start
+
+
+def test_answer_check_defers_to_ready_fixed_suite():
+    check = _section("Checking that it answers")
+    assert "READY" in check and "first eligible fixed case" in check
+    assert "MISSING or MALFORMED" in check
+    assert "diagnostic" in check
+
+
+def test_unadmitted_followups_never_replay_dependent_steps_as_roots():
+    run = _section("Running a campaign")
+    assert "only independent steps" in run
+    assert "continuity-dependent steps BLOCKED" in run
+    assert "without claiming original coverage" in run
+    assert "send the remaining plan as root probes" not in run
+
+
+def test_rerun_never_infers_pass_for_unlisted_or_incomplete_cases():
+    rerun = _section('"rerun"')
+    assert "every other probe passed" not in rerun
+    for phrase in ("explicit per-case and repeat status", "UNCLEAR", "BLOCKED", "NOT RUN",
+                   "unknown prior status", "known PASS or FAIL"):
+        assert phrase in rerun, phrase
+
+
+def test_recorded_timeout_and_uncertain_receipt_controls_have_explicit_evidence():
+    indexed = {case["id"]: case for case in _cases()}
+    timeout = indexed["never-answers"]["input"]
+    assert "180 seconds after the probe" in timeout
+    assert "no final reply" in timeout
+    receipt = indexed["validator-plain-receipt"]["input"]
+    assert "Recorded connector outcome: timeout" in receipt
+    assert "could not be confirmed" in receipt
+    assert "File attachment failed" not in receipt

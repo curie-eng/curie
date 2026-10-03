@@ -427,6 +427,8 @@ def test_workspace_credential_is_worker_only_server_derived_and_no_store(
         "authorization_header": "Basic "
         + base64.b64encode(b"x-access-token:ghp_operator_workspace").decode(),
         "revision": None,
+        "base_branch": None,
+        "base_commit": None,
     }
     assert OTHER_REPO not in issued.text
     assert "evil.example" not in issued.text

@@ -11,6 +11,8 @@ import json
 import tarfile
 import tempfile
 import zipfile
+from collections.abc import Mapping
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,13 @@ from plugin_format.connectors import CONNECTORS_FILE, ConnectorsFile, validate_c
 from plugin_format.deploy_targets import DeployTargetsFile, validate_deploy_targets
 from plugin_format.validate import DEPLOY_FILE
 from plugin_format.yaml_loader import safe_load_unique
+
+from curie_api.e2e_connector import (
+    CONNECTOR_NAME,
+    E2EInstall,
+    pin_server_command,
+    prepare_connectors,
+)
 
 # Re-exported so existing catchers (gitflow.py, routers/bundles.py, tests) keep
 # resolving ``bundles.UnsupportedArchive`` after the extraction logic moved to
@@ -307,6 +316,90 @@ def read_deploy_targets(root: Path) -> DeployTargetsFile | None:
     return parsed
 
 
+def _manifest_object(root: Path) -> dict[str, Any]:
+    """``plugin.json`` as an object, or ``{}`` when it is missing or unusable.
+
+    A missing policy is not an error: the connector route still renders.
+    """
+
+    path = resolve_manifest(bundle_root(root))
+    if path is None or not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
+def approval_tool_patterns(root: Path, agent_tools: list[str] | None) -> tuple[str, ...]:
+    """Approval tool names from the bundle and the agent row.
+
+    Sources are ``toolPolicy.approvalRequired``, ``approvalPolicy`` gates, and
+    ``agent.approval_required_tools``. Absent or malformed policy contributes
+    nothing and does not fail the caller.
+    """
+
+    found: list[str] = []
+    manifest = _manifest_object(root)
+    tool_policy = manifest.get("toolPolicy")
+    if isinstance(tool_policy, dict):
+        required = tool_policy.get("approvalRequired")
+        if isinstance(required, list):
+            found.extend(item for item in required if isinstance(item, str) and item)
+    approval = manifest.get("approvalPolicy")
+    if isinstance(approval, dict):
+        gates = approval.get("gates")
+        if isinstance(gates, list):
+            for gate in gates:
+                if isinstance(gate, dict):
+                    name = gate.get("gate")
+                    if isinstance(name, str) and name:
+                        found.append(name)
+                elif isinstance(gate, str) and gate:
+                    found.append(gate)
+    if agent_tools:
+        found.extend(tool for tool in agent_tools if isinstance(tool, str) and tool)
+    return tuple(found)
+
+
+def gated_tools_for_connector(
+    connector: str, patterns: tuple[str, ...] | list[str]
+) -> tuple[str, ...]:
+    """Patterns this connector's proxy can attribute to itself.
+
+    Kept: ``{connector}/...``, ``mcp__{connector}__...``, and an exact live
+    name whose server segment is this connector or ends with ``_{connector}``
+    (the ``mcp__plugin_<plugin>_<server>__<tool>`` form). Anything else is
+    another server's tool and is dropped.
+    """
+
+    canonical = f"{connector}/"
+    live = f"mcp__{connector}__"
+    kept: list[str] = []
+    for pattern in patterns:
+        if pattern.startswith(canonical) or pattern.startswith(live):
+            attributed = True
+        elif pattern.startswith("mcp__"):
+            server, separator, tool = pattern[len("mcp__") :].partition("__")
+            attributed = bool(
+                separator and tool and (server == connector or server.endswith(f"_{connector}"))
+            )
+        elif "/" in pattern:
+            # `*/merge_pull_request` is a real approvalRequired pattern. The
+            # server segment is a glob, matched the same way the runner matches
+            # a canonical name, so a wildcard is not dropped as "another server".
+            server, separator, tool = pattern.partition("/")
+            attributed = bool(separator and tool and fnmatchcase(connector, server))
+        else:
+            attributed = False
+        if attributed and pattern not in kept:
+            kept.append(pattern)
+    return tuple(kept)
+
+
 def render_connector_manifests(
     connectors: ConnectorsFile,
     *,
@@ -316,6 +409,9 @@ def render_connector_manifests(
     app_name: str,
     secret_name: str,
     proxy: connector_render.ConnectorProxy | None = None,
+    grant_store_url: str = "",
+    gated_tools: Mapping[str, tuple[str, ...]] | None = None,
+    e2e: E2EInstall | None = None,
 ) -> list[dict[str, Any]]:
     """Kubernetes objects for a bundle's hosted connectors (ADR-0086, #1063).
 
@@ -327,8 +423,11 @@ def render_connector_manifests(
     authority stays where it already was.
     """
 
+    install = e2e or E2EInstall()
+    connectors = prepare_connectors(connectors, install)
     objects: list[dict[str, Any]] = []
     for name, spec in sorted(connectors.connectors.items()):
+        tools = tuple(gated_tools.get(name, ())) if gated_tools is not None else ()
         objects.extend(
             connector_render.render(
                 release=release,
@@ -339,8 +438,12 @@ def render_connector_manifests(
                 spec=spec,
                 secret_name=secret_name,
                 proxy=proxy,
+                gated_tools=tools,
+                grant_store_url=grant_store_url if proxy is not None else "",
             )
         )
+    if install.enabled and CONNECTOR_NAME in connectors.connectors:
+        pin_server_command(objects, install)
     return objects
 
 

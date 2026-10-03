@@ -277,6 +277,8 @@ def test_a_real_run_only_emits_attributes_within_the_committed_schema() -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
 
     runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
         session_factory=FakeModelSession,
         ceiling=0,
         tracer=RunTracer(provider),
@@ -341,6 +343,8 @@ def test_every_declared_key_emits_its_committed_value_type() -> None:
         span.tool_span("Bash")
 
     runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
         session_factory=lambda: FakeModelSession(emit_partial_boundaries=True),
         ceiling=0,
         tracer=tracer,
@@ -368,6 +372,8 @@ def test_every_declared_key_emits_its_committed_value_type() -> None:
     result_provider = TracerProvider()
     result_provider.add_span_processor(SimpleSpanProcessor(result_exporter))
     result_only = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
         session_factory=lambda: FakeModelSession(
             script_factory=lambda: [
                 AssistantMessage(

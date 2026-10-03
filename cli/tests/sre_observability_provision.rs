@@ -18,6 +18,7 @@ fn provision_plan_installs_grafana_and_the_connector_secret_without_deploying() 
         "--reuse-values",
         "curie-values.yaml",
         "curie-grafana-connector",
+        "select the Alloy log parser from the cluster node runtimes on live installation",
     ] {
         assert!(
             lines.iter().any(|line| line.contains(needle)),

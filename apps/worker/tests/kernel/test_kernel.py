@@ -15,6 +15,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -56,6 +57,16 @@ from curie_worker.workspace import (
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from queue_fixtures import qevent, wait_until  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).parent))
+from test_work_item_early_stop import (  # noqa: E402
+    ISSUE_PROMPT,
+    _Binding,
+    _PublicationApi,
+    _turn,
+    _WorkItems,
+    _Workspace,
+)
 
 DONE = SessionStatus.DONE
 IDLE = SessionStatus.IDLE_AWAITING_INPUT
@@ -104,6 +115,7 @@ class _HistoryBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         del kind, address
         return {
@@ -402,6 +414,7 @@ class _BuiltInCodingBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         return {}
 
@@ -907,18 +920,13 @@ def test_announcement_sits_between_answer_and_receipt(
     assert unannounced.rendered_with_receipt() == "answer\n\nRECEIPT"
 
 
-@pytest.mark.parametrize(
-    ("message", "thread"),
-    [
-        (_REPO_MESSAGE, "tWorkspacesOffRootUrl"),
-        (_BARE_REPO_MESSAGE, "tWorkspacesOffBareRepo"),
-    ],
-)
 def test_named_repository_with_workspaces_off_is_a_terminal_refusal(
     make_harness,
-    message: str,
-    thread: str,
 ) -> None:
+    # A github.com URL plainly asks for a repository, so with no coordinator
+    # to attach one the turn is refused. A bare owner/repo token is a guess
+    # and is covered by the generic-turn test below (#3671).
+    message, thread = _REPO_MESSAGE, "tWorkspacesOffRootUrl"
     deployment_id = uuid.UUID("77777777-7777-4777-8777-77777777777a")
 
     async def go() -> None:
@@ -937,6 +945,49 @@ def test_named_repository_with_workspaces_off_is_a_terminal_refusal(
             assert h.sink.last_text == _WORKSPACES_OFF_REFUSAL
             assert not any("workspace-error" in t for _a, _r, t in h.sink.updates)
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+_SLASH_PAIR_MESSAGE = "Can you check the Swap/Exchange reservation for next week?"
+
+
+@pytest.mark.parametrize(
+    ("message", "thread"),
+    [
+        (_SLASH_PAIR_MESSAGE, "tWorkspacesOffSlashPair"),
+        (_BARE_REPO_MESSAGE, "tWorkspacesOffBareRepo"),
+    ],
+)
+def test_bare_owner_repo_token_with_workspaces_off_runs_a_generic_turn(
+    make_harness,
+    message: str,
+    thread: str,
+) -> None:
+    # A bare `word/word` token is a guess (#2947). With workspaces on, the
+    # allowlist decides whether it named a repository; with them off there is
+    # no allowlist, so the guess is read as naming none rather than refusing an
+    # ordinary question with chart configuration advice (#3671).
+    deployment_id = uuid.UUID("77777777-7777-4777-8777-777777777780")
+
+    async def go() -> None:
+        binding = _BuiltInCodingBinding(deployment_id, workspace_enabled=False)
+        async with make_harness(binding=binding, max_attempts=3) as h:
+            assert h.kernel._workspace is None
+            h.runner.default_script = [Final(text="answered", status=DONE)]
+            event = qevent(message, thread=thread)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [message]
+            assert h.sink.last_text == "answered"
+            assert _WORKSPACES_OFF_REFUSAL not in [t for _a, _r, t in h.sink.updates]
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert len(h.fake_k8s.claim_envs) == 1
+            claim_env = h.fake_k8s.claim_envs[0] or {}
+            assert not any(key.startswith("CURIE_WORKSPACE_") for key in claim_env)
+            route = h.substrate.lookup(_thread_key(thread))
+            assert route is not None and route.workspace_repo is None
 
     asyncio.run(go())
 
@@ -1107,6 +1158,7 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
             *,
             kind: str | None = None,
             address: str | None = None,
+        **_: object,
         ) -> dict[str, str]:
             return {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
 
@@ -1241,6 +1293,7 @@ def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
             *,
             kind: str | None = None,
             address: str | None = None,
+        **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -1898,6 +1951,7 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
             *,
             kind: str | None = None,
             address: str | None = None,
+        **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -1967,6 +2021,7 @@ def _workspace_binding(
             *,
             kind: str | None = None,
             address: str | None = None,
+        **_: object,
         ) -> dict[str, str]:
             return dict(boot_env_override or {"CURIE_RUNNER_TOKEN": "workspace-test-token"})
 
@@ -2720,6 +2775,146 @@ def test_transient_failure_retries_then_succeeds(
     asyncio.run(go())
 
 
+@pytest.mark.parametrize(
+    ("reason", "detail"),
+    [
+        ("Evicted", 'Usage of EmptyDir volume "workspace" exceeds the limit "1Gi".'),
+        ("OOMKilled", "Memory limit exceeded"),
+    ],
+)
+def test_pod_termination_cause_reaches_terminal_notice(
+    make_harness, reason: str, detail: str
+) -> None:
+    async def go() -> None:
+        async with make_harness(max_attempts=1) as h:
+            h.fake_k8s.termination = SimpleNamespace(reason=reason, detail=detail)
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+            event = qevent("go")
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == ["go"]
+            assert h.sink.last_text is not None
+            assert "sandbox-terminated" in h.sink.last_text
+            assert reason in h.sink.last_text
+            assert detail in h.sink.last_text
+            assert "Kubernetes pod terminated" in h.sink.last_text
+            assert h.fake_k8s.termination_queries
+            assert h.fake_k8s.termination_queries[0].startswith("sbx-")
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_stream_drop_without_pod_cause_remains_runner_error(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(max_attempts=1) as h:
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+
+            await h.kernel.process_event(qevent("go"))
+
+            assert h.runner.opened == ["go"]
+            assert h.sink.last_text is not None
+            assert "runner-error" in h.sink.last_text
+            assert "sandbox-terminated" not in h.sink.last_text
+            assert h.fake_k8s.termination_queries
+
+    asyncio.run(go())
+
+
+def test_pod_termination_cause_reaches_factory_finish_detail(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=1,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.fake_k8s.termination = SimpleNamespace(
+                reason="Evicted", detail="The node was low on memory."
+            )
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "sandbox_terminated"
+            assert isinstance(finish["detail"], str)
+            assert "Evicted" in finish["detail"]
+            assert "The node was low on memory." in finish["detail"]
+            assert "Kubernetes pod terminated" in finish["detail"]
+            assert h.fake_k8s.termination_queries
+
+    asyncio.run(go())
+
+
+def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factory(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=2,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            diagnoses = iter(
+                [
+                    SimpleNamespace(
+                        reason="Evicted",
+                        detail=(
+                            'Usage of EmptyDir volume "workspace" exceeds the limit "1Gi". '
+                            "token=exampleSecretValue123456 " + "x" * 400
+                        ),
+                    ),
+                    None,
+                ]
+            )
+
+            def diagnose(
+                name: str, *, request_timeout_seconds: float, since: datetime
+            ) -> SimpleNamespace | None:
+                h.fake_k8s.termination_queries.append(name)
+                return next(diagnoses)
+
+            monkeypatch.setattr(h.fake_k8s, "pod_termination", diagnose)
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT, ISSUE_PROMPT]
+            assert len(h.fake_k8s.termination_queries) == 2
+            # Factory work items intentionally suppress a direct reply. The
+            # terminal issue comment is built from the recorded finish below.
+            assert "runner-error" in caplog.text
+            assert "Earlier attempt" in caplog.text
+            assert 'EmptyDir volume "workspace" exceeds the limit "1Gi"' in caplog.text
+            assert "exampleSecretValue123456" not in caplog.text
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["cause"] == "runner_escalated"
+            assert isinstance(finish["detail"], str)
+            assert "Earlier attempt" in finish["detail"]
+            assert 'EmptyDir volume "workspace" exceeds the limit "1Gi"' in finish["detail"]
+            assert "exampleSecretValue123456" not in finish["detail"]
+            assert len(finish["detail"]) <= 300
+
+    asyncio.run(go())
+
+
 # Error-classification table, escalation half: the run escalates after a single
 # attempt and the reply names the classification, the detail, and the event_id.
 @pytest.mark.parametrize(
@@ -3269,6 +3464,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
             *,
             kind: str | None = None,
             address: str | None = None,
+        **_: object,
         ) -> dict[str, str]:
             return {
                 "CURIE_HISTORY_REF": f"https://api.example.com/state/transcript/{thread_key}",
@@ -3387,6 +3583,107 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
             assert outcomes == ["reclaimed"]
 
     asyncio.run(go())
+
+
+def test_quota_pressure_reclaims_an_idle_eval_route_before_an_older_person_route(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from channel_protocol import scoped_conversation_id
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+    from curie_worker.sandbox.k8s import _claim_view
+
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            person_key = _thread_key("tPersonIdle")
+            eval_key = scoped_conversation_id("slack", "C1", "eval:1720000000.000100")
+            trigger_thread = "tEvalFirstTrigger"
+
+            for thread_key in (person_key, eval_key):
+                await asyncio.to_thread(
+                    h.substrate.claim,
+                    thread_key,
+                    env={
+                        "CURIE_HISTORY_REF": (
+                            f"https://api.example.com/state/transcript/{thread_key}"
+                        ),
+                        "CURIE_RUNNER_TOKEN": f"token-{thread_key}",
+                    },
+                )
+
+            person = h.substrate.lookup(person_key)
+            eval_route = h.substrate.lookup(eval_key)
+            assert person is not None
+            assert eval_route is not None
+            # The person's route expires first, so expiry order alone probes it
+            # ahead of the eval route.
+            assert h.substrate._affinity.touch(person_key, 30)  # noqa: SLF001
+
+            h.fake_k8s.quota_claim_capacity = 2
+            h.fake_k8s.quota_headroom_results = [True]
+            quota_view = _claim_view(
+                {
+                    "metadata": {"name": "acme-trigger-claim"},
+                    "status": {
+                        "conditions": [
+                            {
+                                "type": "Ready",
+                                "status": "False",
+                                "reason": "ReconcilerError",
+                                "message": (
+                                    'Error seen: pods "acme-trigger-claim" is '
+                                    "forbidden: exceeded quota: curie-sandbox-quota, "
+                                    "requested: limits.cpu=1, used: limits.cpu=2, "
+                                    "limited: limits.cpu=2"
+                                ),
+                            }
+                        ]
+                    },
+                }
+            )
+            assert quota_view.quota_rejection is not None
+            h.fake_k8s.quota_rejection = quota_view.quota_rejection
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            await h.async_redis.xgroup_create(
+                h.config.stream, h.config.consumer_group, id="0", mkstream=True
+            )
+            event_id = "eval-first-capacity-trigger"
+            lease = await _leased_entry(h, store, event_id=event_id, generation=1)
+            h.runner.default_script = [Final(text="started after reclaim", status=DONE)]
+
+            await h.kernel.process_event(
+                qevent("start a new turn", thread=trigger_thread, event_id=event_id),
+                lease=lease,
+            )
+
+            assert eval_route.claim_name in h.fake_k8s.deleted_claims
+            assert h.substrate.lookup(eval_key) is None
+            assert person.claim_name not in h.fake_k8s.deleted_claims
+            assert h.substrate.lookup(person_key) == person
+            assert h.runner.opened == ["start a new turn"]
+            assert h.sink.last_text == "started after reclaim"
+
+    asyncio.run(go())
+
+
+def test_is_eval_thread_key_reads_the_isolate_prefix_from_the_scoped_key() -> None:
+    from channel_protocol import scoped_conversation_id
+
+    is_eval = kernel_module._is_eval_thread_key  # noqa: SLF001
+
+    assert is_eval(scoped_conversation_id("slack", "C1", "eval:1720000000.000100"))
+    assert is_eval(
+        scoped_conversation_id("slack", "C1", "eval:1720000000.000100", identity="ops")
+    )
+    assert not is_eval(scoped_conversation_id("slack", "C1", "1720000000.000100"))
+    assert not is_eval(scoped_conversation_id("slack", "C1", "eval-1720000000.000100"))
+    assert not is_eval(scoped_conversation_id("slack", "eval:C1", "1720000000.000100"))
+    assert not is_eval("eval:1720000000.000100")
+    assert not is_eval("")
 
 
 def test_quota_capacity_waits_for_external_headroom_before_retry(
@@ -4483,32 +4780,40 @@ def test_approval_resume_capacity_retries_then_escalates(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """#3693, #3700: a resume that reclamation cannot help is not a runner failure.
+
+    The reclamation pass runs for the resume as for any turn, finds no idle
+    route to free, and the resume keeps its retries. Each of the three
+    attempts records the pass, and the failure is a ``sandbox-capacity``
+    escalation, not the fresh-turn capacity reply. The person is told the
+    agent was at capacity, with no quota detail (#2434). The same event id
+    resumes an approved, a rejected and an expired approval, so the sentence
+    names the decision, not an approval.
+    """
+
+    real_record_metric = kernel_module.record_metric
+    recorded: list[tuple[str, dict[str, str]]] = []
+
+    def spy(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
+        recorded.append((name, dict(attributes or {})))
+        # Delegate so the metric allowlist still validates the new class.
+        real_record_metric(name, value, attributes=attributes)
+
+    monkeypatch.setattr(kernel_module, "record_metric", spy)
+
     async def go() -> None:
         async with make_harness(
             max_attempts=3,
             slack_no_edit_streaming=True,
             claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
         ) as h:
             thread = "t-approval-capacity"
-            candidate = await _safe_pressure_candidate(h, "tApprovalSafeCandidate")
             await asyncio.to_thread(h.substrate.claim, thread)
             await asyncio.to_thread(h.substrate.suspend, thread, history_ref="history-1")
 
-            def scan_must_not_run(**_kwargs: object) -> object:
-                raise AssertionError("approval resume reached pressure inventory")
-
-            monkeypatch.setattr(
-                h.substrate._affinity,  # noqa: SLF001
-                "pressure_candidates",
-                scan_must_not_run,
-            )
             h.fake_k8s.claim_envs.clear()
-            h.fake_k8s.quota_rejection = QuotaRejection(
-                quota_name="curie-sandbox-quota",
-                requested={"limits.cpu": "NaN"},
-                used={"limits.cpu": "8"},
-                hard={"limits.cpu": "8"},
-            )
+            h.fake_k8s.quota_rejection = _quota_rejection()
             endpoint = "http://127.0.0.1:43199"
             ev = qevent(
                 "approved continuation",
@@ -4516,8 +4821,9 @@ def test_approval_resume_capacity_retries_then_escalates(
                 event_id="approval-example-resolved",
                 endpoint=endpoint,
             )
+            lease = await _pressure_lease(h, ev.event_id)
 
-            await h.kernel.process_event(ev)
+            await h.kernel.process_event(ev, lease=lease)
 
             assert len(h.fake_k8s.claim_envs) == 3
             assert h.runner.opened == []
@@ -4525,15 +4831,185 @@ def test_approval_resume_capacity_retries_then_escalates(
                 (
                     "C1",
                     "p-1",
-                    "curie-turn-failure: runner-error\n\n"
-                    "The run failed (runner-error) after 3 attempt(s). "
+                    "curie-turn-failure: sandbox-capacity\n\n"
+                    "The run failed (sandbox-capacity) after 3 attempt(s). "
+                    "The agent was at capacity, so it could not continue after the "
+                    "approval decision. Send the request again in a few minutes if it "
+                    "is still needed. "
                     "event_id=approval-example-resolved. Flagging for a human.",
                 )
             ]
+            reply = h.sink.updates[0][2]
+            for leaked in (
+                "curie-sandbox-quota",
+                "limits.cpu",
+                "quota",
+                "runner-error",
+                "approved request",
+            ):
+                assert leaked not in reply
+            retries = [attrs for name, attrs in recorded if name == "curie.queue.retry"]
+            assert [attrs["retry_class"] for attrs in retries] == [
+                "sandbox-capacity",
+                "sandbox-capacity",
+            ]
+            reclaims = [
+                attrs["outcome"]
+                for name, attrs in recorded
+                if name == "curie.sandbox.lifecycle" and attrs.get("operation") == "reclaim"
+            ]
+            assert reclaims == ["refused-no-safe-route"] * 3
             assert h.sink.update_endpoints == [endpoint]
-            assert h.substrate.lookup(_thread_key("tApprovalSafeCandidate")) == candidate
             assert h.kernel._order_locks == {}
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_approval_resume_capacity_reclaims_an_idle_route_and_runs(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3700: an approved continuation frees an idle route like any other turn.
+
+    The resume is refused for quota once while a proven-safe idle route holds
+    the capacity. The same bounded pass a fresh turn gets deletes that route,
+    confirms headroom, and the one retry runs the continuation instead of
+    failing it.
+    """
+
+    async def go() -> None:
+        outcomes = _capture_pressure_outcomes(monkeypatch)
+        async with make_harness(
+            binding=_HistoryBinding(),
+            max_attempts=3,
+            slack_no_edit_streaming=True,
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            victim = await _safe_pressure_candidate(h, "tApprovalIdleVictim")
+            h.fake_k8s.quota_claim_capacity = 1
+            h.fake_k8s.quota_headroom_results = [True]
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            h.runner.default_script = [Final(text="continued after reclaim", status=DONE)]
+            ev = qevent(
+                "approved continuation",
+                thread="t-approval-reclaims",
+                event_id="approval-reclaims-resolved",
+            )
+            lease = await _pressure_lease(h, ev.event_id)
+
+            await h.kernel.process_event(ev, lease=lease)
+
+            assert victim.claim_name in h.fake_k8s.deleted_claims
+            assert h.substrate.lookup(victim.thread_key) is None
+            assert h.runner.opened == ["approved continuation"]
+            assert h.sink.last_text == "continued after reclaim"
+            assert not any("curie-turn-failure" in update[2] for update in h.sink.updates)
+            assert outcomes == ["reclaimed"]
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_approval_resume_refused_again_after_reclaim_keeps_its_capacity_failure(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3700: the retry after a reclamation is refused again.
+
+    The resume records ``reclaimed-retry-refused`` and fails as
+    ``sandbox-capacity``. It neither sends the fresh turn's capacity reply nor
+    asks to wait for capacity (#2711), which would drop the approved
+    continuation.
+    """
+
+    async def go() -> None:
+        outcomes = _capture_pressure_outcomes(monkeypatch)
+        async with make_harness(
+            binding=_HistoryBinding(),
+            max_attempts=1,
+            slack_no_edit_streaming=True,
+            claim_timeout_seconds=0.05,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            victim = await _safe_pressure_candidate(h, "tApprovalRefusedVictim")
+            # Headroom is confirmed after the reclamation, then the retry is
+            # refused again: nothing releases capacity to the claim table.
+            h.fake_k8s.quota_headroom_results = [True]
+            h.fake_k8s.quota_rejection = _quota_rejection()
+            ev = qevent(
+                "approved continuation",
+                thread="t-approval-refused-again",
+                event_id="approval-refused-again-resolved",
+            )
+            lease = await _pressure_lease(h, ev.event_id)
+
+            await h.kernel.process_event(ev, lease=lease)
+
+            assert victim.claim_name in h.fake_k8s.deleted_claims
+            # "reclaimed" is recorded only when the retry succeeds.
+            assert outcomes == ["reclaimed-retry-refused"]
+            assert h.runner.opened == []
+            reply = h.sink.updates[-1][2]
+            assert reply.startswith("curie-turn-failure: sandbox-capacity\n\n")
+            assert "queued" not in reply.lower()
+            assert "limits.cpu" not in reply
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_approval_resume_capacity_keeps_an_earlier_pod_termination(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3693: a resume whose pod was evicted, then refused for capacity on the
+    retries, still tells the operator about the eviction, as runner-error did."""
+
+    async def go() -> None:
+        async with make_harness(
+            max_attempts=3,
+            slack_no_edit_streaming=True,
+            claim_timeout_seconds=0.05,
+        ) as h:
+            real_termination = h.fake_k8s.pod_termination
+
+            def evicted_then_full(name: str, **kwargs: object) -> object:
+                # The evicted sandbox is gone and the quota fills behind it, so
+                # every retry needs a new claim and is refused for capacity.
+                h.fake_k8s.quota_rejection = QuotaRejection(
+                    quota_name="curie-sandbox-quota",
+                    requested={"limits.cpu": "1"},
+                    used={"limits.cpu": "8"},
+                    hard={"limits.cpu": "8"},
+                )
+                found = real_termination(name, **kwargs)
+                h.fake_k8s.termination = None
+                for claim in list(h.fake_k8s.claims):
+                    h.fake_k8s.claims.pop(claim)
+                h.fake_k8s.sandboxes.clear()
+                return found
+
+            h.fake_k8s.termination = SimpleNamespace(
+                reason="Evicted", detail="The node was low on memory."
+            )
+            monkeypatch.setattr(h.fake_k8s, "pod_termination", evicted_then_full)
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+            ev = qevent(
+                "approved continuation",
+                thread="t-approval-evicted-then-full",
+                event_id="approval-evicted-resolved",
+            )
+
+            await h.kernel.process_event(ev)
+
+            assert len(h.runner.opened) == 1
+            reply = h.sink.updates[-1][2]
+            assert reply.startswith("curie-turn-failure: sandbox-capacity\n\n")
+            assert "Earlier attempt: Kubernetes pod terminated: Evicted" in reply
+            assert "limits.cpu" not in reply
 
     asyncio.run(go())
 
@@ -4819,6 +5295,7 @@ class _TokenBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         return {"CURIE_RUNNER_TOKEN": self._token}
 
@@ -4898,6 +5375,46 @@ def test_reply_handle_relay_adapter_survives_a_binding_that_names_its_identity(
 
             routes = h.sink.routes_for("reply.update")
             assert routes, "the completed turn emitted no reply update"
+            assert set(routes) == {TargetRoute(endpoint=None, adapter="curie-cluster-message")}
+
+    asyncio.run(go())
+
+
+def test_named_relay_resolves_named_binding_but_replies_through_relay(make_harness) -> None:
+    """@spec WORKER-CANARY-1 WORKER-CANARY-4: the selector and sink are distinct."""
+
+    class NamedBinding(_TokenBinding):
+        def __init__(self) -> None:
+            super().__init__("tok-route", uuid.uuid4())
+            self.seen: list[tuple[str, str | None, str]] = []
+
+        async def resolve(
+            self, kind: str, adapter: str | None, channel: str
+        ) -> _FakeResolved | None:
+            self.seen.append((kind, adapter, channel))
+            if adapter != "sre-bot":
+                return None
+            row = _FakeResolved(self._agent_id)
+            row.adapter = "sre-bot"
+            return row
+
+    async def go() -> None:
+        binding = NamedBinding()
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="done", status=DONE)]
+            await h.kernel.process_event(
+                qevent(
+                    "hi",
+                    thread="tNamedRelay",
+                    placeholder="123e4567-e89b-42d3-a456-426614174000",
+                    adapter="curie-cluster-message",
+                    identity="sre-bot",
+                )
+            )
+            assert binding.seen == [("slack", "sre-bot", "C1")]
+            assert h.runner.opened
+            routes = h.sink.routes_for("reply.update")
+            assert routes
             assert set(routes) == {TargetRoute(endpoint=None, adapter="curie-cluster-message")}
 
     asyncio.run(go())

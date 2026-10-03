@@ -11,11 +11,10 @@ import asyncio
 import os
 import uuid
 
-import pytest
+from curie_test_support.postgres import pg_connect_or_skip
 from curie_worker.binding import BindingResolver
 from curie_worker.config import WorkerConfig
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 _DB_URL = os.environ.get(
@@ -72,11 +71,7 @@ def test_a_bound_address_names_the_identity_bound_there() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+            await pg_connect_or_skip(engine)
             token = uuid.uuid4().hex[:8]
             inbox = f"b-{token}@example.com"
             room = f"room-{token}"

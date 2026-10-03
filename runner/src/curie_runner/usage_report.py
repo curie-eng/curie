@@ -1,8 +1,14 @@
 """Per-model token usage for a factory run's cost line (#3223).
 
-At each turn's ``ResultMessage`` boundary the runner POSTs the turn's per-model
+At each turn's ``ResultMessage`` boundary the runner POSTs that turn's per-model
 token counts to ``<progress_url>/usage`` over the same request-bound progress
 token. A failure is logged and never fails the turn.
+
+In streaming input mode the SDK's ``model_usage`` is the running total for the
+whole call, not the turn that just finished. The reporter subtracts the previous
+total for the same session before it posts, so a later turn does not store the
+earlier turn again. See the Agent SDK cost guide:
+https://code.claude.com/docs/en/agent-sdk/cost-tracking
 """
 
 from __future__ import annotations
@@ -11,7 +17,8 @@ import hashlib
 import json
 import logging
 from collections.abc import Mapping
-from typing import Any, Protocol
+from dataclasses import replace
+from typing import Any, Protocol, cast
 
 import aiohttp
 from claude_agent_sdk import AssistantMessage, ResultMessage
@@ -61,6 +68,48 @@ def _entry(model: str, raw: dict[str, Any], keys: dict[str, str]) -> dict[str, A
     for source, wire in keys.items():
         entry[wire] = _count(raw.get(source))
     return entry
+
+
+def _parse_model_usage(model_usage: dict[Any, Any]) -> dict[str, dict[str, int]]:
+    parsed: dict[str, dict[str, int]] = {}
+    for model, raw in model_usage.items():
+        if isinstance(model, str) and model and isinstance(raw, dict):
+            parsed[model] = {
+                wire: _count(raw.get(source)) for source, wire in _MODEL_USAGE_KEYS.items()
+            }
+    return parsed
+
+
+def _wire_to_model_usage(counts: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
+    source_for = {wire: source for source, wire in _MODEL_USAGE_KEYS.items()}
+    return {
+        model: {source_for[wire]: value for wire, value in per_model.items()}
+        for model, per_model in counts.items()
+    }
+
+
+def _cumulative_decreased(
+    previous: Mapping[str, Mapping[str, int]],
+    parsed: Mapping[str, Mapping[str, int]],
+) -> bool:
+    for model, counts in parsed.items():
+        prior = previous.get(model)
+        if prior is not None and any(counts[key] < prior[key] for key in _WIRE_KEYS):
+            return True
+    return False
+
+
+def _turn_counts(
+    previous: Mapping[str, Mapping[str, int]],
+    parsed: Mapping[str, Mapping[str, int]],
+) -> dict[str, dict[str, int]]:
+    delta: dict[str, dict[str, int]] = {}
+    for model, counts in parsed.items():
+        prior = previous.get(model, {})
+        turned = {key: counts[key] - prior.get(key, 0) for key in _WIRE_KEYS}
+        if any(value > 0 for value in turned.values()):
+            delta[model] = turned
+    return delta
 
 
 def _turn_id(message: ResultMessage, models: list[dict[str, Any]]) -> str:
@@ -151,9 +200,26 @@ class UsageReporter:
         self._url = url
         self._token = token
         self._observed: dict[tuple[str, str], dict[str, int]] = {}
+        self._seen_message_ids: set[tuple[str, str, str]] = set()
+        # Session-cumulative model_usage already accepted by the API.
+        # A new session id, or a drop in any count, means the SDK restarted the total.
+        self._cumulative: dict[str, dict[str, int]] = {}
+        self._cumulative_session: str | None = None
+        # Bodies whose POST has not been accepted, each with the baseline that
+        # becomes current once that body is accepted. Replay keeps the original
+        # turn id and roles. record_usage treats a replayed turn as a no-op.
+        self._queue: list[tuple[dict[str, Any], str | None, dict[str, dict[str, int]]]] = []
+        self._speculative: tuple[str | None, dict[str, dict[str, int]]] | None = None
 
     def observe(self, message: AssistantMessage) -> None:
-        """Accumulate one assistant message's usage under its SDK-given role."""
+        """Accumulate one assistant message's usage under its SDK-given role.
+
+        The Claude Agent SDK can yield several ``AssistantMessage`` objects for
+        one API response, each repeating ``message_id`` and ``usage`` (one per
+        content block when the model emits parallel tools). Count each
+        ``message_id`` once per ``(role, model)``. Messages with no id still
+        accumulate, because there is nothing to deduplicate.
+        """
 
         usage = getattr(message, "usage", None)
         model = getattr(message, "model", None)
@@ -164,19 +230,52 @@ class UsageReporter:
         if not isinstance(usage, dict):
             usage = {}
         role = REVIEWER if getattr(message, "parent_tool_use_id", None) is not None else IMPLEMENTER
+        message_id = getattr(message, "message_id", None)
+        if isinstance(message_id, str) and message_id:
+            seen = (role, model, message_id)
+            if seen in self._seen_message_ids:
+                return
+            self._seen_message_ids.add(seen)
         bucket = self._observed.setdefault((role, model), dict.fromkeys(_WIRE_KEYS, 0))
         for source, wire in _USAGE_KEYS.items():
             bucket[wire] += _count(usage.get(source))
 
-    async def report(self, message: ResultMessage, primary_model: str | None) -> None:
-        observed, self._observed = self._observed, {}
-        try:
-            body = build_usage_body(message, primary_model, observed=observed)
-        except Exception as exc:  # never fail the turn over a cost line
-            logger.warning("usage report build failure: %s", type(exc).__name__)
-            return
-        if body is None:
-            return
+    def _isolate_turn(
+        self,
+        message: ResultMessage,
+        parsed: dict[str, dict[str, int]],
+        previous: Mapping[str, Mapping[str, int]],
+        previous_session: str | None,
+    ) -> tuple[ResultMessage | None, str | None, dict[str, dict[str, int]]]:
+        """Return this turn's model_usage and the baseline after this snapshot.
+
+        ``model_usage`` on a streaming-input result is the call's running total.
+        The same session keeps that total until ``/clear``, a new session, or a
+        zeroed crash result restarts it. The top-level ``usage`` field is already
+        this turn only, so this adjustment applies only when ``model_usage`` is set.
+        """
+
+        session_id = getattr(message, "session_id", None)
+        session_id = session_id if isinstance(session_id, str) else None
+        restarted = session_id != previous_session or _cumulative_decreased(previous, parsed)
+        if restarted:
+            turn = {model: dict(counts) for model, counts in parsed.items()}
+            baseline = {model: dict(counts) for model, counts in parsed.items()}
+        else:
+            turn = _turn_counts(previous, parsed)
+            baseline = {model: dict(counts) for model, counts in {**previous, **parsed}.items()}
+        if not any(any(counts.values()) for counts in turn.values()):
+            return None, session_id, baseline
+        isolated = replace(message, model_usage=cast(Any, _wire_to_model_usage(turn)))
+        return isolated, session_id, baseline
+
+    def _remember(self, session_id: str | None, baseline: dict[str, dict[str, int]]) -> None:
+        self._speculative = (session_id, baseline)
+        if not self._queue:
+            self._cumulative_session = session_id
+            self._cumulative = baseline
+
+    async def _post(self, body: dict[str, Any]) -> bool:
         timeout = aiohttp.ClientTimeout(total=_TIMEOUT_SECONDS)
         status: int | None = None
         for _attempt in range(2):
@@ -194,5 +293,61 @@ class UsageReporter:
                 continue
             if status < 500:
                 break
-        if status is None or not 200 <= status < 300:
-            logger.warning("usage report not recorded: status=%s", status)
+        if status is not None and 200 <= status < 300:
+            return True
+        logger.warning("usage report not recorded: status=%s", status)
+        return False
+
+    async def _flush(self) -> None:
+        """POST queued turn bodies in order. Stop at the first one still unaccepted."""
+
+        while self._queue:
+            body, session_id, baseline = self._queue[0]
+            if not await self._post(body):
+                return
+            self._queue.pop(0)
+            self._cumulative_session = session_id
+            self._cumulative = baseline
+            if not self._queue:
+                self._speculative = (session_id, baseline)
+
+    async def report(self, message: ResultMessage, primary_model: str | None) -> None:
+        observed, self._observed = self._observed, {}
+        self._seen_message_ids.clear()
+        try:
+            model_usage = getattr(message, "model_usage", None)
+            parsed: dict[str, dict[str, int]] = {}
+            if isinstance(model_usage, dict) and model_usage:
+                parsed = _parse_model_usage(model_usage)
+            if parsed:
+                previous_session, previous = self._speculative or (
+                    self._cumulative_session,
+                    self._cumulative,
+                )
+                isolated, session_id, baseline = self._isolate_turn(
+                    message, parsed, previous, previous_session
+                )
+                body = (
+                    None
+                    if isolated is None
+                    else build_usage_body(isolated, primary_model, observed=observed)
+                )
+                if body is not None:
+                    self._queue.append((body, session_id, baseline))
+                self._remember(session_id, baseline)
+            else:
+                body = build_usage_body(message, primary_model, observed=observed)
+                if body is not None:
+                    # Per-turn ``usage`` is not a running total, so it does not move
+                    # the model_usage baseline. Carry the baseline the queue already
+                    # implies, or a flush would rewind an accepted snapshot.
+                    session_id, baseline = self._speculative or (
+                        self._cumulative_session,
+                        self._cumulative,
+                    )
+                    copied = {model: dict(counts) for model, counts in baseline.items()}
+                    self._queue.append((body, session_id, copied))
+        except Exception as exc:  # never fail the turn over a cost line
+            logger.warning("usage report build failure: %s", type(exc).__name__)
+            return
+        await self._flush()

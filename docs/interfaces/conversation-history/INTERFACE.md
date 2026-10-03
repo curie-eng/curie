@@ -68,6 +68,16 @@ conversation, reconstructed through the selected harness adapter.
   harness declaring no structured-replay capability fails rather than receiving
   rendered system text. A configured load failure blocks boot because continuing
   without approval/tool context could duplicate an operation.
+- **A turn's own message.** The user message a turn records is the prompt the
+  runner sent for it, and the attachments a boot found ride on the first prompt
+  that runner sends: the person's text, then a notice naming each file by its
+  absolute path. Later prompts to the same runner carry no notice, because
+  `attachments-init` only runs when a sandbox boots and the worker boots one for
+  every turn that carries a file. The portable prefix and a native checkpoint
+  therefore both show which message carried which files, so a file re-attached
+  under an unchanged name is announced even when this boot's system prompt is
+  the one the checkpoint recorded. The legacy `user` projection stays the
+  person's text.
 - **Append side.** `append(record)` durably writes one turn. A serving runner
   holds a persistable `DONE` or `AWAITING_APPROVAL` final until append finishes
   within its 15 second budget. A dangling denied tool call gets an explicit
@@ -115,24 +125,33 @@ conversation, reconstructed through the selected harness adapter.
 ## Implementations today
 
 One: **`StateApiTranscriptStore`**, backing the transcript as a per-thread
-`transcript/<thread_key>` key over the durable KV/document store landed for
-#23/#248 (`apps/api` `/agents/{agent_id}/state/{namespace}/{key}`, Postgres
-JSONB). `load` GETs the key; `append` POSTs to the key's `/append` endpoint,
-inheriting durability and the per-value/per-namespace size caps. A 413 detail
-names the key over the per-value cap, or the largest key in the namespace for
-the per-namespace cap. The transcript key is the thread key, so the refusal
-names the thread to recover even when a sibling thread's append was refused.
+`transcript/<thread_key>` key served by the state API (`apps/api`
+`/agents/{agent_id}/state/{namespace}/{key}`). The state router no longer
+stores that key in the general state store: it dispatches the reserved
+`transcript` namespace to `apps/api/src/curie_api/transcripts.py::put` and its
+siblings, which keep one `thread_transcripts` row per thread
+(`apps/api/src/curie_api/models.py::ThreadTranscript`, ADR-0170). The wire path
+is unchanged. `load` GETs the key; `append` POSTs to the key's `/append`
+endpoint. Each thread is capped on its own by `transcript_max_thread_bytes`
+(16 MiB by default); there is no agent-wide or namespace-wide transcript cap, so
+one busy thread can no longer exhaust capacity for its siblings. A transcript
+413 therefore always means this thread's value is over the per-thread cap, or
+would leave less than the requested `reserve_bytes` under it, and its detail
+names the thread key
+(`apps/api/src/curie_api/transcripts.py::enforce_thread_cap`).
 The loader maps rejected appends to typed `HistoryCapacityError` or
 `HistoryAppendError` values and never reads an arbitrary API response body.
-Immediately before either transcript 413, the API increments
+Immediately before a per-thread cap 413, the API increments
 `curie_history_persistence_failure_total` with fixed `service.name=curie-api`,
-`source=state-api`, `outcome=capacity`, and `limit=value` or `limit=namespace`
-attributes. A refusal for the append's optional `reserve_bytes` headroom is also
-a 413, with a detail naming the reserve, but it does not increment the counter:
-it is the runner's compaction trigger, not a persistence failure. Both limit series initialize to zero during API startup. Health and
-readiness remain healthy because capacity is data state, not process
-availability. Operational consumers can use the counter to identify a capacity
-refusal without treating it as an API health failure.
+`source=state-api`, `outcome=capacity`, and `limit=value` attributes. A refusal
+for the append's optional `reserve_bytes` headroom is also a 413, with a detail
+naming the reserve, but it does not increment the counter: it is the runner's
+compaction trigger, not a persistence failure. API startup initializes the
+`limit=value` and `limit=namespace` series to zero; transcripts only ever
+increment `limit=value`. Health and readiness remain healthy because capacity
+is data state, not process availability. Operational consumers can use the
+counter to identify a capacity refusal without treating it as an API health
+failure.
 `NullTranscriptStore` is the no-ref sink. The worker (`binding.boot_env`)
 delivers the ref as `http(s)://api/agents/<id>/state/transcript/<thread_key>`
 (URL-encoded thread key) and forwards a scoped, agent-bound `state` token
@@ -165,19 +184,23 @@ unplanned-restart case needs no special worker/kernel branch.
   single turn that cannot be bounded under the cap fails the run with an error
   naming the turn's compacted size and the cap. A
   terminal capacity notice tells the operator to inspect the affected work and
-  retry the run. There is no other automatic data retention or deletion policy
-  for the stored source. For a value cap the runner cannot recover, quiesce
-  and release the affected thread, export and verify its owned key,
+  retry the run. For a value cap the runner cannot recover, quiesce
+  and release the affected thread, export and verify its transcript,
   including version, digest, and records, then delete it with
   `DELETE .../state/transcript/<thread_key>?expected_version=<exported version>`.
   The delete returns 409 and keeps the row when anything was appended after the
   export, so repeat the export instead of losing those turns. Starting
   the same thread on a fresh route accepts the historical reset. A retained
   runner with sticky durability loss needs the existing operator release before
-  it can be handed off. For a namespace cap, quiesce the affected agent route,
-  export and verify only owned keys, starting with the largest key the 413
-  names, then remove enough old owned keys with the same versioned delete to
-  restore space before retrying the target thread.
+  it can be handed off.
+- **Transcripts expire.** A WorkItem's transcript is deleted in the same
+  transaction that makes the WorkItem terminal
+  (`apps/api/src/curie_api/transcripts.py::expire_for_work_item`). Every write
+  also moves the row's `expires_at` forward by `transcript_idle_ttl_seconds`
+  (30 days by default); an expired row reads as absent and is deleted by the
+  next transcript write for the same agent. That idle expiry covers threads with
+  no WorkItem and backstops WorkItem threads. A deployment that needs history to
+  outlive its WorkItem must export it first.
 - **History lives OUTSIDE the sandbox** (ADR-0003) — the store is
   network-reachable and rehydratable, never pod-local state.
 

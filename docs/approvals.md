@@ -163,13 +163,38 @@ the channel the card lands on:
 
 - **In Slack**, nothing changes: the channel's members, the route's user group, or its
   listed users, exactly as for any Slack card.
-- **Anywhere else**, such as an email thread, only the person who asked may answer, by
-  replying in that conversation through the channel's adapter. People copied on the thread
-  cannot answer, and neither can an operator token, a console session or a Slack click.
-  This is the requester confirming their own request, not a second person's sign-off. A
-  route that lists `approvers` and would land on such a conversation is escalated when the
-  approval is raised, because approver lists name Slack users that nobody there can prove
-  to be yet. A bot that needs a second person's sign-off keeps a fixed Slack route.
+- **In an email thread**, only an address on the route's approver list may answer
+  ([ADR-0177 amendment](adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md#amendment-email-approver-lists)). The list
+  is `approvers.emails`, separate from the binding's `allowed_callers`: being allowed to
+  talk to the bot is not being allowed to approve what it does. A reply counts only when
+  the mail adapter verified its sender (the same SPF, DKIM and DMARC check it applies to
+  every message), the binding's `allowed_callers` admit that sender, and the verified
+  address is on the list. The match is exact apart from case. Anyone on the list may
+  answer, including the person who asked only if their own address is listed. An operator
+  token, a console session and a Slack click cannot answer an email card.
+- **With no list, nobody answers by email.** A routeless approval, or a route that lists
+  no `emails`, raised in an email thread is escalated when it is raised instead of creating
+  an approval that can only expire. So is a route that lists only Slack `users` or a
+  `group`, since nobody on an email thread can prove to be one. Any other non-Slack channel
+  has no approver list it can verify yet, so its approvals admit nobody.
+- **The requester adds approvers** (ADR-0177 amendment A5). The request email names the route's listed addresses. If one of them is already on the thread (the person who asked, or the To or Cc of the asking message), it says they can answer. If none is, it asks the requester to reply all and add one or more of them, as many as they like. The first answer the platform accepts is final, and later answers are told it was already answered. A listed requester may approve their own request, as on Slack. The request email and the outcome are sent reply all, the requester always gets the outcome, and the bot never emails an approver who is not on the thread. The worker passes the listed addresses to the adapter as the card's `Approver` fields, for wording only.
+
+`emails` is allowed only on a `requesting_surface` route, and may sit beside `users` or
+`group`: a card shown in Slack reads only the Slack entries, and a card shown in email
+reads only `emails`. A Slack card whose route lists only `emails` admits nobody. For
+example, in a `--routes-from` file:
+
+```json
+{
+  "confirm": {
+    "resolution": { "mode": "requesting_surface" },
+    "approvers": {
+      "users": ["U0123ABCD"],
+      "emails": ["approver@example.com", "second.approver@example.com"]
+    }
+  }
+}
+```
 
 An adapter answers only approvals whose card went to one of its own bindings. Until a
 channel's adapter renders the Approve and Reject request and reads the replies, its
@@ -259,6 +284,9 @@ and the requester stay. An approved or rejected card names who decided and when,
 the note under it. The time is a Slack date token, so each reader sees it in their own
 time zone. An expired card states that the request expired without a decision time.
 A resolve from the CLI or the Console settles the card the same way a click does.
+That holds when the decision lands before the card has finished posting: once the
+worker registers the card it reads the approval back, and a decided or expired record
+settles the card there instead of on the resume.
 
 The dialog is not optional the way the note is: **every** approval card opens one, in
 every deployment, with no toggle. That costs an approver who wants no note one extra

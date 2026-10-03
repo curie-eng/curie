@@ -250,7 +250,8 @@ class ResumeQueue:
         # The runs stream is declared once, on the settings object (#492): the
         # module constant this used to default to was a second declaration of
         # the same name. Settings.runs_stream defaults to the shared
-        # RUNS_STREAM_DEFAULT and stays overridable via RUNS_STREAM. Resolved at
+        # RUNS_STREAM_DEFAULT and stays overridable via RUNS_STREAM or CURIE_STREAM
+        # (a disagreement between the two is refused at boot). Resolved at
         # construction rather than as a default arg so the env override is read
         # when the queue is built, not at import time.
         self._client = client

@@ -17,6 +17,16 @@ trust a pasted diff. Check:
 
 - Every acceptance criterion is met, with evidence (a test that exercises it
   and passes).
+- Service-backed tests: the sandbox has no Postgres, Valkey or other service
+  the repository's CI starts, and no way to start one. When the prompt lists a
+  test as service-backed with its command and missing service, do not demand
+  its run results, real-service evidence, or a red-on-base run; none of these
+  can be produced here, so asking for them only exhausts the loop. Judge the
+  test by reading it: it must exercise the criterion through the changed code
+  and would fail on the base code. If so, that criterion is verified for
+  publication; the pull request's required CI runs the test and the platform's
+  `wait_ci` loop returns any failure to the implementer. Block only when the
+  test is wrong or misses the criterion, or a serviceless check failed.
 - Every hunk serves a criterion; no stray files, debug output, commented-out
   code, secrets, generated caches, or unrequested `.github/` edits.
 - Existing tests are intact and were not weakened.

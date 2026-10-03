@@ -73,7 +73,7 @@ description = "Downstream repository slug -- describe the repo's role, do not na
 # trailing `.` or `-`, which then fails an anchored allowlist and fires on this
 # repo's own name -- the noisy-rule failure mode the aws-account-id comment
 # above describes.
-regex = '''\bcurie-eng/[A-Za-z0-9._-]*[A-Za-z0-9]'''
+regex = '''(?i)\bcurie-eng/[A-Za-z0-9._-]*[A-Za-z0-9]'''
 tags = ["identifier", "repo"]
 
   [rules.allowlist]
@@ -83,9 +83,11 @@ tags = ["identifier", "repo"]
   # repository. Both forms take the `-*` suffix because that is the published
   # image repos (curie-api, curie-runner, curie-worker-local, ...), which the
   # full-history scan meets under the pre-rename name across 26 commits.
+  # GitHub repository URLs are case insensitive; canonical clone URLs also
+  # append `.git`. Keep that suffix anchored so near-miss names still fire.
   regexes = [
-    '''^curie-eng/curie(-[A-Za-z0-9._-]+)?$''',
-    '''^curie-eng/agentos(-[A-Za-z0-9._-]+)?$''',
+    '''(?i)^curie-eng/curie(-[A-Za-z0-9._-]+)?(\.git)?$''',
+    '''(?i)^curie-eng/agentos(-[A-Za-z0-9._-]+)?(\.git)?$''',
   ]
 
 [[rules]]
@@ -99,13 +101,13 @@ description = "Cross-repo issue reference -- cite this repo's issues, or describ
 # number. GitHub owners cannot begin with a digit anyway, and without the
 # constraint the prose `#456/PR#503` -- two of this repo's own references,
 # written back to back -- parses as owner `456`, repo `PR`, issue `503`.
-regex = '''\b[A-Za-z][A-Za-z0-9-]*/[A-Za-z0-9._-]+#[0-9]+\b'''
+regex = '''(?i)\b[A-Za-z][A-Za-z0-9-]*/[A-Za-z0-9._-]+#[0-9]+\b'''
 tags = ["identifier", "repo"]
 
   [rules.allowlist]
   description = "This repo's own issues, written in the qualified form"
   regexTarget = "match"
-  regexes = ['''^curie-eng/(curie|agentos)#[0-9]+$''']
+  regexes = ['''(?i)^curie-eng/(curie|agentos)#[0-9]+$''']
 
 [allowlist]
 description = "Placeholder values this repo uses deliberately, plus generated artifacts"
@@ -123,6 +125,10 @@ regexes = [
   # The provider prefix is intentionally present in the public fixture. The
   # complete finding is anchored so no other OpenRouter shaped value is covered.
   '''^credentials":"sk-or-v1-PLACEHOLDER"$''',
+  # The chart publishes this development caller pair in templates/_helpers.tpl.
+  # Match only the complete assignments used by the isolated upgrade matrix.
+  '''^connectorCaller\.signingKey=Y3VyaWUtZGV2LWNvbm5lY3Rvci1jYWxsZXItc2VlZCE=$''',
+  '''^connectorCaller\.verifyKey=tkmNbO5SSLE0IM84sH4uJ94DxtriNZ/APXha3FiyP6c=$''',
   # Slack token fixtures. The prefix is the whole point of the test that uses
   # them (curie seal / credcheck), so they cannot be shortened past it -- the
   # EXAMPLE marker is what makes them obviously not a live token.

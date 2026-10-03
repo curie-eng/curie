@@ -172,12 +172,15 @@ def _full_boot_env() -> BootEnv:
         fake_model=True,
         history_ref=_HISTORY_REF,
         channel_memory_ref=_CHANNEL_MEMORY_REF,
+        memory_writes=True,
         history_token="st-history-token",
         memory_token="st-memory-token",
         state_url="http://api:8000/agents/agent-abc/state",
         state_token="st-state-token",
         progress_url="http://api:8000/v1/work-item-progress/wi-full",
         progress_token="sbx-progress-token",
+        issue_read_url="http://api:8000/work-items/issue-read",
+        issue_read_token="wir-issue-read-capability",
         approval_required_tools=["Bash", "mcp__github__create_pr"],
         approval_grant_tool="Bash",
         approval_grant_arguments={"command": "printf ok"},
@@ -193,11 +196,13 @@ def _full_boot_env() -> BootEnv:
         api_backend="messages",
         thinking="disabled",
         deployment_environment="prod",
+        channel_bound=True,
         model_env_key="MY_PROVIDER_KEY",
         metrics_temporality_preference="delta",
         max_turns=50,
         history_max_turns=10,
         history_max_bytes=2048,
+        memory_max_facts=300,
     )
 
 
@@ -558,6 +563,8 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         connector_caller_token="cct.payload.signature",
         bundle_version="abc123def456",
         channel_memory_ref=_CHANNEL_MEMORY_REF,
+        memory_writes=True,
+        channel_bound=True,
     )
     worker_owned = set(BootEnv.env_keys(producer="worker"))
     assert set(maximal) <= worker_owned
@@ -575,6 +582,7 @@ def test_the_kernel_owns_exactly_these_resume_overlay_keys() -> None:
     producer map is what pins the overlay's exact extent. ADR-0076/#889 added
     ``CURIE_APPROVAL_DECISION`` alongside the original two, and #3077 added the
     request-bound progress URL/token the resume overlay mints per work item.
+    ADR 0187 added the issue read URL/capability the API mints at boot.
     """
     assert set(BootEnv.env_keys(producer="kernel")) == {
         "CURIE_APPROVAL_GRANT_TOOL",
@@ -583,6 +591,8 @@ def test_the_kernel_owns_exactly_these_resume_overlay_keys() -> None:
         "CURIE_APPROVAL_DECISION",
         "CURIE_PROGRESS_URL",
         "CURIE_PROGRESS_TOKEN",
+        "CURIE_ISSUE_READ_URL",
+        "CURIE_ISSUE_READ_TOKEN",
     }
 
 
@@ -674,6 +684,7 @@ def test_knobs_are_none_when_absent_so_the_consumer_applies_its_own_defaults() -
     assert boot.max_turns is None
     assert boot.history_max_turns is None
     assert boot.history_max_bytes is None
+    assert boot.memory_max_facts is None
 
 
 def test_knobs_and_port_hold_no_default_value_on_the_model_itself() -> None:
@@ -689,12 +700,14 @@ def test_knobs_and_port_hold_no_default_value_on_the_model_itself() -> None:
     assert boot.max_turns is None
     assert boot.history_max_turns is None
     assert boot.history_max_bytes is None
+    assert boot.memory_max_facts is None
     assert boot.port is None
     env = boot.to_env()
     for key in (
         "CURIE_MAX_TURNS",
         "CURIE_HISTORY_MAX_TURNS",
         "CURIE_HISTORY_MAX_BYTES",
+        "CURIE_MEMORY_MAX_FACTS",
         "CURIE_RUNNER_PORT",
     ):
         assert key not in env, f"{key} was rendered although no producer set it"
@@ -708,12 +721,14 @@ def test_knobs_parse_when_set_through_the_declared_operator_surface() -> None:
             "CURIE_MAX_TURNS": "5",
             "CURIE_HISTORY_MAX_TURNS": "7",
             "CURIE_HISTORY_MAX_BYTES": "512",
+            "CURIE_MEMORY_MAX_FACTS": "250",
         }
     )
     boot = BootEnv.from_env(env)
     assert boot.max_turns == 5
     assert boot.history_max_turns == 7
     assert boot.history_max_bytes == 512
+    assert boot.memory_max_facts == 250
 
 
 @pytest.mark.parametrize("garbage", ["abc", "", "   ", "0", "-5", "3.5"])
@@ -737,6 +752,30 @@ def test_history_window_knobs_degrade_rather_than_raise_on_garbage(garbage: str)
     assert boot.history_max_bytes is None
 
 
+@pytest.mark.parametrize("garbage", ["abc", "", "   ", "0", "-5", "3.5"])
+def test_memory_fact_limit_degrades_rather_than_raises_on_garbage(garbage: str) -> None:
+    """CURIE_MEMORY_MAX_FACTS is tolerant like the history window (#3624).
+
+    A typo in an operator's extraEnv must not become a boot crash, and a limit of
+    zero or less would refuse every save while showing nothing, so both degrade
+    to None and the runner applies its default of 200.
+    """
+    env = _worker_env() | _SUBSTRATE_ENV | {"CURIE_MEMORY_MAX_FACTS": garbage}
+    assert BootEnv.from_env(env).memory_max_facts is None
+
+
+def test_memory_fact_limit_is_an_optional_operator_key_in_the_schema() -> None:
+    """A new optional field: a patch under 0.x, owned by the operator alone."""
+    from aci_protocol.schema_export import build_schema
+
+    boot_env = build_schema()["$defs"]["BootEnv"]
+    assert "memory_max_facts" not in boot_env.get("required", [])
+    field = boot_env["properties"]["memory_max_facts"]
+    assert {"type": "integer"} in field["anyOf"]
+    assert BootEnv.env_key("memory_max_facts") == "CURIE_MEMORY_MAX_FACTS"
+    assert "CURIE_MEMORY_MAX_FACTS" not in BootEnv.env_keys(producer="worker")
+
+
 def test_max_turns_raises_on_garbage_rather_than_degrading() -> None:
     """config.py:98 uses a bare int() today and DOES raise. Keep it raising."""
     env = _worker_env() | _SUBSTRATE_ENV | {"CURIE_MAX_TURNS": "not-a-number"}
@@ -756,6 +795,7 @@ def test_no_code_producer_owns_the_knobs() -> None:
         "CURIE_MAX_TURNS",
         "CURIE_HISTORY_MAX_TURNS",
         "CURIE_HISTORY_MAX_BYTES",
+        "CURIE_MEMORY_MAX_FACTS",
         "OTEL_EXPORTER_OTLP_HEADERS",
     }
 
@@ -790,12 +830,15 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_FAKE_MODEL",
         "CURIE_HISTORY_REF",
         "CURIE_CHANNEL_MEMORY_REF",
+        "CURIE_MEMORY_WRITES",
         "CURIE_HISTORY_TOKEN",
         "CURIE_MEMORY_TOKEN",
         "CURIE_STATE_URL",
         "CURIE_STATE_TOKEN",
         "CURIE_PROGRESS_URL",
         "CURIE_PROGRESS_TOKEN",
+        "CURIE_ISSUE_READ_URL",
+        "CURIE_ISSUE_READ_TOKEN",
         "CURIE_APPROVAL_REQUIRED_TOOLS",
         "CURIE_APPROVAL_GRANT_TOOL",
         "CURIE_APPROVAL_GRANT_ARGUMENTS",
@@ -811,11 +854,13 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_MODEL_API_BACKEND",
         "CURIE_THINKING",
         "CURIE_DEPLOYMENT_ENVIRONMENT",
+        "CURIE_CHANNEL_BOUND",
         "CURIE_MODEL_ENV_KEY",
         "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
         "CURIE_MAX_TURNS",
         "CURIE_HISTORY_MAX_TURNS",
         "CURIE_HISTORY_MAX_BYTES",
+        "CURIE_MEMORY_MAX_FACTS",
     }
 
 
@@ -1070,3 +1115,106 @@ def test_from_env_reads_an_empty_channel_memory_ref_as_unset() -> None:
 def test_channel_memory_ref_is_a_worker_only_env_key() -> None:
     assert BootEnv.env_key("channel_memory_ref") == "CURIE_CHANNEL_MEMORY_REF"
     assert _producers_of("CURIE_CHANNEL_MEMORY_REF") == {"worker"}
+
+
+# --- Memory writes flag (#3659) ----------------------------------------------
+
+
+@pytest.mark.parametrize(("declared", "rendered"), [(True, "1"), (False, "0")])
+def test_render_worker_emits_the_memory_writes_flag_explicitly(
+    declared: bool, rendered: str
+) -> None:
+    """The worker sends the flag as ``1``/``0``: an explicit off is not an omission.
+
+    The runner reads an absent flag as an older worker (a channel ref means
+    writes are on), so ``False`` must reach the pod as ``0``, never be dropped.
+    """
+    env = _worker_env(channel_memory_ref=_CHANNEL_MEMORY_REF, memory_writes=declared)
+    assert env["CURIE_MEMORY_WRITES"] == rendered
+
+
+def test_render_worker_omits_the_memory_writes_flag_when_not_given() -> None:
+    assert "CURIE_MEMORY_WRITES" not in _worker_env()
+    assert "CURIE_MEMORY_WRITES" not in _worker_env(memory_writes=None)
+
+
+@pytest.mark.parametrize("declared", [True, False, None])
+def test_memory_writes_survives_the_worker_render_and_the_consumer_parse(
+    declared: bool | None,
+) -> None:
+    boot = BootEnv.from_env(
+        _worker_env(channel_memory_ref=_CHANNEL_MEMORY_REF, memory_writes=declared) | _SUBSTRATE_ENV
+    )
+    assert boot.memory_writes is declared
+    assert BootEnv.from_env(boot.to_env()) == boot
+
+
+@pytest.mark.parametrize(("declared", "rendered"), [(True, "1"), (False, "0")])
+def test_to_env_emits_the_memory_writes_flag_as_one_or_zero(declared: bool, rendered: str) -> None:
+    boot = BootEnv(session=_boot_session(), memory_writes=declared)
+    assert boot.to_env()["CURIE_MEMORY_WRITES"] == rendered
+    assert BootEnv.from_env(boot.to_env()).memory_writes is declared
+
+
+def test_to_env_omits_the_memory_writes_flag_when_unset() -> None:
+    boot = BootEnv(session=_boot_session())
+    assert boot.memory_writes is None
+    assert "CURIE_MEMORY_WRITES" not in boot.to_env()
+
+
+@pytest.mark.parametrize(
+    ("raw", "parsed"), [("1", True), ("true", True), ("0", False), ("false", False)]
+)
+def test_from_env_reads_the_memory_writes_flag(raw: str, parsed: bool) -> None:
+    env = BootEnv(session=_boot_session()).to_env()
+    env["CURIE_MEMORY_WRITES"] = raw
+    assert BootEnv.from_env(env).memory_writes is parsed
+
+
+@pytest.mark.parametrize("raw", ["yes", "2", "on", "off", "garbage"])
+def test_from_env_reads_an_unknown_memory_writes_value_as_off(raw: str) -> None:
+    # None means "an old worker, a ref means writes on", which would fail open.
+    env = BootEnv(session=_boot_session(), channel_memory_ref=_CHANNEL_MEMORY_REF).to_env()
+    env["CURIE_MEMORY_WRITES"] = raw
+    assert BootEnv.from_env(env).memory_writes is False
+
+
+def test_from_env_reads_an_absent_or_empty_memory_writes_flag_as_unset() -> None:
+    """Absent is an older worker, distinct from an explicit off."""
+    env = BootEnv(session=_boot_session()).to_env()
+    assert "CURIE_MEMORY_WRITES" not in env
+    assert BootEnv.from_env(env).memory_writes is None
+    env["CURIE_MEMORY_WRITES"] = ""
+    assert BootEnv.from_env(env).memory_writes is None
+
+
+def test_memory_writes_is_a_worker_only_env_key() -> None:
+    assert BootEnv.env_key("memory_writes") == "CURIE_MEMORY_WRITES"
+    assert _producers_of("CURIE_MEMORY_WRITES") == {"worker"}
+
+
+def test_render_worker_omits_channel_bound_by_default() -> None:
+    assert "CURIE_CHANNEL_BOUND" not in _worker_env()
+
+
+def test_render_worker_emits_channel_bound_when_the_turn_is_bound() -> None:
+    assert _worker_env(channel_bound=True)["CURIE_CHANNEL_BOUND"] == "1"
+
+
+def test_from_env_leaves_channel_bound_unset_when_absent_or_blank() -> None:
+    env = _worker_env() | _SUBSTRATE_ENV
+    assert "CURIE_CHANNEL_BOUND" not in env
+    assert BootEnv.from_env(env).channel_bound is None
+    for blank in ("", " "):
+        parsed = BootEnv.from_env(env | {"CURIE_CHANNEL_BOUND": blank})
+        assert parsed.channel_bound is None
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "True", "yes", "YES"])
+def test_from_env_reads_channel_bound_with_the_fake_model_truthy_set(raw: str) -> None:
+    env = _worker_env() | _SUBSTRATE_ENV | {"CURIE_CHANNEL_BOUND": raw}
+    assert BootEnv.from_env(env).channel_bound is True
+
+
+def test_channel_bound_is_not_a_session_config_field() -> None:
+    assert "channel_bound" not in SessionConfig.model_fields

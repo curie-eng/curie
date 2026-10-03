@@ -1,0 +1,34 @@
+2026-09-23T08:21:33.0680333Z === case: local runner failure is observable and recovers ===
+2026-09-23T08:21:45.2094949Z time="2026-09-23T08:21:45Z" level=warning msg="Found orphan containers ([curie-curie-weather-mcp-receipt-1 curie-curie-weather-mcp-netpol-probe-1]) for this project. If you removed or renamed this service in your compose file, you can run this command with the --remove-orphans flag to clean it up."
+2026-09-23T08:21:45.2097692Z  Container curie-curie-worker-1  Recreate
+2026-09-23T08:21:46.2416193Z  Container curie-curie-worker-1  Recreated
+2026-09-23T08:21:46.2445769Z  Container curie-curie-worker-1  Starting
+2026-09-23T08:21:46.3231655Z  Container curie-curie-worker-1  Started
+2026-09-23T08:24:58.7430433Z waiting for worker reply: ok (187s)
+2026-09-23T08:24:58.7432598Z {"finalized":true,"reply":"The run failed (unclassified) after 1 attempt(s). model error: server_error event_id=EvSIM-acc3ec70-d784-454b-b365-407e45fd9569. Flagging for a human.","thread":"1790151709.684444"}
+2026-09-23T08:24:58.7434313Z continue this conversation: curie local message --continue "..."
+2026-09-23T08:25:09.7236681Z {"classified_failure_delta": 1.0, "done_delta": 0, "error_log_trace_matches": 1, "failed_new_traces": 1}
+2026-09-23T08:25:09.7371074Z local: injected non-retryable runner failure exported a new causally matched ERROR trace/log and classified_failure metric delta
+2026-09-23T08:25:09.8509657Z time="2026-09-23T08:25:09Z" level=warning msg="Found orphan containers ([curie-curie-weather-mcp-receipt-1 curie-curie-weather-mcp-netpol-probe-1]) for this project. If you removed or renamed this service in your compose file, you can run this command with the --remove-orphans flag to clean it up."
+2026-09-23T08:25:09.8512176Z  Container curie-curie-worker-1  Recreate
+2026-09-23T08:25:11.3563786Z  Container curie-curie-worker-1  Recreated
+2026-09-23T08:25:11.3608791Z  Container curie-curie-worker-1  Starting
+2026-09-23T08:25:11.4577851Z  Container curie-curie-worker-1  Started
+2026-09-23T08:25:33.0770217Z waiting for worker reply: ok (16.1s)
+2026-09-23T08:25:33.0771365Z continue this conversation: curie local message --continue "..."
+2026-09-23T08:25:33.0792625Z {"finalized":true,"reply":"I tried to verify the \"healthy control\" state, but I can't reach your Grafana instance — every call (datasources, incidents, alert rules) failed with the same DNS error:\n\n```\ndial tcp: lookup grafana.example.com: no such host\n```\n\nThe configured Grafana base URL is `http://grafana.example.com`, which looks like an unconfigured placeholder rather than a real endpoint. So I can't confirm health from the Grafana side right now.\n\nA couple of things so I can actually help:\n\n1. *What is the real Grafana URL?* If it should be reachable, the MCP server's base URL needs to be pointed at your actual instance (env var / config on the netpol-probe server).\n2. *What did you mean by \"restored healthy control\"?* I want to make sure I act on the right thing. Likely candidates:\n   • You *resolved an incident* and want me to confirm Grafana shows no active incidents / firing alerts.\n   • A *datasource* (Prometheus/Loki) was brought back and you want a health check.\n   • A *control-plane / netpol* probe target was restored to healthy and you want me to verify via metrics.\n\nTell me which, plus the reachable Grafana address, and I'll run the actual health check (datasource health, active incidents, firing/pending alert rules, and the relevant metric).","thread":"1790151914.933541"}
+2026-09-23T08:25:33.1035896Z local: turn finalized with a reply (plumbing asserted, content deliberately not graded)
+2026-09-23T08:25:33.1037218Z local: reply is not the fake sentinel (live negative control)
+2026-09-23T08:27:10.0947989Z Traceback (most recent call last):
+2026-09-23T08:27:10.0948654Z   File "<stdin>", line 191, in <module>
+2026-09-23T08:27:10.0949264Z AssertionError: healthy trace 3a7ea1dac34c99c379f5d9b7f4f1dd5a contains an ERROR span
+2026-09-23T08:27:10.1233649Z 
+2026-09-23T08:27:10.1234423Z === teardown: curie local down ===
+2026-09-23T08:27:23.4873067Z stopping stack: ok (13.4s)
+2026-09-23T08:27:23.7956760Z removed 1 runner container(s)
+2026-09-23T08:27:23.7957266Z dev stack stopped
+2026-09-23T08:27:23.7958597Z volumes kept (fast restart with `curie local up`)
+2026-09-23T08:27:24.1054994Z ##[error]Process completed with exit code 1.
+2026-09-23T08:27:24.1167768Z Post job cleanup.
+2026-09-23T08:27:24.3850642Z ##[group]Generating build summary
+2026-09-23T08:27:24.4490640Z exporting build record to /home/runner/work/_temp/docker-actions-toolkit-nhfQLf/export

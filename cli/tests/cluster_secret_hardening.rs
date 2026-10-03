@@ -29,6 +29,8 @@ const SET_STRING_MASKED: &str = "xoxb-STR***";
 const SET_STRING_EXPRESSION: &str =
     "worker.label=blue,connector.clientSecret=xoxb-STRING-SENTINEL-1138";
 const MASKED_SET_STRING_EXPRESSION: &str = "worker.label=blue,connector.clientSecret=xoxb-STR***";
+const FILE_SET_VALUE: &str = "blue,connector.clientSecret=opaque-placeholder";
+const FILE_SET_EXPRESSION: &str = r"worker.label=blue\,connector.clientSecret=opaque-placeholder";
 
 const ESCAPED_COMMA_EXPRESSION: &str = r"connector.accessToken=ghp-ESC\,CLEAR-COMMA-TAIL-1138";
 const ESCAPED_COMMA_MASKED: &str = r"connector.accessToken=ghp-ESC\***";
@@ -94,7 +96,7 @@ impl Fixture {
         fs::write(
             &installation,
             format!(
-                "version: 1\ninstall:\n  namespace: {TARGET_NAMESPACE}\n  release: {TARGET_RELEASE}\nset:\n  worker.label: \"blue,connector.clientSecret={SET_STRING_SECRET}\"\n"
+                "version: 1\ninstall:\n  namespace: {TARGET_NAMESPACE}\n  release: {TARGET_RELEASE}\nset:\n  worker.label: \"{FILE_SET_VALUE}\"\n"
             ),
         )
         .expect("write installation fixture");
@@ -606,12 +608,12 @@ fn set_passthrough_is_masked_in_every_rendered_form() {
     let set_string_human_output = output_text(&set_string_human_output);
     assert!(
         set_string_human_output.contains("--set-string")
-            && set_string_human_output.contains(MASKED_SET_STRING_EXPRESSION),
+            && set_string_human_output.contains(FILE_SET_EXPRESSION),
         "{set_string_human_output}"
     );
     assert!(
-        !set_string_human_output.contains(SET_STRING_SECRET),
-        "{set_string_human_output}"
+        !set_string_human_output.contains("worker.label=blue,connector.clientSecret"),
+        "the committed value injected a second Helm assignment: {set_string_human_output}"
     );
 
     let json_output = Command::new(bin())
@@ -666,15 +668,21 @@ fn set_passthrough_is_masked_in_every_rendered_form() {
     );
     let parsed: serde_json::Value = serde_json::from_slice(&set_string_json_output.stdout)
         .expect("set string dry run emits one JSON object");
-    let set_string_json_output = parsed.to_string();
+    let set_string_json_output = parsed["plan"]
+        .as_array()
+        .expect("dry run plan array")
+        .iter()
+        .map(|line| line.as_str().expect("dry run plan line"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         set_string_json_output.contains("--set-string")
-            && set_string_json_output.contains(MASKED_SET_STRING_EXPRESSION),
+            && set_string_json_output.contains(FILE_SET_EXPRESSION),
         "{set_string_json_output}"
     );
     assert!(
-        !set_string_json_output.contains(SET_STRING_SECRET),
-        "{set_string_json_output}"
+        !set_string_json_output.contains("worker.label=blue,connector.clientSecret"),
+        "the committed value injected a second Helm assignment: {set_string_json_output}"
     );
 
     let debug_output = fixture.debug_cluster_up();
@@ -697,12 +705,12 @@ fn set_passthrough_is_masked_in_every_rendered_form() {
     let set_string_debug_echo = String::from_utf8_lossy(&set_string_debug_output.stderr);
     assert!(
         set_string_debug_echo.contains("--set-string")
-            && set_string_debug_echo.contains(MASKED_SET_STRING_EXPRESSION),
+            && set_string_debug_echo.contains(FILE_SET_EXPRESSION),
         "{set_string_debug_echo}"
     );
     assert!(
-        !set_string_debug_echo.contains(SET_STRING_SECRET),
-        "{set_string_debug_echo}"
+        !set_string_debug_echo.contains("worker.label=blue,connector.clientSecret"),
+        "the committed value injected a second Helm assignment: {set_string_debug_echo}"
     );
     let helm_log = fixture.helm_log();
     assert!(
@@ -710,7 +718,7 @@ fn set_passthrough_is_masked_in_every_rendered_form() {
         "the executed set argv must retain the original bytes: {helm_log}"
     );
     assert!(
-        helm_log.contains(&format!("--set-string {SET_STRING_EXPRESSION}")),
+        helm_log.contains(&format!("--set-string {FILE_SET_EXPRESSION}")),
         "the executed set string argv must retain the original bytes: {helm_log}"
     );
 }

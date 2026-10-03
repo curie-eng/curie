@@ -17,9 +17,12 @@ import re
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlsplit
 
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
+
+from .config import github_html_base
 
 if TYPE_CHECKING:
     from .publication_loop import PublicationJobObservation
@@ -72,6 +75,10 @@ class PublicationJobSettings:
     github_timeout_seconds: int = 30
     github_api_url: str = "https://api.github.com"
 
+    @property
+    def github_html_base(self) -> str:
+        return github_html_base(self.github_api_url)
+
 
 @dataclass(frozen=True)
 class PublicationPayload:
@@ -95,6 +102,7 @@ class PublicationPayload:
     github_pr_node_id: str | None
     open_as_draft: bool = False
     branch_prefix: str | None = None
+    base_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -236,13 +244,14 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 repo = os.environ["REPO_FULL_NAME"]
 branch = os.environ["BRANCH"]
 owner = repo.split("/", 1)[0]
 github_api = os.environ["GITHUB_API_URL"].rstrip("/")
+github_html = os.environ["GITHUB_HTML_BASE"]
 repo_api = f"{github_api}/repos/{repo}"
 api = f"{repo_api}/pulls"
 credential_path = Path(os.environ.get("CURIE_CREDENTIAL_PATH", "/credentials/credential"))
@@ -339,8 +348,15 @@ def validate_pull(
             "GitHub pull request head does not match the expected publication commit"
         )
     url = row.get("html_url")
-    prefix = f"https://github.com/{repo}/pull/"
+    prefix = f"{github_html}/{repo}/pull/"
     if not isinstance(url, str) or not url.casefold().startswith(prefix.casefold()):
+        raise SystemExit("GitHub did not return a usable pull request URL")
+    parsed_url = urlsplit(url)
+    if (
+        parsed_url.scheme != "https"
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+    ):
         raise SystemExit("GitHub did not return a usable pull request URL")
     url_number = url[len(prefix):]
     number = row.get("number")
@@ -398,7 +414,7 @@ if pr_number:
         raise SystemExit("stored pull request URL is missing")
     if phase in {"pre-push", "metadata-only"}:
         repository = request("GET", repo_api)
-        default_base = repository.get("default_branch")
+        default_base = os.environ.get("BASE_REF") or repository.get("default_branch")
         if not isinstance(default_base, str) or not default_base:
             raise SystemExit("GitHub repository has no default branch")
         current_pull = request("GET", f"{api}/{pr_number}")
@@ -498,7 +514,7 @@ else:
     # Query the deterministic head before POST, and again after an ambiguous
     # REST failure. This is the idempotency boundary for a lost response.
     repository = request("GET", repo_api)
-    default_base = repository.get("default_branch")
+    default_base = os.environ.get("BASE_REF") or repository.get("default_branch")
     if not isinstance(default_base, str) or not default_base:
         raise SystemExit("GitHub repository has no default branch")
     pull = existing(default_base)
@@ -646,8 +662,13 @@ def build_publication_resources(
         raise PublicationResourceError("publication pull request identity is incomplete")
     if payload.pr_number is not None and payload.pr_number <= 0:
         raise PublicationResourceError("publication pull request number must be positive")
-    if payload.clean_clone_url.casefold() != (
-        f"https://github.com/{payload.repo_full_name}.git".casefold()
+    parsed_clone = urlsplit(payload.clean_clone_url)
+    if (
+        parsed_clone.scheme != "https"
+        or parsed_clone.username is not None
+        or parsed_clone.password is not None
+        or payload.clean_clone_url.casefold()
+        != f"{settings.github_html_base}/{payload.repo_full_name}.git".casefold()
     ):
         raise PublicationResourceError(
             "publication clone URL does not match the requested repository"
@@ -732,6 +753,7 @@ def build_publication_resources(
         {"name": "REPO_FULL_NAME", "value": payload.repo_full_name},
         {"name": "CLEAN_CLONE_URL", "value": payload.clean_clone_url},
         {"name": "BASE_SHA", "value": payload.base_sha},
+        {"name": "BASE_REF", "value": payload.base_ref or ""},
         {"name": "BRANCH", "value": payload.branch},
         {"name": "REVISION_ID", "value": str(payload.revision_id)},
         {"name": "REVISION_NUMBER", "value": str(payload.revision_number)},
@@ -758,6 +780,7 @@ def build_publication_resources(
         {"name": "GIT_TIMEOUT_SECONDS", "value": str(settings.git_timeout_seconds)},
         {"name": "GITHUB_TIMEOUT_SECONDS", "value": str(settings.github_timeout_seconds)},
         {"name": "GITHUB_API_URL", "value": settings.github_api_url},
+        {"name": "GITHUB_HTML_BASE", "value": settings.github_html_base},
     ]
     pod_spec: dict[str, Any] = {
         "serviceAccountName": settings.service_account_name,
@@ -1283,7 +1306,7 @@ class KubernetesPublicationCluster:
                 tail = _MAX_JOB_ERROR - head - len(" ... ")
                 error = error[:head] + " ... " + error[-tail:]
         match = re.search(
-            r"^CURIE_PR_URL=(https://github\.com/[^\s]+/pull/\d+)$",
+            r"^CURIE_PR_URL=(https://[^\s]+/pull/[1-9][0-9]*)$",
             logs,
             re.MULTILINE,
         )

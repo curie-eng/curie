@@ -28,13 +28,12 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import pytest
+from curie_test_support.postgres import pg_connect_or_skip
 from curie_worker import binding, connector_loop
 from curie_worker.connector_agent import RenderedConnectors
 from curie_worker.connector_loop import ConnectorReconcileLoop
 from curie_worker.connector_reconcile import OWNER_LABEL
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from .test_connector_agent import FakeClient, live_copy, manifest
@@ -138,11 +137,10 @@ async def _cleanup(engine: AsyncEngine, agent_ids: list[uuid.UUID]) -> None:
 async def _engine_or_skip() -> AsyncEngine:
     engine = create_async_engine(_DB_URL)
     try:
-        async with engine.connect():
-            pass
-    except SQLAlchemyError as exc:
+        await pg_connect_or_skip(engine)
+    except BaseException:
         await engine.dispose()
-        pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+        raise
     return engine
 
 

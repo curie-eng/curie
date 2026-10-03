@@ -1,7 +1,7 @@
 """Which identities an installation declares (ADR-0168 decisions 1 and 3).
 
 Slack's are the chart's list, read from `CURIE_SLACK_IDENTITIES`, until
-ADR-0155's `provider_installations` exists (#2909). An out-of-process adapter's
+ADR-0166's `provider_installations` exists (#2909). An out-of-process adapter's
 name cannot be listed by the API, so other kinds keep the slug rule the write
 schema already applies.
 """

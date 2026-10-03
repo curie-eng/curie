@@ -38,6 +38,7 @@ from .approvals import ApprovalClient
 from .attachments import (
     AttachmentCoordinator,
     AttachmentLimits,
+    ChannelPortFileClient,
     SlackFileClient,
 )
 from .binding import BindingResolver
@@ -52,7 +53,7 @@ from .delivery_lease import DeliveryLeaseStore
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
-from .kernel import Kernel
+from .kernel import Kernel, drain_pending_memory_closes
 from .killswitch import KillSwitch
 from .markers import Markers
 from .progress import ProgressStore
@@ -82,6 +83,7 @@ from .sandbox import (
 )
 from .sibling_turns import build_sibling_limit
 from .slack_tokens import slack_bot_tokens
+from .stream_retention import StreamRetention, build_stream_retention
 from .threadlock import ThreadLock
 from .upgrade_drain import UpgradeDrainGate
 from .workitem_dispatch import WorkItemDispatchClient
@@ -130,6 +132,9 @@ class Runtime:
     publication_loop: PublicationReconcileLoop | None = None
     # None when the worker has no internal token and so no WorkItem client.
     orphan_sweeper: WorkItemOrphanSweeper | None = None
+    # Trims settled entries off the runs and eval streams (ADR 0184). Optional
+    # only so a Runtime constructed elsewhere need not name it.
+    stream_retention: StreamRetention | None = None
 
 
 # 365 days, the ceiling shared by all three operator-tunable seconds knobs
@@ -423,11 +428,13 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     # v0.8.8 answers it. The chart's ``worker.attachments.enabled`` gates the
     # sandbox half from the same value, so there is one knob and not two.
     #
-    # The credential condition is separate and unchanged: the lane's single job
-    # is to download a referenced file with the bot token, and the kernel treats a wired lane as
-    # authoritative, so a credential-less install (compose smoke, a mail-only
-    # deployment) must keep running every turn exactly as it does today rather
-    # than failing on the first message that carries a file.
+    # The credential condition is separate: the lane downloads a referenced
+    # file with a Slack bot token, or with a channel-port adapter's secret
+    # (ADR-0153), and the kernel treats a wired lane as authoritative. An
+    # install holding neither (compose smoke) keeps running every turn exactly
+    # as it does today rather than failing on the first message with a file.
+    # An install holding only one gets a lane whose other client is None, and
+    # a file on that other kind is refused by name.
     #
     # It parks bytes in the PRIVATE workspace store, never the public bundle
     # bucket -- under its own ``attachments/`` key prefix, with its retention
@@ -459,10 +466,19 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
                 for name, token in slack_tokens.items()
                 if name != DEFAULT_IDENTITY
             },
+            channel_files=(
+                ChannelPortFileClient(
+                    credentials=config.adapter_credentials,
+                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+                )
+                if config.adapter_credentials
+                else None
+            ),
             objects=workspace_objects,
             limits=_attachment_limits(config),
         )
-        if config.attachment_enabled and any(slack_tokens.values())
+        if config.attachment_enabled
+        and (any(slack_tokens.values()) or bool(config.adapter_credentials))
         else None
     )
     # One API-lane HTTP client shared by the approval writer (#244) and the two
@@ -544,7 +560,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         approval_reader=approval_client,
         actions=action_client,
         card_store=card_store,
-        hook_runs=HookRunRecorder(engine),
+        hook_runs=HookRunRecorder(engine, config.db_schema),
         route_ttl_seconds=sub_config.route_ttl_seconds,
         suspended_route_ttl_seconds=sub_config.suspended_route_ttl_seconds,
         work_items=work_items,
@@ -658,6 +674,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
             default_max_output_tokens_per_run=config.default_max_output_tokens_per_run,
         ),
         publication_loop=publication_loop,
+        stream_retention=build_stream_retention(config, async_redis),
     )
 
 
@@ -927,11 +944,12 @@ def _build_publication_loop(
         store=store,
         credentials=PublicationCredentialClient(
             api_base_url=config.api_base_url,
+            github_html_base=config.publication_github_html_base,
             worker_token=config.internal_worker_token,
             client=http,
         ),
         cluster=cluster,
-        github=GitHubPublicationLookup(http),
+        github=GitHubPublicationLookup(http, api_base_url=config.publication_github_api_url),
         lineage=PublicationLineageClient(
             api_base_url=config.api_base_url,
             worker_token=config.internal_worker_token,
@@ -1050,6 +1068,7 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
                 )
             else:
                 logger.exception("work-item orphan boot sweep failed; continuing boot")
+    retention = getattr(rt, "stream_retention", None)
     policy = _supervise_policy(config)
     try:
         # return_exceptions=True + per-task restart: a crash in one consumer must
@@ -1112,9 +1131,24 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
                 if sweeper is not None
                 else []
             ),
+            *(
+                [
+                    _supervise(
+                        "stream-retention",
+                        lambda: retention.run_forever(shutdown),
+                        shutdown,
+                        **policy,
+                    )
+                ]
+                if retention is not None
+                else []
+            ),
             return_exceptions=True,
         )
     finally:
+        # Memory turn closes still in flight get a short grace, then are let
+        # go: an unclosed credential is refused at its expiry anyway (#3776).
+        await drain_pending_memory_closes()
         await rt.runner.close()
         await rt.sink.aclose()
         await rt.eval_http.aclose()

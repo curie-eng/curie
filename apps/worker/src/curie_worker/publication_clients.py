@@ -10,6 +10,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
+from .config import github_html_base
 from .publication_loop import (
     PublicationCredential,
     PublicationIdentityUnavailable,
@@ -127,12 +128,14 @@ class PublicationCredentialClient:
         self,
         *,
         api_base_url: str,
+        github_html_base: str,
         worker_token: str,
         client: httpx.AsyncClient,
     ) -> None:
         if not worker_token:
             raise ValueError("publication credentials require internal worker auth")
         self._base = api_base_url.rstrip("/")
+        self._github_html_base = github_html_base.rstrip("/")
         self._headers = {"X-Curie-Worker-Token": worker_token}
         self._client = client
 
@@ -167,10 +170,10 @@ class PublicationCredentialClient:
         parsed = urlsplit(clone_url)
         if (
             parsed.scheme != "https"
-            or parsed.hostname != "github.com"
+            or parsed.hostname != urlsplit(self._github_html_base).hostname
             or parsed.username is not None
             or parsed.password is not None
-            or clone_url != f"https://github.com/{repo}.git"
+            or clone_url != f"{self._github_html_base}/{repo}.git"
         ):
             raise PublicationReconcileError(
                 "publication credential response carried a non-canonical clone URL"
@@ -284,6 +287,7 @@ class GitHubPublicationLookup:
     ) -> None:
         self._client = client
         self._api_base = api_base_url.rstrip("/")
+        self._html_base = github_html_base(api_base_url)
 
     async def read_pr_by_number(
         self,
@@ -320,11 +324,19 @@ class GitHubPublicationLookup:
             merged_at = row.get("merged_at")
         except (KeyError, TypeError, ValueError) as exc:
             raise PublicationReconcileError("GitHub returned an invalid pull request") from exc
-        if number != pr_number or re.fullmatch(
-            rf"https://github\.com/{re.escape(repo_full_name)}/pull/{pr_number}",
-            url,
-            re.IGNORECASE,
-        ) is None:
+        parsed_url = urlsplit(url)
+        if (
+            parsed_url.scheme != "https"
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or number != pr_number
+            or re.fullmatch(
+                rf"{re.escape(self._html_base)}/{re.escape(repo_full_name)}/pull/{pr_number}",
+                url,
+                re.IGNORECASE,
+            )
+            is None
+        ):
             raise PublicationReconcileError("GitHub returned the wrong stored pull request")
         if re.fullmatch(r"[0-9a-f]{40,64}", head_sha) is None or not head_ref:
             raise PublicationReconcileError("GitHub pull request head is invalid")
@@ -419,6 +431,7 @@ class GitHubPublicationLookup:
         expected_head_sha: str,
         authorization_header: str,
         draft: bool = False,
+        base: str | None = None,
     ) -> PublicationPullState | None:
         """Adopt a PR, or create it only when its deterministic branch exists."""
 
@@ -430,7 +443,7 @@ class GitHubPublicationLookup:
             raise PublicationReconcileError(
                 "GitHub deterministic-head recovery expected commit is invalid"
             )
-        default_branch = await self._default_branch(
+        default_branch = base or await self._default_branch(
             repo_full_name,
             authorization_header=authorization_header,
         )
@@ -562,8 +575,8 @@ class GitHubPublicationLookup:
             )
         return default_branch
 
-    @staticmethod
     def _pull_state(
+        self,
         response: httpx.Response,
         repo_full_name: str,
         *,
@@ -640,11 +653,20 @@ class GitHubPublicationLookup:
             raise PublicationReconcileError(
                 "GitHub pull request head does not match the expected commit"
             )
-        if not isinstance(url, str) or re.fullmatch(
-            rf"https://github\.com/{re.escape(repo_full_name)}/pull/[1-9][0-9]*",
-            url,
-            re.IGNORECASE,
-        ) is None:
+        if not isinstance(url, str):
+            raise PublicationReconcileError("GitHub returned an invalid pull request URL")
+        parsed_url = urlsplit(url)
+        if (
+            parsed_url.scheme != "https"
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or re.fullmatch(
+                rf"{re.escape(self._html_base)}/{re.escape(repo_full_name)}/pull/[1-9][0-9]*",
+                url,
+                re.IGNORECASE,
+            )
+            is None
+        ):
             raise PublicationReconcileError("GitHub returned an invalid pull request URL")
         number = payload.get("number")
         if (

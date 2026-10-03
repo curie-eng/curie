@@ -25,13 +25,17 @@ reclaimed event that already finished is skipped.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
+import hashlib
 import json
 import logging
+import math
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -41,6 +45,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 from aci_protocol import (
+    TOOL_ACCESS_STATUS_FIELD,
     ErrorEvent,
     Event,
     Final,
@@ -53,6 +58,7 @@ from aci_protocol import (
     SessionStatus,
     SideEffectFlag,
     TextDelta,
+    ToolAccess,
     ToolNote,
     TurnSource,
 )
@@ -62,6 +68,7 @@ from channel_protocol import (
     Action,
     ConfirmIntent,
     OutboundMessage,
+    parse_scoped_conversation_id,
     scoped_conversation_id,
 )
 from channel_protocol.reply import (
@@ -81,9 +88,10 @@ from opentelemetry.trace import SpanKind, StatusCode
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 from pydantic import ValidationError
 
-from . import sandbox_token
+from . import caller_token, sandbox_token
 from .actions import ActionBackendError, ActionRecorder
 from .approval_cards import ApprovalCardStore
+from .approval_wording import approval_display
 from .approvals import (
     ApprovalBackendError,
     ApprovalCreator,
@@ -95,7 +103,9 @@ from .approvals import (
     PublicationCreator,
     PublicationLineage,
     ReviewAuthorityUnavailable,
+    SettledApproval,
     VerifiedReviewFeedback,
+    approver_fields,
     decided_field,
 )
 from .attachments import (
@@ -114,8 +124,12 @@ from .behaviorpacks import (
 from .binding import (
     CONNECTOR_CALLER_TOKEN_ENV,
     DECISION_ENV,
+    DEFAULT_EXECUTION_DEADLINE_SECONDS,
+    EVAL_ISOLATE_THREAD_PREFIX,
     GRANT_ARGUMENTS_ENV,
     GRANT_TOOL_ENV,
+    ISSUE_READ_TOKEN_ENV,
+    ISSUE_READ_URL_ENV,
     MAX_TURNS_ENV,
     PROGRESS_TOKEN_ENV,
     PROGRESS_URL_ENV,
@@ -123,6 +137,7 @@ from .binding import (
     SANDBOX_TOKEN_TTL_SECONDS,
     AmbiguousRoute,
     BindingResolver,
+    binding_adapter_for_handle,
 )
 from .capacity_wait import (
     CapacityWaitExpired,
@@ -131,6 +146,7 @@ from .capacity_wait import (
     current_wait,
 )
 from .config import WorkerConfig
+from .connector_grant import mint as mint_connector_grant
 from .delivery_lease import DeliveryLease, LeaseLostError
 from .hook_runs import HookRunOutcome, HookRunRecorder, HookRunRecorderError, retry_expiry
 from .killswitch import KillSwitch
@@ -165,6 +181,7 @@ from .sandbox.types import (
     RouteState,
     SandboxError,
     SandboxHandle,
+    SandboxTermination,
     SuspendedThreadError,
     UnschedulableClaimError,
 )
@@ -381,7 +398,9 @@ def _thread_key_for(qevent: QueuedTurn) -> str:
     is a segment after the kind unless it is none or ``default``
     (ADR-0168 decision 4), built by ``channel_protocol.scoped_conversation_id``
     itself, so a pre-ADR key is unchanged and a named one has one more
-    segment. The worker only compares the key; it never parses it back.
+    segment. The worker only compares the key; the one place it reads a key
+    back is quota-pressure ordering (``_is_eval_thread_key``), through the
+    canonical inverse.
     """
     if qevent.reply_handle is None and qevent.hook_run is not None:
         # A targetless cron turn (#2963) has no channel pair; its thread belongs
@@ -389,12 +408,26 @@ def _thread_key_for(qevent: QueuedTurn) -> str:
         # never collide with a bound (kind, address).
         return scoped_conversation_id("@cron", qevent.hook_run.agent_id, qevent.conversation_id)
     handle = _reply_handle_for(qevent)
+    # @spec WORKER-CANARY-3: scope relay state by its binding identity while
+    # keeping the handle's adapter reserved for delivery.
     return scoped_conversation_id(
         handle.kind,
         handle.channel,
         qevent.conversation_id,
-        identity=route_identity(handle.kind, handle.adapter),
+        identity=route_identity(handle.kind, binding_adapter_for_handle(handle)),
     )
+
+
+def _is_eval_thread_key(thread_key: str) -> bool:
+    """True when ``thread_key`` was built from an eval conversation id.
+
+    The eval paths stamp ``EVAL_ISOLATE_THREAD_PREFIX`` onto the conversation id
+    (#1909), and ``_thread_key_for`` scopes it, so the prefix is only visible
+    after the canonical inverse. A key that does not parse is not an eval key:
+    quota-pressure ordering then falls back to plain expiry order.
+    """
+    parsed = parse_scoped_conversation_id(thread_key)
+    return parsed is not None and parsed.conversation_id.startswith(EVAL_ISOLATE_THREAD_PREFIX)
 
 
 def _route_from_handle(qevent: QueuedTurn) -> TargetRoute:
@@ -514,9 +547,22 @@ def _exception_reason(exc: BaseException) -> str:
 # blip was transient before it had a name and still is, and the side-effect
 # check above still runs first, so a workspace failure that somehow arrives
 # after a side-effect frame escalates rather than replaying it.
+# ``sandbox-capacity`` (#3693) is a ResourceQuota refusal on an approval resume,
+# which retries rather than taking the ordinary capacity reply. It is named
+# apart from ``runner-error`` because no runner was reached: the agent was busy.
 RETRYABLE_CLASSIFICATIONS = frozenset(
-    {"rate-limit", "runner-error", "runner-timeout", "workspace-error"}
+    {
+        "rate-limit",
+        "runner-error",
+        "runner-timeout",
+        "sandbox-capacity",
+        "sandbox-terminated",
+        "workspace-error",
+    }
 )
+
+#: The class a restricted turn fails under when its runner cannot enforce it.
+TOOL_ACCESS_UNENFORCED_CLASSIFICATION = "tool-access-unenforced"
 
 # Platform ErrorEvent.classification vocabulary. Allowlist-constrain only: do
 # not synonym-map SDK ``rate_limit`` onto platform ``rate-limit``, which would
@@ -539,10 +585,17 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
         # #3071: the SDK's turn cap ran out (``error_max_turns``). Not retryable:
         # a retry would spend the same budget and stop at the same place.
         "max-turns",
+        # WORKER-TOOL-ACCESS-5: the runner's refusals of a restricted turn
+        # (``curie_runner.tool_access``), and the worker's own for a runner that
+        # cannot enforce one. Not retryable: the same runner refuses again.
+        TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+        "tool-access-refused",
     }
 )
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
-WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset({"runner-timeout-unconfirmed"})
+WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
+    {"runner-timeout-unconfirmed", "sandbox-capacity", "sandbox-terminated"}
+)
 
 _ESCALATION_DETAIL_MAX = 300
 
@@ -564,6 +617,7 @@ _ESCALATION_CAUSES = {
     "budget-exceeded": "budget_exceeded",
     "runner-timeout": "runner_timeout",
     "runner-timeout-unconfirmed": "runner_timeout",
+    "sandbox-terminated": "sandbox_terminated",
     "workspace-error": "workspace_error",
     "history-persistence-error": "history_capacity",
     # #3401: max-turns and an unclassified runner failure used to collapse into
@@ -579,6 +633,23 @@ def _escalation_cause(failure: TurnOutcome | None) -> str:
     if failure is None or failure.classification is None:
         return "runner_escalated"
     return _ESCALATION_CAUSES.get(failure.classification, "runner_escalated")
+
+
+def _sandbox_termination_detail(termination: SandboxTermination) -> str:
+    """Render bounded, redacted Kubernetes diagnosis for terminal surfaces."""
+
+    reason = termination.reason
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", reason) is None:
+        reason = "Unknown"
+    lead = f"Kubernetes pod terminated: {reason}"
+    detail = termination.detail
+    if not isinstance(detail, str):
+        return f"{lead}."
+    safe_detail = " ".join(redact_text(detail).split())
+    if not safe_detail:
+        return f"{lead}."
+    max_detail = _ESCALATION_DETAIL_MAX - len(lead) - len(" ().")
+    return f"{lead} ({safe_detail[:max_detail]})."
 
 
 def _display_error_classification(raw: str | None) -> str:
@@ -631,6 +702,14 @@ _CLASSIFICATION_GUIDANCE = {
         "Conversation history capacity exceeded. Work already performed may have side "
         "effects; inspect the result. The run can be retried; if one turn is over the "
         "cap, raise api.transcriptMaxThreadBytes (TRANSCRIPT_MAX_THREAD_BYTES)."
+    ),
+    # Read by the person who decided the approval. One event id resumes an
+    # approved, a rejected and an expired approval, so it names no decision.
+    # No quota detail (#2434): the worker's "sandbox capacity exhausted"
+    # warning carries it for the operator.
+    "sandbox-capacity": (
+        "The agent was at capacity, so it could not continue after the approval "
+        "decision. Send the request again in a few minutes if it is still needed."
     ),
 }
 
@@ -724,6 +803,17 @@ def _escalation_text(
 # guaranteed to be cut off mid-flight -- it buys nothing and spends the last of
 # the deadline that the escalation and the terminal settle still need.
 _MIN_ATTEMPT_BUDGET_S = 5.0
+
+# Start-refusal codes that mean the work item settled terminally, so the
+# execution is over and the delivering worker is the only one that can release
+# the sandbox claim it just made (#3208). ``not_dispatchable`` is excluded on
+# purpose: it also covers a lapsed acquire lease, where a replacement consumer
+# re-acquires the same generation and adopts this thread's route, so the claim
+# must survive the refusal. The passthrough set is defined by the API's
+# ``_map_start_conflict``; keep the two in sync.
+_WORK_ITEM_TERMINAL_START_REFUSALS = frozenset(
+    {"work_item_cancelled", "waiting_deadline_elapsed", "not_found"}
+)
 
 # A factory execute turn that ends done or idle without calling publish_changes
 # is re-prompted once in the same session (#3128). The progress tool's canonical
@@ -864,9 +954,41 @@ _PRESSURE_OUTCOMES = frozenset(
 
 
 @dataclass(frozen=True)
+class _ApprovalPause:
+    """What ``_pause_for_approval`` did: created the approval, or not and why.
+
+    ``failure_detail`` is the API's redacted, clipped coded refusal (#3617)
+    when the create was refused with one; the factory run reports it.
+    """
+
+    created: bool
+    failure_detail: str | None = None
+
+    @classmethod
+    def refused(cls, detail: str | None) -> _ApprovalPause:
+        clipped = redact_text(detail)[:_ESCALATION_DETAIL_MAX] if detail else None
+        return cls(created=False, failure_detail=clipped or None)
+
+
+@dataclass(frozen=True)
 class _PressureResult:
     reclaimed: bool
     outcome: str
+
+
+@dataclass(frozen=True)
+class TurnMemoryGrant:
+    """What the kernel needs to mint a turn's memory write credential (ADR-0188).
+
+    Built in the routing block from the resolved deployment and the turn's
+    binding, and handed to ``_attempt``, which mints a fresh credential per
+    attempt onto the runner ``Event`` (never the boot env). Absent for a
+    targetless turn and an eval-isolated one."""
+
+    resolved: Any
+    kind: str
+    address: str
+    thread_key: str
 
 
 class ReclaimPreflightUnsafe(RuntimeError):
@@ -958,6 +1080,35 @@ def _valid_notification_endpoint(endpoint: Any) -> bool:
 # ``ApprovalRequestingSurfaceTarget`` (``schemas.REQUESTING_SURFACE_MODE``).
 _REQUESTING_SURFACE = {"mode": "requesting_surface"}
 
+# ADR-0177 amendment: the channels whose approvals are answered from a route's approver
+# ``emails``. Only email today: the mail adapter's kind, and the API's
+# ``schemas.EMAIL_KIND``. A set rather than a comparison, because the question
+# the raise path asks is "does this channel read an email list", not "which
+# channel is this" (the reply seam stays kind-free, see test_reply_wire).
+_APPROVER_EMAIL_KINDS = frozenset({"email"})
+
+
+def _approver_emails(binding: Any) -> list[str]:
+    """The approver email addresses a route binding lists (ADR-0177 amendment).
+
+    Without them, nobody can answer an approval shown in an email thread: the
+    requester is no longer admitted by default. The API validates the list's
+    entries when it is written and re-reads it at resolve time; this answers
+    only the raise-time questions "is there anyone at all" and "who, to name on
+    the card", so it asks for a non-empty list of strings and fails closed to
+    an empty list on any other shape.
+    """
+
+    if not isinstance(binding, dict):
+        return []
+    approvers = binding.get("approvers")
+    if not isinstance(approvers, dict):
+        return []
+    emails = approvers.get("emails")
+    if not isinstance(emails, list) or not all(isinstance(e, str) for e in emails):
+        return []
+    return list(emails)
+
 
 def _parse_approval_targets(
     binding: Any,
@@ -1046,6 +1197,28 @@ def _parse_approval_targets(
     ):
         return None
     return resolution_pair, (kind, address, TargetRoute(endpoint=endpoint, adapter=adapter))
+
+
+def _settled_outcome(
+    record: SettledApproval,
+) -> tuple[SettledOutcome, datetime | None] | None:
+    """A resolved record's outcome to stamp and its decision time (#1084).
+
+    None for any record that is not approved or rejected: a pending one has no
+    verdict, and an expiry names no decision, so its caller settles it apart.
+    """
+
+    if record.status not in ("approved", "rejected"):
+        return None
+    return (
+        SettledOutcome(
+            requested_by="",
+            decision=record.status,
+            resolver=record.resolved_by,
+            note=record.resolution_note,
+        ),
+        record.resolved_at,
+    )
 
 
 def _approval_id_from_resume_event(event_id: str) -> str | None:
@@ -1184,6 +1357,30 @@ class ThreadBusyError(RuntimeError):
     """
 
 
+class ToolAccessUnenforced(Exception):
+    """The runner a restricted turn would go to does not enforce its access.
+
+    @spec WORKER-TOOL-ACCESS-2: a runner that does not list the value under
+    ``tool_access`` would ignore the field and run the turn unrestricted, or
+    cannot enforce it on this session, so the turn is refused once and never
+    retried against the same boot.
+    """
+
+    def __init__(self, access: ToolAccess) -> None:
+        super().__init__(f"the runner does not advertise tool access {access.value!r}")
+        self.public_detail = (
+            f"This agent cannot start: its runner cannot enforce {access.value} tool "
+            "access for this turn, so the turn was not run."
+        )
+
+
+#: The escalation a read-only turn gets when its runner nonetheless ends it
+#: awaiting approval (WORKER-TOOL-ACCESS-4).
+_READ_ONLY_APPROVAL_REFUSAL = (
+    "This read-only turn asked for an approval, which it may not do. No approval was created."
+)
+
+
 class LiveSessionBusy(ThreadBusyError):
     """The busy read under the per-thread lock found a live session.
 
@@ -1271,6 +1468,108 @@ _PUBLICATION_CONTEXT: ContextVar[PublicationContext | None] = ContextVar(
 _TURN_PROGRESS: ContextVar[TurnProgressPlan | None] = ContextVar(
     "curie_worker_turn_progress", default=None
 )
+
+
+@dataclass(frozen=True)
+class _MemoryMint:
+    """What this attempt's runner call needs to mint its memory credential.
+
+    Set for the routing of one attempt, and read where the turn actually opens
+    (``_start_turn_under_hook_control``) or steers. Minting there, rather than
+    when the attempt starts, ties the credential's expiry to the stream deadline
+    the runner call uses, after the sandbox claim (ADR-0188)."""
+
+    qevent: QueuedTurn
+    grant: TurnMemoryGrant
+
+
+_MEMORY_MINT: ContextVar[_MemoryMint | None] = ContextVar("curie_worker_memory_mint", default=None)
+
+
+@dataclass
+class _AttemptMemoryTurns:
+    """The memory write credentials one ``_attempt`` minted (#3776).
+
+    ``_with_memory_token`` records each turn claim here, so the attempt can tell
+    the API those turns are over when it ends. ``steered`` means the attempt
+    folded into another attempt's live turn, which keeps using the credential;
+    ``steered_into`` names that live turn (``_live_memory_turn``), or is None
+    when the runner did not say which turn it was. ``live_turns`` are the
+    runner turns this attempt opened, so it also closes the steers that joined
+    each of them."""
+
+    agent_id: uuid.UUID | None = None
+    minted: list[tuple[uuid.UUID, str]] = field(default_factory=list)
+    steered: bool = False
+    steered_into: str | None = None
+    live_turns: list[str] = field(default_factory=list)
+
+
+# Per attempt, like the carries above; set and reset by ``Kernel._attempt``.
+_MEMORY_TURNS: ContextVar[_AttemptMemoryTurns | None] = ContextVar(
+    "curie_worker_memory_turns", default=None
+)
+# Strong references to in-flight closes, so a close scheduled in the background
+# is not garbage collected before it finishes.
+_PENDING_MEMORY_CLOSES: set[asyncio.Task[None]] = set()
+# The bound on one close call, so a hung API cannot keep a close task (and the
+# shutdown grace below) waiting. The binding client's own timeout is 5 s.
+_MEMORY_CLOSE_TIMEOUT_S = 6.0
+# How long shutdown waits for closes still in flight.
+_MEMORY_CLOSE_SHUTDOWN_GRACE_S = 2.0
+
+
+def _live_memory_turn(epoch: object) -> str | None:
+    """The name a steer and its live turn's owner both use for that turn (#3776).
+
+    The runner's turn epoch, which the owner gets when it opens the turn and a
+    steer reads from the pre-steer status. Hashed, because the epoch is the
+    turn's private timeout credential and this name goes into a Valkey key."""
+
+    if not isinstance(epoch, str) or not epoch:
+        return None
+    return hashlib.sha256(epoch.encode()).hexdigest()[:32]
+
+
+def _note_live_memory_turn(turn: object) -> None:
+    """Record a runner turn the current attempt opened, for its steers' close."""
+
+    record = _MEMORY_TURNS.get()
+    live = _live_memory_turn(getattr(turn, "turn_epoch", None))
+    if record is not None and live is not None:
+        record.live_turns.append(live)
+
+
+async def _close_memory_turn(
+    close: Callable[[uuid.UUID, str], Awaitable[None]], agent: uuid.UUID, turn: str
+) -> None:
+    """One close call, bounded and logged; it never raises."""
+
+    try:
+        async with asyncio.timeout(_MEMORY_CLOSE_TIMEOUT_S):
+            await close(agent, turn)
+    except TimeoutError:
+        logger.warning("memory turn close timed out for %s", turn)
+    except Exception as exc:  # noqa: BLE001 -- a close never fails the turn
+        logger.warning("memory turn close failed for %s: %s", turn, type(exc).__name__)
+
+
+def _settled_memory_close(task: asyncio.Task[None]) -> None:
+    _PENDING_MEMORY_CLOSES.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning("memory turn close failed: %s", type(task.exception()).__name__)
+
+
+async def drain_pending_memory_closes(grace_s: float = _MEMORY_CLOSE_SHUTDOWN_GRACE_S) -> None:
+    """On worker shutdown, give the closes still in flight a short grace (#3776).
+
+    Then let them go: a close that does not finish leaves its credential to
+    expire at the turn's stream deadline, which is the backstop anyway, so
+    shutdown is not held up waiting for a slow API."""
+
+    pending = [task for task in _PENDING_MEMORY_CLOSES if not task.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=grace_s)
 
 
 def _hook_success_outcome() -> HookRunOutcome | None:
@@ -1483,13 +1782,18 @@ class _ThrottledReply:
                 self._on_ref(ack.ref)
 
 
-def _boots_differently(handle: SandboxHandle, boot_env: Mapping[str, str] | None) -> bool:
+def _boots_differently(
+    handle: SandboxHandle,
+    boot_env: Mapping[str, str] | None,
+    *,
+    caller_run: str | None = None,
+) -> bool:
     """Whether a live runner booted with facts this delivery must not inherit.
 
-    Two are read once at boot. ``CURIE_MAX_TURNS`` (#3071), and the connector
-    caller token (ADR-0168 decision 7): a runner claimed before the install
-    had a caller key carries none, and every hosted connector's proxy refuses
-    it, so the next turn on its thread gets a fresh runner instead.
+    Read once at boot: ``CURIE_MAX_TURNS`` (#3071), the connector caller token
+    (ADR-0168 decision 7), and the run that token names (ADR 0178). A runner
+    claimed before the install had a caller key, or booted for a different
+    run, is replaced on the next new turn.
     """
 
     env = boot_env or {}
@@ -1497,7 +1801,57 @@ def _boots_differently(handle: SandboxHandle, boot_env: Mapping[str, str] | None
         return True
     if (ELIGIBILITY_ENV in env) != handle.carries_turn_progress:
         return True
+    if handle.caller_run != caller_run:
+        return True
     return CONNECTOR_CALLER_TOKEN_ENV in env and not handle.carries_caller_token
+
+
+def _caller_token_exp(token: str) -> int | None:
+    """The ``exp`` claim of a caller token, or None when the token is unreadable."""
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+    except (ValueError, binascii.Error):
+        return None
+    exp = payload.get("exp") if isinstance(payload, dict) else None
+    if type(exp) is not int:
+        return None
+    return exp
+
+
+def _connector_tool_grant(
+    tool: object,
+    arguments: object,
+    *,
+    agent: str | None,
+    signing_key_text: str,
+) -> str | None:
+    """Mint a proxy grant for one connector live name, or None when it is not one.
+
+    ``mcp__<connector>__<tool>`` only. A plugin tool (``mcp__plugin_``) and a
+    resume that did not carry a dict of arguments mint nothing.
+    """
+
+    if not isinstance(tool, str) or not isinstance(arguments, dict):
+        return None
+    if not tool.startswith("mcp__") or tool.startswith("mcp__plugin_"):
+        return None
+    connector, separator, upstream = tool.removeprefix("mcp__").partition("__")
+    if not separator or not connector or not upstream or not agent or not signing_key_text.strip():
+        return None
+    return mint_connector_grant(
+        signing_key_text,
+        agent=agent,
+        connector=connector,
+        tool=upstream,
+        args=json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+        exp=int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS,
+        jti=str(uuid.uuid4()),
+    )
 
 
 class Kernel:
@@ -1599,6 +1953,11 @@ class Kernel:
         # Which threads are running which agent, so a kill interrupts the agent's
         # live turns. Populated while a turn owner streams.
         self._active_by_agent: dict[uuid.UUID, set[str]] = {}
+        # ADR-0188: the wall-clock stream deadline of each live turn this worker
+        # opened, by the memory grant's thread key. A steer's memory credential
+        # is capped at it, because a steer ends when the live turn ends. Entries
+        # past their deadline are dropped whenever one is recorded.
+        self._turn_deadlines: dict[str, float] = {}
         # In-process per-thread lock over the route/start critical section only.
         # asyncio.Lock is FIFO, so same-thread events from one worker open/steer
         # the runner in arrival order (ordering preserved under concurrent sends).
@@ -1636,14 +1995,60 @@ class Kernel:
     def owns_work_item(self, request_id: uuid.UUID) -> bool:
         """Whether this process still holds the WorkItem run (#3076).
 
-        A live run that has not finished, or one parked for approval, is ours;
-        the orphan sweeper must never declare either lost.
+        A live run that has not finished is ours, and the orphan sweeper must
+        never declare it lost. A run parked for approval is ours only until its
+        execution deadline: past it the continuation can no longer finish the
+        request, so the entry is evicted and the sweeper may declare it lost
+        (#3564).
         """
 
+        self._evict_expired_held_work_items()
         run = self._work_item_runs.get(request_id)
         if run is not None and not run.finished:
             return True
         return any(held.request_id == request_id for held in self._held_work_items.values())
+
+    def _evict_expired_held_work_items(self) -> None:
+        """Drop held runs whose execution deadline has passed (#3564).
+
+        A held run already closed its heartbeat when it parked, so eviction is
+        local bookkeeping only. A held run always has a deadline, because
+        holding requires start; an entry without one is kept.
+        """
+
+        now = datetime.now(UTC)
+        for thread_key, held in list(self._held_work_items.items()):
+            if held.execution_deadline is None or held.execution_deadline > now:
+                continue
+            del self._held_work_items[thread_key]
+            logger.warning(
+                "evicting held work item %s on thread %s: execution deadline %s passed",
+                held.request_id,
+                thread_key,
+                held.execution_deadline.isoformat(),
+            )
+
+    def _forget_held_work_items(
+        self,
+        *,
+        reason: str,
+        thread_key: str | None = None,
+        agent_id: uuid.UUID | None = None,
+    ) -> None:
+        """Drop held runs for a thread or an agent, so none outlives its end (#3564)."""
+
+        for key, held in list(self._held_work_items.items()):
+            if thread_key is not None and key != thread_key:
+                continue
+            if agent_id is not None and held.agent_id != agent_id:
+                continue
+            del self._held_work_items[key]
+            logger.warning(
+                "dropping held work item %s on thread %s: %s",
+                held.request_id,
+                key,
+                reason,
+            )
 
     def _target_for(self, qevent: QueuedTurn) -> ReplyTarget:
         """This turn's reply target, including any ref minted during the turn.
@@ -2173,6 +2578,9 @@ class Kernel:
         runner by the original execution deadline.
         """
 
+        # An expired held run cannot be finished by this continuation; evict it
+        # so the lookup below asks the API instead (#3564).
+        self._evict_expired_held_work_items()
         held = self._held_work_items.pop(thread_key, None)
         if held is None and self._work_items is not None:
             try:
@@ -2543,6 +2951,9 @@ class Kernel:
             nav: NavAffordance | None = None
             packs: BehaviorPacks | None = None
             approval_routes: dict[str, Any] | None = None
+            # ADR-0188: a targetless turn names no binding, so it never gets a
+            # memory write credential.
+            memory_grant: TurnMemoryGrant | None = None
             if targetless:
                 # Routed by the hook run's agent, never a channel binding (#2963).
                 # The id is the one the hook row lookup parsed and matched, not
@@ -2604,9 +3015,11 @@ class Kernel:
                 # under two kinds, and one pair can answer to only one identity
                 # at a time, so dropping either would answer with somebody
                 # else's route.
+                # @spec WORKER-CANARY-1 WORKER-CANARY-2: the relay's identity
+                # chooses the binding; its adapter stays on the reply route.
                 try:
                     resolved = await self._binding.resolve(
-                        handle.kind, handle.adapter, handle.channel
+                        handle.kind, binding_adapter_for_handle(handle), handle.channel
                     )
                 except AmbiguousRoute as exc:
                     await self._drop_ambiguous_route(qevent, route, exc, lease=lease)
@@ -2617,7 +3030,11 @@ class Kernel:
                     undeployed_lookup = getattr(self._binding, "undeployed_binding", None)
                     try:
                         undeployed = (
-                            await undeployed_lookup(handle.kind, handle.adapter, handle.channel)
+                            # @spec WORKER-CANARY-2 WORKER-CANARY-4: use the
+                            # same binding selector for the diagnostic path.
+                            await undeployed_lookup(
+                                handle.kind, binding_adapter_for_handle(handle), handle.channel
+                            )
                             if undeployed_lookup is not None
                             else None
                         )
@@ -2733,6 +3150,39 @@ class Kernel:
                 # the stable sandbox/history identity (#1909 + ADR-0096).
                 if qevent.conversation_id.startswith("eval:"):
                     boot_env_kwargs["isolate_memory"] = True
+                else:
+                    # ADR-0188: an eval-isolated turn carries no memory, so no
+                    # write credential either.
+                    memory_grant = TurnMemoryGrant(
+                        resolved=resolved,
+                        kind=handle.kind,
+                        address=handle.channel,
+                        thread_key=thread_key,
+                    )
+                caller_for_boot = (
+                    self._work_item_runs.get(owned_work_item_id)
+                    if owned_work_item_id is not None
+                    else None
+                )
+                if caller_for_boot is not None:
+                    if caller_for_boot.execution_deadline is not None:
+                        caller_ceiling = int(caller_for_boot.execution_deadline.timestamp())
+                    else:
+                        seconds = DEFAULT_EXECUTION_DEADLINE_SECONDS
+                        reader = getattr(self._binding, "execution_deadline_seconds_for", None)
+                        if reader is not None and agent_id is not None:
+                            try:
+                                seconds = int(await reader(agent_id))
+                            except Exception:  # noqa: BLE001 - a missing column still boots
+                                logger.warning(
+                                    "execution deadline read failed agent=%s; using the default",
+                                    agent_id,
+                                )
+                                seconds = DEFAULT_EXECUTION_DEADLINE_SECONDS
+                        caller_ceiling = int(time.time()) + seconds
+                    boot_env_kwargs["caller_run"] = str(caller_for_boot.request_id)
+                    boot_env_kwargs["caller_work_item"] = str(caller_for_boot.work_item_id)
+                    boot_env_kwargs["caller_exp_ceiling"] = caller_ceiling
                 boot_env = self._binding.boot_env(
                     resolved,
                     thread_key,
@@ -2752,9 +3202,10 @@ class Kernel:
                 # sandbox. getattr: binding doubles may not carry the method, like the
                 # approval_routes probe below. See docs/interfaces/approval/INTERFACE.md.
                 grant_fn = getattr(self._binding, "approval_grant_tool", None)
+                # @spec WORKER-TOOL-ACCESS-4: never a grant for a restricted turn.
                 grant_tool = (
                     await grant_fn(qevent.event_id, resolved.agent_id)
-                    if grant_fn is not None
+                    if grant_fn is not None and qevent.tool_access is None
                     else None
                 )
                 if grant_tool:
@@ -2766,6 +3217,16 @@ class Kernel:
                         boot_env[GRANT_ARGUMENTS_ENV] = json.dumps(
                             grant_arguments, sort_keys=True, separators=(",", ":")
                         )
+                    # A connector live name is mcp__<server>__<tool>. Plugin
+                    # tools and a resume with no arguments mint no connector grant.
+                    connector_grant = _connector_tool_grant(
+                        grant_tool,
+                        grant_arguments,
+                        agent=agent_name if isinstance(agent_name, str) else None,
+                        signing_key_text=self._config.connector_caller_signing_key,
+                    )
+                    if connector_grant is not None:
+                        boot_env["CURIE_CONNECTOR_TOOL_GRANT"] = connector_grant
                 # A factory execution may report its phases for the live status
                 # card (#3077). The token is bound to this request and to the
                 # work_item.progress scope only; no other turn carries it.
@@ -2780,6 +3241,31 @@ class Kernel:
                         scope="work_item.progress",
                         exp=int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS,
                     )
+                # The bundle reads its issue through the platform (ADR 0187):
+                # the API mints a capability naming this execution and its
+                # WorkItem's issue, and the runner mounts get_issue only when
+                # it is present. A refused or failed mint leaves the tool off
+                # and never stops the boot; the bundle states the gap.
+                if owned_work_item_id is not None and self._work_items is not None:
+                    try:
+                        issue, capability = await self._work_items.issue_read_context(
+                            owned_work_item_id
+                        )
+                    except (WorkItemConflict, WorkItemTransportError) as exc:
+                        logger.warning(
+                            "issue read capability unavailable for %s: %s",
+                            owned_work_item_id,
+                            type(exc).__name__,
+                        )
+                    else:
+                        base = self._config.runner_facing_api_base_url.rstrip("/")
+                        boot_env[ISSUE_READ_URL_ENV] = f"{base}/work-items/issue-read"
+                        boot_env[ISSUE_READ_TOKEN_ENV] = capability
+                        logger.info(
+                            "issue read capability bound for %s to %s",
+                            owned_work_item_id,
+                            issue,
+                        )
                 # Decision A2 marker (#544): an authority-free FACT carrying the
                 # resumed approval's gate kind (the actual gate_kind column value,
                 # e.g. 'policy' or 'permission'). After the approved-only gate in
@@ -2892,6 +3378,7 @@ class Kernel:
                         resume=self._is_approval_resume(event_id),
                     )
                 )
+            termination_detail: str | None = None
             attempt = 0
             while True:
                 attempt += 1
@@ -2952,6 +3439,7 @@ class Kernel:
                         remaining_s=_remaining_budget(lease),
                         pressure_retried=False,
                         workspace_inference=workspace_inference,
+                        memory_grant=memory_grant,
                     )
                 except _WorkItemDeferred:
                     return
@@ -2961,6 +3449,25 @@ class Kernel:
                         event_id,
                         exc.code,
                     )
+                    if exc.code in _WORK_ITEM_TERMINAL_START_REFUSALS:
+                        # #3208: the request settled before a turn opened, so
+                        # this delivery is the only one that can release the
+                        # claim it made. A request cancelled from ``waiting``
+                        # gets no terminate wake and carries no teardown flag,
+                        # so without this the claim holds quota until the
+                        # route TTL lapses. Marking the run finished hands the
+                        # release to the existing finally block.
+                        # ``not_dispatchable`` is deliberately excluded: it can
+                        # mean a lapsed acquire lease, where a replacement
+                        # re-acquires the same generation and adopts this
+                        # thread's route, so the claim must stay standing.
+                        run = (
+                            self._work_item_runs.get(owned_work_item_id)
+                            if owned_work_item_id is not None
+                            else None
+                        )
+                        if run is not None:
+                            run.finished = True
                     return
                 except ThreadBusyError as busy:
                     run = (
@@ -3023,11 +3530,34 @@ class Kernel:
                     )
                     return
 
+                if (
+                    outcome.status is SessionStatus.AWAITING_APPROVAL
+                    and qevent.tool_access is not None
+                ):
+                    # @spec WORKER-TOOL-ACCESS-4: a restricted turn may not raise
+                    # a card, whatever its runner reported. No record, no card,
+                    # no suspend: a failed turn.
+                    await self._escalate(
+                        qevent,
+                        route,
+                        _READ_ONLY_APPROVAL_REFUSAL,
+                        failure_class="tool-access-violation",
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "escalated",
+                        telemetry_outcome="classified_failure",
+                        lease=lease,
+                        hook_outcome=_hook_failure_outcome(),
+                    )
+                    return
+
                 if outcome.status is SessionStatus.AWAITING_APPROVAL:
                     # A gate fired (ADR-0010): persist the durable record, then
                     # suspend the session until a human resolves it. The event
                     # is done -- the resolution arrives as its own queued turn.
-                    approval_created = await self._pause_for_approval(
+                    pause = await self._pause_for_approval(
                         qevent,
                         route,
                         outcome,
@@ -3035,6 +3565,7 @@ class Kernel:
                         approval_routes,
                         deployment_id=workspace_deployment_id,
                     )
+                    approval_created = pause.created
                     if not approval_created:
                         run = self._run_for_event(qevent.event_id)
                         if run is not None:
@@ -3042,7 +3573,7 @@ class Kernel:
                                 await run.finish(
                                     outcome="failed",
                                     cause="approval_create_failed",
-                                    detail=None,
+                                    detail=pause.failure_detail,
                                 )
                             except WorkItemConflict as exc:
                                 if exc.code != "publication_pending":
@@ -3107,6 +3638,8 @@ class Kernel:
                     return
 
                 retryable = outcome.classification in RETRYABLE_CLASSIFICATIONS
+                if outcome.classification == "sandbox-terminated":
+                    termination_detail = outcome.error_message
                 if (
                     qevent.source is TurnSource.CRON
                     and retryable
@@ -3132,6 +3665,16 @@ class Kernel:
                     return
                 retryable = retryable and qevent.source is not TurnSource.CRON
                 if not retryable or attempt >= self._config.max_attempts:
+                    if (
+                        outcome.classification in {"runner-error", "sandbox-capacity"}
+                        and termination_detail is not None
+                    ):
+                        # Keep the final attempt's classification truthful while
+                        # carrying the earlier confirmed pod cause into both
+                        # terminal surfaces.
+                        outcome.error_message = (f"Earlier attempt: {termination_detail}")[
+                            :_ESCALATION_DETAIL_MAX
+                        ]
                     token = _display_error_classification(outcome.classification)
                     await self._escalate(
                         qevent,
@@ -3490,6 +4033,8 @@ class Kernel:
         thread is never left routeless.
 
         True if a route existed to release."""
+        # An operator release ends any run parked on the thread (#3564).
+        self._forget_held_work_items(thread_key=thread_key, reason="operator release")
         try:
             interrupted = await asyncio.wait_for(
                 self.interrupt_thread(thread_key, "operator requested a sandbox reset"),
@@ -3593,6 +4138,9 @@ class Kernel:
                 exc.code,
             )
             return
+        # Cleared only once the claim succeeds, so a refused claim leaves the
+        # held run in place for whoever does own the termination (#3564).
+        self._forget_held_work_items(thread_key=thread_key, reason="terminated")
         claim_name: str | None = None
         sandbox_name: str | None = None
         try:
@@ -3633,6 +4181,7 @@ class Kernel:
     async def _stop_owned_work_item(self, thread_key: str, run: WorkItemRun) -> None:
         """Heartbeat saw cancellation_requested: interrupt, observe, record."""
 
+        self._forget_held_run(thread_key, run, reason="cancellation requested")
         if self._work_items is None or run.runtime_epoch is None:
             return
         observation = await self._halt_work_item_runtime(
@@ -3664,11 +4213,18 @@ class Kernel:
         """Heartbeat 409 stale_owner: drop local ownership without touching the current route."""
 
         run.finished = True
+        self._forget_held_run(thread_key, run, reason="stale owner")
         logger.warning(
             "stale work-item owner abandoning request %s on thread %s without releasing the route",
             run.request_id,
             thread_key,
         )
+
+    def _forget_held_run(self, thread_key: str, run: WorkItemRun, *, reason: str) -> None:
+        """Drop the thread's held entry only when it is this very run (#3564)."""
+
+        if self._held_work_items.get(thread_key) is run:
+            self._forget_held_work_items(thread_key=thread_key, reason=reason)
 
     async def _halt_work_item_runtime(
         self,
@@ -3734,6 +4290,9 @@ class Kernel:
                 return False
 
         results = await asyncio.gather(*(_interrupt_one(key) for key in threads))
+        # A run parked for approval has no live turn to signal, but the kill
+        # still ends it here, so the sweeper can reclaim the request (#3564).
+        self._forget_held_work_items(agent_id=agent_id, reason=f"agent {agent_id} killed")
         signalled = sum(results)
         logger.info("kill: interrupted %d live turn(s) for agent %s", signalled, agent_id)
         return signalled
@@ -4018,6 +4577,13 @@ class Kernel:
                     qevent.event_id,
                     exc.code,
                 )
+                if exc.code == "work_item_cancelled":
+                    # #3208: the request is already settled as cancelled, so
+                    # nothing will ever accept a marker or a finish. Count the
+                    # run as settled locally so this delivery releases its
+                    # sandbox claim now instead of holding quota until the
+                    # terminate-wake backstop catches up.
+                    run.finished = True
                 return
         elif run is not None and not run.started:
             try:
@@ -4523,6 +5089,59 @@ class Kernel:
         remaining_s: float | None = None,
         pressure_retried: bool,
         workspace_inference: _WorkspaceInferenceCarry,
+        memory_grant: TurnMemoryGrant | None = None,
+    ) -> TurnOutcome:
+        """One attempt at a turn, then close its memory write credentials (#3776).
+
+        Every turn claim the attempt minted is reported closed to the API when
+        the attempt ends, on every outcome (success, runner error, start
+        failure, cancellation), so a credential copied out of the sandbox stops
+        writing then rather than at its expiry. A steered attempt hands its
+        claim to the live turn it joined instead (``_close_memory_turns``).
+        The closes run in the background, so the attempt's end never waits on
+        the API (``_settle_memory_turns``)."""
+
+        record = _AttemptMemoryTurns(agent_id=agent_id)
+        reset = _MEMORY_TURNS.set(record)
+        try:
+            return await self._attempt_turn(
+                qevent,
+                route,
+                release_order,
+                boot_env,
+                agent_id,
+                nav,
+                packs,
+                workspace_deployment_id,
+                agent_name,
+                runner_resources=runner_resources,
+                remaining_s=remaining_s,
+                pressure_retried=pressure_retried,
+                workspace_inference=workspace_inference,
+                memory_grant=memory_grant,
+            )
+        finally:
+            _MEMORY_TURNS.reset(reset)
+            if record.minted or record.live_turns:
+                self._settle_memory_turns(record)
+
+    async def _attempt_turn(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        release_order: Callable[[], None],
+        boot_env: dict[str, str] | None = None,
+        agent_id: uuid.UUID | None = None,
+        nav: NavAffordance | None = None,
+        packs: BehaviorPacks | None = None,
+        workspace_deployment_id: uuid.UUID | None = None,
+        agent_name: str | None = None,
+        *,
+        runner_resources: dict[str, Any] | None = None,
+        remaining_s: float | None = None,
+        pressure_retried: bool,
+        workspace_inference: _WorkspaceInferenceCarry,
+        memory_grant: TurnMemoryGrant | None = None,
     ) -> TurnOutcome:
         handle = qevent.reply_handle
         thread_key = _thread_key_for(qevent)
@@ -4557,6 +5176,13 @@ class Kernel:
                 logger.warning("booting-state update failed for %s", qevent.event_id)
 
         event = self._to_event(qevent)
+        # ADR-0188: this attempt's memory write credential is minted where the
+        # runner call is made, after the sandbox claim, so its expiry is the
+        # stream deadline that call uses and a retry gets its own. A steer mints
+        # from the same carry, so a steering sender writes under their own name.
+        memory_mint = _MEMORY_MINT.set(
+            None if memory_grant is None else _MemoryMint(qevent=qevent, grant=memory_grant)
+        )
 
         attachment_intent = self._attachments is not None and bool(qevent.attachments)
 
@@ -4577,6 +5203,8 @@ class Kernel:
             # before routed is assigned here. Canned and steered leave turn None.
             if routed is not None and routed.turn is not None:
                 self._unregister_run(agent_id, thread_key)
+                if memory_grant is not None:
+                    self._turn_deadlines.pop(memory_grant.thread_key, None)
                 routed.turn.close()
             progress_plan = _TURN_PROGRESS.get()
             if progress_plan is not None and self._progress is not None:
@@ -4667,6 +5295,8 @@ class Kernel:
                 # response first if lock cleanup itself fails or is cancelled.
                 await close_routed_turn()
                 raise
+            finally:
+                _MEMORY_MINT.reset(memory_mint)
         except CapacityExhaustedError as exc:
             rejection = exc.rejection
             logger.warning(
@@ -4691,16 +5321,23 @@ class Kernel:
                             exc.code,
                         )
                     raise _WorkItemDeferred() from None
-            if self._is_approval_resume(qevent.event_id):
-                release_order()
-                return TurnOutcome(terminal_ok=False, classification="runner-error")
+
+            async def capacity_refusal() -> TurnOutcome:
+                # An approval resume has no capacity reply to send or queue to
+                # wait in: it fails as sandbox-capacity and the driving loop
+                # retries it (#3693). Every other turn answers the person.
+                if self._is_approval_resume(qevent.event_id):
+                    release_order()
+                    return TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
+                return await capacity_response()
+
             if pressure_retried:
                 self._record_pressure_outcome("reclaimed-retry-refused")
-                return await capacity_response()
+                return await capacity_refusal()
 
             if not quota_rejection_is_valid(rejection):
                 self._record_pressure_outcome("refused-invalid-quota")
-                return await capacity_response()
+                return await capacity_refusal()
 
             pressure_started = time.monotonic()
             current_remaining = (
@@ -4709,7 +5346,7 @@ class Kernel:
             required = _PRESSURE_CEILING_S + self._substrate.claim_timeout_seconds
             if current_remaining is None or current_remaining < required:
                 self._record_pressure_outcome("refused-no-budget")
-                return await capacity_response()
+                return await capacity_refusal()
 
             reclaimed = await self._reclaim_idle_route(
                 thread_key,
@@ -4718,12 +5355,12 @@ class Kernel:
             )
             if not reclaimed.reclaimed:
                 self._record_pressure_outcome(reclaimed.outcome)
-                return await capacity_response()
+                return await capacity_refusal()
 
             retry_remaining = current_remaining - (time.monotonic() - pressure_started)
             if retry_remaining <= 0:
                 self._record_pressure_outcome("timeout")
-                return await capacity_response()
+                return await capacity_refusal()
             logger.info(
                 "idle route reclamation freed sandbox capacity; retrying event %s",
                 qevent.event_id,
@@ -4742,6 +5379,7 @@ class Kernel:
                 remaining_s=retry_remaining,
                 pressure_retried=True,
                 workspace_inference=workspace_inference,
+                memory_grant=memory_grant,
             )
         except PendingPublicationError as exc:
             record_reclaimed_retry()
@@ -4817,6 +5455,18 @@ class Kernel:
             )
             await self._reply_for(qevent, route, _UNAVAILABLE_ATTACHMENT_REPLY)
             return TurnOutcome(terminal_ok=True, start_failed=True)
+        except ToolAccessUnenforced as exc:
+            # @spec WORKER-TOOL-ACCESS-2: a failed turn, escalated under its own
+            # class and never retried (the class is not retryable); the model
+            # was not asked.
+            record_reclaimed_retry()
+            release_order()
+            logger.warning("turn start refused for %s: %s", qevent.event_id, exc)
+            return TurnOutcome(
+                terminal_ok=False,
+                classification=TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+                error_message=exc.public_detail,
+            )
         except MissingAgentPoolError as exc:
             # Before the SandboxError clause below, which would retry it. The
             # pool appears only after an operator changes the release values,
@@ -4933,6 +5583,10 @@ class Kernel:
             # steer folded into a since-failed turn is not itself replayed. This is
             # the accepted MVP semantic; durable per-steer replay is a deliberate
             # follow-up, flagged to the orchestrator rather than silently assumed.
+            memory_turns = _MEMORY_TURNS.get()
+            if memory_turns is not None:
+                # The live turn now holds this attempt's credential (#3776).
+                memory_turns.steered = True
             await self._reply_for(qevent, route, "Folded into the in-progress reply above.")
             return TurnOutcome(terminal_ok=True, steered=True)
 
@@ -4963,7 +5617,13 @@ class Kernel:
             )
             async with self._keep_route_alive(thread_key, routed.handle.claim_name):
                 outcome = await self._consume(
-                    qevent, route, turn, nav, agent_id, workspace_inferred_repo=inferred
+                    qevent,
+                    route,
+                    turn,
+                    nav,
+                    agent_id,
+                    handle=routed.handle,
+                    workspace_inferred_repo=inferred,
                 )
                 outcome = await self._continue_unpublished(
                     qevent,
@@ -4979,6 +5639,7 @@ class Kernel:
                         if remaining_s is None
                         else remaining_s - (time.monotonic() - attempt_started)
                     ),
+                    memory_grant=memory_grant,
                 )
             outcome.workspace_inferred_repo = inferred
             if verified_review is not None:
@@ -5006,6 +5667,7 @@ class Kernel:
                         max_patch_bytes=self._config.publication_patch_max_bytes,
                         scratch_root=Path(self._config.workspace_scratch_root),
                         git_timeout_seconds=(self._config.publication_git_command_timeout_seconds),
+                        protected_paths=self._config.publication_protected_paths,
                     )
                     outcome.publication_snapshot = snapshot
                 except (
@@ -5040,6 +5702,10 @@ class Kernel:
     ) -> TurnStream:
         """Serialize runner admission with the operator pause action."""
 
+        if event.tool_access is not None:
+            # @spec WORKER-TOOL-ACCESS-2: every path that opens a turn comes
+            # through here, the attachment handoff included.
+            await self._require_tool_access(handle, event.tool_access, remaining_s)
         extra: dict[str, Any] = {"capacity_admission": True} if capacity_admission else {}
         plan = _TURN_PROGRESS.get()
         progress = (
@@ -5054,13 +5720,18 @@ class Kernel:
         )
         if progress is not None:
             extra["progress"] = progress
+        # ADR-0188: mint the memory credential here, after the claim, from the
+        # same ``remaining_s`` the stream timeout is bound from.
+        mint = _MEMORY_MINT.get()
+        if mint is not None:
+            event = self._with_memory_token(event, mint.qevent, mint.grant, remaining_s)
         carry = _HOOK_RUN_CARRY.get()
         if carry is not None and carry.recorder is not None and carry.ref is not None:
             async with carry.recorder.start_guard(carry.ref) as allowed:
                 if not allowed:
                     raise HookPaused("cron hook paused before runner start")
                 try:
-                    return await self._runner.start_turn(
+                    turn = await self._runner.start_turn(
                         handle.base_url,
                         event,
                         token=handle.token or None,
@@ -5071,8 +5742,12 @@ class Kernel:
                     if plan is not None and self._progress is not None:
                         await deactivate_turn_progress(self._progress, plan)
                     raise
+                if mint is not None:
+                    self._record_turn_deadline(mint.grant, remaining_s)
+                _note_live_memory_turn(turn)
+                return turn
         try:
-            return await self._runner.start_turn(
+            turn = await self._runner.start_turn(
                 handle.base_url,
                 event,
                 token=handle.token or None,
@@ -5083,6 +5758,11 @@ class Kernel:
             if plan is not None and self._progress is not None:
                 await deactivate_turn_progress(self._progress, plan)
             raise
+        if mint is not None:
+            self._record_turn_deadline(mint.grant, remaining_s)
+        # This attempt owns the turn, so it closes the steers that join it.
+        _note_live_memory_turn(turn)
+        return turn
 
     async def _route_attachment_and_start(
         self,
@@ -5142,16 +5822,19 @@ class Kernel:
                     )
                 repository_requested = workspace_inference.repo is not None
                 if not repository_requested and workspace_deployment_id is not None:
-                    repository_requested = (
-                        trusted_repository_fact(
-                            event.text,
-                            ignore_message=(
-                                verified_review is not None
-                                or source is TurnSource.WEBHOOK
-                                or self._is_approval_resume(qevent.event_id)
-                            ),
-                        )
-                        is not None
+                    retained_fact = trusted_repository_fact(
+                        event.text,
+                        ignore_message=(
+                            verified_review is not None
+                            or source is TurnSource.WEBHOOK
+                            or self._is_approval_resume(qevent.event_id)
+                        ),
+                    )
+                    # With workspaces off a bare token has no allowlist to
+                    # confirm it, so it names no repository (#3671), exactly
+                    # as on the new-turn path below.
+                    repository_requested = retained_fact is not None and not (
+                        self._workspace is None and retained_fact.bare
                     )
                 selected_repository = None
                 if workspace_deployment_id is not None and self._workspace is not None:
@@ -5260,6 +5943,7 @@ class Kernel:
                                         workspace_repo=None,
                                         agent_name=agent_name,
                                         runner_resources=runner_resources,
+                                        caller_run=current_handle.caller_run,
                                     ),
                                     None,
                                 )
@@ -5437,6 +6121,9 @@ class Kernel:
             agent_id=str(agent_id) if agent_id is not None else None,
             attachments=list(qevent.attachments),
             identity=identity,
+            # ADR-0153: a channel-port turn's files come from its own adapter,
+            # and the server-minted handle is what names that adapter.
+            handle=handle,
         )
         return {**(boot_env or {}), **prepared.claim_env()}, prepared
 
@@ -5477,6 +6164,9 @@ class Kernel:
         # repository it attached (#2659); None when no selection ran.
         repo_fact: str | None = None
         workspace_repo: str | None = None
+        owned_run_id = _OWNED_WORK_ITEM.get()
+        owned_run = self._work_item_runs.get(owned_run_id) if owned_run_id is not None else None
+        caller_run = str(owned_run.request_id) if owned_run is not None else None
         lineage: PublicationLineage | None = None
         if workspace_deployment_id is not None:
             # The API already bound a verified review to its persisted thread
@@ -5510,6 +6200,15 @@ class Kernel:
                 # this delivery, or verified feedback whose authority is bound to
                 # a repository. Ambiguity still raises from
                 # trusted_repository_fact above before any route is adopted.
+                #
+                # A bare owner/repo token is a guess (#2947) that only the
+                # allowlist can confirm, and with workspaces off there is none.
+                # So it names no repository and the turn runs generic (#3671),
+                # rather than answering `Swap/Exchange` with chart settings. A
+                # github.com URL, the carried inference and verified feedback
+                # still refuse.
+                if getattr(repo_fact, "bare", False):
+                    repo_fact = None
                 if (
                     repo_fact is not None
                     or workspace_inference.repo is not None
@@ -5675,7 +6374,7 @@ class Kernel:
         # rule instead: it adopts and steers, and the replacement applies
         # from the next new turn.
         turn_budget_replacement = existing_handle is not None and _boots_differently(
-            existing_handle, boot_env
+            existing_handle, boot_env, caller_run=caller_run
         )
         if (
             turn_budget_replacement
@@ -5693,7 +6392,8 @@ class Kernel:
             raise ThreadBusyError(
                 f"thread {thread_key} has not reached a durable turn budget handoff boundary"
             )
-        if packs is not None and verified_review is None:
+        # @spec WORKER-TOOL-ACCESS-3: a restricted turn never gets a canned reply.
+        if packs is not None and verified_review is None and event.tool_access is None:
             reply = match_greeting(packs, event.text) or match_help(packs, event.text)
             if reply is not None and existing_handle is None:
                 return _RouteResult(steered=False, canned_reply=reply)
@@ -5741,6 +6441,7 @@ class Kernel:
             runner_resources=runner_resources,
             remaining_s=remaining_s,
             attachment_fresh_only=attachment_fresh_only,
+            caller_run=caller_run,
         )
         wait = current_wait()
 
@@ -5907,7 +6608,7 @@ class Kernel:
                     or capacity_status.get("turn_active") is not False
                 ):
                     raise CapacityWaitRequested()
-        elif source.is_job or verified_review is not None:
+        elif source.is_job or verified_review is not None or event.tool_access is not None:
             # ADR-0079: a job is an OUTPUT, not a steering input. A cron digest or
             # a webhook must never fold itself into whatever a person is currently
             # saying. A verified review likewise owns a separately reserved
@@ -5931,13 +6632,23 @@ class Kernel:
                 # The claim can outlast what was left of a retry's catch-up
                 # bound; checked again here, right before the start (#2929).
                 raise CatchUpExpired(f"cron retry on {thread_key} passed its catch-up bound")
+            # @spec WORKER-TOOL-ACCESS-3: a restricted turn takes this branch too.
+            # Steering it would run its text under the live turn's access, and
+            # an ordinary live turn has none of its restriction.
             if await self._turn_active(handle, remaining_s=remaining_s):
-                deferred_kind = "review" if verified_review is not None else str(source)
+                deferred_kind = (
+                    "review"
+                    if verified_review is not None
+                    else "restricted"
+                    if event.tool_access is not None
+                    else str(source)
+                )
                 raise LiveSessionBusy(
                     f"thread {thread_key} has a live session; deferring the {deferred_kind} turn"
                 )
         else:
             active_before_steer = False
+            live_turn_before_steer: str | None = None
             if retained_live_route:
                 try:
                     # NOT given ``remaining_s``: see the note above _turn_active.
@@ -5962,10 +6673,34 @@ class Kernel:
                             "runner pre-steer status carried no usable turn_active: %r",
                             status,
                         )
+                    # The live turn this steer would join (#3776). The read and
+                    # the steer both run under the per-thread lock, so no other
+                    # attempt can open a turn on this thread between them.
+                    live_turn_before_steer = _live_memory_turn(status.get("turn_epoch"))
+            steer_event = event
+            mint = _MEMORY_MINT.get()
+            if mint is not None and retained_live_route and active_before_steer:
+                # ADR-0188: a steer ends when the live turn ends, so its
+                # credential never outlives that turn's stream deadline. A turn
+                # another worker opened has no recorded deadline here; the
+                # steer's own bound applies. Minted only when the retained
+                # sandbox reports a live turn to fold into: a fresh, replacement
+                # or idle runner refuses the probe, and a credential minted for
+                # it would be one more claim to close (#3776).
+                steer_event = self._with_memory_token(
+                    event,
+                    mint.qevent,
+                    mint.grant,
+                    remaining_s,
+                    cap_at=self._turn_deadlines.get(mint.grant.thread_key),
+                )
             steered = await self._runner.steer(
-                handle.base_url, event, token=handle.token or None, remaining_s=remaining_s
+                handle.base_url, steer_event, token=handle.token or None, remaining_s=remaining_s
             )
             if steered:
+                memory_turns = _MEMORY_TURNS.get()
+                if memory_turns is not None:
+                    memory_turns.steered_into = live_turn_before_steer
                 _record_route("steer")
                 _lifecycle_event("runner.turn.steered", "steer")
                 return _RouteResult(steered=True)
@@ -5984,7 +6719,7 @@ class Kernel:
             # caller token both bind at boot, so a new turn must not open on
             # this runner. Retry: the redelivery finds the turn idle and
             # takes the replacement path above.
-            if _boots_differently(handle, boot_env):
+            if _boots_differently(handle, boot_env, caller_run=caller_run):
                 raise ThreadBusyError(
                     f"thread {thread_key} turn ended before its steer; "
                     "retrying to replace the runner's turn budget or caller token"
@@ -6046,8 +6781,41 @@ class Kernel:
                 if remaining_s is None
                 else min(remaining_s, started.remaining_s)
             )
+            handle = await self._cap_caller_token_to_deadline(
+                thread_key,
+                boot_env,
+                handle,
+                run,
+                agent_name=agent_name,
+                workspace_deployment_id=workspace_deployment_id,
+                workspace_repo=workspace_repo,
+                lineage_branch=lineage_branch,
+                lineage_head=lineage_head,
+                lineage_base_sha=lineage_base_sha,
+                publication_visible_outcome_revision=publication_visible_outcome_revision,
+                runner_resources=runner_resources,
+                remaining_s=remaining_s,
+            )
         elif run is not None:
             remaining_s = run.bound_remaining_s(remaining_s)
+            handle = await self._cap_caller_token_to_deadline(
+                thread_key,
+                boot_env,
+                handle,
+                run,
+                agent_name=agent_name,
+                workspace_deployment_id=workspace_deployment_id,
+                workspace_repo=workspace_repo,
+                lineage_branch=lineage_branch,
+                lineage_head=lineage_head,
+                lineage_base_sha=lineage_base_sha,
+                publication_visible_outcome_revision=publication_visible_outcome_revision,
+                runner_resources=runner_resources,
+                remaining_s=remaining_s,
+            )
+        if run is not None and agent_id is not None:
+            # Lets a kill find this run if it later parks for approval (#3564).
+            run.agent_id = agent_id
         if agent_id is not None:
             self._register_run(agent_id, thread_key)
         turn: TurnStream | None = None
@@ -6090,6 +6858,35 @@ class Kernel:
         return _RouteResult(
             steered=False, handle=handle, turn=turn, workspace_inferred_repo=inferred
         )
+
+    async def _require_tool_access(
+        self,
+        handle: SandboxHandle,
+        access: ToolAccess,
+        remaining_s: float | None,
+    ) -> None:
+        """Refuse unless THIS runner advertises ``access`` (WORKER-TOOL-ACCESS-2).
+
+        Read from the handle the event is about to be posted to, with its own
+        token, so a replaced or different runner cannot answer for it. An
+        unreadable status raises the client's own error, which the caller
+        retries like any turn the runner did not accept.
+        """
+
+        try:
+            status = await self._runner.status(
+                handle.base_url,
+                token=handle.token or None,
+                remaining_s=2.0 if remaining_s is None else min(2.0, remaining_s),
+            )
+        except (ValueError, TypeError) as exc:
+            # A body that is not JSON: not accepted, so retried, never run.
+            raise RunnerError("runner status was not readable") from exc
+        if not isinstance(status, dict):
+            raise RunnerError("runner status was not a JSON object")
+        advertised = status.get(TOOL_ACCESS_STATUS_FIELD)
+        if not isinstance(advertised, list) or access.value not in advertised:
+            raise ToolAccessUnenforced(access)
 
     async def _bind_publication_context(
         self,
@@ -6302,10 +7099,18 @@ class Kernel:
             return _PressureResult(False, inventory.outcome)
 
         saw_race = False
+        # Idle eval routes go first, so a liveness probe's sandboxes are freed
+        # before a person's. The sort is stable: each group keeps the
+        # inventory's (expiry, thread key) order.
         candidates = tuple(
-            candidate
-            for candidate in inventory.candidates
-            if candidate.thread_key != requesting_thread_key
+            sorted(
+                (
+                    candidate
+                    for candidate in inventory.candidates
+                    if candidate.thread_key != requesting_thread_key
+                ),
+                key=lambda candidate: not _is_eval_thread_key(candidate.thread_key),
+            )
         )[:_PRESSURE_CANDIDATES]
         for candidate in candidates:
             if time.monotonic() >= pressure_deadline:
@@ -6517,6 +7322,69 @@ class Kernel:
             and status.get("status") == SessionStatus.IDLE_AWAITING_INPUT.value
         )
 
+    async def _cap_caller_token_to_deadline(
+        self,
+        thread_key: str,
+        boot_env: dict[str, str] | None,
+        handle: SandboxHandle,
+        run: WorkItemRun,
+        *,
+        agent_name: str | None,
+        workspace_deployment_id: uuid.UUID | None,
+        workspace_repo: str | None,
+        lineage_branch: str | None,
+        lineage_head: str | None,
+        lineage_base_sha: str | None,
+        publication_visible_outcome_revision: int | None,
+        runner_resources: dict[str, Any] | None,
+        remaining_s: float | None,
+    ) -> SandboxHandle:
+        """Replace a runner whose caller token outlives the committed deadline.
+
+        Writes the corrected token back onto ``boot_env`` so a later claim of
+        this same env, including a retry after the request has already started,
+        does not restore the provisional expiry.
+        """
+
+        if boot_env is None or run.execution_deadline is None:
+            return handle
+        if not self._config.connector_caller_signing_key.strip():
+            return handle
+        if not isinstance(agent_name, str) or not agent_name:
+            return handle
+        token = boot_env.get(CONNECTOR_CALLER_TOKEN_ENV)
+        signed_exp = _caller_token_exp(token) if isinstance(token, str) else None
+        deadline_unix = int(run.execution_deadline.timestamp())
+        if signed_exp is None or signed_exp <= deadline_unix:
+            return handle
+        boot_env[CONNECTOR_CALLER_TOKEN_ENV] = caller_token.mint(
+            self._config.connector_caller_signing_key,
+            agent=agent_name,
+            exp=min(int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS, deadline_unix),
+            run=str(run.request_id),
+            work_item=str(run.work_item_id),
+        )
+        replaced = await self._claim_or_resume(
+            thread_key,
+            boot_env,
+            workspace_deployment_id=(
+                workspace_deployment_id if workspace_repo is not None else None
+            ),
+            workspace_repo=workspace_repo,
+            replace_handle=handle,
+            lineage_branch=lineage_branch,
+            lineage_head=lineage_head,
+            lineage_base_sha=lineage_base_sha,
+            publication_visible_outcome_revision=(publication_visible_outcome_revision or 0),
+            agent_name=agent_name,
+            runner_resources=runner_resources,
+            remaining_s=remaining_s,
+            caller_run=str(run.request_id),
+        )
+        run.claim_name = replaced.claim_name
+        run.sandbox_name = replaced.sandbox_name
+        return replaced
+
     async def _claim_or_resume(
         self,
         thread_key: str,
@@ -6535,6 +7403,7 @@ class Kernel:
         runner_resources: dict[str, Any] | None = None,
         remaining_s: float | None = None,
         attachment_fresh_only: bool = False,
+        caller_run: str | None = None,
     ) -> SandboxHandle:
         wait = current_wait()
         previous_handle: SandboxHandle | None = None
@@ -6698,6 +7567,7 @@ class Kernel:
                 lineage_base_sha=lineage_base_sha,
                 publication_visible_outcome_revision=(publication_visible_outcome_revision),
                 fresh_only=attachment_fresh_only,
+                caller_run=caller_run,
             )
             if not isinstance(workspace_claim.handle, SandboxHandle):
                 raise WorkspacePreparationError(
@@ -6716,6 +7586,7 @@ class Kernel:
                 workspace_repo=None,
                 agent_name=agent_name,
                 runner_resources=runner_resources,
+                caller_run=caller_run,
             )
             return await validate_wait_claim(handle)
         try:
@@ -6726,6 +7597,7 @@ class Kernel:
                 agent_name=agent_name,
                 runner_resources=runner_resources,
                 fresh_only=attachment_fresh_only,
+                caller_run=caller_run,
             )
             return await validate_wait_claim(handle)
         except SuspendedThreadError:
@@ -6739,6 +7611,7 @@ class Kernel:
                 env=boot_env,
                 agent_name=agent_name,
                 runner_resources=runner_resources,
+                caller_run=caller_run,
             )
             return await validate_wait_claim(handle)
 
@@ -6811,73 +7684,149 @@ class Kernel:
                         thread_key,
                     )
                     return
-            entry = await self._card_store.read(approval_id)
-            if entry is None:
-                return
-            ref, raw_ref = entry
-            if is_expiry:
-                # The branch above left the outcome unread, on purpose: an expiry
-                # says only that nobody decided.
-                settled = SettledOutcome(requested_by=ref.requested_by)
-            else:
-                # The resolve branch returned above unless it read an outcome.
-                assert outcome is not None
-                settled = SettledOutcome(
-                    requested_by=ref.requested_by,
-                    decision=outcome.decision,
-                    resolver=outcome.resolver,
-                    note=outcome.note,
-                )
-            # Emit the channel-neutral summary (ADR-0020) plus the semantic
-            # outcome; the adapter renders the buttonless settled card below the
-            # seam.
-            # The card's own address and ref, over the transport it was posted
-            # through. ``settled`` carries the whole difference between an
-            # expired card and a resolved one; the adapter renders the form.
-            await self._sink.emit(
-                ReplyUpdate(
-                    version=REPLY_WIRE_VERSION,
-                    event="reply.update",
-                    target=ReplyTarget(
-                        # The card's OWN destination, remembered at post time. A
-                        # policy-routed card lives in a channel this resume turn
-                        # may not share a kind or a transport with, so rebuilding
-                        # either from the turn addresses the wrong place; ``kind``
-                        # empty is the pre-upgrade entry, which falls back to the
-                        # turn's kind but NOT its identity: the historical card
-                        # was posted by the default transport.
-                        kind=ref.kind or handle.kind,
-                        address=ref.channel,
-                        conversation_id=qevent.conversation_id,
-                        reply_ref=ref.ts,
-                    ),
-                    message=OutboundMessage(
-                        version=MESSAGE_VERSION,
-                        text=ref.summary,
-                        # When it was decided, as data (ADR-0179); the adapter
-                        # chooses how to show it.
-                        fields=[decided_field(decided)] if decided is not None else [],
-                    ),
-                    settled=settled,
-                ),
-                route=TargetRoute(
-                    endpoint=ref.endpoint,
-                    adapter=ref.adapter if ref.kind else None,
-                ),
+            await self._settle_remembered_card(
+                approval_id,
+                is_expiry=is_expiry,
+                outcome=outcome,
+                decided=decided,
+                conversation_id=qevent.conversation_id,
+                handle=handle,
             )
-            consumed = await self._card_store.consume(approval_id, raw_ref)
-            if consumed:
-                logger.info("settled approval card for thread %s", qevent.conversation_id)
-            else:
-                logger.info(
-                    "approval card ref changed or vanished before cleanup for approval %s",
-                    approval_id,
-                )
         except Exception as exc:  # noqa: BLE001 - card teardown is best-effort
             logger.warning(
                 "approval card teardown failed for thread %s: %s",
                 thread_key,
                 exc,
+            )
+
+    async def _settle_remembered_card(
+        self,
+        approval_id: str,
+        *,
+        is_expiry: bool,
+        outcome: SettledOutcome | None,
+        decided: datetime | None,
+        conversation_id: str,
+        handle: ReplyHandle,
+    ) -> None:
+        """Edit the remembered card into its settled form, then consume its ref.
+
+        Shared by the resume (``_finalize_settled_card``) and by the pause once
+        it registers a card whose record is already settled
+        (``_settle_if_decided_before_registration``, #3637). Either may run
+        first, or both at once: each emits the same edit, and the atomic
+        ``consume`` of the exact value read lets only one of them remove it.
+        Raises on failure; each caller owns its own best-effort handling.
+        """
+
+        assert self._card_store is not None
+        entry = await self._card_store.read(approval_id)
+        if entry is None:
+            return
+        ref, raw_ref = entry
+        if is_expiry:
+            # An expiry says only that nobody decided, so no outcome is stamped.
+            settled = SettledOutcome(requested_by=ref.requested_by)
+        else:
+            # A caller settles a resolve only once it has read an outcome.
+            assert outcome is not None
+            settled = SettledOutcome(
+                requested_by=ref.requested_by,
+                decision=outcome.decision,
+                resolver=outcome.resolver,
+                note=outcome.note,
+            )
+        # Emit the channel-neutral summary (ADR-0020) plus the semantic
+        # outcome; the adapter renders the buttonless settled card below the
+        # seam.
+        # The card's own address and ref, over the transport it was posted
+        # through. ``settled`` carries the whole difference between an
+        # expired card and a resolved one; the adapter renders the form.
+        await self._sink.emit(
+            ReplyUpdate(
+                version=REPLY_WIRE_VERSION,
+                event="reply.update",
+                target=ReplyTarget(
+                    # The card's OWN destination, remembered at post time. A
+                    # policy-routed card lives in a channel this resume turn
+                    # may not share a kind or a transport with, so rebuilding
+                    # either from the turn addresses the wrong place; ``kind``
+                    # empty is the pre-upgrade entry, which falls back to the
+                    # turn's kind but NOT its identity: the historical card
+                    # was posted by the default transport.
+                    kind=ref.kind or handle.kind,
+                    address=ref.channel,
+                    conversation_id=conversation_id,
+                    reply_ref=ref.ts,
+                ),
+                message=OutboundMessage(
+                    version=MESSAGE_VERSION,
+                    text=ref.summary,
+                    # When it was decided, as data (ADR-0179); the adapter
+                    # chooses how to show it.
+                    fields=[decided_field(decided)] if decided is not None else [],
+                ),
+                settled=settled,
+            ),
+            route=TargetRoute(
+                endpoint=ref.endpoint,
+                adapter=ref.adapter if ref.kind else None,
+            ),
+        )
+        consumed = await self._card_store.consume(approval_id, raw_ref)
+        if consumed:
+            logger.info("settled approval card for thread %s", conversation_id)
+        else:
+            logger.info(
+                "approval card ref changed or vanished before cleanup for approval %s",
+                approval_id,
+            )
+
+    async def _settle_if_decided_before_registration(
+        self, approval_id: str, qevent: QueuedTurn
+    ) -> None:
+        """Settle a card whose approval was decided before it was registered (#3637).
+
+        The record precedes every delivery, so an operator can resolve it, or
+        the sweeper expire it, while the card post is still in flight. Its
+        resume then finds no card ref and finishes, and nothing else would
+        settle the card this pause registers afterwards. So once the card is
+        registered, the pause reads its record back: a decided record settles
+        the card now, and a pending one leaves it to the resume.
+
+        Neither order is lost. A verdict recorded before this read is seen
+        here, and one recorded after it reaches a resume that runs after the
+        card was registered and settles it there. Best-effort, like the
+        resume's settle: an unreadable record leaves the card as it is.
+        """
+
+        if self._approval_reader is None or self._card_store is None:
+            return
+        try:
+            record = await self._approval_reader.get(approval_id)
+            if record is None:
+                return
+            if record.status == "expired":
+                # ``_settled_outcome`` answers only a resolve. An expiry names
+                # no decision and stamps none, exactly as its resume would.
+                is_expiry, outcome, decided = True, None, None
+            else:
+                read = _settled_outcome(record)
+                if read is None:
+                    return
+                is_expiry = False
+                outcome, decided = read
+            await self._settle_remembered_card(
+                approval_id,
+                is_expiry=is_expiry,
+                outcome=outcome,
+                decided=decided,
+                conversation_id=qevent.conversation_id,
+                handle=_reply_handle_for(qevent),
+            )
+        except Exception as exc:  # noqa: BLE001 - the pause stands without the settle
+            logger.warning(
+                "settling approval card %s after registration failed: %s", approval_id, exc
             )
 
     async def _settled_from_record(
@@ -6898,17 +7847,9 @@ class Kernel:
         if self._approval_reader is None:
             return None
         record = await self._approval_reader.get(approval_id)
-        if record is None or record.status not in ("approved", "rejected"):
+        if record is None:
             return None
-        return (
-            SettledOutcome(
-                requested_by="",
-                decision=record.status,
-                resolver=record.resolved_by,
-                note=record.resolution_note,
-            ),
-            record.resolved_at,
-        )
+        return _settled_outcome(record)
 
     async def _place_the_resumed_reply(self, qevent: QueuedTurn) -> QueuedTurn:
         """Choose where a resumed approval turn answers (ADR-0179 decision 3).
@@ -6971,7 +7912,7 @@ class Kernel:
         approval_routes: dict[str, Any] | None = None,
         *,
         deployment_id: uuid.UUID | None = None,
-    ) -> bool:
+    ) -> _ApprovalPause:
         """Persist the approval, suspend the session, and leave the pending notice.
 
         Ordering is deliberate: the durable record exists before the sandbox is
@@ -6995,6 +7936,9 @@ class Kernel:
         silently widening authority to whoever happens to be in the requesting
         channel is exactly the failure AC2 closes. No approval is created in
         that case.
+
+        Returns whether the approval was created and, when it was not, the
+        API's coded refusal (#3617) for the factory run's detail, if any.
         """
 
         handle = _reply_handle_for(qevent)
@@ -7005,7 +7949,13 @@ class Kernel:
         thread = qevent.conversation_id
         thread_key = _thread_key_for(qevent)
         summary = outcome.approval_summary or outcome.text or "Approval requested"
-        display_summary = outcome.approval_display or summary
+        display_summary = (
+            outcome.approval_display
+            if outcome.approval_display
+            else approval_display(
+                summary, outcome.approval_granted_tool, outcome.approval_granted_arguments
+            )
+        )
 
         # Resolve the manifest route NAME (#247) to its workspace channel. A named
         # route that resolves to no binding escalates instead of widening (#544).
@@ -7024,6 +7974,10 @@ class Kernel:
         card_kind = handle.kind
         card_channel = handle.channel
         notification_target: tuple[str, str, TargetRoute] | None = None
+        # The listed approver addresses an email card names (ADR-0177 amendment
+        # A5), so the mail adapter can tell the requester who can approve. Set
+        # only on the email branch below, where the list was just required.
+        card_approver_emails: list[str] = []
         if route_name:
             binding = (approval_routes or {}).get(route_name)
             targets = _parse_approval_targets(binding)
@@ -7043,10 +7997,17 @@ class Kernel:
                     "to this channel.",
                     failure_class="approval-route-unbound",
                 )
-                return False
+                return _ApprovalPause(created=False)
             fixed_target, notification_target = targets
             if fixed_target is not None:
                 card_kind, card_channel = fixed_target
+            elif handle.kind in _APPROVER_EMAIL_KINDS:
+                card_approver_emails = _approver_emails(binding)
+                if not card_approver_emails:
+                    await self._escalate_unanswerable_email_approval(
+                        qevent, route, agent_id, route_name
+                    )
+                    return _ApprovalPause(created=False)
             elif (
                 handle.kind != SLACK_KIND
                 and isinstance(binding, dict)
@@ -7071,7 +8032,12 @@ class Kernel:
                     "instead of creating an approval nobody here can answer.",
                     failure_class="approval-approvers-unverifiable",
                 )
-                return False
+                return _ApprovalPause(created=False)
+        elif handle.kind in _APPROVER_EMAIL_KINDS:
+            # ADR-0177 amendment A3: a routeless approval has no binding, so no
+            # approver emails, and on email nobody else may answer it.
+            await self._escalate_unanswerable_email_approval(qevent, route, agent_id, None)
+            return _ApprovalPause(created=False)
 
         if not is_publication and self._approvals is None:
             await self._escalate(
@@ -7081,7 +8047,7 @@ class Kernel:
                 "configured on this worker; flagging for a human instead of pausing.",
                 failure_class="approval-backend-missing",
             )
-            return False
+            return _ApprovalPause(created=False)
 
         if is_publication and self._publication_creator is None:
             await self._escalate(
@@ -7091,7 +8057,7 @@ class Kernel:
                 "published and no approval was created.",
                 failure_class="publication-unavailable",
             )
-            return False
+            return _ApprovalPause(created=False)
 
         base = outcome.text.strip()
         # #2659: the inferred repository is a reply block only. It is composed
@@ -7236,7 +8202,7 @@ class Kernel:
                 exc.public_detail,
             )
             await self._reply_for(qevent, route, exc.public_detail)
-            return False
+            return _ApprovalPause.refused(exc.public_detail)
         except ApprovalRefused as exc:
             # #2885: a person rejected this approval in this thread and nobody
             # has asked since. The API refused it and audited the refusal; the
@@ -7248,7 +8214,7 @@ class Kernel:
                 qevent.event_id,
             )
             await self._reply_for(qevent, route, exc.public_detail)
-            return False
+            return _ApprovalPause.refused(exc.public_detail)
         except (ApprovalBackendError, ValidationError) as exc:
             # ValidationError: the shared model rejected the payload at
             # construction (#492) -- an unknown gate_kind, or an empty
@@ -7264,7 +8230,8 @@ class Kernel:
                 "not be created; flagging for a human instead of pausing.",
                 failure_class="approval-create-failed",
             )
-            return False
+            refusal = exc.refusal if isinstance(exc, ApprovalBackendError) else None
+            return _ApprovalPause.refused(refusal)
 
         progress_plan = _TURN_PROGRESS.get()
         if progress_plan is not None and self._progress is not None:
@@ -7438,7 +8405,16 @@ class Kernel:
                 thread_key,
                 created.id,
             )
-            return True
+            return _ApprovalPause(created=True)
+
+        # Display attribution is distinct from the resume actor and the durable
+        # approval author. An older API cannot prove a continuation's origin.
+        if created.requester_known:
+            requested_by = created.requested_by or ""
+        elif self._is_approval_resume(qevent.event_id):
+            requested_by = ""
+        else:
+            requested_by = qevent.author
 
         # The approval interaction (#246, ADR-0010/0020): a channel-neutral
         # Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit -- the
@@ -7453,6 +8429,9 @@ class Kernel:
             card_message = OutboundMessage(
                 version=MESSAGE_VERSION,
                 text=display_summary,
+                # ADR-0177 amendment A5: an email card in the asking thread names
+                # who can approve. Display only; the platform decides who may.
+                fields=approver_fields(card_approver_emails),
                 interaction=ConfirmIntent(
                     kind="confirm",
                     id=created.id,
@@ -7512,7 +8491,7 @@ class Kernel:
                         reply_ref=card_reply_ref,
                     ),
                     message=card_message,
-                    requested_by=qevent.author,
+                    requested_by=requested_by,
                 ),
                 route=TargetRoute(endpoint=card_endpoint, adapter=card_adapter),
             )
@@ -7525,6 +8504,7 @@ class Kernel:
             # later (#419). Best-effort: a lost memory only means the card is not
             # auto-disabled, and the resolve-click path still heals it.
             if card_ts and self._card_store is not None:
+                registered = False
                 try:
                     await self._card_store.remember(
                         str(created.id),
@@ -7542,10 +8522,13 @@ class Kernel:
                         # The settled rebuild shows the same "Requested by" line
                         # the live card did, and once the sandbox is gone this
                         # is the worker's only copy of it (#1084).
-                        requested_by=qevent.author,
+                        requested_by=requested_by,
                     )
+                    registered = True
                 except Exception as exc:  # noqa: BLE001 - best-effort memory
                     logger.warning("remembering approval card for %s failed: %s", created.id, exc)
+                if registered:
+                    await self._settle_if_decided_before_registration(str(created.id), qevent)
             # ADR-0179 decision 3: the card is now a message of its own below the
             # notice, so the resume answers below it. Remembered apart from the
             # card ref because settling consumes that ref, and a redelivered
@@ -7584,14 +8567,14 @@ class Kernel:
                             ),
                             interaction=None,
                         ),
-                        requested_by=qevent.author,
+                        requested_by=requested_by,
                     ),
                     route=notification_route,
                 )
             except Exception as exc:  # noqa: BLE001 - the durable pause stands
                 logger.warning("approval notification post failed for %s: %s", created.id, exc)
         logger.info("thread %s suspended awaiting approval %s", thread_key, created.id)
-        return True
+        return _ApprovalPause(created=True)
 
     @contextlib.asynccontextmanager
     async def _keep_route_alive(self, thread_key: str, claim_name: str) -> AsyncIterator[None]:
@@ -7644,6 +8627,7 @@ class Kernel:
         *,
         workspace_deployment_id: uuid.UUID | None,
         remaining_s: float | None,
+        memory_grant: TurnMemoryGrant | None = None,
     ) -> TurnOutcome:
         """Re-prompt a factory execute turn that ended without publishing, ONCE.
 
@@ -7686,8 +8670,28 @@ class Kernel:
                 run=run,
                 remaining_s=left,
             )
+            if event.tool_access is not None:
+                # @spec WORKER-TOOL-ACCESS-2: the continuation opens a turn too.
+                await self._require_tool_access(handle, event.tool_access, left)
+            # ADR-0188: the continuation opens a turn too, with its own
+            # credential, minted from the budget its stream is bound from.
+            event = self._with_memory_token(event, qevent, memory_grant, left)
             turn = await self._runner.start_turn(
                 handle.base_url, event, token=handle.token or None, remaining_s=left
+            )
+            if memory_grant is not None:
+                self._record_turn_deadline(memory_grant, left)
+            _note_live_memory_turn(turn)
+        except ToolAccessUnenforced as exc:
+            logger.warning("work-item continuation refused for %s: %s", qevent.event_id, exc)
+            return TurnOutcome(
+                terminal_ok=False,
+                saw_side_effect=outcome.saw_side_effect,
+                classification=TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+                error_message=exc.public_detail,
+                tools_called=outcome.tools_called,
+                assistant_text=outcome.assistant_text,
+                continued=True,
             )
         except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
             # The agent never saw the prompt, so the ending is the runner's: the
@@ -7712,7 +8716,13 @@ class Kernel:
         _lifecycle_event("runner.turn.started", "continuation")
         try:
             second = await self._consume(
-                qevent, route, turn, nav, agent_id, workspace_inferred_repo=inferred
+                qevent,
+                route,
+                turn,
+                nav,
+                agent_id,
+                handle=handle,
+                workspace_inferred_repo=inferred,
             )
         finally:
             turn.close()
@@ -7731,6 +8741,7 @@ class Kernel:
         nav: NavAffordance | None = None,
         agent_id: uuid.UUID | None = None,
         *,
+        handle: SandboxHandle,
         workspace_inferred_repo: str | None,
     ) -> TurnOutcome:
         acc = _StreamAccumulator(
@@ -7773,12 +8784,15 @@ class Kernel:
             ),
         )
         pump = await self._start_progress_pump(qevent, route)
+        stream_started_at = datetime.now(UTC)
+        stream_reading = True
         try:
             # ``async with`` releases the aiohttp response on every exit path
             # (normal end, apply-frame error, or a mid-stream transport drop), so
             # the connection is never leaked.
             async with turn:
                 async for frame in turn:
+                    stream_reading = False
                     await self._apply_frame(frame, acc, reply, qevent, agent_id)
                     # ``Final`` is the protocol's terminal response event. Stop
                     # at that boundary so a late frame from a finishing runner
@@ -7786,6 +8800,7 @@ class Kernel:
                     # bounded retry/escalation decision.
                     if isinstance(frame, Final):
                         break
+                    stream_reading = True
         except (aiohttp.ClientError, TimeoutError) as exc:
             # Stream dropped mid-run (sandbox killed, network fault, or the
             # client's streaming budget expiring). No final.
@@ -7824,6 +8839,24 @@ class Kernel:
                 )
             else:
                 classification = "runner-error"
+                if stream_reading and isinstance(exc, aiohttp.ClientError):
+                    try:
+                        termination = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self._substrate.pod_termination,
+                                handle,
+                                since=stream_started_at,
+                            ),
+                            timeout=3.0,
+                        )
+                    except Exception:
+                        # Diagnosis is best effort; the original stream warning
+                        # above remains the operator record of this failure.
+                        pass
+                    else:
+                        if termination is not None:
+                            classification = "sandbox-terminated"
+                            acc.error_message = _sandbox_termination_detail(termination)
             return TurnOutcome(
                 terminal_ok=False,
                 saw_side_effect=acc.saw_side_effect,
@@ -8012,9 +9045,183 @@ class Kernel:
         logger.warning("escalating event %s: %s", qevent.event_id, text)
         await self._reply_for(qevent, route, text)
 
+    async def _escalate_unanswerable_email_approval(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        agent_id: uuid.UUID | None,
+        route_name: str | None,
+    ) -> None:
+        """Escalate an approval raised in an email thread that nobody may answer.
+
+        ADR-0177 amendment A3: on email, only an address on the route's approver
+        list may answer, and there is no requester-only default. Creating the
+        approval would leave a card that can only expire, so the turn is
+        flagged for a human with the reason, as ADR-0177 decision 3 already does
+        for approvers that cannot be verified on the asking channel.
+
+        Args:
+            qevent: the turn that raised the approval.
+            route: the turn's reply route.
+            agent_id: the agent, for the log line.
+            route_name: the route the approval named, or None when routeless.
+        """
+
+        logger.warning(
+            "approval route %r has no approver emails but its card would land on an "
+            "email conversation for agent %s; escalating",
+            route_name,
+            agent_id,
+        )
+        if route_name is None:
+            why = "The run requested an approval without naming a route"
+        else:
+            why = (
+                f"The run requested approval via route {route_name!r}, which lists no "
+                "approver email addresses"
+            )
+        await self._escalate(
+            qevent,
+            route,
+            f"{why}, and on email only an address on a route's approver list may "
+            "answer; flagging for a human instead of creating an approval nobody "
+            "here can answer.",
+            failure_class="approval-no-email-approvers",
+        )
+
     def _backoff(self, attempt: int) -> float:
         raw: float = self._config.retry_backoff_base_s * (2 ** (attempt - 1))
         return min(self._config.retry_backoff_max_s, raw)
+
+    def _with_memory_token(
+        self,
+        event: Event,
+        qevent: QueuedTurn,
+        grant: TurnMemoryGrant | None,
+        remaining_s: float | None,
+        *,
+        cap_at: float | None = None,
+    ) -> Event:
+        """``event`` with this turn's memory write credential (ADR-0188).
+
+        Call it just before the runner call that opens or steers the turn, with
+        the ``remaining_s`` that call gets: the credential expires at that
+        call's stream deadline (``RunnerClient.turn_deadline_s``), and no later
+        than ``cap_at`` (a wall-clock time) when one is given, as for a steer.
+
+        No credential when there is no grant, the binding cannot mint (a double
+        without the method), or the resolver declines (writes off, no key). Nor
+        when the budget is spent (``remaining_s <= 0``): the stream then gets
+        only a 50 ms floor to fail fast, so there is no turn to cover. ``None``
+        is no budget in hand, which is the runner ceiling, not "spent". The
+        credential rides the event only (MEMORY-TOKEN-2/3): never the boot env,
+        never a log line."""
+
+        unminted = event.model_copy(update={"memory_token": None}) if event.memory_token else event
+        if grant is None or self._binding is None:
+            return unminted
+        mint = getattr(self._binding, "turn_memory_token", None)
+        if mint is None:
+            return unminted
+        if remaining_s is not None and remaining_s <= 0:
+            return unminted
+        ttl_s = self._runner.turn_deadline_s(remaining_s)
+        if cap_at is not None:
+            # Whole seconds down, since the binding rounds the lifetime up.
+            ttl_s = min(ttl_s, math.floor(cap_at - time.time()))
+            if ttl_s <= 0:
+                return unminted
+        # Unique per mint (#3776): the attempt closes its turn when it ends, so a
+        # retry or a continuation needs its own claim, or the close would refuse
+        # it. It still starts with the event id, for the API's refusal log.
+        turn = f"{qevent.event_id}#{uuid.uuid4().hex[:8]}"
+        token = mint(
+            grant.resolved,
+            kind=grant.kind,
+            address=grant.address,
+            thread_key=grant.thread_key,
+            sender=qevent.author or "",
+            turn=turn,
+            ttl_s=ttl_s,
+        )
+        if not token:
+            return unminted
+        record = _MEMORY_TURNS.get()
+        agent = getattr(grant.resolved, "agent_id", None)
+        if record is not None and isinstance(agent, uuid.UUID):
+            record.minted.append((agent, turn))
+        return event.model_copy(update={"memory_token": token})
+
+    def _record_turn_deadline(self, grant: TurnMemoryGrant, remaining_s: float | None) -> None:
+        """Remember the stream deadline of a turn just opened, for steer caps."""
+
+        now = time.time()
+        for key in [k for k, at in self._turn_deadlines.items() if at <= now]:
+            del self._turn_deadlines[key]
+        self._turn_deadlines[grant.thread_key] = now + self._runner.turn_deadline_s(remaining_s)
+
+    def _settle_memory_turns(self, record: _AttemptMemoryTurns) -> None:
+        """Close the turns an attempt minted, in the background (#3776).
+
+        The attempt's end does not wait on the API: the closes run as their own
+        task, kept in ``_PENDING_MEMORY_CLOSES`` so it is not garbage collected,
+        and a cancelled attempt still closes its credential. A failed or timed
+        out close never fails the turn: the credential then expires at the
+        turn's stream deadline, as before."""
+
+        task = asyncio.ensure_future(self._close_memory_turns(record))
+        _PENDING_MEMORY_CLOSES.add(task)
+        task.add_done_callback(_settled_memory_close)
+
+    async def _close_memory_turns(self, record: _AttemptMemoryTurns) -> None:
+        close = getattr(self._binding, "close_turn_memory", None)
+        if close is None:
+            return
+        turns: list[tuple[uuid.UUID, str]] = []
+        if record.steered:
+            # The live turn this attempt joined holds the steering credential
+            # (the runner's ``MemoryTurn.begin`` on steer) until it ends, so the
+            # attempt that owns that turn closes it. A list in Valkey keyed by
+            # that live turn, so the owner can be on another worker, and the
+            # owner of an earlier turn on the thread never takes it.
+            push = getattr(self._markers, "push_steer_memory_turns", None)
+            if push is not None and record.minted and record.steered_into is not None:
+                by_agent: dict[uuid.UUID, list[tuple[uuid.UUID, str]]] = {}
+                for agent, turn in record.minted:
+                    by_agent.setdefault(agent, []).append((agent, turn))
+                for agent, claims in by_agent.items():
+                    try:
+                        await push(agent, record.steered_into, claims)
+                    except Exception as exc:  # noqa: BLE001 -- falls back to expiry
+                        logger.warning(
+                            "could not hand a steer's memory turn to its live turn: %s",
+                            type(exc).__name__,
+                        )
+            elif record.minted:
+                # The runner did not name its live turn (an older runner, or one
+                # booted without a token), so no owner can find this claim. It is
+                # refused at its expiry instead.
+                logger.info("steer's memory turn left to expire: the live turn was not named")
+        else:
+            turns.extend(record.minted)
+        drain = getattr(self._markers, "drain_steer_memory_turns", None)
+        if record.live_turns and drain is not None:
+            agents = {agent for agent, _turn in record.minted}
+            if record.agent_id is not None:
+                agents.add(record.agent_id)
+            for agent in agents:
+                for live_turn in record.live_turns:
+                    try:
+                        turns.extend(await drain(agent, live_turn))
+                    except Exception as exc:  # noqa: BLE001 -- falls back to expiry
+                        logger.warning(
+                            "could not read the steers that joined a turn: %s",
+                            type(exc).__name__,
+                        )
+        if turns:
+            # Concurrently, each under its own bound, so one slow close does not
+            # hold up the others.
+            await asyncio.gather(*(_close_memory_turn(close, agent, turn) for agent, turn in turns))
 
     @staticmethod
     def _to_event(qevent: QueuedTurn) -> Event:
@@ -8023,4 +9230,6 @@ class Kernel:
             text=qevent.text,
             user=qevent.author,
             ts=qevent.conversation_id,
+            # @spec WORKER-TOOL-ACCESS-1: carried unchanged; None is today's turn.
+            tool_access=qevent.tool_access,
         )

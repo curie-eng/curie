@@ -74,6 +74,8 @@ from plugin_format import (
     resolve_manifest,
 )
 
+from .approval_wording import describe_approval, presentation_text
+from .caller_feedback import action_label
 from .memory_facts import (
     FORGET_TOOL,
     MAX_STATEMENT_CHARS,
@@ -84,6 +86,7 @@ from .memory_facts import (
     MemoryFactsError,
     MemoryFactsStore,
     MemoryFull,
+    MemoryRefused,
     MemoryTurn,
 )
 from .publication_precheck import PublicationPrecheck
@@ -245,6 +248,9 @@ PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__report_progress"
 # Deliberate progress (ADR 0130's ``curie_progress``), mounted on the same server
 # whenever ``report_progress`` is not; see ``turn_progress.py``.
 TURN_PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TURN_PROGRESS_TOOL}"
+# The GitHub factory's platform issue read (ADR 0187), mounted on the same
+# server only when the worker injected the issue read route and capability.
+ISSUE_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__get_issue"
 
 # Curie's own platform-owned MCP servers are ``curie`` and ``curie-state``
 # (#2286). The runner mounts both itself and a bundle cannot declare either:
@@ -275,15 +281,16 @@ TURN_PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TURN_PROGRESS_TOOL}"
 # exempting its name costs nothing, and making the exemption depend on the
 # pager decision would add a second way for the two to disagree. The same
 # reasoning covers ``report_progress`` (#3077), mounted only for a factory
-# execution: it reports a phase and never acts, so it is never gated. And it
-# covers ``progress`` (ADR 0130), mounted only for eligible human turns: it
-# reports task state and never acts either.
+# execution: it reports a phase and never acts, so it is never gated.
+# This also covers ``progress`` (ADR 0130), mounted only for eligible human
+# turns, and ``get_issue`` (ADR 0187), which reads only the execution's own issue.
 _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
     {
         APPROVAL_TOOL_NAME,
         PLATFORM_PUBLISH_TOOL_NAME,
         PROGRESS_TOOL_NAME,
         TURN_PROGRESS_TOOL_NAME,
+        ISSUE_TOOL_NAME,
     }
 )
 
@@ -452,6 +459,7 @@ def build_approval_server(
     progress_tool: SdkMcpTool[Any] | None = None,
     turn_progress_tool: SdkMcpTool[Any] | None = None,
     memory_tools: Sequence[SdkMcpTool[Any]] = (),
+    issue_tool: SdkMcpTool[Any] | None = None,
 ) -> McpSdkServerConfig:
     """Build the in-process MCP server carrying applicable approval tools.
 
@@ -480,6 +488,9 @@ def build_approval_server(
 
     ``memory_tools`` (#1461) are ``remember``/``update``/``forget``, passed only
     when the worker set a channel memory ref.
+
+    ``issue_tool`` (ADR 0187) is the ``get_issue`` tool, appended only for an
+    execution with a WorkItem, when the worker injected its read capability.
     """
 
     @tool(_TOOL_NAME, _TOOL_DESCRIPTION, _TOOL_SCHEMA)
@@ -513,6 +524,8 @@ def build_approval_server(
     elif turn_progress_tool is not None:
         tools.append(turn_progress_tool)
     tools.extend(memory_tools)
+    if issue_tool is not None:
+        tools.append(issue_tool)
 
     return create_sdk_mcp_server(
         name=APPROVAL_SERVER_NAME,
@@ -600,17 +613,33 @@ def build_memory_tools(
                 f"Refused: that fact is too large to store as one {memory} memory entry "
                 f"({exc}). Nothing was saved; state it more briefly."
             )
+        if isinstance(exc, MemoryFull) and exc.limit == "facts":
+            return _approval_error(f"Refused: {memory} memory is full: {exc}. Nothing was saved.")
         if isinstance(exc, MemoryFull):
             return _approval_error(f"Refused: {memory} memory is full ({exc}). Nothing was saved.")
         if isinstance(exc, FactNotFound):
             return _approval_error(f"Not found: no fact with id {fact_id!r} in {memory} memory.")
+        if isinstance(exc, MemoryRefused):
+            # ADR-0188: the API refused this credential, which is not an outage.
+            logger.warning("memory tool refused error_class=%s: %s", type(exc).__name__, exc)
+            return _approval_error(
+                "Refused: this memory cannot be written from this conversation. "
+                "Nothing was saved."
+            )
         logger.warning("memory tool failed error_class=%s: %s", type(exc).__name__, exc)
         return _approval_error(f"The {memory} memory could not be reached. Nothing changed.")
 
     def ok(payload: dict[str, Any]) -> dict[str, Any]:
         return {"content": [{"type": "text", "text": json.dumps(payload)}]}
 
-    @tool(REMEMBER_TOOL, "Save one new fact to memory. Returns its id.", _REMEMBER_SCHEMA)
+    @tool(
+        REMEMBER_TOOL,
+        "Save one new fact to memory and return its id. This, or update for a fact "
+        "that already exists, is the only way to keep something for a later "
+        "conversation: a request to remember, note or make something stick, or to set "
+        "a standing instruction, means calling one of them.",
+        _REMEMBER_SCHEMA,
+    )
     async def remember(args: dict[str, Any]) -> dict[str, Any]:
         store, problem = pick(args)
         if store is None:
@@ -897,6 +926,10 @@ class ApprovalGate:
     # ``SessionRunner`` knows the runner itself requested that stop. It is
     # runner-internal and is NEVER serialized onto the wire.
     pending_halt: bool = False
+    # The metric observer must attribute a hold to the exact SDK call. A tool
+    # name is insufficient when a granted call and a held sibling share it.
+    held_call_ids: set[str] = field(default_factory=set)
+    refused_call_ids: set[str] = field(default_factory=set)
     # A declared tool policy plus the bundle identity needed to translate live
     # SDK MCP names back to the canonical "<server>/<tool>" policy surface.
     tool_policy: ToolPolicy | None = None
@@ -933,7 +966,27 @@ class ApprovalGate:
             return None
         return self.grantable_by_route.get(route)
 
-    def reset(self) -> None:
+    def requires_approval(self, tool_name: str) -> bool:
+        """Whether a call to ``tool_name`` would need an approval, read-only.
+
+        @spec RUNNER-TOOL-ACCESS-1: a read-only turn cannot request one, so the
+        tool access check refuses these before the gate is consulted. The same
+        membership ``_decide_gate`` blocks on, with no state touched.
+        """
+
+        return (
+            tool_name in self.required
+            or _tool_policy_outcome(self, tool_name) is ToolPolicyDecision.APPROVAL_REQUIRED
+        )
+
+    def reset(self, *, grant_eligible: bool = True) -> None:
+        """Clear one turn's gate state before the next turn runs.
+
+        ``grant_eligible`` False is a turn that may not spend the boot grant (a
+        read-only turn, RUNNER-TOOL-ACCESS-10): it neither expires the grant
+        nor counts as the boot turn, so the next eligible turn still can.
+        """
+
         self.pending_summary = None
         self.pending_display = None
         self.pending_route = None
@@ -952,9 +1005,13 @@ class ApprovalGate:
         # than with the boot-turn grant below: a halt that leaked forward would
         # make every later errored turn finalize as awaiting-approval (#1852).
         self.pending_halt = False
+        self.held_call_ids.clear()
+        self.refused_call_ids.clear()
         # Boot-turn-only grant: keep it on the first reset (the boot turn),
         # expire any unspent grant on the second and later resets so it never
         # leaks into a subsequent turn.
+        if not grant_eligible:
+            return
         if self._boot_turn_seen:
             self.grant_tool = None
             self.grant_arguments = None
@@ -1068,8 +1125,10 @@ class ApprovalGate:
         self.pending_summary = summarize_tool_call(tool_name, tool_input)
         template = self.summary_by_tool.get(tool_name)
         self.pending_display = (
-            render_gate_summary(template, tool_input) if template else None
-        )
+            render_gate_summary(presentation_text(template, tool_name), tool_input)
+            if template
+            else None
+        ) or describe_approval(tool_name, tool_input)
         self.pending_route = self.route_by_tool.get(tool_name)
         # Provenance for the permission gate (#544, Decision C): the tool
         # name here is the value ``can_use_tool`` itself denied -- the
@@ -1199,22 +1258,20 @@ def is_platform_owned_tool(
     of a DIFFERENT server whose key merely begins ``curie__`` or
     ``curie-state__``: ``mcp__curie__extra__foo`` and
     ``mcp__curie-state__extra__bar`` both matched, and both were handed a bundle
-    toolPolicy bypass. That is reachable, not theoretical --
-    ``ClaudeAgentOptions.strict_mcp_config`` defaults to False and
-    ``adapter.build_options`` never sets it, so the CLI loads project
-    ``.mcp.json``, user settings and plugin servers BESIDE the ``--mcp-config``
-    dict ``build_mcp_servers`` controls (``check.py::evaluate`` already treats
-    those ambient servers as real). A mounted workspace is the session cwd, it is
-    writable, and it survives across sandboxes, so a ``.mcp.json`` sitting there
-    is bundle-influenced input. A connector cannot do it (a connector name may
-    not contain ``_``), an ambient project server can.
+    toolPolicy bypass. It was reachable while ``adapter.build_options`` left
+    ``strict_mcp_config`` off: the CLI then loaded project ``.mcp.json``, user
+    settings and plugin servers BESIDE the ``--mcp-config`` dict, and a mounted
+    workspace is the session cwd, writable, and survives across sandboxes, so a
+    ``.mcp.json`` sitting there was bundle-influenced input. A connector cannot
+    do it (a connector name may not contain ``_``), an ambient project server
+    could.
 
-    The residual this does NOT close, stated rather than hidden: when the
-    platform HAS mounted a server, an impostor publishing a name-identical tool
-    is exempt too, because the live name is the entire thing this gate sees --
-    ``mcp__curie-state__get`` from an ambient server and from Curie's own server
-    are the same string. Closing that needs ``strict_mcp_config`` or an
-    ambient-server policy, which is a separate change and out of scope here. The
+    The residual the exact match alone cannot close: when the platform HAS
+    mounted a server, an impostor publishing a name-identical tool is exempt
+    too, because the live name is the entire thing this gate sees. #2899 closes
+    it one layer down: the runner now sets ``strict_mcp_config``, so no server
+    outside the ``--mcp-config`` dict the runner builds can load, and this exact
+    match stays as defence in depth. The
     class this closes is the one the prefix match invented: every name on a
     platform-shaped prefix that the platform does not itself publish.
 
@@ -1306,10 +1363,9 @@ def _canonical_arguments(arguments: dict[str, Any]) -> str:
 
 def _grant_mismatch_refusal(tool_name: str) -> str:
     return (
-        f"The approval for {tool_name} covers only the exact arguments the approver "
-        "saw, and this call's arguments differ. It was not run. Retry with exactly "
-        "the approved arguments, or tell the user what changed so they can approve "
-        "the new call."
+        f"The approval for {action_label(tool_name)} covers only the approved details, "
+        "and this request has different details. It was not run. Use the approved "
+        "details, or tell the user what changed so they can approve the new request."
     )
 
 
@@ -1338,19 +1394,23 @@ async def _decide_gate(
             )
     outcome = _tool_policy_outcome(gate, tool_name)
     if outcome is ToolPolicyDecision.DENY:
+        if tool_use_id is not None:
+            gate.refused_call_ids.add(tool_use_id)
         return _GateDecision(
             blocked=False,
             ungated=False,
             refusal=(
-                f"{tool_name} is denied by this agent's tool policy. This is not an "
-                "approval you can request -- the policy forbids the call. Do not retry "
-                "it; say what you were trying to do and stop."
+                f"The {action_label(tool_name)} action is not permitted for this agent. "
+                "Approval cannot authorize it. It was not run. Do not retry; "
+                "explain what you were trying to do and stop."
             ),
         )
     # Policy gates are additive to legacy/operator gates. A policy allow never
     # removes a legacy gate, while approvalRequired joins the same one-shot path.
     if outcome is ToolPolicyDecision.APPROVAL_REQUIRED and tool_name not in gate.required:
         if gate.grant_argument_mismatch(tool_name, tool_input):
+            if tool_use_id is not None:
+                gate.refused_call_ids.add(tool_use_id)
             return _GateDecision(
                 blocked=False,
                 ungated=False,
@@ -1360,6 +1420,8 @@ async def _decide_gate(
         if gate.consume_grant(tool_name, tool_input):
             return _GateDecision(blocked=False, ungated=False)
         gate.block(tool_name, tool_input)
+        if tool_use_id is not None:
+            gate.held_call_ids.add(tool_use_id)
         return _GateDecision(blocked=True, ungated=False)
     if tool_name not in gate.required:
         return _GateDecision(blocked=False, ungated=True)
@@ -1368,6 +1430,8 @@ async def _decide_gate(
     if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.grant_argument_mismatch(
         tool_name, tool_input
     ):
+        if tool_use_id is not None:
+            gate.refused_call_ids.add(tool_use_id)
         return _GateDecision(
             blocked=False,
             ungated=False,
@@ -1377,6 +1441,8 @@ async def _decide_gate(
     if tool_name != PLATFORM_PUBLISH_TOOL_NAME and gate.consume_grant(tool_name, tool_input):
         return _GateDecision(blocked=False, ungated=False)
     gate.block(tool_name, tool_input)
+    if tool_use_id is not None:
+        gate.held_call_ids.add(tool_use_id)
     if (
         tool_name == PLATFORM_PUBLISH_TOOL_NAME
         and gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME

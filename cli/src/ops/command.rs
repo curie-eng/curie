@@ -2,7 +2,7 @@
 //! registry and its signal cleanup, and the two process runners
 //! (`run_capture`, `run_step`) every verb shells out through.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeSet;
 use std::process::Stdio;
 #[cfg(unix)]
@@ -148,6 +148,31 @@ impl OpsCommand {
     /// values are dropped rather than executed.
     pub fn argv(&self) -> Vec<String> {
         self.args.iter().flat_map(CmdArg::value_tokens).collect()
+    }
+
+    /// The `tokio::process::Command` for this command: program, real argv, env,
+    /// and secret env, with no stdio, `kill_on_drop`, or process group applied.
+    /// This is the one place a child `Command` is constructed, so a caller that
+    /// needs its own stdio or process group still never writes `Command::new`.
+    /// Call it on the result of
+    /// [`materialize_secret_files`](Self::materialize_secret_files), otherwise any
+    /// [`CmdArg::SecretValuesFile`] values are dropped rather than executed.
+    pub(crate) fn tokio_command(&self) -> Command {
+        debug_assert!(
+            !self.args.iter().any(|arg| matches!(
+                arg,
+                CmdArg::SecretValuesFile(_)
+                    | CmdArg::SecretValuesDocument(_)
+                    | CmdArg::PrivateJsonValuesFile(_)
+                    | CmdArg::SecretPatchFile { .. }
+            )),
+            "materialize_secret_files before tokio_command"
+        );
+        let mut command = Command::new(&self.program);
+        command
+            .args(self.argv())
+            .envs(self.env.iter().chain(self.secret_env.iter()).cloned());
+        command
     }
 
     /// The full shell-quoted command line with secrets masked, one line as it
@@ -371,6 +396,17 @@ impl SecretValuesFileGuard {
         Self::write_document(&nest_dotted_keys(pairs))
     }
 
+    /// Write a complete values document into a fresh private (0600) temp file
+    /// a caller passes to helm with `-f`. Removed on drop or signal.
+    pub(crate) fn private_document(doc: &serde_json::Value) -> Result<Self> {
+        Self::write_document(doc)
+    }
+
+    /// Where the private values file lives.
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     fn write_document(doc: &serde_json::Value) -> Result<Self> {
         ensure_secret_signal_cleanup()?;
         let body = serde_json::to_vec(doc).context("serializing secret helm values")?;
@@ -535,15 +571,32 @@ pub struct CommonOpts {
 // Execution
 // ---------------------------------------------------------------------------
 
+/// Whether `bin` resolves on PATH. For a caller that has a fallback when the
+/// tool is absent rather than a refusal (#3503).
+pub(crate) fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
 /// Fail with a clear one-line error if `bin` is not on `PATH`.
 pub(crate) fn require_on_path(bin: &str) -> Result<()> {
-    let found = std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
-        .unwrap_or(false);
-    if found {
+    if on_path(bin) {
         Ok(())
     } else {
         bail!("`{bin}` is not on PATH; install it (or add it to PATH) and retry")
+    }
+}
+
+/// Preserve the operating-system cause of a command invocation failure.
+/// A PATH hint is useful only for `NotFound`; claiming PATH for permission,
+/// resource, or text-file errors hid the errno needed to diagnose #2236.
+pub(crate) fn command_io_error(program: &str, error: std::io::Error) -> anyhow::Error {
+    let kind = error.kind();
+    if kind == std::io::ErrorKind::NotFound {
+        anyhow!("failed to invoke `{program}`: {error} (kind: {kind:?}); is it on PATH?")
+    } else {
+        anyhow!("failed to invoke `{program}`: {error} (kind: {kind:?})")
     }
 }
 
@@ -561,13 +614,12 @@ pub async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
     // reads by a timeout for a wedged daemon, and each timed-out call would
     // otherwise strand another hung `docker` client (#1031). Inert for every
     // caller that awaits to completion: the child has already exited by then.
-    let output = Command::new(&cmd.program)
-        .args(cmd.argv())
-        .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
+    let output = cmd
+        .tokio_command()
         .kill_on_drop(true)
         .output()
         .await
-        .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
+        .map_err(|error| command_io_error(&cmd.program, error))?;
     Ok((
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).to_string(),
@@ -580,15 +632,14 @@ pub(crate) async fn run_capture_with_stdin(
     input: &[u8],
 ) -> Result<(bool, String, String)> {
     let (cmd, _secret_files) = cmd.materialize_secret_files()?;
-    let mut child = Command::new(&cmd.program)
-        .args(cmd.argv())
-        .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
+    let mut child = cmd
+        .tokio_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
+        .map_err(|error| command_io_error(&cmd.program, error))?;
     let write_result = match child.stdin.take() {
         Some(mut stdin) => stdin.write_all(input).await,
         None => Err(std::io::Error::other("child stdin pipe was unavailable")),
@@ -670,6 +721,34 @@ mod tests {
     use super::*;
 
     use crate::ops::testsupport::*;
+
+    #[tokio::test]
+    async fn spawn_failure_names_the_io_error_kind_and_cause() {
+        let missing = OpsCommand::new("curie-definitely-missing-2236", vec![]);
+        let error = run_capture(&missing).await.unwrap_err().to_string();
+        assert!(error.contains("NotFound"), "{error}");
+        assert!(
+            error.contains("No such file") || error.contains("not found"),
+            "{error}"
+        );
+        assert!(error.contains("PATH"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_path_spawn_failure_does_not_claim_the_program_is_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("not-executable");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let command = OpsCommand::new(&program.display().to_string(), vec![]);
+        let error = run_capture(&command).await.unwrap_err().to_string();
+        assert!(error.contains("PermissionDenied"), "{error}");
+        assert!(error.contains("Permission denied"), "{error}");
+        assert!(!error.contains("is it on PATH"), "{error}");
+    }
 
     #[test]
     fn with_env_stores_the_pairs() {

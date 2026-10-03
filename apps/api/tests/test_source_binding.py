@@ -9,14 +9,14 @@ must not multiply work.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
+import time
 from typing import Any
 
 import pytest
 import redis
 from aci_protocol import QueuedTurn, TurnSource
+from curie_api import hook_signing
 from curie_api.config import get_settings
 from curie_api.hook_signing import derive
 from fastapi.testclient import TestClient
@@ -31,10 +31,6 @@ REVISION = "0123456789abcdef0123456789abcdef01234567"
 WORKLOAD = "curie-api"
 STOP_PHRASE = "Coding is stopped"
 MAPPING_PHRASE = "authorized source mapping"
-
-
-def _sign(secret: str, body: bytes) -> str:
-    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
 def _secret_for(agent_id: str, generation: int = 0) -> str:
@@ -163,11 +159,19 @@ def _post(
     delivery_id: str | None = "dlv-1",
     hook: str = HOOK,
 ) -> Any:
-    headers = {"Content-Type": "application/json"}
+    timestamp = str(int(time.time()))
+    headers = {"Content-Type": "application/json", "X-Curie-Timestamp": timestamp}
     if signature is not None:
         headers["X-Curie-Signature-256"] = signature
     elif secret is not None:
-        headers["X-Curie-Signature-256"] = _sign(secret, body)
+        headers["X-Curie-Signature-256"] = hook_signing.sign(
+            secret,
+            timestamp=timestamp,
+            delivery_id=delivery_id or "",
+            hook=hook,
+            tool_access=None,
+            body=body,
+        )
     if delivery_id is not None:
         headers["X-Curie-Delivery-Id"] = delivery_id
     return client.post(f"/hooks/{agent_id}/{hook}", content=body, headers=headers)

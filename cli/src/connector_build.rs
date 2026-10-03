@@ -1209,12 +1209,37 @@ pub fn host_platform() -> String {
     format!("linux/{arch}")
 }
 
+/// Narrow a declared platform set to the `--platform` values requested.
+///
+/// No request keeps the declared set. Otherwise every requested platform must
+/// be declared; the result keeps declared order without duplicates. The source
+/// digest still hashes the declared block, so narrowing never moves it.
+pub fn narrow_platforms(declared: &[String], requested: &[String]) -> Result<Vec<String>> {
+    if requested.is_empty() {
+        return Ok(declared.to_vec());
+    }
+    if let Some(missing) = requested.iter().find(|r| !declared.contains(r)) {
+        bail!(
+            "--platform {missing} is not declared; the declared platforms are [{}]",
+            declared.join(", ")
+        );
+    }
+    let mut out: Vec<String> = Vec::new();
+    for platform in declared {
+        if requested.contains(platform) && !out.contains(platform) {
+            out.push(platform.clone());
+        }
+    }
+    Ok(out)
+}
+
 /// Resolve everything one connector's build needs, without contacting anything.
 ///
 /// Planning is where a bad declaration fails: a context outside the bundle, a
 /// symlinked Dockerfile, a missing Dockerfile. A planner that returned a plan
 /// for any of those would hand `docker` a path and surface Docker's error
 /// instead of one naming the connector.
+#[allow(clippy::too_many_arguments)]
 pub fn build_plan(
     bundle_root: &Path,
     bundle_name: &str,
@@ -1223,6 +1248,7 @@ pub fn build_plan(
     registry: Option<&str>,
     host_platform: &str,
     metadata_dir: &Path,
+    platforms: &[String],
 ) -> Result<ConnectorBuildPlan> {
     let build = spec.build.as_ref().ok_or_else(|| {
         anyhow!("connectors.{connector}: declares no `build` block, so there is nothing to build")
@@ -1252,7 +1278,7 @@ pub fn build_plan(
         connector: connector.to_string(),
         context,
         dockerfile,
-        platforms: build.platforms.clone(),
+        platforms: platforms.to_vec(),
         host_platform: host_platform.to_string(),
         delivery,
         image_ref,
@@ -1298,6 +1324,7 @@ pub fn check_runner_source(
 ///
 /// `base_arg` is what the build uses: the `<repo>@sha256:` reference for a
 /// registry build, the inspected reference for a local-daemon one.
+#[allow(clippy::too_many_arguments)]
 pub fn runner_build_plan(
     bundle_root: &Path,
     bundle_name: &str,
@@ -1306,6 +1333,7 @@ pub fn runner_build_plan(
     base_arg: &str,
     host_platform: &str,
     metadata_dir: &Path,
+    platforms: &[String],
 ) -> Result<ConnectorBuildPlan> {
     let (context, dockerfile) = check_runner_source(bundle_root, runner)?;
     let source_digest = source_digest_of(&context, &runner.build).context("runner")?;
@@ -1326,7 +1354,7 @@ pub fn runner_build_plan(
         connector: "runner".to_string(),
         context,
         dockerfile,
-        platforms: runner.build.platforms.clone(),
+        platforms: platforms.to_vec(),
         host_platform: host_platform.to_string(),
         delivery,
         image_ref,
@@ -1802,7 +1830,7 @@ pub(crate) fn compose_service_ids_command(
 
 /// Whether a declared connector is one Curie runs (as opposed to one already
 /// running somewhere else).
-fn is_hosted(spec: &ConnectorSpecDecl) -> bool {
+pub(crate) fn is_hosted(spec: &ConnectorSpecDecl) -> bool {
     spec.url.is_none() && spec.unhosted_url.is_none()
 }
 
@@ -1852,9 +1880,16 @@ pub fn compose_overlay(
     identity: &ConnectorScope,
     project: &str,
     plugin_dir: &Path,
+    caller_public_key: Option<&str>,
 ) -> Result<serde_json::Value> {
     let network = crate::local::current_resources()?.docker_network;
     let mut services = serde_json::Map::new();
+    let hosts_one = decl.connectors.values().any(is_hosted);
+    if hosts_one && caller_public_key.map(str::trim).unwrap_or("").is_empty() {
+        anyhow::bail!(
+            "hosted_connector_requires_caller_key: a hosted connector needs a caller public key"
+        );
+    }
     for (connector, spec) in &decl.connectors {
         if !is_hosted(spec) {
             continue;
@@ -2444,5 +2479,94 @@ mod undeclared_runner_dockerfile_tests {
         let dir = bundle(None, false);
         let decl = load(dir.path()).unwrap();
         assert_eq!(undeclared_runner_dockerfile(dir.path(), &decl), None);
+    }
+}
+
+#[cfg(test)]
+mod narrow_platforms_tests {
+    use super::*;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    // B1
+    #[test]
+    fn no_requested_platform_keeps_the_declared_set() {
+        let declared = strings(&["linux/arm64", "linux/amd64"]);
+        assert_eq!(narrow_platforms(&declared, &[]).unwrap(), declared);
+    }
+
+    #[test]
+    fn a_requested_subset_keeps_declared_order_without_duplicates() {
+        let declared = strings(&["linux/arm64", "linux/amd64", "linux/ppc64le"]);
+        let requested = strings(&["linux/ppc64le", "linux/arm64", "linux/arm64"]);
+        assert_eq!(
+            narrow_platforms(&declared, &requested).unwrap(),
+            strings(&["linux/arm64", "linux/ppc64le"])
+        );
+    }
+
+    #[test]
+    fn an_undeclared_platform_is_refused_by_name() {
+        let declared = strings(&["linux/amd64"]);
+        let error = narrow_platforms(&declared, &strings(&["linux/s390x"]))
+            .expect_err("an undeclared platform must be refused");
+        let text = format!("{error:#}");
+        assert!(text.contains("linux/s390x"), "{text}");
+        assert!(
+            text.contains("linux/amd64"),
+            "should name the declared set: {text}"
+        );
+    }
+
+    // B2
+    #[test]
+    fn a_narrowed_registry_build_builds_one_platform_and_keeps_the_digest() {
+        let bundle = tempfile::tempdir().unwrap();
+        let context = bundle.path().join("connectors").join("tempo");
+        std::fs::create_dir_all(&context).unwrap();
+        std::fs::write(context.join("Dockerfile"), "FROM python:3.13-slim\n").unwrap();
+        let meta = tempfile::tempdir().unwrap();
+        let declared = strings(&["linux/amd64", "linux/arm64"]);
+        let spec = ConnectorSpecDecl {
+            build: Some(ConnectorBuildDecl {
+                context: "connectors/tempo".to_string(),
+                dockerfile: "Dockerfile".to_string(),
+                platforms: declared.clone(),
+            }),
+            ..Default::default()
+        };
+        let plan = |platforms: &[String]| {
+            build_plan(
+                bundle.path(),
+                "factory",
+                "tempo",
+                &spec,
+                Some("localhost:5001"),
+                "linux/amd64",
+                meta.path(),
+                platforms,
+            )
+            .expect("build_plan")
+        };
+        let narrowed = narrow_platforms(&declared, &strings(&["linux/amd64"])).unwrap();
+        let single = plan(&narrowed);
+        let full = plan(&declared);
+
+        let argv = build_argv(&single).argv();
+        let at = argv
+            .iter()
+            .position(|t| t == "--platform")
+            .unwrap_or_else(|| panic!("no --platform in {argv:?}"));
+        assert_eq!(argv[at + 1], "linux/amd64", "{argv:?}");
+        assert_eq!(argv.iter().filter(|t| *t == "--platform").count(), 1);
+        assert!(!argv.iter().any(|t| t.contains("linux/arm64")), "{argv:?}");
+        assert_eq!(single.platforms, strings(&["linux/amd64"]));
+        assert_eq!(
+            single.source_digest, full.source_digest,
+            "narrowing must not change the declared source digest"
+        );
+        assert_eq!(single.image_ref, full.image_ref);
     }
 }

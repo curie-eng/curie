@@ -3,16 +3,17 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from sqlalchemy import select
 from starlette.concurrency import run_in_threadpool
 
 from .. import crud
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import SessionDep
-from ..models import Deployment
+from ..models import Deployment, WorkItem
 from ..repository_auth import resolve_repository_credential
 from ..schemas import (
-    RepositoryCredentialOut,
+    WorkspaceCredentialOut,
     WorkspaceCredentialRequest,
     WorkspaceSelectionOut,
     WorkspaceSelectionRequest,
@@ -91,7 +92,7 @@ async def select_workspace_repository(
 
 @router.post(
     "/{deployment_id}/credential",
-    response_model=RepositoryCredentialOut,
+    response_model=WorkspaceCredentialOut,
     dependencies=[Depends(require_internal_worker_token)],
 )
 async def redeem_workspace_credential(
@@ -99,7 +100,7 @@ async def redeem_workspace_credential(
     data: WorkspaceCredentialRequest,
     session: SessionDep,
     response: Response,
-) -> RepositoryCredentialOut:
+) -> WorkspaceCredentialOut:
     response.headers["Cache-Control"] = "no-store"
     deployment = await crud.get_deployment(session, deployment_id)
     if deployment is None:
@@ -157,6 +158,22 @@ async def redeem_workspace_credential(
             "repository is not allowed for runtime workspaces",
             headers={"Cache-Control": "no-store"},
         )
+    # A factory WorkItem on this conversation froze its base at admission (ADR
+    # 0186); the sandbox starts there. Legacy and non-factory threads get None
+    # and keep the repository default branch.
+    # Exactly one match carries a base; zero or an ambiguous two carry none.
+    factory_items = (
+        await session.execute(
+            select(WorkItem.base_branch, WorkItem.base_commit)
+            .where(
+                WorkItem.agent_id == deployment.agent_id,
+                WorkItem.conversation_id == data.conversation_id,
+                WorkItem.repo_full_name == repo,
+            )
+            .limit(2)
+        )
+    ).all()
+    base_branch, base_commit = factory_items[0] if len(factory_items) == 1 else (None, None)
     try:
         clone_url, authorization_header = await run_in_threadpool(
             resolve_repository_credential, repo, settings
@@ -192,9 +209,11 @@ async def redeem_workspace_credential(
             )
         ),
     )
-    return RepositoryCredentialOut(
+    return WorkspaceCredentialOut(
         repo_full_name=repo,
         clone_url=clone_url,
         authorization_header=authorization_header,
         revision=selected.revision,
+        base_branch=base_branch,
+        base_commit=base_commit,
     )

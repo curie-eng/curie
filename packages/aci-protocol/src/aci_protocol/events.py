@@ -18,6 +18,7 @@ from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Annotated, Any, Literal
+from typing import Final as TypingFinal
 from uuid import UUID
 
 from pydantic import (
@@ -97,6 +98,31 @@ class SessionStatus(StrEnum):
 # --- Inbound channel messages -------------------------------------------------
 
 
+class ToolAccess(StrEnum):
+    """Which tools one turn may execute (TOOL-ACCESS-1, TOOL-ACCESS-3).
+
+    Carried as ``QueuedTurn.tool_access`` and ``Event.tool_access``. Null means
+    the turn runs exactly as it always has. On a server that advertises it
+    under ``TOOL_ACCESS_STATUS_FIELD`` (TOOL-ACCESS-4), ``READ_ONLY`` restricts
+    the turn to tools the server explicitly classifies as read-only, denies
+    every other tool before it executes, and never requests an approval. A
+    worker or server that does not implement the contract decodes the value and
+    drops it (TOOL-ACCESS-6).
+
+    An enum, not free text (TOOL-ACCESS-2): an unknown value is refused on the
+    wire, never read as null, because reading it as null would run a restricted
+    turn unrestricted. A second value is a breaking change, decided on its own.
+    """
+
+    READ_ONLY = "read-only"
+
+
+#: The ``GET /status`` and ``GET /v1/status`` key under which an ACI server
+#: lists the ``ToolAccess`` values it enforces (TOOL-ACCESS-4). A server that
+#: omits it enforces none, so a consumer must not send it such a turn.
+TOOL_ACCESS_STATUS_FIELD: TypingFinal = "tool_access"
+
+
 class PublicationContext(_AciModel):
     """API issued authority and observation for one execution's publication read.
 
@@ -143,6 +169,20 @@ class Event(_AciModel):
     ``session_id`` and ``history_ref`` carry conversation-scoped identity to a
     runner after its sandbox is bound. Both remain optional so older producers
     can omit them and tolerant consumers can adopt the additive wire shape.
+
+    ``tool_access`` asks a server to restrict what this turn may execute
+    (TOOL-ACCESS-1, TOOL-ACCESS-3); null is an unrestricted turn. It is sent
+    only to a server that advertises the value under
+    ``TOOL_ACCESS_STATUS_FIELD`` (TOOL-ACCESS-4), because a server that does
+    not enforce it ignores it.
+
+    ``memory_token`` is the per-turn signed state credential the runner's
+    memory tools present for writes (MEMORY-TOKEN-1). Null means the turn
+    carries no write credential. It is never a BootEnv key or an env var, and
+    it is sent only on the runner POST (``/v1/event``, ``/v1/steer``;
+    MEMORY-TOKEN-2). ``repr=False`` keeps the value out of ``repr(event)`` and
+    log ``%r``; a consumer must not place it in env, logs, hook or subprocess
+    input, or persisted state (MEMORY-TOKEN-3).
     """
 
     kind: Literal["event"] = "event"
@@ -153,6 +193,8 @@ class Event(_AciModel):
     session_id: str | None = None
     history_ref: str | None = None
     publication_context: PublicationContext | None = None
+    tool_access: ToolAccess | None = None  # @spec TOOL-ACCESS-1 TOOL-ACCESS-2
+    memory_token: str | None = Field(default=None, repr=False)  # @spec MEMORY-TOKEN-1
 
 
 class Interrupt(_AciModel):
@@ -296,6 +338,12 @@ class SideEffectFlag(_OutboundBase):
     # frame, or a producer that predates this). A record is undoable only on a
     # successful outcome, so the outcome has to travel with the result.
     failed: bool | None = None
+    # Whether outbound redaction replaced anything inside ``result``. A scrubbed
+    # snapshot is no longer what the connector reported, and replaying it would
+    # write a placeholder over the live value, so a consumer must not treat a
+    # redacted ``result`` as restorable state (#1873). ``None`` means nothing was
+    # replaced or the producer predates this field.
+    redacted: bool | None = None
 
 
 OutboundEvent = Annotated[

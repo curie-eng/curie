@@ -12,15 +12,19 @@ that has nothing for the control to do -- a button that authorizes a restore
 which never runs is the platform telling a user an action was put back when it
 was not.
 
-The line still says which actions could be put back. That is the thing an
-operator is buying: not a bot that cannot make mistakes, but a platform that
-knows which mistakes it can take back.
+The line still says which actions the ledger holds restore information for.
+That is the thing an operator is buying: not a bot that cannot make mistakes, but
+a platform that knows which mistakes it could take back. It does not say "can be
+undone": nothing executes a restore yet (#1867), so that would promise what no
+part of the platform can deliver.
 """
 
 from __future__ import annotations
 
 import re
 from typing import Any, Literal
+
+from curie_worker.action_wording import action_label, presentation_text
 
 # What the receipt shows, chosen per install (ADR-0180). ``WorkerConfig`` reads
 # it from ``CURIE_TURN_RECEIPT``, and the chart schema offers the same three.
@@ -40,7 +44,7 @@ _MAX_LINES = 10
 # explained itself are both not-undoable, and flattening them to one line would
 # hide which happened.
 _UNDECLARED = "cannot be undone: nothing reported a prior state"
-_GENERIC_BASH_DETAILS = {
+_GENERIC_DETAILS = {
     None,
     "non-idempotent tool completed",
     "non-idempotent tool executed",
@@ -74,13 +78,13 @@ def _clamp(text: str) -> str:
 
 
 def _described(action: dict[str, Any]) -> str:
-    """The connector's own summary, or the tool's name when it offered none."""
+    """The connector description or a plain label, never an execution claim."""
 
     result = action.get("result")
     summary = result.get("summary") if isinstance(result, dict) else None
     if isinstance(summary, str) and summary.strip():
-        return _clamp(summary)
-    return f"called `{_clamp(action.get('tool') or 'a tool')}`"
+        return _clamp(presentation_text(summary, action.get("tool")))
+    return _clamp(action_label(action.get("tool")))
 
 
 def _verdict(action: dict[str, Any]) -> str:
@@ -89,17 +93,24 @@ def _verdict(action: dict[str, Any]) -> str:
         # reported failure, and a failed write is not the same as no write.
         return "failed — check before retrying"
     if action.get("undoable"):
-        return "can be undone"
+        # The ledger holds what a restore needs; nothing performs one yet (#1867).
+        return "restore information recorded"
     detail = action.get("detail")
-    if isinstance(detail, str) and detail.strip():
-        return _clamp(detail)
+    # Runner bookkeeping is not a connector explanation of irreversibility.
+    if isinstance(detail, str) and detail.strip() and detail not in _GENERIC_DETAILS:
+        return _clamp(presentation_text(detail, action.get("tool")))
+    result = action.get("result")
+    if action.get("prior_state") is not None or (
+        isinstance(result, dict) and result.get("prior") is not None
+    ):
+        return "cannot be undone: undo information is incomplete"
     return _UNDECLARED
 
 
-def _generic_bash(action: dict[str, Any]) -> bool:
-    if action.get("tool") != "Bash" or action.get("status") != "succeeded":
+def _generic_native(action: dict[str, Any]) -> bool:
+    if action.get("tool") not in {"Bash", "Skill"} or action.get("status") != "succeeded":
         return False
-    if action.get("undoable") or action.get("detail") not in _GENERIC_BASH_DETAILS:
+    if action.get("undoable") or action.get("detail") not in _GENERIC_DETAILS:
         return False
     result = action.get("result")
     summary = result.get("summary") if isinstance(result, dict) else None
@@ -109,7 +120,7 @@ def _generic_bash(action: dict[str, Any]) -> bool:
 def _read_only_bash(action: dict[str, Any]) -> bool:
     """Suppress only plain commands whose stored arguments show a read."""
 
-    if not _generic_bash(action):
+    if action.get("tool") != "Bash" or not _generic_native(action):
         return False
     arguments = action.get("arguments")
     command = arguments.get("command") if isinstance(arguments, dict) else None
@@ -127,8 +138,9 @@ def render_receipt(actions: list[dict[str, Any]], mode: TurnReceiptMode = "all")
 
     Both kinds of line are here on purpose. A receipt listing only the undoable
     actions would hide the ones that matter most: the value of showing
-    "restarting pods cannot be undone" beside "scaled 3 to 10, can be undone" is
-    that an operator sees the system knows the difference.
+    "restarting pods cannot be undone" beside "scaled 3 to 10, restore
+    information recorded" is that an operator sees the system knows the
+    difference.
 
     ``mode`` is the install's choice (ADR-0180): ``failures`` renders this same
     receipt for the failed actions alone, and ``off`` renders none. It decides
@@ -151,10 +163,12 @@ def render_receipt(actions: list[dict[str, Any]], mode: TurnReceiptMode = "all")
     failures: list[int] = []
     grouped: dict[str, int] = {}
     for action in visible:
-        generic_bash = _generic_bash(action)
+        generic_native = _generic_native(action)
+        request = "Shell" if action.get("tool") == "Bash" else "Instruction"
         line = (
-            "• Bash calls; changes not described"
-            if generic_bash
+            f"• {request} request completed; changes were not summarized "
+            "and undo information is incomplete"
+            if generic_native
             else f"• {_described(action)} — {_verdict(action)}"
         )
         if action.get("status") == "failed":
@@ -168,10 +182,7 @@ def render_receipt(actions: list[dict[str, Any]], mode: TurnReceiptMode = "all")
         counts.append(1)
 
     for i, line in enumerate(lines):
-        if line == "• Bash calls; changes not described":
-            noun = "call" if counts[i] == 1 else "calls"
-            lines[i] = f"• {counts[i]} Bash {noun}; changes not described"
-        elif counts[i] > 1:
+        if counts[i] > 1:
             lines[i] = f"{line} ({counts[i]} calls)"
     if len(lines) > _MAX_LINES:
         # A turn with a hundred calls used to end with a hundred lines, and the

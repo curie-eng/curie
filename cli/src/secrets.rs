@@ -813,7 +813,7 @@ fn write_index(index: &SecretIndex) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn write_private(path: &Path, body: &[u8]) -> Result<()> {
+pub(crate) fn write_private(path: &Path, body: &[u8]) -> Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let mut file = fs::OpenOptions::new()
@@ -830,7 +830,7 @@ fn write_private(path: &Path, body: &[u8]) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_private(path: &Path, body: &[u8]) -> Result<()> {
+pub(crate) fn write_private(path: &Path, body: &[u8]) -> Result<()> {
     fs::write(path, body).with_context(|| format!("writing private file {}", path.display()))
 }
 
@@ -842,7 +842,7 @@ fn credentials_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("credentials.json"))
 }
 
-fn config_dir() -> Result<PathBuf> {
+pub(crate) fn config_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("CURIE_CONFIG_DIR") {
         return Ok(PathBuf::from(dir));
     }

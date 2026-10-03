@@ -1,13 +1,20 @@
 """Provider installations: table, admin CRUD and the static Slack bootstrap (#2909).
 
-Migration 0053 adds ``provider_installations``: one row per connected provider
-account in a tenant. ``credential_ref`` and ``webhook_verification_ref`` are
-pointers (``env:NAME`` or ``k8s-secret:name/key``), never secret values; the
-grammar is a DB CHECK and an API check, and a rejected value is never echoed.
+Migration 0074 adds ``provider_installations``: one row per channel identity --
+one bot speaking through one connected account -- not one connected account
+(ADR 0168 decision 1). ``name`` is unique with ``(tenant_id, provider)``, so
+two rows can share one ``external_account_id`` (e.g. one Slack workspace, two
+bots) but never a ``name``. ``credential_ref`` and ``webhook_verification_ref``
+are pointers (``env:NAME`` or ``k8s-secret:name/key``), never secret values;
+the grammar is a DB CHECK and an API check, and a rejected value is never
+echoed.
 
 When ``SLACK_BOT_TOKEN`` is set, the API lifespan creates one static Slack row
-at a fixed id in the default tenant, keyed on "any slack row in the default
-tenant" so a rename, an operator-created row or a disconnect is never undone.
+at a fixed id in the default tenant, named ``default``. Every other identity
+``CURIE_SLACK_IDENTITIES`` declares with a configured bot token gets its own
+row at a fresh id, named after that identity. Every bootstrapped row is keyed
+on "this (tenant, provider, name) already has a row" so a rename, an
+operator-created row or a disconnect is never undone, independently per name.
 
 The DB-level tests share the session's migrated database, so every insert runs
 inside an outer transaction that is always rolled back; an insert expected to
@@ -20,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
@@ -67,6 +75,7 @@ def _foreign_key_constraints(table: Table) -> dict[str | None, ForeignKeyConstra
 
 def test_provider_installation_model_shape() -> None:
     from curie_api.models import ProviderInstallation
+    from sqlalchemy.dialects.postgresql import JSONB
 
     assert ProviderInstallation.__tablename__ == "provider_installations"
     columns = ProviderInstallation.__table__.c
@@ -99,7 +108,22 @@ def test_provider_installation_model_shape() -> None:
     assert columns["disconnected_at"].type.python_type is datetime
     assert columns["disconnected_at"].nullable is True
 
-    assert "provider_installations_tenant_provider_external_key" in _unique_constraint_names(
+    # ADR 0168 decision 1: one channel identity per row, named within the
+    # tenant and provider; "default" is the one identity an install need not
+    # name explicitly.
+    name_col = columns["name"]
+    assert name_col.type.python_type is str
+    assert name_col.nullable is False
+    assert name_col.default is not None
+    assert name_col.server_default is not None
+
+    attributes_col = columns["attributes"]
+    assert isinstance(attributes_col.type, JSONB)
+    assert attributes_col.nullable is False
+    assert attributes_col.default is not None
+    assert attributes_col.server_default is not None
+
+    assert "provider_installations_tenant_provider_name_key" in _unique_constraint_names(
         ProviderInstallation.__table__
     )
     # The installer FK is composite so the installer must be in the same tenant.
@@ -202,9 +226,9 @@ async def _expect_integrity_error(
 
 _INSERT = (
     "INSERT INTO curie.provider_installations "
-    "(id, tenant_id, provider, external_account_id, credential_ref, "
+    "(id, tenant_id, provider, name, external_account_id, credential_ref, "
     "webhook_verification_ref, status, disconnected_at, installed_by_principal_id) "
-    "VALUES (:id, :tenant_id, :provider, :external_account_id, :credential_ref, "
+    "VALUES (:id, :tenant_id, :provider, :name, :external_account_id, :credential_ref, "
     ":webhook_verification_ref, :status, :disconnected_at, :installed_by_principal_id)"
 )
 
@@ -214,6 +238,9 @@ def _row(**overrides: Any) -> dict[str, Any]:
         "id": uuid.uuid4(),
         "tenant_id": DEFAULT_TENANT_UUID,
         "provider": "slack",
+        # Unique per call, like external_account_id below: several rows in one
+        # test body must not collide on (tenant, provider, name) by accident.
+        "name": f"identity-{uuid.uuid4().hex[:8]}",
         "external_account_id": f"T{uuid.uuid4().hex[:8]}",
         "credential_ref": None,
         "webhook_verification_ref": None,
@@ -259,12 +286,14 @@ def test_insert_applies_defaults(migrated: None) -> None:
         )
         return await _exec(
             conn,
-            "SELECT status, scopes, installed_at, disconnected_at "
+            "SELECT name, attributes, status, scopes, installed_at, disconnected_at "
             "FROM curie.provider_installations WHERE id = :id",
             {"id": installation_id},
         )
 
     (row,) = _rolled_back(body)
+    assert row["name"] == "default"
+    assert row["attributes"] == {}
     assert row["status"] == "connected"
     assert row["scopes"] == []
     assert row["installed_at"] is not None
@@ -328,17 +357,33 @@ def test_valid_references_and_disconnected_row_accepted(migrated: None) -> None:
     _rolled_back(body)
 
 
-def test_duplicate_tenant_provider_external_rejected(migrated: None) -> None:
+def test_duplicate_tenant_provider_name_rejected(migrated: None) -> None:
     async def body(conn: AsyncConnection) -> None:
-        await _exec(conn, _INSERT, _row(external_account_id="T-DUP"))
+        await _exec(conn, _INSERT, _row(name="dup-name"))
         await _expect_integrity_error(
             conn,
             _INSERT,
-            _row(external_account_id="T-DUP"),
-            constraint="provider_installations_tenant_provider_external_key",
+            # A different external_account_id does not save it: the key is
+            # (tenant, provider, name), not external_account_id.
+            _row(name="dup-name"),
+            constraint="provider_installations_tenant_provider_name_key",
         )
-        # The same account under another provider is a different installation.
-        await _exec(conn, _INSERT, _row(provider="github", external_account_id="T-DUP"))
+        # The same name under another provider is a different installation.
+        await _exec(conn, _INSERT, _row(provider="github", name="dup-name"))
+
+    _rolled_back(body)
+
+
+def test_same_workspace_different_names_accepted(migrated: None) -> None:
+    """Two bots in one Slack workspace: one external_account_id, two names.
+
+    ADR 0168 decision 1's whole point -- a row is a channel identity, not a
+    connected account, so this is no longer a collision.
+    """
+
+    async def body(conn: AsyncConnection) -> None:
+        await _exec(conn, _INSERT, _row(external_account_id="T-SHARED", name="default"))
+        await _exec(conn, _INSERT, _row(external_account_id="T-SHARED", name="support-bot"))
 
     _rolled_back(body)
 
@@ -457,7 +502,7 @@ def _committed_tenant_and_principal() -> tuple[str, str]:
 # fresh random value per worker process makes each worker collect a
 # DIFFERENT test id for the same case, which xdist reports as "different
 # tests were collected between gw.. and gw.." and fails the whole run. Safe
-# to reuse one id everywhere: require_api_key runs as a router-level
+# to reuse one id everywhere: require_platform_key runs as a router-level
 # dependency, before any path operation touches the database.
 _MISSING_ID = "00000000-0000-0000-0000-0000000000fe"
 
@@ -472,7 +517,7 @@ _MISSING_ID = "00000000-0000-0000-0000-0000000000fe"
         ("delete", f"{BASE}/{_MISSING_ID}"),
     ],
 )
-def test_routes_require_api_key(api: TestClient, method: str, path: str) -> None:
+def test_routes_require_platform_key(api: TestClient, method: str, path: str) -> None:
     kwargs: dict[str, Any] = {}
     if method in ("post", "patch"):
         kwargs["json"] = {"provider": "slack", "external_account_id": "T1"}
@@ -492,11 +537,15 @@ def test_create_list_get_patch_delete(api: TestClient, auth_headers: dict[str, s
     )
     assert created["tenant_id"] == DEFAULT_TENANT_ID
     assert created["provider"] == "slack"
+    # Omitted in the request body: "default" is the one identity an install
+    # need not name explicitly.
+    assert created["name"] == "default"
     assert created["external_account_id"] == "T0CRUD"
     assert created["display_name"] == "Acme Slack"
     assert created["credential_ref"] == "env:SLACK_BOT_TOKEN"
     assert created["webhook_verification_ref"] == "k8s-secret:curie-slack/signing-secret"
     assert created["scopes"] == ["chat:write", "users:read"]
+    assert created["attributes"] == {}
     assert created["status"] == "connected"
     assert created["installed_by_principal_id"] is None
     assert created["installed_at"] is not None
@@ -520,7 +569,13 @@ def test_create_list_get_patch_delete(api: TestClient, auth_headers: dict[str, s
 
     patched = api.patch(
         f"{BASE}/{installation_id}",
-        json={"display_name": "Renamed", "scopes": ["chat:write"], "credential_ref": None},
+        json={
+            "display_name": "Renamed",
+            "scopes": ["chat:write"],
+            "credential_ref": None,
+            "name": "support-bot",
+            "attributes": {"app_token_ref": "env:CURIE_SLACK_APP_TOKEN__1"},
+        },
         headers=auth_headers,
     )
     assert patched.status_code == 200, patched.text
@@ -531,6 +586,8 @@ def test_create_list_get_patch_delete(api: TestClient, auth_headers: dict[str, s
     assert body["credential_ref"] is None
     assert body["webhook_verification_ref"] == "k8s-secret:curie-slack/signing-secret"
     assert body["external_account_id"] == "T0CRUD"
+    assert body["name"] == "support-bot"
+    assert body["attributes"] == {"app_token_ref": "env:CURIE_SLACK_APP_TOKEN__1"}
 
     assert api.delete(f"{BASE}/{installation_id}", headers=auth_headers).status_code == 204
     assert api.get(f"{BASE}/{installation_id}", headers=auth_headers).status_code == 404
@@ -557,6 +614,8 @@ def test_missing_id_returns_404(api: TestClient, auth_headers: dict[str, str]) -
 
 
 def test_duplicate_returns_409(api: TestClient, auth_headers: dict[str, str]) -> None:
+    # Both installs omit `name`, so both default to "default" -- the
+    # collision is on (tenant, provider, name), not on external_account_id.
     _create(api, auth_headers, external_account_id="T0DUP")
     response = api.post(
         BASE, json={"provider": "slack", "external_account_id": "T0DUP"}, headers=auth_headers
@@ -564,15 +623,38 @@ def test_duplicate_returns_409(api: TestClient, auth_headers: dict[str, str]) ->
     assert response.status_code == 409
 
 
-def test_patch_rename_collision_returns_409(api: TestClient, auth_headers: dict[str, str]) -> None:
-    _create(api, auth_headers, external_account_id="T0TAKEN")
-    other = _create(api, auth_headers, external_account_id="T0OTHER")
-    response = api.patch(
-        f"{BASE}/{other['id']}", json={"external_account_id": "T0TAKEN"}, headers=auth_headers
+def test_duplicate_name_returns_409_with_different_external_account(
+    api: TestClient, auth_headers: dict[str, str]
+) -> None:
+    _create(api, auth_headers, name="support-bot", external_account_id="T0A")
+    response = api.post(
+        BASE,
+        json={"provider": "slack", "external_account_id": "T0B", "name": "support-bot"},
+        headers=auth_headers,
     )
     assert response.status_code == 409
+
+
+def test_same_workspace_different_names_accepted_via_routes(
+    api: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """Two bots sharing one Slack workspace is the point of ADR 0168 decision 1."""
+
+    first = _create(api, auth_headers, external_account_id="T0SHARED", name="default")
+    second = _create(api, auth_headers, external_account_id="T0SHARED", name="support-bot")
+    assert first["external_account_id"] == second["external_account_id"] == "T0SHARED"
+    assert first["name"] == "default"
+    assert second["name"] == "support-bot"
+    assert first["id"] != second["id"]
+
+
+def test_patch_rename_collision_returns_409(api: TestClient, auth_headers: dict[str, str]) -> None:
+    _create(api, auth_headers, name="taken")
+    other = _create(api, auth_headers, name="other")
+    response = api.patch(f"{BASE}/{other['id']}", json={"name": "taken"}, headers=auth_headers)
+    assert response.status_code == 409
     unchanged = api.get(f"{BASE}/{other['id']}", headers=auth_headers).json()
-    assert unchanged["external_account_id"] == "T0OTHER"
+    assert unchanged["name"] == "other"
 
 
 def test_patch_renames_external_account_id(api: TestClient, auth_headers: dict[str, str]) -> None:
@@ -595,6 +677,74 @@ def test_patch_external_account_id_to_null_rejected(
     assert response.status_code == 422
 
 
+def test_patch_name_to_null_rejected(api: TestClient, auth_headers: dict[str, str]) -> None:
+    created = _create(api, auth_headers)
+    response = api.patch(f"{BASE}/{created['id']}", json={"name": None}, headers=auth_headers)
+    assert response.status_code == 422
+    unchanged = api.get(f"{BASE}/{created['id']}", headers=auth_headers).json()
+    assert unchanged["name"] == "default"
+
+
+def test_patch_attributes_to_null_rejected(api: TestClient, auth_headers: dict[str, str]) -> None:
+    created = _create(api, auth_headers)
+    response = api.patch(f"{BASE}/{created['id']}", json={"attributes": None}, headers=auth_headers)
+    assert response.status_code == 422
+    unchanged = api.get(f"{BASE}/{created['id']}", headers=auth_headers).json()
+    assert unchanged["attributes"] == {}
+
+
+def test_attributes_cannot_smuggle_a_credential(
+    api: TestClient, auth_headers: dict[str, str]
+) -> None:
+    # attributes is not a reference field -- it also holds plain identifiers
+    # (a future team/app/bot user id) -- but a credential-shaped value nested
+    # anywhere inside it must still be refused, not stored and echoed back.
+    bad_post = api.post(
+        BASE,
+        json={
+            "provider": "slack",
+            "external_account_id": "T0ATTRS",
+            "attributes": {"app_token_ref": CANARY},
+        },
+        headers=auth_headers,
+    )
+    assert bad_post.status_code == 422
+    assert CANARY not in bad_post.text
+
+    nested_post = api.post(
+        BASE,
+        json={
+            "provider": "slack",
+            "external_account_id": "T0ATTRS2",
+            "attributes": {"nested": {"list": [CANARY]}},
+        },
+        headers=auth_headers,
+    )
+    assert nested_post.status_code == 422
+    assert CANARY not in nested_post.text
+
+    created = _create(api, auth_headers)
+    bad_patch = api.patch(
+        f"{BASE}/{created['id']}",
+        json={"attributes": {"app_token_ref": CANARY}},
+        headers=auth_headers,
+    )
+    assert bad_patch.status_code == 422
+    assert CANARY not in bad_patch.text
+    unchanged = api.get(f"{BASE}/{created['id']}", headers=auth_headers).json()
+    assert unchanged["attributes"] == {}
+
+    # A plain identifier -- not a reference, not a known credential shape --
+    # is exactly what attributes is for, and must still be accepted.
+    good_patch = api.patch(
+        f"{BASE}/{created['id']}",
+        json={"attributes": {"team_id": "T0123456"}},
+        headers=auth_headers,
+    )
+    assert good_patch.status_code == 200, good_patch.text
+    assert good_patch.json()["attributes"] == {"team_id": "T0123456"}
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -602,8 +752,9 @@ def test_patch_external_account_id_to_null_rejected(
         {"provider": "slack", "external_account_id": "T1", "status": "paused"},
         {"provider": "slack", "external_account_id": ""},
         {"provider": "slack"},
+        {"provider": "slack", "external_account_id": "T1", "name": ""},
     ],
-    ids=["bad-provider", "bad-status", "empty-external", "missing-external"],
+    ids=["bad-provider", "bad-status", "empty-external", "missing-external", "empty-name"],
 )
 def test_invalid_body_returns_422(
     api: TestClient, auth_headers: dict[str, str], body: dict[str, Any]
@@ -782,7 +933,8 @@ def test_canary_never_appears_in_any_response(
 
 def _slack_rows() -> list[dict[str, Any]]:
     return _sql(
-        "SELECT id, tenant_id, external_account_id, credential_ref, status, scopes "
+        "SELECT id, tenant_id, name, external_account_id, credential_ref, "
+        "webhook_verification_ref, attributes, status, scopes "
         "FROM curie.provider_installations WHERE provider = 'slack' ORDER BY installed_at, id"
     )
 
@@ -798,8 +950,11 @@ def test_bootstrap_creates_one_static_row(
     assert row["id"] == STATIC_ID
     assert row["tenant_id"] == DEFAULT_TENANT_ID
     assert row["provider"] == "slack"
+    assert row["name"] == "default"
     assert row["external_account_id"] == "static"
     assert row["credential_ref"] == "env:SLACK_BOT_TOKEN"
+    assert row["webhook_verification_ref"] == "env:SLACK_SIGNING_SECRET"
+    assert row["attributes"] == {"app_token_ref": "env:SLACK_APP_TOKEN"}
     assert row["status"] == "connected"
     assert row["scopes"] == []
     assert row["disconnected_at"] is None
@@ -831,6 +986,28 @@ def test_renamed_static_row_is_not_duplicated_on_restart(
     with _app(env, CANARY) as app:
         listed = app.get(BASE, headers=auth_headers).json()
     assert [(r["id"], r["external_account_id"]) for r in listed] == [(STATIC_ID, "T0TEST")]
+
+
+def test_renamed_static_row_survives_restart_without_duplicating(
+    clean_installations: None, env: pytest.MonkeyPatch, auth_headers: dict[str, str]
+) -> None:
+    # The static row's id is fixed (STATIC_ID) on every boot, unlike a declared
+    # identity's. Renaming it away from "default" must not make the next boot
+    # try to re-insert at that same id. Calling `bootstrap_static_slack`
+    # directly (not through the lifespan, like `_bootstrap_once` above) is the
+    # point: `start_static_slack_bootstrap`'s retry loop swallows any
+    # exception and just keeps retrying, so going through the lifespan would
+    # pass this test whether or not the dedup check actually works (#3040
+    # review: a name-only check tries to re-INSERT at the same primary key and
+    # raises `IntegrityError`, caught and silently retried forever).
+    with _app(env, CANARY) as app:
+        patched = app.patch(
+            f"{BASE}/{STATIC_ID}", json={"name": "renamed-default"}, headers=auth_headers
+        )
+        assert patched.status_code == 200, patched.text
+    assert asyncio.run(_bootstrap_once(CANARY)) is True
+    rows = _slack_rows()
+    assert [(str(r["id"]), r["name"]) for r in rows] == [(STATIC_ID, "renamed-default")]
 
 
 def test_disconnected_static_row_is_not_resurrected(
@@ -881,6 +1058,141 @@ def test_other_provider_rows_do_not_suppress_bootstrap(
     with _app(env, CANARY) as app:
         slack = app.get(BASE, params={"provider": "slack"}, headers=auth_headers).json()
     assert [r["id"] for r in slack] == [STATIC_ID]
+
+
+# --- declared Slack identities beyond "default" (ADR 0168 decision 1) -------
+
+# "default" must appear with the exact legacy env names whenever the list is
+# non-empty (aci_protocol.slack_identities._check_declarations); every other
+# identity reads an indexed CURIE_SLACK_*__<n> name.
+_IDENTITIES_WITH_SUPPORT_BOT = json.dumps(
+    [
+        {
+            "name": "default",
+            "app_token_env": "SLACK_APP_TOKEN",
+            "bot_token_env": "SLACK_BOT_TOKEN",
+            "signing_secret_env": "SLACK_SIGNING_SECRET",
+        },
+        {
+            "name": "support-bot",
+            "app_token_env": "CURIE_SLACK_APP_TOKEN__1",
+            "bot_token_env": "CURIE_SLACK_BOT_TOKEN__1",
+            "signing_secret_env": "CURIE_SLACK_SIGNING_SECRET__1",
+        },
+    ]
+)
+
+
+def test_declared_identity_gets_its_own_row(
+    clean_installations: None, env: pytest.MonkeyPatch, auth_headers: dict[str, str]
+) -> None:
+    env.setenv("CURIE_SLACK_IDENTITIES", _IDENTITIES_WITH_SUPPORT_BOT)
+    env.setenv("CURIE_SLACK_BOT_TOKEN__1", "xapp-support-TOKEN")
+    with _app(env, CANARY) as app:
+        response = app.get(BASE, params={"provider": "slack"}, headers=auth_headers)
+    assert response.status_code == 200
+    rows = {row["name"]: row for row in response.json()}
+    assert set(rows) == {"default", "support-bot"}
+
+    default_row = rows["default"]
+    assert default_row["id"] == STATIC_ID
+    assert default_row["external_account_id"] == "static"
+    assert default_row["credential_ref"] == "env:SLACK_BOT_TOKEN"
+
+    support_row = rows["support-bot"]
+    # A fresh id, not the fixed STATIC_ID: only "default" gets that one.
+    assert support_row["id"] != STATIC_ID
+    assert support_row["external_account_id"] == "static"
+    assert support_row["credential_ref"] == "env:CURIE_SLACK_BOT_TOKEN__1"
+    assert support_row["webhook_verification_ref"] == "env:CURIE_SLACK_SIGNING_SECRET__1"
+    assert support_row["attributes"] == {"app_token_ref": "env:CURIE_SLACK_APP_TOKEN__1"}
+
+
+def test_declared_identity_without_bot_token_gets_no_row(
+    clean_installations: None, env: pytest.MonkeyPatch, auth_headers: dict[str, str]
+) -> None:
+    env.setenv("CURIE_SLACK_IDENTITIES", _IDENTITIES_WITH_SUPPORT_BOT)
+    # Declared, but its bot token env var is blank: no row, same as
+    # identities.slack_bot_tokens would treat it as unconfigured.
+    env.setenv("CURIE_SLACK_BOT_TOKEN__1", "")
+    with _app(env, CANARY) as app:
+        response = app.get(BASE, params={"provider": "slack"}, headers=auth_headers)
+    assert [row["name"] for row in response.json()] == ["default"]
+
+
+def test_operator_created_named_row_suppresses_only_that_name(
+    clean_installations: None, env: pytest.MonkeyPatch, auth_headers: dict[str, str]
+) -> None:
+    # No identity declared yet for the first boot, so nothing auto-bootstraps
+    # "support-bot" here -- the operator's row must be the first and only one.
+    with _app(env, "") as app:
+        operator_row = _create(
+            app,
+            auth_headers,
+            name="support-bot",
+            external_account_id="T0OPERATOR",
+            credential_ref="env:MY_TOKEN",
+        )
+    env.setenv("CURIE_SLACK_IDENTITIES", _IDENTITIES_WITH_SUPPORT_BOT)
+    env.setenv("CURIE_SLACK_BOT_TOKEN__1", "xapp-support-TOKEN")
+    with _app(env, CANARY) as app:
+        listed = app.get(BASE, params={"provider": "slack"}, headers=auth_headers).json()
+    rows = {row["name"]: row for row in listed}
+    # "support-bot" is suppressed (operator-created); "default" still
+    # bootstraps normally -- suppression is independent per name.
+    assert set(rows) == {"default", "support-bot"}
+    assert rows["support-bot"]["id"] == operator_row["id"]
+    assert rows["support-bot"]["external_account_id"] == "T0OPERATOR"
+    assert rows["default"]["id"] == STATIC_ID
+
+
+def test_concurrent_bootstrap_of_named_identity_yields_one_row(
+    clean_installations: None, env: pytest.MonkeyPatch
+) -> None:
+    from aci_protocol.slack_identities import (
+        LEGACY_APP_TOKEN_ENV,
+        LEGACY_BOT_TOKEN_ENV,
+        LEGACY_SIGNING_SECRET_ENV,
+        SlackIdentity,
+    )
+    from curie_api.db import create_sessionmaker
+    from curie_api.provider_installations import bootstrap_static_slack
+
+    env.setenv("CURIE_SLACK_BOT_TOKEN__1", CANARY)
+    identities = (
+        SlackIdentity(
+            name="default",
+            app_token_env=LEGACY_APP_TOKEN_ENV,
+            bot_token_env=LEGACY_BOT_TOKEN_ENV,
+            signing_secret_env=LEGACY_SIGNING_SECRET_ENV,
+        ),
+        SlackIdentity(
+            name="support-bot",
+            app_token_env="CURIE_SLACK_APP_TOKEN__1",
+            bot_token_env="CURIE_SLACK_BOT_TOKEN__1",
+            signing_secret_env="CURIE_SLACK_SIGNING_SECRET__1",
+        ),
+    )
+
+    async def bootstrap_once() -> bool:
+        # No SLACK_BOT_TOKEN: isolates this race to the named identity alone.
+        settings = get_settings().model_copy(
+            update={"slack_bot_token": "", "slack_identities": identities}
+        )
+        engine = create_async_engine(settings.database_url)
+        try:
+            return await bootstrap_static_slack(create_sessionmaker(engine), settings)
+        finally:
+            await engine.dispose()
+
+    async def race() -> list[bool]:
+        return list(await asyncio.gather(bootstrap_once(), bootstrap_once()))
+
+    assert asyncio.run(race()) == [True, True]
+    rows = _slack_rows()
+    assert [r["name"] for r in rows] == ["support-bot"]
+    assert rows[0]["external_account_id"] == "static"
+    assert rows[0]["credential_ref"] == "env:CURIE_SLACK_BOT_TOKEN__1"
 
 
 # --- bootstrap_static_slack called directly --------------------------------
@@ -1127,6 +1439,47 @@ def test_repeated_bootstrap_failure_warns_once_then_finishes(
             state["fail"] = False
             await asyncio.wait_for(task, timeout=2)
             assert task.done() and task.exception() is None
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_persistent_failure_warns_again_after_warn_period(
+    migrated: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failure that never clears re-warns every ``warn_period_s``, not once ever."""
+
+    import curie_api.provider_installations as pi
+    from curie_api.db import create_sessionmaker
+
+    async def always_fails(sessionmaker: Any, settings: Any) -> bool:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(pi, "bootstrap_static_slack", always_fails)
+
+    async def run() -> None:
+        settings = get_settings()
+        engine = create_async_engine(settings.database_url)
+        task = None
+        try:
+            with caplog.at_level("WARNING", logger="curie_api.provider_installations"):
+                task = await pi.start_static_slack_bootstrap(
+                    create_sessionmaker(engine), settings, interval_s=0.01, warn_period_s=0.05
+                )
+                assert task is not None
+                await asyncio.sleep(0.3)
+            failures = [
+                r
+                for r in caplog.records
+                if r.levelname == "WARNING" and "bootstrap failed" in r.getMessage()
+            ]
+            # ~0.3s / 0.05s warn period is roughly 6-7 warnings; a generous
+            # range absorbs scheduling jitter without accepting one-shot or
+            # every-10ms behavior.
+            assert 2 <= len(failures) <= 12, [r.getMessage() for r in failures]
         finally:
             if task is not None and not task.done():
                 task.cancel()
