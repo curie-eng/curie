@@ -346,7 +346,16 @@
         "workerClusterRole": {"type": "string"},
         "ttlSeconds": {"type": "integer", "minimum": 60, "maximum": 86400},
         "podSecurity": {"type": "string", "enum": ["baseline", "restricted"]},
-        "reaperIntervalSeconds": {"type": "integer", "minimum": 10}
+        "reaperIntervalSeconds": {"type": "integer", "minimum": 10},
+        "registry": {"type": "string"},
+        "buildCacheRepo": {"type": ["string", "null"]},
+        "registryInsecure": {"type": "boolean"},
+        "registryTokenHosts": {"type": "array", "items": {"type": "string"}},
+        "builderImage": {"type": "string"},
+        "gitImage": {"type": "string"},
+        "pushImage": {"type": "string"},
+        "buildTimeoutSeconds": {"type": "integer", "minimum": 60, "maximum": 3600},
+        "sourceHosts": {"type": "array", "items": {"type": "string"}, "minItems": 1}
       }
     },
     "e2eConnectorIdentity": {

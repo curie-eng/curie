@@ -9,6 +9,11 @@ every item is checked again here for the prefix and the exact owner label
 value, so a server that ignored the selector still cannot hand this module a
 namespace the installation does not own. ``sweep`` checks the prefix once
 more on the names it is given.
+
+Since #3246 every reap first runs image retention (``retention``): it closes
+build admission, stops build Jobs, and deletes the run's images. A namespace
+whose close is still settling or whose build pod still runs is deferred to
+the next pass rather than failed.
 """
 
 from __future__ import annotations
@@ -21,6 +26,8 @@ from typing import Any
 
 from curie_e2e_connector.contract import EXPIRES_ANNOTATION, RUN_LABEL
 from curie_e2e_connector.kube import ClusterApi, ClusterError
+from curie_e2e_connector.registry import RegistryApi
+from curie_e2e_connector.retention import TeardownDeferred, prepare_teardown
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +70,14 @@ class ScopedNamespace:
     terminating: bool
 
 
+@dataclass(frozen=True)
+class SweepTarget:
+    """One test cluster and the registry its run images were pushed to."""
+
+    cluster: ClusterApi
+    registry: RegistryApi
+
+
 @dataclass
 class SweepResult:
     reaped: list[str] = field(default_factory=list)
@@ -72,6 +87,10 @@ class SweepResult:
     # Scoped namespaces at least OVERDUE_GRACE_S past their TTL, or without a
     # readable TTL, whatever their phase or whether this sweep deleted them.
     overdue: int = 0
+    # Scoped namespaces whose teardown must wait: admission closed less than
+    # CLOSE_SETTLE_S ago, or a build pod still runs. Not failed and not unclean;
+    # the next pass retries, and the overdue gauge covers a build that never stops.
+    deferred: list[str] = field(default_factory=list)
 
 
 def is_expired(namespace: ScopedNamespace, now: datetime) -> bool:
@@ -149,6 +168,7 @@ def sweep(
     *,
     now: datetime,
     terminal_runs: set[str],
+    registry: RegistryApi,
 ) -> SweepResult:
     """Delete every scoped namespace that is past its TTL or whose run finished.
 
@@ -168,7 +188,11 @@ def sweep(
         if not expired and namespace.run not in terminal_runs:
             continue
         try:
-            _reap(cluster, namespace.name, terminating=namespace.terminating)
+            _reap(cluster, registry, namespace.name, terminating=namespace.terminating, now=now)
+        except TeardownDeferred as exc:
+            logger.info("e2e reaper deferred namespace=%s: %s", namespace.name, exc)
+            result.deferred.append(namespace.name)
+            continue
         except ClusterError as exc:
             logger.warning("e2e reaper could not delete namespace=%s: %s", namespace.name, exc)
             result.failed.append(namespace.name)
@@ -177,8 +201,18 @@ def sweep(
     return result
 
 
-def _reap(cluster: ClusterApi, name: str, *, terminating: bool) -> None:
-    """Delete the children, then the namespace. Raises ``ClusterError`` on failure.
+def _reap(
+    cluster: ClusterApi,
+    registry: RegistryApi,
+    name: str,
+    *,
+    terminating: bool,
+    now: datetime,
+) -> None:
+    """Delete the images, the children, then the namespace.
+
+    Raises ``TeardownDeferred`` when retention must wait and ``ClusterError``
+    on failure; either way, nothing after retention is sent.
 
     A 403 on a child does not stop the namespace delete. On a Terminating
     namespace it is expected, because teardown removes the RoleBinding first.
@@ -187,6 +221,7 @@ def _reap(cluster: ClusterApi, name: str, *, terminating: bool) -> None:
     is still deleted but the pass reports it failed.
     """
 
+    prepare_teardown(cluster, registry, name, terminating=terminating, now=now)
     refused: list[str] = []
     for template in _CHILD_COLLECTIONS:
         path = template.format(ns=name)

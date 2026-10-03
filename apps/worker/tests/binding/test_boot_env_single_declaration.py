@@ -288,6 +288,12 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_E2E_OWNER_LABEL_KEY",
         "CURIE_E2E_OWNER_LABEL_VALUE",
         "CURIE_E2E_REAPER_INTERVAL_S",
+        # Registry retention for the image build tool (#3246), read by the
+        # worker process only. The push credential is not among them: the
+        # reaper reads it from the connector Secret at sweep time.
+        "CURIE_E2E_REGISTRY",
+        "CURIE_E2E_REGISTRY_INSECURE",
+        "CURIE_E2E_REGISTRY_TOKEN_HOSTS",
         # Cron scheduler tick (#268), read by the worker process only.
         "CURIE_CRON_TICK_INTERVAL_S",
         # Cron hook run claim lease (#2931), read by the worker process only.

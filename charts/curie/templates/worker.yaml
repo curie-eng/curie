@@ -413,6 +413,12 @@ spec:
               value: {{ $e2e.ownerLabel.value | quote }}
             - name: CURIE_E2E_REAPER_INTERVAL_S
               value: {{ $e2e.reaperIntervalSeconds | quote }}
+            - name: CURIE_E2E_REGISTRY
+              value: {{ $e2e.registry | default "" | quote }}
+            - name: CURIE_E2E_REGISTRY_INSECURE
+              value: {{ $e2e.registryInsecure | default false | quote }}
+            - name: CURIE_E2E_REGISTRY_TOKEN_HOSTS
+              value: {{ join "," ($e2e.registryTokenHosts | default list) | quote }}
 {{- end }}
             - name: LANGFUSE_HOST
               value: {{ include "curie.langfuse.url" . }}

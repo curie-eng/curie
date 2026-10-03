@@ -765,6 +765,44 @@ class Settings(BaseSettings):
         default="baseline",
         validation_alias=AliasChoices("CURIE_E2E_POD_SECURITY", "e2e_pod_security"),
     )
+    e2e_registry: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_REGISTRY", "e2e_registry"),
+    )
+    e2e_build_cache_repo: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_BUILD_CACHE_REPO", "e2e_build_cache_repo"),
+    )
+    e2e_registry_insecure: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("CURIE_E2E_REGISTRY_INSECURE", "e2e_registry_insecure"),
+    )
+    e2e_registry_token_hosts: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_REGISTRY_TOKEN_HOSTS", "e2e_registry_token_hosts"),
+    )
+    e2e_builder_image: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_BUILDER_IMAGE", "e2e_builder_image"),
+    )
+    e2e_git_image: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_GIT_IMAGE", "e2e_git_image"),
+    )
+    e2e_push_image: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_PUSH_IMAGE", "e2e_push_image"),
+    )
+    e2e_build_timeout_seconds: int = Field(
+        default=1200,
+        validation_alias=AliasChoices(
+            "CURIE_E2E_BUILD_TIMEOUT_SECONDS", "e2e_build_timeout_seconds"
+        ),
+    )
+    e2e_source_hosts: str = Field(
+        default="github.com",
+        validation_alias=AliasChoices("CURIE_E2E_SOURCE_HOSTS", "e2e_source_hosts"),
+    )
 
     def connector_proxy(self) -> ConnectorProxy | None:
         """The proxy each hosted connector renders with, or None for none."""
@@ -796,6 +834,15 @@ class Settings(BaseSettings):
             worker_cluster_role=self.e2e_worker_cluster_role.strip(),
             ttl_seconds=self.e2e_ttl_seconds,
             pod_security=self.e2e_pod_security.strip() or "baseline",
+            registry=self.e2e_registry.strip(),
+            build_cache_repo=self.e2e_build_cache_repo.strip(),
+            registry_insecure=self.e2e_registry_insecure,
+            registry_token_hosts=self.e2e_registry_token_hosts.strip(),
+            builder_image=self.e2e_builder_image.strip(),
+            git_image=self.e2e_git_image.strip(),
+            push_image=self.e2e_push_image.strip(),
+            build_timeout_seconds=self.e2e_build_timeout_seconds,
+            source_hosts=self.e2e_source_hosts.strip() or "github.com",
         )
 
     def valkey_dsn(self) -> str:

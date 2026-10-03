@@ -219,6 +219,29 @@ spec:
               value: {{ $e2e.ttlSeconds | quote }}
             - name: CURIE_E2E_POD_SECURITY
               value: {{ $e2e.podSecurity | quote }}
+            - name: CURIE_E2E_REGISTRY
+              value: {{ $e2e.registry | default "" | quote }}
+            - name: CURIE_E2E_BUILD_CACHE_REPO
+              {{- /* null means <registry>/cache; an explicit empty string disables the cache. */}}
+              {{- if kindIs "invalid" $e2e.buildCacheRepo }}
+              value: {{ ternary (printf "%s/cache" (trimSuffix "/" ($e2e.registry | default ""))) "" (ne ($e2e.registry | default "") "") | quote }}
+              {{- else }}
+              value: {{ $e2e.buildCacheRepo | quote }}
+              {{- end }}
+            - name: CURIE_E2E_REGISTRY_INSECURE
+              value: {{ $e2e.registryInsecure | default false | quote }}
+            - name: CURIE_E2E_REGISTRY_TOKEN_HOSTS
+              value: {{ join "," ($e2e.registryTokenHosts | default list) | quote }}
+            - name: CURIE_E2E_BUILDER_IMAGE
+              value: {{ $e2e.builderImage | default "" | quote }}
+            - name: CURIE_E2E_GIT_IMAGE
+              value: {{ $e2e.gitImage | default "" | quote }}
+            - name: CURIE_E2E_PUSH_IMAGE
+              value: {{ $e2e.pushImage | default "" | quote }}
+            - name: CURIE_E2E_BUILD_TIMEOUT_SECONDS
+              value: {{ $e2e.buildTimeoutSeconds | default 1200 | quote }}
+            - name: CURIE_E2E_SOURCE_HOSTS
+              value: {{ join "," ($e2e.sourceHosts | default (list "github.com")) | quote }}
             - name: CURIE_PUBLICATION_PATCH_MAX_BYTES
               value: {{ .Values.worker.publication.patchMaxBytes | quote }}
             - name: CURIE_PUBLICATION_RETENTION_SECONDS

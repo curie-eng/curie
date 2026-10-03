@@ -143,3 +143,19 @@ class HttpxCluster(ClusterApi):
             if isinstance(parsed, dict):
                 payload = parsed
         return response.status_code, payload
+
+
+def checked_request(
+    cluster: ClusterApi, method: str, path: str, body: dict[str, Any] | None = None
+) -> tuple[int, dict[str, Any]]:
+    code, payload = cluster.request(method, path, body)
+    if code in (401, 403):
+        raise ClusterError(f"the test cluster refused {method} {path} ({code})")
+    return code, payload
+
+
+def ensure_object(cluster: ClusterApi, path: str, body: dict[str, Any]) -> None:
+    code, _payload = checked_request(cluster, "POST", path, body)
+    if code in (200, 201, 409):
+        return
+    raise ClusterError(f"the test cluster refused to create {body.get('kind')} ({code})")

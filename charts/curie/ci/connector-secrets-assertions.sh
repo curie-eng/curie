@@ -458,15 +458,19 @@ echo "OK: per-agent connector-secret render assertions passed"
 withheld="$(helm template curie "$CHART" \
   --set-string 'agentSandbox.connectorSecrets.acme-a.GITHUB_PERSONAL_ACCESS_TOKEN=agent-a-sentinel' \
   --set-string 'agentSandbox.connectorSecrets.acme-a.E2E_CLUSTER_KUBECONFIG=kubeconfig-sentinel' \
+  --set-string 'agentSandbox.connectorSecrets.acme-a.E2E_REGISTRY_PUSH_CONFIG=registry-sentinel' \
+  --set-string 'agentSandbox.connectorSecrets.acme-a.E2E_BUILD_CACHE_CONFIG=cache-sentinel' \
   2>/dev/null)"
 withheld_secret="$(require_resource "$withheld" Secret curie-agent-acme-a-connector-secrets)"
 withheld_template="$(require_resource "$withheld" SandboxTemplate curie-agent-acme-a-runner)"
 require_text "$withheld_secret" 'GITHUB_PERSONAL_ACCESS_TOKEN: "agent-a-sentinel"' \
   "withheld render dropped the ordinary connector secret"
-forbid_text "$withheld_secret" 'E2E_CLUSTER_KUBECONFIG|kubeconfig-sentinel' \
-  "sandbox Secret stored the test cluster kubeconfig"
-forbid_text "$withheld_template" 'E2E_CLUSTER_KUBECONFIG|kubeconfig-sentinel' \
-  "sandbox template referenced the test cluster kubeconfig"
+forbid_text "$withheld_secret" \
+  'E2E_CLUSTER_KUBECONFIG|E2E_REGISTRY_PUSH_CONFIG|E2E_BUILD_CACHE_CONFIG|kubeconfig-sentinel|registry-sentinel|cache-sentinel' \
+  "sandbox Secret stored a test cluster or registry credential"
+forbid_text "$withheld_template" \
+  'E2E_CLUSTER_KUBECONFIG|E2E_REGISTRY_PUSH_CONFIG|E2E_BUILD_CACHE_CONFIG|kubeconfig-sentinel|registry-sentinel|cache-sentinel' \
+  "sandbox template referenced a test cluster or registry credential"
 require_text "$withheld_template" 'name: GITHUB_PERSONAL_ACCESS_TOKEN' \
   "sandbox template dropped the ordinary connector secret"
 
@@ -522,6 +526,66 @@ require_text "$no_reconciler" 'e2eConnector.enabled requires worker.connectorRec
 if helm template curie "$CHART" "${e2e_identity[@]}" --set worker.connectorReconciler.enabled=true \
   --set e2eConnector.reaperIntervalSeconds=5 >/dev/null 2>&1; then
   fail "a reaper interval below 10 seconds passed the schema"
+fi
+
+# #3246: the image build values reach the API (the connector render) and the
+# worker (registry retention), and the push and cache configs stay off the sandbox.
+build_render="$(helm template curie "$CHART" "${e2e_identity[@]}" \
+  --set worker.connectorReconciler.enabled=true \
+  --set e2eConnector.registry=registry.test:5000/e2e \
+  --set 'e2eConnector.registryTokenHosts={auth.test,auth2.test:8443}' \
+  --set e2eConnector.registryInsecure=true 2>/dev/null)"
+build_api="$(require_resource "$build_render" Deployment curie-api)"
+build_worker="$(require_resource "$build_render" Deployment curie-worker)"
+for name in CURIE_E2E_REGISTRY CURIE_E2E_BUILD_CACHE_REPO CURIE_E2E_REGISTRY_INSECURE \
+  CURIE_E2E_REGISTRY_TOKEN_HOSTS CURIE_E2E_BUILDER_IMAGE CURIE_E2E_GIT_IMAGE \
+  CURIE_E2E_PUSH_IMAGE CURIE_E2E_BUILD_TIMEOUT_SECONDS CURIE_E2E_SOURCE_HOSTS; do
+  require_text "$build_api" "name: ${name}\$" "enabled install did not give the API ${name}"
+done
+require_text "$(grep -A1 'name: CURIE_E2E_REGISTRY$' <<<"$build_api")" \
+  'value: "registry.test:5000/e2e"' "the API did not receive the registry prefix"
+# An unset cache repository defaults to <registry>/cache.
+require_text "$(grep -A1 'name: CURIE_E2E_BUILD_CACHE_REPO' <<<"$build_api")" \
+  'value: "registry.test:5000/e2e/cache"' "the cache repository did not default to <registry>/cache"
+require_text "$(grep -A1 'name: CURIE_E2E_BUILD_TIMEOUT_SECONDS' <<<"$build_api")" \
+  'value: "1200"' "the build timeout did not default to 1200 seconds"
+require_text "$(grep -A1 'name: CURIE_E2E_REGISTRY_TOKEN_HOSTS' <<<"$build_api")" \
+  'value: "auth.test,auth2.test:8443"' "the API token hosts were not joined with commas"
+require_text "$(grep -A1 'name: CURIE_E2E_REGISTRY_INSECURE' <<<"$build_api")" \
+  'value: "true"' "the API did not receive registryInsecure"
+require_text "$(grep -A1 'name: CURIE_E2E_SOURCE_HOSTS' <<<"$build_api")" \
+  'value: "github.com"' "the source hosts did not default to github.com"
+for name in CURIE_E2E_REGISTRY CURIE_E2E_REGISTRY_INSECURE CURIE_E2E_REGISTRY_TOKEN_HOSTS; do
+  require_text "$build_worker" "name: ${name}\$" "enabled install did not give the worker ${name}"
+done
+require_text "$(grep -A1 'name: CURIE_E2E_REGISTRY$' <<<"$build_worker")" \
+  'value: "registry.test:5000/e2e"' "the worker did not receive the registry prefix"
+require_text "$(grep -A1 'name: CURIE_E2E_REGISTRY_TOKEN_HOSTS' <<<"$build_worker")" \
+  'value: "auth.test,auth2.test:8443"' "the worker token hosts were not joined with commas"
+require_text "$(grep -A1 'name: CURIE_E2E_REGISTRY_INSECURE' <<<"$build_worker")" \
+  'value: "true"' "the worker did not receive registryInsecure"
+forbid_text "$build_worker" 'E2E_REGISTRY_PUSH_CONFIG|E2E_BUILD_CACHE_CONFIG' \
+  "the worker env named a registry credential"
+
+# An installation with no registry still renders, with the registry empty.
+unset_render="$(helm template curie "$CHART" "${e2e_identity[@]}" \
+  --set worker.connectorReconciler.enabled=true 2>/dev/null)"
+unset_api="$(require_resource "$unset_render" Deployment curie-api)"
+require_text "$(grep -A1 'name: CURIE_E2E_REGISTRY$' <<<"$unset_api")" 'value: ""' \
+  "an unset registry did not render empty"
+
+# An explicit empty cache repository disables the cache.
+nocache_render="$(helm template curie "$CHART" "${e2e_identity[@]}" \
+  --set worker.connectorReconciler.enabled=true \
+  --set e2eConnector.registry=registry.test:5000/e2e \
+  --set-string e2eConnector.buildCacheRepo= 2>/dev/null)"
+nocache_api="$(require_resource "$nocache_render" Deployment curie-api)"
+require_text "$(grep -A1 'name: CURIE_E2E_BUILD_CACHE_REPO' <<<"$nocache_api")" 'value: ""' \
+  "an explicit empty buildCacheRepo did not disable the cache"
+
+if helm template curie "$CHART" "${e2e_identity[@]}" --set worker.connectorReconciler.enabled=true \
+  --set e2eConnector.buildTimeoutSeconds=30 >/dev/null 2>&1; then
+  fail "a build timeout below 60 seconds passed the schema"
 fi
 
 echo "OK: end to end connector render assertions passed"

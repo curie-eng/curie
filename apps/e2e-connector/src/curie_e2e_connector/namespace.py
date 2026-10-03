@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -17,13 +18,16 @@ from curie_e2e_connector.contract import (
     EXPIRES_ANNOTATION,
     OWNER_LABEL,
     POD_SECURITY_LABEL,
+    REFUSAL_BUILD_IN_PROGRESS,
     REFUSAL_MISCONFIGURED,
     REFUSAL_NO_RUN,
     REFUSAL_NOT_OWNED,
     RUN_LABEL,
     WORK_ITEM_LABEL,
 )
-from curie_e2e_connector.kube import ClusterApi, ClusterError
+from curie_e2e_connector.kube import ClusterApi, ClusterError, checked_request, ensure_object
+from curie_e2e_connector.registry import RegistryApi
+from curie_e2e_connector.retention import BuildInProgress, CloseSettling, prepare_teardown
 
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _PREFIX = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?-$")
@@ -105,16 +109,21 @@ def namespace_name(install: Install, caller: Caller) -> str:
     return name
 
 
-def _labels(install: Install, caller: Caller) -> dict[str, str]:
+def run_labels(install: Install, caller: Caller) -> dict[str, str]:
+    """The owner, run and work item labels every run object carries."""
+
     return {
         install.owner_label_key: install.owner_label_value,
         RUN_LABEL: caller.run,
         WORK_ITEM_LABEL: caller.work_item,
-        POD_SECURITY_LABEL: install.pod_security,
     }
 
 
-def _owned(install: Install, caller: Caller, metadata: dict[str, Any]) -> bool:
+def _labels(install: Install, caller: Caller) -> dict[str, str]:
+    return {**run_labels(install, caller), POD_SECURITY_LABEL: install.pod_security}
+
+
+def owned_by(install: Install, caller: Caller, metadata: dict[str, Any]) -> bool:
     labels = metadata.get("labels") or {}
     if not isinstance(labels, dict):
         return False
@@ -292,34 +301,18 @@ def _expires(now: datetime, ttl: int) -> str:
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _status(
-    cluster: ClusterApi, method: str, path: str, body: dict[str, Any] | None = None
-) -> tuple[int, dict[str, Any]]:
-    code, payload = cluster.request(method, path, body)
-    if code in (401, 403):
-        raise ClusterError(f"the test cluster refused {method} {path} ({code})")
-    return code, payload
-
-
-def _ensure(cluster: ClusterApi, path: str, body: dict[str, Any]) -> None:
-    code, _payload = _status(cluster, "POST", path, body)
-    if code in (200, 201, 409):
-        return
-    raise ClusterError(f"the test cluster refused to create {body.get('kind')} ({code})")
-
-
 def _children(
     cluster: ClusterApi, namespace: str, install: Install, policies: list[dict[str, Any]]
 ) -> None:
-    _ensure(
+    ensure_object(
         cluster,
         f"/apis/rbac.authorization.k8s.io/v1/namespaces/{namespace}/rolebindings",
         _role_binding(namespace, install),
     )
-    _ensure(cluster, f"/api/v1/namespaces/{namespace}/resourcequotas", _quota())
-    _ensure(cluster, f"/api/v1/namespaces/{namespace}/limitranges", _limit_range())
+    ensure_object(cluster, f"/api/v1/namespaces/{namespace}/resourcequotas", _quota())
+    ensure_object(cluster, f"/api/v1/namespaces/{namespace}/limitranges", _limit_range())
     for policy in policies:
-        _ensure(
+        ensure_object(
             cluster,
             f"/apis/networking.k8s.io/v1/namespaces/{namespace}/networkpolicies",
             policy,
@@ -344,10 +337,10 @@ def create_environment(
     policies = allow_policies(allow)
     name = namespace_name(install, caller)
     expires = _expires(now, ttl)
-    code, existing = _status(cluster, "GET", f"/api/v1/namespaces/{name}")
+    code, existing = checked_request(cluster, "GET", f"/api/v1/namespaces/{name}")
     if code == 200:
         metadata = existing.get("metadata") or {}
-        if not isinstance(metadata, dict) or not _owned(install, caller, metadata):
+        if not isinstance(metadata, dict) or not owned_by(install, caller, metadata):
             _refuse_not_owned()
         _children(cluster, name, install, policies)
         annotations = metadata.get("annotations") or {}
@@ -360,7 +353,7 @@ def create_environment(
         }
     if code != 404:
         raise ClusterError(f"the test cluster did not answer a namespace read ({code})")
-    created, _payload = _status(
+    created, _payload = checked_request(
         cluster,
         "POST",
         "/api/v1/namespaces",
@@ -380,21 +373,61 @@ def create_environment(
 
 
 def destroy_environment(
-    cluster: ClusterApi, install: Install, caller: Caller, namespace: str
+    cluster: ClusterApi,
+    install: Install,
+    caller: Caller,
+    namespace: str,
+    *,
+    registry: RegistryApi,
+    now: Callable[[], datetime],
+    sleep: Callable[[float], None],
 ) -> dict[str, Any]:
     install.validate()
     expected = namespace_name(install, caller)
     if namespace != expected or not namespace.startswith(install.namespace_prefix):
         _refuse_not_owned()
-    code, existing = _status(cluster, "GET", f"/api/v1/namespaces/{namespace}")
+    code, existing = checked_request(cluster, "GET", f"/api/v1/namespaces/{namespace}")
     if code == 404:
         _refuse_not_owned()
     if code != 200:
         raise ClusterError(f"the test cluster did not answer a namespace read ({code})")
     metadata = existing.get("metadata") or {}
-    if not isinstance(metadata, dict) or not _owned(install, caller, metadata):
+    if not isinstance(metadata, dict) or not owned_by(install, caller, metadata):
         _refuse_not_owned()
-    deleted, _payload = _status(cluster, "DELETE", f"/api/v1/namespaces/{namespace}")
+    _retain(cluster, registry, namespace, now=now, sleep=sleep)
+    deleted, _payload = checked_request(cluster, "DELETE", f"/api/v1/namespaces/{namespace}")
     if deleted not in (200, 202):
         raise ClusterError(f"the test cluster refused the namespace delete ({deleted})")
     return {"namespace": namespace, "deleted": True}
+
+
+def _retain(
+    cluster: ClusterApi,
+    registry: RegistryApi,
+    namespace: str,
+    *,
+    now: Callable[[], datetime],
+    sleep: Callable[[float], None],
+) -> None:
+    """Run image retention before env_destroy's namespace delete.
+
+    env_destroy closes admission itself, so it sleeps out the settle once
+    rather than asking the agent to call again. Every refusal here leaves the
+    namespace in place.
+    """
+
+    try:
+        try:
+            prepare_teardown(cluster, registry, namespace, terminating=False, now=now())
+        except CloseSettling as settling:
+            sleep(settling.remaining_s)
+            try:
+                prepare_teardown(cluster, registry, namespace, terminating=False, now=now())
+            except CloseSettling as again:
+                raise ClusterError(
+                    f"{REFUSAL_BUILD_IN_PROGRESS}: teardown is settling; call env_destroy again"
+                ) from again
+    except BuildInProgress as exc:
+        raise ClusterError(
+            f"{REFUSAL_BUILD_IN_PROGRESS}: a build is still stopping; call env_destroy again"
+        ) from exc

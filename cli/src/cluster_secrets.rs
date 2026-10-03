@@ -96,10 +96,15 @@ where
 /// Dotted helm keys for `agentSandbox.connectorSecrets.<agent>.<NAME>`.
 /// Connector secret names that must never be bound into a sandbox.
 ///
-/// `E2E_CLUSTER_KUBECONFIG` is the test cluster credential (ADR 0176). The
+/// `E2E_CLUSTER_KUBECONFIG` is the test cluster credential (ADR 0176), and the
+/// registry push and cache configs are the image build credentials. The
 /// connector pod receives it from the connector Secret. The sandbox bind map
 /// does not. The spelling is frozen in `tests/vectors/e2e-connector-sandbox.json`.
-pub const SANDBOX_WITHHELD_CONNECTOR_SECRETS: &[&str] = &["E2E_CLUSTER_KUBECONFIG"];
+pub const SANDBOX_WITHHELD_CONNECTOR_SECRETS: &[&str] = &[
+    "E2E_CLUSTER_KUBECONFIG",
+    "E2E_REGISTRY_PUSH_CONFIG",
+    "E2E_BUILD_CACHE_CONFIG",
+];
 
 pub fn sandbox_connector_secrets(secrets: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     secrets
@@ -943,20 +948,47 @@ mod tests {
     }
 
     #[test]
-    fn the_e2e_kubeconfig_is_withheld_from_the_sandbox_bind() {
+    fn the_e2e_credentials_are_withheld_from_the_sandbox_bind() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/vectors/e2e-connector-sandbox.json");
         let raw = std::fs::read_to_string(path).expect("vector");
         let doc: serde_json::Value = serde_json::from_str(&raw).expect("vector json");
-        let key = doc["kubeconfig_secret"]
-            .as_str()
-            .expect("kubeconfig_secret")
-            .to_string();
+        let withheld: Vec<String> = doc["withheld_from_sandbox"]
+            .as_array()
+            .expect("withheld_from_sandbox")
+            .iter()
+            .map(|name| name.as_str().expect("withheld name").to_string())
+            .collect();
+        for required in [
+            "kubeconfig_secret",
+            "registry_push_secret",
+            "build_cache_secret",
+        ] {
+            let name = doc[required].as_str().expect(required);
+            assert!(
+                withheld.iter().any(|item| item == name),
+                "{required} must be withheld"
+            );
+        }
+        let mut constant: Vec<&str> = SANDBOX_WITHHELD_CONNECTOR_SECRETS.to_vec();
+        let mut frozen: Vec<&str> = withheld.iter().map(String::as_str).collect();
+        constant.sort_unstable();
+        frozen.sort_unstable();
+        assert_eq!(constant, frozen);
         let mut values = secrets();
-        values.insert(key.clone(), "kubeconfig-sentinel".into());
+        for key in &withheld {
+            values.insert(key.clone(), format!("{key}-sentinel"));
+        }
         let bound = sandbox_connector_secrets(&values);
-        assert!(!bound.contains_key(&key));
-        assert!(!bound.values().any(|value| value == "kubeconfig-sentinel"));
+        for key in &withheld {
+            assert!(!bound.contains_key(key), "{key} reached the sandbox bind");
+            assert!(
+                !bound
+                    .values()
+                    .any(|value| value == &format!("{key}-sentinel")),
+                "{key} value reached the sandbox bind"
+            );
+        }
         assert_eq!(
             bound
                 .get("GITHUB_PERSONAL_ACCESS_TOKEN")

@@ -1381,10 +1381,12 @@ def apply_model_env(
         env[FALSE_COMPLETION_CHECK_ENV] = "1"
 
 
-# ADR 0176 decision 2. The test cluster kubeconfig is a connector secret the
-# sandbox must not receive. Frozen with the CLI and the chart in
-# tests/vectors/e2e-connector-sandbox.json.
-SANDBOX_WITHHELD_CONNECTOR_SECRETS = frozenset({"E2E_CLUSTER_KUBECONFIG"})
+# ADR 0176 decision 2. The test cluster kubeconfig and the registry push and
+# cache configs are connector secrets the sandbox must not receive. Frozen with
+# the CLI and the chart in tests/vectors/e2e-connector-sandbox.json.
+SANDBOX_WITHHELD_CONNECTOR_SECRETS = frozenset(
+    {"E2E_CLUSTER_KUBECONFIG", "E2E_REGISTRY_PUSH_CONFIG", "E2E_BUILD_CACHE_CONFIG"}
+)
 
 
 def inject_connector_secrets(

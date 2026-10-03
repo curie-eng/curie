@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import sys
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -18,9 +19,22 @@ from typing import Any
 import httpx
 import pytest
 from curie_e2e_connector import kube as kube_module
-from curie_e2e_connector.contract import EXPIRES_ANNOTATION, OWNER_LABEL, RUN_LABEL
+from curie_e2e_connector.contract import (
+    CLOSE_SETTLE_S,
+    EXPIRES_ANNOTATION,
+    IMAGES_CONFIGMAP,
+    IMAGES_CONFIGMAP_KEY,
+    OWNER_LABEL,
+    RUN_LABEL,
+)
 from curie_e2e_connector.kube import ClusterApi, ClusterError, HttpxCluster
-from curie_e2e_connector.reaper import Scope
+from curie_e2e_connector.reaper import Scope, SweepTarget
+from curie_e2e_connector.registry import (
+    DockerRegistry,
+    RegistryApi,
+    RegistryError,
+    RegistrySettings,
+)
 from curie_worker import e2e_reaper as e2e_reaper_module
 from curie_worker.config import WorkerConfig
 from curie_worker.e2e_reaper import (
@@ -78,8 +92,19 @@ def ns(
     }
 
 
+def retention_job_delete(name: str) -> tuple[str, str]:
+    """Teardown stops build Jobs before it deletes anything else (#3246)."""
+
+    return (
+        "DELETE",
+        f"/apis/batch/v1/namespaces/{name}/jobs"
+        "?labelSelector=curietech.ai%2Fe2e-build&propagationPolicy=Background",
+    )
+
+
 def reap_calls(name: str) -> list[tuple[str, str]]:
     return [
+        retention_job_delete(name),
         ("DELETE", f"/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/{name}/sandboxclaims"),
         ("DELETE", f"/apis/batch/v1/namespaces/{name}/jobs?propagationPolicy=Background"),
         ("DELETE", f"/api/v1/namespaces/{name}/persistentvolumeclaims"),
@@ -95,11 +120,29 @@ class FakeCluster(ClusterApi):
         self.calls: list[tuple[str, str]] = []
         self.list_status = 200
         self.status: dict[tuple[str, str], int] = {}
+        # Per namespace image ledger. Absent means a settled, empty ledger: the
+        # close was written a minute ago and nothing was recorded, so one pass
+        # reaps the namespace exactly as it did before image retention.
+        self.ledgers: dict[str, dict[str, Any]] = {}
+        self.build_pods: dict[str, list[dict[str, Any]]] = {}
+        self.log: list[str] | None = None
 
     def request(
         self, method: str, path: str, body: dict[str, Any] | None = None
     ) -> tuple[int, dict[str, Any]]:
         self.calls.append((method, path))
+        if self.log is not None:
+            self.log.append(f"cluster {method} {path}")
+        configmap = f"/configmaps/{IMAGES_CONFIGMAP}"
+        if method == "GET" and path.endswith(configmap):
+            name = path.split("/")[4]
+            ledger = self.ledgers.get(name) or ledger_body(closed_ago=60)
+            return 200, {
+                "metadata": {"resourceVersion": "1"},
+                "data": {IMAGES_CONFIGMAP_KEY: json.dumps(ledger)},
+            }
+        if method == "GET" and "/pods?labelSelector=" in path:
+            return 200, {"items": self.build_pods.get(path.split("/")[4], [])}
         if method == "GET" and path.startswith("/api/v1/namespaces?"):
             if self.list_status != 200:
                 return self.list_status, {}
@@ -123,7 +166,7 @@ class LiveCluster(FakeCluster):
         super().__init__(items)
         self.children: dict[str, dict[str, int]] = {
             item["metadata"]["name"]: {
-                path: 1 for _, path in reap_calls(item["metadata"]["name"])[:-1]
+                path: 1 for _, path in reap_calls(item["metadata"]["name"])[1:-1]
             }
             for item in items
         }
@@ -144,6 +187,55 @@ class LiveCluster(FakeCluster):
 
     def listed(self) -> list[str]:
         return [item["metadata"]["name"] for item in self.items]
+
+
+def ledger_body(
+    *, closed_ago: float | None = 60, repositories: list[str] | None = None
+) -> dict[str, Any]:
+    body: dict[str, Any] = {"repositories": list(repositories or [])}
+    if closed_ago is not None:
+        body["closing_at"] = (NOW - timedelta(seconds=closed_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return body
+
+
+REGISTRY_PREFIX = "registry.test:5000/e2e"
+DIGEST_A = "sha256:" + "a" * 64
+DIGEST_B = "sha256:" + "b" * 64
+
+
+class FakeRegistry(RegistryApi):
+    """A registry keyed by repository; records every call into a shared log."""
+
+    def __init__(
+        self,
+        *,
+        prefix: str = "",
+        tags: dict[str, dict[str, str]] | None = None,
+        fail: bool = False,
+    ) -> None:
+        self.settings = RegistrySettings(prefix=prefix, insecure=False, token_hosts=())
+        self.tags = tags or {}
+        self.fail = fail
+        self.calls: list[tuple[str, str]] = []
+        self.log: list[str] | None = None
+
+    def _note(self, op: str, *args: str) -> None:
+        self.calls.append((op, *args))
+        if self.log is not None:
+            self.log.append(f"registry {op} {' '.join(args)}")
+
+    def list_tags(self, repo: str) -> list[str]:
+        self._note("list_tags", repo)
+        if self.fail:
+            raise RegistryError("registry unreachable host=registry.test")
+        return sorted(self.tags.get(repo, {}))
+
+    def resolve(self, repo: str, tag: str) -> str | None:
+        self._note("resolve", repo, tag)
+        return self.tags.get(repo, {}).get(tag)
+
+    def delete_manifest(self, repo: str, digest: str) -> None:
+        self._note("delete", repo, digest)
 
 
 class FakeStatus:
@@ -167,11 +259,20 @@ class Clock:
         return self.now
 
 
+def targets(clusters: list[FakeCluster], registry: FakeRegistry | None = None) -> list[SweepTarget]:
+    return [
+        SweepTarget(cluster=cluster, registry=registry or FakeRegistry()) for cluster in clusters
+    ]
+
+
 def make_loop(
-    clusters: list[FakeCluster], status: FakeStatus, clock: Clock | None = None
+    clusters: list[FakeCluster],
+    status: FakeStatus,
+    clock: Clock | None = None,
+    registry: FakeRegistry | None = None,
 ) -> E2EReaperLoop:
     return E2EReaperLoop(
-        clusters=lambda: clusters,
+        clusters=lambda: targets(clusters, registry),
         request_status=status,
         scope=scope(),
         interval_s=60.0,
@@ -464,7 +565,7 @@ def test_a_listing_failure_records_neither_namespace_gauge(probe: Probe) -> None
 def test_run_forever_sweeps_until_stopped(probe: Probe) -> None:
     cluster = FakeCluster([])
     loop = E2EReaperLoop(
-        clusters=lambda: [cluster],
+        clusters=lambda: targets([cluster]),
         request_status=FakeStatus({}),
         scope=scope(),
         interval_s=0.01,
@@ -532,7 +633,7 @@ def test_a_slow_pass_is_never_cancelled_or_overlapped_and_reports_its_stale_time
     clusters: list[FakeCluster] = []
     status = GatedStatus({RUN_DONE: "completed"})
     loop = E2EReaperLoop(
-        clusters=lambda: clusters,
+        clusters=lambda: targets(clusters),
         request_status=status,
         scope=scope(),
         interval_s=0.02,
@@ -571,7 +672,7 @@ def test_stop_while_a_pass_runs_cancels_it_and_returns_promptly(probe: Probe) ->
     status = GatedStatus({RUN_DONE: "completed"})
     cluster = LiveCluster([ns(f"{PREFIX}done", run=str(RUN_DONE))])
     loop = E2EReaperLoop(
-        clusters=lambda: [cluster],
+        clusters=lambda: targets([cluster]),
         request_status=status,
         scope=scope(),
         interval_s=0.02,
@@ -604,6 +705,9 @@ def test_the_slow_pass_warning_defaults_to_five_intervals_with_a_five_minute_flo
 
     assert threshold(10.0) == 300.0
     assert threshold(120.0) == 600.0
+
+
+SETTINGS = RegistrySettings(prefix="", insecure=False, token_hosts=())
 
 
 def _kubeconfig(server: str) -> str:
@@ -653,12 +757,14 @@ def test_connector_secret_clusters_reads_only_this_releases_connector_secrets() 
         ]
     )
 
-    clusters = connector_secret_clusters(
-        core, namespace="curie-system", release="curie", timeout=5.0
+    found = connector_secret_clusters(
+        core, namespace="curie-system", release="curie", timeout=5.0, registry=SETTINGS
     )
 
     assert core.namespaces == ["curie-system"]
-    assert len(clusters) == 2
+    assert len(found) == 2
+    assert all(isinstance(target, SweepTarget) for target in found)
+    clusters = [target.cluster for target in found]
     assert all(isinstance(cluster, HttpxCluster) for cluster in clusters)
     servers = {str(cluster._client.base_url).rstrip("/") for cluster in clusters}
     assert servers == {"https://cluster-a.example:6443", "https://cluster-b.example:6443"}
@@ -668,7 +774,12 @@ def test_connector_secret_clusters_reads_only_this_releases_connector_secrets() 
 
 def test_connector_secret_clusters_with_no_matching_secret_is_empty() -> None:
     core = FakeCoreV1([_secret("curie-alpha-connector-secrets", {"GITHUB_TOKEN": _b64("t")})])
-    assert connector_secret_clusters(core, namespace="ns", release="curie", timeout=5.0) == []
+    assert (
+        connector_secret_clusters(
+            core, namespace="ns", release="curie", timeout=5.0, registry=SETTINGS
+        )
+        == []
+    )
 
 
 _EXEC_KUBECONFIG = (
@@ -696,9 +807,13 @@ def test_connector_secret_clusters_reports_a_refused_kubeconfig_instead_of_dropp
         ]
     )
 
-    clusters = connector_secret_clusters(core, namespace="ns", release="curie", timeout=5.0)
+    found = connector_secret_clusters(
+        core, namespace="ns", release="curie", timeout=5.0, registry=SETTINGS
+    )
 
-    assert len(clusters) == 4
+    assert len(found) == 4
+    assert all(isinstance(target, SweepTarget) for target in found)
+    clusters = [target.cluster for target in found]
     valid = [cluster for cluster in clusters if isinstance(cluster, HttpxCluster)]
     refused = [cluster for cluster in clusters if not isinstance(cluster, HttpxCluster)]
     assert len(valid) == 1
@@ -722,15 +837,33 @@ def test_connector_secret_clusters_reports_a_refused_kubeconfig_instead_of_dropp
 
 
 def _mock_cluster_clients(
-    monkeypatch: pytest.MonkeyPatch, items_by_server: dict[str, list[dict[str, Any]]]
+    monkeypatch: pytest.MonkeyPatch,
+    items_by_server: dict[str, list[dict[str, Any]]],
+    ledgers: dict[str, dict[str, Any]] | None = None,
 ) -> list[tuple[str, str, str]]:
-    """Make valid kubeconfigs yield clients served in process; refusals stay real."""
+    """Make valid kubeconfigs yield clients served in process; refusals stay real.
+
+    ``ledgers`` maps a namespace to its image ledger; any other namespace has a
+    settled, empty one.
+    """
 
     calls: list[tuple[str, str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         server = f"{request.url.scheme}://{request.url.host}:{request.url.port}"
-        calls.append((server, request.method, request.url.raw_path.decode()))
+        path = request.url.raw_path.decode()
+        calls.append((server, request.method, path))
+        if request.method == "GET" and path.endswith(f"/configmaps/{IMAGES_CONFIGMAP}"):
+            ledger = (ledgers or {}).get(path.split("/")[4]) or ledger_body(closed_ago=60)
+            return httpx.Response(
+                200,
+                json={
+                    "metadata": {"resourceVersion": "1"},
+                    "data": {IMAGES_CONFIGMAP_KEY: json.dumps(ledger)},
+                },
+            )
+        if request.method == "GET" and "/pods?labelSelector=" in path:
+            return httpx.Response(200, json={"items": []})
         if request.method == "GET":
             return httpx.Response(200, json={"items": items_by_server[server]})
         return httpx.Response(200, json={})
@@ -746,7 +879,7 @@ def _mock_cluster_clients(
 def _secret_loop(core: FakeCoreV1, clock: Clock) -> E2EReaperLoop:
     return E2EReaperLoop(
         clusters=lambda: connector_secret_clusters(
-            core, namespace="ns", release="curie", timeout=5.0
+            core, namespace="ns", release="curie", timeout=5.0, registry=SETTINGS
         ),
         request_status=FakeStatus({}),
         scope=scope(),
@@ -895,3 +1028,486 @@ def test_request_status_lookup_maps_not_found_to_none_and_propagates_transport()
     assert asyncio.run(lookup(client.missing)) is None
     with pytest.raises(WorkItemTransportError):
         asyncio.run(lookup(client.down))
+
+
+# ---------------------------------------------------------------------------
+# Image retention wiring (#3246, ADR 0176 decision 6)
+# ---------------------------------------------------------------------------
+
+PUSH_SECRET_KEY = "E2E_REGISTRY_PUSH_CONFIG"
+PUSH_USER = "pusher"
+PUSH_PASSWORD = "push-password-sentinel"
+IMAGE_SETTINGS = RegistrySettings(
+    prefix=REGISTRY_PREFIX, insecure=True, token_hosts=("auth.registry.test",)
+)
+
+
+def _push_config(user: str = PUSH_USER, password: str = PUSH_PASSWORD) -> str:
+    auth = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+    return json.dumps({"auths": {"registry.test:5000": {"auth": auth}}})
+
+
+def _both(kubeconfig: str, push: str | None) -> dict[str, str]:
+    data = {"E2E_CLUSTER_KUBECONFIG": _b64(kubeconfig)}
+    if push is not None:
+        data[PUSH_SECRET_KEY] = _b64(push)
+    return data
+
+
+def _close(found: list[SweepTarget]) -> None:
+    for target in found:
+        client = getattr(target.cluster, "_client", None)
+        if client is not None:
+            client.close()
+
+
+def test_the_cluster_source_stays_a_callable_returning_sweep_targets_every_pass(
+    probe: Probe,
+) -> None:
+    cluster = FakeCluster([])
+    invocations = [0]
+
+    def source() -> list[SweepTarget]:
+        invocations[0] += 1
+        return targets([cluster])
+
+    loop = E2EReaperLoop(
+        clusters=source,
+        request_status=FakeStatus({}),
+        scope=scope(),
+        interval_s=60.0,
+        wall_clock=Clock(NOW),
+    )
+
+    async def drive() -> list[bool]:
+        return [await loop.sweep_once(), await loop.sweep_once()]
+
+    assert asyncio.run(drive()) == [True, True]
+    assert invocations[0] == 2
+
+
+def test_the_push_config_is_read_from_the_same_secret_and_reaches_the_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            (
+                request.method,
+                str(request.url),
+                request.headers.get("authorization"),
+            )
+        )
+        return httpx.Response(200, json={"name": "x", "tags": ["build-a"]})
+
+    def factory(*_args: Any, **_kwargs: Any) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+
+    monkeypatch.setattr(e2e_reaper_module, "registry_client", factory)
+    # The registry owns only <prefix><run uuid> namespace segments.
+    run_ns = f"{PREFIX}{RUN_DONE}"
+    kubeconfig = _kubeconfig("https://cluster-a.example:6443")
+    core = FakeCoreV1([_secret("curie-alpha-connector-secrets", _both(kubeconfig, _push_config()))])
+
+    found = connector_secret_clusters(
+        core, namespace="ns", release="curie", timeout=5.0, registry=IMAGE_SETTINGS
+    )
+    try:
+        assert len(found) == 1
+        registry = found[0].registry
+        assert isinstance(registry, DockerRegistry)
+        assert registry.settings == IMAGE_SETTINGS
+        assert registry.list_tags(f"{REGISTRY_PREFIX}/{run_ns}/app") == ["build-a"]
+    finally:
+        _close(found)
+    expected = "Basic " + base64.b64encode(f"{PUSH_USER}:{PUSH_PASSWORD}".encode()).decode()
+    assert seen
+    assert all(auth == expected for _method, _url, auth in seen)
+    assert all(
+        url.startswith(f"http://registry.test:5000/v2/e2e/{run_ns}/app/") for _m, url, _a in seen
+    )
+
+
+def test_a_secret_without_a_push_config_still_yields_a_target_with_no_credentials() -> None:
+    kubeconfig = _kubeconfig("https://cluster-a.example:6443")
+    core = FakeCoreV1([_secret("curie-alpha-connector-secrets", _both(kubeconfig, None))])
+
+    found = connector_secret_clusters(
+        core, namespace="ns", release="curie", timeout=5.0, registry=SETTINGS
+    )
+    try:
+        assert len(found) == 1
+        assert isinstance(found[0].cluster, HttpxCluster)
+        assert isinstance(found[0].registry, RegistryApi)
+        assert found[0].registry.settings.prefix == ""
+    finally:
+        _close(found)
+
+
+def test_the_same_kubeconfig_with_different_push_configs_gives_one_composite_target() -> None:
+    from curie_e2e_connector.registry import CompositeRegistry
+
+    kubeconfig = _kubeconfig("https://cluster-a.example:6443")
+    core = FakeCoreV1(
+        [
+            _secret(
+                "curie-alpha-connector-secrets",
+                _both(kubeconfig, _push_config(password="one")),
+            ),
+            _secret(
+                "curie-beta-connector-secrets",
+                _both(kubeconfig, _push_config(password="two")),
+            ),
+        ]
+    )
+    found = connector_secret_clusters(
+        core, namespace="ns", release="curie", timeout=5.0, registry=IMAGE_SETTINGS
+    )
+    try:
+        assert len(found) == 1
+        assert isinstance(found[0].registry, CompositeRegistry)
+    finally:
+        _close(found)
+
+
+def test_agents_with_and_without_a_push_config_on_one_kubeconfig_share_one_target() -> None:
+    kubeconfig = _kubeconfig("https://cluster-a.example:6443")
+    core = FakeCoreV1(
+        [
+            _secret("curie-alpha-connector-secrets", _both(kubeconfig, _push_config())),
+            _secret("curie-beta-connector-secrets", _both(kubeconfig, _push_config())),
+            _secret("curie-gamma-connector-secrets", _both(kubeconfig, None)),
+        ]
+    )
+    found = connector_secret_clusters(
+        core, namespace="ns", release="curie", timeout=5.0, registry=IMAGE_SETTINGS
+    )
+    try:
+        assert len(found) == 1
+    finally:
+        _close(found)
+
+
+def test_two_secrets_sharing_a_cluster_count_an_expired_namespace_once(
+    probe: Probe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = "https://cluster-a.example:6443"
+    old = f"{PREFIX}{RUN_OLD}"
+    _mock_cluster_clients(monkeypatch, {server: [ns(old, run=str(RUN_OLD), expires=PAST)]})
+    kubeconfig = _kubeconfig(server)
+    core = FakeCoreV1(
+        [
+            _secret(
+                "curie-alpha-connector-secrets",
+                _both(kubeconfig, _push_config(password="one")),
+            ),
+            _secret(
+                "curie-beta-connector-secrets",
+                _both(kubeconfig, _push_config(password="two")),
+            ),
+        ]
+    )
+    loop = E2EReaperLoop(
+        clusters=lambda: connector_secret_clusters(
+            core, namespace="ns", release="curie", timeout=5.0, registry=IMAGE_SETTINGS
+        ),
+        request_status=FakeStatus({}),
+        scope=scope(),
+        interval_s=60.0,
+        wall_clock=Clock(NOW),
+    )
+
+    assert asyncio.run(loop.sweep_once()) is True
+
+    assert [point.value for point in probe.points(EXPIRED)] == [1.0]
+    assert [point.value for point in probe.points(OVERDUE)] == [1.0]
+
+
+@pytest.mark.parametrize(
+    "bad_push",
+    ["%%not-base64%%", base64.b64encode(b"{not json: push-text-sentinel").decode("ascii")],
+    ids=["not-base64", "not-json"],
+)
+def test_an_undecodable_push_config_fails_only_namespaces_with_a_ledger_and_never_logs_its_text(
+    bad_push: str,
+    probe: Probe,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    server = "https://cluster-a.example:6443"
+    empty = f"{PREFIX}{RUN_OLD}"
+    imaged = f"{PREFIX}{RUN_FLAKY}"
+    repo = f"{REGISTRY_PREFIX}/{imaged}/app"
+    calls = _mock_cluster_clients(
+        monkeypatch,
+        {
+            server: [
+                ns(empty, run=str(RUN_OLD), expires=PAST),
+                ns(imaged, run=str(RUN_FLAKY), expires=PAST),
+            ]
+        },
+        ledgers={imaged: ledger_body(closed_ago=60, repositories=[repo])},
+    )
+    core = FakeCoreV1(
+        [
+            _secret(
+                "curie-alpha-connector-secrets",
+                {"E2E_CLUSTER_KUBECONFIG": _b64(_kubeconfig(server)), PUSH_SECRET_KEY: bad_push},
+            )
+        ]
+    )
+    loop = E2EReaperLoop(
+        clusters=lambda: connector_secret_clusters(
+            core, namespace="ns", release="curie", timeout=5.0, registry=IMAGE_SETTINGS
+        ),
+        request_status=FakeStatus({}),
+        scope=scope(),
+        interval_s=60.0,
+        wall_clock=Clock(NOW),
+    )
+
+    with caplog.at_level("DEBUG"):
+        ok = asyncio.run(loop.sweep_once())
+
+    assert ok is False
+    deleted = [path for _server, method, path in calls if method == "DELETE"]
+    assert f"/api/v1/namespaces/{empty}" in deleted
+    assert f"/api/v1/namespaces/{imaged}" not in deleted
+    assert not any(path.startswith(f"/api/v1/namespaces/{imaged}/") for path in deleted)
+    assert "push-text-sentinel" not in caplog.text
+    assert "not-base64" not in caplog.text
+    assert "curie-alpha-connector-secrets" in caplog.text
+
+
+def test_a_refused_push_config_names_only_the_secret_in_the_registry_error() -> None:
+    kubeconfig = _kubeconfig("https://cluster-a.example:6443")
+    core = FakeCoreV1(
+        [
+            _secret(
+                "curie-alpha-connector-secrets",
+                _both(kubeconfig, "{not json: push-text-sentinel"),
+            )
+        ]
+    )
+    found = connector_secret_clusters(
+        core, namespace="ns", release="curie", timeout=5.0, registry=IMAGE_SETTINGS
+    )
+    try:
+        assert len(found) == 1
+        with pytest.raises(RegistryError) as excinfo:
+            found[0].registry.list_tags(f"{REGISTRY_PREFIX}/ns/app")
+        assert "curie-alpha-connector-secrets" in str(excinfo.value)
+        assert "push-text-sentinel" not in str(excinfo.value)
+    finally:
+        _close(found)
+
+
+def test_a_namespace_with_images_deletes_them_before_any_child_or_namespace_delete(
+    probe: Probe,
+) -> None:
+    name = f"{PREFIX}{RUN_OLD}"
+    repo = f"{REGISTRY_PREFIX}/{name}/app"
+    cluster = FakeCluster([ns(name, run=str(RUN_OLD), expires=PAST)])
+    cluster.ledgers[name] = ledger_body(closed_ago=60, repositories=[repo])
+    registry = FakeRegistry(
+        prefix=REGISTRY_PREFIX,
+        tags={repo: {"staging-a": DIGEST_A, "build-a": DIGEST_B}},
+    )
+    log: list[str] = []
+    cluster.log = log
+    registry.log = log
+
+    ok = asyncio.run(make_loop([cluster], FakeStatus({}), registry=registry).sweep_once())
+
+    assert ok is True
+    assert sorted(call for call in registry.calls if call[0] == "delete") == [
+        ("delete", repo, DIGEST_A),
+        ("delete", repo, DIGEST_B),
+    ]
+    last_registry = max(i for i, line in enumerate(log) if line.startswith("registry "))
+    first_child = min(
+        i
+        for i, line in enumerate(log)
+        if "sandboxclaims" in line or "persistentvolumeclaims" in line
+    )
+    namespace_delete = log.index(f"cluster DELETE /api/v1/namespaces/{name}")
+    assert last_registry < first_child < namespace_delete
+
+
+def test_a_registry_failure_keeps_the_namespace_and_the_pass_unclean_but_isolates_the_next(
+    probe: Probe,
+) -> None:
+    broken = f"{PREFIX}{RUN_OLD}"
+    healthy = f"{PREFIX}{RUN_FLAKY}"
+    first = FakeCluster([ns(broken, run=str(RUN_OLD), expires=PAST)])
+    first.ledgers[broken] = ledger_body(
+        closed_ago=60, repositories=[f"{REGISTRY_PREFIX}/{broken}/app"]
+    )
+    second = FakeCluster([ns(healthy, run=str(RUN_FLAKY), expires=PAST)])
+    failing = FakeRegistry(prefix=REGISTRY_PREFIX, fail=True)
+    fine = FakeRegistry(prefix=REGISTRY_PREFIX)
+    loop = E2EReaperLoop(
+        clusters=lambda: [
+            SweepTarget(cluster=first, registry=failing),
+            SweepTarget(cluster=second, registry=fine),
+        ],
+        request_status=FakeStatus({}),
+        scope=scope(),
+        interval_s=60.0,
+        wall_clock=Clock(NOW),
+    )
+
+    ok = asyncio.run(loop.sweep_once())
+
+    assert ok is False
+    assert [call for call in first.calls if call[0] == "DELETE"] == [retention_job_delete(broken)]
+    assert [call for call in second.calls if call[0] == "DELETE"] == reap_calls(healthy)
+    assert [point.value for point in probe.points(LAST_SUCCESS)] == [0.0]
+
+
+def test_a_running_build_defers_the_namespace_without_failing_the_pass(probe: Probe) -> None:
+    name = f"{PREFIX}{RUN_OLD}"
+    cluster = FakeCluster([ns(name, run=str(RUN_OLD), expires=PAST)])
+    cluster.build_pods[name] = [{"status": {"phase": "Running"}}]
+
+    ok = asyncio.run(make_loop([cluster], FakeStatus({})).sweep_once())
+
+    assert ok is True
+    deletes = [call for call in cluster.calls if call[0] == "DELETE"]
+    assert ("DELETE", f"/api/v1/namespaces/{name}") not in deletes
+    assert [point.value for point in probe.points(LAST_SUCCESS)] == [NOW.timestamp()]
+
+
+def test_a_namespace_inside_the_close_settle_window_is_deferred_with_no_delete(
+    probe: Probe,
+) -> None:
+    name = f"{PREFIX}{RUN_OLD}"
+    cluster = FakeCluster([ns(name, run=str(RUN_OLD), expires=PAST)])
+    cluster.ledgers[name] = ledger_body(closed_ago=CLOSE_SETTLE_S - 1)
+
+    ok = asyncio.run(make_loop([cluster], FakeStatus({})).sweep_once())
+
+    assert ok is True
+    assert [call for call in cluster.calls if call[0] == "DELETE"] == []
+
+
+def test_an_unset_registry_with_an_empty_ledger_reaps_in_one_pass_as_before(probe: Probe) -> None:
+    """Liveness: no registry configured changes nothing about reaping."""
+
+    name = f"{PREFIX}{RUN_OLD}"
+    cluster = FakeCluster([ns(name, run=str(RUN_OLD), expires=PAST)])
+    registry = FakeRegistry(prefix="")
+
+    ok = asyncio.run(make_loop([cluster], FakeStatus({}), registry=registry).sweep_once())
+
+    assert ok is True
+    assert [call for call in cluster.calls if call[0] == "DELETE"] == reap_calls(name)
+    assert registry.calls == []
+
+
+class _Captured:
+    def __init__(self) -> None:
+        self.kwargs: dict[str, Any] = {}
+
+
+def _patch_reaper_build(monkeypatch: pytest.MonkeyPatch) -> _Captured:
+    from kubernetes import client as k8s_client
+    from kubernetes import config as k8s_config
+
+    captured = _Captured()
+    monkeypatch.setattr(k8s_config, "load_incluster_config", lambda: None)
+    monkeypatch.setattr(k8s_client, "CoreV1Api", lambda: object())
+
+    def fake(core: Any, **kwargs: Any) -> list[SweepTarget]:
+        captured.kwargs = kwargs
+        return []
+
+    monkeypatch.setattr(e2e_reaper_module, "connector_secret_clusters", fake)
+    return captured
+
+
+def test_the_worker_config_reads_the_three_registry_env_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "CURIE_E2E_REGISTRY",
+        "CURIE_E2E_REGISTRY_INSECURE",
+        "CURIE_E2E_REGISTRY_TOKEN_HOSTS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    defaults = WorkerConfig()
+    assert defaults.e2e_registry == ""
+    assert defaults.e2e_registry_insecure is False
+    assert defaults.e2e_registry_token_hosts == ""
+    monkeypatch.setenv("CURIE_E2E_REGISTRY", REGISTRY_PREFIX)
+    monkeypatch.setenv("CURIE_E2E_REGISTRY_INSECURE", "true")
+    monkeypatch.setenv("CURIE_E2E_REGISTRY_TOKEN_HOSTS", "a.test, b.test:8443")
+    config = WorkerConfig()
+    assert config.e2e_registry == REGISTRY_PREFIX
+    assert config.e2e_registry_insecure is True
+    assert config.e2e_registry_token_hosts == "a.test, b.test:8443"
+
+
+def test_build_e2e_reaper_hands_the_registry_settings_to_the_cluster_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _patch_reaper_build(monkeypatch)
+    config = WorkerConfig(
+        e2e_reaper_enabled=True,
+        connector_reconcile_enabled=True,
+        connector_namespace="curie-system",
+        connector_release="curie",
+        connector_app_name="curie",
+        e2e_registry=REGISTRY_PREFIX,
+        e2e_registry_insecure=True,
+        e2e_registry_token_hosts="a.test, b.test:8443",
+    )
+
+    loop = _build_e2e_reaper(config, SimpleNamespace())  # type: ignore[arg-type]
+
+    assert isinstance(loop, E2EReaperLoop)
+    assert loop._clusters() == []
+    assert captured.kwargs["registry"] == RegistrySettings(
+        prefix=REGISTRY_PREFIX, insecure=True, token_hosts=("a.test", "b.test:8443")
+    )
+
+
+def test_build_e2e_reaper_with_the_registry_unset_passes_an_empty_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _patch_reaper_build(monkeypatch)
+    config = _worker_config(reaper=True, reconcile=True)
+
+    loop = _build_e2e_reaper(config, SimpleNamespace())  # type: ignore[arg-type]
+
+    assert isinstance(loop, E2EReaperLoop)
+    loop._clusters()
+    assert captured.kwargs["registry"] == RegistrySettings(
+        prefix="", insecure=False, token_hosts=()
+    )
+
+
+def test_build_e2e_reaper_normalizes_a_trailing_slash_and_owns_the_connector_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_e2e_connector.registry import owns_repository
+
+    captured = _patch_reaper_build(monkeypatch)
+    monkeypatch.setenv("CURIE_E2E_REGISTRY", "registry.example.com/e2e/")
+    config = WorkerConfig(
+        e2e_reaper_enabled=True,
+        connector_reconcile_enabled=True,
+        connector_namespace="curie-system",
+        connector_release="curie",
+        connector_app_name="curie",
+    )
+
+    loop = _build_e2e_reaper(config, SimpleNamespace())  # type: ignore[arg-type]
+
+    assert isinstance(loop, E2EReaperLoop)
+    loop._clusters()
+    settings = captured.kwargs["registry"]
+    assert settings.prefix == "registry.example.com/e2e"
+    namespace = f"{PREFIX}{RUN_OLD}"
+    assert owns_repository(settings, namespace, f"registry.example.com/e2e/{namespace}/app")
