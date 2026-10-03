@@ -35,17 +35,17 @@ from curie_runner.mcp_tool_capability import (
 )
 from curie_runner.sender_frame import frame_user_turn
 from curie_runner.session import SessionRunner
+from opentelemetry import trace
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
 
 def _sent(text: str, user: str = "U") -> str:
     """The prompt a message turn queries when no channel kind is bound."""
 
     return frame_user_turn("message", user, text, None)
-from opentelemetry import trace
-from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.trace import StatusCode
 
 
 def test_fake_canned_turn_matches_the_shared_wire_vector() -> None:

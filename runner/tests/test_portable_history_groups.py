@@ -14,11 +14,6 @@ import logging
 import anyio
 import pytest
 from curie_runner.adapter import build_structured_resume
-from curie_runner.sender_frame import frame_user_turn
-
-
-def _sent(text: str, user: str = "U0EXAMPLE1") -> str:
-    return frame_user_turn("message", user, text, None)
 from curie_runner.history import (
     ConversationMessage,
     HarnessReplayState,
@@ -26,6 +21,12 @@ from curie_runner.history import (
     TurnRecord,
     bound_turn_record,
 )
+from curie_runner.sender_frame import frame_user_turn
+
+
+def _sent(text: str, user: str = "U0EXAMPLE1") -> str:
+    return frame_user_turn("message", user, text, None)
+
 
 GROUP = hashlib.sha256(b"msg_acme_example").hexdigest()
 OTHER = hashlib.sha256(b"msg_acme_dependent").hexdigest()

@@ -31,6 +31,7 @@ from curie_runner.history import (
     build_conversation_replay,
     resolve_history,
 )
+from curie_runner.sender_frame import frame_user_turn
 from runner_state_fake import CappedCasState
 
 _STATE_VALUE_MAX_BYTES = 65_536
@@ -1278,7 +1279,8 @@ def test_accepted_steer_is_persisted_in_ordered_structured_history() -> None:
     steers = [
         message
         for message in messages
-        if message.role == "user" and message.content == "authorized steering state"
+        if message.role == "user"
+        and message.content == frame_user_turn("message", "", "authorized steering state", None)
     ]
     assert len(steers) == 1
 

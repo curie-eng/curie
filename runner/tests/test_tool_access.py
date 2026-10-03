@@ -53,10 +53,6 @@ from curie_runner.harness.claude.approval import build_can_use_tool
 from curie_runner.otel import RunTracer
 from curie_runner.sender_frame import frame_user_turn
 from curie_runner.session import SessionRunner
-
-
-def _sent(text: str, user: str = "U0EXAMPLE1") -> str:
-    return frame_user_turn("message", user, text, None)
 from curie_runner.side_effects import CLAUDE_READONLY_TOOLS, SideEffectClassifier
 from curie_runner.tool_access import (
     TurnToolAccess,
@@ -67,6 +63,11 @@ from curie_telemetry import configure_meter_provider
 from curie_telemetry import metrics as curie_metrics
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+
+def _sent(text: str, user: str = "U0EXAMPLE1") -> str:
+    return frame_user_turn("message", user, text, None)
+
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 _READ_ONLY_MCP = "mcp__acme__list_files"
