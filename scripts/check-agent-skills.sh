@@ -63,6 +63,7 @@ printf 'using %s\n' "$skills_ref_version_line"
 VALID_SKILLS=(
   ".claude/skills/implement"
   ".claude/skills/update-architecture-atlas"
+  "examples/curie-manager/skills/curie-manager"
   "examples/dark-factory/skills/implement-issue"
   "examples/github-issues/skills/github-issues"
   "examples/mean-tester/skills/mean-tester"

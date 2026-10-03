@@ -49,7 +49,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use curie::evals::{load_suite, turn_passes, EvalCase, EvalSuite};
+use curie::evals::{load_suite, turn_passes, EvalCase, EvalSuite, GraderKind};
 use curie_aci_protocol::{OutboundEvent, SessionStatus, PROTOCOL_VERSION};
 use serde::Deserialize;
 
@@ -122,6 +122,23 @@ fn done_turn(text: &str) -> Vec<OutboundEvent> {
         input_tokens: None,
         output_tokens: None,
     }]
+}
+
+/// The known-good turn for `case`'s exemplar. A text grader reads the final
+/// text, so the exemplar is that text. A `tool_called` grader reads the tool-call
+/// trajectory, which a final frame alone never carries, so its exemplar is the
+/// tool name and the turn calls that tool before finishing.
+fn exemplar_turn(case: &EvalCase, exemplar: &str) -> Vec<OutboundEvent> {
+    if case.grader.kind != GraderKind::ToolCalled {
+        return done_turn(exemplar);
+    }
+    let mut events = vec![OutboundEvent::ToolNote {
+        version: PROTOCOL_VERSION.into(),
+        text: format!("calling {exemplar}"),
+        tool: Some(exemplar.into()),
+    }];
+    events.extend(done_turn("done"));
+    events
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,8 +299,8 @@ fn every_grader_greens_on_its_known_good_exemplar() {
                 continue; // missing-exemplar completeness is asserted below
             };
             // Grade the exemplar through the same pass condition the runner path
-            // uses (a completed `done` turn whose final text is the exemplar).
-            if !turn_passes(case, &done_turn(exemplar)) {
+            // uses (a completed `done` turn carrying the exemplar).
+            if !turn_passes(case, &exemplar_turn(case, exemplar)) {
                 red.push(format!(
                     "{key} -> exemplar {exemplar:?} does NOT satisfy its grader"
                 ));
