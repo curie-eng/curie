@@ -96,7 +96,12 @@ scheduled, deferred, retry, skipped, blocked and reclaim paths. Configured
 sources whose private routing is unavailable refuse before a run claim or
 mutation. A source snapshot includes both policy and attempt-history presence:
 only absence of both means never configured. SOURCE-10 owns pending history
-and its absent-policy refusal. Never treat a missing or unreadable table as
+and its absent-policy refusal. Existing declared cron names retain their exact
+identity, including names outside the signed hook's canonical grammar. For such
+names, check both source tables by the exact declared name under the same gate;
+any policy or attempt history closes the unavailable configured path. Do not
+lowercase, truncate or otherwise alias a legacy name to another source. Absence
+of both retains existing ordinary fire behavior. Never treat a missing or unreadable table as
 an ordinary source. The wired candidate requires the actual new ledger
 migration head as its schema minimum; preserve prior registered windows. The
 source-control candidate is `0.12.2`, with schema head and minimum both `0076`.
