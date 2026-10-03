@@ -182,6 +182,12 @@ construction can fail. Preserve READ COMMITTED and gate-before-work ordering;
 gate waiters hold no work connection. Checkout timeout does not bound network
 connect or advisory-lock wait.
 
+Own the scheduled bundle reader's S3 client immediately after construction and
+register its close before any later construction can fail. Close it through the
+existing bounded synchronous transport adapter only after cron and its owned
+reads join. This adds ownership of that reader, without changing other legacy
+bundle-client lifecycles.
+
 Cleanup stops and joins supervised cron before gate disposal, with a ten-second
 stop/cancel/join budget. Thread-backed scheduled bundle reads keep an owned
 task until the synchronous read finishes, even after supervisor cancellation.
