@@ -971,11 +971,72 @@ def test_a_rolebinding_to_an_existing_role_granting_pods_exec_is_refused() -> No
     ]
 
 
-def test_a_read_only_role_over_configmaps_and_pod_logs_deploys() -> None:
+# Reading pods is refused even with read-only verbs: exec and attach work over a
+# GET WebSocket, and pod logs, termination messages and status of build pods
+# would bypass image_build's credential redaction.
+POD_READ_ROLES = [
+    pytest.param(
+        {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["get"]}, id="pods-exec-get"
+    ),
+    pytest.param(
+        {"apiGroups": [""], "resources": ["pods/attach"], "verbs": ["get"]}, id="pods-attach-get"
+    ),
+    pytest.param(
+        {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]}, id="pods-log-get"
+    ),
+    pytest.param(
+        {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list"]}, id="pods-get-list"
+    ),
+    pytest.param(
+        {"apiGroups": [""], "resources": ["pods/portforward"], "verbs": ["get"]},
+        id="pods-portforward-get",
+    ),
+    pytest.param(
+        {"apiGroups": [""], "resources": ["*"], "verbs": ["get"]}, id="star-resources-get"
+    ),
+]
+
+
+@pytest.mark.parametrize("rule", POD_READ_ROLES)
+def test_a_read_only_role_over_pods_or_a_subresource_is_refused(rule: dict[str, Any]) -> None:
+    cluster = FakeCluster()
+
+    exc = refuse_deploy(
+        cluster,
+        manifest(role("peeker", [rule]), rolebinding("peeker-binding", "peeker")),
+        REFUSAL_DEPLOY_OBJECT,
+    )
+
+    objects = refusal_json(exc)["objects"]
+    assert any(o["kind"] == "Role" and o["name"] == "peeker" and o["reason"] for o in objects)
+
+
+def test_a_rolebinding_to_an_existing_role_reading_pod_logs_is_refused() -> None:
+    cluster = FakeCluster()
+    log_rule = {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]}
+    cluster.existing[f"{RBAC}/roles/logs"] = {
+        **role("logs", [log_rule]),
+        "metadata": {"name": "logs", "namespace": NS, "resourceVersion": "5"},
+    }
+
+    exc = refuse_deploy(
+        cluster, manifest(rolebinding("logs-binding", "logs")), REFUSAL_DEPLOY_OBJECT
+    )
+
+    assert [(o["kind"], o["name"]) for o in refusal_json(exc)["objects"]] == [
+        ("RoleBinding", "logs-binding")
+    ]
+
+
+def test_a_read_only_role_over_non_pod_resources_deploys() -> None:
     cluster = FakeCluster()
     rules = [
-        {"apiGroups": [""], "resources": ["configmaps"], "verbs": ["get", "list", "watch"]},
-        {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get", "list", "watch"]},
+        {
+            "apiGroups": [""],
+            "resources": ["configmaps", "services", "events"],
+            "verbs": ["get", "list", "watch"],
+        },
+        {"apiGroups": ["apps"], "resources": ["deployments"], "verbs": ["get", "list"]},
     ]
 
     result = run_deploy(
