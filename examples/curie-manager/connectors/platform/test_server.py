@@ -36,8 +36,12 @@ OTHER_ID = "22222222-2222-2222-2222-222222222222"
 VERSION_ID = "33333333-3333-3333-3333-333333333333"
 AGENTS = [
     {"id": SELF_ID, "name": "curie-manager", "channels": [], "created_at": "2026-10-02T00:00:00Z"},
-    {"id": OTHER_ID, "name": "acme-bot", "channels": [{"kind": "slack", "address": "C0EXAMPLE1"}],
-     "created_at": "2026-10-01T00:00:00Z"},
+    {
+        "id": OTHER_ID,
+        "name": "acme-bot",
+        "channels": [{"kind": "slack", "address": "C0EXAMPLE1"}],
+        "created_at": "2026-10-01T00:00:00Z",
+    },
 ]
 
 
@@ -104,8 +108,14 @@ def _tools(srv):
 
 def test_no_tool_reaches_a_credential_endpoint():
     source = _SERVER_PY.read_text()
-    for route in ("hook-secret", "/console/", "/approvals/principals", "/resolve",
-                  "/channels/token", "/channels/callers"):
+    for route in (
+        "hook-secret",
+        "/console/",
+        "/approvals/principals",
+        "/resolve",
+        "/channels/token",
+        "/channels/callers",
+    ):
         assert route not in source.replace("`GET /agents/{id}/hook-secret`", ""), route
 
 
@@ -164,14 +174,19 @@ def test_delete_memory_passes_the_version_guard(platform):
     srv, fake = platform
     srv.delete_memory("acme-bot", 2, 7)
     method, path, params, _ = fake.calls[-1]
-    assert (method, path, params) == ("DELETE", f"/agents/{OTHER_ID}/memory/2", {"expected_version": "7"})
+    assert (method, path, params) == (
+        "DELETE",
+        f"/agents/{OTHER_ID}/memory/2",
+        {"expected_version": "7"},
+    )
 
 
 def test_a_platform_error_reaches_the_model_as_a_tool_error(monkeypatch):
     srv = _load(monkeypatch)
     transport = httpx.MockTransport(lambda r: httpx.Response(409, json={"detail": "conflict"}))
     monkeypatch.setattr(
-        srv, "_client",
+        srv,
+        "_client",
         lambda: httpx.Client(base_url=srv.API_URL, transport=transport),
     )
     with pytest.raises(ToolError) as excinfo:
