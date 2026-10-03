@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import select
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -163,6 +165,78 @@ def test_failed_test_producer_cannot_make_actual_resource_cleanup_report_success
             if not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+            await engine.dispose()
+            await observer.dispose()
+
+    asyncio.run(asyncio.wait_for(scenario(), 10))
+
+
+def test_secondary_warning_cancellation_preserves_primary_after_actual_disposal(
+    worker_db: Any,
+) -> None:
+    """Controlled TEST diagnostic, not cron qualification; @spec PROTECTED-HOOK-SOURCE-2."""
+    _, _, url = worker_db
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        engine = create_async_engine(url, pool_size=1, max_overflow=0)
+        observer = create_async_engine(url, pool_size=1, max_overflow=0)
+        owner = WorkerResources()
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        primary = ValueError("TEST-primary")
+
+        class ControlledWarning(logging.Handler):
+            """Explicit TEST actor on secondary warning, @spec PROTECTED-HOOK-SOURCE-2."""
+
+            def emit(self, record: logging.LogRecord) -> None:
+                """@spec PROTECTED-HOOK-SOURCE-2."""
+                if record.getMessage().startswith("worker_secondary_cleanup_unavailable"):
+                    entered.set()
+                    release.wait(timeout=1)
+                    finished.set()
+
+        async def failed_close() -> None:
+            """Explicit TEST closer failure, @spec PROTECTED-HOOK-SOURCE-2."""
+            raise RuntimeError("TEST-private-close-failure")
+
+        async with engine.connect() as connection:
+            pid = await connection.scalar(text("SELECT pg_backend_pid()"))
+        owner.register_close("TEST-close-failure", failed_close, order=1)
+        owner.register_close("actual-engine", engine.dispose, order=100)
+        logger = logging.getLogger("curie_worker.worker_lifecycle")
+        diagnostic = ControlledWarning()
+        logger.addHandler(diagnostic)
+        caller = asyncio.create_task(owner.aclose(primary=primary))
+        caught: BaseException | None = None
+        try:
+            async with asyncio.timeout(3):
+                while not entered.is_set():
+                    await asyncio.sleep(0.005)
+            caller.cancel()
+            await asyncio.sleep(0.02)
+            release.set()
+            try:
+                await caller
+            except (ValueError, asyncio.CancelledError) as error:
+                caught = error
+            async with asyncio.timeout(3):
+                while not finished.is_set():
+                    await asyncio.sleep(0.005)
+            async with observer.connect() as connection:
+                assert not await connection.scalar(
+                    text("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=:pid)"),
+                    {"pid": pid},
+                )
+            assert caught is primary, (
+                "SOURCE-2: cancellation during owned secondary diagnostics must not "
+                "replace the original primary failure"
+            )
+        finally:
+            release.set()
+            if not caller.done():
+                caller.cancel()
+                await asyncio.gather(caller, return_exceptions=True)
+            logger.removeHandler(diagnostic)
             await engine.dispose()
             await observer.dispose()
 
