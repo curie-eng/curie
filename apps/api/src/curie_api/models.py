@@ -1733,8 +1733,10 @@ class WorkflowStateEntry(Base):
         ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
     )
     # NULL is one agent-wide shared identity: for general state when the owning
-    # agent has `memory=True`, and always for the reserved `memory`/`transcript`
-    # namespaces. The binding's own `"{kind}:{address}"` is the isolated identity
+    # agent has `memory=True`, and for the reserved `memory` namespace's
+    # agent-wide rows. The `transcript` namespace is not stored in this table at
+    # all: it lives in `thread_transcripts` (ADR-0170), keyed by its own
+    # `binding_scope`. The binding's own `"{kind}:{address}"` is the isolated identity
     # for general state when `memory=False` (#1525 follow-up). Minted into the
     # worker's `state.app`/`state` token per turn from the agent's CURRENT
     # `memory` value, never read back off this column -- the column only picks

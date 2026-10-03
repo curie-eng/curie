@@ -128,7 +128,9 @@ contribution, `main` (`runner/src/curie_runner/__main__.py::main`) calls
 `build_spawn_env`, and `build_runner`
 (`runner/src/curie_runner/__main__.py::build_runner`) calls `compile_bundle` and
 feeds `readonly_tools` to `SideEffectClassifier`
-(`runner/src/curie_runner/side_effects.py::SideEffectClassifier`).
+(`runner/src/curie_runner/side_effects.py::SideEffectClassifier`) and to the per-turn
+tool access (`runner/src/curie_runner/__main__.py::_readonly_tools`). It also reads
+`harness.auth.credential_env_keys` to build the held-secret redaction set.
 
 The gate a registration must survive today is the import-linter contract set in
 the root `pyproject.toml`, run as `uv run lint-imports` in
@@ -147,10 +149,11 @@ The registry is CLEAN as a discovery mechanism, and it is a guarded indirection
 around one contribution rather than a working plugin distribution channel. Four
 concrete gaps:
 
-- **Most of the manifest has no reader.** `image`, `install`, `auth` and
+- **Most of the manifest has no reader.** `image`, `install` and
   `model_override_env_keys` are declared and consumed by nothing in production;
   `labels` has no reader anywhere, tests included. Only `build_spawn_env`,
-  `compile_bundle`, `supports_structured_replay` and `readonly_tools` are load-bearing, plus `name`/`aliases`
+  `compile_bundle`, `supports_structured_replay`, `readonly_tools` and
+  `auth` (its `credential_env_keys`, for redaction) are load-bearing, plus `name`/`aliases`
   inside the registry. A second harness that fills the other fields correctly
   changes no behavior.
 - **The facts the manifest declares are still hardcoded elsewhere, in two
