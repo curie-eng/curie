@@ -768,7 +768,10 @@ promote:
    settings, to `<your-api-url>/github/webhook`. This requires the
    Curie API to be reachable from GitHub's servers (an ingress, a load
    balancer, or a tunnel); how you expose it is an infrastructure decision
-   this chart does not make for you.
+   this chart does not make for you. The push endpoint requires the
+   `X-GitHub-Delivery` header, which GitHub always sends. A delivery that
+   errored partway through is not reprocessed under the same delivery id, so
+   push again or let commit polling pick the commit up.
 3. **The webhook secret matches.** GitHub signs each delivery
    (`x-hub-signature-256`), verified against the chart-managed
    `githubWebhookSecret`. Retrieve the generated value from the same Secret
@@ -789,7 +792,10 @@ promote:
 Each target agent owns its own Version row for the commit SHA. Dev and prod
 versions can share one immutable stored bundle object (`bundle_ref`); they do
 not share a Version row. A dev delivery always clones, checks commit ancestry,
-archives and validates, including on redelivery. A prod delivery first looks
+archives and validates, including a new delivery (a new `X-GitHub-Delivery`
+id) of a commit it has seen before. A webhook delivery whose id already
+deployed or promoted answers `push_duplicate` and does nothing; polling has no
+delivery id and is unaffected. A prod delivery first looks
 for a stored bundle for the SHA across agents bound to this repository. When
 found, it reads `deploy.yaml` from that object and promotes those exact bytes
 without fetching the remote, creating the target agent's Version row if needed
