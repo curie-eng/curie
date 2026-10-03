@@ -166,9 +166,10 @@ def test_any_exact_policy_or_history_refuses_without_mutation(
 
     asyncio.run(scenario())
     assert (
-        support.sql_dicts("SELECT * FROM curie.hook_source_operations ORDER BY generation")
-        == before
-    )
+        support.sql_dicts("SELECT * FROM curie.hook_source_operations ORDER BY generation"),
+        support.sql_dicts("SELECT * FROM curie.hook_source_policies ORDER BY hook"),
+        support.sql_dicts("SELECT hook_generation FROM curie.agents WHERE id=:id", {"id": agent}),
+    ) == before
 
 
 def test_legacy_exact_name_does_not_alias_configured_canonical_neighbor(guard_db: Any) -> None:
