@@ -78,6 +78,14 @@ Use a dedicated bounded gate connection pool, separate from the work/claim
 pool. Every path acquires the agent gate before a work connection. Release
 preliminary authentication read transactions before waiting for the gate,
 then reload and reauthenticate through a fresh work transaction after locking.
+A locked signed request first reads only the current authentication key-family
+fields and reauthenticates, before validating full source references or operation
+history. A stale signature therefore retains the uniform authentication refusal
+even when the new source configuration is unavailable. Immediately before each
+delivery claim attempt, validate the gate context's current task, live ownership
+and transaction, and probe its held database connection. Loss detected before
+that first effect refuses without a claim. This probe does not make a later
+database disconnect atomic with an already started broker operation.
 A lock waiter must not retain a work/claim connection. Pass an acquired gate
 context to inner helpers; never reacquire the same agent lock on another
 connection. Close the outer transaction on every error or cancellation path.
