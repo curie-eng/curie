@@ -12,7 +12,7 @@ DEFAULT_ROOT = Path(__file__).resolve().parent.parent / "apps/api/src/curie_api"
 
 
 def is_private(name: str) -> bool:
-    return name.startswith("_") and not name.startswith("__")
+    return name.startswith("_") and not (name.startswith("__") and name.endswith("__"))
 
 
 def is_api_module(name: str) -> bool:
@@ -406,6 +406,10 @@ def self_test() -> int:
          "def load():\n    from .models import _hidden\n", [(2, "private API import")]),
         ("absolute module alias", "consumer.py",
          "import curie_api.models as m\nm._hidden()\n", [(2, "private API module attribute")]),
+        ("double underscore private symbol", "consumer.py",
+         "from curie_api.models import __hidden\n", [(1, "private API import")]),
+        ("double underscore private attribute", "consumer.py",
+         "import curie_api.models as m\nm.__hidden()\n", [(2, "private API module attribute")]),
         ("parent module alias", "consumer.py",
          "from . import models as m\nm._hidden()\n", [(2, "private API module attribute")]),
         ("parent package alias", "consumer.py",
@@ -445,7 +449,7 @@ def self_test() -> int:
         ("public imports", "consumer.py",
          "from .models import public\nfrom . import models as m\nm.public()\n", []),
         ("dunders", "consumer.py",
-         "from .models import __all__\nfrom . import models as m\nm.__name__\n", []),
+         "from .models import __all__\nfrom . import models as m\nm.__name__\nm.__version__\n", []),
         ("own module", "consumer.py",
          "from curie_api.consumer import _hidden\n"
          "import curie_api.consumer as own\nown._hidden()\n", []),
