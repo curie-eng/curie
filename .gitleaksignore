@@ -148,3 +148,7 @@ a7c60011eb9aeac392845e3c3bcc0fd1a4b4dc19:cli/tests/surfaces_verb.rs:discord-clie
 # not credentials.
 a95919ccfb6e368497c613d358721dcdc18ac7e6:runner/tests/test_redact.py:generic-api-key:724
 a95919ccfb6e368497c613d358721dcdc18ac7e6:runner/tests/test_redact.py:generic-api-key:734
+
+# Invented migration-preservation fixture repository and issue number, not a
+# downstream reference. Exact historical finding only; future references remain gated.
+afdf8c97efb448e35fcb53b53c718fb2fa550af9:apps/api/tests/test_migration_0074_deploy_notifications.py:cross-repo-issue-ref:39
