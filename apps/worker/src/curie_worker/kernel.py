@@ -1803,6 +1803,12 @@ def _boots_differently(
         return True
     if handle.caller_run != caller_run:
         return True
+    # #3823: a boot state token that has already expired cannot serve another
+    # turn. The next new turn replaces the sandbox. A token with no recorded
+    # expiry is a route from before this field and is left until it expires
+    # on its own.
+    if handle.state_token_exp is not None and handle.state_token_exp <= int(time.time()):
+        return True
     return CONNECTOR_CALLER_TOKEN_ENV in env and not handle.carries_caller_token
 
 
@@ -1902,6 +1908,12 @@ class Kernel:
         # absent the kernel runs a generic sandbox (the F1 behavior); when present
         # it resolves channel -> agent -> bundle/budget and gates killed agents.
         self._binding = binding
+        revoker = getattr(self._substrate, "set_boot_credential_revoker", None)
+        poster = (
+            getattr(binding, "release_boot_credential_sync", None) if binding is not None else None
+        )
+        if revoker is not None and poster is not None:
+            revoker(poster)
         # The trusted repository preparation lane. It is optional for generic
         # and legacy deployments. A turn that requires a repository refuses when
         # this lane is unavailable instead of booting an empty directory.
@@ -3002,7 +3014,11 @@ class Kernel:
                 # No kind/address: there is no binding to scope the state
                 # namespace to. No approval grant, resumed kind or decision
                 # either: a targetless turn is never a resume.
-                boot_env = binding.boot_env(resolved, thread_key)
+                boot_env = binding.boot_env(
+                    resolved,
+                    thread_key,
+                    token_ttl_s=self._runner.turn_deadline_s(_remaining_budget(lease)),
+                )
                 workspace_deployment_id = resolved.deployment_id
                 packs = binding.packs_for(resolved)
                 approval_routes = resolved.approval_routes
@@ -3143,6 +3159,7 @@ class Kernel:
                 boot_env_kwargs: dict[str, Any] = {
                     "kind": handle.kind,
                     "address": handle.channel,
+                    "token_ttl_s": self._runner.turn_deadline_s(_remaining_budget(lease)),
                 }
                 # The internal thread key is channel-scoped, so it no longer
                 # starts with the eval marker carried by conversation_id.

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -613,3 +614,23 @@ def test_a_runner_booted_for_another_run_is_replaced() -> None:
     assert _boots_differently(handle(run_a), env, caller_run=run_a) is False
     assert _boots_differently(handle(None), env, caller_run=run_a) is True
     assert _boots_differently(handle(None), {}, caller_run=None) is False
+
+
+def test_an_expired_boot_token_replaces_the_warm_sandbox() -> None:
+    """#3823: the next new turn does not keep a sandbox whose state token is dead."""
+
+    base = dict(
+        thread_key="slack:C0EXAMPLE1:t",
+        claim_name="claim",
+        sandbox_name="sandbox",
+        namespace="curie",
+        service_fqdn="sandbox.curie.svc",
+        port=8080,
+        session_id="session",
+    )
+    live = SandboxHandle(**base, state_token_exp=int(time.time()) + 600)
+    dead = SandboxHandle(**base, state_token_exp=int(time.time()) - 1)
+    unknown = SandboxHandle(**base)
+    assert _boots_differently(live, {}) is False
+    assert _boots_differently(dead, {}) is True
+    assert _boots_differently(unknown, {}) is False
