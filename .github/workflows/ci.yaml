@@ -1049,7 +1049,7 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-  # The two example connectors are the only images CI does not run, and the
+  # The example connectors are the only images CI does not run, and the
   # only ones release.yaml publishes for a second architecture. They are
   # validated here, build only, for both architectures: validating only amd64
   # leaves an arm64-only Dockerfile failure to appear for the first time during
@@ -1072,6 +1072,10 @@ jobs:
           - name: sre-bot-self-upgrade
             context: examples/sre-bot/connectors/self-upgrade
             dockerfile: examples/sre-bot/connectors/self-upgrade/Dockerfile
+            platforms: linux/amd64,linux/arm64
+          - name: github-activity-github
+            context: examples/github-activity/connectors/github
+            dockerfile: examples/github-activity/connectors/github/Dockerfile
             platforms: linux/amd64,linux/arm64
     steps:
       - uses: actions/checkout@v7
