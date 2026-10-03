@@ -212,4 +212,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0187 | [The factory polls GitHub for its work, and the platform reads the issue](0187-the-factory-polls-github-and-the-platform-reads-the-issue.md) | Accepted |
 | 0188 | [The sandbox memory credential is scoped to its own channel](0188-the-sandbox-memory-credential-is-scoped-to-its-own-channel.md) | Accepted |
 | 0189 | [Deployed agents see only their bundle's skills](0189-deployed-agents-see-only-their-bundles-skills.md) | Accepted |
+| 0190 | [Automated hook sources cannot widen their tool access](0190-automated-hook-sources-cannot-widen-their-tool-access.md) | Draft |
 <!-- END GENERATED: adr-index -->
