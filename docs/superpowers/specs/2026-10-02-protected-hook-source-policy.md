@@ -92,6 +92,10 @@ Acquire the workspace work connection before its probe. Before failed-delivery
 settlement, probe again; detected gate loss leaves already-created claims or
 quota to their existing expiry/recovery rather than authorizing more writes.
 Secondary settlement or diagnostic failure preserves the original refusal.
+Request cancellation retains the existing live-gate refund behavior: shield the
+probe and settlement in the registered request task for a bounded five-second
+cleanup scope, then propagate the original cancellation. No replacement task
+may borrow the gate context, and detected gate loss still authorizes no cleanup.
 A lock waiter must not retain a work/claim connection. Pass an acquired gate
 context to inner helpers; never reacquire the same agent lock on another
 connection. Close the outer transaction on every error or cancellation path.
