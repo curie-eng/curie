@@ -13,8 +13,9 @@ import anyio
 import pytest
 from curie_runner import hooks, load_bundle_hooks
 from curie_runner.__main__ import build_runner
-from curie_runner.approval import ApprovalGate, build_approval_hook
+from curie_runner.approval import ApprovalGate
 from curie_runner.config import RunnerConfig
+from curie_runner.harness.claude.approval import build_approval_hook
 from curie_runner.mcp_tool_capability import (
     ConnectorAvailability,
     ConnectorCapabilityFailure,

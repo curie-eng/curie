@@ -80,11 +80,13 @@ from curie_runner.approval import (
     ApprovalGate,
     ApprovalPolicyError,
     build_approval_gate,
-    build_approval_hook,
-    build_can_use_tool,
 )
 from curie_runner.config import RunnerConfig
 from curie_runner.fake import FakeModelSession
+from curie_runner.harness.claude.approval import (
+    build_approval_hook,
+    build_can_use_tool,
+)
 from curie_runner.otel import RunTracer
 from curie_runner.session import SessionRunner
 from curie_runner.side_effects import SideEffectClassifier

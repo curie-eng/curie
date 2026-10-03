@@ -180,11 +180,11 @@ in code now:
   (`agents.approval_required_tools`, forwarded as `CURIE_APPROVAL_REQUIRED_TOOLS` by the
   worker binding) marks tools approval-required. The runner intercepts those calls
   first through an SDK `PreToolUse` hook (`build_approval_hook`,
-  `runner/src/curie_runner/approval.py::build_approval_hook`) -- the call is denied
+  `runner/src/curie_runner/harness/claude/approval.py::build_approval_hook`) -- the call is denied
   before execution, and the turn ends `awaiting-approval` on the same override the
   policy gate uses, so both trigger types share one record/suspend/resume lifecycle.
   The SDK `can_use_tool` callback (`build_can_use_tool`,
-  `runner/src/curie_runner/approval.py::build_can_use_tool`) is the backstop for a
+  `runner/src/curie_runner/harness/claude/approval.py::build_can_use_tool`) is the backstop for a
   tool the hook abstains on, or if no hook is registered. The one-shot grant is
   spent at hook decision time; a concurrent bundle `PreToolUse` matcher can still
   veto the approved call and burn that grant (the CLI dispatches matchers on one
@@ -662,6 +662,15 @@ lands in the audit trail in the same transaction as its effect. Recovery cannot 
 and the sandbox's scoped token cannot reach it. A
 notification transport credential likewise confers no resolution capability: the
 notification contains no interaction, and this contract exposes no second-channel resolver.
+The policy gate `ApprovalGate`
+(`runner/src/curie_runner/approval.py::ApprovalGate`) contains no Claude SDK
+imports. It owns tool policy, grants, pending approval state, and gate decision
+results. The Claude adapter in
+`runner/src/curie_runner/harness/claude/approval.py` translates those results
+into SDK permission responses and hook matchers. Import rules separately keep
+the core gate free of SDK dependencies and ratchet legacy SDK edges elsewhere
+in the runner, exempting only the Claude harness package.
+
 The runtime `PreToolUse` hook (`build_approval_hook`, #1852) is the first interceptor
 of a gated tool call, with the SDK `canUseTool` callback (`build_can_use_tool`, #245)
 as backstop, but

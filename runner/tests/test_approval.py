@@ -28,8 +28,6 @@ from curie_runner.approval import (
     ApprovalPolicyError,
     ApprovalPolicyResolution,
     build_approval_gate,
-    build_approval_server,
-    build_can_use_tool,
     guard_reserved_summary,
     load_approval_policy,
     resolve_approval_policy,
@@ -41,6 +39,10 @@ from curie_runner.fake import (
     FakeModelSession,
     approval_turn,
     default_turn,
+)
+from curie_runner.harness.claude.approval import (
+    build_approval_server,
+    build_can_use_tool,
 )
 from curie_runner.otel import RunTracer
 from curie_runner.session import SessionRunner, _apply_approval_override

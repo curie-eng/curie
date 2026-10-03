@@ -35,10 +35,6 @@ from .approval import (
     ApprovalPolicyError,
     assert_gates_not_shadowed,
     build_approval_gate,
-    build_approval_hook,
-    build_approval_server,
-    build_can_use_tool,
-    build_memory_tools,
     include_generic_policy_pager,
     policy_disallowed_tools,
     resolve_approval_policy,
@@ -53,11 +49,17 @@ from .connectors import (
     materialize_hosted_bearer_headers,
 )
 from .fake import FakeModelSession
+from .harness.claude.approval import (
+    build_approval_hook,
+    build_approval_server,
+    build_can_use_tool,
+    build_memory_tools,
+)
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
     BUILTIN_HARNESS_CANONICAL_PATHS,
     DEFAULT_HARNESS,
-    resolve_harness,
+    UnsupportedHarnessError,
 )
 from .history import (
     DEFAULT_REPLAY_MAX_BYTES,
@@ -102,13 +104,17 @@ from .progress import (
 )
 from .publication_precheck import PublicationPrecheck
 from .redact import collect_held_secrets, install_stdout_redaction
-from .sdk_auth import UnsupportedCredentialError
+from .sdk_auth import DEFAULT_CREDENTIAL_ENV_KEYS, UnsupportedCredentialError
 from .server import bind_status_attestation, create_app
 from .session import ConnectorReprobe, SessionRunner
 from .side_effects import SideEffectClassifier
-from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
+from .state import (
+    build_state_server,
+    resolve_state_client,
+)
 from .subprocess_env import lock_process_environ
 from .tool_access import TurnToolAccess, front_can_use_tool, front_pre_tool_use_hooks
+from .tool_names import STATE_SERVER_NAME
 from .turn_progress import (
     PROGRESS_PREAMBLE,
     TurnProgress,
@@ -197,32 +203,20 @@ def format_attachment_notice(paths: Sequence[Path]) -> str | None:
 
 
 def _resolve_harness(name: str = DEFAULT_HARNESS) -> HarnessContribution:
-    """Resolve the active harness's contribution manifest (ADR-0060).
+    """Resolve only the supported Claude name and aliases (ADR 0140).
 
-    The built-in Claude harness must always be available, so a built-in name --
-    its declared name or any alias in ``BUILTIN_HARNESS_CANONICAL_PATHS`` -- is
-    resolved from its direct import and never through entry-point discovery.
-    That keeps the critical boot path independent of packaging metadata
-    entirely: a malformed, colliding, or import-crashing *sibling* entry point
-    makes ``discover_contributions`` raise (a guard error such as
-    ``FlatHarnessPackageError``/``HarnessNameCollisionError``/
-    ``MalformedHarnessContributionError``, none of them ``UnknownHarnessError``),
-    and none of that may take down the built-in (#865). The registry already
-    refuses any third party that claims a built-in key, so a built-in name can
-    only ever mean the built-in -- resolving it directly is equivalent for a
-    well-formed registry and strictly safer for a broken one.
-
-    A non-built-in name goes through the registry and still fails loud (an
-    ``UnknownHarnessError`` if unregistered, or a guard error if the registry is
-    malformed), so an operator who selects a harness that isn't installed fails
-    visibly, not silently.
+    A direct import keeps boot independent of entry point discovery, including
+    malformed or colliding sibling metadata (#865). Every other selection is
+    refused before discovery even if an alternate contribution is registered.
     """
 
     if name in BUILTIN_HARNESS_CANONICAL_PATHS:
         from .harness.claude import get_contribution
 
         return get_contribution()
-    return resolve_harness(name)
+    raise UnsupportedHarnessError(
+        f"Curie supports only the built in Claude harness; {name!r} is unsupported."
+    )
 
 
 def _format_check_data(check: dict[str, Any]) -> str:
@@ -781,7 +775,7 @@ def build_runner(
     held_secrets = collect_held_secrets(
         config,
         environments=(os.environ, sdk_env or {}),
-        credential_names=harness.auth.credential_env_keys,
+        credential_names=DEFAULT_CREDENTIAL_ENV_KEYS,
         connector_names=declared_secret_names(config.session.plugin_dir),
         server_groups=(bundle_mcp_servers(config.session.plugin_dir), derived_mcp_servers),
     )

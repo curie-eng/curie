@@ -20,28 +20,33 @@ epic_note: folds into
 
 ## The black line
 
-Inside the runner the model harness is reached through one in-process port: the
-`ModelSession` Protocol. Everything above it (ACI translation, budget, side-effect
-flagging, NDJSON, the HTTP layer) is written against the Protocol. The port itself is
-CLEAN, but the SDK is not yet confined to one module: sixteen runner modules still import
-`claude_agent_sdk` today (`check.py`, `session.py`, `hooks.py`, `adapter.py`, `mcp_argv.py`, `fake.py`,
-`approval.py`, `translate.py`, `plugin.py`, `state.py`, `progress.py`, `turn_progress.py`, `issue_read.py`, `usage_report.py`, `tool_access.py`, `__main__.py`, whose boot path
-assembles the approval gate's `PreToolUse` hook matcher alongside the bundle's), and the
-value that crosses the port is currently the raw SDK message union rather than a
-runner-owned neutral type. The
-runner-owned `TurnEvent` model that was once going to draw that line is withdrawn, not
-pending: issue #307 is closed as superseded and its PR #315 was closed unmerged (the
-withdrawal of OpenCode-as-second-harness, recorded in ADR-0060/0061), and no `TurnEvent`
-type exists anywhere in the tree.
-ADR-0061 (Draft) replaces it with an out-of-process harness boundary, tracked by open
-#844; until something lands, a second harness must emit objects the SDK-shaped
-translation step accepts. What stays opinionated core is the frozen ACI wire contract the runner
-serves; the port is how a harness plugs into that runner. Steer and interrupt are
-first-class Protocol operations, not emulated.
+Inside the runner, the model harness is reached through the `ModelSession`
+Protocol. The session loop, ACI translation, budget enforcement, telemetry,
+and HTTP layer call that port. Steer and interrupt are explicit operations.
+The messages crossing it still use the Claude SDK dataclasses, so the typed
+port does not provide a neutral event format.
+
+[ADR 0140](../../adr/0140-curie-supports-one-model-harness-until-a-second-one-exists.md)
+limits supported boot to Claude and stops the unfinished process boundary
+program in ADR 0061. A real second engine must reopen that decision. The
+withdrawn `TurnEvent` model from #307 and #315 never shipped.
+
+The approval policy gate at `runner/src/curie_runner/approval.py` contains no
+SDK imports. Its Claude permission callback and hook adapter live at
+`runner/src/curie_runner/harness/claude/approval.py`.
+
+16 runner modules import `claude_agent_sdk` today (`check.py`, `session.py`,
+`hooks.py`, `adapter.py`, `mcp_argv.py`, `fake.py`, `approval.py`, `translate.py`,
+`plugin.py`, `state.py`, `progress.py`, `turn_progress.py`, `issue_read.py`,
+`usage_report.py`, `tool_access.py`, `__main__.py`). In that inventory,
+`approval.py` means `runner/src/curie_runner/harness/claude/approval.py`;
+the core `runner/src/curie_runner/approval.py` has no SDK import. The import
+rules in `pyproject.toml` forbid SDK dependencies in the gate and ratchet the
+legacy edges outside the Claude harness package. Only that package is exempt.
 
 ## Current contract
 
-A second harness must supply an object satisfying `ModelSession`
+A session supplies an object satisfying `ModelSession`
 (`runner/src/curie_runner/adapter.py::ModelSession`), a five-method `Protocol`:
 
 - `async def connect(self) -> None` (`runner/src/curie_runner/adapter.py::ModelSession.connect`) — start/attach the harness,
@@ -83,24 +88,22 @@ runs in `permission_mode="default"` so each tool call is gated, and only an unco
 agent (no callback) keeps the historical `"bypassPermissions"` verbatim
 (`runner/src/curie_runner/adapter.py::build_options`).
 
-The Protocol is only half of what a second harness owes the runner. Since ADR-0060
-(Accepted) a harness is also a **declared package**: it ships a `HarnessContribution`
-manifest (`runner/src/curie_runner/harness/contribution.py::HarnessContribution`) naming
-its image, install packages, accepted credential shapes, read-only tool set,
-model-override env keys, spawn-env builder and bundle compiler, and it registers a
-`get_contribution` callable under the `curie.harness` entry-point group
-(`runner/src/curie_runner/harness/registry.py::ENTRY_POINT_GROUP`, declared for the
-built-in in `runner/pyproject.toml`). Discovery is fail-closed: a flat module path, a
-key already claimed by a built-in or by an earlier contribution, or a non-`str` key is
-refused rather than resolved by scan order
-(`runner/src/curie_runner/harness/registry.py::discover_contributions`). The runner
-selects one at boot from `CURIE_HARNESS`
-(`runner/src/curie_runner/config.py::RunnerConfig.from_env`, surfaced as
-`runner/src/curie_runner/config.py::RunnerConfig.harness`) and resolves it through
-`runner/src/curie_runner/__main__.py::_resolve_harness`, which short-circuits built-in
-names to a direct import so a broken sibling entry point cannot brick the default, and
-otherwise goes through `runner/src/curie_runner/harness/registry.py::resolve_harness`
-and fails loud on an unregistered name.
+The package declaration above this port is `HarnessContribution`
+(`runner/src/curie_runner/harness/contribution.py::HarnessContribution`). It
+contains `name`, `aliases`, `readonly_tools`, `build_spawn_env`,
+`compile_bundle`, and `supports_structured_replay`. Registry discovery retains
+its checks for malformed paths, reserved names, duplicate keys, and keys that
+are not exact strings
+(`runner/src/curie_runner/harness/registry.py::discover_contributions`).
+
+Supported boot is narrower than registry discovery. `RunnerConfig.from_env`
+(`runner/src/curie_runner/config.py::RunnerConfig.from_env`) reads the internal
+`CURIE_HARNESS` value. `_resolve_harness`
+(`runner/src/curie_runner/__main__.py::_resolve_harness`) admits only the built
+in Claude name and aliases by direct import. Every other name raises
+`UnsupportedHarnessError` before discovery, even when another installed
+contribution registered it. A broken sibling entry point cannot affect a
+supported boot path.
 
 ## Implementations today
 
@@ -121,42 +124,44 @@ Two, both in `runner/src/curie_runner/`:
   a real `SessionRunner` over the fake (`runner/src/curie_runner/conformance.py::_build_runner`), so the ACI conformance gate
   validates the actual translation/final plumbing, not a canned stream.
 
-At the package layer there is exactly one registered contribution, the built-in Claude
-harness (`runner/src/curie_runner/harness/claude.py::CLAUDE_CONTRIBUTION`), which
-declares no new behavior and only names what `sdk_auth.py`, `side_effects.py` and
-`plugin.py` already did. So the registry is a guarded indirection around this same
-adapter until a second contribution exists to teach it.
+At the package layer there is one supported contribution, Claude
+(`runner/src/curie_runner/harness/claude/__init__.py::CLAUDE_CONTRIBUTION`). It
+supplies environment resolution, bundle compilation, the tool allowlist, and
+structured replay support. Another registry contribution does not imply
+supported engine selection.
 
 ## Known leakage
 
 The port is CLEAN as a code interface but leaks harness shape where the SDK is not yet
 walled off, called out in vision-doc Job 1:
 
-- **SDK-shaped message payload.** The value crossing the port is the concrete
-  `claude_agent_sdk` message union, and `claude_agent_sdk` is imported across sixteen
-  runner modules rather than one harness package. The runner-owned `TurnEvent` model that
-  was to draw the neutral line is withdrawn (issue #307 closed as superseded, its PR #315
-  closed unmerged and kept only as mining material for the package-shaped redesign);
-  ADR-0061 (Draft) puts the boundary out of process instead, and
-  confining these imports into the Claude harness package is part of open #844. ADR-0062
-  (Accepted) already gates the boundaries that are clean with import-linter contracts in
-  `pyproject.toml`, but its full ban on importing the SDK outside the Claude harness
-  package cannot be turned on until that refactor lands. Until then a second harness
-  emits SDK-shaped dataclasses that `translate_message` understands.
-- **Plugin-format entanglement, now visible in the manifest.** `packages/plugin-format`
-  is the Claude Code plugin shape verbatim, so a non-Claude harness must interpret Claude
-  Code plugin bundles or translate them; "implement the ACI server" understates that work.
-  ADR-0060's manifest names that cost rather than removing it: `compile_bundle` returns a
-  `runner/src/curie_runner/harness/contribution.py::BundleCompileResult` whose `plugins`
-  field is typed `list[Any]` and, for the built-in, is filled with the SDK's own
-  `SdkPluginConfig` objects (`runner/src/curie_runner/plugin.py::load_plugins`).
-- **Duck-typed replay export.** `export_replay_state` is discovered with `getattr` in
-  `runner/src/curie_runner/session.py::SessionRunner`, unlike the declared
-  `McpServerReconnector` optional protocol. A second harness can therefore miss a
-  load-bearing checkpoint capability without a protocol conformance failure.
+1. **SDK message payload.** The values crossing the port remain the
+   `claude_agent_sdk` message union. The runner owned `TurnEvent` model was
+   withdrawn. The import ratchet records the remaining legacy SDK edges and
+   prevents new exceptions outside the Claude package. It does not claim that
+   those modules have already moved or that a neutral message contract exists.
+2. **Plugin format entanglement, visible in the manifest.**
+   `packages/plugin-format` is the Claude Code plugin shape verbatim, so another
+   harness must interpret or translate those bundles. `compile_bundle` returns
+   `BundleCompileResult`
+   (`runner/src/curie_runner/harness/contribution.py::BundleCompileResult`),
+   whose `plugins` field is typed `list[Any]`. Claude fills it with SDK
+   `SdkPluginConfig` objects
+   (`runner/src/curie_runner/plugin.py::load_plugins`).
+3. **Replay export by attribute lookup.** `export_replay_state` is discovered
+   with `getattr` in `SessionRunner`
+   (`runner/src/curie_runner/session.py::SessionRunner`), unlike the declared
+   `McpServerReconnector` optional protocol. A session can omit a checkpoint
+   capability without a protocol conformance failure.
 
-## Cross-links
+## Cross links
 
-- **Epic(s):** — no standalone epic; folds into #25 (ACI producer / second-harness work).
-- **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 1 (Harness / runtime), grade A-.
-- **ADR(s):** [ADR-0005](../../adr/0005-claude-agent-sdk-adapter-and-frozen-aci.md) — claude-agent-sdk adapter behind a frozen ACI session contract; [ADR-0010](../../adr/0010-approval-gates-and-human-in-the-loop.md) — approval gates make `permission_mode` conditional on a `can_use_tool` callback; [ADR-0060](../../adr/0060-the-harness-is-a-declared-package.md) (Accepted) — a harness is a declared package with a contribution manifest and an entry point, not a class; [ADR-0061](../../adr/0061-out-of-process-harness-boundary.md) (Draft) — the boundary moves out of process, replacing the withdrawn `TurnEvent` union; [ADR-0062](../../adr/0062-harness-conformance-has-teeth.md) (Accepted) — conformance obligations and the import-linter contracts behind them; [ADR-0011](../../adr/0011-opencode-second-harness.md) — OpenCode as the second harness, **Superseded by ADR-0060** (the steer spike passed, adoption was withdrawn for other reasons).
+1. [Architecture vision](../../architecture-vision.md) grades the harness
+   runtime as Job 1, grade A minus. This seam folds into #25.
+2. [ADR 0005](../../adr/0005-claude-agent-sdk-adapter-and-frozen-aci.md)
+   defines the SDK adapter behind the frozen ACI contract.
+3. [ADR 0010](../../adr/0010-approval-gates-and-human-in-the-loop.md)
+   makes permission mode conditional on a `can_use_tool` callback.
+4. [ADR 0140](../../adr/0140-curie-supports-one-model-harness-until-a-second-one-exists.md)
+   limits supported engines to Claude and replaces the programs in ADRs 0060,
+   0061, and 0062 until a real second engine exists.
