@@ -216,6 +216,8 @@ testpaths = [
     # (#2093).
     "examples/sre-bot/connectors",
     "tools/doclint/tests",
+    # @spec PROTECTED-HOOK-LANE-2
+    "packages/protected-hooks/tests",
     "tools/wire-tolerance-gate/tests",
     "tools/ci-retry-gate/tests",
     "tools/ci-workflow-paths/tests",

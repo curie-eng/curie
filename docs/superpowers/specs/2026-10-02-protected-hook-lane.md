@@ -83,6 +83,10 @@ Each encoded record is at most 16384 bytes. Decoder rejects invalid UTF-8, dupli
 
 Canonical record bytes are ASCII JSON with object keys sorted lexicographically, no insignificant whitespace, standard JSON string escaping and no nonfinite numbers. The only JSON integers are schema version, broker port and database. Decimal generations and milliseconds remain JSON strings. Implementations produce the same bytes as `json.dumps(validated_primitives, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")` for these closed v1 shapes. Input whitespace/member order does not change canonical content. Manifest identity is the lowercase SHA256 of its canonical bytes, without a prefix or an embedded self-digest member. Mutable dictionaries are not retained as record state: records and nested values remain immutable, and cached identities cannot survive content mutation.
 
+The authority-record grammar tests under `packages/protected-hooks/tests` are
+part of the default root pytest collection and its CI execution. An explicitly
+selected focused run does not replace registration in the complete suite.
+
 ## Nested shared records
 
 <!-- @spec PROTECTED-HOOK-LANE-2 -->
