@@ -990,7 +990,9 @@ download_pin() {
         rm -f "$dest"
     fi
     log "downloading $(basename "$dest")"
-    curl -fsSL --retry 3 -o "$dest" "$url"
+    # --retry alone does not retry a connection reset (curl exit 35). That
+    # reset dropped the 0.8.9 binary on upgrade shard s03.
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$dest" "$url"
     verify_sha256 "$sha" "$dest"
 }
 

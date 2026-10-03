@@ -151,6 +151,22 @@ def test_tool_and_chart_downloads_retry_with_backoff() -> None:
     )
 
 
+def test_upgrade_matrix_download_retries_connection_resets() -> None:
+    """curl --retry skips a connection reset. The matrix download must not.
+
+    Shard s03 failed with curl exit 35 (connection reset by peer) while
+    fetching a published binary. --retry-all-errors covers that class.
+    A checksum mismatch after a complete download still fails closed.
+    """
+    script = (REPO_ROOT / "cli/scripts/cluster-upgrade-matrix.sh").read_text()
+    start = script.index("download_pin()")
+    body = script[start:script.index("\nfetch_published", start)]
+    assert "--retry 5" in body
+    assert "--retry-all-errors" in body
+    assert "--retry-delay 5" in body
+    assert "verify_sha256" in body
+
+
 def test_kind_creation_recreates_a_missing_kind_registry() -> None:
     """The attempt and its backoff both recreate kind-registry when it is gone."""
     gaps: list[str] = []
