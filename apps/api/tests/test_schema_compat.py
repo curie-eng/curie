@@ -41,8 +41,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 CONTRACT = "0041"
-# Agent reads include the 0072 deploy-notification column unconditionally.
-APP_SCHEMA_MIN = "0072"
+# @spec DEPLOY-NOTICE-RELEASE-1.
+# Agent reads include the 0074 deploy-notification column unconditionally.
+APP_SCHEMA_MIN = "0074"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -120,10 +121,12 @@ def test_the_route_identity_contract_raises_the_floor_and_needs_forward_only() -
 
 
 def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> None:
+    """@spec DEPLOY-NOTICE-RELEASE-1."""
     window = load_window()
-    known = {"0070", "0071", "0072"}
-    assert can_serve("0071", window, known) is False
-    assert can_serve("0072", window, known) is True
+    known = {"0070", "0071", "0072", "0073", "0074"}
+    for released in ("0070", "0071", "0072", "0073"):
+        assert can_serve(released, window, known) is False
+    assert can_serve("0074", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

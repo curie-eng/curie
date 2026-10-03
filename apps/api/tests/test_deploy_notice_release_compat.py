@@ -37,6 +37,9 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == candidate
     assert catalog["revisions"][-3:] == ["0072", "0073", "0074"]
-    for name in ("apps/api/src/curie_api/schema_compat.json", "charts/curie/files/schema-compat.json"):
+    for name in (
+        "apps/api/src/curie_api/schema_compat.json",
+        "charts/curie/files/schema-compat.json",
+    ):
         payload = json.loads((ROOT / name).read_text())
         assert {key: payload[key] for key in candidate} == candidate
