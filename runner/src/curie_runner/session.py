@@ -1471,8 +1471,11 @@ class SessionRunner:
         if self._attachment_notice is not None:
             prompt = f"{prompt}\n\n{self._attachment_notice}"
             self._attachment_notice = None
-        # The prompt text never reaches OTel (e2e ladder gate); record its size only.
-        gen.observe_prompt(prompt)
+        # The user text is the recorded prompt size, and neither it nor the
+        # framed query is exported to OTel, even when the model echoes them.
+        gen.observe_prompt(event.text)
+        if prompt != event.text:
+            gen.remember_echo(prompt)
         state.prompt_text = prompt
         await self._session.query(prompt)
         async for message in self._session.receive_turn():

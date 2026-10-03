@@ -36,7 +36,12 @@ from curie_runner.adapter import ClaudeAgentSession, PartialMessageBoundary
 from curie_runner.approval import ApprovalGate
 from curie_runner.fake import FakeModelSession
 from curie_runner.otel import _SchemaValidatingSpanProcessor
+from curie_runner.sender_frame import frame_user_turn
 from curie_runner.session import SessionRunner
+
+
+def _sent(text: str, user: str = "U0EXAMPLE1") -> str:
+    return frame_user_turn("message", user, text, None)
 from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
     OTLPSpanExporter as GrpcOTLPSpanExporter,
@@ -606,7 +611,7 @@ def test_steer_during_provider_wait_preserves_generation_and_ttft(
                 tasks.start_soon(consume)
                 await session.waiting_after_boundary.wait()
                 assert runner.turn_active
-                assert session.queries == ["initial"]
+                assert session.queries == [_sent("initial")]
                 assert await runner.steer("steered follow-up") is True
                 session.release.set()
         finally:
@@ -614,7 +619,7 @@ def test_steer_during_provider_wait_preserves_generation_and_ttft(
         return parse_ndjson("".join(lines)), session
 
     events, session = anyio.run(go)
-    assert session.queries == ["initial", "steered follow-up"]
+    assert session.queries == [_sent("initial"), _sent("steered follow-up", "")]
     assert isinstance(events[-1], Final)
     assert events[-1].status is SessionStatus.DONE
 

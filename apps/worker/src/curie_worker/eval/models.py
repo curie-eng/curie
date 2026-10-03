@@ -175,6 +175,16 @@ class EvalCase(BaseModel):
     expect_status: ExpectedStatus = ExpectedStatus.DONE
 
 
+def eval_author(sender: str | None, default: str) -> str:
+    """The turn author for one eval case.
+
+    A missing or empty sender keeps the driver's default. An empty string
+    must not become an unknown person.
+    """
+
+    return sender if sender else default
+
+
 class EvalSuite(BaseModel):
     """A named set of eval cases run together against one plugin version."""
 

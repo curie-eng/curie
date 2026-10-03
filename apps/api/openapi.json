@@ -3631,7 +3631,7 @@
         "type": "string"
       },
       "EvalCaseOut": {
-        "description": "An eval case conforming to the frozen eval-case format (#8, ADR-0019):\nan input prompt plus the grader that judges the answer. Emitted by the\npromote-a-trace-to-an-eval-case endpoint (#259).\n\n``shared_history`` mirrors the worker's ``EvalCase`` field (#550, ADR-0051):\na promoted trace is a standalone case, so it emits the ``False`` default\n(fresh conversation). Kept here to satisfy the schema field-parity gate; the\npromote endpoint has no reason to mint a history-chained case.\n\n``expect_status`` mirrors the frozen ``ExpectedStatus`` (#262, ADR-0053): the\nterminal session status the case asserts, default ``done``. A promoted trace\nis a completed conversation, so the emitted case keeps the default; a human\nedits it to ``awaiting-approval`` when the case should assert an approval gate\nheld. Do not let this literal drift from the schema's ``ExpectedStatus`` enum.",
+        "description": "An eval case conforming to the frozen eval-case format (#8, ADR-0019):\nan input prompt plus the grader that judges the answer. Emitted by the\npromote-a-trace-to-an-eval-case endpoint (#259).\n\n``shared_history`` mirrors the worker's ``EvalCase`` field (#550, ADR-0051):\na promoted trace is a standalone case, so it emits the ``False`` default\n(fresh conversation). Kept here to satisfy the schema field-parity gate; the\npromote endpoint has no reason to mint a history-chained case.\n\n``expect_status`` mirrors the frozen ``ExpectedStatus`` (#262, ADR-0053): the\nterminal session status the case asserts, default ``done``. A promoted trace\nis a completed conversation, so the emitted case keeps the default; a human\nedits it to ``awaiting-approval`` when the case should assert an approval gate\nheld. Do not let this literal drift from the schema's ``ExpectedStatus`` enum.\n\n``sender`` mirrors the worker's optional eval-case sender (#3818). A promoted\ntrace leaves it unset, so omitted suites keep decoding. Do not let this field\ndrift from the schema's ``EvalCase`` properties.",
         "properties": {
           "expect_status": {
             "default": "done",
@@ -3652,6 +3652,17 @@
           "input": {
             "title": "Input",
             "type": "string"
+          },
+          "sender": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sender"
           },
           "shared_history": {
             "default": false,

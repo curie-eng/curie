@@ -285,7 +285,7 @@ pub(super) async fn run_suite_cases(
                 .send_event(
                     EventType::EvalCase,
                     &case.input,
-                    case.sender.as_deref().unwrap_or("U-eval"),
+                    eval_author(&case.sender, "U-eval"),
                     |_| {},
                 )
                 .await?;

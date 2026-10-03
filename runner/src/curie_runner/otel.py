@@ -534,6 +534,16 @@ class _GenerationSpan:
             self._prompts.append(text)
         self.observe_input(_prompt_placeholder(text))
 
+    def remember_echo(self, text: str) -> None:
+        """Redact an exact echo of ``text`` without recording it as input.
+
+        The generation input stays the user text. The framed query is longer,
+        and a model that repeats that whole query must not export it either.
+        """
+
+        if text and text not in self._prompts:
+            self._prompts.append(text)
+
     def observe_output(self, text: str) -> None:
         """Buffer assistant text or a ``[tool_use NAME]`` marker as output."""
 

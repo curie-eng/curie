@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from curie_worker.eval.models import EvalCase
+from curie_worker.eval.models import EvalCase, eval_author
 
 
 def _case(sender: str | None = None) -> dict[str, object]:
@@ -21,3 +21,6 @@ def test_eval_case_accepts_sender_and_omits_it_as_none() -> None:
     assert present.sender == "eval-sender-acme"
     absent = EvalCase.model_validate(_case())
     assert absent.sender is None
+    assert eval_author(None, "eval") == "eval"
+    assert eval_author("", "eval") == "eval"
+    assert eval_author("eval-sender-acme", "eval") == "eval-sender-acme"

@@ -18,8 +18,8 @@ use crate::api::{ApiClient, ChannelOutcome, RoutingCheck};
 use crate::bundle::{git_status_is_clean_for_pack, pack_tar_gz};
 use crate::docker::{self, CheckSpec, StartSpec};
 use crate::evals::{
-    graded_answer, load_eval, outcome_label, rollup_line, score_turn, turn_completed, CaseOutcome,
-    EvalSuite, TrajectoryScorer,
+    eval_author, graded_answer, load_eval, outcome_label, rollup_line, score_turn, turn_completed,
+    CaseOutcome, EvalSuite, TrajectoryScorer,
 };
 use crate::render::{boxed_summary, status_str, TurnPart, TurnPrinter};
 use crate::runner::RunnerClient;

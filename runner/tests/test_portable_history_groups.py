@@ -14,6 +14,11 @@ import logging
 import anyio
 import pytest
 from curie_runner.adapter import build_structured_resume
+from curie_runner.sender_frame import frame_user_turn
+
+
+def _sent(text: str, user: str = "U0EXAMPLE1") -> str:
+    return frame_user_turn("message", user, text, None)
 from curie_runner.history import (
     ConversationMessage,
     HarnessReplayState,
@@ -562,13 +567,16 @@ def test_accepted_steer_clears_capture_group(monkeypatch):
             await runner.close()
 
     anyio.run(run)
-    assert client.queries == ["inspect", "fresh steer"]
+    assert client.queries == [_sent("inspect"), _sent("fresh steer", "")]
     assert [
         m.to_dict().get("assistant_group")
         for m in store.records[0].messages
         if m.role == "assistant"
     ] == [GROUP, None]
-    assert any(m.role == "user" and m.content == "fresh steer" for m in store.records[0].messages)
+    assert any(
+        m.role == "user" and m.content == _sent("fresh steer", "")
+        for m in store.records[0].messages
+    )
 
 
 @pytest.mark.parametrize("mismatch", [False, True])

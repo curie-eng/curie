@@ -150,6 +150,15 @@ pub struct EvalCase {
     pub expect_status: ExpectedStatus,
 }
 
+/// The turn author for one eval case. A missing or empty sender keeps the
+/// driver's default, so an empty string does not become an unknown person.
+pub fn eval_author<'a>(sender: &'a Option<String>, default: &'a str) -> &'a str {
+    match sender.as_deref() {
+        Some(value) if !value.is_empty() => value,
+        _ => default,
+    }
+}
+
 /// A named set of eval cases run together against one plugin version.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EvalSuite {
@@ -832,6 +841,17 @@ mod tests {
         let path = dir.path().join("cases.json");
         std::fs::write(&path, body).unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn an_empty_sender_keeps_the_driver_default() {
+        assert_eq!(eval_author(&None, "U-eval"), "U-eval");
+        assert_eq!(eval_author(&Some(String::new()), "U-eval"), "U-eval");
+        assert_eq!(
+            eval_author(&Some("eval-sender-acme".into()), "U-eval"),
+            "eval-sender-acme"
+        );
+        assert_eq!(eval_author(&Some(String::new()), "U123"), "U123");
     }
 
     #[test]
