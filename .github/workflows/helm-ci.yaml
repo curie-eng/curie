@@ -1078,7 +1078,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Pull Docker Hub images through the mirror
-        run: bash tools/ci/configure-docker-hub-mirror.sh
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Install Helm
         id: install_helm
         continue-on-error: true
@@ -1096,7 +1096,7 @@ jobs:
         with:
           version: v3.17.3
       - name: Ensure kind-registry exists
-        run: bash tools/ci/ensure-kind-registry.sh
+        run: bash cli/scripts/ensure-kind-registry.sh
       - name: Create the kind cluster
         id: create_the_kind_cluster
         continue-on-error: true
@@ -1108,7 +1108,7 @@ jobs:
         if: steps.create_the_kind_cluster.outcome == 'failure'
         run: |
           echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
-          bash tools/ci/ensure-kind-registry.sh
+          bash cli/scripts/ensure-kind-registry.sh
           kind delete cluster --name curie-reserved-env 2>/dev/null || true
           sleep 15
       - name: Create the kind cluster (retry)

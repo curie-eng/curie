@@ -133,7 +133,7 @@ jobs:
       # code. Never wrap a step that builds, tests, or gates that code.
       # Enforced by tools/ci-retry-gate/tests/test_retry_eligibility.py.
       - name: Pull Docker Hub images through the mirror
-        run: bash tools/ci/configure-docker-hub-mirror.sh
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Install uv
         id: install_uv
         continue-on-error: true
@@ -706,7 +706,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Pull Docker Hub images through the mirror
-        run: bash tools/ci/configure-docker-hub-mirror.sh
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -948,7 +948,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Pull Docker Hub images through the mirror
-        run: bash tools/ci/configure-docker-hub-mirror.sh
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Generate the release compose
         run: python3 compose/generate_release_compose.py > compose.release.yaml
       # compose.release.yaml is generated from compose.dev.yaml (the single
@@ -1021,7 +1021,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Pull Docker Hub images through the mirror
-        run: bash tools/ci/configure-docker-hub-mirror.sh
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Set up a cache-only buildx builder (named, NOT the default -- preserves the overlay's FROM)
         id: imagescache
         continue-on-error: true
@@ -1172,7 +1172,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Pull Docker Hub images through the mirror
-        run: bash tools/ci/configure-docker-hub-mirror.sh
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Set up QEMU
         id: set_up_qemu
         continue-on-error: true
@@ -1663,7 +1663,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Pull Docker Hub images through the mirror
-        run: bash tools/ci/configure-docker-hub-mirror.sh
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Download the curie binary built by the Rust job
         uses: actions/download-artifact@v8
         with:
@@ -1833,7 +1833,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Pull Docker Hub images through the mirror
-        run: bash tools/ci/configure-docker-hub-mirror.sh
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Download the curie binary built by the Rust job
         uses: actions/download-artifact@v8
         with:
@@ -2053,7 +2053,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Pull Docker Hub images through the mirror
-        run: bash tools/ci/configure-docker-hub-mirror.sh
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Download the curie binary built by the Rust job
         uses: actions/download-artifact@v8
         with:
@@ -2130,7 +2130,7 @@ jobs:
       # node container sits on; its gateway is the host address the in-cluster
       # worker reaches the reply stub through, resolved below.
       - name: Ensure kind-registry exists
-        run: bash tools/ci/ensure-kind-registry.sh
+        run: bash cli/scripts/ensure-kind-registry.sh
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
@@ -2150,7 +2150,7 @@ jobs:
         run: |
           echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
           kind delete cluster --name curie-e2e 2>/dev/null || true
-          bash tools/ci/ensure-kind-registry.sh
+          bash cli/scripts/ensure-kind-registry.sh
           sleep 15
       - name: Create the kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
@@ -2387,7 +2387,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Pull Docker Hub images through the mirror
-        run: bash tools/ci/configure-docker-hub-mirror.sh
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Install Helm
         id: install_helm
         continue-on-error: true
@@ -2435,7 +2435,7 @@ jobs:
       # Disposable kind cluster. Pins both the action and the kind/node-image
       # versions.
       - name: Ensure kind-registry exists
-        run: bash tools/ci/ensure-kind-registry.sh
+        run: bash cli/scripts/ensure-kind-registry.sh
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
@@ -2455,7 +2455,7 @@ jobs:
         run: |
           echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
           kind delete cluster --name curie-e2e 2>/dev/null || true
-          bash tools/ci/ensure-kind-registry.sh
+          bash cli/scripts/ensure-kind-registry.sh
           sleep 15
       - name: Create the kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
@@ -2597,7 +2597,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Pull Docker Hub images through the mirror
-        run: bash tools/ci/configure-docker-hub-mirror.sh
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Download the curie binary built by the Rust job
         uses: actions/download-artifact@v8
         with:
@@ -2674,7 +2674,7 @@ jobs:
       # node container sits on; its gateway is the host address the in-cluster
       # worker reaches the reply stub through, resolved below.
       - name: Ensure kind-registry exists
-        run: bash tools/ci/ensure-kind-registry.sh
+        run: bash cli/scripts/ensure-kind-registry.sh
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
@@ -2694,7 +2694,7 @@ jobs:
         run: |
           echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
           kind delete cluster --name curie-e2e 2>/dev/null || true
-          bash tools/ci/ensure-kind-registry.sh
+          bash cli/scripts/ensure-kind-registry.sh
           sleep 15
       - name: Create the kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
@@ -2849,7 +2849,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Pull Docker Hub images through the mirror
-        run: bash tools/ci/configure-docker-hub-mirror.sh
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Download the candidate curie binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -2902,7 +2902,7 @@ jobs:
                   protocol: TCP
           EOF
       - name: Ensure kind-registry exists
-        run: bash tools/ci/ensure-kind-registry.sh
+        run: bash cli/scripts/ensure-kind-registry.sh
       - name: Create the disposable kind cluster
         id: create_the_disposable_kind_cluster
         continue-on-error: true
@@ -2916,7 +2916,7 @@ jobs:
         if: steps.create_the_disposable_kind_cluster.outcome == 'failure'
         run: |
           echo "Create the disposable kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
-          bash tools/ci/ensure-kind-registry.sh
+          bash cli/scripts/ensure-kind-registry.sh
           kind delete cluster --name curie-upgrade 2>/dev/null || true
           sleep 15
       - name: Create the disposable kind cluster (retry)
@@ -3272,7 +3272,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Pull Docker Hub images through the mirror
-        run: bash tools/ci/configure-docker-hub-mirror.sh
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Install Helm
         id: install_helm
         continue-on-error: true
@@ -3307,7 +3307,7 @@ jobs:
             - role: control-plane
           EOF
       - name: Ensure kind-registry exists
-        run: bash tools/ci/ensure-kind-registry.sh
+        run: bash cli/scripts/ensure-kind-registry.sh
       - name: Create the disposable kind cluster
         id: create_the_disposable_kind_cluster
         continue-on-error: true
@@ -3321,7 +3321,7 @@ jobs:
         if: steps.create_the_disposable_kind_cluster.outcome == 'failure'
         run: |
           echo "Create the disposable kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
-          bash tools/ci/ensure-kind-registry.sh
+          bash cli/scripts/ensure-kind-registry.sh
           kind delete cluster --name curie-upgrade-negative 2>/dev/null || true
           sleep 15
       - name: Create the disposable kind cluster (retry)
@@ -3501,7 +3501,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Pull Docker Hub images through the mirror
-        run: bash tools/ci/configure-docker-hub-mirror.sh
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Download the candidate curie binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -3554,7 +3554,7 @@ jobs:
                   protocol: TCP
           EOF
       - name: Ensure kind-registry exists
-        run: bash tools/ci/ensure-kind-registry.sh
+        run: bash cli/scripts/ensure-kind-registry.sh
       - name: Create the disposable kind cluster
         id: create_kind_cluster
         continue-on-error: true
@@ -3569,7 +3569,7 @@ jobs:
         run: |
           echo "Create the disposable kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
           kind delete cluster --name curie-upgrade-matrix 2>/dev/null || true
-          bash tools/ci/ensure-kind-registry.sh
+          bash cli/scripts/ensure-kind-registry.sh
           sleep 15
       - name: Create the disposable kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'

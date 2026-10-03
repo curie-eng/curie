@@ -23,8 +23,8 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 SCOPED = ("ci.yaml", "helm-ci.yaml")
-ENSURE_SCRIPT = REPO_ROOT / "tools" / "ci" / "ensure-kind-registry.sh"
-MIRROR_SCRIPT = REPO_ROOT / "tools" / "ci" / "configure-docker-hub-mirror.sh"
+ENSURE_SCRIPT = REPO_ROOT / "cli" / "scripts" / "ensure-kind-registry.sh"
+MIRROR_SCRIPT = REPO_ROOT / "cli" / "scripts" / "configure-docker-hub-mirror.sh"
 
 # Third-party acquisition actions #3866 requires a trio for, in these two files.
 REQUIRED_ACTIONS = frozenset(
@@ -173,11 +173,12 @@ def test_kind_creation_recreates_a_missing_kind_registry() -> None:
                     None,
                 )
                 label = name or "<unnamed>"
-                ensured = any("tools/ci/ensure-kind-registry.sh" in _run(item) for item in earlier)
+                script = "cli/scripts/ensure-kind-registry.sh"
+                ensured = any(script in _run(item) for item in earlier)
                 if not ensured:
                     gaps.append(f"{filename} :: {job_id} :: {label} has no ensure step before it")
                 backoff_body = _run(backoff) if isinstance(backoff, dict) else ""
-                if "tools/ci/ensure-kind-registry.sh" not in backoff_body:
+                if script not in backoff_body:
                     gaps.append(f"{filename} :: {job_id} :: {label} backoff skips the registry")
     assert not gaps, "\n  ".join(gaps)
 
@@ -211,7 +212,7 @@ def test_docker_hub_pulls_go_through_the_mirror() -> None:
         for job_id, steps in _jobs(filename):
             if _job_pulls_docker_hub(steps):
                 if not any(
-                    "tools/ci/configure-docker-hub-mirror.sh" in _run(step)
+                    "cli/scripts/configure-docker-hub-mirror.sh" in _run(step)
                     for step in steps
                     if isinstance(step, dict)
                 ):
