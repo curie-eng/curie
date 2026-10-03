@@ -1843,6 +1843,43 @@ class ScheduleControl(Base):
     generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
 
 
+class HookSourcePolicy(Base):
+    """@spec PROTECTED-HOOK-SOURCE-1."""
+
+    __tablename__ = "hook_source_policies"
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="hook_source_policies_generation_ck"),
+        CheckConstraint(
+            "mode IN ('protected', 'ordinary')", name="hook_source_policies_mode_ck"
+        ),
+        CheckConstraint(
+            "(mode = 'protected' AND tool_access IS NOT NULL "
+            "AND tool_access = 'read-only' AND runtime_id IS NOT NULL "
+            "AND qualification_id IS NOT NULL AND bundle_digest IS NOT NULL) "
+            "OR (mode = 'ordinary' AND tool_access IS NULL AND runtime_id IS NULL "
+            "AND qualification_id IS NULL AND bundle_digest IS NULL)",
+            name="hook_source_policies_policy_ck",
+        ),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    hook: Mapped[str] = mapped_column(String(63), primary_key=True)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    operation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    mode: Mapped[str] = mapped_column(String, nullable=False)
+    tool_access: Mapped[str | None] = mapped_column(String, nullable=True)
+    runtime_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    qualification_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    bundle_digest: Mapped[str | None] = mapped_column(String, nullable=True)
+    legacy_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class HookRun(Base):
     """One claimed trigger slot for an agent version."""
 

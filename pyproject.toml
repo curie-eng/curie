@@ -6,6 +6,7 @@ requires-python = ">=3.13"
 dependencies = [
     "aci-protocol",
     "curie-channel-protocol",
+    "curie-protected-hooks",
     "curie-telemetry-schema",
     "plugin-format",
     "curie-api",
@@ -25,6 +26,7 @@ package = false
 members = [
     "packages/aci-protocol",
     "packages/channel-protocol",
+    "packages/protected-hooks",
     "packages/plugin-format",
     "packages/telemetry-schema",
     "packages/test-support",
@@ -43,6 +45,7 @@ members = [
 [tool.uv.sources]
 aci-protocol = { workspace = true }
 curie-channel-protocol = { workspace = true }
+curie-protected-hooks = { workspace = true }
 curie-telemetry-schema = { workspace = true }
 plugin-format = { workspace = true }
 curie-test-support = { workspace = true }
@@ -83,6 +86,7 @@ dev = [
 # the boundaries that are ALREADY clean, so they cannot rot back before that
 # lands, and the third contract is added when it does.
 root_packages = [
+    "curie_protected_hooks",
     "curie_api",
     "curie_worker",
     "curie_connector_proxy",
@@ -102,6 +106,13 @@ root_packages = [
 # Required for the contracts below: `claude_agent_sdk` is an EXTERNAL package, and
 # import-linter only tracks imports that leave the root packages when told to.
 include_external_packages = true
+
+# @spec PROTECTED-HOOK-LANE-1: internal transport has no application/SDK authority.
+[[tool.importlinter.contracts]]
+name = "Protected hook primitives stay independent of applications and harnesses"
+type = "forbidden"
+source_modules = ["curie_protected_hooks"]
+forbidden_modules = ["curie_api", "curie_worker", "curie_runner", "claude_agent_sdk"]
 
 [[tool.importlinter.contracts]]
 # Telemetry attribute names are shared schema, not an application or harness
@@ -205,6 +216,8 @@ testpaths = [
     # (#2093).
     "examples/sre-bot/connectors",
     "tools/doclint/tests",
+    # @spec PROTECTED-HOOK-LANE-2
+    "packages/protected-hooks/tests",
     "tools/wire-tolerance-gate/tests",
     "tools/ci-retry-gate/tests",
     "tools/ci-workflow-paths/tests",
@@ -254,6 +267,7 @@ explicit_package_bases = true
 mypy_path = [
     "packages/aci-protocol/src",
     "packages/channel-protocol/src",
+    "packages/protected-hooks/src",
     "packages/plugin-format/src",
     "packages/telemetry-schema/src",
     "packages/test-support/src",
@@ -271,6 +285,7 @@ mypy_path = [
 files = [
     "packages/aci-protocol/src",
     "packages/channel-protocol/src",
+    "packages/protected-hooks/src",
     "packages/plugin-format/src",
     "packages/telemetry-schema/src",
     "packages/test-support/src",
