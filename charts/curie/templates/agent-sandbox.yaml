@@ -244,8 +244,16 @@ spec:
       {{- end }}
       {{- if $runner.serviceAccount.create }}
       serviceAccountName: {{ include "curie.fullname" . }}-runner
-      automountServiceAccountToken: {{ $runner.serviceAccount.automountToken }}
       {{- end }}
+      {{- /* Rail 2 (#3842): the runner never calls the Kubernetes API, so no
+             template mounts a ServiceAccount token, whichever SA it runs as.
+             The runner-resources admission policy requires this on every
+             template the worker writes; any other value of the knob is
+             refused here rather than silently ignored. */}}
+      {{- if ne (toString $runner.serviceAccount.automountToken) "false" }}
+      {{- fail (printf "agentSandbox.runner.serviceAccount.automountToken must be false (Rail 2: the runner pod never mounts a Kubernetes API token, and runner template admission refuses one); got %q" (toString $runner.serviceAccount.automountToken)) }}
+      {{- end }}
+      automountServiceAccountToken: false
       {{- with .Values.priorityClasses.sandbox.name }}
       priorityClassName: {{ . }}
       {{- end }}

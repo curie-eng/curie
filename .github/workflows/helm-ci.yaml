@@ -408,6 +408,16 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/gvisor-runtime-class-assertions.sh
 
+      # Prove the worker's runner template writes are admitted only in the
+      # chart's shape: one admission rule per host escape, token mount, SA swap
+      # and image swap, an image allowlist equal to the rendered templates,
+      # label-scoped cleanup and Secret policies, and no runner role ARN shared
+      # with a read/write chart identity (#3842).
+      - name: helm render assertions (runner template admission)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/runner-template-admission-assertions.sh
+
       # Keep the chart ClickHouse default and Langfuse pin as one supported
       # pair. ClickHouse 24.8 cannot apply Langfuse 3.225.x migration 39, so
       # the default must stay on 25.12 and AVX-required (#2210).

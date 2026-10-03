@@ -2183,36 +2183,49 @@ securityContext:
 {{- end -}}
 {{/*
 Render the runner-sandbox egress rules for a list of {cidr, ports, except?}
-entries. The dot IS the entry list, and the caller supplies the indentation:
+entries. The argument is a dict: `entries` is the entry list and `root` is the
+chart context (read for security.networkPolicy.clusterCidrs). The caller
+supplies the indentation:
 
-    {{- include "curie.egress.ipBlockRules" .Values.api.egress | trim | nindent 4 }}
+    {{- include "curie.egress.ipBlockRules" (dict "entries" .Values.api.egress "root" $) | trim | nindent 4 }}
 
-Every ipBlock peer rail 1 renders goes through here, so the metadata carve-out
-is stated ONCE. That carve-out is the security invariant: NetworkPolicy allows
-are additive, so an entry broad enough to contain 169.254.169.254 re-permits the
-cloud metadata endpoint rail 1 otherwise denies. An explicit per-entry `except:`
-list wins (an empty one is refused before render by
-curie.objectStore.egressEntry, because it would drop the carve-out); otherwise
-curie.metadataExcept returns a comma-separated list of same-family, subset-safe
-carve-outs for ANY CIDR that contains a metadata address -- not just an exact /0
--- rendered one except line per item, and "" for CIDRs that cannot reach one. See that helper for the containment/family rules.
+Inside this helper `$` is that wrapper dict, not the chart context, so the root
+is captured from `.root` once, before the range rebinds the dot.
+
+Every ipBlock peer rail 1 renders goes through here, so the carve-outs are
+stated ONCE. They are the security invariant: NetworkPolicy allows are
+additive, so an entry broad enough to contain 169.254.169.254 or a private range
+re-permits what rail 1 otherwise denies. Per entry the except list is the
+explicit per-entry `except:` when set (an empty one is refused before render by
+curie.objectStore.egressEntry, because it would drop the carve-out), else
+curie.metadataExcept (same-family, subset-safe metadata carve-outs for ANY CIDR
+that contains a metadata address, not just an exact /0); then every
+curie.privateExcept range (private, link-local, CGNAT, ULA and
+security.networkPolicy.clusterCidrs ranges the CIDR strictly contains, #3842)
+not already listed is appended. A narrow entry equal to or inside a private
+range gets no private except, which is the re-allow path for a private peer.
+See those helpers for the containment/family rules.
 */}}
 {{- define "curie.egress.ipBlockRules" -}}
-{{- range . }}
+{{- $root := .root }}
+{{- range .entries }}
 - to:
     - ipBlock:
         cidr: {{ .cidr }}
+        {{- $excepts := list }}
         {{- if .except }}
-        except:
-          {{- toYaml .except | nindent 10 }}
+        {{- $excepts = .except }}
         {{- else }}
-        {{- $auto := include "curie.metadataExcept" .cidr | trim }}
-        {{- if $auto }}
-        except:
-          {{- range splitList "," $auto }}
-          - {{ . }}
-          {{- end }}
+        {{- $excepts = without (splitList "," (include "curie.metadataExcept" .cidr | trim)) "" }}
         {{- end }}
+        {{- range without (splitList "," (include "curie.privateExcept" (dict "cidr" .cidr "root" $root) | trim)) "" }}
+        {{- if not (has . $excepts) }}
+        {{- $excepts = append $excepts . }}
+        {{- end }}
+        {{- end }}
+        {{- if $excepts }}
+        except:
+          {{- toYaml $excepts | nindent 10 }}
         {{- end }}
   {{- with .ports }}
   ports:

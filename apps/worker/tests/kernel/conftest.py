@@ -449,6 +449,7 @@ class FakeK8s:
     unschedulable_message: str | None = None
     termination: Any | None = None
     termination_queries: list[str] = field(default_factory=list)
+    template_reaps: list[tuple[set[str], datetime]] = field(default_factory=list)
     # OPT-IN per-sandbox runner ports, pre-started by the harness fixture (see
     # ``per_sandbox_runners``). Empty (the default) is the shared-runner world
     # every existing test lives in: every sandbox gets ``port=None`` and dials
@@ -550,6 +551,10 @@ class FakeK8s:
                 assert view is not None
                 out.append(view)
         return out
+
+    def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
+        self.template_reaps.append((set(keep), created_before))
+        return []
 
     def get_sandbox(
         self, name: str, *, request_timeout_seconds: float

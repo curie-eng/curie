@@ -60,15 +60,32 @@ rules:
     resources: ["resourcequotas"]
     verbs: ["get"]
   {{- if .Values.agentSandbox.deploy }}
-  # Per-agent runner resources (#3209). get reads the chart template. create
-  # and patch write only the worker-owned copy. list and delete stay absent.
-  # The ValidatingAdmissionPolicy in runner-resources-admission.yaml is rendered
-  # on the same condition and refuses any name that is not that copy, so this
-  # grant cannot rewrite the shared template. Kubernetes older than 1.30 fails
-  # that template, which fails this render before the grant is installed.
+  # Per-agent runner resources (#3209) and per-claim token templates (#3842).
+  # get reads the chart template and the source warm pool. create and patch
+  # write only worker-owned copies. Templates also need delete (rollback of a
+  # half-built per-claim set) and list (the reaper sweep of per-claim templates
+  # whose claim is gone); warm pools are never listed or deleted by the worker,
+  # because Kubernetes GC removes a per-claim pool with its template.
+  # The ValidatingAdmissionPolicies in runner-resources-admission.yaml render on
+  # the same condition: they refuse any name that is not a worker-owned copy,
+  # any template shape the chart does not render, and any delete of a template
+  # without the curietech.ai/sandbox-claim label, so this grant cannot rewrite
+  # or remove the shared template. Kubernetes older than 1.30 fails that
+  # template, which fails this render before the grant is installed.
   - apiGroups: ["extensions.agents.x-k8s.io"]
-    resources: ["sandboxtemplates", "sandboxwarmpools"]
+    resources: ["sandboxtemplates"]
+    verbs: ["get", "create", "patch", "list", "delete"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxwarmpools"]
     verbs: ["get", "create", "patch"]
+  # Per-claim token Secret (#3842): the claim's scoped tokens reach the runner
+  # by secretKeyRef instead of riding the SandboxClaim spec. create only; no
+  # get, list, or watch, so this grant cannot read any Secret back. The
+  # worker-secrets admission policy admits only an Opaque `*-tokens` Secret
+  # carrying curietech.ai/sandbox-claim in this namespace.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
   {{- end }}
   # The worker reads the exact sandbox pod for capacity and stream failure
   # diagnosis. It lists only events for that named pod after a stream drop.

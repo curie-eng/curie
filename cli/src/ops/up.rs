@@ -8103,6 +8103,28 @@ mod tests {
             "the conflict guard matches the key trimmed on both ends"
         );
     }
+
+    #[test]
+    fn namespace_manifest_carries_pod_security_labels_and_ownership_labels() {
+        let bytes = namespace_manifest("curie-ns", "curie-rel").expect("manifest serializes");
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("manifest is JSON");
+        let labels = &doc["metadata"]["labels"];
+        assert_eq!(
+            labels["pod-security.kubernetes.io/enforce"], "baseline",
+            "the release namespace enforces baseline"
+        );
+        assert_eq!(
+            labels["pod-security.kubernetes.io/warn"], "restricted",
+            "the release namespace warns on restricted violations"
+        );
+        assert_eq!(
+            labels["pod-security.kubernetes.io/audit"], "restricted",
+            "the release namespace audits restricted violations"
+        );
+        // Liveness: the ownership labels the `down` sweep keys on survive.
+        assert_eq!(labels[CREATED_BY_LABEL], "curie-rel");
+        assert_eq!(labels[CREATED_IN_LABEL], "curie-ns");
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -8489,12 +8511,20 @@ fn namespace_inventory_cmd(namespace: &str, resource: &str) -> OpsCommand {
 }
 
 fn namespace_manifest(namespace: &str, release: &str) -> Result<Vec<u8>> {
+    let mut labels = ownership_labels(release, namespace);
+    // Every chart workload passes `baseline`, so it is enforced. Several
+    // (clickhouse, postgres, valkey, some Jobs, the prewarm DaemonSet) still
+    // fail `restricted`, so that level is warn and audit only: it surfaces
+    // violations without rejecting pods.
+    labels["pod-security.kubernetes.io/enforce"] = "baseline".into();
+    labels["pod-security.kubernetes.io/warn"] = "restricted".into();
+    labels["pod-security.kubernetes.io/audit"] = "restricted".into();
     serde_json::to_vec(&serde_json::json!({
         "apiVersion": "v1",
         "kind": "Namespace",
         "metadata": {
             "name": namespace,
-            "labels": ownership_labels(release, namespace),
+            "labels": labels,
         },
     }))
     .context("serializing the owned Namespace manifest")

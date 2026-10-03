@@ -480,7 +480,12 @@ spec:
               # carve-out: a broad allow (the realistic model-API 0.0.0.0/0 case) must
               # reach the internet yet keep the metadata endpoint blocked via `except`.
               # Mirrors exactly what the chart renders for allowedEgress:[{cidr:0.0.0.0/0}]
-              # (issue #70: a broad allow must not silently re-open IMDS).
+              # (issue #70: a broad allow must not silently re-open IMDS), including the
+              # private-range excepts curie.privateExcept appends (#3842; any
+              # security.networkPolicy.clusterCidrs entries are not mirrored here). No
+              # private-range leg: NetworkPolicy permits pod-to-own-node traffic, so a
+              # node or API address proves nothing; scripts/check-runner-byo-egress.sh
+              # proves the private except against a controlled pod peer instead.
               echo ""
               echo "== Claim 1b: metadata blocked under a broad 0.0.0.0/0 allowlist =="
               kubectl run "$EGRESS_POD" -n "$NS" --image="$NETSHOOT" --restart=Never \
@@ -504,6 +509,10 @@ spec:
                           cidr: 0.0.0.0/0
                           except:
                             - 169.254.0.0/16
+                            - 10.0.0.0/8
+                            - 100.64.0.0/10
+                            - 172.16.0.0/12
+                            - 192.168.0.0/16
               EOF
               sleep 5
               broad_ext=$(classify "$(probe_rc "https://${BLOCKED}/")")

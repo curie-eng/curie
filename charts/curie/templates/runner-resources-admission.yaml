@@ -6,6 +6,41 @@
 {{- $fullname := include "curie.fullname" . }}
 {{- $workerSA := printf "%s-worker" $fullname }}
 {{- $gvisorClass := include "curie.gvisor.runtimeClassName" . | trim }}
+{{- $runner := .Values.agentSandbox.runner }}
+{{- /* #3842: the ServiceAccount every runner template must run as. Empty when
+       the chart does not create one, so the pod uses the namespace default. */}}
+{{- $runnerSA := "" }}
+{{- if $runner.serviceAccount.create }}
+{{- $runnerSA = printf "%s-runner" $fullname }}
+{{- end }}
+{{- /* #3842: the image allowlist is exactly what templates/agent-sandbox.yaml
+       renders into a runner template: the runner ref (also used by
+       workspace-init and attachments-init), each per-agent runnerImages
+       digest, and the bundle-fetch pair when enabled. extraImages adds images
+       an operator lets the worker write beyond those. Every entry is embedded
+       in CEL as a single-quoted literal, so each must match a CEL-safe image
+       reference pattern or the render fails naming its key. */}}
+{{- $celSafeImage := "^[A-Za-z0-9][A-Za-z0-9._/:@-]*$" }}
+{{- $imageSources := list (dict "key" "agentSandbox.runner.image" "ref" (include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion))) }}
+{{- range $agent, $ref := .Values.agentSandbox.runnerImages | default dict }}
+{{- $imageSources = append $imageSources (dict "key" (printf "agentSandbox.runnerImages.%s" $agent) "ref" (toString $ref)) }}
+{{- end }}
+{{- if $runner.bundleFetch.enabled }}
+{{- $imageSources = append $imageSources (dict "key" "agentSandbox.runner.bundleFetch.fetchImage" "ref" (toString $runner.bundleFetch.fetchImage)) }}
+{{- $imageSources = append $imageSources (dict "key" "agentSandbox.runner.bundleFetch.extractImage" "ref" (toString $runner.bundleFetch.extractImage)) }}
+{{- end }}
+{{- range $extra := dig "admission" "extraImages" (list) $runner }}
+{{- $imageSources = append $imageSources (dict "key" "agentSandbox.runner.admission.extraImages" "ref" (toString $extra)) }}
+{{- end }}
+{{- $allowedImages := list }}
+{{- range $source := $imageSources }}
+{{- if not (regexMatch $celSafeImage $source.ref) }}
+{{- fail (printf "%s entry %q is not an image reference the runner admission policy can embed (must match %s)" $source.key $source.ref $celSafeImage) }}
+{{- end }}
+{{- $allowedImages = append $allowedImages (printf "'%s'" $source.ref) }}
+{{- end }}
+{{- $imageList := printf "[%s]" (join ", " ($allowedImages | uniq)) }}
+{{- $pod := "object.spec.podTemplate.spec" }}
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -78,6 +113,28 @@ spec:
     - expression: {{ printf "request.resource.resource != 'sandboxtemplates' || object.spec.podTemplate.spec.runtimeClassName == '%s'" $gvisorClass | quote }}
       message: runner resource templates must keep the chart RuntimeClass
     {{- end }}
+    {{- /* #3842: the worker writes per-claim template copies, so every template
+           it writes is held to the shape the chart renders. A compromised
+           worker must not reach the node through a host volume, a host
+           namespace, a privileged container, a mounted API token, another
+           ServiceAccount, or an image the chart never renders. */}}
+    - expression: {{ printf "request.resource.resource != 'sandboxtemplates' || !has(%[1]s.volumes) || %[1]s.volumes.all(v, !has(v.hostPath))" $pod | quote }}
+      message: runner templates must not mount a hostPath volume
+    - expression: {{ printf "request.resource.resource != 'sandboxtemplates' || ((!has(%[1]s.hostNetwork) || !%[1]s.hostNetwork) && (!has(%[1]s.hostPID) || !%[1]s.hostPID) && (!has(%[1]s.hostIPC) || !%[1]s.hostIPC))" $pod | quote }}
+      message: runner templates must not share the host network, PID, or IPC namespace
+    - expression: {{ printf "request.resource.resource != 'sandboxtemplates' || (has(%[1]s.automountServiceAccountToken) && %[1]s.automountServiceAccountToken == false && (!has(%[1]s.volumes) || %[1]s.volumes.all(v, !has(v.projected) || !has(v.projected.sources) || v.projected.sources.all(p, !has(p.serviceAccountToken)))))" $pod | quote }}
+      message: runner templates must not mount a ServiceAccount token
+    {{- if $runnerSA }}
+    - expression: {{ printf "request.resource.resource != 'sandboxtemplates' || (has(%[1]s.serviceAccountName) && %[1]s.serviceAccountName == '%[2]s')" $pod $runnerSA | quote }}
+    {{- else }}
+    - expression: {{ printf "request.resource.resource != 'sandboxtemplates' || !has(%[1]s.serviceAccountName) || %[1]s.serviceAccountName == 'default'" $pod | quote }}
+    {{- end }}
+      message: runner templates must run as the chart runner ServiceAccount
+    - expression: {{ printf "request.resource.resource != 'sandboxtemplates' || (%[1]s.containers.all(c, c.image in %[2]s) && (!has(%[1]s.initContainers) || %[1]s.initContainers.all(c, c.image in %[2]s)))" $pod $imageList | quote }}
+      message: runner templates may run only the images the chart renders or agentSandbox.runner.admission.extraImages lists
+    {{- $hostSafe := "(!has(c.securityContext) || ((!has(c.securityContext.privileged) || !c.securityContext.privileged) && (!has(c.securityContext.capabilities) || !has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0))) && (!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))" }}
+    - expression: {{ printf "request.resource.resource != 'sandboxtemplates' || (%[1]s.containers.all(c, %[2]s) && (!has(%[1]s.initContainers) || %[1]s.initContainers.all(c, %[2]s)))" $pod $hostSafe | quote }}
+      message: runner templates must not run privileged, add capabilities, or bind a host port
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -88,5 +145,89 @@ metadata:
     app.kubernetes.io/component: worker
 spec:
   policyName: {{ $fullname }}-runner-resources
+  validationActions: ["Deny"]
+---
+{{- /* #3842: the worker may delete a SandboxTemplate (per-claim rollback and
+       the reaper sweep) only when the stored object carries the per-claim
+       label, so it can never remove a chart-rendered template. */}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $fullname }}-runner-claim-cleanup
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["extensions.agents.x-k8s.io"]
+        apiVersions: ["v1beta1"]
+        operations: ["DELETE"]
+        resources: ["sandboxtemplates"]
+  matchConditions:
+    - name: worker-service-account
+      expression: {{ printf "request.userInfo.username == 'system:serviceaccount:%s:%s'" .Release.Namespace $workerSA | quote }}
+  validations:
+    - expression: >-
+        has(oldObject.metadata.labels) &&
+        'curietech.ai/sandbox-claim' in oldObject.metadata.labels
+      message: the worker may delete only per-claim runner templates labelled curietech.ai/sandbox-claim
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $fullname }}-runner-claim-cleanup
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  policyName: {{ $fullname }}-runner-claim-cleanup
+  validationActions: ["Deny"]
+---
+{{- /* #3842: the worker's Secret create exists only for the per-claim token
+       Secret. Admit exactly that shape: the claim label, a -tokens name, and
+       Opaque, which refuses minting a kubernetes.io/service-account-token
+       Secret for another ServiceAccount. Scoped to the release namespace by
+       namespaceSelector: the same worker identity also creates publication
+       Secrets in the publication namespace, which this policy must not see. */}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $fullname }}-worker-secrets
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace | quote }}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["secrets"]
+  matchConditions:
+    - name: worker-service-account
+      expression: {{ printf "request.userInfo.username == 'system:serviceaccount:%s:%s'" .Release.Namespace $workerSA | quote }}
+  validations:
+    - expression: >-
+        has(object.metadata.labels) &&
+        'curietech.ai/sandbox-claim' in object.metadata.labels &&
+        object.metadata.name.endsWith('-tokens') &&
+        (!has(object.type) || object.type == 'Opaque')
+      message: the worker may create only Opaque per-claim -tokens Secrets labelled curietech.ai/sandbox-claim
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $fullname }}-worker-secrets
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  policyName: {{ $fullname }}-worker-secrets
   validationActions: ["Deny"]
 {{- end }}
