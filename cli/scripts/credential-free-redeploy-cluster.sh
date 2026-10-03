@@ -52,7 +52,7 @@ kubectl -n "$NAMESPACE" rollout status deploy/curie-api --timeout=300s
 kubectl -n "$NAMESPACE" rollout status deploy/curie-worker --timeout=300s
 
 api_key="$(kubectl -n "$NAMESPACE" get secret "${RELEASE}-secrets" -o jsonpath='{.data.apiKey}' | base64 -d)"
-kubectl -n "$NAMESPACE" port-forward "svc/${RELEASE}-api" 127.0.0.1:18080:8000 >/dev/null &
+kubectl -n "$NAMESPACE" port-forward --address 127.0.0.1 "svc/${RELEASE}-api" 18080:8000 >/dev/null &
 pf_pid=$!
 ready=0
 for _ in $(seq 1 30); do
