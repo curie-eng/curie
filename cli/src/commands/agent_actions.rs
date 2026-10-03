@@ -752,18 +752,45 @@ pub fn memory_add_fresh_session_line(message_verb: &str) -> String {
     )
 }
 
-/// Output of `<tier> memory <agent>`: the dry-run plan, the empty case, the
-/// learned-memory list, or an operator-seeded add (#1904). Owns its data so it
-/// outlives the `ApiClient`.
+/// The exact channel pair owning a memory fact.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryChannel {
+    pub kind: String,
+    pub address: String,
+}
+
+impl MemoryChannel {
+    fn pair(&self) -> (&str, &str) {
+        (&self.kind, &self.address)
+    }
+}
+
+/// An individual fact with the attribution stored by its producer.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryFact {
+    pub id: String,
+    pub scope: String,
+    pub channel: Option<MemoryChannel>,
+    pub statement: String,
+    pub author: String,
+    pub stated_at: String,
+}
+
+/// Output of `<tier> memory <agent>`: a plan, log and fact listing, deletion,
+/// or an operator seeded add. Owns its data so it outlives the `ApiClient`.
 #[derive(Debug)]
 pub enum MemoryOutput {
     DryRun(crate::ui::DryRunPlan),
-    Empty {
-        agent: String,
-    },
     List {
         agent: String,
         entries: Vec<crate::api::MemoryEntry>,
+        facts: Vec<MemoryFact>,
+    },
+    Deleted {
+        agent: String,
+        id: String,
+        scope: String,
+        channel: Option<MemoryChannel>,
     },
     Added {
         agent: String,
@@ -779,16 +806,29 @@ impl crate::ui::CliOutput for MemoryOutput {
     fn to_json(&self) -> serde_json::Value {
         match self {
             MemoryOutput::DryRun(plan) => plan.to_json(),
-            MemoryOutput::Empty { agent } => {
-                serde_json::json!({"agent": agent, "entries": []})
-            }
-            MemoryOutput::List { agent, entries } => {
+            MemoryOutput::List {
+                agent,
+                entries,
+                facts,
+            } => {
                 let entries: Vec<serde_json::Value> = entries
                     .iter()
                     .map(|e| serde_json::json!({"index": e.index, "content": e.content}))
                     .collect();
-                serde_json::json!({"agent": agent, "entries": entries})
+                serde_json::json!({"agent": agent, "entries": entries, "facts": facts})
             }
+            MemoryOutput::Deleted {
+                agent,
+                id,
+                scope,
+                channel,
+            } => serde_json::json!({
+                "agent": agent,
+                "id": id,
+                "scope": scope,
+                "channel": channel,
+                "deleted": true,
+            }),
             MemoryOutput::Added {
                 agent,
                 index,
@@ -810,14 +850,39 @@ impl crate::ui::CliOutput for MemoryOutput {
     fn render(&self, ui: &crate::ui::Ui) {
         match self {
             MemoryOutput::DryRun(plan) => plan.render(ui),
-            MemoryOutput::Empty { agent } => {
-                ui.payload(&format!("{agent} has no learned memory yet"));
-            }
-            MemoryOutput::List { agent, entries } => {
-                ui.payload(&format!("{agent} — {} memory entr(ies):", entries.len()));
+            MemoryOutput::List {
+                agent,
+                entries,
+                facts,
+            } => {
+                if entries.is_empty() && facts.is_empty() {
+                    ui.payload(&format!("{agent} has no learned memory yet"));
+                    return;
+                }
+                ui.payload(&format!(
+                    "{agent}: {} memory log entries and {} facts:",
+                    entries.len(),
+                    facts.len()
+                ));
                 for e in entries {
                     ui.kv(&format!("#{}", e.index), &e.content);
                 }
+                for fact in facts {
+                    let scope = memory_scope_label(fact.channel.as_ref());
+                    let date = fact.stated_at.split('T').next().unwrap_or(&fact.stated_at);
+                    ui.payload(&format!(
+                        "{} ({scope}): {} on {date} stated: {}",
+                        fact.id, fact.author, fact.statement
+                    ));
+                }
+            }
+            MemoryOutput::Deleted {
+                agent, id, channel, ..
+            } => {
+                ui.payload(&format!(
+                    "{agent}: deleted fact {id} from {} memory",
+                    memory_scope_label(channel.as_ref())
+                ));
             }
             MemoryOutput::Added {
                 agent,
@@ -827,7 +892,7 @@ impl crate::ui::CliOutput for MemoryOutput {
                 fresh_session_required,
                 message_verb,
             } => {
-                ui.payload(&format!("{agent} — added memory #{index} ({source})"));
+                ui.payload(&format!("{agent}: added memory #{index} ({source})"));
                 ui.kv("content", content);
                 if *fresh_session_required {
                     ui.payload(memory_add_fresh_session_required_line());
@@ -838,25 +903,207 @@ impl crate::ui::CliOutput for MemoryOutput {
     }
 }
 
-/// `<tier> memory <agent>`: show what the agent has learned (its memory log).
-pub async fn memory(opts: AgentActionOpts) -> Result<MemoryOutput> {
+fn memory_scope_label(channel: Option<&MemoryChannel>) -> String {
+    match channel {
+        Some(channel) => format!("channel {}={}", channel.kind, channel.address),
+        None => "agent".to_string(),
+    }
+}
+
+fn is_memory_fact_id(id: &str) -> bool {
+    id.len() == 37
+        && id.starts_with("fact-")
+        && id.as_bytes()[5..]
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn memory_channel(channel: Option<String>) -> Result<Option<MemoryChannel>> {
+    channel
+        .map(|selection| {
+            let (kind, address) = selection.split_once('=').ok_or_else(|| {
+                crate::exit::usage("channel must be KIND=ADDRESS for an exact bound pair")
+            })?;
+            if kind.is_empty() || address.is_empty() || selection.chars().any(char::is_whitespace) {
+                return Err(crate::exit::usage(
+                    "channel must have a nonempty kind and address without whitespace",
+                ));
+            }
+            Ok(MemoryChannel {
+                kind: kind.to_string(),
+                address: address.to_string(),
+            })
+        })
+        .transpose()
+}
+
+fn require_memory_channel(agent: &crate::api::Agent, channel: &MemoryChannel) -> Result<()> {
+    if !agent
+        .channels
+        .iter()
+        .any(|binding| binding.kind == channel.kind && binding.address == channel.address)
+    {
+        return Err(crate::exit::usage(format!(
+            "channel {}={} is not bound to agent {:?}",
+            channel.kind, channel.address, agent.name
+        )));
+    }
+    Ok(())
+}
+
+fn memory_plan_url(
+    api_url: &str,
+    channel: Option<(&str, &str)>,
+    id: Option<&str>,
+) -> Result<String> {
+    let url = crate::api::memory_state_url(api_url, "<id>", channel, id)?;
+    Ok(url
+        .as_str()
+        .replacen("/agents/%3Cid%3E/state", "/agents/<id>/state", 1))
+}
+
+async fn read_memory_facts(
+    client: &ApiClient,
+    agent_id: &str,
+    channel: Option<&MemoryChannel>,
+) -> Result<Vec<MemoryFact>> {
+    let rows = client
+        .list_memory_facts(agent_id, channel.map(MemoryChannel::pair))
+        .await?;
+    rows.into_iter()
+        .filter(|row| is_memory_fact_id(&row.key))
+        .map(|row| {
+            let field = |name: &str| -> Result<String> {
+                row.value
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "memory fact {} in {} memory has malformed {name}: expected a nonempty stored string",
+                            row.key,
+                            memory_scope_label(channel)
+                        )
+                    })
+            };
+            Ok(MemoryFact {
+                id: row.key.clone(),
+                scope: if channel.is_some() { "channel" } else { "agent" }.to_string(),
+                channel: channel.cloned(),
+                statement: field("statement")?,
+                author: field("author")?,
+                stated_at: field("stated_at")?,
+            })
+        })
+        .collect()
+}
+
+/// List the retained memory log and agent and bound channel facts. A channel
+/// selection reads only that binding's fact namespace.
+pub async fn memory(opts: AgentActionOpts, channel: Option<String>) -> Result<MemoryOutput> {
+    let channel = memory_channel(channel)?;
     if opts.dry_run {
+        let lines = if let Some(channel) = &channel {
+            vec![format!(
+                "GET {}  (would resolve agent {:?} and verify the bound channel first)",
+                memory_plan_url(&opts.api_url, Some(channel.pair()), None)?,
+                opts.agent
+            )]
+        } else {
+            vec![
+                format!(
+                    "GET {}/agents/<id>/memory  (would resolve agent {:?} first)",
+                    opts.api_url.trim_end_matches('/'),
+                    opts.agent
+                ),
+                format!("GET {}", memory_plan_url(&opts.api_url, None, None)?),
+                format!(
+                    "GET {}/agents/<id>/state/bindings/<kind>/<address>/memory  (for every distinct bound kind and address pair)",
+                    opts.api_url.trim_end_matches('/')
+                ),
+            ]
+        };
+        return Ok(MemoryOutput::DryRun(crate::ui::DryRunPlan { lines }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let (entries, facts) = if let Some(channel) = &channel {
+        require_memory_channel(&agent, channel)?;
+        (
+            vec![],
+            read_memory_facts(&client, &agent.id, Some(channel)).await?,
+        )
+    } else {
+        let entries = client.list_memory(&agent.id).await?;
+        let mut facts = read_memory_facts(&client, &agent.id, None).await?;
+        let channels: BTreeSet<_> = agent
+            .channels
+            .iter()
+            .map(|binding| (binding.kind.clone(), binding.address.clone()))
+            .collect();
+        for (kind, address) in channels {
+            let channel = MemoryChannel { kind, address };
+            facts.extend(read_memory_facts(&client, &agent.id, Some(&channel)).await?);
+        }
+        (entries, facts)
+    };
+    Ok(MemoryOutput::List {
+        agent: agent.name,
+        entries,
+        facts,
+    })
+}
+
+/// Delete a canonical fact using the current row's version. Its value need not
+/// be well formed so operators can remove a corrupt fact.
+pub async fn memory_delete(
+    opts: AgentActionOpts,
+    id: String,
+    channel: Option<String>,
+) -> Result<MemoryOutput> {
+    if !is_memory_fact_id(&id) {
+        return Err(crate::exit::usage(
+            "fact id must be fact- followed by exactly 32 lowercase hexadecimal characters",
+        ));
+    }
+    let channel = memory_channel(channel)?;
+    if opts.dry_run {
+        let url = memory_plan_url(
+            &opts.api_url,
+            channel.as_ref().map(MemoryChannel::pair),
+            Some(&id),
+        )?;
         return Ok(MemoryOutput::DryRun(crate::ui::DryRunPlan {
-            lines: vec![format!(
-                "GET {}/agents/<id>/memory  (would resolve agent {:?} first)",
-                opts.api_url, opts.agent
-            )],
+            lines: vec![
+                format!(
+                    "GET {url}  (would resolve agent {:?} and verify any selected bound channel first)",
+                    opts.agent
+                ),
+                format!("DELETE {url}?expected_version=<current-version>  (using the version from that GET)"),
+            ],
         }));
     }
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
-    let entries = client.list_memory(&agent.id).await?;
-    if entries.is_empty() {
-        return Ok(MemoryOutput::Empty { agent: agent.name });
+    if let Some(channel) = &channel {
+        require_memory_channel(&agent, channel)?;
     }
-    Ok(MemoryOutput::List {
+    let pair = channel.as_ref().map(MemoryChannel::pair);
+    let row = client.get_memory_fact(&agent.id, pair, &id).await?;
+    client
+        .delete_memory_fact(&agent.id, pair, &id, row.version)
+        .await?;
+    Ok(MemoryOutput::Deleted {
         agent: agent.name,
-        entries,
+        id,
+        scope: if channel.is_some() {
+            "channel"
+        } else {
+            "agent"
+        }
+        .to_string(),
+        channel,
     })
 }
 

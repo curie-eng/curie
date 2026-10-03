@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/memory/v2.1.json",
+  "$id": "https://schemas.curietech.ai/cli/memory/v2.2.json",
   "title": "curie <tier> memory --json",
-  "description": "The agent-facing payload of `curie <tier> memory <agent>`, `curie <tier> memory <agent> --add <content>` and the guidance flags (`--guidance`, `--guidance-from <file>`, `--reset-guidance`): the dry-run plan, the learned-memory entries (an empty array when none exist), the operator-seeded add result, or the agent's effective memory guidance with its source (`default` or `operator`) and whether this invocation wrote it.",
+  "description": "The payload of `curie <tier> memory <agent>` and its channel, delete, add, and guidance flags: a dry run plan, the retained memory log and attributed individual facts, a confirmed deletion, an operator seeded add result, or the effective memory guidance. Lists always emit facts, including an empty array; facts is optional in the schema to retain validity of prior list payloads.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -21,6 +21,60 @@
       "required": [
         "dry_run",
         "plan"
+      ]
+    },
+    "channel": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "address": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "address"
+      ]
+    },
+    "fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "scope": {
+          "enum": [
+            "agent",
+            "channel"
+          ]
+        },
+        "channel": {
+          "$ref": "#/$defs/channel"
+        },
+        "statement": {
+          "type": "string"
+        },
+        "author": {
+          "type": "string"
+        },
+        "stated_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "scope",
+        "channel",
+        "statement",
+        "author",
+        "stated_at"
       ]
     }
   },
@@ -52,6 +106,12 @@
               "index",
               "content"
             ]
+          }
+        },
+        "facts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/fact"
           }
         }
       },
@@ -117,6 +177,37 @@
         "text",
         "source",
         "changed"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "scope": {
+          "enum": [
+            "agent",
+            "channel"
+          ]
+        },
+        "channel": {
+          "$ref": "#/$defs/channel"
+        },
+        "deleted": {
+          "const": true
+        }
+      },
+      "required": [
+        "agent",
+        "id",
+        "scope",
+        "channel",
+        "deleted"
       ]
     }
   ]

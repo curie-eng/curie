@@ -1071,25 +1071,25 @@ impl EvalSamplingArgs {
 
 /// The memory-guidance flags shared by `local memory` and `cluster memory`
 /// (#1461). `--guidance-from` and `--reset-guidance` are two different writes,
-/// and none of them combines with `--add`, which writes the memory log.
+/// and none of them combines with add, delete, or channel selection.
 #[derive(clap::Args, Debug, Default, Clone)]
 pub(crate) struct MemoryGuidanceArgs {
     /// Show the guidance the agent gets beside its memory tools, and whether it
     /// is the platform default or operator-set
     /// (`GET /agents/{id}/memory/guidance`).
-    #[arg(long, conflicts_with = "add")]
+    #[arg(long, conflicts_with_all = ["add", "delete", "channel"])]
     pub(crate) guidance: bool,
     /// Replace the agent's memory guidance with this file's text
     /// (`PUT /agents/{id}/memory/guidance`). An empty file is refused.
     #[arg(
         long,
         value_name = "FILE",
-        conflicts_with_all = ["reset_guidance", "add"]
+        conflicts_with_all = ["reset_guidance", "add", "delete", "channel"]
     )]
     pub(crate) guidance_from: Option<std::path::PathBuf>,
     /// Remove operator guidance so the platform default applies again
     /// (`DELETE /agents/{id}/memory/guidance`).
-    #[arg(long, conflicts_with = "add")]
+    #[arg(long, conflicts_with_all = ["add", "delete", "channel"])]
     pub(crate) reset_guidance: bool,
 }
 

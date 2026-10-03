@@ -757,6 +757,17 @@ pub struct MemoryEntry {
     pub provenance: MemoryProvenance,
 }
 
+/// A row from the existing state routes (`StateEntryOut`). The memory command
+/// validates the open value only after selecting a canonical fact key.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StateEntry {
+    pub namespace: String,
+    pub key: String,
+    pub value: serde_json::Value,
+    pub version: u64,
+    pub updated_at: String,
+}
+
 /// An agent's effective memory guidance (`MemoryGuidanceOut`, #1461): the
 /// text the runner shows beside its memory tools, and whether it is the
 /// platform `default` or `operator`-set.
@@ -1919,6 +1930,34 @@ fn hook_agent_path(agent: &str, name: &str, tail: &[&str]) -> String {
         }
     }
     url.path().to_string()
+}
+
+/// Build the existing agent or binding memory state route. Every identity is
+/// pushed as a path segment, including addresses containing literal escapes.
+pub(crate) fn memory_state_url(
+    base_url: &str,
+    agent_id: &str,
+    channel: Option<(&str, &str)>,
+    key: Option<&str>,
+) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base_url)?;
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("api URL cannot hold path segments"))?;
+        path.pop_if_empty()
+            .push("agents")
+            .push(agent_id)
+            .push("state");
+        if let Some((kind, address)) = channel {
+            path.push("bindings").push(kind).push(address);
+        }
+        path.push("memory");
+        if let Some(key) = key {
+            path.push(key);
+        }
+    }
+    Ok(url)
 }
 
 impl ApiClient {
@@ -3356,6 +3395,70 @@ impl ApiClient {
             .json()
             .await
             .context("decoding hook run")
+    }
+
+    /// Read canonical fact candidates from agent or channel memory state.
+    pub async fn list_memory_facts(
+        &self,
+        agent_id: &str,
+        channel: Option<(&str, &str)>,
+    ) -> Result<Vec<StateEntry>> {
+        let url = memory_state_url(&self.base_url, agent_id, channel, None)?;
+        let response = self
+            .send_request(
+                self.http.get(url).header("X-API-Key", &self.api_key),
+                "GET memory state namespace",
+            )
+            .await?;
+        Self::expect_ok(response, "listing memory facts")
+            .await?
+            .json()
+            .await
+            .context("decoding memory fact state rows")
+    }
+
+    /// Read the current selected row before a versioned fact deletion.
+    pub async fn get_memory_fact(
+        &self,
+        agent_id: &str,
+        channel: Option<(&str, &str)>,
+        id: &str,
+    ) -> Result<StateEntry> {
+        let url = memory_state_url(&self.base_url, agent_id, channel, Some(id))?;
+        let response = self
+            .send_request(
+                self.http.get(url).header("X-API-Key", &self.api_key),
+                "GET memory state fact",
+            )
+            .await?;
+        Self::expect_ok(response, "reading memory fact")
+            .await?
+            .json()
+            .await
+            .context("decoding memory fact state row")
+    }
+
+    /// Delete exactly the selected row version. A conflict is returned without
+    /// retrying or falling back to an unversioned deletion.
+    pub async fn delete_memory_fact(
+        &self,
+        agent_id: &str,
+        channel: Option<(&str, &str)>,
+        id: &str,
+        version: u64,
+    ) -> Result<()> {
+        let url = memory_state_url(&self.base_url, agent_id, channel, Some(id))?;
+        let response = self
+            .send_request(
+                self.http
+                    .delete(url)
+                    .query(&[("expected_version", version)])
+                    .header("X-API-Key", &self.api_key),
+                "DELETE memory state fact",
+            )
+            .await?;
+        Self::expect_ok(response, "deleting memory fact").await?;
+        Ok(())
     }
 
     /// List an agent's learned memory, oldest first: `GET /agents/{id}/memory`.

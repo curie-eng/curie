@@ -1384,6 +1384,8 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
         ClusterAction::Memory {
             target,
             add,
+            delete,
+            channel,
             guidance,
         } => {
             let ClusterAgentTarget {
@@ -1398,10 +1400,11 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 agent,
                 dry_run,
             };
-            match (guidance.action(), add) {
-                (Some(action), _) => emit_memory_guidance(opts, action).await,
-                (None, None) => emit(commands::memory(opts).await?),
-                (None, Some(content)) => {
+            match (guidance.action(), add, delete) {
+                (Some(action), _, _) => emit_memory_guidance(opts, action).await,
+                (None, None, Some(id)) => emit(commands::memory_delete(opts, id, channel).await?),
+                (None, None, None) => emit(commands::memory(opts, channel).await?),
+                (None, Some(content), _) => {
                     emit(commands::memory_add(opts, content, "cluster").await?)
                 }
             }

@@ -41,7 +41,7 @@ use curie::api::{
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     ApprovalsOutput, BudgetOutput, CallersOutput, ChannelsOutput, DeleteOutput, HookFireOutput,
-    HookOutput, KillOutput, MemoryOutput, OverridesOutput, PublicationPolicyOutput,
+    HookOutput, KillOutput, MemoryChannel, MemoryOutput, OverridesOutput, PublicationPolicyOutput,
     ResetThreadOutput, ResumeOutput, SchedulesOutput, SkillApprovalsOutput, VersionsOutput,
     WorkItemsOutput,
 };
@@ -421,8 +421,17 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         "MemoryOutput",
         samples![
             "DryRun" => MemoryOutput::DryRun(plan()),
-            "Empty" => MemoryOutput::Empty { agent: "a".to_string() },
-            "List" => MemoryOutput::List { agent: "a".to_string(), entries: vec![memory_entry()] },
+            "List" => MemoryOutput::List {
+                agent: "a".to_string(), entries: vec![memory_entry()], facts: vec![],
+            },
+            "Deleted" => MemoryOutput::Deleted {
+                agent: "a".to_string(),
+                id: "fact-0123456789abcdef0123456789abcdef".to_string(),
+                scope: "channel".to_string(),
+                channel: Some(MemoryChannel {
+                    kind: "slack".to_string(), address: "C0EXAMPLE1".to_string(),
+                }),
+            },
             "Added" => MemoryOutput::Added {
                 agent: "a".to_string(),
                 index: 0,
