@@ -1074,7 +1074,8 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
 
     stack_index = _single_step_index(
         steps,
-        lambda step: "docker compose -f compose.dev.yaml up -d" in _string(step, "run"),
+        lambda step: _string(step, "run").strip()
+        == "python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480",
         "dev stack startup",
     )
     migration_index = _single_step_index(
@@ -1255,7 +1256,8 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     )
     stack_index = _single_step_index(
         steps,
-        lambda step: "docker compose -f compose.dev.yaml up -d" in _string(step, "run"),
+        lambda step: _string(step, "run").strip()
+        == "python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480",
         "dev stack startup",
     )
     migration_index = _single_step_index(

@@ -276,7 +276,14 @@ def test_python_job_gates_compose_and_pytest_on_selector_output() -> None:
 
     stack = named["Start dev stack"]
     assert stack["id"] == "dev-stack"
-    assert "postgres" in _string(stack, "run")
+    assert (
+        _string(stack, "run").strip()
+        == "python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480"
+    )
+    assert (
+        _string(named["Wait for Langfuse to serve"], "run").strip()
+        == "python3 scripts/wait-for-langfuse.py"
+    )
 
     pytest_step = named["Pytest"]
     assert pytest_step["id"] == "pytest"

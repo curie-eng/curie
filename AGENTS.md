@@ -125,7 +125,6 @@ Set `base=next` when your worktree targets `next`.
   export TEST_LANGFUSE_HOST=${TEST_LANGFUSE_HOST:-${LANGFUSE_HOST:-http://127.0.0.1:23000}}
   export LANGFUSE_HOST="$TEST_LANGFUSE_HOST"
   export TEST_OTEL_COLLECTOR_ENDPOINT=${TEST_OTEL_COLLECTOR_ENDPOINT:-http://127.0.0.1:24318/v1/traces}
-  langfuse_health_url="$TEST_LANGFUSE_HOST/api/public/health"
   exec 9>"$baseline_lock"
   if ! flock -n 9; then
     echo "Another local Python CI baseline is already running"
@@ -146,19 +145,8 @@ Set `base=next` when your worktree targets `next`.
   uv run lint-imports
   bash scripts/check-docs.sh
   bash scripts/check-wire-tolerance.sh
-  "${compose[@]}" up -d \
-    postgres valkey clickhouse rustfs rustfs-init \
-    langfuse-web langfuse-worker otel-collector
-  "${compose[@]}" up -d --wait --wait-timeout 300 \
-    postgres valkey clickhouse rustfs \
-    langfuse-web langfuse-worker otel-collector
-  for i in $(seq 1 60); do
-    if curl -fsS "$langfuse_health_url" >/dev/null 2>&1; then
-      break
-    fi
-    sleep 3
-  done
-  curl -fsS "$langfuse_health_url" >/dev/null
+  COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" COMPOSE_FILE="$compose_file_list" \
+    python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480
   git fetch --force --tags origin refs/heads/main:refs/remotes/origin/main
   uv run python scripts/check-released-upgrade.py --self-test
   uv run python scripts/check-released-upgrade.py
@@ -248,7 +236,8 @@ is an exception to the CLI entry point guidance in `CLAUDE.md`.
    `CURIE_RELEASED_UPGRADE_POSTGRES_PORT`. Also export matching
    `TEST_VALKEY_HOST`, `TEST_VALKEY_PORT`, `TEST_S3_ENDPOINT_URL`,
    `TEST_LANGFUSE_HOST`, and `TEST_OTEL_COLLECTOR_ENDPOINT`. The baseline derives
-   runtime consumer variables and the Langfuse health URL from those values.
+   runtime consumer variables from those values, and the readiness helper reads
+   `TEST_LANGFUSE_HOST` for its web endpoint.
    For example:
 
    ```bash
