@@ -112,8 +112,11 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   already-bundled sha therefore needs no access to the git remote -- which
   matters because the platform's GitHub credential can expire or be revoked
   without stopping webhook delivery (#1211). A **dev-branch** push is not
-  affected by this: it always clones and always validates, redeliveries
-  included, because the clone is also where the ancestry check (#1139) runs.
+  affected by this: it always clones and always validates, including a new
+  delivery (a new `X-GitHub-Delivery` id) of the same commit, because the
+  clone is also where the ancestry check (#1139) runs. A webhook delivery whose
+  id already deployed or promoted answers `push_duplicate` and does nothing
+  (#3820); polling has no delivery id and is unaffected.
   If you find yourself rebuilding on promote, that is a bug, not a feature --
   promotion is meant to be "the exact artifact that passed on dev," not a
   fresh build.
