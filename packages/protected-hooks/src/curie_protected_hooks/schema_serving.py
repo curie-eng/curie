@@ -2,11 +2,36 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from importlib.resources import files
 from types import MappingProxyType
+
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+
+_SCHEMA_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z")
+_TEXT_TYPES = frozenset({"text", "varchar", "bpchar"})
+_REQUIRED: dict[str, dict[str, frozenset[str]]] = {
+    "agents": {"id": frozenset({"uuid"}), "hook_generation": frozenset({"int4"})},
+    "hook_source_policies": {
+        "agent_id": frozenset({"uuid"}), "hook": _TEXT_TYPES,
+        "generation": frozenset({"int8"}), "operation_id": frozenset({"uuid"}),
+        "mode": _TEXT_TYPES, "tool_access": _TEXT_TYPES, "runtime_id": _TEXT_TYPES,
+        "qualification_id": _TEXT_TYPES, "bundle_digest": _TEXT_TYPES,
+        "legacy_generation": frozenset({"int8"}), "updated_at": frozenset({"timestamptz"}),
+    },
+    "hook_source_operations": {
+        "agent_id": frozenset({"uuid"}), "hook": _TEXT_TYPES,
+        "operation_id": frozenset({"uuid"}), "intent_sha256": _TEXT_TYPES,
+        "status": _TEXT_TYPES, "generation": frozenset({"int8"}),
+        "attempted_at": frozenset({"timestamptz"}),
+    },
+}
 
 
 class SchemaServingUnavailable(RuntimeError):
@@ -15,7 +40,11 @@ class SchemaServingUnavailable(RuntimeError):
     def __init__(self, code: str) -> None:
         """@spec PROTECTED-HOOK-SOURCE-2."""
         self.code = code
-        super().__init__(code)
+        message = (
+            "schema_below_min: database schema is below application min"
+            if code == "schema_below_min" else code
+        )
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -168,3 +197,66 @@ def can_serve(
         links = parents.get(revision, ())
         revision = links[0] if links else None
     return False
+
+
+async def _source_structure(connection: AsyncConnection) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
+    try:
+        for table, required in _REQUIRED.items():
+            columns = ",".join(f'"{column}"' for column in required)
+            await connection.execute(text(f'SELECT {columns} FROM curie."{table}" WHERE FALSE'))
+            rows = await connection.execute(text(
+                "SELECT a.attname,t.typname FROM pg_catalog.pg_attribute a "
+                "JOIN pg_catalog.pg_class c ON c.oid=a.attrelid "
+                "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+                "JOIN pg_catalog.pg_type t ON t.oid=a.atttypid "
+                "JOIN pg_catalog.pg_namespace tn ON tn.oid=t.typnamespace "
+                "WHERE n.nspname='curie' AND c.relname=:table "
+                "AND tn.nspname='pg_catalog' AND a.attnum>0 AND NOT a.attisdropped"
+            ), {"table": table})
+            actual: dict[str, str] = {row[0]: row[1] for row in rows}
+            if any(actual.get(column, "") not in types for column, types in required.items()):
+                raise SchemaServingUnavailable("schema_structure_unavailable")
+    except SQLAlchemyError:
+        raise SchemaServingUnavailable("schema_structure_unavailable") from None
+
+
+async def _observe_servable(engine: AsyncEngine, *, metadata_schema: str) -> str:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
+    if type(metadata_schema) is not str or not _SCHEMA_IDENTIFIER.fullmatch(metadata_schema):
+        raise SchemaServingUnavailable("schema_metadata_invalid")
+    metadata = load_metadata()
+    try:
+        async with engine.connect() as connection:
+            async with connection.begin():
+                await connection.execute(text("SET TRANSACTION READ ONLY"))
+                quoted = connection.dialect.identifier_preparer.quote_identifier(metadata_schema)
+                try:
+                    result = await connection.execute(text(
+                        f'SELECT version_num FROM {quoted}."alembic_version" LIMIT 2'
+                    ))
+                    rows = result.all()
+                except SQLAlchemyError:
+                    raise SchemaServingUnavailable("schema_revision_unavailable") from None
+                if len(rows) != 1 or type(rows[0][0]) is not str or not rows[0][0]:
+                    raise SchemaServingUnavailable("schema_revision_unavailable")
+                current = rows[0][0]
+                if not can_serve(
+                    current, metadata.window, metadata.known_revisions, metadata.parents
+                ):
+                    raise SchemaServingUnavailable("schema_below_min")
+                await _source_structure(connection)
+                return current
+    except SchemaServingUnavailable:
+        raise
+    except Exception:
+        raise SchemaServingUnavailable("schema_probe_unavailable") from None
+
+
+async def assert_servable(engine: AsyncEngine, *, metadata_schema: str) -> str:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
+    try:
+        async with asyncio.timeout(30):
+            return await _observe_servable(engine, metadata_schema=metadata_schema)
+    except TimeoutError:
+        raise SchemaServingUnavailable("schema_probe_timeout") from None

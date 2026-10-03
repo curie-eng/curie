@@ -24,10 +24,11 @@ from typing import Any
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from curie_protected_hooks.schema_serving import AppWindow, load_window
+from curie_protected_hooks.schema_serving import AppWindow, SchemaServingUnavailable, load_window
+from curie_protected_hooks.schema_serving import assert_servable as shared_assert_servable
 from curie_protected_hooks.schema_serving import can_serve as shared_can_serve
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from .config import get_settings
 from .db import SCHEMA
@@ -311,17 +312,40 @@ def apply_upgrade(
     return decision
 
 
+async def _dispose_startup_engine(engine: AsyncEngine) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+    async with asyncio.timeout(5):
+        await engine.dispose()
+
+
 async def assert_servable() -> None:
-    """Fail closed at process start when the live schema is older than min."""
-    window = load_window()
-    kinds = load_kinds()
-    current = await current_revision_async()
-    if not can_serve(current, window, kinds):
-        raise RuntimeError(
-            f"database schema {current!r} is below application min "
-            f"{window.schema_min}; wait for the upgrade Job / curie-migrate "
-            "phase, or restore a compatible backup"
-        )
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
+    try:
+        engine = create_async_engine(get_settings().database_url)
+    except Exception:
+        raise SchemaServingUnavailable("schema_probe_unavailable") from None
+    primary: BaseException | None = None
+    try:
+        await shared_assert_servable(engine, metadata_schema=SCHEMA)
+    except BaseException as error:
+        primary = error
+    cleanup = asyncio.create_task(_dispose_startup_engine(engine))
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError as error:
+            if primary is None:
+                primary = error
+        except Exception:
+            break
+    try:
+        cleanup.result()
+    except (Exception, asyncio.CancelledError):
+        if primary is None:
+            raise SchemaServingUnavailable("schema_cleanup_unavailable") from None
+        logger.warning("schema_cleanup_unavailable")
+    if primary is not None:
+        raise primary
 
 
 def wait_for_schema(*, attempts: int = 60, interval_s: float = 2.0) -> int:

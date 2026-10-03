@@ -54,6 +54,14 @@ release windows remain separate and unchanged. Polling
 cursor migration `0073` follows `0072`; both existing next migrations, `0071`
 and `0072`, remain in the chain.
 
+API startup calls
+`packages/protected-hooks/src/curie_protected_hooks/schema_serving.py::assert_servable`
+under its configured database identity. The read-only probe requires one live
+revision plus readable source policy and operation columns with compatible
+types, including when an unknown future revision is presumed compatible.
+Configured schema selection locates version metadata; source tables remain in
+`curie`. This proves readable structure, not runtime authority or qualification.
+
 ## Implementations today
 
 One: the compose/dev Postgres. Two SQLAlchemy async engines reach it, the API's
