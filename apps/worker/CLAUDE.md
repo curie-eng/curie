@@ -4,15 +4,15 @@ The concurrency kernel plus the Agent Sandbox substrate, and the F3 eval-stream
 runner (`curie_worker.eval`), which runs eval suites off the `curie:evals`
 stream against the frozen eval-case format (#8, ADR-0019). Full behavior spec
 lives in `apps/worker/README.md`; this file is the enforceable-rule summary. Read
-`../../ARCHITECTURE.md`'s message-flow diagram before changing `kernel.py`.
+`../../ARCHITECTURE.md`'s message-flow diagram before changing the `kernel` package.
 
 ## The kernel is sacred: single owner, adversarial review
 
-`kernel.py`/`consumer.py`/`threadlock.py`/`markers.py` are correctness logic
+`kernel/`/`consumer.py`/`threadlock.py`/`markers.py` are correctness logic
 with races that only show up under concurrent load. **One change owns this
 module at a time, it is never split across parallel work, and any change needs
 an adversarial review (spec-vs-impl + side-effects-detective, minimum) before
-merge.** If you are touching `kernel.py` as a side effect of another change,
+merge.** If you are touching `kernel/` as a side effect of another change,
 stop -- that is scope creep on the sacred module.
 
 ## The four rules the kernel enforces (each has a provoking integration test)
@@ -157,7 +157,7 @@ string-key verbs.
   lease-expiry pass recovers such a row once its lease has expired, whoever owns
   it. A pre-lease or pre-marker entry with no delivery state still waits out the
   unchanged 900-second backstop. While the row waits,
-  `apps/worker/src/curie_worker/kernel.py::Kernel.notify_turn_not_started` edits
+  `apps/worker/src/curie_worker/kernel/delivery.py::notify_turn_not_started` edits
   the placeholder to `turn_not_started_text` (`CURIE_TURN_NOT_STARTED_TEXT`),
   best effort, so the thread is not silent.
 - **Runs/eval parity is mandatory.** Both

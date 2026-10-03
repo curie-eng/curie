@@ -599,7 +599,7 @@ upgrade, because a guessed reply route is a silent misroute.
 | Concern | Path |
 |---|---|
 | Raising a request, and the tool gate | `runner/src/curie_runner/approval.py` |
-| Pausing, routing the card, suspending | `apps/worker/src/curie_worker/kernel.py` |
+| Pausing, routing the card, suspending | `apps/worker/src/curie_worker/kernel/core.py` |
 | Remembering the card so an expiry can disable it | `apps/worker/src/curie_worker/approval_cards.py` |
 | Click to resolve, and rendering the verdict | `apps/dispatcher/src/curie_dispatcher/approval_actions.py` |
 | The resolve endpoint, claim, and audit | `apps/api/src/curie_api/routers/approvals.py` |

@@ -347,7 +347,7 @@ class UsageReporter:
                     )
                     copied = {model: dict(counts) for model, counts in baseline.items()}
                     self._queue.append((body, session_id, copied))
-        except Exception as exc:  # never fail the turn over a cost line
+        except Exception as exc:  # noqa: BLE001 - never fail the turn over a cost line
             logger.warning("usage report build failure: %s", type(exc).__name__)
             return
         await self._flush()

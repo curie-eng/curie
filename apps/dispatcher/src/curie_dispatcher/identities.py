@@ -142,7 +142,7 @@ def bot_ids_from_auth_test(response: object) -> SlackBotIds | None:
         if getter("ok") is not True:
             return None
         values = {key: getter(key) for key in ("team_id", "app_id", "bot_id", "user_id")}
-    except Exception:
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         return None
 
     def text(key: str) -> str | None:

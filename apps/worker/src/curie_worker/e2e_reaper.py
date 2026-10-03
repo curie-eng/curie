@@ -264,7 +264,7 @@ class E2EReaperLoop:
             if run not in statuses and run not in failed:
                 try:
                     statuses[run] = await self._request_status(run)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - one unread status must not stop the pass
                     logger.warning(
                         "e2e reaper could not read request=%s status: %s; "
                         "keeping its namespace this pass",

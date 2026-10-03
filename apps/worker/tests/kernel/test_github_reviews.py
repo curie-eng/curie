@@ -38,7 +38,7 @@ from curie_worker.approvals import (
     PublicationLineage,
 )
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.kernel import ThreadBusyError
+from curie_worker.kernel.failures import ThreadBusyError
 from curie_worker.runner_client import RunnerWorkspaceSnapshot, TurnStream
 from curie_worker.workspace import WorkspaceSelectionRefused
 
@@ -673,7 +673,7 @@ def test_review_publication_carries_origin_into_a_fresh_same_pr_approval(
 
             monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
             monkeypatch.setattr(
-                "curie_worker.kernel.validate_snapshot_against_base",
+                'curie_worker.kernel.attempt.validate_snapshot_against_base',
                 lambda *_args, **_kwargs: None,
             )
 

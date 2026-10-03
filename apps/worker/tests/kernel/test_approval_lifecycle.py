@@ -43,7 +43,7 @@ from curie_worker.approvals import (
 )
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import GRANT_TOOL_ENV
-from curie_worker.kernel import _WorkspaceInferenceCarry
+from curie_worker.kernel.workspace import _WorkspaceInferenceCarry
 from curie_worker.reply_sink import TargetRoute, _ClusterMessageReplyAdapter
 from curie_worker.runner_client import RunnerError
 from curie_worker.sandbox.types import RouteState
@@ -192,7 +192,7 @@ def test_completed_lineage_can_replace_an_idle_durable_awaiting_runner() -> None
     """A failed publication suspend must not strand the dirty pre-publish route."""
 
     async def go() -> None:
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
 
         kernel = object.__new__(Kernel)
         kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
@@ -250,7 +250,7 @@ def test_lineage_handoff_keeps_busy_and_durability_fences(
     status: dict[str, object], pending: bool, reason: str
 ) -> None:
     async def go() -> None:
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
 
         kernel = object.__new__(Kernel)
         kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
@@ -270,7 +270,7 @@ def test_non_lineage_handoff_still_refuses_awaiting_approval() -> None:
     """The AWAITING_APPROVAL waiver belongs only to completed publication lineage."""
 
     async def go() -> None:
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
 
         kernel = object.__new__(Kernel)
         kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
@@ -294,7 +294,7 @@ def test_non_lineage_handoff_still_refuses_awaiting_approval() -> None:
 
 def test_open_lineage_bypasses_same_repo_adoption_and_surfaces_route_cas_loss() -> None:
     async def go() -> None:
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
 
         old_route = object()
 
@@ -333,7 +333,7 @@ def test_open_lineage_bypasses_same_repo_adoption_and_surfaces_route_cas_loss() 
 
 def test_route_cas_loss_never_steers_or_starts_the_old_lineage_runner() -> None:
     async def go() -> None:
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
         from curie_worker.sandbox.types import SandboxHandle
 
         thread_key = "slack:C0EXAMPLE1:1700000000.000100"
@@ -442,7 +442,7 @@ def test_verified_lineage_with_mismatched_route_state_cold_reconciles(
 ) -> None:
     async def go() -> None:
         from curie_worker.approvals import PublicationLineage
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
         from curie_worker.sandbox.types import SandboxHandle
 
         thread_key = "slack:C0EXAMPLE1:1700000000.000100"
@@ -842,7 +842,8 @@ def test_api_pending_publication_work_is_fenced_before_lineage_handoff_probe(
 ) -> None:
     async def go() -> None:
         from curie_worker.approvals import PublicationLineage
-        from curie_worker.kernel import Kernel, ThreadBusyError
+        from curie_worker.kernel.core import Kernel
+        from curie_worker.kernel.failures import ThreadBusyError
         from curie_worker.sandbox.types import SandboxHandle
 
         thread_key = "slack:C0EXAMPLE1:1700000000.000100"
@@ -1061,7 +1062,7 @@ def test_pending_first_revision_is_a_terminal_reply_before_dirty_route_adoption(
 
 def test_api_stale_head_conflict_stops_before_workspace_or_model_for_private_repo() -> None:
     async def go() -> None:
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
 
         deployment_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
 
@@ -1367,7 +1368,7 @@ async def _publication_run(
 
         monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
         monkeypatch.setattr(
-            "curie_worker.kernel.validate_snapshot_against_base",
+            'curie_worker.kernel.attempt.validate_snapshot_against_base',
             lambda *_args, **_kwargs: None,
         )
         await h.kernel.process_event(
@@ -1590,7 +1591,7 @@ def test_publication_notice_keeps_the_announcement_above_it(
 def test_private_lineage_head_reaches_handoff_without_a_publication_credential() -> None:
     async def go() -> None:
         from curie_worker.approvals import PublicationLineage
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
         from curie_worker.sandbox.types import SandboxHandle
 
         thread_key = "slack:C0EXAMPLE1:1700000000.000100"
@@ -2085,7 +2086,7 @@ def test_a_long_refusal_is_redacted_whole_before_it_is_clipped() -> None:
     redaction would cut the PEM end line and leak the key body.
     """
 
-    from curie_worker.kernel import _ApprovalPause
+    from curie_worker.kernel.approval import _ApprovalPause
 
     body = "A" * 900
     pem = f"-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----"
@@ -4770,7 +4771,7 @@ def test_the_remembered_approval_id_matches_the_resume_events_approval_id() -> N
     """
 
     from curie_api.resumequeue import resume_event_id
-    from curie_worker.kernel import _approval_id_from_resume_event
+    from curie_worker.kernel.approval import _approval_id_from_resume_event
 
     approval_id = uuid.UUID("6f1c8b3e-9c2a-4f5d-8a71-2b3c4d5e6f70")
     assert _approval_id_from_resume_event(resume_event_id(approval_id)) == str(approval_id)
@@ -6203,12 +6204,12 @@ def test_production_ttls_reach_workspace_lease_during_streaming_and_pause(
                     route = runtime.consumer._kernel._substrate._affinity.get(thread_key)
                     if route is not None:
                         cleanup_errors.append(AssertionError("TTL test left a sandbox route"))
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - teardown collects every failure
                     cleanup_errors.append(exc)
                 if bucket_created:
                     try:
                         await asyncio.to_thread(workspace.release, thread_key)
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 - teardown collects every failure
                         cleanup_errors.append(exc)
                     try:
                         remaining_keys = await asyncio.to_thread(
@@ -6221,17 +6222,17 @@ def test_production_ttls_reach_workspace_lease_during_streaming_and_pause(
                         for key in remaining_keys:
                             try:
                                 await asyncio.to_thread(objects.delete, key)
-                            except Exception as exc:
+                            except Exception as exc:  # noqa: BLE001 - teardown collects every failure
                                 cleanup_errors.append(exc)
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 - teardown collects every failure
                         cleanup_errors.append(exc)
                     try:
                         await asyncio.to_thread(client.delete_bucket, Bucket=bucket)
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 - teardown collects every failure
                         cleanup_errors.append(exc)
                 try:
                     runtime.consumer._kernel._substrate._affinity._redis.close()
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - teardown collects every failure
                     cleanup_errors.append(exc)
                 closed = await asyncio.gather(
                     runtime.runner.close(),

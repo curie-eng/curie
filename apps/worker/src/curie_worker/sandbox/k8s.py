@@ -574,7 +574,7 @@ class KubernetesSandboxClient:
                 propagation_policy="Background",
                 _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a rollback delete is best effort
             if isinstance(exc, k8s_client.ApiException) and exc.status == 404:
                 return
             logger.warning(
@@ -797,7 +797,7 @@ class KubernetesSandboxClient:
             # from it. Re-read that one claim; only a 404 proves it is gone.
             try:
                 live = self.get_claim(claim, request_timeout_seconds=_CLAIM_PREPARATION_TIMEOUT_S)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - an unreadable claim is spared
                 logger.warning(
                     "claim recheck for template %s failed (%s); sparing it",
                     name,

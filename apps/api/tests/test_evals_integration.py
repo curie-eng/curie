@@ -28,7 +28,7 @@ def _stack_up() -> bool:
         httpx.get(
             f"{get_settings().langfuse_host}/api/public/health", timeout=2.0
         ).raise_for_status()
-    except Exception:
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         return False
     return True
 

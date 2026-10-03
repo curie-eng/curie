@@ -232,7 +232,7 @@ def _select_scorer(files: _ExtractedEvalFiles) -> _LoadedEvalSuite:
 
     try:
         sidecar = TrajectorySidecar.model_validate_json(files.trajectory_bytes)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         return _LoadedEvalSuite(
             suite=files.suite,
             trajectory_error=f"invalid trajectory sidecar: {exc}",

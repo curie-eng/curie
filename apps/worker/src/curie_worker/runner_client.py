@@ -412,7 +412,7 @@ class RunnerClient:
             inject_trace_context(headers)
             try:
                 result, outcome = await request(headers or None)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 outcome = "timeout" if isinstance(exc, TimeoutError) else "failure"
                 _mark_rpc_failed(span, outcome, exc)

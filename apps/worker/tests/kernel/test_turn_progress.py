@@ -26,7 +26,8 @@ from aci_protocol import Final, SessionStatus, TextDelta, TurnSource
 from curie_worker import sandbox_token
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
 from curie_worker.config import WorkerConfig
-from curie_worker.kernel import _boots_differently, _thread_key_for
+from curie_worker.kernel.claim import _boots_differently
+from curie_worker.kernel.routing import _thread_key_for
 from curie_worker.progress import ProgressStore, progress_id_for, sweep_pending_progress
 from curie_worker.sandbox.types import SandboxHandle
 from pydantic import ValidationError

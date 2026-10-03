@@ -44,7 +44,7 @@ from aci_protocol import (
     TextDelta,
     TurnSource,
 )
-from curie_worker.kernel import ThreadBusyError
+from curie_worker.kernel.failures import ThreadBusyError
 
 # importlib import mode does not add the test root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))

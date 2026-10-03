@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from curie_worker.kernel import map_error_classification
+from curie_worker.kernel.failures import map_error_classification
 
 _VECTOR = (
     Path(__file__).resolve().parents[4]

@@ -1538,7 +1538,7 @@ def test_cluster_message_publication_card_consumer_is_delivered_or_bounded(
                     if not await reconciler.deliver_pending_card():
                         break
                     raised.append(None)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                     raised.append(type(exc).__name__)
         finally:
             await sink.aclose()
@@ -2067,7 +2067,7 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
     from curie_worker.approvals import CreatedPublication, PublicationCreateRequest
     from curie_worker.behaviorpacks import BehaviorPacks
     from curie_worker.binding import ResolvedDeployment
-    from curie_worker.kernel import TurnOutcome
+    from curie_worker.kernel.failures import TurnOutcome
     from curie_worker.runner_client import RunnerWorkspaceSnapshot
 
     from apps.worker.tests.kernel.conftest import kernel_harness

@@ -589,14 +589,14 @@ user-visible effect.
 
 | Verb | Where | What fences it |
 |---|---|---|
-| Execute or retry a turn | `kernel.py` (the attempt loop; `start_turn` / `steer`) | The lease is checked before every attempt, and attempts consume the one overall deadline. A loss mid-turn fires the base's lease-lost handler, which interrupts the live turn. |
-| Re-execute a *reclaimed* delivery | `kernel.py` reclaim preflight (generation > 1) | A side-effect marker forbids replay and escalates; a runner still reporting an active turn is interrupted and waited out; an unreadable runner fails closed. |
+| Execute or retry a turn | `kernel/` (the attempt loop; `start_turn` / `steer`) | The lease is checked before every attempt, and attempts consume the one overall deadline. A loss mid-turn fires the base's lease-lost handler, which interrupts the live turn. |
+| Re-execute a *reclaimed* delivery | `kernel/` reclaim preflight (generation > 1) | A side-effect marker forbids replay and escalates; a runner still reporting an active turn is interrupted and waited out; an unreadable runner fails closed. |
 | ACK (runs lane) | `consumer.py`, immediately before `XACK` | `lease.raise_if_lost()`. A refusal leaves the entry pending for the current owner. |
 | ACK (eval lane) | `eval/stream.py`, immediately before `XACK` | The same pre-ACK `raise_if_lost()`. |
 | ACK **via dead-letter**, handler path | `stream_consumer.py` `_dead_letter` → `_dead_letter_refusal` | Dead-letter is a terminal settlement (it ACKs, then deletes the lease and delivery state). A handler holds a registered lease, so the question is whether that lease is still ours. The one exception is a broker entry that a fresh read shows is gone and whose lease token is still ours or already absent (`broker-entry-vanished`): there is no successor to leave it for. |
 | ACK **via dead-letter**, over-cap scan | `stream_consumer.py` `_dead_letter_over_cap` | A live-lease check runs *before* cap evaluation, so a healthy long turn cannot be dead-lettered, and `_dead_letter_refusal` re-reads the lease before writing. Both fail closed on an unreadable answer. |
-| Write the done marker + the completion-outbox record | `markers.py` `settle_fenced`, whose only caller is `kernel.py` `_complete` — the only `mark_done` call site | One Lua script verifies the lease token and the fencing generation and then performs the terminal write. A loser writes nothing and returns `None`. |
-| Emit the terminal reply (`turn.completed`) | `kernel.py` `_complete` → `_deliver_completion` | Only reachable past `settle_fenced`; the fenced-out owner returns having emitted nothing. |
+| Write the done marker + the completion-outbox record | `markers.py` `settle_fenced`, whose only caller is `kernel/` `_complete` — the only `mark_done` call site | One Lua script verifies the lease token and the fencing generation and then performs the terminal write. A loser writes nothing and returns `None`. |
+| Emit the terminal reply (`turn.completed`) | `kernel/` `_complete` → `_deliver_completion` | Only reachable past `settle_fenced`; the fenced-out owner returns having emitted nothing. |
 | Clear an outbox record | `markers.py` `clear_completion`, via `_deliver_completion` | The same fence, plus the record-generation compare-and-check, so a stale pass cannot delete a fresh record. |
 | Write platform progress, terminal states included | `progress.py` `ProgressStore.apply_platform_update` (no caller yet; ADR 0130) | One Lua script checks the lease token and the fencing generation, the same two checks `settle_fenced` makes, before it writes anything. A loser writes no state and enqueues no delivery, and is refused `lease-lost`. |
 | Publish an eval report | `eval/stream.py` `_report` → `POST /evals/report` | The lease is resolved from the entry's stream id (never from a field that is `None` on the failure paths) and checked immediately before the send. A fenced lane whose lease cannot be resolved refuses to publish. |
@@ -608,13 +608,13 @@ new attempt.
 Three verbs are **deliberately not lease-fenced**, and none is an oversight:
 
 - **The side-effect marker** (`markers.mark_side_effect`, written from
-  `kernel.py` the instant a `side_effect_flag` is seen). A side effect that
+  `kernel/` the instant a `side_effect_flag` is seen). A side effect that
   happened must be recorded even by an owner that has since lost its fence. The
   marker is itself a hard no-replay fence, and it is what stops the
   *replacement* from re-running a non-idempotent action; fencing the write would
   let a lost lease erase the evidence. This is the one place where fail-closed
   means "write anyway".
-- **The completion-outbox sweeper** (`kernel.py` `sweep_pending_completions`).
+- **The completion-outbox sweeper** (`kernel/` `sweep_pending_completions`).
   The sweeper is not an owner: it drains records for entries that may already be
   acked off the group, where no lease exists or ever will. Its guard is the
   record's done flag plus the compare-and-checked `clear_completion`, not a

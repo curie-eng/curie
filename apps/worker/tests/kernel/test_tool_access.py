@@ -34,7 +34,7 @@ from curie_runner.side_effects import SideEffectClassifier
 from curie_telemetry import configure_meter_provider
 from curie_telemetry import metrics as curie_metrics
 from curie_worker.approvals import CreatedApproval
-from curie_worker.kernel import ThreadBusyError
+from curie_worker.kernel.failures import ThreadBusyError
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
@@ -443,7 +443,8 @@ def test_the_runners_refusal_classes_are_platform_classes() -> None:
         TOOL_ACCESS_REFUSED_CLASSIFICATION,
         TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
     )
-    from curie_worker.kernel import PLATFORM_ERROR_CLASSIFICATIONS, _display_error_classification
+    from curie_worker.kernel.constants import PLATFORM_ERROR_CLASSIFICATIONS
+    from curie_worker.kernel.failures import _display_error_classification
 
     for classification in (
         TOOL_ACCESS_UNENFORCED_CLASSIFICATION,

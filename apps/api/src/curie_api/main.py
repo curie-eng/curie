@@ -417,7 +417,7 @@ def create_app() -> FastAPI:
             async with asyncio.timeout(2):
                 async with request.app.state.sessionmaker() as session:
                     await crud_agents.list_agents(session)
-        except Exception:
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             raise HTTPException(
                 status_code=503,
                 detail="Database is unavailable",

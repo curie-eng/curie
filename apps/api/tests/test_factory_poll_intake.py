@@ -1291,7 +1291,7 @@ def test_locked_poll_makes_no_github_request(
 
         try:
             asyncio.run(inner())
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 - existing broad catch retained
             errors.append(exc)
             held.set()
 
@@ -1307,7 +1307,7 @@ def test_locked_poll_makes_no_github_request(
         def once() -> None:
             try:
                 _run_once(github)
-            except BaseException as exc:
+            except BaseException as exc:  # noqa: BLE001 - existing broad catch retained
                 outcome.append(exc)
 
         runner = threading.Thread(target=once)

@@ -52,7 +52,7 @@ from aci_protocol import (
 )
 from curie_worker.attachments import AttachmentResolutionError
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.kernel import Kernel
+from curie_worker.kernel.core import Kernel
 from curie_worker.sandbox import SuspendedThreadError
 from curie_worker.workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
 

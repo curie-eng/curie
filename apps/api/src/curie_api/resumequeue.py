@@ -281,7 +281,7 @@ class ResumeQueue:
             fields.update(carrier)
             try:
                 stream_id = await self._client.xadd(self._stream, fields)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 span.set_status(StatusCode.ERROR)
                 span.add_event("queue.enqueue.failed", {"outcome": "failure"})

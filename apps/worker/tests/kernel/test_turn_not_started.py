@@ -55,7 +55,7 @@ from curie_dispatcher.queue import to_stream_fields
 from curie_worker.config import WorkerConfig
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
-from curie_worker.kernel import _route_from_handle
+from curie_worker.kernel.routing import _route_from_handle
 from curie_worker.markers import CompletionRecord
 from curie_worker.reply_sink import TargetRoute
 

@@ -271,7 +271,7 @@ async def deactivate_turn_progress(store: ProgressStore, plan: TurnProgressPlan)
             await asyncio.shield(close)
         except asyncio.CancelledError as exc:
             cancellation = cancellation or exc
-        except Exception:  # handled from task.result() below
+        except Exception:  # noqa: BLE001 - handled from task.result() below
             break
     try:
         close.result()

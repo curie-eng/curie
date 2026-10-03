@@ -121,7 +121,7 @@ def moves_to_deploy(
         for branch in target.branches:
             try:
                 sha = tips.sha_for(target.repo_full_name, branch)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 # One unreachable or unauthorized repository must not stop the
                 # rest. Logged per repo/branch so the cause is attributable.
                 logger.warning(
@@ -463,7 +463,7 @@ class CommitPoller:
         ) as span:
             try:
                 moves = await self._poll_once()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)

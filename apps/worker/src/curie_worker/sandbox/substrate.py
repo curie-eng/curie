@@ -250,7 +250,7 @@ class SandboxSubstrate:
                         caller_run=caller_run,
                     )
                     outcome = "claimed"
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
@@ -500,7 +500,7 @@ class SandboxSubstrate:
                 self._affinity.mark_suspended(
                     thread_key, history_ref, self._config.suspended_route_ttl_seconds
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
@@ -592,7 +592,7 @@ class SandboxSubstrate:
                     runner_resources=runner_resources,
                     caller_run=caller_run,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
@@ -653,7 +653,7 @@ class SandboxSubstrate:
                     released = True
                     if wait_gone:
                         self._await_quota_freed(claim_name, sandbox_name)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
@@ -720,7 +720,7 @@ class SandboxSubstrate:
                         "sandbox.terminated",
                         {"outcome": "terminated"},
                     )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
@@ -1000,7 +1000,7 @@ class SandboxSubstrate:
             try:
                 inventory = self._affinity.route_inventory()
                 deleted, observed_claims = self._reap_orphans(inventory)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
@@ -1115,7 +1115,7 @@ class SandboxSubstrate:
         # the API error body can carry object detail.
         try:
             self._k8s.reap_claim_templates(keep=observed, created_before=cutoff)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed sweep retries next tick
             logger.warning(
                 "sandbox claim-template sweep failed (%s); orphaned per-claim "
                 "templates are retried on the next tick",

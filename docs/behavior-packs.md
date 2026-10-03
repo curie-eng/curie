@@ -122,7 +122,7 @@ additive and touches neither the kernel nor a frozen contract.
 
 ### The kernel wiring for tips/greeting/help (needs F1 review)
 
-These touches fire from inside `apps/worker/src/curie_worker/kernel.py::Kernel`, which is the F1 "sacred"
+These touches fire from inside `apps/worker/src/curie_worker/kernel/core.py::Kernel`, which is the F1 "sacred"
 module: any change needs the escalated adversarial review (spec-vs-impl +
 side-effects-detective) per `apps/worker/CLAUDE.md`. The greeting short-circuit
 also brushes against kernel rule 3 ("the kernel never keyword-guesses intent"),
@@ -152,7 +152,7 @@ The intended integration points, once that review is scheduled:
    with the sampled load line (optionally plus a tip) so the dispatcher's generic
    placeholder is replaced by the per-agent line before the first `text_delta`
    arrives. (The *shimmer* half of this is now wired --
-   `apps/worker/src/curie_worker/kernel.py::Kernel._set_shimmer` raises the
+   `apps/worker/src/curie_worker/kernel/core.py::Kernel._set_shimmer` raises the
    caption, using the sampled load line plus tip when the agent enables the packs
    and `CURIE_STATUS_TEXT` otherwise. What remains deferred is seeding the
    placeholder **message** itself.)

@@ -138,7 +138,7 @@ def _hold_memory_update_gate(
 
     try:
         asyncio.run(hold())
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - existing broad catch retained
         errors.append(error)
         acquired.set()
 

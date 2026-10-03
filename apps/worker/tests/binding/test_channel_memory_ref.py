@@ -203,7 +203,7 @@ def test_memory_writes_for_reads_the_agent_setting(
 def test_memory_writes_for_is_called_on_the_turn_path() -> None:
     # The separate read is only useful if a turn uses it: the definition plus at
     # least one call site across the resolver and the kernel.
-    from curie_worker import kernel
+    from curie_worker.kernel import lifecycle as kernel
 
     sources = inspect.getsource(binding) + inspect.getsource(kernel)
     assert sources.count("memory_writes_for(") >= 2

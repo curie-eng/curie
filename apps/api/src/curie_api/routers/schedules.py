@@ -187,7 +187,7 @@ async def _hooks_for(
     try:
         data = await store.get(bundle_ref)
         declared = await run_in_threadpool(read_triggers, data)
-    except Exception:
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         return [], _UNREADABLE
     latest = await _latest(session, agent_id)
     paused = await _paused(session, agent_id)

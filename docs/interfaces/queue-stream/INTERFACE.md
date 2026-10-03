@@ -149,7 +149,7 @@ Lua script (`_MARK_AND_XADD`).
 ## The port (as of #284 / ADR-0027)
 
 Drawn only at the **non-sacred** seams; the sacred concurrency kernel
-(`apps/worker/src/curie_worker/kernel.py` / `apps/worker/src/curie_worker/consumer.py` /
+(`apps/worker/src/curie_worker/kernel/core.py` / `apps/worker/src/curie_worker/consumer.py` /
 `apps/worker/src/curie_worker/threadlock.py` / `apps/worker/src/curie_worker/markers.py`)
 is not touched:
 

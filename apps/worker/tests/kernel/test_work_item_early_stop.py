@@ -370,7 +370,7 @@ def test_only_context_reads_end_as_early_stop(make_harness) -> None:
     ],
 )
 def test_the_unpublished_cause_follows_the_work_evidence(tools: frozenset[str], cause: str) -> None:
-    from curie_worker.kernel import _unpublished_cause
+    from curie_worker.kernel.failures import _unpublished_cause
 
     assert _unpublished_cause(tools) == cause
 
@@ -411,7 +411,7 @@ def _patch_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)  # type: ignore[attr-defined]
     monkeypatch.setattr(
-        "curie_worker.kernel.validate_snapshot_against_base",
+        'curie_worker.kernel.attempt.validate_snapshot_against_base',
         lambda *_args, **_kwargs: None,
     )
 

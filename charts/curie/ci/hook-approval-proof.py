@@ -1213,10 +1213,10 @@ class Proof:
                             )
                             if reset.get("released") is not True:
                                 failures.append(f"thread/{self.thread_key}")
-                        except Exception:
+                        except Exception:  # noqa: BLE001 - existing broad catch retained
                             failures.append(f"thread/{self.thread_key}")
                     self.cli_json("delete", [AGENT, "--yes"])
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 failures.append(f"agent/{AGENT}")
         if self.fixture_started:
             objects = [
@@ -1253,13 +1253,13 @@ def main() -> int:
     try:
         proof = Proof()
         outcome = proof.run_proof()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         error = exc
     finally:
         if proof is not None:
             try:
                 cleanup_failures = proof.cleanup()
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 cleanup_raised = True
 
     failed = False

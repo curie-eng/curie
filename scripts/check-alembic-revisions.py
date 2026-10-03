@@ -189,7 +189,7 @@ def main() -> int:
 
     try:
         heads = sorted(ScriptDirectory(str(script_location)).get_heads())
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         print(
             f"Alembic revision gate failed: could not load the revision graph "
             f"from {script_location}: {exc}",

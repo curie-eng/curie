@@ -145,9 +145,7 @@ class PublicationWork:
 class PublicationStore(Protocol):
     def claim_pending_card(self) -> Any: ...
 
-    def mark_card_delivered(
-        self, publication_id: uuid.UUID
-    ) -> None | Awaitable[None]: ...
+    def mark_card_delivered(self, publication_id: uuid.UUID) -> None | Awaitable[None]: ...
 
     def retry_card_delivery(
         self, publication_id: uuid.UUID, *, error: str, permanent: bool
@@ -155,13 +153,9 @@ class PublicationStore(Protocol):
 
     def claim_pending_cleanup(self) -> Any: ...
 
-    def mark_cleanup_completed(
-        self, publication_id: uuid.UUID
-    ) -> None | Awaitable[None]: ...
+    def mark_cleanup_completed(self, publication_id: uuid.UUID) -> None | Awaitable[None]: ...
 
-    def retry_cleanup(
-        self, publication_id: uuid.UUID, *, error: str
-    ) -> None | Awaitable[None]: ...
+    def retry_cleanup(self, publication_id: uuid.UUID, *, error: str) -> None | Awaitable[None]: ...
 
     def is_terminal(self, publication_id: uuid.UUID) -> bool | Awaitable[bool]: ...
 
@@ -177,21 +171,15 @@ class PublicationStore(Protocol):
 
     def pending_result(self, publication_id: uuid.UUID | None = None) -> Any: ...
 
-    def mark_result_delivered(
-        self, publication_id: uuid.UUID
-    ) -> None | Awaitable[None]: ...
+    def mark_result_delivered(self, publication_id: uuid.UUID) -> None | Awaitable[None]: ...
 
-    def mark_outcome_history_ready(
-        self, publication_id: uuid.UUID
-    ) -> None | Awaitable[None]: ...
+    def mark_outcome_history_ready(self, publication_id: uuid.UUID) -> None | Awaitable[None]: ...
 
     def retry_result_delivery(
         self, publication_id: uuid.UUID, *, error: str
     ) -> None | Awaitable[None]: ...
 
-    def retry(
-        self, publication_id: uuid.UUID, *, error: str
-    ) -> None | Awaitable[None]: ...
+    def retry(self, publication_id: uuid.UUID, *, error: str) -> None | Awaitable[None]: ...
 
     def release(self, publication_id: uuid.UUID) -> None | Awaitable[None]: ...
 
@@ -243,13 +231,9 @@ class PublicationCluster(Protocol):
         self, job_name: str
     ) -> PublicationJobObservation | Awaitable[PublicationJobObservation]: ...
 
-    def cleanup_credentials(
-        self, names: PublicationResourceNames
-    ) -> None | Awaitable[None]: ...
+    def cleanup_credentials(self, names: PublicationResourceNames) -> None | Awaitable[None]: ...
 
-    def cleanup_terminal(
-        self, names: PublicationResourceNames
-    ) -> None | Awaitable[None]: ...
+    def cleanup_terminal(self, names: PublicationResourceNames) -> None | Awaitable[None]: ...
 
 
 class PublicationGitHub(Protocol):
@@ -419,9 +403,7 @@ class PublicationReconciler:
         if self._card_store is None:
             error = "durable approval-card reference storage is unavailable"
             await _resolve(
-                self._store.retry_card_delivery(
-                    work.publication_id, error=error, permanent=False
-                )
+                self._store.retry_card_delivery(work.publication_id, error=error, permanent=False)
             )
             raise PublicationReconcileError(error)
         try:
@@ -467,7 +449,7 @@ class PublicationReconciler:
                 kind=work.target.kind,
                 adapter=work.route.adapter,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
             error = str(exc)[:2000] or type(exc).__name__
             await _resolve(
                 self._store.retry_card_delivery(
@@ -492,7 +474,7 @@ class PublicationReconciler:
         try:
             await self._cleanup_credentials(names)
             await self._cleanup_terminal(names)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
             await _resolve(
                 self._store.retry_cleanup(
                     work.publication_id,
@@ -554,9 +536,7 @@ class PublicationReconciler:
         resolver = result.resolved_by if decision is not None else None
         note = result.resolution_note if decision is not None else None
         decided = result.resolved_at if decision is not None else None
-        if decision is not None and (
-            not isinstance(resolver, str) or not resolver.strip()
-        ):
+        if decision is not None and (not isinstance(resolver, str) or not resolver.strip()):
             raise PublicationReconcileError(
                 "resolved publication approval has no durable resolver identity"
             )
@@ -602,7 +582,7 @@ class PublicationReconciler:
             return target
         try:
             notice_ref = await self._card_store.read_notice_ref(approval_id)
-        except Exception:
+        except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
             logger.warning(
                 "publication notice ref lookup failed publication_id=%s",
                 result.publication_id,
@@ -671,7 +651,7 @@ class PublicationReconciler:
                                 compact_text,
                             )
                         )
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
                         transcript_retry_error = exc
                         logger.warning(
                             "publication compact transcript outcome failed "
@@ -679,7 +659,7 @@ class PublicationReconciler:
                             result.publication_id,
                             exc_info=True,
                         )
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
                     transcript_retry_error = exc
                     logger.warning(
                         "publication transcript recording failed transiently "
@@ -688,26 +668,22 @@ class PublicationReconciler:
                         exc_info=True,
                     )
                 if transcript_retry_error is None:
-                    await _resolve(
-                        self._store.mark_outcome_history_ready(result.publication_id)
-                    )
+                    await _resolve(self._store.mark_outcome_history_ready(result.publication_id))
             else:
                 transcript_retry_error = PublicationReconcileError(
                     "publication transcript recording is not configured"
                 )
-            await self._report(
-                await self._result_target(result, approval_id), result.route, text
-            )
+            await self._report(await self._result_target(result, approval_id), result.route, text)
             if card_ref is not None:
                 await self._settle_card(result, card_ref)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
             if card_ref is not None and self._card_store is not None:
                 try:
                     await self._card_store.restore(
                         approval_id,
                         card_ref,
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
                     # Keep the only surviving copy available to this process.
                     # The routed-delivery error remains the failure charged to
                     # the outbox instead of being masked by a Valkey outage.
@@ -725,21 +701,17 @@ class PublicationReconciler:
                         error=(str(exc)[:2000] or type(exc).__name__),
                     )
                 )
-            except Exception as retry_exc:
+            except Exception as retry_exc:  # noqa: BLE001 - broad catch kept at a failure boundary
                 raise exc from retry_exc
             raise
         if transcript_retry_error is not None:
             transcript_error = (
-                str(transcript_retry_error)[:1950]
-                or type(transcript_retry_error).__name__
+                str(transcript_retry_error)[:1950] or type(transcript_retry_error).__name__
             )
             await _resolve(
                 self._store.retry_result_delivery(
                     result.publication_id,
-                    error=(
-                        "publication transcript recording failed: "
-                        f"{transcript_error}"
-                    ),
+                    error=(f"publication transcript recording failed: {transcript_error}"),
                 )
             )
             return True
@@ -765,9 +737,7 @@ class PublicationReconciler:
             raise PublicationReconcileError("metadata-only publication has no GitHub update time")
         if new_head is not None:
             if pr_url is None or pr_number is None:
-                raise PublicationReconcileError(
-                    "publication success omitted pull request identity"
-                )
+                raise PublicationReconcileError("publication success omitted pull request identity")
             await self._advance_lineage(
                 work,
                 pr_url=pr_url,
@@ -973,10 +943,7 @@ class PublicationReconciler:
         commit_sha = observation.commit_sha or _marker_commit(observation.logs)
         pr_state = observation.pr_state or _marker_state(observation.logs)
         if observation.phase in {"pending", "running"} and (
-            pr_state is not None
-            or pr_url is None
-            or pr_number is None
-            or commit_sha is None
+            pr_state is not None or pr_url is None or pr_number is None or commit_sha is None
         ):
             # The commit marker is the script's final line, so a complete
             # success triple already proves the pull request exists. Settle it
@@ -996,10 +963,7 @@ class PublicationReconciler:
                 raise PublicationReconcileError(
                     "publication Job returned a different stored pull request"
                 )
-            if (
-                work.pr_url is not None
-                and pr_url.casefold() != work.pr_url.casefold()
-            ):
+            if work.pr_url is not None and pr_url.casefold() != work.pr_url.casefold():
                 raise PublicationReconcileError(
                     "publication Job returned a different stored pull request"
                 )
@@ -1069,8 +1033,7 @@ class PublicationReconciler:
                 work,
                 PublicationReconcileError(
                     "publication branch does not carry the required prefix"
-                    if work.branch_prefix
-                    and not work.branch.startswith(work.branch_prefix)
+                    if work.branch_prefix and not work.branch.startswith(work.branch_prefix)
                     else "publication branch is not a valid stored lineage branch"
                 ),
             )
@@ -1078,7 +1041,7 @@ class PublicationReconciler:
 
         try:
             observation = await _cluster_call(self._cluster.observe, names.job)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
             await self._bounded_setup_failure(work, exc)
             return
 
@@ -1101,19 +1064,17 @@ class PublicationReconciler:
                     settings=self._job_settings,
                 )
                 await _cluster_call(self._cluster.validate_existing, probe_resources)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
                 await self._bounded_setup_failure(work, exc)
                 return
             if observation.phase in {"pending", "running"}:
                 try:
-                    if await self._finish_observation(
-                        work, observation, probe_resources.names
-                    ):
+                    if await self._finish_observation(work, observation, probe_resources.names):
                         return
                 except PublicationIdentityUnavailable as identity_exc:
                     await self._identity_unavailable(work, identity_exc)
                     return
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
                     if await _resolve(self._store.is_terminal(work.publication_id)):
                         raise
                     await self._bounded_setup_failure(work, exc)
@@ -1135,25 +1096,23 @@ class PublicationReconciler:
             marker_number = observation.pr_number or _marker_number(observation.logs)
             marker_commit = observation.commit_sha or _marker_commit(observation.logs)
             marker_state = observation.pr_state or _marker_state(observation.logs)
-            if marker_state is not None or (
-                marker_url is not None
-                and marker_number is not None
-                and marker_commit is not None
-            ) or (
-                marker_url is not None
-                and marker_number is None
-                and marker_commit is None
+            if (
+                marker_state is not None
+                or (
+                    marker_url is not None
+                    and marker_number is not None
+                    and marker_commit is not None
+                )
+                or (marker_url is not None and marker_number is None and marker_commit is None)
             ):
                 try:
-                    await self._finish_observation(
-                        work, observation, probe_resources.names
-                    )
+                    await self._finish_observation(work, observation, probe_resources.names)
                 except PublicationIdentityUnavailable as identity_exc:
                     # A transient lineage verification failure must never consume
                     # a reconcile attempt. Lease expiry retries it uncharged,
                     # bounded so a permanent failure still converges.
                     await self._identity_unavailable(work, identity_exc)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
                     if await _resolve(self._store.is_terminal(work.publication_id)):
                         raise
                     await self._bounded_setup_failure(work, exc)
@@ -1238,13 +1197,10 @@ class PublicationReconciler:
                             head_sha=recovered.head_sha,
                         )
                         raise PublicationReconcileError(
-                            "pull request lineage is "
-                            f"{recovered.state}; start a new thread"
+                            f"pull request lineage is {recovered.state}; start a new thread"
                         )
                     if recovered.state != "open":
-                        raise PublicationReconcileError(
-                            "GitHub pull request state is invalid"
-                        )
+                        raise PublicationReconcileError("GitHub pull request state is invalid")
                     await self._terminalize(
                         work,
                         outcome="published",
@@ -1304,14 +1260,14 @@ class PublicationReconciler:
                             authorization_header=credential.authorization_header,
                         )
                     )
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
                     raise PublicationReconcileError(
                         "pull request head no longer matches the stored lineage head"
                     ) from exc
         except PublicationIdentityUnavailable as identity_exc:
             await self._identity_unavailable(work, identity_exc)
             return
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
             await self._bounded_setup_failure(work, exc)
             return
 
@@ -1333,7 +1289,7 @@ class PublicationReconciler:
             except PublicationIdentityUnavailable as identity_exc:
                 await self._identity_unavailable(work, identity_exc)
                 return
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
                 await self._bounded_setup_failure(work, exc)
                 return
             await self._terminalize(
@@ -1370,13 +1326,16 @@ class PublicationReconciler:
                     "ask again to request a new publication approval."
                 )
                 await self._terminalize(
-                    work, outcome="failed", error=error, names=names,
+                    work,
+                    outcome="failed",
+                    error=error,
+                    names=names,
                     metadata_updated_at=None,
                 )
                 return
             try:
                 await self._finish_observation(work, observation, names)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
                 await self._bounded_setup_failure(work, exc)
             return
 
@@ -1386,7 +1345,7 @@ class PublicationReconciler:
                 credential=credential.authorization_header,
                 settings=self._job_settings,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
             await self._bounded_setup_failure(work, exc)
             return
 
@@ -1400,25 +1359,21 @@ class PublicationReconciler:
         except PublicationResourceError as exc:
             await self._bounded_setup_failure(work, exc)
             return
-        except Exception as apply_exc:
+        except Exception as apply_exc:  # noqa: BLE001 - broad catch kept at a failure boundary
             # The apiserver may have accepted the resources and lost only the
             # response. Observe the deterministic name, then recover the
             # deterministic remote head, before charging a bounded retry.
             try:
-                observation = await _cluster_call(
-                    self._cluster.observe, resources.names.job
-                )
+                observation = await _cluster_call(self._cluster.observe, resources.names.job)
                 in_flight = False
                 if observation.exists:
-                    if await self._finish_observation(
-                        work, observation, resources.names
-                    ):
+                    if await self._finish_observation(work, observation, resources.names):
                         return
                     in_flight = observation.phase in {"pending", "running"}
             except PublicationIdentityUnavailable as identity_exc:
                 await self._identity_unavailable(work, identity_exc)
                 return
-            except Exception as recovery_exc:
+            except Exception as recovery_exc:  # noqa: BLE001 - broad catch kept at a failure boundary
                 if await _resolve(self._store.is_terminal(work.publication_id)):
                     raise
                 await self._bounded_setup_failure(
@@ -1435,16 +1390,12 @@ class PublicationReconciler:
             return
 
         try:
-            observation = await _cluster_call(
-                self._cluster.observe, resources.names.job
-            )
-            finished = await self._finish_observation(
-                work, observation, resources.names
-            )
+            observation = await _cluster_call(self._cluster.observe, resources.names.job)
+            finished = await self._finish_observation(work, observation, resources.names)
         except PublicationIdentityUnavailable as identity_exc:
             await self._identity_unavailable(work, identity_exc)
             return
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
             if await _resolve(self._store.is_terminal(work.publication_id)):
                 raise
             await self._bounded_setup_failure(work, exc)
@@ -1484,17 +1435,17 @@ class PublicationReconcileLoop:
         while not shutdown.is_set():
             try:
                 await self._reconciler.deliver_pending_card()
-            except Exception:
+            except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
                 logger.exception("publication approval card delivery failed")
             try:
                 await self._reconciler.deliver_pending_cleanup()
-            except Exception:
+            except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
                 # Cleanup is deliberately unbounded. Its released lease is
                 # reclaimed until every deterministic resource is absent.
                 logger.exception("publication resource cleanup failed")
             try:
                 await self._reconciler.deliver_pending_result()
-            except Exception:
+            except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
                 # The result lease was released (or dead-lettered) before the
                 # error escaped. Publication mutation remains terminal and is
                 # never repeated because a reply transport is unavailable.
@@ -1508,7 +1459,7 @@ class PublicationReconcileLoop:
             for _ in range(self._batch_limit):
                 try:
                     work = await self._store.claim_next(exclude=seen)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
                     logger.exception(
                         "publication claim_next failed cause=%s: %s",
                         type(exc).__name__,
@@ -1525,7 +1476,7 @@ class PublicationReconcileLoop:
                         await self._reconciler.reconcile(work, allow_launch=False)
                     else:
                         await self._reconciler.reconcile(work)
-                except Exception:
+                except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
                     # The lease is intentionally left in place. A worker crash
                     # or ambiguous apiserver response is retried only after it
                     # expires, adopting the deterministic resource names.

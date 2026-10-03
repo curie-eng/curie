@@ -69,7 +69,7 @@ def main() -> int:
                 config=config,
                 redis_client=redis_client,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - existing broad catch retained
             _LOG.error(
                 "one-shot dispatcher enqueue failed (%s)",
                 type(exc).__name__,

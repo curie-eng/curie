@@ -288,7 +288,7 @@ networks:
                 with urllib.request.urlopen(f"{api_url}/health", timeout=1) as response:
                     if response.status == 200:
                         break
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 time.sleep(1)
         else:
             api_log.flush()

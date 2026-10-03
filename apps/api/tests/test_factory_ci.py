@@ -23,7 +23,6 @@ from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_e
 from curie_api import factory_ci
 from curie_api.config import Settings
 from curie_api.workitem_outcomes import CiDetail
-from curie_api.workitems import lifecycle as workitems
 from pydantic import ValidationError
 
 HEAD = "a1" * 20

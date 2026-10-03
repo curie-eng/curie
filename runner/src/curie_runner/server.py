@@ -383,7 +383,7 @@ async def _turn_admit(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid turn epoch"}, status=400)
     try:
         body = await request.json()
-    except Exception:
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         return web.json_response({"error": "invalid admission body"}, status=400)
     if not isinstance(body, dict) or type(body.get("allow")) is not bool:
         return web.json_response({"error": "invalid admission decision"}, status=400)

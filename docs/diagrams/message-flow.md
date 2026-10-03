@@ -53,7 +53,7 @@ Note the shape of the suspended branch: the approval resolution is **not** the
 same turn waking up. The original event **completes** at
 `SessionStatus.AWAITING_APPROVAL`, and the human's click arrives later as its
 own queued turn
-(`apps/worker/src/curie_worker/kernel.py::Kernel._pause_for_approval`). That is what lets the
+(`apps/worker/src/curie_worker/kernel/core.py::Kernel._pause_for_approval`). That is what lets the
 suspension outlive the pod, the worker, and a restart.
 
 The click does **not** go straight from the dispatcher to the queue. The

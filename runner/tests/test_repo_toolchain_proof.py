@@ -85,14 +85,14 @@ try:  # pragma: no cover - exercised by whichever branch the env provides
 
     HARDENING_ARGS = RunnerHardening().run_args()
     HARDENING_IMPORTED = True
-except Exception:  # pragma: no cover
+except Exception:  # noqa: BLE001 - pragma: no cover
     RunnerHardening = None  # type: ignore[assignment]
     HARDENING_ARGS = list(_LITERAL_RUN_ARGS)
     HARDENING_IMPORTED = False
 
 try:  # pragma: no cover
     from curie_worker.workspace import WORKSPACE_MOUNT_PATH
-except Exception:  # pragma: no cover
+except Exception:  # noqa: BLE001 - pragma: no cover
     WORKSPACE_MOUNT_PATH = _LITERAL_WORKSPACE_MOUNT_PATH
 
 # Same env var and same default as ``apps/worker/src/curie_worker/run.py``, so a

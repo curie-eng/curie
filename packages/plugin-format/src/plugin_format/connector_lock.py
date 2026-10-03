@@ -136,7 +136,7 @@ def validate_connector_lock(data: Any) -> tuple[ConnectorLockFile | None, list[t
 
     try:
         parsed = ConnectorLockFile.model_validate(data)
-    except Exception as exc:  # pydantic ValidationError -- surface it verbatim
+    except Exception as exc:  # noqa: BLE001 - pydantic ValidationError -- surface it verbatim
         return None, [("connectors.lock_invalid", f"{CONNECTOR_LOCK_FILE}: {str(exc)[:400]}")]
 
     if parsed.version != LOCK_VERSION:

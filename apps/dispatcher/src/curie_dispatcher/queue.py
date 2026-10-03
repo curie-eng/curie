@@ -150,7 +150,7 @@ def enqueue(redis_client: "StreamPublisher", config: "DispatcherConfig", turn: Q
             # async handoff while leaving QueuedTurn's JSON bytes untouched.
             fields = cast("dict[Any, Any]", to_stream_fields(turn))
             stream_id = redis_client.xadd(config.stream, fields)
-        except Exception as exc:  # preserve the queue's original exception shape
+        except Exception as exc:  # noqa: BLE001 - preserve the queue's original exception shape
             error = exc
             span.set_status(StatusCode.ERROR)
             span.add_event("queue.enqueue.failed", {"outcome": "failure"})

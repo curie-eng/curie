@@ -715,7 +715,7 @@ async def _replay_held_review_feedback(
                 repository_id=lineage.github_repository_id,
                 pr_number=lineage.pr_number,
             )
-    except Exception:
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         logger.warning("held GitHub review replay after identity failed; reconciler retries")
 
 

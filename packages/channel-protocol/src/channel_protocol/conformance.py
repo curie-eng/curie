@@ -394,7 +394,7 @@ async def _expect_refused(
 
     try:
         ack = await delivery
-    except Exception:
+    except Exception:  # noqa: BLE001 - the expected failure is the pass
         return
     raise ConformanceFailure(
         f"{check}: expected {expected}; observed it acked with {ack!r} and effects "
@@ -1028,7 +1028,7 @@ async def ambiguous_send_is_not_repeated(subject: ChannelAdapterSubject, ctx: Ch
     for _ in range(1 + _AMBIGUOUS_RETRIES):
         try:
             await subject.emit(completed)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - record the failure and retry
             errors.append(type(exc).__name__)
             continue
         break

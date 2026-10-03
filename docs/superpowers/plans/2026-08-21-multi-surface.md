@@ -108,7 +108,7 @@ Run: `git add apps/api && git commit -m "Add the agent surfaces subresource"`
 
 **Files:**
 - Modify: `apps/worker/src/curie_worker/binding.py`
-- Modify: `apps/worker/src/curie_worker/kernel.py`
+- Modify: `apps/worker/src/curie_worker/kernel/core.py`
 - Modify: `apps/dispatcher/tests/test_dispatch.py`
 - Test: `apps/worker/tests/binding/test_resolver.py`
 - Test: `apps/worker/tests/kernel/test_multi_channel_respond_in_kind.py`

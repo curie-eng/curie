@@ -285,13 +285,13 @@ def _drain_provider(provider: _DrainableProvider, deadline: float) -> None:
     try:
         remaining_millis = max(0.0, deadline - time.monotonic()) * 1000
         provider.force_flush(timeout_millis=int(remaining_millis))
-    except BaseException:
+    except BaseException:  # noqa: BLE001 - existing broad catch retained
         pass
     try:
         # Never pass a timeout here: TracerProvider.shutdown() takes no such
         # parameter, and telemetry teardown must not depend on SDK specifics.
         provider.shutdown()
-    except BaseException:
+    except BaseException:  # noqa: BLE001 - existing broad catch retained
         pass
 
 
@@ -340,7 +340,7 @@ class ServiceTelemetry:
             )
             try:
                 worker.start()
-            except BaseException:
+            except BaseException:  # noqa: BLE001 - existing broad catch retained
                 continue
             started.append(worker)
         for worker in started:
