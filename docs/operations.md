@@ -836,7 +836,19 @@ version in its environment, a rollback to an earlier sha included; a
 redelivered push for the version already active changes nothing and posts
 nothing. Multiple Slack bindings each receive a notice through their configured
 bot identity. Notice delivery uses the worker's bounded retry and dead-letter
-path. The API first records selected recipients in a durable PostgreSQL outbox;
+path.
+
+<!-- @spec DEPLOY-NOTICE-RELEASE-1 -->
+Deploy notices ship after v0.12.0. Their additive migration is `0074`,
+following the released polling-cursor migration `0073`. Applying it to a
+v0.12.0 database preserves the released work-item base and poll cursors,
+defaults existing agents to success notices off, and creates the retry outbox.
+Downgrading only this migration removes notice state and keeps those released
+features. API and packaged chart require schema `0074` because agent reads
+include the new column. The CLI candidate is v0.13.0 with window
+`0074` through `0074`; the published v0.12.0 and v0.12.0-rc.1 windows
+remain `0070` through `0073`.
+ The API first records selected recipients in a durable PostgreSQL outbox;
 its reconciler retries Valkey publication after a transient outage or API
 restart. An unavailable outbox returns HTTP 503 to the webhook instead of a
 false success, with the push's own result under `detail.result`. Inspect the `<runs-stream>:deploy-notices[:<installation-id>]:dead`
