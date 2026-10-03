@@ -131,7 +131,8 @@ def _run_gate(repo_root: Path | None = None) -> subprocess.CompletedProcess[str]
                 if "revision" in fields:
                     parent = fields.get("down_revision")
                     graph[fields["revision"]] = (
-                        list(parent) if isinstance(parent, (tuple, list)) else [parent] if parent else []
+                        list(parent) if isinstance(parent, (tuple, list))
+                        else [parent] if parent else []
                     )
             owner = repo_root / (
                 "packages/protected-hooks/src/curie_protected_hooks/schema_serving.json"
