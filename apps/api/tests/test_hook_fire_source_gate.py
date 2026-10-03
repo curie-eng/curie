@@ -250,6 +250,87 @@ def test_unconfigured_ordinary_preserves_run_and_queue_outcomes(
     asyncio.run(asyncio.wait_for(scenario(), 25))
 
 
+def test_gate_loss_at_claim_commit_refuses_unguarded_failure_cleanup(fire_db: None) -> None:
+    """Actual post-claim gate loss, @spec PROTECTED-HOOK-SOURCE-2."""
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        async with fire_app() as (app, client, headers, agent, _version):
+            observer = create_async_engine(get_settings().database_url, poolclass=NullPool)
+            suffix = uuid.uuid4().hex
+            audit = "fire_loss_audit_" + suffix
+            function = "fire_loss_commit_" + suffix
+            trigger = "fire_loss_trigger_" + suffix
+            try:
+                assert await state(app, agent) == ([], [])
+                async with observer.begin() as conn:
+                    await conn.execute(
+                        text(
+                            f"CREATE TABLE curie.{audit} "
+                            "(claim_id uuid, outcome text, ended_at timestamptz, "
+                            "gate_pid integer, terminated boolean)"
+                        )
+                    )
+                    await conn.execute(
+                        text(
+                            f"CREATE FUNCTION curie.{function}() RETURNS trigger "
+                            "LANGUAGE plpgsql AS $$ DECLARE gate_pid integer; BEGIN "
+                            "SELECT l.pid INTO STRICT gate_pid FROM pg_locks l "
+                            "JOIN pg_database d ON d.oid=l.database "
+                            "WHERE d.datname=current_database() "
+                            "AND l.locktype='advisory' AND l.granted "
+                            "AND l.classid::bigint="
+                            "((hashtextextended('hook-source:' || NEW.agent_id::text,0)>>32)"
+                            "&4294967295) AND l.objid::bigint="
+                            "(hashtextextended('hook-source:' || NEW.agent_id::text,0)&4294967295) "
+                            "AND l.objsubid=1 AND l.pid<>pg_backend_pid(); "
+                            f"INSERT INTO curie.{audit} "
+                            "VALUES (NEW.id, NEW.outcome, NEW.ended_at, gate_pid, "
+                            "pg_terminate_backend(gate_pid,1000)); RETURN NEW; END; $$"
+                        )
+                    )
+                    await conn.execute(
+                        text(
+                            f"CREATE CONSTRAINT TRIGGER {trigger} AFTER INSERT "
+                            "ON curie.hook_runs DEFERRABLE INITIALLY DEFERRED "
+                            f"FOR EACH ROW WHEN (NEW.agent_id='{agent}'::uuid) "
+                            f"EXECUTE FUNCTION curie.{function}()"
+                        )
+                    )
+                response = await asyncio.wait_for(fire(client, headers, agent, HOOK), 5)
+                assert response.status_code == 503, response.text
+                runs, queue = await state(app, agent)
+                assert queue == [], "gate loss before XADD must leave the real stream unchanged"
+                async with observer.connect() as conn:
+                    committed = (
+                        (await conn.execute(text(f"SELECT * FROM curie.{audit}"))).mappings().one()
+                    )
+                    assert committed["terminated"] is True
+                    assert committed["gate_pid"] != await conn.scalar(
+                        text("SELECT pg_backend_pid()")
+                    )
+                    assert not await conn.scalar(
+                        text("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid=:pid)"),
+                        {"pid": committed["gate_pid"]},
+                    )
+                assert len(runs) == 1
+                assert runs[0]["id"] == committed["claim_id"]
+                assert committed["outcome"] is None and committed["ended_at"] is None
+                assert runs[0]["outcome"] is None, (
+                    "PROTECTED-HOOK-SOURCE-2: detected post-commit gate loss must not "
+                    "authorize failure-cleanup UPDATE"
+                )
+                assert runs[0]["ended_at"] is None
+            finally:
+                async with observer.begin() as conn:
+                    await conn.execute(text(f"DROP TRIGGER IF EXISTS {trigger} ON curie.hook_runs"))
+                    await conn.execute(text(f"DROP FUNCTION IF EXISTS curie.{function}()"))
+                    await conn.execute(text(f"DROP TABLE IF EXISTS curie.{audit}"))
+                await observer.dispose()
+
+    asyncio.run(asyncio.wait_for(scenario(), 25))
+
+
 @pytest.mark.parametrize("kind", ["protected", "tombstone", "pending", "committed_history"])
 @pytest.mark.parametrize("outcome", ["running", "blocked", "failed", "skipped"])
 def test_closed_sources_refuse_before_every_run_outcome(
