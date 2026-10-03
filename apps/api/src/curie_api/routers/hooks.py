@@ -336,9 +336,7 @@ async def ingest_hook(
     x_curie_delivery_id: Annotated[str | None, Header()] = None,
     x_curie_timestamp: Annotated[str | None, Header()] = None,
 ) -> HookAccepted:
-    """@spec PROTECTED-HOOK-SOURCE-2/4/10.
-
-    Verify one hook delivery and enqueue it as a turn.
+    """Verify one hook delivery and enqueue it as a turn.
 
     ``tool_access=read-only`` opts into the existing TOOL-ACCESS contract.
     Before requesting it, the operator must verify homogeneous worker artifacts
@@ -368,6 +366,8 @@ async def ingest_hook(
     7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),
        after both of those and before anything is claimed;
     8. routability, then the claim, quota and enqueue.
+    \f
+    @spec PROTECTED-HOOK-SOURCE-2/4/10.
     """
 
     if not HOOK_NAME.fullmatch(hook):

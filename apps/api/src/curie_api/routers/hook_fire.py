@@ -242,7 +242,10 @@ async def fire_hook(
     agent_id: str,
     name: str,
 ) -> HookFireOut:
-    """@spec PROTECTED-HOOK-SOURCE-2/10."""
+    """Run one named cron hook now and return its run record.
+    \f
+    @spec PROTECTED-HOOK-SOURCE-2/10.
+    """
 
     selected = await _resolve_agent(session, agent_id)
     selected_id = uuid.UUID(str(selected.id))
