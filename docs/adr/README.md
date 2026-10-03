@@ -214,5 +214,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0189 | [Deployed agents see only their bundle's skills](0189-deployed-agents-see-only-their-bundles-skills.md) | Accepted |
 | 0190 | [Automated hook sources cannot widen their tool access](0190-automated-hook-sources-cannot-widen-their-tool-access.md) | Accepted |
 | 0191 | [Protected hooks use a separately authorized delivery lane](0191-protected-hook-delivery-authority.md) | Accepted |
-| 0193 | [A provider installation is a workspace, and it hosts channel identities](0193-a-provider-installation-is-a-workspace-and-hosts-channel-identities.md) | Draft |
+| 0193 | [Identity links live in provider identity namespaces](0193-identity-links-live-in-provider-identity-namespaces.md) | Draft |
 <!-- END GENERATED: adr-index -->
