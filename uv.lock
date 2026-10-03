@@ -869,10 +869,14 @@ version = "0.0.0"
 source = { editable = "packages/protected-hooks" }
 dependencies = [
     { name = "redis" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "redis", specifier = ">=8.1.0" }]
+requires-dist = [
+    { name = "redis", specifier = ">=8.1.0" },
+    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.51" },
+]
 
 [[package]]
 name = "curie-runner"
