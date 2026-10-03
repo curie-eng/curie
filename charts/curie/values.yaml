@@ -1148,16 +1148,16 @@ grafanaConnector:
 #   - ui         static React SPA served by nginx, proxying /api to the API
 #
 # IMAGE DEFAULTS: every app image defaults to the GHCR package the Release
-# workflow publishes. The `tag` is left EMPTY so it resolves to the chart
-# `appVersion` (see Chart.yaml) -- an immutable, per-release version tag rather
-# than the mutable `latest`. That makes installs deterministic and rollback-able:
-# the same chart version always renders the same image ref (`helm template` shows
-# `...-api:<appVersion>`, not `:latest`). For the strongest guarantee set `digest`
-# to a `sha256:...` content digest instead (it wins over `tag` and pins by digest,
-# verifiable via `cosign verify-attestation` / `gh attestation verify`); the
-# Release workflow prints each published image's digest. `pullPolicy: Always` on
-# an immutable ref is a cheap no-op that still self-heals a node that cached a
-# same-named ref, so it is kept.
+# workflow publishes. In this source tree `tag` is left EMPTY so it resolves to
+# the chart `appVersion` (see Chart.yaml) -- an immutable, per-release version
+# tag rather than the mutable `latest`. The released chart asset differs: it
+# ships each first-party image's `digest` set to the signed index digest that
+# release built. `digest` wins over `tag`, so to run a different tag from the
+# released chart, clear that image's digest too (for example
+# `--set api.image.tag=X --set api.image.digest=`). Verify signatures and
+# attestations as described in docs/release-verification.md.
+# `pullPolicy: Always` on an immutable ref is a cheap no-op that still
+# self-heals a node that cached a same-named ref, so it is kept.
 # The repo and its packages are public, so NO imagePullSecret is needed by
 # default; the `imagePullSecrets` plumbing stays for private forks. For offline
 # dev/e2e use values-dev.yaml, which repoints each image at a locally-built,
