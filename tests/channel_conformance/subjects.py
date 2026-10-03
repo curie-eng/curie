@@ -62,7 +62,7 @@ from channel_protocol.conformance import (
     Upstream,
 )
 from curie_api.github_factory_events import parse_factory_event
-from curie_api.workitems import github_reply_route
+from curie_api.workitems.lifecycle import github_reply_route
 from curie_discord_adapter.config import DiscordConfig
 from curie_discord_adapter.egress import DiscordReplyService
 from curie_discord_adapter.http import create_reply_app
