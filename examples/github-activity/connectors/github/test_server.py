@@ -20,6 +20,7 @@ import json
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import anyio
 import httpx
@@ -991,8 +992,16 @@ def test_foreign_pagination_link_is_refused_before_any_request_reaches_it(monkey
         srv.repository_activity(SINCE, UNTIL)
     assert foreign not in fake.urls()
     assert all(c["url"].startswith(f"{API}/") for c in fake.calls)
-    sent_to = [c for c in fake.calls if "evil.example.com" in c["url"] or c["url"] == foreign]
-    assert sent_to == []
+    configured = urlsplit(API)
+    # Compare parsed scheme and host, so a lookalike host or a plain-http
+    # downgrade is caught even though it shares a prefix with the configured URL.
+    strayed = [
+        c["url"]
+        for c in fake.calls
+        if (urlsplit(c["url"]).scheme, urlsplit(c["url"]).hostname)
+        != (configured.scheme, configured.hostname)
+    ]
+    assert strayed == []
 
 
 def test_events_paging_stops_once_an_event_is_older_than_since(monkeypatch):
