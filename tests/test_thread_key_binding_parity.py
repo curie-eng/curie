@@ -31,7 +31,7 @@ from curie_worker.binding import (
     ResolvedDeployment,
 )
 from curie_worker.config import WorkerConfig
-from curie_worker.kernel import _thread_key_for
+from curie_worker.kernel.routing import _thread_key_for
 from curie_worker.sandbox_token import decode
 
 _AGENT = uuid.UUID("33333333-3333-4333-8333-333333333333")

@@ -42,10 +42,10 @@ from typing import Any
 
 from aci_protocol import Final, QueuedTurn, SessionStatus, TextDelta
 from curie_dispatcher.queue import to_stream_fields
-from curie_worker import kernel as kernel_module
 from curie_worker.consumer import Consumer
 from curie_worker.consumer_liveness import ConsumerLivenessStore, consumer_heartbeat_key
 from curie_worker.delivery_lease import DeliveryLeaseStore
+from curie_worker.kernel import log as kernel_log
 
 from .conftest import _failing_process_event, _pending_rows, _ProcessEventSpy
 
@@ -944,7 +944,7 @@ def test_an_already_expired_delivery_escalates_once_records_deadline_halted_and_
     """
 
     recorded: list[tuple[str, dict[str, str]]] = []
-    real_record_metric = kernel_module.record_metric
+    real_record_metric = kernel_log.record_metric
 
     def spy(
         name: str, value: float = 1, *, attributes: dict[str, str] | None = None
@@ -952,7 +952,7 @@ def test_an_already_expired_delivery_escalates_once_records_deadline_halted_and_
         recorded.append((name, dict(attributes or {})))
         real_record_metric(name, value, attributes=attributes)
 
-    monkeypatch.setattr(kernel_module, "record_metric", spy)
+    monkeypatch.setattr(kernel_log, "record_metric", spy)
 
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:

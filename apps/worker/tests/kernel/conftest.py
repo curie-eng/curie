@@ -51,7 +51,7 @@ from curie_test_support.valkey import (
 )
 from curie_worker.approval_cards import ApprovalCardStore
 from curie_worker.config import WorkerConfig
-from curie_worker.kernel import Kernel
+from curie_worker.kernel.core import Kernel
 from curie_worker.markers import Markers
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerClient

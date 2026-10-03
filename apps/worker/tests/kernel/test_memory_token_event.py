@@ -456,11 +456,11 @@ class _ShiftedTime:
 
 
 def _shift_clocks(monkeypatch: pytest.MonkeyPatch) -> _ShiftedTime:
-    from curie_worker import kernel as kernel_module
+    from curie_worker.kernel import clock as kernel_clock
 
     clock = _ShiftedTime()
     monkeypatch.setattr(binding_module, "time", clock)
-    monkeypatch.setattr(kernel_module, "time", clock)
+    monkeypatch.setattr(kernel_clock, "time", clock)
     return clock
 
 
@@ -471,7 +471,7 @@ def _stream_s(h: Any, remaining_s: float | None) -> float:
 
 
 def _grant(thread_key: str) -> Any:
-    from curie_worker.kernel import TurnMemoryGrant
+    from curie_worker.kernel.memory import TurnMemoryGrant
 
     resolved = ResolvedDeployment(
         agent_id=AGENT_ID,

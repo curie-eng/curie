@@ -28,8 +28,8 @@ from aci_protocol import (
     TurnSource,
 )
 from channel_protocol import work_item_events
-from curie_worker import kernel as kernel_module
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.kernel import routing as kernel_routing
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemConflict,
@@ -276,7 +276,7 @@ def test_a_targetless_ci_id_is_refused() -> None:
         ),
     )
     with pytest.raises(ValueError, match="work-item or resume id"):
-        kernel_module._check_targetless_shape(turn)
+        kernel_routing._check_targetless_shape(turn)
 
 
 # --- adoption into the same request ---------------------------------------------------
@@ -396,7 +396,7 @@ def test_a_fix_publication_carries_the_adopted_request_and_epoch(
 
             monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
             monkeypatch.setattr(
-                "curie_worker.kernel.validate_snapshot_against_base",
+                'curie_worker.kernel.attempt.validate_snapshot_against_base',
                 lambda *_args, **_kwargs: None,
             )
 

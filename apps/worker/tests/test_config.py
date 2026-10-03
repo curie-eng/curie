@@ -25,7 +25,7 @@ from curie_worker.attachments import AttachmentLimits
 from curie_worker.config import WorkerConfig
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
-from curie_worker.kernel import Kernel
+from curie_worker.kernel.core import Kernel
 from nacl.signing import SigningKey
 from pydantic import AliasChoices, ValidationError
 from redis.asyncio import Redis as AsyncRedis

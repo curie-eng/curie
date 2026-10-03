@@ -29,7 +29,7 @@ from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_worker.config import WorkerConfig
-from curie_worker.kernel import Kernel
+from curie_worker.kernel.core import Kernel
 from curie_worker.markers import Markers
 from curie_worker.runner_client import RunnerClient
 from curie_worker.threadlock import ThreadLock

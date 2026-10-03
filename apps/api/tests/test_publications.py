@@ -2054,7 +2054,7 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
     from curie_worker.approvals import CreatedPublication, PublicationCreateRequest
     from curie_worker.behaviorpacks import BehaviorPacks
     from curie_worker.binding import ResolvedDeployment
-    from curie_worker.kernel import TurnOutcome
+    from curie_worker.kernel.failures import TurnOutcome
     from curie_worker.runner_client import RunnerWorkspaceSnapshot
 
     from apps.worker.tests.kernel.conftest import kernel_harness

@@ -36,12 +36,18 @@ from aci_protocol import (
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyTarget
-from curie_worker import kernel as kernel_module
 from curie_worker.actions import ActionClient
 from curie_worker.attachments import PreparedAttachments
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.capacity_wait import CapacityWaitRequested
-from curie_worker.kernel import ThreadBusyError
+from curie_worker.kernel import constants as kernel_constants
+from curie_worker.kernel import core as kernel_core
+from curie_worker.kernel import delivery as kernel_delivery
+from curie_worker.kernel import failures as kernel_failures
+from curie_worker.kernel import log as kernel_log
+from curie_worker.kernel import routing as kernel_routing
+from curie_worker.kernel import workspace as kernel_workspace
+from curie_worker.kernel.failures import ThreadBusyError
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerError, TurnStream
 from curie_worker.sandbox import (
@@ -178,7 +184,7 @@ class _PressureAttachmentLane:
 
 
 def _capture_pressure_outcomes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    real_record_metric = kernel_module.record_metric
+    real_record_metric = kernel_log.record_metric
     outcomes: list[str] = []
 
     def record(
@@ -195,7 +201,7 @@ def _capture_pressure_outcomes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         ):
             outcomes.append(attributes["outcome"])
 
-    monkeypatch.setattr(kernel_module, "record_metric", record)
+    monkeypatch.setattr(kernel_log, "record_metric", record)
     return outcomes
 
 
@@ -904,16 +910,16 @@ def test_announcement_sits_between_answer_and_receipt(
 ) -> None:
     # A unit on the composition order: answer, announcement, receipt. The stub
     # takes the install's receipt mode too (ADR-0180), which the order ignores.
-    monkeypatch.setattr(kernel_module, "render_receipt", lambda rows, mode="all": "RECEIPT")
+    monkeypatch.setattr(kernel_delivery, "render_receipt", lambda rows, mode="all": "RECEIPT")
 
-    announced = kernel_module._StreamAccumulator(
+    announced = kernel_delivery._StreamAccumulator(
         text_parts=["answer"],
         receipt_rows=[{"x": 1}],
         workspace_inferred_repo="acme-corp/acme-bot",
     )
     assert announced.rendered_with_receipt() == f"answer\n\n{_ANNOUNCEMENT}\n\nRECEIPT"
 
-    unannounced = kernel_module._StreamAccumulator(
+    unannounced = kernel_delivery._StreamAccumulator(
         text_parts=["answer"],
         receipt_rows=[{"x": 1}],
     )
@@ -2486,7 +2492,7 @@ def test_streamer_adopts_its_own_minted_ref(make_harness) -> None:
 
     async def go() -> None:
         async with make_harness() as h:
-            reply = kernel_module._ThrottledReply(
+            reply = kernel_delivery._ThrottledReply(
                 h.sink,
                 target=ReplyTarget(
                     kind="slack", address="C1", conversation_id="th-1", reply_ref=None
@@ -3118,11 +3124,11 @@ def test_turn_start_failure_is_retryable_not_a_stall(make_harness) -> None:
 def test_max_turns_classification_is_platform_vocabulary_and_not_retryable() -> None:
     """#3071: an exhausted turn budget is a named platform failure, and retrying
     it would only burn the same budget again."""
-    from curie_worker.kernel import (
+    from curie_worker.kernel.constants import (
         PLATFORM_ERROR_CLASSIFICATIONS,
         RETRYABLE_CLASSIFICATIONS,
-        map_error_classification,
     )
+    from curie_worker.kernel.failures import map_error_classification
 
     assert "max-turns" in PLATFORM_ERROR_CLASSIFICATIONS
     assert "max-turns" not in RETRYABLE_CLASSIFICATIONS
@@ -3152,7 +3158,7 @@ def test_max_turns_escalates_once_naming_the_turn_budget_knob(make_harness) -> N
             assert "CURIE_MAX_TURNS" in text, text
             assert "CURIE_WORK_ITEM_MAX_TURNS" not in text, text
             assert text.startswith("curie-turn-failure: max-turns\n")
-            assert kernel_module.failure_class_from_reply(text) == "max-turns"
+            assert kernel_failures.failure_class_from_reply(text) == "max-turns"
 
     asyncio.run(go())
 
@@ -3174,7 +3180,7 @@ def test_failed_turn_reply_replaces_success_looking_model_text(make_harness) -> 
 
             reply = h.sink.last_text
             assert reply is not None
-            assert kernel_module.failure_class_from_reply(reply) == "max-turns"
+            assert kernel_failures.failure_class_from_reply(reply) == "max-turns"
             assert model_text not in reply
             assert h.sink.completions[-1].outcome == "escalated"
 
@@ -3192,15 +3198,15 @@ def test_successful_reply_is_not_a_failure_marker(make_harness) -> None:
 
             reply = h.sink.last_text
             assert reply == "the answer is PONG"
-            assert kernel_module.failure_class_from_reply(reply or "") is None
+            assert kernel_failures.failure_class_from_reply(reply or "") is None
             assert (
-                kernel_module.failure_class_from_reply(
+                kernel_failures.failure_class_from_reply(
                     "the answer is PONG\n\ncurie-turn-failure: max-turns"
                 )
                 is None
             )
             assert (
-                kernel_module.failure_class_from_reply(
+                kernel_failures.failure_class_from_reply(
                     "curie-turn-failure: max-turns and more words"
                 )
                 is None
@@ -3538,7 +3544,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
             event_id = "idle-route-capacity-trigger"
             lease = await _leased_entry(h, store, event_id=event_id, generation=1)
             h.runner.default_script = [Final(text="started after reclaim", status=DONE)]
-            real_record_metric = kernel_module.record_metric
+            real_record_metric = kernel_log.record_metric
 
             def record(
                 name: str,
@@ -3557,7 +3563,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
                     assert h.substrate.lookup(_thread_key(oldest_thread)) is None
                     outcomes.append(attributes["outcome"])
 
-            monkeypatch.setattr(kernel_module, "record_metric", record)
+            monkeypatch.setattr(kernel_log, "record_metric", record)
 
             await h.kernel.process_event(
                 qevent("start a new turn", thread=trigger_thread, event_id=event_id),
@@ -3673,7 +3679,7 @@ def test_quota_pressure_reclaims_an_idle_eval_route_before_an_older_person_route
 def test_is_eval_thread_key_reads_the_isolate_prefix_from_the_scoped_key() -> None:
     from channel_protocol import scoped_conversation_id
 
-    is_eval = kernel_module._is_eval_thread_key  # noqa: SLF001
+    is_eval = kernel_routing._is_eval_thread_key  # noqa: SLF001
 
     assert is_eval(scoped_conversation_id("slack", "C1", "eval:1720000000.000100"))
     assert is_eval(
@@ -4493,7 +4499,7 @@ def test_route_created_between_attachment_retry_locks_keeps_changed_route_outcom
             assert lane.discard_calls == 2
             assert h.substrate.lookup(trigger_key) is not None
             assert h.runner.opened == []
-            assert h.sink.last_text == kernel_module._CHANGED_ATTACHMENT_REPLY
+            assert h.sink.last_text == kernel_constants._CHANGED_ATTACHMENT_REPLY
 
     asyncio.run(go())
 
@@ -4557,7 +4563,7 @@ def test_pressure_can_reclaim_victim_between_its_attachment_locks(
             assert lane.resolve_calls == 1
             assert lane.discard_calls == 1
             assert any(
-                update[2] == kernel_module._CHANGED_ATTACHMENT_REPLY for update in h.sink.updates
+                update[2] == kernel_constants._CHANGED_ATTACHMENT_REPLY for update in h.sink.updates
             )
 
     asyncio.run(go())
@@ -4600,22 +4606,22 @@ def test_quota_without_delivery_budget_refuses_before_pressure_inventory(
 
 def test_pressure_ceiling_is_derived_from_named_transport_slices() -> None:
     cold_redis_operation = (
-        kernel_module._PRESSURE_REDIS_CONNECT_S + 3 * kernel_module._PRESSURE_REDIS_READ_S
+        kernel_constants._PRESSURE_REDIS_CONNECT_S + 3 * kernel_constants._PRESSURE_REDIS_READ_S
     )
-    inventory = kernel_module._PRESSURE_SCAN_DEADLINE_S
+    inventory = kernel_constants._PRESSURE_SCAN_DEADLINE_S
     candidate = (
         2 * cold_redis_operation
-        + kernel_module._PRESSURE_RUNNER_STATUS_S
-        + 3 * kernel_module._PRESSURE_REDIS_READ_S
+        + kernel_constants._PRESSURE_RUNNER_STATUS_S
+        + 3 * kernel_constants._PRESSURE_REDIS_READ_S
     )
-    cleanup = kernel_module._PRESSURE_DELETE_S + kernel_module._PRESSURE_GONE_WAIT_S
+    cleanup = kernel_constants._PRESSURE_DELETE_S + kernel_constants._PRESSURE_GONE_WAIT_S
 
-    assert kernel_module._PRESSURE_REDIS_COLD_OPERATION_S == cold_redis_operation
-    assert kernel_module._PRESSURE_INVENTORY_CEILING_S == inventory
-    assert kernel_module._PRESSURE_CANDIDATE_CEILING_S == candidate
-    assert kernel_module._PRESSURE_CLEANUP_CEILING_S == cleanup
-    assert kernel_module._PRESSURE_CEILING_S == (
-        inventory + kernel_module._PRESSURE_CANDIDATES * candidate + cleanup
+    assert kernel_constants._PRESSURE_REDIS_COLD_OPERATION_S == cold_redis_operation
+    assert kernel_constants._PRESSURE_INVENTORY_CEILING_S == inventory
+    assert kernel_constants._PRESSURE_CANDIDATE_CEILING_S == candidate
+    assert kernel_constants._PRESSURE_CLEANUP_CEILING_S == cleanup
+    assert kernel_constants._PRESSURE_CEILING_S == (
+        inventory + kernel_constants._PRESSURE_CANDIDATES * candidate + cleanup
     )
 
 
@@ -4625,7 +4631,7 @@ def test_pressure_entry_refuses_when_current_budget_is_below_derived_floor(
 ) -> None:
     async def go() -> None:
         claim_timeout = 0.05
-        budget = kernel_module._PRESSURE_CEILING_S + claim_timeout - 0.01
+        budget = kernel_constants._PRESSURE_CEILING_S + claim_timeout - 0.01
         async with make_harness(
             binding=_HistoryBinding(),
             claim_timeout_seconds=claim_timeout,
@@ -4666,7 +4672,7 @@ def test_scan_cap_emits_one_incomplete_pressure_outcome(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     outcomes = _capture_pressure_outcomes(monkeypatch)
-    monkeypatch.setattr(kernel_module, "_PRESSURE_SCAN_RECORDS", 0)
+    monkeypatch.setattr(kernel_constants, "_PRESSURE_SCAN_RECORDS", 0)
 
     async def go() -> None:
         async with make_harness(
@@ -4698,7 +4704,7 @@ def test_expiry_unsupported_is_a_declared_finite_pressure_outcome(
 ) -> None:
     outcomes = _capture_pressure_outcomes(monkeypatch)
 
-    kernel_module.Kernel._record_pressure_outcome("expiry-unsupported")
+    kernel_core.Kernel._record_pressure_outcome("expiry-unsupported")
 
     assert outcomes == ["expiry-unsupported"]
 
@@ -4791,7 +4797,7 @@ def test_approval_resume_capacity_retries_then_escalates(
     names the decision, not an approval.
     """
 
-    real_record_metric = kernel_module.record_metric
+    real_record_metric = kernel_log.record_metric
     recorded: list[tuple[str, dict[str, str]]] = []
 
     def spy(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
@@ -4799,7 +4805,7 @@ def test_approval_resume_capacity_retries_then_escalates(
         # Delegate so the metric allowlist still validates the new class.
         real_record_metric(name, value, attributes=attributes)
 
-    monkeypatch.setattr(kernel_module, "record_metric", spy)
+    monkeypatch.setattr(kernel_log, "record_metric", spy)
 
     async def go() -> None:
         async with make_harness(
@@ -5090,7 +5096,7 @@ def test_interrupt_agent_signals_other_threads_past_a_wedged_runner(
                 await h.kernel.process_event(qevent("hi", thread=thread))
             h.kernel._active_by_agent[agent_id] = {_thread_key(t) for t in threads}
 
-            monkeypatch.setattr(kernel_module, "_KILL_INTERRUPT_TIMEOUT_S", 0.2)
+            monkeypatch.setattr(kernel_constants, "_KILL_INTERRUPT_TIMEOUT_S", 0.2)
 
             wedged = asyncio.Event()  # never set: the first thread's runner hangs forever
             attempted: list[str] = []
@@ -5728,7 +5734,7 @@ def test_release_thread_releases_when_the_runner_never_answers_the_interrupt(
             await h.kernel.process_event(qevent("hi", thread="tWedged"))
             assert h.substrate.lookup(_thread_key("tWedged")) is not None  # the route is live
 
-            monkeypatch.setattr(kernel_module, "_RESET_INTERRUPT_TIMEOUT_S", 0.2)
+            monkeypatch.setattr(kernel_constants, "_RESET_INTERRUPT_TIMEOUT_S", 0.2)
 
             wedged = asyncio.Event()  # never set: the runner answers nothing, ever
 
@@ -5901,7 +5907,7 @@ def test_lock_acquire_timeout_is_a_retryable_turn_start_failure(make_harness) ->
                 TargetRoute(),
                 release_order,
                 pressure_retried=False,
-                workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
             )
 
             assert outcome.terminal_ok is False
@@ -6355,7 +6361,7 @@ def test_stream_timeout_classifies_as_runner_timeout_with_a_named_reason(
                         TargetRoute(),
                         release_order,
                         pressure_retried=False,
-                        workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                        workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
                     )
             finally:
                 hold.set()  # let the fake runner's handler unwind
@@ -6499,7 +6505,7 @@ def test_error_event_classification_precedes_unconfirmed_stream_timeout(
                     TargetRoute(),
                     lambda: None,
                     pressure_retried=False,
-                    workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                    workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
                 )
             finally:
                 hold.set()
@@ -6511,25 +6517,25 @@ def test_error_event_classification_precedes_unconfirmed_stream_timeout(
 
 
 def test_history_persistence_error_has_dedicated_factory_cause() -> None:
-    failure = kernel_module.TurnOutcome(
+    failure = kernel_failures.TurnOutcome(
         terminal_ok=False,
         classification="history-persistence-error",
         error_message="conversation history capacity exceeded",
     )
 
-    assert kernel_module._escalation_cause(failure) == "history_capacity"
+    assert kernel_failures._escalation_cause(failure) == "history_capacity"
 
 
 def test_max_turns_and_unclassified_have_their_own_factory_causes() -> None:
-    max_turns = kernel_module.TurnOutcome(
+    max_turns = kernel_failures.TurnOutcome(
         terminal_ok=False, classification="max-turns"
     )
-    unclassified = kernel_module.TurnOutcome(
+    unclassified = kernel_failures.TurnOutcome(
         terminal_ok=False, classification="unclassified"
     )
 
-    assert kernel_module._escalation_cause(max_turns) == "max_turns"
-    assert kernel_module._escalation_cause(unclassified) == "unclassified"
+    assert kernel_failures._escalation_cause(max_turns) == "max_turns"
+    assert kernel_failures._escalation_cause(unclassified) == "unclassified"
 
 
 @pytest.mark.parametrize(
@@ -6659,7 +6665,7 @@ def test_stream_timeout_without_a_side_effect_still_retries(make_harness, monkey
     the retry folded into the dead turn as a STEER instead of opening a second
     one, which is what ``steers == []`` below guards."""
 
-    real_record_metric = kernel_module.record_metric
+    real_record_metric = kernel_log.record_metric
     recorded: list[tuple[str, dict[str, str]]] = []
 
     def spy(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
@@ -6667,7 +6673,7 @@ def test_stream_timeout_without_a_side_effect_still_retries(make_harness, monkey
         # Delegate to the real recorder so the metric allowlist still validates.
         real_record_metric(name, value, attributes=attributes)
 
-    monkeypatch.setattr(kernel_module, "record_metric", spy)
+    monkeypatch.setattr(kernel_log, "record_metric", spy)
 
     async def go() -> None:
         async with make_harness(
@@ -6747,7 +6753,7 @@ def test_reply_delivery_timeout_is_not_a_runner_timeout(make_harness, caplog, mo
                     TargetRoute(),
                     lambda: None,
                     pressure_retried=False,
-                    workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                    workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
                 )
 
             assert outcome.terminal_ok is False

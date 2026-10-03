@@ -31,7 +31,7 @@ from channel_protocol.reply import ReplyAck, ReplyEvent
 from curie_worker.approvals import ApprovalRequest, CreatedApproval, PublicationLineage
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.config import WorkerConfig
-from curie_worker.kernel import ThreadBusyError
+from curie_worker.kernel.failures import ThreadBusyError
 from curie_worker.reply_sink import ReplySink, TargetRoute, build_reply_sink
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
