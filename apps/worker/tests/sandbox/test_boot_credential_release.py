@@ -8,7 +8,7 @@ import uuid
 from curie_worker.binding import HISTORY_TOKEN_ENV
 from curie_worker.sandbox.affinity import AffinityStore
 from curie_worker.sandbox.substrate import SandboxSubstrate
-from curie_worker.sandbox.types import SubstrateConfig
+from curie_worker.sandbox.types import SandboxHandle, SubstrateConfig
 from curie_worker.sandbox_token import mint
 
 from .conftest import FakeSandboxClient
@@ -70,3 +70,25 @@ def test_a_failed_report_is_retried_once_the_claim_is_gone(
     substrate.reap_orphans()
     assert calls["n"] == 2
     assert affinity.claim_credential(handle.claim_name) is None
+
+
+def test_a_preexisting_handle_is_persisted_when_the_report_fails(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    substrate.set_boot_credential_revoker(lambda _agent, _cred: False)
+    agent = "44444444-4444-4444-8444-444444444444"
+    cred = uuid.uuid4().hex
+    handle = SandboxHandle(
+        thread_key="thread-old",
+        claim_name="claim-old",
+        sandbox_name="sandbox-old",
+        namespace=config.namespace,
+        service_fqdn="sandbox-old.curie.svc",
+        port=8080,
+        session_id="session-old",
+        state_credential_agent=agent,
+        state_credential_id=cred,
+    )
+    substrate._retire_claim(handle.claim_name, request_timeout_seconds=5, handle=handle)
+    assert affinity.claim_credential(handle.claim_name) == (agent, cred)

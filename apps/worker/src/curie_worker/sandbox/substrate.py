@@ -206,6 +206,7 @@ class SandboxSubstrate:
 
         agent: str | None = None
         cred: str | None = None
+        stored: tuple[str, str] | None = None
         if claim_name is not None:
             stored = self._affinity.claim_credential(claim_name)
             if stored is not None:
@@ -218,10 +219,10 @@ class SandboxSubstrate:
                 if env is not None:
                     token = env.get(HISTORY_TOKEN_ENV) or env.get(BootEnv.env_key("state_token"))
                 agent, cred, _exp = boot_token_facts(token)
-                if agent and cred and claim_name is not None:
-                    self._affinity.remember_claim_credential(
-                        claim_name, agent, cred, ttl_s=SANDBOX_TOKEN_TTL_SECONDS
-                    )
+        if agent and cred and claim_name is not None and stored is None:
+            self._affinity.remember_claim_credential(
+                claim_name, agent, cred, ttl_s=SANDBOX_TOKEN_TTL_SECONDS
+            )
         if not agent or not cred:
             return
         revoker = self._boot_credential_revoker
@@ -1279,6 +1280,7 @@ class SandboxSubstrate:
                 derived = self._existing_agent_pool(config.warm_pool, agent_name)
                 if derived is not None:
                     pool = derived
+        self._remember_claim_credential(name, env)
         self._k8s.create_claim(
             name,
             pool=pool,
@@ -1287,7 +1289,6 @@ class SandboxSubstrate:
             runner_resources=runner_resources,
             agent_name=agent_name,
         )
-        self._remember_claim_credential(name, env)
         deadline = time.monotonic() + config.claim_timeout_seconds
         try:
             sandbox_name = self._await_bound(name, deadline)
