@@ -45,6 +45,23 @@ NEW_KEYS = {
     "refusal_registry_delete": "REFUSAL_REGISTRY_DELETE",
 }
 
+# The keys #3247 adds for deploy, run, logs and events.
+WORKLOAD_KEYS = {
+    "refusal_cluster_scoped": "REFUSAL_CLUSTER_SCOPED",
+    "refusal_image_not_digest": "REFUSAL_IMAGE_NOT_DIGEST",
+    "refusal_deploy_manifest": "REFUSAL_DEPLOY_MANIFEST",
+    "refusal_deploy_object": "REFUSAL_DEPLOY_OBJECT",
+    "refusal_deploy_failed": "REFUSAL_DEPLOY_FAILED",
+    "refusal_run_argument": "REFUSAL_RUN_ARGUMENT",
+    "refusal_run_failed": "REFUSAL_RUN_FAILED",
+    "refusal_run_timeout": "REFUSAL_RUN_TIMEOUT",
+    "refusal_pod_not_found": "REFUSAL_POD_NOT_FOUND",
+    "refusal_logs_refused": "REFUSAL_LOGS_REFUSED",
+    "run_job_prefix": "RUN_JOB_PREFIX",
+    "run_timeout_s": "RUN_TIMEOUT_S",
+    "output_limit_bytes": "OUTPUT_LIMIT_BYTES",
+}
+
 
 def vector() -> dict[str, Any]:
     loaded = json.loads(VECTOR.read_text(encoding="utf-8"))
@@ -70,7 +87,11 @@ def test_every_vector_key_equals_its_constant(key: str) -> None:
     assert vector()[key] == expected_value(key)
 
 
-@pytest.mark.parametrize(("key", "constant"), sorted(NEW_KEYS.items()))
+def test_the_vector_carries_every_workload_key() -> None:
+    assert sorted(set(WORKLOAD_KEYS) - set(vector())) == []
+
+
+@pytest.mark.parametrize(("key", "constant"), sorted({**NEW_KEYS, **WORKLOAD_KEYS}.items()))
 def test_new_keys_map_to_the_named_constants(key: str, constant: str) -> None:
     assert key.upper() == constant
     assert hasattr(contract, constant)
@@ -99,6 +120,14 @@ def test_fixed_values() -> None:
     assert "@sha256:" in contract.DEFAULT_PUSH_IMAGE
     assert "@sha256:" in contract.DEFAULT_BUILDER_IMAGE
     assert "@sha256:" in contract.DEFAULT_GIT_IMAGE
+
+
+def test_workload_fixed_values() -> None:
+    assert contract.REFUSAL_CLUSTER_SCOPED == "e2e_cluster_scoped_object"
+    assert contract.REFUSAL_IMAGE_NOT_DIGEST == "e2e_image_not_digest"
+    assert contract.RUN_JOB_PREFIX == "e2e-run-"
+    assert contract.RUN_TIMEOUT_S == 1200
+    assert contract.OUTPUT_LIMIT_BYTES == 65536
 
 
 def test_platform_env_adds_the_nine_build_names_before_port() -> None:
