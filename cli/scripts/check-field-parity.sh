@@ -4,7 +4,7 @@
 #  - cli/src/api.rs mirrors of the platform REST DTOs against the committed
 #    apps/api/openapi.json (#691, cli/api-mirrors.json,
 #    cli/tests/api_field_parity.rs).
-#  - cli/src/commands.rs + cli/src/spec.rs hand-mirrors of the frozen
+#  - cli/src/commands/*.rs + cli/src/spec.rs hand-mirrors of the frozen
 #    packages/plugin-format manifest shape (#701, the sibling seam #691
 #    explicitly did not cover: a different source of truth, the frozen
 #    package's own packages/plugin-format/schema/plugin-format.schema.json

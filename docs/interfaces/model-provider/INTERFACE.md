@@ -130,14 +130,14 @@ hosts for Anthropic, OpenRouter, Zhipu, Moonshot, and DeepSeek.
 - **Two mirrors of the non-forwardable-credential rule.** The runner is the authority
   for the `sk-ant-oat` prefix
   (`runner/src/curie_runner/sdk_auth.py::OAUTH_TOKEN_PREFIX`). Above the seam
-  the CLI (`cli/src/commands.rs`) and the
+  the CLI (`cli/src/commands/credential_env.rs`) and the
   worker's Docker sandbox
   (`apps/worker/src/curie_worker/sandbox/docker.py::_OAUTH_TOKEN_PREFIX`) each
   re-declare the literal so they can decide whether to forward a credential into a
   sandbox. The three are pinned together by the shared vector file
   `tests/vectors/model-credential-forwarding.json`, read by
   `apps/worker/tests/sandbox/test_vector_credential_forwarding.py` and by the vector
-  loop in the `cli/src/commands.rs` test module, so a lane that changes the rule
+  loop in `cli/src/commands/tests.rs`, so a lane that changes the rule
   without changing the file fails its own test. That gate makes the duplication safe,
   not absent: those mirrors remain tied to Claude credential policy.
 

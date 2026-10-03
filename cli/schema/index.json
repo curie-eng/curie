@@ -469,6 +469,6 @@
   "raw_emit_sites": {
     "cli/src/ui.rs": 1,
     "cli/src/main.rs": 1,
-    "cli/src/commands.rs": 1
+    "cli/src/commands/eval.rs": 1
   }
 }

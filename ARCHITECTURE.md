@@ -68,7 +68,7 @@ on 2026-08-20.
 
 | Clause | Status | Evidence and limit |
 | --- | --- | --- |
-| Skill uses an immutable snapshot | ENFORCED | `cli/src/bundle.rs`, `cli/src/commands.rs`, and `cli/src/docker.rs` materialize and mount a content addressed snapshot read only. The snapshot materialization test in `cli/src/bundle.rs` and `cli/scripts/e2e.sh` AC1 mutate the source after boot and require unchanged mounted bytes and digest. |
+| Skill uses an immutable snapshot | ENFORCED | `cli/src/bundle.rs`, `cli/src/commands/skill.rs`, and `cli/src/docker.rs` materialize and mount a content addressed snapshot read only. The snapshot materialization test in `cli/src/bundle.rs` and `cli/scripts/e2e.sh` AC1 mutate the source after boot and require unchanged mounted bytes and digest. |
 | Every tier uses the same bundle | VALIDATED-ONLY | `cli/scripts/e2e-ladder.sh` compares independently computed skill, local, local release, and cluster receipt digests in `assert_bundle_identity`. Individual commands do not require a prior rung digest and can deploy different trees. |
 | Every tier uses the same eval suite | VALIDATED-ONLY | `cli/scripts/e2e-ladder.sh` asserts suite name and count only from each tier's `eval --dry-run` in `assert_suite`. The bundle digest covers the suite bytes, but this dry run check does not read or compare case ids. No product state binds later tier commands to an earlier suite. |
 | Every tier uses the same model mode | VALIDATED-ONLY | `cli/scripts/e2e-ladder.sh` checks deployed `CURIE_FAKE_MODEL` in `assert_model_mode`, `probe_local_fake_model`, and `probe_cluster_fake_model`. Mode remains independently configurable outside the ladder. |
@@ -105,11 +105,11 @@ The routing and bundle-reuse rows below were refreshed against `main` commit
 | Clause | Status | Evidence and limit |
 | --- | --- | --- |
 | Eval cases have one checked schema | ENFORCED | Pydantic owns `apps/worker/schema/eval-cases.schema.json`; `apps/worker/tests/eval/test_schema_compat.py` rejects generated artifact drift; the schema grader deserialization test in `cli/src/evals.rs` rejects a grader kind the Rust loader cannot read. |
-| Text graders determine pass or fail | ENFORCED | `cli/src/evals.rs` serves skill eval through `Grader::grade`; `cli/src/message.rs` serves local and cluster messages through `reply_passes`. `cli/src/commands.rs` exits failure for any genuine case failure, with unit coverage for exact, contains, regex, terminal status, and classified failures. |
+| Text graders determine pass or fail | ENFORCED | `cli/src/evals.rs` serves skill eval through `Grader::grade`; `cli/src/message.rs` serves local and cluster messages through `reply_passes`. `cli/src/commands/eval.rs` exits failure for any genuine case failure, with unit coverage for exact, contains, regex, terminal status, and classified failures. |
 | Trajectory grader semantics agree across languages | ENFORCED | Python `apps/worker/src/curie_worker/eval/scorer.py::match_trajectory` and Rust `cli/src/evals.rs` replay `tests/vectors/trajectory-match.json`. `apps/worker/tests/eval/test_trajectory.py::test_python_matcher_owns_the_shared_cross_language_vectors` and the five mode trajectory test in `cli/tests/trajectory_eval.rs` cover all modes. |
 | One server side grader implementation exists | RESERVED | `cli/src/evals.rs` and `apps/worker/src/curie_worker/eval/models.py` each implement graders. Shared schema and vectors limit drift but do not create one implementation. |
 | Fake models cannot produce a quality pass | ENFORCED | `cli/src/evals.rs` and `apps/worker/src/curie_worker/eval/runner.py` return `PLUMBING_OK` before grading with a fake model. `apps/worker/src/curie_worker/eval/stream.py`, `cli/tests/fake_tier_plumbing.rs`, and worker tests pin the tri state. |
-| Skill, local, and local release grade failures are fatal | ENFORCED | `cli/src/commands.rs` exits 1 for a failed case. `cli/scripts/e2e-ladder.sh` runs skill, local, and local release evals under `set -e`; the associated nightly jobs therefore fail on those grades. |
+| Skill, local, and local release grade failures are fatal | ENFORCED | `cli/src/commands/eval.rs` exits 1 for a failed case. `cli/scripts/e2e-ladder.sh` runs skill, local, and local release evals under `set -e`; the associated nightly jobs therefore fail on those grades. |
 | Cluster answer quality failure is fatal | VALIDATED-ONLY | The `rung_cluster` path in `cli/scripts/e2e-ladder.sh` runs live `cluster eval --json` but captures a failure and reports it without failing the rung, citing issue #1603. The current grader cannot prove forecast provenance. Cluster plumbing remains fatal, answer quality does not. |
 | Cluster workers receive eval reporting environment | ENFORCED | On `next`, `charts/curie/templates/worker.yaml` supplies `CURIE_API_URL`, `CURIE_API_KEY`, and three `LANGFUSE_*` values. `charts/curie/ci/worker-eval-wiring-assertions.sh`, run as `helm render assertions (worker eval wiring)` in `.github/workflows/helm-ci.yaml`, requires one correctly sourced entry with default and connector enabled renders. Issue #1452 and PR #1486 fixed only these five worker reporting environment entries on `next`, not the broader installed cluster gate. |
 | A semantic provenance grader exists | RESERVED | Neither Python nor Rust defines `GraderKind.verifier`. Issue #1603 names it as the prerequisite for a meaningful fatal cluster weather grade; the current exact, contains, regex, and `tool_called` kinds cannot prove source provenance. |
@@ -694,7 +694,7 @@ can be a redacted per-run trace/log attribute, not a resource or metric label.
 **The observability CLI.** `curie local observability` prints the local
 observability surfaces — the console, Langfuse traces/cost, and the API base.
 `curie cluster observability` is its cluster twin. Both are per-tier
-subcommands, not a top-level one ([`cli/src/main.rs`](cli/src/main.rs)). It is
+subcommands, not a top-level one ([`cli/src/args/`](cli/src/args/)). It is
 deliberately a **thin client over the same `apps/api` proxy the UI uses, not a
 second backend** (ADR-0038,
 [`docs/adr/0038-observability-cli-helper-for-the-agent-dev-loop.md`](docs/adr/0038-observability-cli-helper-for-the-agent-dev-loop.md)).

@@ -44,15 +44,15 @@ IDLE_ROUTE_PATH = (
     REPO_ROOT / "cli" / "scripts" / "e2e-cluster-idle-route-reclamation.sh"
 )
 MAIL_ADAPTER_PATH = REPO_ROOT / "scripts" / "e2e-mail-adapter.sh"
-CLI_MAIN_PATH = REPO_ROOT / "cli" / "src" / "main.rs"
+CLI_DEV_DISPATCH_PATH = REPO_ROOT / "cli" / "src" / "dispatch" / "dev_action.rs"
 # Every script a `curie dev` verb runs, read from the verbs' dispatch.
-DEV_SCRIPT_CALLS = CLI_MAIN_PATH.read_text().count("dev_script(")
+DEV_SCRIPT_CALLS = CLI_DEV_DISPATCH_PATH.read_text().count("dev_script(")
 DEV_SCRIPTS = [
     REPO_ROOT / path
-    for path in re.findall(r'dev_script\(\s*"([^"]+\.sh)"', CLI_MAIN_PATH.read_text())
+    for path in re.findall(r'dev_script\(\s*"([^"]+\.sh)"', CLI_DEV_DISPATCH_PATH.read_text())
 ]
 # `curie dev chart-check` runs this with the bash on PATH through
-# `run_chart_check_scripts` (cli/src/commands.rs), not `dev_script`, so the
+# `run_chart_check_scripts` (cli/src/commands/dev.rs), not `dev_script`, so the
 # dispatch above does not find it.
 WORKER_TTL_BOUNDS_PATH = (
     REPO_ROOT / "charts" / "curie" / "ci" / "worker-ttl-bounds-assertions.sh"
@@ -203,7 +203,7 @@ def test_every_curie_dev_script_is_a_host_script() -> None:
     """A dispatch the pattern cannot read would drop its script silently."""
 
     assert len(DEV_SCRIPTS) == DEV_SCRIPT_CALLS, (
-        f"{CLI_MAIN_PATH} calls dev_script {DEV_SCRIPT_CALLS} times, but only "
+        f"{CLI_DEV_DISPATCH_PATH} calls dev_script {DEV_SCRIPT_CALLS} times, but only "
         f"{len(DEV_SCRIPTS)} name a script literally"
     )
     assert {LADDER_PATH, AGENT_SKILLS_PATH} <= set(DEV_SCRIPTS)

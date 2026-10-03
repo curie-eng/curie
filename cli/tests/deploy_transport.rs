@@ -7,7 +7,7 @@
 //! rather than defaulting to a dev placeholder; an explicit key wins.
 //!
 //! These tests pin two pure builders the implementer will add to
-//! `cli/src/commands.rs` (imported here from the `curie` lib):
+//! `cli/src/commands/deploy.rs` (imported here from the `curie` lib):
 //!
 //!   pub fn deploy_port_forward(
 //!       api_url: Option<&str>,

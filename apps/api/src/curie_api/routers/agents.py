@@ -804,7 +804,7 @@ async def read_version_connectors(
             # it returns to a Kubernetes cluster: the worker's connector
             # reconcile loop (`curie_worker.connector_loop.HttpManifestSource`,
             # ADR-0090) and `curie cluster deploy`'s `sync_connectors`
-            # (`cli/src/main.rs`, ADR-0086). Nothing reads these manifests for
+            # (`cli/src/dispatch/cluster_action.rs`, ADR-0086). Nothing reads these manifests for
             # display. A `local-daemon` lock records a bare docker image id that
             # names nothing a node can pull, so rendering one here yields a
             # Deployment that ImagePullBackOffs long after the deploy reported

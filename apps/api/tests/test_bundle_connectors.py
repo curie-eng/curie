@@ -542,7 +542,7 @@ def test_the_connectors_route_refuses_a_local_daemon_lock(
     # Everything that calls this route APPLIES what it returns to a cluster --
     # the worker's connector reconcile loop
     # (`curie_worker.connector_loop.HttpManifestSource`, ADR-0090) and
-    # `curie cluster deploy`'s `sync_connectors` (`cli/src/main.rs`, ADR-0086).
+    # `curie cluster deploy`'s `sync_connectors` (`cli/src/dispatch/cluster_action.rs`, ADR-0086).
     # A `local-daemon` lock records a bare image id no node can pull, so
     # rendering it hands the applier a Deployment that ImagePullBackOffs minutes
     # after the deploy reported success, with every gate green. The bundle

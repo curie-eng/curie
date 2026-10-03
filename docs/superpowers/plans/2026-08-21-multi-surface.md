@@ -143,7 +143,7 @@ Run: `git add apps/worker apps/dispatcher/tests/test_dispatch.py && git commit -
 
 **Files:**
 - Modify: `cli/src/api.rs`
-- Modify: `cli/src/commands.rs`
+- Modify: `cli/src/commands/` (then a single `commands.rs`)
 - Modify: `cli/src/main.rs`
 - Modify: `cli/src/message.rs`
 - Create: `cli/schema/surfaces.schema.json`

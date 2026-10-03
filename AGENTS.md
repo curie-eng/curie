@@ -611,7 +611,7 @@ as a whole; remembered only):
 
 - worker vs CLI credential forwarding -- `_SDK_PASSTHROUGH_ENV`
   (`apps/worker/src/curie_worker/sandbox/docker.py`) and the CLI picker
-  (`cli/src/commands.rs`) can't share code across Python/Rust, so they are frozen
+  (`cli/src/commands/credential_env.rs`) can't share code across Python/Rust, so they are frozen
   together in `tests/vectors/model-credential-forwarding.json`.
   [vector: `tests/vectors/model-credential-forwarding.json`]
 - dispatcher vs CLI approval action ids -- the approval-card action-id constants

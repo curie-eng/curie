@@ -10,8 +10,8 @@
 // manifest" -- so the only new work here is (a) wrapping
 // `packages/plugin-format/schema/plugin-format.schema.json`'s `$defs` into the
 // `components.schemas` shape the comparator expects, and (b) running it once
-// per source file (`cli/src/commands.rs`, `cli/src/spec.rs`), since the
-// plugin_format mirrors are split across both, filtering
+// per source file (each file under `cli/src/commands/`, plus `cli/src/spec.rs`),
+// since the plugin_format mirrors are split across them, filtering
 // `cli/plugin-format-mirrors.json`'s entries to each file's own slice.
 //
 // The comparator's own violation-class behavior (MissingField, StaleOmission,
@@ -130,20 +130,50 @@ fn mentions_struct(vs: &[Violation], struct_name: &str) -> bool {
 
 // ─── Real-tree assertions ────────────────────────────────────────────────────
 
+/// Every source file of the `commands` module, as repo-relative paths. The
+/// handlers are split one command group per file, and a Deserialize mirror may
+/// live in any of them, so the gate sweeps the whole directory.
+fn commands_module_files() -> Vec<String> {
+    let dir = format!("{}/src/commands", env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {dir}: {e}"))
+        .map(|entry| {
+            entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.ends_with(".rs"))
+        .map(|name| format!("cli/src/commands/{name}"))
+        .collect();
+    files.sort();
+    files
+}
+
 #[test]
-fn commands_rs_has_no_plugin_format_field_parity_violations() {
-    let src = repo_text("cli/src/commands.rs");
+fn commands_module_has_no_plugin_format_field_parity_violations() {
     let schema = plugin_format_schema_as_components();
     let manifest = repo_json("cli/plugin-format-mirrors.json");
-    let scoped = manifest_for_file(&manifest, "cli/src/commands.rs");
-
-    let vs = violations(&src, &schema, &scoped);
+    let files = commands_module_files();
     assert!(
-        vs.is_empty(),
-        "cli/src/commands.rs has drifted from packages/plugin-format/schema/plugin-format.schema.json. \
-         Each entry below is fixed by either adding the field to the struct or declaring the \
-         omission (with a justification) in cli/plugin-format-mirrors.json:\n{vs:#?}"
+        files
+            .iter()
+            .any(|f| f == "cli/src/commands/skill_approvals.rs"),
+        "the commands module sweep found {files:?}; the directory walk is misconfigured"
     );
+
+    for file in files {
+        let src = repo_text(&file);
+        let scoped = manifest_for_file(&manifest, &file);
+        let vs = violations(&src, &schema, &scoped);
+        assert!(
+            vs.is_empty(),
+            "{file} has drifted from packages/plugin-format/schema/plugin-format.schema.json. \
+             Each entry below is fixed by either adding the field to the struct or declaring the \
+             omission (with a justification) in cli/plugin-format-mirrors.json:\n{vs:#?}"
+        );
+    }
 }
 
 #[test]
@@ -250,8 +280,8 @@ fn every_connector_mirror_struct_denies_unknown_fields() {
 #[test]
 fn approval_gate_and_policy_mirrors_stay_fully_covered() {
     // The issue's named drift class hinges on ApprovalGate/ApprovalPolicy
-    // never silently losing coverage across BOTH mirror sites (commands.rs's
-    // runtime read path and spec.rs's authoring-write path). Checked
+    // never silently losing coverage across BOTH mirror sites (the commands
+    // module's runtime read path and spec.rs's authoring-write path). Checked
     // independently of the whole-file sweep so a manifest mistake elsewhere
     // cannot hide a regression here.
     let schema = plugin_format_schema_as_components();
@@ -259,7 +289,7 @@ fn approval_gate_and_policy_mirrors_stay_fully_covered() {
 
     for (file, structs) in [
         (
-            "cli/src/commands.rs",
+            "cli/src/commands/skill_approvals.rs",
             vec!["ApprovalGateDecl", "ApprovalPolicyDecl"],
         ),
         (

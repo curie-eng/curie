@@ -694,7 +694,7 @@ services:
       # alias the local connector container starts under, so the runner
       # derives the identical name it would derive on cluster. The default
       # here must match the CLI's local connector bring-up identity: release
-      # `curie` (cli/src/commands.rs), the same as `local::COMPOSE_PROJECT`.
+      # `curie` (cli/src/commands/connector_images.rs), the same as `local::COMPOSE_PROJECT`.
       - CURIE_RELEASE=${CURIE_RELEASE:-curie}
       - CURIE_NAMESPACE=${CURIE_NAMESPACE:-default}
     restart: unless-stopped

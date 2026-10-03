@@ -370,7 +370,7 @@ fn approval_card_channel_null_explanations_preserve_compatibility_meaning() {
         ("approval recipe", include_str!("../src/recipes.rs")),
         (
             "approval JSON projection",
-            include_str!("../src/commands.rs"),
+            include_str!("../src/commands/approvals.rs"),
         ),
         (
             "approval documentation",

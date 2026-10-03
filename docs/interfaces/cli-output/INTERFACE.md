@@ -46,7 +46,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 - **One decision point.** `Ui::emit(&dyn CliOutput)` (`cli/src/ui.rs`) is the only
   success-path branch: under `--json` it writes `to_json()` as one compact line via
   `emit_json`; otherwise it calls `render(self)`. Handlers must not call a stdout
-  emitter directly. `main`'s `emit<T: CliOutput>` helper (`cli/src/main.rs`) is the
+  emitter directly. The binary's `emit<T: CliOutput>` helper (`cli/src/dispatch/mod.rs`) is the
   dispatch-side funnel that routes every read verb's return value through it.
 - **One JSON object per invocation.** `to_json` returns a single
   `serde_json::Value`, emitted as one line. A multi-line or streamed stdout payload
@@ -58,7 +58,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   timed out). `CliOutput` covers only exit-0 stdout.
 - **Human and JSON render the same value.** Both methods read the same owned data,
   so the two paths cannot disagree about content — only about form. `VersionsOutput`
-  (`cli/src/commands.rs`) documents this obligation explicitly: it holds versions
+  (`cli/src/commands/agent_actions.rs`) documents this obligation explicitly: it holds versions
   newest-first, normalized once by the handler, because `to_json` and `render` each
   iterate it plainly and a constructor that broke the order would let the two paths
   silently diverge.
@@ -74,7 +74,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   re-derives argv or reads a raw secret. It is also **composed** rather than
   duplicated: the outputs whose verbs take `--dry-run` are enums carrying a `DryRun`
   variant that delegates to it instead of re-rendering the plan.
-- **`cli/src/commands.rs`**, the largest group, covering the skill and agent verbs
+- **`cli/src/commands/`**, the largest group, covering the skill and agent verbs
   and the shared lifecycle results: `InitOutput`, `CheckOutput`, `ChartCheckOutput`,
   `ListAgentsOutput`, `BumpVersionOutput`, `StatusOutput`, `SkillMessageOutput`,
   `EvalOutput`, `DeployOutput`, `AllTargetsDeployOutput`, `KillOutput`, `ResumeOutput`,
