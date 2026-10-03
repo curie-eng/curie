@@ -177,7 +177,7 @@ def _stored_policy(row: Mapping[str, object]) -> tuple[SourcePolicySnapshot, str
     return policy, intent
 
 
-def _validate_context(context: SourceGateContext, work: AsyncConnection) -> None:
+def _validate_gate_context(context: SourceGateContext) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
     if (
         type(context) is not SourceGateContext
@@ -185,9 +185,23 @@ def _validate_context(context: SourceGateContext, work: AsyncConnection) -> None
         or context._task is not asyncio.current_task()
         or context._connection.closed
         or not context._transaction.is_active
-        or work.engine.pool is context._owner.engine.pool
-        or work.closed
     ):
+        raise SourceGateInvalid("invalid_source_gate")
+
+
+async def ensure_source_gate_live(context: SourceGateContext) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+    _validate_gate_context(context)
+    try:
+        await context._connection.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        raise SourceSnapshotUnavailable("source_gate_unavailable") from None
+
+
+def _validate_context(context: SourceGateContext, work: AsyncConnection) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+    _validate_gate_context(context)
+    if work.engine.pool is context._owner.engine.pool or work.closed:
         raise SourceGateInvalid("invalid_source_gate")
 
 
@@ -203,7 +217,7 @@ async def read_source_snapshot(
     try:
         if await work_connection.get_isolation_level() != "READ COMMITTED":
             raise SourceGateInvalid("invalid_source_isolation")
-        await context._connection.execute(text("SELECT 1"))
+        await ensure_source_gate_live(context)
         parameters = {"agent": context.agent_id, "hook": hook}
         agent = (
             (
@@ -269,7 +283,7 @@ async def read_source_snapshot(
                 or ledger["intent_sha256"] != intent
             ):
                 raise SourceSnapshotUnavailable("inconsistent_source_state")
-        await context._connection.execute(text("SELECT 1"))
+        await ensure_source_gate_live(context)
         return SourceSnapshot(context.agent_id, hook, legacy, policy, count > 0, highwater)
     except SQLAlchemyError:
         raise SourceSnapshotUnavailable("source_snapshot_unavailable") from None
