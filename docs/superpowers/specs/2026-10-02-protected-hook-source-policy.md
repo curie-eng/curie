@@ -96,6 +96,11 @@ provenance at every effect entry; another guard's context is not authority even
 for the same agent and name. The guard uses the producer's actual work engine
 and a distinct same-DSN gate pool. No missing guard/context grants ordinary
 admission, and no ambient context or implicit replacement pool supplies one.
+A supplied work connection must belong to that exact work engine before any
+SQL statement. Enqueue-failure settlement matches the authorized agent and exact
+hook name in addition to its run ID; another source record remains unchanged.
+Secondary cleanup telemetry or diagnostic failures preserve the original
+enqueue exception, even after the settlement transaction commits.
 
 Scheduled target discovery is a read-only hint. After acquiring the source gate,
 reload the currently preferred deployment using existing precedence, then its
