@@ -128,8 +128,19 @@ async def kill_owned_gate(observer: Any, agent: uuid.UUID) -> int:
     return pid
 
 
+def isolate_current_due_slot(campaign: Any) -> None:
+    """Actual daily archive avoids prior skipped slots, @spec PROTECTED-HOOK-SOURCE-2."""
+    campaign.trigger["schedule"] = f"{campaign.slot.minute} {campaign.slot.hour} * * *"
+    campaign.key = campaign.bundle([campaign.trigger])
+    campaign.support.sql_dicts(
+        "UPDATE curie.agent_versions SET bundle_ref=:ref WHERE id=:id",
+        dict(ref=campaign.key, id=campaign.version),
+    )
+
+
 def test_gate_loss_while_inner_hook_lock_waits_preserves_aged_claim(campaign: Any) -> None:
     """Probe BEFORE reclaim/insert, @spec PROTECTED-HOOK-SOURCE-2."""
+    isolate_current_due_slot(campaign)
 
     async def scenario() -> None:
         """@spec PROTECTED-HOOK-SOURCE-2."""
@@ -213,6 +224,8 @@ def test_real_statement_or_commit_gate_loss_has_honest_durable_counts(
     campaign: Any, phase: str
 ) -> None:
     """AFTER effects authorize only NEXT-boundary proof, @spec PROTECTED-HOOK-SOURCE-2."""
+    if phase == "reclaim":
+        isolate_current_due_slot(campaign)
 
     async def scenario() -> None:
         """@spec PROTECTED-HOOK-SOURCE-2."""

@@ -227,7 +227,7 @@ def test_actual_ordinary_bundle_claim_and_queue_preserve_payload(campaign: Campa
             )
             queued = await redis.xrange(campaign.stream)
             assert len(queued) == 1
-            turn = QueuedTurn.model_validate_json(queued[0][1][b"payload"])
+            turn = QueuedTurn.model_validate_json(queued[0][1]["payload"])
             assert turn.text == campaign.trigger["prompt"]
             assert turn.reply_handle.channel == campaign.address
             assert await loop.one_pass(campaign.now) is not None
@@ -348,7 +348,7 @@ def test_outer_gate_wait_holds_no_work_and_uses_fresh_target_decisions(
                 if change == "new_version":
                     assert len(rows) == len(queue) == 1 and rows[0]["version_id"] == fresh_version
                     assert (
-                        QueuedTurn.model_validate_json(queue[0][1][b"payload"]).text
+                        QueuedTurn.model_validate_json(queue[0][1]["payload"]).text
                         == "Fresh immutable version."
                     )
                 elif change in {"budget", "kill"}:
