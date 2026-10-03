@@ -175,7 +175,10 @@ cleanup failures produce safe diagnostics, and failure without a primary cause
 fails shutdown. Shield only an owned bounded cleanup task; do not detach
 unbounded work. If producer join expires, perform process-level fatal exit
 within one further second, preserving safe primary-cause diagnostics. Diagnostic
-errors or blocked log sinks must not prevent that fatal exit. Merely
+errors or blocked log sinks must not prevent that fatal exit. Owned cleanup
+diagnostics are nonthrowing and bounded; an output still blocked after five
+seconds uses the same fatal exit instead of leaving an unjoined diagnostic
+task or thread. Merely
 raising/returning to `asyncio.run` is insufficient. Do not dispose gate/work
 engines under unjoined producers or claim successful termination/disposal or
 normal exception propagation after fatal exit. Fatal-path tests run only in
