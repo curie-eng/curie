@@ -134,7 +134,10 @@ def test_readiness_waits_for_worker_and_keeps_exact_compose_contract(
     assert all(call[:7] == ["compose", "-p", "curie-check-3864-example",
                            "-f", files[0], "-f", files[1]] for call in calls)
     worker_checks = [call for call in calls if "exec" in call]
-    assert all("http://127.0.0.1:3030/api/ready" in call[-1] for call in worker_checks)
+    # The driver observed pinned 3.225.5 bind to env.HOSTNAME, whose container
+    # address serves readiness while loopback refuses connections. Probe the
+    # Compose service DNS name on the observed port and path.
+    assert all("http://langfuse-worker:3030/api/ready" in call[-1] for call in worker_checks)
     assert not any("--force-recreate" in call for call in calls)
 
 

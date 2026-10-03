@@ -164,10 +164,9 @@ jobs:
           fi
       # Integration tests dial the real dev stack (Postgres 25432, Valkey 26379,
       # RustFS 29000, Langfuse 23000 + ClickHouse + OTel Collector). Boot it after
-      # ruff/mypy so cheap failures stay fast. The first up starts the one-shot
-      # rustfs-init that creates the Langfuse bucket alongside the long-lived
-      # services; the second --waits only on the long-lived ones (rustfs-init is
-      # kept out of the wait set because --wait treats its exit(0) as a failure).
+      # ruff/mypy so cheap failures stay fast. The readiness helper waits for
+      # backing services and bucket creation, then starts Langfuse web before
+      # its worker so migrations and bootstrap cannot race worker startup.
       # The app services (curie-api, curie-migrate) are deliberately NOT
       # started: the suite runs the app in-process via uv and migrates the shared
       # DB with alembic below, so their image is never needed here -- and it lives
@@ -175,27 +174,12 @@ jobs:
       - name: Start dev stack
         id: dev-stack
         if: steps.python-runtime.outputs.pytest == 'true'
-        run: |
-          docker compose -f compose.dev.yaml up -d \
-            postgres valkey clickhouse rustfs rustfs-init \
-            langfuse-web langfuse-worker otel-collector
-          docker compose -f compose.dev.yaml up -d --wait --wait-timeout 300 \
-            postgres valkey clickhouse rustfs \
-            langfuse-web langfuse-worker otel-collector
-      # Langfuse web has no compose healthcheck, so --wait returns once its
-      # container is merely running. Poll its public health endpoint until it is
-      # actually serving, so the full-stack readiness gate fails fast with an
-      # actionable error before integration tests begin.
+        run: python3 scripts/wait-for-langfuse.py --start
+      # Recheck authenticated web reads and worker readiness at the test
+      # boundary. A running container alone does not prove usable Langfuse.
       - name: Wait for Langfuse to serve
         if: steps.python-runtime.outputs.pytest == 'true'
-        run: |
-          for i in $(seq 1 60); do
-            if curl -fsS http://localhost:23000/api/public/health >/dev/null 2>&1; then
-              echo "Langfuse ready after attempt ${i}"; exit 0
-            fi
-            sleep 3
-          done
-          echo "Langfuse did not become ready within 180s"; exit 1
+        run: python3 scripts/wait-for-langfuse.py
       - name: Released database upgrade gate
         if: steps.python-runtime.outputs.pytest == 'true'
         run: |

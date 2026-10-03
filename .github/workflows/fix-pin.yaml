@@ -92,29 +92,14 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.4
-      # Same boot as the Python job: the first `up` starts the one-shot
-      # rustfs-init alongside the long-lived services, the second `--wait`s only
-      # on the long-lived ones because `--wait` reads rustfs-init's exit(0) as a
-      # failure.
+      # Use the same migration, authenticated read and worker readiness gate
+      # as the Python job before executing any pinned integration selector.
       - name: Start dev stack
         if: steps.fix-pin-curie.outputs.needed == 'true'
-        run: |
-          docker compose -f compose.dev.yaml up -d \
-            postgres valkey clickhouse rustfs rustfs-init \
-            langfuse-web langfuse-worker otel-collector
-          docker compose -f compose.dev.yaml up -d --wait --wait-timeout 300 \
-            postgres valkey clickhouse rustfs \
-            langfuse-web langfuse-worker otel-collector
+        run: python3 scripts/wait-for-langfuse.py --start
       - name: Wait for Langfuse to serve
         if: steps.fix-pin-curie.outputs.needed == 'true'
-        run: |
-          for i in $(seq 1 60); do
-            if curl -fsS http://localhost:23000/api/public/health >/dev/null 2>&1; then
-              echo "Langfuse ready after attempt ${i}"; exit 0
-            fi
-            sleep 3
-          done
-          echo "Langfuse did not become ready within 180s"; exit 1
+        run: python3 scripts/wait-for-langfuse.py
       # A pinned worker binding test dials the shared default database and
       # assumes the curie schema exists, exactly as it does under the Python
       # job, so the same migration runs here.
