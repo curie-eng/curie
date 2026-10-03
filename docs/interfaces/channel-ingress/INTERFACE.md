@@ -107,10 +107,12 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   [ACI producer seam](../aci-producer/INTERFACE.md). A turn producer sets it
   only toward a worker and runner that implement it (TOOL-ACCESS-6): one that
   does not decodes the field and drops it, and the turn then runs
-  unrestricted. No first-party ingress sets it (for example the Slack
-  dispatcher, the wire ingress and the API resume queue); an operator's own
-  synthetic producer, such as a canary on the disconnected cluster-message
-  relay, is the intended caller. An absent value is today's turn.
+  unrestricted. The Slack dispatcher, the wire ingress and the API resume
+  queue never set it. The signed hook route
+  (`apps/api/src/curie_api/routers/hooks.py::ingest_hook`) sets it when the
+  operator sends `tool_access=read-only`; its receipt proves the queued policy,
+  not runner enforcement. An operator's own synthetic producer may set it too.
+  An absent value is today's turn.
 - **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
   whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
   (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral
