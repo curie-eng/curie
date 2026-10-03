@@ -90,7 +90,12 @@ mutation. A source snapshot includes both policy and attempt-history presence:
 only absence of both means never configured. SOURCE-10 owns pending history
 and its absent-policy refusal. Never treat a missing or unreadable table as
 an ordinary source. The wired candidate requires the actual new ledger
-migration head as its schema minimum; preserve prior registered windows.
+migration head as its schema minimum; preserve prior registered windows. The
+source-control candidate is `0.12.2`, with schema head and minimum both `0076`.
+Register that minimum before connecting producer paths to ledger reads; missing
+ledger support must fail startup, not fall back to ordinary admission. Keep all
+previous windows, including the unwired `0.12.1` foundation, unchanged. These
+are candidate compatibility records, not a published release.
 
 ## API DTOs and credential lifecycle
 

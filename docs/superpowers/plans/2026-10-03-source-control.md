@@ -43,6 +43,12 @@ reserved migrations; allocate this ledger separately from the fresh base.
 | 6. Manual and scheduled producers | API fire owner and sole worker cron owner; task 3 | Preserve durable claim before ordinary enqueue under outer gate; all configured/history-only scheduled, deferred, retry, skipped, blocked and reclaim paths refuse before run mutation, while unrelated hooks still run. |
 | 7. Wired schema and installed integration | Integration owner; all prior tasks | Actual new ledger head passes startup and candidate image checks; old schema refuses instead of treating missing tables as ordinary. Preserve registered windows and verify full affected baselines. |
 
+Before task 5 connects any producer to the ledger, land task 7's schema
+prerequisite: candidate `0.12.2`, head/minimum `0076`, with previous windows
+unchanged. Its actual installed-image, released-upgrade and full baseline
+verification still follows the complete producer integration. Administration
+routes and protected activation stay unavailable throughout these slices.
+
 ## Races and boundaries to review
 
 Use actual disposable Postgres and role-scoped Valkey, not mocked dependencies.
