@@ -2,13 +2,14 @@
 
 Date: 2026-10-02
 
-Status: Draft
+Status: Accepted
 
 Tracked in [#3603](https://github.com/curie-eng/curie/issues/3603).
-This proposes the concrete consumption mechanism deferred by
+This selects the concrete consumption mechanism deferred by
 [ADR 0190](0190-automated-hook-sources-cannot-widen-their-tool-access.md).
-It does not authorize implementation, clear the automated intake installation
-gate, or describe existing runtime support.
+Maintainer jw3329 explicitly approved this mechanism on 2026-10-02.
+Acceptance authorizes the realizing contracts and implementation; it does not
+clear the intake installation gate or describe existing runtime support.
 
 ## Context
 
@@ -28,7 +29,7 @@ key is administrative authority under `apps/api/src/curie_api/auth.py`.
 A mechanism using that same key to mint protected consumption credentials
 would not create an independent worker boundary.
 
-## Proposed decision
+## Decision
 
 ### Administrative source policy
 
@@ -53,8 +54,9 @@ re-enabling a hook cannot revive a revoked key.
 ### Separate consumption authority
 
 Use a separate Valkey delivery endpoint with independent credentials and a
-distinct protected worker deployment. Ordinary Valkey remains the existing
-state store. The API receives enqueue authority; qualified protected workers
+distinct protected worker deployment. Ordinary workers keep their existing
+Valkey state store. Protected workers keep all dispatchable execution state
+private to the protected broker. The API receives enqueue authority; qualified protected workers
 receive consumption authority. Sources, runners and ordinary workers receive
 neither consumption credentials nor a route that returns them.
 
@@ -144,12 +146,18 @@ credentials. A `readOnlyHint` annotation alone is not evidence of no effects.
 
 ## Realizing work and acceptance evidence
 
-No realizing implementation exists for this proposal. The work under #3603
+The concrete contracts are [source policy](../superpowers/specs/2026-10-02-protected-hook-source-policy.md)
+and [delivery lane](../superpowers/specs/2026-10-02-protected-hook-lane.md).
+Their [implementation plan](../superpowers/plans/2026-10-02-protected-hooks.md)
+orders specification, failing tests and implementation.
+No realizing implementation exists at acceptance. The work under #3603
 must name and review source-policy persistence and HMAC minting, API support
 and admission, protected provisioning/verifier, worker transport and lifecycle,
 artifact selection, bundle eligibility, and receipt/telemetry consumers before
-implementation begins. The precise configuration schema, provisioning identity
-and orchestration permissions remain review decisions, not implied defaults.
+implementation begins. The realizing contracts own precise configuration and
+activation semantics.
+Provisioning support remains unavailable until actual guard and runtime
+qualification evidence passes their criteria.
 
 Required evidence includes the actual ingress, broker, worker and runner path:
 
@@ -196,4 +204,4 @@ schema windows remain unchanged.
 
 The automated intake installation gate stays closed until source authority,
 consumption fencing, runtime enforcement and actual delivery evidence exist.
-Merging this Draft would publish the proposal only.
+Acceptance does not close #3603; all realizing execution evidence is required.
