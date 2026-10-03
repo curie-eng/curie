@@ -7,6 +7,7 @@ so the worker settles the row when the turn ends.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -40,6 +41,7 @@ from ..schemas import HookFireOut, ScheduleOutcome
 from .schedules import _read_triggers, _resolve_agent
 
 router = APIRouter(dependencies=[Depends(require_api_key)])
+logger = logging.getLogger(__name__)
 
 _DEFAULT_USD = 10.0
 _DEFAULT_TOKENS = 100_000
@@ -348,11 +350,17 @@ async def fire_hook(
             await ensure_source_gate_live(held)
             await request.app.state.resume_queue.enqueue(turn)
         except Exception as exc:
-            async with session.begin():
-                failed = (
-                    (await session.execute(_sql(_FAIL_SQL), {"id": row["id"]})).mappings().one()
-                )
-            record = _record(agent_id=selected.id, agent=selected.name, name=name, row=failed)
+            try:
+                async with session.begin():
+                    await session.connection()
+                    await ensure_source_gate_live(held)
+                    failed = (
+                        (await session.execute(_sql(_FAIL_SQL), {"id": row["id"]})).mappings().one()
+                    )
+                record = _record(agent_id=selected.id, agent=selected.name, name=name, row=failed)
+            except Exception:
+                # The committed claim remains recoverable when cleanup has no authority.
+                logger.warning("hook_fire_cleanup_unavailable")
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "hook fire could not be queued"
             ) from exc
