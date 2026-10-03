@@ -283,9 +283,7 @@ def _stale_delete_proxy(
                 if selected and self.command == "GET" and response.status == 200:
                     audit.read_versions.append(json.loads(raw)["version"])
                 self.send_response_only(response.status)
-                for key, value in response.getheaders():
-                    if key.lower() not in {"transfer-encoding", "connection", "content-length"}:
-                        self.send_header(key, value)
+                self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
