@@ -640,12 +640,52 @@ pub fn plan_touches_forbidden_tool(lines: &[String]) -> Option<String> {
     None
 }
 
+fn check_prerequisites(
+    explicit_context: Option<&str>,
+    current_context: Option<&str>,
+    mut on_path: impl FnMut(&str) -> bool,
+) -> Result<()> {
+    let tools = [
+        ("docker", "https://docs.docker.com/get-docker/"),
+        (
+            "kind",
+            "https://kind.sigs.k8s.io/docs/user/quick-start/#installation",
+        ),
+        ("kubectl", "https://kubernetes.io/docs/tasks/tools/"),
+        ("helm", "https://helm.sh/docs/intro/install/"),
+    ];
+    let required = if explicit_context.is_none() && current_context.is_none() {
+        &tools[..]
+    } else {
+        &tools[2..]
+    };
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|(tool, _)| !on_path(tool))
+        .map(|(tool, url)| format!("{tool}: {url}"))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::failure(format!(
+        "missing required tools on PATH: {}",
+        missing.join("; ")
+    ))
+    .with_fix("install the listed tools using their official guides, add them to PATH, and rerun")
+    .into())
+}
+
 pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     let current = if opts.context.is_some() {
         None
     } else {
         crate::kube_context::current_context_name()
     };
+    check_prerequisites(
+        opts.context.as_deref(),
+        current.as_deref(),
+        crate::ops::on_path,
+    )?;
     let existing = if opts.context.is_none() && current.is_none() {
         match kind_clusters().await {
             Ok(clusters) => clusters,
@@ -1094,6 +1134,91 @@ mod tests {
             credential_in_env: false,
             release_has_real_model: false,
             interactive: true,
+        }
+    }
+
+    #[test]
+    fn all_prerequisites_present_accepts_both_cluster_paths() {
+        for (explicit, current, expected) in [
+            (None, None, vec!["docker", "kind", "kubectl", "helm"]),
+            (Some("acme-cluster"), None, vec!["kubectl", "helm"]),
+            (None, Some("acme-cluster"), vec!["kubectl", "helm"]),
+        ] {
+            let mut checked = Vec::new();
+            check_prerequisites(explicit, current, |tool| {
+                checked.push(tool.to_string());
+                true
+            })
+            .unwrap();
+            assert_eq!(checked, expected);
+        }
+    }
+
+    #[test]
+    fn one_missing_prerequisite_names_the_tool_and_official_install_url() {
+        for (explicit, current) in [
+            (None, None),
+            (Some("acme-cluster"), None),
+            (None, Some("acme-cluster")),
+        ] {
+            let error = check_prerequisites(explicit, current, |tool| tool != "helm").unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("helm"), "{message}");
+            assert!(
+                message.contains("https://helm.sh/docs/intro/install/"),
+                "{message}"
+            );
+            assert!(!message.contains("docker"), "{message}");
+            assert!(!message.contains("kind"), "{message}");
+            assert!(!message.contains("kubectl"), "{message}");
+        }
+    }
+
+    #[test]
+    fn missing_kind_path_prerequisites_are_reported_together() {
+        let error = check_prerequisites(None, None, |tool| tool == "helm").unwrap_err();
+        let message = error.to_string();
+        for expected in [
+            "docker",
+            "https://docs.docker.com/get-docker/",
+            "kind",
+            "https://kind.sigs.k8s.io/docs/user/quick-start/#installation",
+            "kubectl",
+            "https://kubernetes.io/docs/tasks/tools/",
+        ] {
+            assert!(message.contains(expected), "{message}");
+        }
+        assert!(!message.contains("https://helm.sh/"), "{message}");
+    }
+
+    #[test]
+    fn missing_existing_context_prerequisites_are_reported_together() {
+        for (explicit, current) in [(Some("acme-cluster"), None), (None, Some("acme-cluster"))] {
+            let error = check_prerequisites(explicit, current, |_| false).unwrap_err();
+            let message = error.to_string();
+            for expected in [
+                "kubectl",
+                "https://kubernetes.io/docs/tasks/tools/",
+                "helm",
+                "https://helm.sh/docs/intro/install/",
+            ] {
+                assert!(message.contains(expected), "{message}");
+            }
+            assert!(!message.contains("docker"), "{message}");
+            assert!(!message.contains("kind"), "{message}");
+        }
+    }
+
+    #[test]
+    fn targeted_contexts_accept_missing_docker_and_kind_including_kind_contexts() {
+        for (explicit, current) in [
+            (Some("acme-cluster"), None),
+            (None, Some("acme-cluster")),
+            (Some("kind-acme-cluster"), None),
+            (None, Some("kind-acme-cluster")),
+        ] {
+            check_prerequisites(explicit, current, |tool| matches!(tool, "kubectl" | "helm"))
+                .unwrap();
         }
     }
 

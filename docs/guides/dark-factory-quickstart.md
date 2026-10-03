@@ -18,11 +18,19 @@ the factory run.
 
 | Tool | Used for |
 |---|---|
-| Docker | kind nodes |
-| `kind` v0.24 or later, `kubectl`, `helm` | the local cluster, when you do not already have a context. kind's network plugin enforces NetworkPolicy from v0.24. |
+| [Docker](https://docs.docker.com/get-docker/) | kind nodes, required only when neither `--context` nor a current kubeconfig context is set |
+| [`kind`](https://kind.sigs.k8s.io/docs/user/quick-start/#installation) v0.24 or later | the local cluster, required only when neither `--context` nor a current kubeconfig context is set. kind's network plugin enforces NetworkPolicy from v0.24. |
+| [`kubectl`](https://kubernetes.io/docs/tasks/tools/) | Kubernetes operations, required for every context |
+| [`helm`](https://helm.sh/docs/intro/install/) | Curie installation, required for every context |
 | `curie` | this command ([releases](https://github.com/curie-eng/curie/releases)) |
 | An [OpenRouter](https://openrouter.ai/) API key (`sk-or-`) | the factory model, `z-ai/glm-5.3-flash` by default. The command asks once, or reads `CURIE_CREDENTIALS`. |
 | A GitHub account | your own GitHub App and the trial repository |
+
+The command checks all required tools on `PATH` before running any command or
+changing the cluster. If tools are missing, it lists every missing tool with
+its official installation link. `--dry-run` performs the same prerequisite
+check. An explicit or current context skips the Docker and kind requirements,
+including when the context belongs to an existing kind cluster.
 
 A released `curie` deploys the dark factory runner image that release published.
 A binary built from a source checkout has no published layer for its own
