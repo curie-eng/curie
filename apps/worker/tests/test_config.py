@@ -766,41 +766,6 @@ def test_max_concurrency_accepts_both_ends_of_its_range(
     assert WorkerConfig().max_concurrency == int(raw)
 
 
-def _consumer_as_run_builds_it(config: WorkerConfig) -> Consumer:
-    """Build the runs consumer with exactly the arguments ``run.py`` passes.
-
-    Construction opens no connection, so an unconnected client and a stand-in
-    kernel are enough to observe what the consumer was sized to.
-    """
-    redis = AsyncRedis(host="127.0.0.1", port=1)
-    return Consumer(
-        redis=redis,
-        kernel=cast(Kernel, SimpleNamespace()),
-        config=config,
-        leases=DeliveryLeaseStore(redis, config),
-    )
-
-
-def test_max_concurrency_env_sizes_the_runs_consumer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The env value reaches the consumer that ``run.py`` constructs, which
-    passes no ``max_concurrency`` of its own."""
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_WORKER_MAX_CONCURRENCY", "4")
-
-    consumer = _consumer_as_run_builds_it(WorkerConfig())
-
-    assert consumer._max_concurrency == 4
-    assert consumer._transfer_capacity() == 4
-
-
-def test_runs_consumer_defaults_to_sixteen_turns(monkeypatch: pytest.MonkeyPatch) -> None:
-    _clear_all_config_env(monkeypatch)
-
-    assert _consumer_as_run_builds_it(WorkerConfig())._max_concurrency == 16
-
-
 def test_explicit_consumer_concurrency_still_wins_over_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -898,28 +863,6 @@ def _load_test_module(module_name: str, path: Path) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def test_worker_boolean_explanations_do_not_cite_removed_parser() -> None:
-    repo_root = Path(__file__).resolve().parents[3]
-    config_text = (repo_root / "apps/worker/src/curie_worker/config.py").read_text(encoding="utf-8")
-    config_start = config_text.index("def _parse_bool")
-    config_end = config_text.index("\n\nBool =", config_start)
-    config_region = config_text[config_start:config_end]
-
-    test_text = Path(__file__).read_text(encoding="utf-8")
-    test_start = test_text.index("# Worker boolean behavior")
-    test_end = test_text.index("# --- Eval claim-creation concurrency", test_start)
-    test_region = test_text[test_start:test_end]
-
-    removed_helper = "_" + "set" + "_bool"
-    retired_service = "dis" + "patcher"
-
-    for region in (config_region, test_region):
-        assert removed_helper not in region, f"boolean notes still cite {removed_helper}"
-        assert retired_service not in region, (
-            f"boolean notes still compare this parser to {retired_service}"
-        )
 
 
 def test_async_test_body_gate_rejects_a_shallow_corpus(

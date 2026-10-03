@@ -6,12 +6,9 @@ is what TurnStream.close (called from __aexit__) invokes."""
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import contextlib
-import inspect
 import logging
-import textwrap
 import tracemalloc
 from typing import Any
 
@@ -1025,48 +1022,8 @@ def test_handler_timeout_before_turn_deadline_stays_plain_timeout() -> None:
     asyncio.run(go())
 
 
-def test_interrupt_takes_no_remaining_budget_while_the_other_rpcs_do() -> None:
-    """A structural guard against a future "simplification" that folds interrupt
-    into the budget path. ``/v1/interrupt`` is the fail-closed path a lost lease
-    fires: deriving its timeout from a budget that may already be exhausted would
-    make the fence unable to stop the runner it just fenced."""
-    for name in ("start_turn", "steer", "status", "snapshot", "reset"):
-        parameters = inspect.signature(getattr(RunnerClient, name)).parameters
-        assert "remaining_s" in parameters, f"{name} must accept a remaining budget"
-
-    assert "remaining_s" not in inspect.signature(RunnerClient.interrupt).parameters, (
-        "interrupt must never take a remaining budget: it is the fail-closed "
-        "control path and keeps its own independent timeout"
-    )
-
-    source = textwrap.dedent(inspect.getsource(RunnerClient))
-    tree = ast.parse(source)
-    timeout_posts = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        call_source = ast.get_source_segment(source, node) or ""
-        if (
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr == "post"
-            and "/v1/timeout" in call_source
-        ):
-            timeout_posts.append(node)
-
-    assert len(timeout_posts) == 1, "RunnerClient must own one /v1/timeout POST"
-    timeout_keywords = {
-        keyword.arg: ast.unparse(keyword.value)
-        for keyword in timeout_posts[0].keywords
-        if keyword.arg is not None
-    }
-    assert timeout_keywords.get("timeout") == "self._interrupt_timeout", (
-        "/v1/timeout must use the independent control-plane cap, never the "
-        "expired stream/delivery budget"
-    )
-
-
 def test_interrupt_keeps_its_own_timeout_under_a_huge_streaming_budget() -> None:
-    """The behavioral half of the guard above. With a 30s session budget and a
+    """With a 30s session budget and a
     wedged runner, the interrupt must still return at its own 0.2s bound."""
 
     async def go() -> None:

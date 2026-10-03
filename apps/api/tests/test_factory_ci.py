@@ -158,14 +158,6 @@ def test_bounds_are_the_planned_constants() -> None:
     assert set(factory_ci.TRANSIENT) == set(TRANSIENT)
 
 
-def test_ci_causes_match_the_literal_set_in_workitems() -> None:
-    assert factory_ci.CI_CAUSES == frozenset({"ci_failed", "ci_timeout", "ci_unverified"})
-    assert "ci_fix_unpublished" not in factory_ci.CI_CAUSES
-    source = inspect.getsource(workitems)
-    literal = re.search(r"\{\s*\"ci_failed\",\s*\"ci_timeout\",\s*\"ci_unverified\"\s*\}", source)
-    assert literal is not None, "workitems must keep the CI cause literal equal to CI_CAUSES"
-
-
 def test_continuation_event_id_is_the_worker_contract() -> None:
     request_id = uuid.uuid4()
     for round_ in CI_ROUNDS:

@@ -16,11 +16,9 @@ from __future__ import annotations
 import gzip
 import hashlib
 import importlib
-import inspect
 import io
 import json
 import os
-import re
 import stat
 import tarfile
 import threading
@@ -38,6 +36,14 @@ GIT_CREDENTIAL = "Basic redeemed-credential-value"
 CLEAN_URL = "https://github.com/acme-corp/acme-bot.git"
 AUTHENTICATED_URL = "https://redeemed-credential-value@github.com/acme-corp/acme-bot.git"
 DEPLOYMENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
+_SELECTION_REFUSAL_VECTORS: list[dict[str, Any]] = json.loads(
+    (
+        Path(__file__).resolve().parents[3]
+        / "tests/vectors/workspace-selection-refusal.json"
+    ).read_text(encoding="utf-8")
+)["vectors"]
+if not _SELECTION_REFUSAL_VECTORS:
+    raise ValueError("workspace selection refusal vectors must not be empty")
 
 
 @pytest.fixture
@@ -804,27 +810,21 @@ def test_workspace_coordinator_propagates_absent_repository_selection(
 
 
 @pytest.mark.parametrize(
-    ("code", "expected_detail"),
-    [
-        (
-            "workspace.selection_conflict",
-            "This thread is already bound to a different repository.",
-        ),
-    ],
+    "refusal", _SELECTION_REFUSAL_VECTORS, ids=lambda refusal: refusal["name"]
 )
 def test_internal_workspace_selection_409_maps_machine_code_not_detail_prose(
-    workspace: Any, code: str, expected_detail: str
+    workspace: Any, refusal: dict[str, Any]
 ) -> None:
-    """The worker must not infer a control-plane decision from mutable prose."""
+    """Render every API refusal case without matching its mutable prose."""
 
     def transport(**_request: Any) -> Any:
         return SimpleNamespace(
-            status=409,
+            status=refusal["status"],
             headers={},
             body=json.dumps(
                 {
                     "detail": {
-                        "code": code,
+                        "code": refusal["code"],
                         "message": "wording intentionally shares no legacy match text",
                     }
                 }
@@ -840,35 +840,27 @@ def test_internal_workspace_selection_409_maps_machine_code_not_detail_prose(
     with pytest.raises(workspace.WorkspaceSelectionRefused) as excinfo:
         client.select(DEPLOYMENT_ID, "1700000000.000100", "U0REQUEST1", None)
 
-    assert excinfo.value.public_detail == expected_detail
+    assert excinfo.value.public_detail == refusal["public_detail"]
 
 
-def test_selection_refusal_codes_match_the_apis_emissions(workspace: Any) -> None:
-    """#2684: the worker must map exactly the codes the API emits.
-
-    The two sides cannot share a constant: the worker does not import the API
-    package at runtime, so this seam is pinned here instead. A code in the
-    worker map that the API never emits is unreachable dead prose, and a code
-    the API emits that the worker does not map degrades into an
-    ``invalid selection refusal response`` preparation fault instead of a
-    refusal the user can read, so the two sets must stay equal.
-    """
-
-    router = importlib.import_module("curie_api.routers.workspaces")
-    quoted_codes = re.findall(r'(["\'])(workspace\.[a-z_]+)\1', inspect.getsource(router))
-    emitted = {code for _quote, code in quoted_codes}
-    understood = set(workspace._SELECTION_REFUSAL_MESSAGES)
-
-    assert emitted == understood, (
-        "worker workspace-refusal codes and the codes the API selection "
-        "router emits have drifted; update both sides of the seam together"
-    )
-
-
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(
+            b'{"detail":{"code":"workspace.repository_required"}}',
+            id="unmapped-code",
+        ),
+        pytest.param(b'{"detail":{}}', id="missing-code"),
+        pytest.param(b'{"detail":{"code":null}}', id="nonstring-code"),
+        pytest.param(b'{"detail":"selection conflict"}', id="nonobject-detail"),
+        pytest.param(b'{"detail":', id="invalid-json"),
+    ],
+)
 def test_internal_workspace_selection_409_unmapped_code_is_invalid_response(
     workspace: Any,
+    body: bytes,
 ) -> None:
-    """A code the worker does not map is a protocol fault, not refusal prose.
+    """Unknown codes and malformed refusals are protocol faults.
 
     ``workspace.repository_required`` was one of the unreachable mappings
     removed in #2684; reusing it here pins that the removed code now fails
@@ -880,14 +872,7 @@ def test_internal_workspace_selection_409_unmapped_code_is_invalid_response(
         return SimpleNamespace(
             status=409,
             headers={},
-            body=json.dumps(
-                {
-                    "detail": {
-                        "code": "workspace.repository_required",
-                        "message": "wording intentionally shares no legacy match text",
-                    }
-                }
-            ).encode(),
+            body=body,
         )
 
     client = workspace.WorkspaceCredentialClient(

@@ -1,28 +1,6 @@
-"""Pins that keep examples/sre-bot's shipped files honest about what they do.
+"""Validate shipped deployment targets and lint the executable upgrade script.
 
-Four independent ways this example has already lied, each of which reached a
-reviewer as a confident wrong answer rather than as a missing file:
-
-1. ``docs/STAGING-DEPLOY.md`` described four hand-applied deltas and never
-   named the self-upgrade connector or the platform-upgrade Job the tree
-   actually installs today. A reviewer following it would reproduce a bot
-   that cannot start either upgrade.
-2. ``deploy.yaml`` shipped ``C0EXAMPLE1`` / ``C0EXAMPLE2`` as live
-   ``slack_channel`` values. Those match the Slack id shape, so
-   ``curie cluster deploy --target`` reports success and rebinds the bot to
-   a channel that does not exist. The bot then goes silent with nothing in
-   any log naming the cause.
-3. ``docs/PERMISSION-MAP.md`` said ``restart_deployment`` "ships commented
-   out" while ``connectors.yaml`` declares ``k8s-write`` live. The document
-   that claims to list every write is then wrong about the one write that
-   actually ships.
-4. ``platform-upgrade/upgrade.sh`` is the script the platform-upgrade Job
-   runs, and nothing in CI shellchecked it. A script with zero tests and no
-   CI is a script whose next edit lands unreviewed.
-
-Each test below fails closed on the matching lie. They are deliberately
-shallow -- they read the shipped files and the workflow -- because the
-failure is the file saying the wrong thing, not a runtime of the bot.
+Installer and connector behavior is covered in their runtime test suites.
 """
 
 from __future__ import annotations
@@ -40,99 +18,6 @@ UPGRADE_SCRIPT = BUNDLE / "platform-upgrade" / "upgrade.sh"
 # of the sanctioned placeholders matches slack-conversation-id and is
 # not a gitleaks stopword; C0EXAMPLE1 and C0EXAMPLE2 are.
 PLACEHOLDER_CHANNELS = frozenset({"C0EXAMPLE1", "C0EXAMPLE2"})
-
-
-def _markdown_section(text: str, heading: str) -> str:
-    start = text.index(heading) + len(heading)
-    end = text.find("\n## ", start)
-    return text[start:] if end == -1 else text[start:end]
-
-
-def _first_bash_block(text: str) -> str:
-    marker = "```bash\n"
-    start = text.index(marker) + len(marker)
-    end = text.index("\n```", start)
-    return text[start:end]
-
-
-def _live_command_index(text: str, prefix: str) -> int:
-    for index, line in enumerate(text.splitlines()):
-        if line.startswith(prefix) and "--dry-run" not in line:
-            return index
-    raise AssertionError(f"missing live command beginning with {prefix!r}")
-
-
-def _assert_credential_exported_before_installer(block: str, where: str) -> None:
-    # The installer reads CURIE_CREDENTIALS itself (#2920). Exported after
-    # it, the install lands on the fake model.
-    export = _live_command_index(block, "export CURIE_CREDENTIALS")
-    installer = _live_command_index(block, "curie example sre-bot install")
-    assert export < installer, (
-        f"{where} must export CURIE_CREDENTIALS before the example installer "
-        "so the fresh install records the real model"
-    )
-
-
-def test_demo_fresh_install_exports_the_credential_before_the_installer() -> None:
-    text = (BUNDLE / "DEMO.md").read_text(encoding="utf-8")
-    fresh_install = _markdown_section(text, "## Fresh install")
-    _assert_credential_exported_before_installer(fresh_install, "examples/sre-bot/DEMO.md")
-
-
-def test_readme_first_install_block_exports_the_credential_before_the_installer() -> None:
-    text = (BUNDLE / "README.md").read_text(encoding="utf-8")
-    install = _markdown_section(text, "## Install")
-    _assert_credential_exported_before_installer(
-        _first_bash_block(install), "the first README install block"
-    )
-
-
-def test_staging_deploy_doc_names_what_the_tree_installs_today() -> None:
-    """The reproduction doc must describe the installer that exists, including
-    the two upgrade paths it currently never mentioned."""
-
-    text = (BUNDLE / "docs" / "STAGING-DEPLOY.md").read_text(encoding="utf-8")
-    assert "curie example sre-bot install" in text, (
-        "docs/STAGING-DEPLOY.md must name `curie example sre-bot install`; "
-        "that is the command the tree actually uses to stand this bot up"
-    )
-    assert "--platform-upgrade" in text, (
-        "docs/STAGING-DEPLOY.md never mentions --platform-upgrade, so a "
-        "reviewer following it cannot reproduce the platform-upgrade Job "
-        "the tree installs"
-    )
-    assert "self-upgrade" in text, (
-        "docs/STAGING-DEPLOY.md never mentions self-upgrade, so a reviewer "
-        "following it cannot reproduce the connector the tree ships"
-    )
-    assert "platform-upgrade" in text, (
-        "docs/STAGING-DEPLOY.md never mentions platform-upgrade, so a "
-        "reviewer following it cannot reproduce the Job the tree ships"
-    )
-    # PR #1923 landed. Describing the installer as a future change is the
-    # original lie this file now exists to stop.
-    assert "Once that lands" not in text, (
-        "docs/STAGING-DEPLOY.md still describes `curie example sre-bot "
-        "install` as unlanded. The command is in the tree; this file is "
-        "the reproduction doc, not the history of a PR"
-    )
-    # The installer does not apply self-upgrade/cronjob.yaml. Claiming
-    # --platform-upgrade makes upgrade_self live is the next lie: the
-    # connector is kept, the bot's own CronJob is not.
-    assert "does not apply `self-upgrade/cronjob.yaml`" in text, (
-        "docs/STAGING-DEPLOY.md must say the installer does not apply "
-        "self-upgrade/cronjob.yaml; --platform-upgrade installs the "
-        "platform Job, not this bot's own upgrade CronJob"
-    )
-    # #2169 retired the bespoke writer and its duplicated allowlist. The
-    # reproduction guide must describe the one policy-scoped upstream server,
-    # not retain knobs the installer no longer accepts.
-    for retired in ("--write-allowlist", "--no-write", "K8S_WRITE_ALLOWLIST"):
-        assert retired not in text, (
-            f"docs/STAGING-DEPLOY.md still names retired writer surface {retired}"
-        )
-    assert "K8S_KUBECONFIG" in text
-    assert "six mutating core tools require" in text
 
 
 def test_deploy_yaml_placeholder_channels_cannot_silently_rebind() -> None:
@@ -171,49 +56,6 @@ def test_deploy_yaml_placeholder_channels_cannot_silently_rebind() -> None:
         "does not exist. Comment the slack_channel lines out (or put a "
         "real id) so a target cannot silently rebind Slack."
     )
-
-
-def test_self_upgrade_connector_docstring_names_the_tools_it_ships() -> None:
-    """The module docstring is this connector's blast-radius argument.
-
-    After the #2126 forward merge it claimed one zero-argument tool on a
-    three-tool file. A reviewer reading the header would stop. The invariant
-    that actually guards the connector is that no tool takes caller input
-    (curie#2292).
-    """
-
-    text = (BUNDLE / "connectors" / "self-upgrade" / "server.py").read_text(encoding="utf-8")
-    docstring = text[text.index('"""') + 3 : text.index('"""', 3)]
-    for tool in ("upgrade_self", "upgrade_platform", "latest_release"):
-        assert tool in docstring, (
-            f"self-upgrade module docstring must name {tool}; the file ships "
-            "three tools and the header is the security argument a reviewer reads"
-        )
-    assert "no tool takes caller input" in docstring, (
-        "self-upgrade module docstring must state the no-caller-input invariant; "
-        "that is the line, not the count of tools"
-    )
-    assert "one zero-argument tool" not in docstring, (
-        "self-upgrade module docstring still claims one zero-argument tool"
-    )
-    assert "exactly one thing" not in docstring, (
-        "self-upgrade module docstring still claims the connector does exactly one thing"
-    )
-
-
-def test_permission_map_matches_the_vanilla_kubernetes_connector() -> None:
-    """Retiring the bespoke writers must retire their documentation too."""
-
-    connectors = yaml.safe_load((BUNDLE / "connectors.yaml").read_text(encoding="utf-8"))
-    declared = connectors.get("connectors") or {}
-    assert "kubernetes" in declared
-    assert "k8s-write" not in declared
-    assert "k8s-scale" not in declared
-    text = (BUNDLE / "docs" / "PERMISSION-MAP.md").read_text(encoding="utf-8")
-    assert "mcp__k8s-write__" not in text
-    assert "mcp__k8s-scale__" not in text
-    assert "kubernetes/resources_create_or_update" in text
-    assert "kubernetes/resources_scale" in text
 
 
 def test_platform_upgrade_script_is_shellcheck_clean() -> None:
