@@ -10,8 +10,10 @@ import logging
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -25,13 +27,20 @@ from aci_protocol import (
     TextDelta,
     TurnSource,
 )
+from curie_api.config import Settings
+from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_dispatcher.queue import to_stream_fields
+from curie_telemetry import tracing as telemetry_tracing
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker import capacity_wait as capacity_wait_module
 from curie_worker import consumer as consumer_module
 from curie_worker import kernel as kernel_module
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.capacity_wait import WAIT_GENERATION_FIELD
+from curie_worker.capacity_wait import (
+    WAIT_GENERATION_FIELD,
+    WAIT_TERMINAL_ONLY_FIELD,
+    CapacityWaitStore,
+)
 from curie_worker.consumer import (
     THREAD_RESET_INFLIGHT_SET,
     THREAD_RESET_SET,
@@ -42,13 +51,19 @@ from curie_worker.consumer_liveness import (
     consumer_heartbeat_capable_key,
     consumer_heartbeat_key,
 )
+from curie_worker.cron_loop import CronSchedulerLoop, _Target
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.runner_client import TurnStream
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.stream_consumer import ConsumerLivenessExpired
 from curie_worker.threadlock import ThreadLock
 from curie_worker.workspace import WorkspacePreparationError
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind
 from redis.asyncio import Redis as AsyncRedis
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 # importlib import mode does not add the test root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -59,6 +74,247 @@ from queue_fixtures import wait_until as _wait_until  # noqa: E402
 DONE = SessionStatus.DONE
 
 HEARTBEAT_TTL_MS = 15_000
+
+
+@pytest.fixture
+def producer_spans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[tuple[TracerProvider, InMemorySpanExporter]]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(telemetry_tracing, "_tracer", provider.get_tracer("curie-telemetry"))
+    try:
+        yield provider, exporter
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("producer", ["cron", "work_item"])
+def test_enqueue_producer_is_the_real_consumer_parent(
+    make_harness,
+    make_hook_run,
+    producer_spans: tuple[TracerProvider, InMemorySpanExporter],
+    producer: str,
+) -> None:
+    provider, exporter = producer_spans
+
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            with provider.get_tracer("test-ingress").start_as_current_span("test.ingress"):
+                if producer == "work_item":
+                    settings = Settings(
+                        runs_stream=h.config.stream,
+                        runs_consumer_group=h.config.consumer_group,
+                    )
+                    reconciler = WorkItemReconciler(
+                        async_sessionmaker(run.engine), h.async_redis, settings
+                    )
+                    await reconciler._xadd(
+                        _qevent(
+                            "work item",
+                            event_id=f"work-item-{uuid.uuid4()}-execute-1",
+                            source=TurnSource.WEBHOOK,
+                        )
+                    )
+                else:
+                    async def not_killed(_agent_id: uuid.UUID) -> bool:
+                        return False
+
+                    loop = CronSchedulerLoop(
+                        engine=run.engine,
+                        redis=h.async_redis,
+                        source=SimpleNamespace(triggers=lambda _bundle: []),
+                        is_killed=not_killed,
+                        db_schema="curie",
+                        stream=h.config.stream,
+                        interval_seconds=1,
+                        claim_lease_s=300,
+                        default_max_usd_per_day=10,
+                        default_max_output_tokens_per_run=100_000,
+                    )
+                    await loop._enqueue(
+                        _Target(
+                            agent_id=run.agent_id,
+                            agent_name="acme-bot",
+                            version_id=run.version_id,
+                            bundle_ref=None,
+                            deployed_at=None,
+                            max_usd_per_day=None,
+                            max_output_tokens_per_run=None,
+                        ),
+                        {"name": run.ref.name, "prompt": "cron prompt"},
+                        _qevent("route").reply_handle,
+                        datetime.fromisoformat(run.ref.slot_utc),
+                        run.run_id,
+                    )
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group,
+                h.config.consumer_name,
+                {h.config.stream: ">"},
+                count=1,
+            )
+            entry_id, fields = rows[0][1][0]
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            spans = exporter.get_finished_spans()
+            enqueue = [span for span in spans if span.name == "curie.queue.enqueue"]
+            process = [span for span in spans if span.name == "curie.queue.process"]
+            assert len(enqueue) == len(process) == 1
+            assert enqueue[0].kind is SpanKind.PRODUCER
+            assert process[0].kind is SpanKind.CONSUMER
+            assert process[0].parent.span_id == enqueue[0].context.span_id
+            assert process[0].context.trace_id == enqueue[0].context.trace_id
+            assert int(fields["traceparent"].split("-")[2], 16) == enqueue[0].context.span_id
+            if producer == "cron":
+                assert h.runner.opened == ["cron prompt"]
+
+    asyncio.run(go())
+
+
+def test_carrierless_cli_entry_starts_a_real_root_consumer_span(
+    make_harness,
+    producer_spans: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    provider, exporter = producer_spans
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.default_script = [Final(text="root answer", status=DONE)]
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent("carrierless CLI turn")
+            await h.async_redis.xadd(h.config.stream, {"payload": event.model_dump_json()})
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group,
+                h.config.consumer_name,
+                {h.config.stream: ">"},
+                count=1,
+            )
+            entry_id, fields = rows[0][1][0]
+            assert set(fields) == {"payload"}
+            with provider.get_tracer("test-unrelated").start_as_current_span("test.unrelated"):
+                await consumer._sem.acquire()
+                await consumer._handle(entry_id, fields)
+            process = [
+                span for span in exporter.get_finished_spans() if span.name == "curie.queue.process"
+            ]
+            assert len(process) == 1
+            assert process[0].parent is None
+            assert process[0].context.is_valid
+            assert h.runner.opened == ["carrierless CLI turn"]
+            assert not any(
+                span.name == "curie.queue.enqueue" for span in exporter.get_finished_spans()
+            )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("recover", [False, True], ids=["wake", "lost_wake"])
+@pytest.mark.parametrize("active", [False, True], ids=["stored", "active"])
+@pytest.mark.parametrize(
+    "stored", [None, "00-3123456789abcdef0123456789abcdef-3123456789abcdef-01"],
+    ids=["absent", "present"],
+)
+def test_capacity_publication_injects_active_context_and_preserves_stored_fields(
+    make_harness,
+    producer_spans: tuple[TracerProvider, InMemorySpanExporter],
+    recover: bool,
+    active: bool,
+    stored: str | None,
+) -> None:
+    provider, exporter = producer_spans
+
+    async def go() -> None:
+        async with make_harness() as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            store = CapacityWaitStore(h.async_redis, h.config)
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            event = _qevent("wait for capacity")
+            original = to_stream_fields(event)
+            if stored is not None:
+                original["traceparent"] = stored
+            original["test_transport"] = "retained"
+            entry_id = await h.async_redis.xadd(h.config.stream, original)
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group,
+                h.config.consumer_name,
+                {h.config.stream: ">"},
+                count=1,
+            )
+            assert rows[0][1][0][0] == entry_id
+            lease = await leases.acquire(
+                h.config.stream, h.config.consumer_group, entry_id,
+                consumer=h.config.consumer_name,
+            )
+            try:
+                parked = await store.park(entry_id, original, event.event_id, lease)
+            finally:
+                await leases.release(
+                    h.config.stream, h.config.consumer_group, entry_id,
+                    owner=lease.owner, resume_event_id=None,
+                )
+            await h.async_redis.zadd(store._due, {event.event_id: 0})
+            if recover:
+                assert await store.wake_due() == 1
+                wake_id = (await h.async_redis.xrevrange(h.config.stream, count=1))[0][0]
+                await h.async_redis.xdel(h.config.stream, wake_id)
+                await h.async_redis.hset(store._record(event.event_id), "deadline_ms", "0")
+                await h.async_redis.zadd(store._flight, {event.event_id: 0})
+            if active:
+                with provider.get_tracer("test-capacity").start_as_current_span("test.capacity"):
+                    published = await (
+                        store.reconcile_lost_wakes() if recover else store.wake_due()
+                    )
+                    assert published == 1
+            else:
+                wake_task = asyncio.create_task(consumer._capacity_wake_loop())
+                try:
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        latest = await h.async_redis.xrevrange(h.config.stream, count=1)
+                        if latest and latest[0][0] != entry_id:
+                            break
+                        if wake_task.done():
+                            await wake_task
+                            raise AssertionError("capacity wake loop exited before publication")
+                        await asyncio.sleep(0.005)
+                    else:
+                        raise AssertionError("capacity wake loop did not publish the due entry")
+                finally:
+                    consumer.request_stop()
+                    await wake_task
+            rows = await h.async_redis.xrevrange(h.config.stream, count=1)
+            fields = rows[0][1]
+            assert fields["payload"] == original["payload"]
+            assert fields["test_transport"] == "retained"
+            assert fields[WAIT_GENERATION_FIELD] == str(parked.generation + (2 if recover else 1))
+            assert (fields.get(WAIT_TERMINAL_ONLY_FIELD) == "1") is recover
+            if active:
+                maintenance = next(
+                    span for span in exporter.get_finished_spans() if span.name == "test.capacity"
+                )
+                carrier = fields["traceparent"].split("-")
+                assert int(carrier[1], 16) == maintenance.context.trace_id
+                assert int(carrier[2], 16) == maintenance.context.span_id
+                assert fields["traceparent"] != stored
+            else:
+                assert fields.get("traceparent") == stored
+                assert {key: fields[key] for key in original} == original
+                if stored is None:
+                    assert "traceparent" not in fields
+            record = await store.get(event.event_id)
+            assert record is not None and record.fields == original
+            assert not any(
+                span.name == "curie.queue.enqueue" for span in exporter.get_finished_spans()
+            )
+            assert await (store.reconcile_lost_wakes() if recover else store.wake_due()) == 0
+
+    asyncio.run(go())
 
 
 async def _wait_consumer_idle(

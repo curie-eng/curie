@@ -12,7 +12,14 @@ from typing import Any
 import httpx
 import redis.asyncio as redis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
-from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
+from curie_telemetry import (
+    TRACEPARENT_STREAM_FIELD,
+    canonicalize_traceparent,
+    extract_trace_context,
+    inject_trace_context,
+    operation_span,
+)
+from opentelemetry.trace import SpanKind
 from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -599,20 +606,37 @@ class GitHubReviewReconciler:
                                 row.version += 1
                                 continue
                             row.quota_taken = True
-                        _, receipt = await enqueue_owned(
-                            self._valkey,
-                            key=f"curie:github-review:{row.event_id}",
-                            stream=self._settings.runs_stream,
-                            # Lua preserves its preceding SET if XADD fails.
-                            # Reuse this row's owner so a retry can finish that
-                            # partial operation without waiting for lease expiry.
-                            owner=f"pending:{row.event_id}",
-                            payload=json.dumps(row.turn),
-                            payload_field=STREAM_PAYLOAD_FIELD,
-                            lease_s=30,
-                            transport_field=TRACEPARENT_STREAM_FIELD,
-                            transport_value=row.traceparent,
+                        parent = extract_trace_context(
+                            {TRACEPARENT_STREAM_FIELD: row.traceparent}
+                            if row.traceparent is not None
+                            else {}
                         )
+                        with operation_span(
+                            "curie.queue.enqueue",
+                            kind=SpanKind.PRODUCER,
+                            parent=parent,
+                            attributes={"service.name": "curie-api", "source": "api"},
+                        ):
+                            carrier: dict[str, str] = {}
+                            inject_trace_context(carrier)
+                            _, receipt = await enqueue_owned(
+                                self._valkey,
+                                key=f"curie:github-review:{row.event_id}",
+                                stream=self._settings.runs_stream,
+                                # Lua preserves its preceding SET if XADD fails.
+                                # Reuse this row's owner so a retry can finish that
+                                # partial operation without waiting for lease expiry.
+                                owner=f"pending:{row.event_id}",
+                                payload=json.dumps(row.turn),
+                                payload_field=STREAM_PAYLOAD_FIELD,
+                                lease_s=30,
+                                transport_field=(
+                                    TRACEPARENT_STREAM_FIELD
+                                    if TRACEPARENT_STREAM_FIELD in carrier
+                                    else None
+                                ),
+                                transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+                            )
                     if "-" not in receipt or not all(p.isdigit() for p in receipt.split("-")):
                         raise RuntimeError("enqueue receipt unavailable")
                 except Exception:

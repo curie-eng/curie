@@ -73,9 +73,11 @@ from aci_protocol.service_config import STREAM_PAYLOAD_FIELD
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from channel_protocol import hook_conversation_id
 from cronsim import CronSim
-from curie_telemetry import record_metric
+from curie_telemetry import inject_trace_context, operation_span, record_metric
+from opentelemetry.trace import SpanKind
 from plugin_format import resolve_manifest
 from redis.asyncio import Redis
+from redis.typing import EncodableT
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -812,7 +814,16 @@ class CronSchedulerLoop:
             hook_run=HookRunRef(agent_id=agent, name=name, slot_utc=slot_iso),
         )
         try:
-            await self._redis.xadd(self._stream, {STREAM_PAYLOAD_FIELD: turn.model_dump_json()})
+            with operation_span(
+                "curie.queue.enqueue",
+                kind=SpanKind.PRODUCER,
+                attributes={"service.name": "curie-worker", "source": "worker"},
+            ):
+                carrier: dict[str, str] = {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
+                inject_trace_context(carrier)
+                fields: dict[EncodableT, EncodableT] = {}
+                fields.update(carrier)
+                await self._redis.xadd(self._stream, fields)
         except Exception:
             async with self._engine.begin() as conn:
                 failed = (await conn.execute(self._fail_run_sql, {"id": run_id})).first()
