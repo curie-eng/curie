@@ -7366,6 +7366,21 @@ mod tests {
         rest.split_whitespace().next()?.chars().next()
     }
 
+    /// An interrupted `poll` is not a missing child. `poll` returns `EINTR`
+    /// even when the process restarts interrupted calls.
+    #[cfg(target_os = "linux")]
+    fn readiness_poll_was_interrupted(rc: i32, err: i32) -> bool {
+        rc < 0 && err == libc::EINTR
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_interrupted_readiness_poll_is_not_a_failure() {
+        assert!(readiness_poll_was_interrupted(-1, libc::EINTR));
+        assert!(!readiness_poll_was_interrupted(-1, libc::EIO));
+        assert!(!readiness_poll_was_interrupted(1, libc::EINTR));
+    }
+
     /// Pid of the shim, published on `ready` only after that stub has exec'd.
     #[cfg(target_os = "linux")]
     fn pid_published_on(ready: std::fs::File) -> u32 {
@@ -7381,17 +7396,43 @@ mod tests {
             0,
             "mark the readiness fifo nonblocking"
         );
-        let mut pollfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `pollfd` points at one stack descriptor for this fifo.
-        let ready_count = unsafe { libc::poll(&raw mut pollfd, 1, 10_000) };
-        assert_eq!(ready_count, 1, "the shim never published its pid");
+        let started = std::time::Instant::now();
+        let limit = std::time::Duration::from_secs(10);
+        loop {
+            let left = limit.saturating_sub(started.elapsed());
+            assert!(!left.is_zero(), "the shim never published its pid");
+            let timeout_ms = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `pollfd` points at one stack descriptor for this fifo.
+            let ready_count = unsafe { libc::poll(&raw mut pollfd, 1, timeout_ms) };
+            if ready_count < 0 {
+                let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if readiness_poll_was_interrupted(ready_count, err) {
+                    continue;
+                }
+                panic!("readiness poll failed: {err}");
+            }
+            if ready_count == 1 {
+                break;
+            }
+        }
         let mut buf = [0u8; 64];
-        // SAFETY: `buf` is writable storage and `fd` is the same open fifo.
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        let n = loop {
+            // SAFETY: `buf` is writable storage and `fd` is the same open fifo.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if err == libc::EINTR {
+                    continue;
+                }
+                panic!("readiness read failed: {err}");
+            }
+            break n;
+        };
         assert!(n > 0, "the readiness fifo closed before a pid");
         let line = std::str::from_utf8(&buf[..n as usize]).expect("pid is utf 8");
         line.trim().parse().expect("the recorded pid is a number")

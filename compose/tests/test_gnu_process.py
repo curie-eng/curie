@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import os
+import re
 import select
 import shlex
 import shutil
@@ -46,6 +47,10 @@ NOT_FOUND = "/nonexistent/acme-command"
 SIGPIPE_PROBE = ["bash", "-c", 'yes | head -n 1 >/dev/null; exit "${PIPESTATUS[0]}"']
 # The lock as the drill scripts take it, on a descriptor the shell opened.
 TAKE_THE_LOCK = 'exec 9>"$1"; shift; "$@" -n 9'
+# The first GNU timeout that blocks signals across fork (coreutils ab4ffc8503).
+# An earlier one exits 143, without signalling the command, when TERM arrives
+# before the parent has stored the child pid.
+GNU_TIMEOUT_HOLDS_SIGNALS_ACROSS_FORK = (9, 5)
 
 
 def _is_gnu(tool: str) -> bool:
@@ -56,6 +61,15 @@ def _is_gnu(tool: str) -> bool:
         [path, "--version"], capture_output=True, text=True, check=False
     ).stdout
     return GNU_VERSION_MARKERS[tool] in version
+
+
+def _gnu_version(tool: str) -> tuple[int, ...]:
+    version = subprocess.run(
+        [tool, "--version"], capture_output=True, text=True, check=False
+    ).stdout
+    match = re.search(r"(\d+)\.(\d+)", version.splitlines()[0])
+    assert match is not None, version
+    return tuple(int(part) for part in match.groups())
 
 
 def _implementations(tool: str) -> list[object]:
@@ -275,14 +289,25 @@ def _pid_from_ready_fifo(process: subprocess.Popen[str], ready: Path) -> int:
 
     fd = os.open(ready, os.O_RDONLY | os.O_NONBLOCK)
     try:
-        readable, _, _ = select.select([fd], [], [], 10)
-        if not readable:
-            process.kill()
-            raise AssertionError(f"child never published its pid (status {process.poll()})")
-        data = os.read(fd, 64)
+        deadline = time.monotonic() + 10
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                raise AssertionError(
+                    f"child never published its pid (status {process.poll()})"
+                )
+            try:
+                readable, _, _ = select.select([fd], [], [], remaining)
+            except InterruptedError:
+                continue
+            if not readable:
+                continue
+            data = os.read(fd, 64)
+            if data:
+                return int(data.splitlines()[0])
     finally:
         os.close(fd)
-    return int(data.splitlines()[0])
 
 
 @pytest.mark.parametrize("implementation", _implementations("timeout"))
@@ -302,9 +327,10 @@ def test_timeout_passes_a_term_it_receives_to_the_command(
 
     GNU timeout before 9.5 exits 143 without signalling the command when the
     TERM lands before its parent has stored the child's pid (coreutils
-    ab4ffc8503). A child that has opened the readiness fifo is already past
-    that fork, and past ``trap`` when the case installs one. Measured on GNU
-    timeout 9.4. The helper holds the signal across its own fork, and
+    ab4ffc8503). The fifo proves the child has installed ``trap`` when this
+    case uses one. On those older versions the parent is then waited on until
+    it is asleep in ``wait``, which is when it has stored the pid. The helper
+    holds the signal across its own fork, and
     test_timeout_passes_on_a_term_that_arrives_while_the_command_starts sends
     one into that fork.
     """
@@ -326,6 +352,11 @@ def test_timeout_passes_a_term_it_receives_to_the_command(
     )
     try:
         command_pid = _pid_from_ready_fifo(process, ready)
+        if (
+            implementation == ["timeout"]
+            and _gnu_version("timeout") < GNU_TIMEOUT_HOLDS_SIGNALS_ACROSS_FORK
+        ):
+            _wait_until_asleep(process.pid)
         process.terminate()
         returncode = process.wait(timeout=10)
         assert not _alive(command_pid), "the TERM never reached the command"

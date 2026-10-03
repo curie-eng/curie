@@ -10,6 +10,7 @@ import os
 import select
 import shlex
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -74,10 +75,20 @@ def _read_ready_pid(ready: Path) -> str:
 
     fd = os.open(ready, os.O_RDONLY | os.O_NONBLOCK)
     try:
-        readable, _, _ = select.select([fd], [], [], 10)
-        if not readable:
-            raise AssertionError("spawned process never became ready")
-        return os.read(fd, 64).decode("utf-8")
+        deadline = time.monotonic() + 10
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError("spawned process never became ready")
+            try:
+                readable, _, _ = select.select([fd], [], [], remaining)
+            except InterruptedError:
+                continue
+            if not readable:
+                continue
+            data = os.read(fd, 64)
+            if data:
+                return data.decode("utf-8")
     finally:
         os.close(fd)
 
