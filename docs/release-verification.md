@@ -53,6 +53,10 @@ reads "zero open issues" is not itself a reason to cut.
 | `checksums.txt` | sha256 of every file above |
 | `checksums.txt.sigstore.json` | cosign signature over `checksums.txt` |
 
+Container images are not release assets. The release workflow publishes them to
+GHCR (GitHub Container Registry) with the signatures and attestations described
+in [Verify a container image](#verify-a-container-image).
+
 Every asset also carries [SLSA (Supply-chain Levels for Software Artifacts)
 build provenance](https://slsa.dev/), naming the repository, the workflow, and
 the commit it was built from.
@@ -137,7 +141,10 @@ provenance statement, including the commit the build ran from.
 ## Verify the chart and the compose file
 
 Same two steps, different asset. The chart and compose file are data rather than
-executables, but a tampered chart deploys tampered images:
+executables, but a tampered chart can point at different images. The released
+chart pins each first-party image to a signed digest (see
+[Verify a container image](#verify-a-container-image)), so a chart that passes
+the check below deploys exactly the images the release built:
 
 ```bash
 curl -fsSLO "$BASE/compose.release.yaml"
@@ -153,6 +160,91 @@ up` or `curie local up`, caching them under `~/.cache/curie/`. That fetch
 does not verify them today: it is protected by HTTPS to GitHub, not by the
 signature. Verify them by hand as above if you need the stronger guarantee.
 
+## Verify a container image
+
+Every image the release publishes is a multi-arch index: `curie-runner`,
+`curie-api`, `curie-dispatcher`, `curie-mail-adapter`, `curie-worker`,
+`curie-ui`, `curie-sre-bot-tempo`, `curie-sre-bot-self-upgrade`,
+`curie-worker-local`, and `curie-dark-factory-runner`. Each index carries:
+
+- a BuildKit SPDX SBOM and a SLSA provenance attestation per platform;
+- a keyless cosign signature over the index digest, made by the release
+  workflow's GitHub OIDC identity;
+- a GitHub build provenance attestation, pushed to the registry.
+
+This runs on every push to `main` or `next` (`sha-<commit>` tags) and on every
+`v*` tag. The released chart pins every first-party image it deploys to the
+index digest that release built. The chart job verifies each signature before it
+pins.
+
+**Read the pinned digests from the released chart.** Either command works:
+
+```bash
+helm show values curie-<version>.tgz | grep -n 'digest: "sha256'
+helm template x curie-<version>.tgz | grep -E 'image: "?ghcr.io/curie-eng/curie-'
+```
+
+**Resolve a tag to its digest** when you have only a tag:
+
+```bash
+docker buildx imagetools inspect ghcr.io/curie-eng/curie-api:<version> \
+  --format '{{json .Manifest}}' | jq -r .digest
+```
+
+**Verify the signature.** The identity is pinned to the release workflow and
+ref, so a signature from any other workflow, repo, or ref fails:
+
+```bash
+cosign verify ghcr.io/curie-eng/curie-api@<digest> \
+  --certificate-identity "https://github.com/curie-eng/curie/.github/workflows/release.yaml@refs/tags/v<version>" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+For a `sha-<commit>` build from a branch, the identity ends in
+`@refs/heads/main` or `@refs/heads/next` instead of the tag ref. To accept
+either branch, use a fully anchored, escaped pattern in place of
+`--certificate-identity`. A looser pattern can accept a signature from
+another workflow or ref.
+
+```bash
+cosign verify ghcr.io/curie-eng/curie-api@<digest> \
+  --certificate-identity-regexp '^https://github\.com/curie-eng/curie/\.github/workflows/release\.yaml@refs/heads/(main|next)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+**Verify the build provenance:**
+
+```bash
+gh attestation verify oci://ghcr.io/curie-eng/curie-api@<digest> \
+  --repo curie-eng/curie \
+  --signer-workflow curie-eng/curie/.github/workflows/release.yaml
+```
+
+**Read the SBOM and BuildKit provenance.** Both are stored per platform:
+
+```bash
+docker buildx imagetools inspect ghcr.io/curie-eng/curie-api@<digest> --format '{{ json .SBOM }}'
+docker buildx imagetools inspect ghcr.io/curie-eng/curie-api@<digest> --format '{{ json .Provenance }}'
+# one platform only
+docker buildx imagetools inspect ghcr.io/curie-eng/curie-api@<digest> \
+  --format '{{ json (index .SBOM "linux/amd64").SPDX }}'
+```
+
+The attestation manifests are referenced by digest from the signed index. So
+verifying the index signature covers them: you do not sign or check each
+platform separately.
+
+**Overriding a tag on the released chart.** The pinned digest wins over the
+tag. To run a different tag, clear that image's digest too:
+
+```bash
+helm upgrade curie curie-<version>.tgz \
+  --set api.image.tag=<other-tag> --set api.image.digest=
+```
+
+The source-tree chart keeps `digest` empty and falls back to the chart
+`appVersion` tag. Only the released chart asset is pinned.
+
 ## SBOMs (Software Bill of Materials)
 
 Each asset ships an SPDX (Software Package Data Exchange) 2.3 SBOM at
@@ -165,8 +257,8 @@ it the same way before trusting it:
 - **Chart and compose** -- these are deployment manifests with no dependencies of
   their own, so their SBOMs inventory the packaged artifact itself and little
   else. The dependency graph of what they deploy belongs to the `curie-*`
-  container images, and those do **not** carry SBOMs or provenance yet: that is
-  issue #62, still open. Do not read a verified chart as a verified stack.
+  container images. Those carry their own SBOMs, read from the registry as
+  described in [Verify a container image](#verify-a-container-image).
 
 Scan one with any SPDX-aware tool, for example
 [grype](https://github.com/anchore/grype):
@@ -209,8 +301,10 @@ which is a reviewed edit rather than a side effect.
   `xattr -d com.apple.quarantine ./curie-aarch64-apple-darwin` (or right-click
   the binary in Finder and choose Open). Verify it with cosign or
   `gh attestation verify` as above -- that is the real check regardless.
-- **Container images.** GHCR (GitHub Container Registry) image signing,
-  provenance, and SBOMs are issue #62.
+- **Compose image pinning.** The released chart pins images by digest.
+  `compose.release.yaml` does not: it still pins each image by version tag, so
+  the images it pulls are not tied to a signed digest until you verify them as
+  above.
 - **The SBOM generator's own supply chain.** `anchore/sbom-action` is pinned to a
   commit SHA, but on Linux and macOS it fetches `install.sh` from the `anchore/syft`
   `main` branch at run time, so the SBOM step still executes mutable upstream code
