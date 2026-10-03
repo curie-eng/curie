@@ -786,16 +786,16 @@ just that unit tests pass.
 ### The tier decision rule
 
 Applicability is a recorded decision, not a matter of taste. Every
-behavior-bearing change classifies all six tiers below as **required** or
+behavior-bearing change classifies all seven tiers below as **required** or
 **not applicable**, and a not-applicable row states a concrete reason naming
 the surface the change does not reach. "Unit tests cover it", "low risk", "CI
 is green", and "no time" are not reasons.
 
 A behavior-bearing change has at least one required tier, on the quick path as
-much as the build path. A classification that marks all six not applicable is
+much as the build path. A classification that marks all seven not applicable is
 a claim that the change alters no runtime behavior on any surface: either say
 that plainly and carry no tier, or the tier set is wrong for this change and
-the maintainer decides, but do not proceed on all six not applicable while
+the maintainer decides, but do not proceed on all seven not applicable while
 still calling the change behavior-bearing. A change that genuinely bears no
 runtime behavior records that reason once and is exempt from tier
 classification and E2E evidence for each acceptance criterion, including on
@@ -822,6 +822,35 @@ required and proved, not carried on the original classification.
 | cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
 | live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow; also the MCP/workspace/coding-tool path set below | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
 | external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape; Slack is required on the MCP/workspace/coding-tool path set below | drive the real integration; a replayed fixture or a fake does not close this tier |
+| factory | API factory runtime, CI, progress, or publication behavior; runner verification preflight or factory progress; the dark factory example; worker work item execution | `curie dev factory-e2e run --scenario issue-to-pr` until the scenario in #3814 ships |
+
+The factory path set includes `apps/api/src/curie_api/factory_runtime*`,
+`factory_ci*`, `factory_progress*`, and `routers/publications*`;
+runner verification preflight and progress; `examples/dark-factory/`; and
+worker work item execution. Factory evidence must run the production factory
+scenario through the changed components. A canned fixture or fake scenario
+does not close this tier. Until #3814 ships its scenario, use the command in
+the factory row.
+
+The PR body guard derives minimum required tiers from changed files. A row
+required by those paths cannot be omitted or marked not applicable through
+body prose. Classify all seven rows and supply the changed files and current
+open issues to the guard. Skill and local may use fake in the mode column when
+the row supplies its exact command and an observed completed outcome. Live
+provider, external integration, and factory require `live` in the mode column;
+a blank cell or any other mode leaves the row unproved.
+
+Evidence text saying blocked, not run, or fake leaves a required row unproved
+at any tier. For a completed negative test, describe the observed outcome as
+denied, refused, or returned 401; reserve blocked, not run, and fake for
+unproved status requiring a waiver. To proceed as discovery, include the
+visible line
+`Discovery waiver: <reason> #N`, naming an open issue that tracks the missing
+proof. Table rows and waiver lines must be visible. Text inside HTML comments,
+fenced code blocks, or indented code blocks does not count as evidence.
+Any follow up named in the tier table must include its issue number.
+A waiver records the missing proof; it does not change the tier to not
+applicable or claim that the acceptance criterion passed.
 
 The path set is runner MCP catalog projection, unscoped PreToolUse,
 in-process platform MCP tools, workspace publication, and
@@ -851,8 +880,9 @@ Every meaningful acceptance criterion needs two observations, not one.
 Record both against the run, per the run state contract in
 `.claude/skills/implement/SKILL.md`, and expose them in the pull request
 through the checklist in `.github/PULL_REQUEST_TEMPLATE.md`. A required tier
-with no passing evidence record blocks completion; it is reported as a blocker,
-not carried as a note.
+with no passing evidence record blocks completion unless the discovery waiver
+above names an open issue. Report the missing proof as a blocker, including
+when proceeding under that waiver.
 
 ## Playwright: two modes
 
@@ -956,7 +986,7 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
   inert. A patch release PR (title `Prepare the vX.Y.Z release` with Z not 0)
   must also fill Trigger (issue numbers) and Live proof (a run URL or
   `waiver: <reason>`); the same guard rejects either section left empty. Run
-  `scripts/check-pr-body.sh <body-file>` before opening or editing a PR
+  `scripts/check-pr-body.sh <body-file> --changed-files-file <changed-files-json> --open-issues-file <open-issues-json>` before opening or editing a PR
   (`--title-file` for a release PR). See
   [`docs/release-verification.md`](docs/release-verification.md#patch-releases-name-their-trigger-and-live-proof).
 - **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
@@ -969,7 +999,7 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
 
   ```bash
   scripts/check-commit-messages.sh origin/<base>..HEAD
-  scripts/check-pr-body.sh <body-file>
+  scripts/check-pr-body.sh <body-file> --changed-files-file <changed-files-json> --open-issues-file <open-issues-json>
   scripts/check-commit-messages.sh --self-test
   scripts/check-pr-body.sh --self-test
   ```

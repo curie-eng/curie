@@ -24,7 +24,19 @@ def _check_body(
 ) -> subprocess.CompletedProcess[str]:
     body_path = tmp_path / "pull-request-body.md"
     body_path.write_text(body, encoding="utf-8")
-    command = ["bash", str(CHECKER), str(body_path)]
+    changed_files_path = tmp_path / "changed-files.json"
+    changed_files_path.write_text("[]\n", encoding="utf-8")
+    open_issues_path = tmp_path / "open-issues.json"
+    open_issues_path.write_text("[]\n", encoding="utf-8")
+    command = [
+        "bash",
+        str(CHECKER),
+        str(body_path),
+        "--changed-files-file",
+        str(changed_files_path),
+        "--open-issues-file",
+        str(open_issues_path),
+    ]
     if title is not None:
         title_path = tmp_path / "pull-request-title.txt"
         title_path.write_text(title, encoding="utf-8")
