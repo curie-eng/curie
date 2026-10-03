@@ -54,10 +54,14 @@ fail() {
   exit 1
 }
 
+# $1 = reconciler enabled, $2 = agentSandbox.deploy (default true: the per-claim
+# token Secret grant renders only with the sandbox plane, #3842).
 render() {
   helm template curie "$CHART" -n "$NS" \
     -f "$CHART/values-dev.yaml" \
     --set "worker.connectorReconciler.enabled=$1" \
+    --set "agentSandbox.deploy=${2:-true}" \
+    --set agentSandbox.controller.deploy=false \
     --set worker.publication.enabled=false \
     -s templates/worker.yaml
 }
@@ -80,6 +84,7 @@ DISABLED="$(render false)"
 ENABLED="$(render true)"
 DISABLED_RULES="$(worker_role_rules "$DISABLED")"
 ENABLED_RULES="$(worker_role_rules "$ENABLED")"
+NO_SANDBOX_RULES="$(worker_role_rules "$(render false false)")"
 
 # (a) Off by default means no grant at all on the connector kinds...
 for resource in deployments services networkpolicies; do
@@ -87,6 +92,10 @@ for resource in deployments services networkpolicies; do
     fail a "worker Role grants $resource with the reconciler disabled; the RBAC gate is not working"
   fi
 done
+# ...and with the sandbox plane off, no Secrets grant at all.
+if grep -q "secrets" <<<"$NO_SANDBOX_RULES"; then
+  fail a "worker Role grants secrets with agentSandbox.deploy=false and the reconciler disabled"
+fi
 # ...and Secrets only through the per-claim token rule (#3842): create, and
 # nothing else, in exactly one rule that names only secrets.
 python3 - "$DISABLED_RULES" <<'PY' || exit 1
