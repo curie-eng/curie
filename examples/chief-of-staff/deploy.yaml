@@ -1,0 +1,8 @@
+# Where this bundle is deployed. Replace the channel ID with your team's channel,
+# and use the same ID as `target` on both triggers in .claude-plugin/plugin.json:
+# a cron trigger posts only to a channel already bound to the agent.
+targets:
+  prod:
+    agent: chief-of-staff
+    env: prod
+    slack_channel: C0YOURCHANNEL

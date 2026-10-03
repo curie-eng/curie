@@ -1,0 +1,50 @@
+{
+  "name": "chief-of-staff",
+  "cases": [
+    {
+      "id": "an-unnamed-asker-is-asked-who-they-are",
+      "input": "what's my top priority?",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*Who's asking\\?",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "adding-a-deliverable-saves-it-and-confirms-in-one-line",
+      "input": "Add deliverable: Eval fixture deliverable, owner Evalia, P1, due 2030-01-15, done when the eval passes.",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*Saved [A-Z]+\\d+: Eval fixture deliverable \\(Evalia, P1, due Tue Jan 15\\)\\.\\s*$",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "a-named-asker-gets-their-own-deliverable-back",
+      "input": "What is the top priority for Evalia?",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*Evalia, your top priority is [A-Z]+\\d+: Eval fixture deliverable \\(P1, due Tue Jan 15\\)\\. Done when: the eval passes\\.",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "someone-with-nothing-open-is-told-so",
+      "input": "What is the top priority for Nobodyx?",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*Nobodyx, you have no open deliverables\\.\\s*$",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "marking-the-fixture-done-takes-it-out-of-the-plan",
+      "input": "Evalia's Eval fixture deliverable is done.",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*Saved [A-Z]+\\d+: now done\\.\\s*$",
+        "case_sensitive": true
+      }
+    }
+  ]
+}
