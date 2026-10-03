@@ -2158,7 +2158,7 @@ fn publication_gate_survives_both_embedded_installer_modes_with_operator_approve
             .api
             .recorded()
             .into_iter()
-            .find(|request| route_patch(request))
+            .find(route_patch)
             .expect("install must bind sre-approvals before uploading the bundle");
         let route_body: Value = serde_json::from_slice(&route_write.body)
             .expect("approval route request must remain valid JSON");
@@ -4255,7 +4255,7 @@ fn rerun_moves_route_narrows_users_preserves_other_routes_and_reports_rebound() 
     );
     let route_write_index = requests
         .iter()
-        .position(|request| route_patch(request))
+        .position(route_patch)
         .expect("rerun must send a route PATCH");
     let deployment_index = requests
         .iter()
@@ -4298,7 +4298,7 @@ fn rerun_moves_route_narrows_users_preserves_other_routes_and_reports_rebound() 
     let all_requests = fixture.api.recorded();
     let second_requests = &all_requests[first_request_count..];
     assert!(
-        !second_requests.iter().any(|request| route_patch(request)),
+        !second_requests.iter().any(route_patch),
         "identical rerun must send no additional route PATCH: {second_requests:?}"
     );
     assert_eq!(
@@ -4337,7 +4337,7 @@ fn a_needed_route_write_that_would_drop_a_notification_is_refused_before_deploy(
     );
     let requests = fixture.api.recorded();
     assert!(
-        !requests.iter().any(|request| route_patch(request)),
+        !requests.iter().any(route_patch),
         "no route write may be sent: {requests:?}"
     );
     assert!(
@@ -4373,7 +4373,7 @@ fn an_identical_binding_with_a_notification_elsewhere_proceeds_without_a_route_w
     );
     let requests = fixture.api.recorded();
     assert!(
-        !requests.iter().any(|request| route_patch(request)),
+        !requests.iter().any(route_patch),
         "no route write may be sent when nothing changes: {requests:?}"
     );
     assert!(
