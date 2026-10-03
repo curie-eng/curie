@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.7";
+pub const PROTOCOL_VERSION: &str = "0.5.14";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -113,6 +113,12 @@ pub enum TurnSource {
     Cron,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ToolAccess {
+    #[serde(rename = "read-only")]
+    ReadOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Budget {
     pub max_output_tokens_per_run: i64,
@@ -167,6 +173,8 @@ pub struct BootEnv {
     #[serde(default)]
     pub channel_memory_ref: Option<String>,
     #[serde(default)]
+    pub memory_writes: Option<bool>,
+    #[serde(default)]
     pub state_url: Option<String>,
     #[serde(default)]
     pub state_token: Option<String>,
@@ -174,6 +182,10 @@ pub struct BootEnv {
     pub progress_url: Option<String>,
     #[serde(default)]
     pub progress_token: Option<String>,
+    #[serde(default)]
+    pub issue_read_url: Option<String>,
+    #[serde(default)]
+    pub issue_read_token: Option<String>,
     #[serde(default)]
     pub approval_required_tools: Option<Vec<String>>,
     #[serde(default)]
@@ -205,6 +217,8 @@ pub struct BootEnv {
     #[serde(default)]
     pub deployment_environment: Option<String>,
     #[serde(default)]
+    pub channel_bound: Option<bool>,
+    #[serde(default)]
     pub model_env_key: Option<String>,
     #[serde(default)]
     pub metrics_temporality_preference: Option<String>,
@@ -214,6 +228,8 @@ pub struct BootEnv {
     pub history_max_turns: Option<i64>,
     #[serde(default)]
     pub history_max_bytes: Option<i64>,
+    #[serde(default)]
+    pub memory_max_facts: Option<i64>,
 }
 
 /// Boot-env variable names, generated from aci_protocol.session.BootEnv.
@@ -229,6 +245,7 @@ pub mod env_keys {
     pub const CURIE_BUDGET: &str = "CURIE_BUDGET";
     pub const CURIE_BUNDLE_REF: &str = "CURIE_BUNDLE_REF";
     pub const CURIE_BUNDLE_VERSION: &str = "CURIE_BUNDLE_VERSION";
+    pub const CURIE_CHANNEL_BOUND: &str = "CURIE_CHANNEL_BOUND";
     pub const CURIE_CHANNEL_MEMORY_REF: &str = "CURIE_CHANNEL_MEMORY_REF";
     pub const CURIE_CONNECTOR_AGENT: &str = "CURIE_CONNECTOR_AGENT";
     pub const CURIE_CONNECTOR_CALLER_TOKEN: &str = "CURIE_CONNECTOR_CALLER_TOKEN";
@@ -242,9 +259,13 @@ pub mod env_keys {
     pub const CURIE_HISTORY_MAX_TURNS: &str = "CURIE_HISTORY_MAX_TURNS";
     pub const CURIE_HISTORY_REF: &str = "CURIE_HISTORY_REF";
     pub const CURIE_HISTORY_TOKEN: &str = "CURIE_HISTORY_TOKEN";
+    pub const CURIE_ISSUE_READ_TOKEN: &str = "CURIE_ISSUE_READ_TOKEN";
+    pub const CURIE_ISSUE_READ_URL: &str = "CURIE_ISSUE_READ_URL";
     pub const CURIE_MAX_TURNS: &str = "CURIE_MAX_TURNS";
+    pub const CURIE_MEMORY_MAX_FACTS: &str = "CURIE_MEMORY_MAX_FACTS";
     pub const CURIE_MEMORY_REF: &str = "CURIE_MEMORY_REF";
     pub const CURIE_MEMORY_TOKEN: &str = "CURIE_MEMORY_TOKEN";
+    pub const CURIE_MEMORY_WRITES: &str = "CURIE_MEMORY_WRITES";
     pub const CURIE_MODEL: &str = "CURIE_MODEL";
     pub const CURIE_MODEL_API_BACKEND: &str = "CURIE_MODEL_API_BACKEND";
     pub const CURIE_MODEL_ENV_KEY: &str = "CURIE_MODEL_ENV_KEY";
@@ -274,6 +295,8 @@ pub struct ReplyHandle {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub adapter: Option<String>,
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -308,6 +331,8 @@ pub struct QueuedTurn {
     pub attachments: Vec<Attachment>,
     #[serde(default)]
     pub hook_run: Option<HookRunRef>,
+    #[serde(default)]
+    pub tool_access: Option<ToolAccess>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -399,6 +424,10 @@ pub enum InboundMessage {
         history_ref: Option<String>,
         #[serde(default)]
         publication_context: Option<PublicationContext>,
+        #[serde(default)]
+        tool_access: Option<ToolAccess>,
+        #[serde(default)]
+        memory_token: Option<String>,
     },
     #[serde(rename = "interrupt")]
     Interrupt {
@@ -471,6 +500,8 @@ pub enum OutboundEvent {
         result: Option<serde_json::Map<String, serde_json::Value>>,
         #[serde(default)]
         failed: Option<bool>,
+        #[serde(default)]
+        redacted: Option<bool>,
     },
 }
 
@@ -528,8 +559,15 @@ mod tests {
             session_id: None,
             history_ref: None,
             publication_context: None,
+            // TOOL-ACCESS-1: the enum's wire spelling round-trips too.
+            tool_access: Some(ToolAccess::ReadOnly),
+            memory_token: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
+        assert!(encoded.contains(r#""tool_access":"read-only""#));
+        // TOOL-ACCESS-2: an unknown value is refused, never read as None.
+        let unknown = encoded.replace(r#""read-only""#, r#""read-mostly""#);
+        assert!(serde_json::from_str::<InboundMessage>(&unknown).is_err());
         let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
         assert_eq!(message, decoded);
     }
@@ -566,13 +604,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.8","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.15","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.7","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.14","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

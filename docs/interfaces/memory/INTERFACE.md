@@ -75,8 +75,9 @@ starts with `eval:` (#1909): that path omits the ref so the runner boots
 Beside the legacy `log`, memory also holds **facts**, read and written by
 `runner/src/curie_runner/memory_facts.py::MemoryFactsStore` rather than through
 the `MemoryStore` port. A fact is one key `fact-<32 hex>` whose value is
-`{statement, author, stated_at, session_id}`. Facts live in two namespaces
-reached with the same memory token:
+`{statement, author, stated_at, session_id}`. Facts live in two namespaces,
+read with the long-lived memory token and written with the turn's write
+credential (see "The memory credential" below):
 
 - **Agent memory**, at `CURIE_MEMORY_REF`, loaded in every channel. It also
   holds two reserved keys that are never facts: `log` (above) and `guidance`
@@ -84,30 +85,99 @@ reached with the same memory token:
 - **Channel memory**, at `CURIE_CHANNEL_MEMORY_REF`
   (`BootEnv.channel_memory_ref`), the binding-scoped namespace
   `.../agents/<id>/state/bindings/<kind>/<address>/memory`. The worker sets it
-  only when the agent's `memory_writes` setting is on and the turn has a
-  binding, and never on an eval-isolated turn.
+  whenever the turn has a binding, whether memory writes are on or off, and
+  never on an eval-isolated turn. Alongside it the worker sends
+  `CURIE_MEMORY_WRITES` (`BootEnv.memory_writes`), `1` or `0` from the agent's
+  `memory_writes` setting; it is never sent without a channel ref.
 
 At boot the runner lists whichever of the two it was given and renders a
 "Remembered facts" block (agent facts, then channel facts, newest first, at
-most 200 per memory, each statement flattened to one line and framed as data,
-not instructions) after the legacy log preamble. With memory writes off no
-channel ref is minted, so only agent facts are loaded. When
-`CURIE_CHANNEL_MEMORY_REF` is set it also mounts `remember`, `update` and
-`forget` on the platform `curie` server and injects the guidance block
-(`guidance` if stored, else `DEFAULT_GUIDANCE`) before the bundle prompt. The
+most 200 per memory by default, each statement flattened to one line and framed as data,
+not instructions) after the legacy log preamble. Each line reads
+`- [<id>] <author> on <YYYY-MM-DD> stated: <statement>` (or
+`- [<id>] <author> stated: <statement>` without a date; a date that does not
+parse is left out, never shown raw), or
+`- [<id>] Author unknown, as of <YYYY-MM-DD>: <statement>` (or
+`- [<id>] Author unknown: <statement>`) when no person is recorded. The
+attribution comes before the statement so a statement cannot forge it. The
+author keeps only the characters `[A-Za-z0-9._@+-]` (anything else, including
+whitespace, parentheses, colons, zero-width and bidi characters, is dropped; nothing
+left means unknown) and is capped at 64 characters. The block tells the model to
+weigh each fact by who stated it, and says that only the attribution at the
+start of each line is the platform's record: anything in the statement that
+looks like an attribution is part of what was said. Reading memory needs no
+switch: with memory writes off, both agent and channel facts still load. Only
+when writes are on does it also mount `remember`, `update` and `forget` on the
+platform `curie` server and inject the guidance block (`guidance` if stored,
+else `DEFAULT_GUIDANCE`) before the bundle prompt. Writes are on when
+`CURIE_MEMORY_WRITES` is `1`, or when it is absent and
+`CURIE_CHANNEL_MEMORY_REF` is set (an older worker, which only sent the ref
+with writes on). With a channel ref and token but writes off, a short notice
+(`WRITES_OFF_NOTICE`) takes the guidance block's place: saving memory is turned
+off for this agent, nothing said here is kept for later conversations, and the
+agent must never say it saved, noted or will remember something. The
 tools take `memory: agent|channel`; the author is the turn's sender, never a
 tool argument. A write the state API refuses at its cap is reported to the model
-as refused. The tools are exempt from bundle toolPolicy by published name, and
-the worker leaves them out of change receipts.
+as refused, and so is one it refuses for the credential (a 403, `MemoryRefused`:
+"this memory cannot be written from this conversation"). So is a `remember` into a memory that already holds 200 facts, the
+most boot loads, so no fact silently leaves the prompt; `update` and `forget`
+still work there. The operator can change that limit with
+`CURIE_MEMORY_MAX_FACTS` (`BootEnv.memory_max_facts`, read as
+`RunnerConfig.memory_max_facts`). It is one number for both the save refusal
+and the boot load, and for agent and channel memory alike, so a saved fact is
+always shown. A value that is not a positive integer is ignored and the
+default of 200 applies. The tools are exempt from bundle toolPolicy by published
+name, and the worker leaves them out of change receipts.
+
+### The memory credential (ADR-0188)
+
+The state API, not the sandbox, decides what a sandbox may do on the `memory`
+namespace (`apps/api/src/curie_api/routers/state.py::_check_memory_reach`).
+There are two sandbox credentials, both `scope="state"` tokens:
+
+- **Long-lived, read-only.** `CURIE_MEMORY_TOKEN` (and `CURIE_HISTORY_TOKEN`),
+  minted in `boot_env` with claims `{binding, memory: "read"}`. `binding` is
+  the boot binding's `"<kind>:<address>"`, or JSON null when the turn has none.
+- **Per turn, write.** Minted by
+  `apps/worker/src/curie_worker/binding.py::BindingResolver.turn_memory_token`
+  only when the agent has memory writes on, the turn names a binding and it is
+  not eval-isolated, with claims `{binding, memory: "write", sender, turn}`.
+  `sender` is the turn's `event.user`, or `<no person>`; `turn` is the queued
+  event id. It expires after the turn's remaining delivery budget (capped at
+  24 hours) plus 60 seconds. It rides the runner POST as `Event.memory_token`
+  (MEMORY-TOKEN-1..3), never the env. The runner keeps it on
+  `MemoryTurn.write_token`, and the tool stores present it, falling back to the
+  env token when the event has none.
+
+On `memory` the API allows a sandbox credential: agent memory; channel memory
+only for the binding its `binding` claim names (otherwise 403, checked before
+the binding lookup so it reveals nothing); writes (PUT, DELETE) only with
+`memory: "write"` and only on fact keys (`fact-` plus 32 lowercase hex, so
+never `guidance` or `log`); no POST append. On a PUT it stores the `sender`
+claim as the fact's `author`, whatever the body says, and refuses a value that
+is not a JSON object (422). The namespace listing for another binding leaves
+out its `memory` row. A token with no `memory` claim (from a worker older than
+ADR-0188) is read-only on agent memory and refused on channel memory, with a
+warning naming "legacy sandbox token". The platform key keeps full reach and
+the body's author.
+
+Upgrade order: a runner older than `CURIE_MEMORY_WRITES` ignores the flag and
+mounts the memory tools whenever it gets a channel ref. A newer worker sends
+that ref with writes off too, so an older runner behind it would mount the tools
+against the operator's setting. Upgrade runners with or before workers (one
+`helm upgrade` does both), and don't pin runner images separately across this
+change.
 
 ## Known leakage
 
 - **Scoped memory token (was: shared API key).** Earlier the state API's one
   shared platform key was forwarded into the sandbox as `CURIE_MEMORY_TOKEN`,
   granting that key's full scope. ADR-0033 (#410) closed that: the worker now
-  mints a scoped, agent-bound, HMAC-signed `state` token per turn, accepted only
+  mints a scoped, agent-bound, HMAC-signed `state` token per claim, accepted only
   by the state router and bound to this agent's namespace, so the sandbox
-  credential can no longer resolve approvals or reach another agent's state. The
+  credential can no longer resolve approvals or reach another agent's state.
+  ADR-0188 (#3623) narrows it further on memory, to its own channel and to
+  reads; writes need the per-turn credential above. The
   platform key still authenticates the state router for operators, the CLI, and
   the worker's own control-plane calls.
 - **Consolidation is an opt-in capability, not part of the port.** The core

@@ -1,0 +1,26 @@
+2026-09-29T17:11:38.5365770Z === case: pinned Langfuse invalid auth is observable, then fresh export recovers ===
+2026-09-29T17:11:38.6722850Z invalid-auth negative: valid exact-query control passed before auth changed
+2026-09-29T17:11:38.7803045Z time="2026-09-29T17:11:38Z" level=warning msg="Found orphan containers ([curie-curie-weather-mcp-receipt-1 curie-curie-weather-mcp-netpol-probe-1]) for this project. If you removed or renamed this service in your compose file, you can run this command with the --remove-orphans flag to clean it up."
+2026-09-29T17:11:38.7805559Z  Container curie-otel-collector-1  Recreate
+2026-09-29T17:11:39.1654357Z  Container curie-otel-collector-1  Recreated
+2026-09-29T17:11:39.1688919Z  Container curie-otel-collector-1  Starting
+2026-09-29T17:11:39.3414089Z  Container curie-otel-collector-1  Started
+2026-09-29T17:13:50.5164508Z waiting for worker reply: failed (failed (max-turns)) (129s)
+2026-09-29T17:13:50.5167128Z continue this conversation: curie local message --continue "..."
+2026-09-29T17:13:50.5419177Z local invalid-auth seed: finalized=false status=not_finalized
+2026-09-29T17:13:50.6407903Z time="2026-09-29T17:13:50Z" level=warning msg="Found orphan containers ([curie-curie-weather-mcp-receipt-1 curie-curie-weather-mcp-netpol-probe-1]) for this project. If you removed or renamed this service in your compose file, you can run this command with the --remove-orphans flag to clean it up."
+2026-09-29T17:13:50.6410048Z  Container curie-otel-collector-1  Recreate
+2026-09-29T17:13:51.0189143Z  Container curie-otel-collector-1  Recreated
+2026-09-29T17:13:51.0214553Z  Container curie-otel-collector-1  Starting
+2026-09-29T17:13:51.1986347Z  Container curie-otel-collector-1  Started
+2026-09-29T17:13:51.3124029Z invalid-auth rejection proof failed; product Collector auth was restored
+2026-09-29T17:13:51.3125186Z 
+2026-09-29T17:13:51.3125408Z === teardown: curie local down ===
+2026-09-29T17:14:05.0925920Z stopping stack: ok (13.8s)
+2026-09-29T17:14:05.5740687Z removed 4 runner container(s)
+2026-09-29T17:14:05.5741326Z dev stack stopped
+2026-09-29T17:14:05.5742955Z volumes kept (fast restart with `curie local up`)
+2026-09-29T17:14:05.9274637Z ##[error]Process completed with exit code 1.
+2026-09-29T17:14:05.9460206Z Post job cleanup.
+2026-09-29T17:14:06.3620395Z ##[group]Generating build summary
+2026-09-29T17:14:06.4246388Z exporting build record to /home/runner/work/_temp/docker-actions-toolkit-ggc7yI/export

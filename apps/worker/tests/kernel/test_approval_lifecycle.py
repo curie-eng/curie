@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import aiohttp
 import httpx
@@ -110,6 +111,12 @@ class RecordingReader:
     Separate from ``RecordingApprovals`` for the same reason the kernel takes two
     parameters (#1084): most tests need only the create half, and a combined fake
     would make every one of them carry a read they never exercise.
+
+    Those responses answer only for an approval the test has resolved. Until
+    then the record reads back ``pending``, as the API's does, because the pause
+    reads its own record back once its card is registered (#3637). A test that
+    resolves before a resume calls ``resolve`` first, which is the API's order:
+    the row is resolved, then the resume is enqueued.
     """
 
     def __init__(self, *records: SettledApproval | None) -> None:
@@ -118,11 +125,20 @@ class RecordingReader:
         # is how you spell "the read came back empty".
         assert records, "RecordingReader needs at least one record; use RecordingReader(None)"
         self.records = records
+        # Every read, pending or not, in order.
         self.reads: list[str] = []
+        self.resolved: set[str] = set()
+        self._settled_reads = 0
+
+    def resolve(self, approval_id: str) -> None:
+        self.resolved.add(approval_id)
 
     async def get(self, approval_id: str) -> SettledApproval | None:
         self.reads.append(approval_id)
-        return self.records[min(len(self.reads), len(self.records)) - 1]
+        if approval_id not in self.resolved:
+            return SettledApproval(status="pending", resolved_by=None, resolution_note=None)
+        self._settled_reads += 1
+        return self.records[min(self._settled_reads, len(self.records)) - 1]
 
 
 _qevent = functools.partial(qevent, thread="th-appr", received_at="2026-07-14T00:00:00+00:00")
@@ -636,6 +652,7 @@ def test_verified_lineage_at_materialized_route_head_reuses_existing_session(
             SimpleNamespace(
                 text="Continue https://github.com/acme-corp/acme-bot",
                 user="U0REQUEST1",
+                tool_access=None,
             ),
             {},
             queued_event_id="test-event",
@@ -779,6 +796,7 @@ def test_headless_visible_outcome_cold_reconciles_once_then_live_followup_steers
         event = SimpleNamespace(
             text="Continue https://github.com/acme-corp/acme-bot",
             user="U0REQUEST1",
+            tool_access=None,
         )
 
         first = await kernel._route_and_start(
@@ -1965,6 +1983,127 @@ def test_publication_create_workspace_409_is_a_terminal_refusal(message: str) ->
     asyncio.run(go())
 
 
+def _refusal_publication_request() -> PublicationCreateRequest:
+    return PublicationCreateRequest(
+        deployment_id=uuid.UUID("11111111-1111-4111-8111-111111111111"),
+        conversation_id="slack:C0EXAMPLE1:1700000000.000100",
+        repo_full_name="acme-corp/acme-private",
+        author="U0REQUEST1",
+        summary="Publish the bounded change",
+        reply_kind="slack",
+        reply_channel="C0EXAMPLE1",
+        reply_placeholder="1700000000.000001",
+        reply_endpoint=None,
+        reply_adapter=None,
+        dedupe_key="publication-example",
+        base_sha="a" * 40,
+        patch=b"diff --git a/unitconv/convert.py b/unitconv/convert.py\n",
+        changed_paths=("unitconv/convert.py",),
+        expires_in_seconds=600,
+        title="Update converter",
+        body="Approved platform publication.",
+    )
+
+
+async def _create_publication_error(response: httpx.Response) -> Any:
+    from curie_worker.approvals import ApprovalBackendError
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: response)
+    ) as http:
+        client = ApprovalClient(
+            api_base_url="https://api.example.test",
+            api_key="",
+            client=http,
+            read_timeout_s=1.0,
+            worker_token="worker-test-token",
+        )
+        with pytest.raises(ApprovalBackendError) as excinfo:
+            await client.create_publication(_refusal_publication_request())
+    return excinfo.value
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "message"),
+    [
+        (
+            409,
+            "publication.required_python_ci_unselected",
+            "required Python CI does not select unitconv/convert.py",
+        ),
+        (
+            409,
+            "publication.verification_preflight_missing",
+            "verification preflight observation is missing",
+        ),
+        (422, "publication.patch_too_large", "patch exceeds the limit"),
+    ],
+)
+def test_a_coded_publication_refusal_carries_its_code_and_message(
+    status: int, code: str, message: str
+) -> None:
+    """#3617: the API's refusal reaches the factory run instead of a generic cause."""
+
+    error = asyncio.run(
+        _create_publication_error(
+            httpx.Response(status, json={"detail": {"code": code, "message": message}})
+        )
+    )
+
+    assert error.refusal == f"{code}: {message}"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(500, text="internal error"),
+        httpx.Response(409, json={"detail": {"code": 7, "message": "not a code"}}),
+    ],
+    ids=["plain-500", "non-string-code"],
+)
+def test_an_uncoded_publication_failure_has_no_refusal(response: httpx.Response) -> None:
+    error = asyncio.run(_create_publication_error(response))
+
+    assert error.refusal is None
+
+
+def test_a_string_detail_api_refusal_is_carried_as_the_refusal() -> None:
+    message = "publication patch exceeds the 1048576-byte limit"
+
+    error = asyncio.run(
+        _create_publication_error(httpx.Response(413, json={"detail": message}))
+    )
+
+    assert error.refusal == message
+
+
+def test_a_long_refusal_is_redacted_whole_before_it_is_clipped() -> None:
+    """A secret whose closing delimiter lies past any clip must still redact.
+
+    The refusal reaches a public GitHub issue, so a clip that runs before
+    redaction would cut the PEM end line and leak the key body.
+    """
+
+    from curie_worker.kernel import _ApprovalPause
+
+    body = "A" * 900
+    pem = f"-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----"
+    error = asyncio.run(
+        _create_publication_error(
+            httpx.Response(
+                409,
+                json={"detail": {"code": "publication.example", "message": f"x {pem}"}},
+            )
+        )
+    )
+
+    pause = _ApprovalPause.refused(error.refusal)
+
+    assert pause.failure_detail is not None
+    assert "publication.example" in pause.failure_detail
+    assert "AAAAAAAAAA" not in pause.failure_detail
+
+
 def test_worker_approval_http_does_not_fabricate_a_parent() -> None:
     """A legacy/root call without an active trace stays a clean HTTP root."""
 
@@ -2224,8 +2363,11 @@ def test_the_created_record_carries_the_turns_kind_and_adapter(make_harness) -> 
 
     async def go() -> None:
         approvals = RecordingApprovals()
-        async with make_harness(approvals=approvals) as h:
-            h.runner.default_script = _awaiting_script("Send the quote to ACME")
+        # An email approval is created only for a route that lists approver
+        # emails (ADR-0177 amendment); a routeless one escalates.
+        binding = RoutedBinding({"approve": _LISTED_EMAIL_ROUTE})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Send the quote to ACME", "approve")
             ev = _qevent(
                 "send it",
                 event_id="ev-appr-kind",
@@ -2300,8 +2442,9 @@ def test_null_placeholder_turn_persists_its_approval_before_any_delivery(
 
     async def go() -> None:
         approvals = RecordingApprovals()
-        async with make_harness(approvals=approvals) as h:
-            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+        binding = RoutedBinding({"approve": _LISTED_EMAIL_ROUTE})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Give ACME a 20% discount", "approve")
             event = _qevent(
                 "please discount",
                 placeholder=None,
@@ -2584,8 +2727,9 @@ def test_no_edit_placeholderless_approval_tolerates_a_notice_without_a_ref(
 def test_stream_minted_ref_survives_a_booting_delivery_failure(make_harness) -> None:
     async def go() -> None:
         approvals = RecordingApprovals()
-        async with make_harness(approvals=approvals) as h:
-            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+        binding = RoutedBinding({"approve": _LISTED_EMAIL_ROUTE})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Give ACME a 20% discount", "approve")
             booting = h.config.booting_text
             original_emit = h.sink.emit
             booting_failures = 0
@@ -2787,7 +2931,7 @@ class GrantBinding:
 
         return Budget(max_output_tokens_per_run=1000, max_usd_per_day=1.0)
 
-    def boot_env(self, resolved, thread_key, *, kind=None, address=None):  # noqa: ANN001, ANN201
+    def boot_env(self, resolved, thread_key, *, kind=None, address=None, **_: object):  # noqa: ANN001, ANN201
         return {"CURIE_SESSION_ID": f"s-{thread_key}"}
 
     async def approval_grant_tool(self, event_id: str, agent_id):  # noqa: ANN001, ANN201
@@ -2839,6 +2983,38 @@ def test_resume_claim_injects_approval_grant_tool_env(make_harness) -> None:
             assert "CURIE_APPROVAL_GRANT_TOOL" not in fresh_env
             assert "CURIE_APPROVAL_GRANT_ARGUMENTS" not in fresh_env
             assert "CURIE_APPROVAL_DECISION" not in fresh_env
+
+    asyncio.run(go())
+
+
+def test_a_read_only_turn_never_boots_with_an_approval_grant(make_harness) -> None:
+    """WORKER-TOOL-ACCESS-4: even carrying an approval resume's event id.
+
+    A resume event id is platform-minted, so a read-only turn wearing one is
+    forged or misrouted; either way no grant reaches its boot.
+    """
+
+    # @spec WORKER-TOOL-ACCESS-4
+    async def go() -> None:
+        from aci_protocol import ToolAccess
+        from curie_api.resumequeue import resume_event_id
+
+        grant_event = resume_event_id(uuid.uuid4())
+        binding = GrantBinding(grant_event_id=grant_event, grant_tool="mcp__github__create_issue")
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="read it", status=DONE)]
+            h.runner.tool_access_enforced = ["read-only"]
+            await h.kernel.process_event(
+                _qevent(
+                    "proceed with the approved action",
+                    thread="th-grant-read-only",
+                    event_id=grant_event,
+                ).model_copy(update={"tool_access": ToolAccess.READ_ONLY})
+            )
+            env = h.fake_k8s.claim_envs[-1]
+            assert env is not None
+            assert "CURIE_APPROVAL_GRANT_TOOL" not in env
+            assert "CURIE_APPROVAL_GRANT_ARGUMENTS" not in env
 
     asyncio.run(go())
 
@@ -3104,7 +3280,7 @@ class RoutedBinding:
 
         return Budget(max_output_tokens_per_run=1000, max_usd_per_day=1.0)
 
-    def boot_env(self, resolved, thread_key, *, kind=None, address=None):  # noqa: ANN001, ANN201
+    def boot_env(self, resolved, thread_key, *, kind=None, address=None, **_: object):  # noqa: ANN001, ANN201
         return {"CURIE_SESSION_ID": f"s-{thread_key}"}
 
 
@@ -3667,6 +3843,7 @@ def test_the_resumed_answer_is_posted_below_an_in_thread_card(make_harness) -> N
         thread = "th-order"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
             card_index = _card_post_index(h)
             paused_events = len(h.sink.events)
 
@@ -3711,6 +3888,7 @@ def test_the_answer_goes_below_the_card_even_after_the_card_ref_is_consumed(
         thread = "th-order-consumed"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
             await h.async_redis.delete(h.config.approval_card_key("appr-1"))
 
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
@@ -3779,6 +3957,7 @@ def test_a_resume_without_the_memory_edits_the_notice_as_before(make_harness) ->
         thread = "th-order-forgotten"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
             assert await h.async_redis.exists(h.config.approval_reply_below_card_key("appr-1"))
             await h.async_redis.delete(h.config.approval_reply_below_card_key("appr-1"))
 
@@ -3828,6 +4007,7 @@ def test_a_card_acknowledged_without_a_ref_keeps_todays_reply(make_harness) -> N
             assert not await h.async_redis.exists(
                 h.config.approval_reply_below_card_key("appr-1")
             )
+            reader.resolve("appr-1")
 
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
             await h.kernel.process_event(
@@ -3918,6 +4098,7 @@ def test_resolve_resume_stamps_the_card_from_the_record(make_harness) -> None:
         thread = "th-resolve-card"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
 
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
             await h.kernel.process_event(
@@ -3943,8 +4124,10 @@ def test_resolve_resume_stamps_the_card_from_the_record(make_harness) -> None:
             # is exactly what `approval_card` rendered as "Requested by".
             assert settled.requested_by == "U1"
 
-            # The read was keyed off the resume turn's deterministic event id.
-            assert reader.reads == ["appr-1"]
+            # The pause read its record back once the card was registered and
+            # found it pending (#3637); the resume's read was keyed off the
+            # resume turn's deterministic event id.
+            assert reader.reads == ["appr-1", "appr-1"]
 
             # The memory is still consumed, so a later approval cannot collide.
             assert not await h.async_redis.exists(h.config.approval_card_key("appr-1"))
@@ -3980,6 +4163,7 @@ def test_a_resolve_resume_carries_the_records_decision_time_to_the_card(
         thread = "th-decided"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
             await h.kernel.process_event(
                 _resume_turn(
@@ -4019,6 +4203,7 @@ def test_a_resolve_resume_leaves_the_card_alone_when_the_record_cannot_be_read(
         thread = "th-unreadable-record"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
 
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
             await h.kernel.process_event(
@@ -4128,6 +4313,7 @@ def test_a_transient_record_read_leaves_the_ref_for_a_later_pass(make_harness) -
         thread = "th-transient-read"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
 
             resume = _resume_turn(
                 "[approval resolved] approved by U9",
@@ -4186,6 +4372,7 @@ def test_a_failed_card_edit_keeps_the_ref_and_a_reclaimed_pass_settles(
         thread = "th-card-edit-recovery"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
             key = h.config.approval_card_key("appr-1")
             original_raw = await h.async_redis.get(key)
             assert original_raw is not None
@@ -4244,8 +4431,13 @@ def test_a_hanging_approval_read_does_not_hold_the_same_thread_order_lock_for_30
     async def go() -> None:
         request_started = asyncio.Event()
         release_response = asyncio.Event()
+        resolved = False
 
         async def hang(_request: web.Request) -> web.Response:
+            # Before the resolve, the pause's read after card registration
+            # (#3637) finds the record pending, as the API answers it.
+            if not resolved:
+                return web.json_response({"status": "pending"})
             request_started.set()
             await release_response.wait()
             return web.json_response(
@@ -4273,6 +4465,7 @@ def test_a_hanging_approval_read_does_not_hold_the_same_thread_order_lock_for_30
                 ) as h:
                     thread = "th-bounded-approval-read"
                     await _pause_awaiting_approval(h, thread)
+                    resolved = True
                     key = h.config.approval_card_key("appr-1")
                     original_raw = await h.async_redis.get(key)
                     assert original_raw is not None
@@ -4309,6 +4502,156 @@ def test_a_hanging_approval_read_does_not_hold_the_same_thread_order_lock_for_30
     asyncio.run(go())
 
 
+# --- A verdict that lands before the card is registered (#3637) ----------------
+
+_REJECTED = SettledApproval(
+    status="rejected", resolved_by="U9", resolution_note="not this quarter"
+)
+_EXPIRED = SettledApproval(status="expired", resolved_by=None, resolution_note=None)
+
+
+def _hold_the_card_post(h, monkeypatch: pytest.MonkeyPatch) -> tuple[asyncio.Event, asyncio.Event]:  # noqa: ANN001
+    """The external Slack barrier: hold the card post's acknowledgement.
+
+    ``posting`` is set once the card post has been handed to the transport.
+    Until the test sets ``release`` the kernel has no ref for it, so it cannot
+    have registered the card.
+    """
+
+    posting = asyncio.Event()
+    release = asyncio.Event()
+    original_emit = h.sink.emit
+
+    async def held(event: ReplyEvent, **kwargs: Any) -> ReplyAck:
+        if isinstance(event, ReplyPost) and isinstance(event.message.interaction, ConfirmIntent):
+            posting.set()
+            await release.wait()
+        return await original_emit(event, **kwargs)
+
+    monkeypatch.setattr(h.sink, "emit", held)
+    return posting, release
+
+
+def _runs_of(h, text: str) -> int:  # noqa: ANN001
+    """How many times the runner was handed a turn carrying ``text``."""
+
+    return sum(text in opened for opened in h.runner.opened)
+
+
+@pytest.mark.parametrize(
+    ("record", "resume_text", "author", "decision"),
+    [
+        (_APPROVED, "[approval resolved] approved by U9", "U9", "approved"),
+        (_REJECTED, "[approval resolved] rejected by U9", "U9", "rejected"),
+        (_EXPIRED, "[approval expired] not approved in time", "system", None),
+    ],
+    ids=["approved", "rejected", "expired"],
+)
+def test_resolve_before_card_registration_settles_the_card(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    record: SettledApproval,
+    resume_text: str,
+    author: str,
+    decision: str | None,
+) -> None:
+    """#3637: a verdict recorded before the card is registered still settles it.
+
+    The row is durable before any delivery, so an operator can resolve it (or the
+    sweeper expire it) while the card's post is still waiting on Slack. The resume
+    then runs, finds no card ref, and finishes. The card is posted and registered
+    afterwards, so the pause itself must settle it from the durable record.
+
+    THE MUTATION THIS CATCHES: registering the card without reading its record
+    back leaves Approve and Reject live on a decided approval, with its ref
+    stored until the TTL.
+    """
+
+    async def go() -> None:
+        reader = RecordingReader(record)
+        thread = f"th-settled-before-card-{record.status}"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            key = h.config.approval_card_key("appr-1")
+            posting, release = _hold_the_card_post(h, monkeypatch)
+            h.runner.default_script = _awaiting_script("Refund order 42")
+            pause = asyncio.create_task(h.kernel.process_event(_qevent("refund?", thread=thread)))
+            await asyncio.wait_for(posting.wait(), timeout=5.0)
+
+            # The session is suspended and its row exists, but its card is not
+            # registered. The verdict lands now and its resume runs to the end.
+            assert not await h.async_redis.exists(key)
+            reader.resolve("appr-1")
+            resume = _resume_turn(resume_text, thread=thread, approval_id="appr-1", author=author)
+            h.runner.default_script = [Final(text="Continued.", status=DONE)]
+            await asyncio.wait_for(h.kernel.process_event(resume), timeout=10.0)
+            assert await h.async_redis.exists(h.config.done_key(resume.event_id))
+            assert h.sink.card_updates == [], "the resume had no registered card to settle"
+
+            # Slack acknowledges the post; the pause registers the card.
+            release.set()
+            await asyncio.wait_for(pause, timeout=10.0)
+
+            assert len(h.sink.card_updates) == 1
+            channel, ts, message, endpoint, settled = h.sink.card_updates[0]
+            assert (channel, ts, endpoint) == ("C1", "posted-1", None)
+            assert message.text == "Refund order 42"
+            assert settled is not None
+            assert settled.decision == decision
+            assert settled.requested_by == "U1"
+            assert settled.resolver == record.resolved_by
+            assert settled.note == record.resolution_note
+            assert not await h.async_redis.exists(key)
+            assert _runs_of(h, resume_text) == 1
+
+            # A redelivered resume stops at its done marker: no second edit and
+            # no second continuation.
+            await h.kernel.process_event(resume)
+            assert len(h.sink.card_updates) == 1
+            assert _runs_of(h, resume_text) == 1
+
+    asyncio.run(go())
+
+
+def test_registration_before_resolve_still_settles_once(make_harness) -> None:
+    """#3637, the ordinary order: a card registered while pending stays live.
+
+    The pause's read back finds the record pending and leaves the card for the
+    resume, which settles it exactly once.
+
+    THE MUTATION THIS CATCHES: settling on anything but a decided record stamps
+    a card nobody has decided, or edits it twice.
+    """
+
+    async def go() -> None:
+        reader = RecordingReader(_APPROVED)
+        thread = "th-card-before-resolve"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            await _pause_awaiting_approval(h, thread)
+            assert h.sink.card_updates == [], "a pending card must stay live"
+            live = await _peek_card_ref(h, "appr-1")
+            assert live is not None and live["ts"] == "posted-1"
+
+            reader.resolve("appr-1")
+            resume_text = "[approval resolved] approved by U9"
+            resume = _resume_turn(resume_text, thread=thread, approval_id="appr-1", author="U9")
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(resume)
+
+            assert len(h.sink.card_updates) == 1
+            _channel, ts, _message, _endpoint, settled = h.sink.card_updates[0]
+            assert ts == "posted-1"
+            assert settled is not None and settled.decision == "approved"
+            assert not await h.async_redis.exists(h.config.approval_card_key("appr-1"))
+            assert _runs_of(h, resume_text) == 1
+
+            # The crash-before-done redelivery finds no ref to settle again.
+            await h.async_redis.delete(h.config.done_key(resume.event_id))
+            await h.kernel.process_event(resume)
+            assert len(h.sink.card_updates) == 1
+
+    asyncio.run(go())
+
+
 def test_a_redelivery_after_a_successful_stamp_still_finds_nothing(make_harness) -> None:
     """A successful card edit consumes its exact ref before redelivery.
 
@@ -4321,6 +4664,7 @@ def test_a_redelivery_after_a_successful_stamp_still_finds_nothing(make_harness)
         thread = "th-redelivered-stamp"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             await _pause_awaiting_approval(h, thread)
+            reader.resolve("appr-1")
 
             resume = _resume_turn(
                 "[approval resolved] approved by U9",
@@ -4951,6 +5295,7 @@ class _WorkspacelessBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         return {}
 
@@ -5176,6 +5521,9 @@ def test_tool_approval_card_reaches_the_cluster_message_caller(
 # --- ADR-0177: a route may show its card where the request was asked ----------
 
 _REQUESTING_SURFACE = {"resolution": {"mode": "requesting_surface"}}
+# ADR-0177 amendment: an email card needs a route that lists approver emails, or the
+# approval escalates when raised.
+_LISTED_EMAIL_ROUTE = {**_REQUESTING_SURFACE, "approvers": {"emails": ["approver@example.com"]}}
 _MAIL_ENDPOINT = "http://curie-mail-adapter:8080/"
 _MAIL_ADAPTER = "agentmail-sandbox"
 _MAIL_INBOX = "bot@example.com"
@@ -5198,11 +5546,11 @@ def test_a_requesting_surface_route_shows_the_card_in_the_email_thread_that_aske
 ) -> None:
     """ADR-0177 decision 1: the card joins the conversation that asked, over
     that conversation's own transport, and the record says so, which is what
-    the API's served check and requester-only set read back."""
+    the API's served check and approver email list read back (ADR-0177 amendment)."""
 
     async def go() -> None:
         approvals = RecordingApprovals()
-        binding = RoutedBinding({"confirm": _REQUESTING_SURFACE})
+        binding = RoutedBinding({"confirm": _LISTED_EMAIL_ROUTE})
         async with make_harness(approvals=approvals, binding=binding) as h:
             h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
             await h.kernel.process_event(_email_qevent("send it", thread="th-mail"))
@@ -5249,6 +5597,46 @@ def test_a_requesting_surface_route_shows_the_card_in_the_email_thread_that_aske
     asyncio.run(go())
 
 
+def test_an_email_card_names_every_listed_approver_and_a_slack_card_names_none(
+    make_harness,
+) -> None:
+    """ADR-0177 amendment A5: the email card carries the route's listed addresses,
+    so the mail adapter can tell the requester who can approve. Every address,
+    lowercased, once, in list order. A Slack card on a route that also lists
+    emails carries none: an address means nothing on Slack."""
+
+    async def go() -> None:
+        route = {
+            **_REQUESTING_SURFACE,
+            "approvers": {
+                "emails": [
+                    "approver@example.com",
+                    "Second.Approver@Example.com",
+                    "approver@example.com",
+                ],
+                "users": ["U0EXAMPLE1"],
+            },
+        }
+        binding = RoutedBinding({"confirm": route})
+        async with make_harness(approvals=RecordingApprovals(), binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
+            await h.kernel.process_event(_email_qevent("send it", thread="th-mail-names"))
+            (_address, message, _by, _conversation, _endpoint) = h.sink.posts[0]
+            assert [(f.label, f.value) for f in message.fields] == [
+                ("Approver", "approver@example.com"),
+                ("Approver", "second.approver@example.com"),
+            ]
+
+        async with make_harness(approvals=RecordingApprovals(), binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
+            await h.kernel.process_event(_qevent("send it", thread="th-slack-names"))
+            (address, message, _by, _conversation, _endpoint) = h.sink.posts[0]
+            assert address == "C1"
+            assert message.fields == []
+
+    asyncio.run(go())
+
+
 def test_a_settled_email_card_is_sent_to_the_thread_with_its_outcome(make_harness) -> None:
     """ADR-0177 decision 6: whatever ends the approval, the resume settles the
     one card. For email the adapter turns the settled update into a follow-up,
@@ -5257,13 +5645,14 @@ def test_a_settled_email_card_is_sent_to_the_thread_with_its_outcome(make_harnes
 
     async def go() -> None:
         reader = RecordingReader(_APPROVED)
-        binding = RoutedBinding({"confirm": _REQUESTING_SURFACE})
+        binding = RoutedBinding({"confirm": _LISTED_EMAIL_ROUTE})
         async with make_harness(
             approvals=RecordingApprovals(), approval_reader=reader, binding=binding
         ) as h:
             h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
             await h.kernel.process_event(_email_qevent("send it", thread="th-mail-settle"))
             assert len(h.sink.posts) == 1
+            reader.resolve("appr-1")
 
             h.runner.default_script = [Final(text="Sent.", status=DONE)]
             await h.kernel.process_event(
@@ -5315,12 +5704,55 @@ def test_a_requesting_surface_route_asked_in_slack_joins_the_slack_thread(
     asyncio.run(go())
 
 
-def test_approvers_on_a_route_that_lands_on_email_escalate_at_raise_time(
+@pytest.mark.parametrize(
+    ("route", "routes"),
+    [
+        # Routeless: no binding, so no list (ADR-0177 amendment A3).
+        (None, None),
+        # The mode alone lists nobody; the requester is not a default.
+        ("confirm", {"confirm": _REQUESTING_SURFACE}),
+        # Slack users nobody on an email thread can prove to be (ADR-0177).
+        ("confirm", {"confirm": {**_REQUESTING_SURFACE, "approvers": {"users": ["U0EXAMPLE1"]}}}),
+        # An empty list written around the API, and a malformed one.
+        ("confirm", {"confirm": {**_REQUESTING_SURFACE, "approvers": {"emails": []}}}),
+        ("confirm", {"confirm": {**_REQUESTING_SURFACE, "approvers": {"emails": "a@example.com"}}}),
+    ],
+)
+def test_an_email_approval_nobody_is_listed_for_escalates_at_raise_time(
+    make_harness, route: str | None, routes: dict | None
+) -> None:
+    """ADR-0177 amendment A3: on email only an address on the route's approver
+    list may answer. Rather than create an approval nobody there can answer,
+    the turn escalates and says why."""
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        binding = RoutedBinding(routes)
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = (
+                _awaiting_script("Send the quote")
+                if route is None
+                else _awaiting_routed_script("Send the quote", route)
+            )
+            ev = _email_qevent("send it", thread=f"th-mail-nobody-{route}")
+            await h.kernel.process_event(ev)
+
+            assert approvals.requests == []
+            assert h.sink.posts == []
+            assert h.sink.last_text is not None
+            assert "approval-no-email-approvers" in h.sink.last_text
+            assert "approver list" in h.sink.last_text
+            if route is not None:
+                assert repr(route) in h.sink.last_text
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_slack_approvers_on_a_route_that_lands_on_another_channel_still_escalate(
     make_harness,
 ) -> None:
-    """ADR-0177 decision 3: approver lists hold Slack users, and nobody on an
-    email thread can prove to be one. Rather than create an approval nobody
-    there can answer, the turn escalates and says why."""
+    """ADR-0177 decision 3 for a non-Slack channel that has no email list."""
 
     async def go() -> None:
         approvals = RecordingApprovals()
@@ -5329,16 +5761,20 @@ def test_approvers_on_a_route_that_lands_on_email_escalate_at_raise_time(
         )
         async with make_harness(approvals=approvals, binding=binding) as h:
             h.runner.default_script = _awaiting_routed_script("Send the quote", "confirm")
-            ev = _email_qevent("send it", thread="th-mail-approvers")
+            ev = _qevent(
+                "send it",
+                thread="th-webchat-approvers",
+                kind="webchat",
+                channel="chat-room-1",
+                endpoint=_MAIL_ENDPOINT,
+                adapter="webchat-adapter",
+                placeholder=None,
+            )
             await h.kernel.process_event(ev)
 
             assert approvals.requests == []
-            assert h.sink.posts == []
             assert h.sink.last_text is not None
-            assert "confirm" in h.sink.last_text
-            assert "approvers" in h.sink.last_text
-            assert "email" in h.sink.last_text
-            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+            assert "approval-approvers-unverifiable" in h.sink.last_text
 
     asyncio.run(go())
 
@@ -5357,5 +5793,286 @@ def test_approvers_on_a_requesting_surface_route_asked_in_slack_still_apply(
 
             assert [r.route for r in approvals.requests] == ["confirm"]
             assert len(h.sink.posts) == 1
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "metadata,requester,known",
+    [
+        ({}, None, False),
+        ({"requested_by": None}, None, True),
+        ({"requested_by": "U0EXAMPLE1"}, "U0EXAMPLE1", True),
+    ],
+)
+def test_approval_create_decoder_distinguishes_unavailable_from_older_api(
+    metadata: dict, requester: str | None, known: bool
+) -> None:
+    async def go() -> None:
+        def handle(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/approvals"
+            return httpx.Response(201, json={"id": "appr-1", "status": "pending", **metadata})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            client = ApprovalClient(
+                api_base_url="https://api.example.com",
+                api_key="test-key", client=http, read_timeout_s=1.0
+            )
+            created = await client.create(
+                ApprovalRequest(
+                    conversation_id="thread-example",
+                    author="U0EXAMPLE2",
+                    summary="Next action",
+                    reply_kind="slack",
+                    reply_channel="C0EXAMPLE1",
+                    reply_placeholder=None,
+                    dedupe_key="approval-11111111-1111-4111-8111-111111111111-resolved",
+                )
+            )
+            assert created.requested_by == requester
+            assert created.requester_known is known
+
+    asyncio.run(go())
+
+
+class DerivedRequesterApprovals(RecordingApprovals):
+    def __init__(self, requester: str | None, *, known: bool = True) -> None:
+        super().__init__()
+        self.requester = requester
+        self.known = known
+
+    async def create(self, request: ApprovalRequest) -> CreatedApproval:
+        created = await super().create(request)
+        if not self.known:
+            return created  # The real old API shape has no attribution metadata.
+        return CreatedApproval(
+            id=created.id,
+            status=created.status,
+            requested_by=self.requester,
+            requester_known=self.known,
+        )
+
+
+def test_three_gate_requester_survives_restart_and_consumed_cards(make_harness) -> None:
+    # The API fixture supplies independently tested durable attribution. Real
+    # Valkey carries card identity; each harness replaces all in-memory state.
+    async def go() -> None:
+        approvals = DerivedRequesterApprovals("U0EXAMPLE1")
+        thread = "th-requester-chain"
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _awaiting_script("First action")
+            await h.kernel.process_event(
+                _qevent("Do three actions", thread=thread).model_copy(
+                    update={"author": "U0EXAMPLE1"}
+                )
+            )
+            assert h.sink.posts[0][2] == "U0EXAMPLE1"
+        for index, actor in enumerate(("U0EXAMPLE2", "U0EXAMPLE3"), 1):
+            reader = RecordingReader(
+                SettledApproval(
+                    status="approved",
+                    resolved_by=actor,
+                    resolution_note="U0EXAMPLE4 requested it",
+                    resolved_at=datetime(2026, 9, 30, 10, index, tzinfo=UTC),
+                )
+            )
+            # Only the approval this resume answers is resolved. The one its
+            # continuation raises next is still pending when its card lands.
+            reader.resolve(f"appr-{index}")
+            async with make_harness(approvals=approvals, approval_reader=reader) as h:
+                h.runner.default_script = _awaiting_script(f"Next action {index}")
+                await h.kernel.process_event(
+                    _resume_turn(
+                        "Untrusted display prose names U0EXAMPLE4",
+                        thread=thread,
+                        approval_id=f"appr-{index}",
+                        author=actor,
+                    )
+                )
+                assert approvals.requests[-1].author == actor
+                assert h.sink.posts[-1][2] == "U0EXAMPLE1"
+                assert len(h.sink.card_updates) == 1
+                settled = h.sink.card_updates[0][-1]
+                assert settled is not None
+                assert settled.requested_by == "U0EXAMPLE1"
+                assert settled.resolver == actor
+                from curie_worker.approvals import decided_at
+
+                assert decided_at(h.sink.card_updates[0][2]) == reader.records[0].resolved_at
+                assert not await h.async_redis.exists(h.config.approval_card_key(f"appr-{index}"))
+                ref = await _peek_card_ref(h, f"appr-{index + 1}")
+                assert ref is not None and ref["requested_by"] == "U0EXAMPLE1"
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("known", [True, False])
+@pytest.mark.parametrize("actor", ["U0EXAMPLE2", "system"])
+def test_unavailable_or_legacy_resume_never_labels_resolver_as_requester(
+    make_harness, known: bool, actor: str
+) -> None:
+    async def go() -> None:
+        approvals = DerivedRequesterApprovals(None, known=known)
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _awaiting_script("Next action")
+            await h.kernel.process_event(
+                _resume_turn(
+                    "U0EXAMPLE1 supposedly asked",
+                    thread="th-unknown-requester",
+                    approval_id="appr-prior",
+                    author=actor,
+                )
+            )
+            assert approvals.requests[0].author == actor
+            assert h.sink.posts[0][2] == ""
+            assert isinstance(h.sink.posts[0][1].interaction, ConfirmIntent)
+            ref = await _peek_card_ref(h, "appr-1")
+            assert ref is not None and ref["requested_by"] == ""
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("known,expected", [(False, "U0EXAMPLE4"), (True, "")])
+def test_fresh_human_request_fallback_only_for_older_api(make_harness, known, expected) -> None:
+    async def go() -> None:
+        async with make_harness(approvals=DerivedRequesterApprovals(None, known=known)) as h:
+            h.runner.default_script = _awaiting_script("Fresh action")
+            await h.kernel.process_event(
+                _qevent("New ask", thread="th-fresh-requester").model_copy(
+                    update={"author": "U0EXAMPLE4"}
+                )
+            )
+            assert h.sink.posts[0][2] == expected
+            assert isinstance(h.sink.posts[0][1].interaction, ConfirmIntent)
+
+    asyncio.run(go())
+
+
+def test_routed_requester_is_used_in_card_memory_and_notification_metadata(make_harness) -> None:
+    async def go() -> None:
+        approvals = DerivedRequesterApprovals("U0EXAMPLE1")
+        async with make_harness(
+            approvals=approvals, binding=RoutedBinding(_split_approval_routes())
+        ) as h:
+            h.runner.default_script = _awaiting_routed_script("Next bounded action", "managers")
+            await h.kernel.process_event(
+                _resume_turn(
+                    "approved",
+                    thread="th-requester-notification",
+                    approval_id="appr-prior",
+                    author="U0EXAMPLE2",
+                )
+            )
+            posts = [
+                event
+                for event, _route, _best_effort in h.sink.events
+                if isinstance(event, ReplyPost)
+            ]
+            assert len(posts) == 2
+            assert [event.requested_by for event in posts] == ["U0EXAMPLE1", "U0EXAMPLE1"]
+            assert posts[0].message.interaction is not None
+            assert posts[1].message.interaction is None
+            assert approvals.requests[0].author == "U0EXAMPLE2"
+
+    asyncio.run(go())
+
+
+def test_missing_display_uses_plain_notice_and_card_without_rewriting_record(make_harness) -> None:
+    tool = "mcp__plugin_acme_files__file_attachment"
+    machine = "Tool call awaiting approval: " + tool + ' {"file_name": "example.pdf"}'
+    sentence = "Approve file attachment. File name: example.pdf"
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"managers": _resolution_route()})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            script = _awaiting_script_with_display(machine, "")
+            script[-1] = script[-1].model_copy(
+                update={
+                    "approval_display": None,
+                    "approval_route": "managers",
+                    "approval_granted_tool": tool,
+                    "approval_granted_arguments": {"file_name": "example.pdf"},
+                }
+            )
+            h.runner.default_script = script
+            await h.kernel.process_event(_qevent("please attach", event_id="ev-plain-display"))
+            assert approvals.requests[0].summary == machine
+            assert h.sink.last_text is not None
+            assert sentence in h.sink.last_text and tool not in h.sink.last_text
+            assert h.sink.posts[0][1].text == sentence
+            assert isinstance(h.sink.posts[0][1].interaction, ConfirmIntent)
+            assert h.sink.posts[0][1].interaction.prompt == sentence
+
+    asyncio.run(go())
+
+
+def test_rendered_approval_display_preserves_exact_argument_tokens(make_harness) -> None:
+    tool = "mcp__plugin_acme_files__file_attachment"
+    filename = "mcp__acme__file_attachment"
+    sentence = f"Attach {filename}"
+    machine = f'Tool call awaiting approval: {tool} {{"filename": "{filename}"}}'
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"managers": _resolution_route()})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            script = _awaiting_script_with_display(machine, sentence)
+            script[-1] = script[-1].model_copy(
+                update={
+                    "approval_route": "managers",
+                    "approval_granted_tool": tool,
+                    "approval_granted_arguments": {"filename": filename},
+                }
+            )
+            h.runner.default_script = script
+            await h.kernel.process_event(_qevent("please attach", event_id="ev-exact-display"))
+            assert approvals.requests[0].summary == machine
+            assert approvals.requests[0].granted_arguments == {"filename": filename}
+            assert h.sink.last_text is not None and sentence in h.sink.last_text
+            assert h.sink.posts[0][1].text == sentence
+            assert isinstance(h.sink.posts[0][1].interaction, ConfirmIntent)
+            assert h.sink.posts[0][1].interaction.prompt == sentence
+
+    asyncio.run(go())
+
+
+def test_missing_display_sentence_boundaries_reach_notice_and_card(make_harness) -> None:
+    """@spec plain-approval-wording: actual fallback notice and card retain grants."""
+    import json
+    from pathlib import Path
+
+    cases = json.loads(
+        (Path(__file__).resolve().parents[4] / "tests/vectors/user-action-wording.json").read_text()
+    )["metadata_references"]
+
+    async def go() -> None:
+        for index, case in enumerate(cases):
+            arguments = {"file_name": case["tool"] + ".json"}
+            approvals = RecordingApprovals()
+            binding = RoutedBinding({"managers": _resolution_route()})
+            async with make_harness(approvals=approvals, binding=binding) as h:
+                script = _awaiting_script_with_display(case["summary"], "")
+                script[-1] = script[-1].model_copy(
+                    update={
+                        "approval_display": None,
+                        "approval_route": "managers",
+                        "approval_granted_tool": case["tool"],
+                        "approval_granted_arguments": arguments,
+                    }
+                )
+                h.runner.default_script = script
+                await h.kernel.process_event(
+                    _qevent("please review", event_id=f"ev-period-display-{index}")
+                )
+                assert approvals.requests[0].summary == case["summary"]
+                assert approvals.requests[0].granted_tool == case["tool"]
+                assert approvals.requests[0].granted_arguments == arguments
+                # The notice control string compacts whitespace (#817); the card stays literal.
+                notice = " ".join(case["display"].split())
+                assert h.sink.last_text is not None and notice in h.sink.last_text
+                assert h.sink.posts[0][1].text == case["display"]
+                assert isinstance(h.sink.posts[0][1].interaction, ConfirmIntent)
+                assert h.sink.posts[0][1].interaction.prompt == case["display"]
 
     asyncio.run(go())

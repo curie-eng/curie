@@ -17,10 +17,18 @@ afterwards is a bug report the operator never gets.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 
 import pytest
+from curie_api import crud
+from curie_api.config import get_settings
+from curie_api.models import AgentAction
+from curie_api.routers.actions import undo_action
+from curie_api.schemas import ActionUndo
+from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -191,6 +199,91 @@ def test_an_undo_is_authorized_once(client: Any, auth_headers: Any) -> None:
 
     assert second.status_code == 409
     assert [e["action"] for e in _audit(client, auth_headers, action["id"])] == [
+        "authorized",
+        "refused_already_undone",
+    ]
+
+
+def test_two_sessions_with_a_stale_unclaimed_record_cannot_both_claim_undo(
+    client: Any, auth_headers: Any
+) -> None:
+    """Only one stale claimant may receive a restore authorization.
+
+    Both real Postgres sessions read the unclaimed record before either writes.
+    The second commit deliberately follows the first to reproduce the lost-
+    update interleaving without a scheduler-dependent timing window.
+    """
+
+    action_id = uuid.UUID(_record(client, auth_headers)["id"])
+
+    async def contend() -> tuple[AgentAction | None, AgentAction | None, AgentAction]:
+        engine = create_async_engine(get_settings().database_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessions() as first_session, sessions() as second_session:
+                first = await first_session.get(AgentAction, action_id)
+                second = await second_session.get(AgentAction, action_id)
+                assert first is not None and second is not None
+                assert first.undone_at is None and second.undone_at is None
+                winner = await crud.claim_action_undo(first_session, first, actor="U-first")
+                await first_session.commit()
+                loser = await crud.claim_action_undo(second_session, second, actor="U-second")
+                await second_session.commit()
+                async with sessions() as check_session:
+                    stored = await check_session.get(AgentAction, action_id)
+                    assert stored is not None
+                    return winner, loser, stored
+        finally:
+            await engine.dispose()
+
+    winner, loser, stored = asyncio.run(contend())
+    assert winner is not None
+    assert loser is None
+    assert stored.undone_by == "U-first"
+    assert stored.undone_at is not None
+
+
+def test_stale_undo_request_gets_a_refusal_not_a_second_restore(
+    client: Any, auth_headers: Any
+) -> None:
+    """The API route must turn a lost CAS into an audited 409 without a payload."""
+
+    action_id = uuid.UUID(_record(client, auth_headers)["id"])
+
+    async def contend() -> tuple[dict[str, Any], int]:
+        engine = create_async_engine(get_settings().database_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessions() as first_session, sessions() as second_session:
+                second = await second_session.get(AgentAction, action_id)
+                # The eventual loser begins its transaction first. PostgreSQL
+                # now() is transaction-start time, not audit-insert time.
+                await asyncio.sleep(0.02)
+                first = await first_session.get(AgentAction, action_id)
+                assert first is not None and second is not None
+                # Identity-map reads inside undo_action retain the same stale
+                # objects while Postgres arbitrates the actual UPDATE.
+                ruling = await undo_action(
+                    action_id,
+                    ActionUndo(actor="U-first", observed_state=LEFT),
+                    first_session,
+                    lambda approval, binding: None,
+                )
+                with pytest.raises(HTTPException) as refused:
+                    await undo_action(
+                        action_id,
+                        ActionUndo(actor="U-second", observed_state=LEFT),
+                        second_session,
+                        lambda approval, binding: None,
+                    )
+                return ruling.restore.model_dump(), refused.value.status_code
+        finally:
+            await engine.dispose()
+
+    restore, status_code = asyncio.run(contend())
+    assert restore == {"target": TARGET, "prior_state": PRIOR}
+    assert status_code == 409
+    assert [entry["action"] for entry in _audit(client, auth_headers, str(action_id))] == [
         "authorized",
         "refused_already_undone",
     ]

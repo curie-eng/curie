@@ -47,6 +47,7 @@ from aci_protocol import (
     ReplyHandle,
     SessionStatus,
     TextDelta,
+    ToolAccess,
     TurnSource,
 )
 from curie_worker.attachments import AttachmentResolutionError
@@ -233,6 +234,7 @@ class _WorkspaceBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         return {
             "CURIE_SESSION_ID": f"session:{thread_key}",
@@ -251,6 +253,7 @@ class _HistoryBinding(_WorkspaceBinding):
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         return {
             **super().boot_env(
@@ -497,6 +500,56 @@ def test_a_file_on_an_idle_retained_thread_replaces_the_claim_and_reaches_runner
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("advertised", [None, ["read-only"]], ids=["unadvertised", "advertised"])
+def test_a_read_only_file_turn_is_checked_on_the_runner_it_hands_off_to(
+    make_harness, advertised: list[str] | None
+) -> None:
+    """WORKER-TOOL-ACCESS-2 on the attachment handoff, which once skipped it.
+
+    The file turn replaces the retained claim and starts on a second runner.
+    That runner's own status decides: unadvertised, nothing restricted is
+    sent and the turn escalates; advertised, the event carries read-only.
+    """
+
+    # @spec WORKER-TOOL-ACCESS-2
+    async def go() -> None:
+        binding = _HistoryBinding(uuid.uuid4(), workspace_enabled=False)
+        async with make_harness(binding=binding, per_sandbox_runners=2) as h:
+            lane = _FakeAttachmentLane()
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.kernel._workspace = _WorkspaceProbe(  # type: ignore[assignment]
+                h.substrate, selected_repo=None
+            )
+            for runner in h.runners.values():
+                runner.default_script = [Final(text="ok", status=DONE)]
+                runner.tool_access_enforced = advertised
+
+            await h.kernel.process_event(_qevent("first", thread="tReadOnlyFile"))
+            restricted = _qevent(
+                "read the file",
+                thread="tReadOnlyFile",
+                attachments=[Attachment(id="F9", name="probe.txt", mime_type="text/plain")],
+            ).model_copy(update={"tool_access": ToolAccess.READ_ONLY})
+
+            await h.kernel.process_event(restricted)
+
+            assert len(h.fake_k8s.claim_envs) == 2, "the file turn did not hand off"
+            claim = next(iter(h.fake_k8s.claims))
+            second = h.runners[h.fake_k8s.assigned_ports[h.fake_k8s.claims[claim].sandbox_name]]
+            assert second.opened != ["first"], "the handoff reused the first runner"
+            sent = [b.get("tool_access") for r in h.runners.values() for b in r.event_bodies]
+            assert second.status_headers, "the handoff runner's status was never read"
+            if advertised is None:
+                assert "read-only" not in sent
+                assert h.sink.last_text is not None
+                assert h.sink.last_text.startswith("curie-turn-failure: tool-access-unenforced")
+            else:
+                assert second.event_bodies[-1]["tool_access"] == "read-only"
+                assert h.sink.last_text == "ok"
+
+    asyncio.run(go())
+
+
 def test_deployed_nonworkspace_thread_with_deployment_id_handoffs_the_file(
     make_harness,
 ) -> None:
@@ -634,6 +687,58 @@ def test_repository_named_with_workspace_coordinator_off_keeps_main_refusal(
             ]
             assert len(completions) == 1
             assert completions[0].outcome == "delivered"
+
+    asyncio.run(go())
+
+
+def test_bare_slash_pair_on_a_retained_file_turn_with_workspaces_off_hands_off_the_file(
+    make_harness,
+) -> None:
+    """A bare `word/word` token is not a repository request when workspaces are off.
+
+    The retained-route twin of the new-turn case (#3671): with no coordinator
+    there is no allowlist to confirm the guess, so it names no repository and
+    the file reaches a runner. The github.com URL case above still refuses.
+    """
+
+    message = "Can you check the Swap/Exchange reservation for next week?"
+
+    async def go() -> None:
+        binding = _HistoryBinding(uuid.uuid4(), workspace_enabled=False)
+        async with make_harness(binding=binding, per_sandbox_runners=2) as h:
+            lane = _FakeAttachmentLane()
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            assert h.kernel._workspace is None  # noqa: SLF001
+            for runner in h.runners.values():
+                runner.default_script = [Final(text="ok", status=DONE)]
+
+            await h.kernel.process_event(_qevent("first", thread="tSlashPairFile"))
+            first = h.substrate.lookup(_thread_key("tSlashPairFile"))
+            assert first is not None and first.workspace_repo is None
+            first_port = h.fake_k8s.assigned_ports[first.sandbox_name]
+            file_event = _qevent(
+                message,
+                thread="tSlashPairFile",
+                event_id="slash-pair-file",
+                placeholder="p-file",
+                attachments=[Attachment(id="F2E", name="reservation.pdf")],
+            )
+
+            await h.kernel.process_event(file_event)
+
+            file_updates = [
+                text for _channel, ref, text in h.sink.updates if ref == "p-file"
+            ]
+            assert WORKSPACES_OFF_REPLY not in file_updates
+            second = h.substrate.lookup(_thread_key("tSlashPairFile"))
+            assert second is not None and second.workspace_repo is None
+            assert second.claim_name != first.claim_name
+            assert h.fake_k8s.claim_envs[-1] is not None
+            assert h.fake_k8s.claim_envs[-1][ATTACHMENTS_REF_ENV] == REF_VALUE
+            second_port = h.fake_k8s.assigned_ports[second.sandbox_name]
+            assert h.runners[first_port].opened == ["first"]
+            assert h.runners[second_port].opened == [message]
+            assert await h.async_redis.exists(h.config.done_key(file_event.event_id))
 
     asyncio.run(go())
 
@@ -2127,9 +2232,56 @@ def test_the_lane_is_asked_for_the_identity_the_turn_arrived_on(make_harness) ->
             await h.kernel.process_event(turn("tNamedIdentity", "ops-bot"))
             await h.kernel.process_event(turn("tStockIdentity", None))
 
-            assert [call["extra"] for call in lane.resolve_calls] == [
-                {"identity": "ops-bot"},
-                {"identity": "default"},
+            assert [call["extra"]["identity"] for call in lane.resolve_calls] == [
+                "ops-bot",
+                "default",
+            ]
+
+    asyncio.run(go())
+
+
+def test_a_channel_port_turn_hands_the_lane_the_binding_it_arrived_on(make_harness) -> None:
+    """ADR-0153 decision 3: the lane picks its transport from the turn's binding.
+
+    The server-minted reply handle is the only place the worker learns which
+    adapter produced a channel-port turn and where that adapter listens, so the
+    kernel must hand it over. A Slack turn hands over its Slack handle, which
+    keeps the Slack client.
+    """
+
+    def turn(thread: str, handle: ReplyHandle) -> QueuedTurn:
+        return QueuedTurn(
+            event_id=f"ev-{thread}",
+            conversation_id=thread,
+            author="person@example.test",
+            text="what does this say?",
+            reply_handle=handle,
+            received_at="2026-07-05T00:00:00+00:00",
+            source=TurnSource.SLACK,
+            attachments=[Attachment(id="msg-1/att-1", name="report.pdf")],
+        )
+
+    email = ReplyHandle(
+        kind="email",
+        channel="inbox@example.test",
+        placeholder="msg-1",
+        endpoint="http://mail-adapter.example.test:8080/curie",
+        adapter="mail-adapter",
+    )
+    slack = ReplyHandle(kind="slack", channel="C1", placeholder="p-1")
+
+    async def go() -> None:
+        async with make_harness() as h:
+            lane = _FakeAttachmentLane()
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.runner.default_script = [Final(text="read it", status=DONE)]
+
+            await h.kernel.process_event(turn("tEmailBinding", email))
+            await h.kernel.process_event(turn("tSlackBinding", slack))
+
+            assert [call["extra"].get("handle") for call in lane.resolve_calls] == [
+                email,
+                slack,
             ]
 
     asyncio.run(go())

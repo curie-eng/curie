@@ -98,7 +98,12 @@ async def github_webhook(
             await factory_owns(session, x_github_event, payload)
             or (
                 not review_enabled
-                and is_actionable_feedback(x_github_event, payload, x_github_delivery)
+                and is_actionable_feedback(
+                    x_github_event,
+                    payload,
+                    x_github_delivery,
+                    github_html_base=settings.github_html_base,
+                )
             )
         ):
             return await handle_factory_review_delivery(
@@ -150,7 +155,12 @@ async def github_webhook(
                 await request.app.state.github_review_reconciler.reconcile_once(event_id)
             return WebhookResult(status="feedback_duplicate")
         try:
-            feedback = parse_feedback(x_github_event, payload, x_github_delivery)
+            feedback = parse_feedback(
+                x_github_event,
+                payload,
+                x_github_delivery,
+                github_html_base=settings.github_html_base,
+            )
             row, created = await admit_feedback(
                 session,
                 feedback,

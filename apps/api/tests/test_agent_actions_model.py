@@ -1,8 +1,9 @@
 """What an action record may claim about itself (ADR-0117).
 
 The ledger invariant this file exists to hold: a record claims to be undoable
-ONLY when it holds a prior state, a target, and a successful outcome. ``undoable``
-is therefore derived from those three columns rather than stored beside them --
+ONLY when it holds a prior state, a post state, a target, and a successful
+outcome. ``undoable`` is therefore derived from those columns rather than stored
+beside them --
 a stored flag can be set by a writer that captured nothing, and the platform
 would then offer an undo button it cannot honor.
 """
@@ -22,6 +23,7 @@ def _action(**overrides: object) -> AgentAction:
         "dedupe_key": f"{uuid.uuid4()}",
         "status": ActionStatus.succeeded,
         "prior_state": {"spec": {"replicas": 3}},
+        "post_state": {"spec": {"replicas": 10}},
         "target": {"kind": "Deployment", "namespace": "public", "name": "api"},
     }
     fields.update(overrides)
@@ -42,6 +44,17 @@ def test_a_record_without_a_target_is_not_undoable() -> None:
     """A state to restore is useless without the resource to restore it onto."""
 
     assert _action(target=None).undoable is False
+
+
+def test_a_record_without_a_post_state_is_not_undoable() -> None:
+    """The undo route refuses it, so the record must not claim it (#1861).
+
+    ``post`` is what the live resource is compared against before a restore.
+    Without it the route answers ``refused_uncomparable`` every time, and a row
+    that still called itself undoable would promise a restore nothing can grant.
+    """
+
+    assert _action(post_state=None).undoable is False
 
 
 def test_a_failed_call_is_not_undoable() -> None:

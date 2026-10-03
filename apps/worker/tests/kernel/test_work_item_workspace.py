@@ -37,6 +37,7 @@ from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemConflict,
     WorkItemStartGrant,
+    WorkItemStartRefused,
 )
 from redis.exceptions import ResponseError
 
@@ -87,6 +88,7 @@ class _Workspace:
                 env=dict(kwargs.get("env") or {}),
                 workspace_repo=kwargs.get("repo_full_name"),
                 agent_name=kwargs.get("agent_name"),
+                caller_run=kwargs.get("caller_run"),
             )
             return SimpleNamespace(handle=handoff, prepared=None)
         handle = self.substrate.claim(  # type: ignore[attr-defined]
@@ -94,6 +96,7 @@ class _Workspace:
             env=kwargs.get("env"),
             agent_name=kwargs.get("agent_name"),
             workspace_repo=kwargs.get("repo_full_name"),
+            caller_run=kwargs.get("caller_run"),
         )
         return SimpleNamespace(handle=handle, prepared=None)
 
@@ -132,6 +135,10 @@ class _WorkItems:
             remaining_s=3600.0,
             heartbeat_interval_s=60.0,
         )
+
+    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+        self.calls.append("issue_read_context")
+        return f"{WORK_ITEM_REPO}#7", f"wir.capability-for-{request_id}"
 
     async def finish(self, _request_id: uuid.UUID, **kwargs: object) -> None:
         self.calls.append("finish")
@@ -177,6 +184,12 @@ class _RecordingSink:
             route=route,
             best_effort_unreachable=best_effort_unreachable,
         )
+
+
+def _thread_key(conversation_id: str = "1700000000.000001") -> str:
+    """The worker-internal route key for a turn built by ``_turn`` below."""
+
+    return f"slack:{CHANNEL}:{conversation_id}"
 
 
 def _turn(
@@ -576,6 +589,120 @@ def test_finished_work_item_deletes_its_sandbox_claim(
     asyncio.run(exercise())
 
 
+class _StartRefusedWorkItems(_WorkItems):
+    """The API refuses ``start``: the request settled before the turn could open."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__()
+        self.code = code
+
+    async def start(self, _request_id: uuid.UUID, **_: object) -> WorkItemStartGrant:
+        self.calls.append("start")
+        raise WorkItemStartRefused(self.code)
+
+
+class _FinishRefusedWorkItems(_WorkItems):
+    """The label came off mid-turn: ``finish`` is refused ``work_item_cancelled``."""
+
+    async def finish(self, _request_id: uuid.UUID, **_: object) -> None:
+        self.calls.append("finish")
+        raise WorkItemConflict("work_item_cancelled")
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["work_item_cancelled", "waiting_deadline_elapsed", "not_found"],
+)
+def test_start_refused_on_a_terminal_code_releases_the_claimed_sandbox(
+    make_harness, code: str
+) -> None:
+    """#3208: a start refusal on a terminal code ends the execution, so the
+    claim the delivery just made must not hold quota until the route TTL lapses.
+    A request cancelled from ``waiting`` gets no terminate wake and carries no
+    teardown flag, so the worker is the only one that can release it."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            work_items = _StartRefusedWorkItems(code)
+            h.kernel._work_items = work_items
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            assert "start" in work_items.calls
+            assert h.fake_k8s.deleted_claims
+            assert h.fake_k8s.claims == {}
+            assert h.substrate._affinity.get(_thread_key()) is None
+
+    asyncio.run(exercise())
+
+
+def test_start_refused_not_dispatchable_keeps_its_sandbox_claim(make_harness) -> None:
+    """#3208's allowlist has an opposite: ``not_dispatchable`` can mean a lapsed
+    acquire lease, where a replacement re-acquires the same generation and
+    adopts this thread's route, so the refused delivery must leave the claim
+    standing rather than yank it out from under the next owner."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            work_items = _StartRefusedWorkItems("not_dispatchable")
+            h.kernel._work_items = work_items
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            assert "start" in work_items.calls
+            assert h.fake_k8s.deleted_claims == []
+            assert len(h.fake_k8s.claims) == 1
+            assert h.substrate._affinity.get(_thread_key()) is not None
+
+    asyncio.run(exercise())
+
+
+def test_finish_refused_as_cancelled_releases_the_sandbox_claim(make_harness) -> None:
+    """#3208: the label came off mid-turn, so the request is already settled
+    ``cancelled`` and ``finish`` is refused. The run must still count as
+    settled locally so the delivery releases its claim instead of holding
+    quota until the terminate-wake backstop catches up."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            work_items = _FinishRefusedWorkItems()
+            h.kernel._work_items = work_items
+            h.runner.default_script = [
+                TextDelta(text="Working. "),
+                Final(text="Working. Done.", status=SessionStatus.DONE),
+            ]
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            assert "finish" in work_items.calls
+            assert h.fake_k8s.deleted_claims
+            assert h.fake_k8s.claims == {}
+            assert h.substrate._affinity.get(_thread_key()) is None
+
+    asyncio.run(exercise())
+
+
 def test_approval_hold_keeps_its_sandbox_claim(make_harness) -> None:
     """Awaiting approval is not a terminus: the resume turn still needs the route."""
 
@@ -647,6 +774,10 @@ def test_cancelled_work_item_deletes_its_suspended_sandbox_claim(make_harness, p
             assert "record_termination" in work_items.calls
             assert h.fake_k8s.claims == {}
             assert h.substrate._affinity.get(thread_key) is None
+            # Termination ends the held run too, so the sweeper may reclaim it
+            # (#3564).
+            assert h.kernel._held_work_items == {}
+            assert h.kernel.owns_work_item(request_id) is False
 
     asyncio.run(exercise())
 
@@ -825,12 +956,12 @@ def _fail_settled_release(h: object) -> None:
     h.substrate.release = release  # type: ignore[attr-defined]
 
 
-def test_consecutive_work_items_with_the_same_budget_adopt_the_sandbox(
+def test_consecutive_work_items_replace_the_sandbox_even_with_the_same_budget(
     make_harness,
 ) -> None:
-    """#3071: a matching turn budget is no reason to replace a live runner.
-    The first work item's release fails, so its live sandbox survives, and the
-    next work item with the same budget adopts it instead of claiming again."""
+    """ADR 0178: two work items are two runs, so a matching turn budget does
+    not let the second adopt the first's runner. The first release fails, the
+    live sandbox survives, and the next run still claims a fresh one."""
 
     async def exercise() -> None:
         async with make_harness(
@@ -846,10 +977,11 @@ def test_consecutive_work_items_with_the_same_budget_adopt_the_sandbox(
                 )
 
             envs = h.fake_k8s.claim_envs
-            assert len(envs) == 1
+            assert len(envs) == 2
             assert (envs[0] or {}).get("CURIE_MAX_TURNS") == "5"
+            assert (envs[1] or {}).get("CURIE_MAX_TURNS") == "5"
             # Each execution ends without publishing, so each gets its one
-            # continuation turn (#3128) on the same adopted runner.
+            # continuation turn (#3128) on the runner booted for that run.
             assert len(h.runner.opened) == 4
             assert h.runner.opened[0] == f"Resolve {ISSUE_URL}"
             assert h.runner.opened[2] == f"Resolve {ISSUE_URL}"
@@ -1035,6 +1167,140 @@ def test_owns_work_item_tracks_live_and_held_runs(make_harness) -> None:
             assert h.kernel._held_work_items
             assert h.kernel.owns_work_item(held) is True
             assert h.kernel.owns_work_item(uuid.uuid4()) is False
+
+    asyncio.run(exercise())
+
+
+# --- #3564: a held run never outlives its deadline or its end -------------
+
+
+_APPROVAL_FINAL = Final(
+    text="Requesting approval.",
+    status=SessionStatus.AWAITING_APPROVAL,
+    approval_summary="Run the requested publication",
+    approval_gate_kind="permission",
+    approval_granted_tool="Bash",
+)
+
+
+async def _park_for_approval(h: object) -> tuple[uuid.UUID, str]:
+    """Run one execute wake that parks for approval; return its request and thread."""
+
+    h.kernel._work_items = _WorkItems()  # type: ignore[attr-defined]
+    h.runner.default_script = [_APPROVAL_FINAL]  # type: ignore[attr-defined]
+    request_id = uuid.uuid4()
+    await h.kernel.process_event(  # type: ignore[attr-defined]
+        _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+    )
+    [thread_key] = list(h.kernel._held_work_items)  # type: ignore[attr-defined]
+    assert h.kernel.owns_work_item(request_id) is True  # type: ignore[attr-defined]
+    return request_id, thread_key
+
+
+class _OwnerRows:
+    """Orphan-sweeper client double listing one runtime-owner row."""
+
+    def __init__(self, request_id: uuid.UUID, owner: str) -> None:
+        self.rows = [SimpleNamespace(request_id=request_id, runtime_owner=owner, runtime_epoch=1)]
+        self.declared: list[tuple[uuid.UUID, str, int]] = []
+
+    async def runtime_owners(self, after: uuid.UUID | None = None) -> list[SimpleNamespace]:
+        return [] if after is not None else self.rows
+
+    async def declare_owner_lost(
+        self, request_id: uuid.UUID, *, owner: str, runtime_epoch: int
+    ) -> None:
+        self.declared.append((request_id, owner, runtime_epoch))
+
+
+@pytest.mark.parametrize("expired", [True, False])
+def test_orphan_sweeper_reclaims_a_held_run_only_past_its_deadline(
+    make_harness, expired: bool
+) -> None:
+    """A continuation that never arrives must not pin the request forever: past
+    the execution deadline the held run is evicted and the sweeper declares it
+    lost. Before the deadline it stays ours (#3564)."""
+
+    from curie_worker.workitem_orphans import WorkItemOrphanSweeper
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            approvals=_Approvals(),
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            request_id, thread_key = await _park_for_approval(h)
+            held = h.kernel._held_work_items[thread_key]
+            offset = timedelta(seconds=-1) if expired else timedelta(hours=1)
+            held.execution_deadline = datetime.now(UTC) + offset
+            self_name = h.kernel._config.consumer_name
+            client = _OwnerRows(request_id, self_name)
+
+            async def alive(_owner: str) -> bool:
+                return True
+
+            sweeper = WorkItemOrphanSweeper(
+                client,
+                alive,
+                self_name=self_name,
+                locally_owned=h.kernel.owns_work_item,
+                absence_proof_s=60.0,
+                interval_s=60.0,
+            )
+
+            declared = await sweeper.sweep()
+
+            if expired:
+                assert declared == 1
+                assert client.declared == [(request_id, self_name, 1)]
+                assert h.kernel._held_work_items == {}
+            else:
+                assert declared == 0
+                assert client.declared == []
+                assert h.kernel.owns_work_item(request_id) is True
+
+    asyncio.run(exercise())
+
+
+def test_kill_drops_the_held_run_of_that_agent_only(make_harness) -> None:
+    """A kill ends a run parked for approval as well as live turns (#3564)."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            approvals=_Approvals(),
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            request_id, _thread_key = await _park_for_approval(h)
+
+            await h.kernel.interrupt_agent(uuid.uuid4())
+            assert h.kernel.owns_work_item(request_id) is True
+
+            await h.kernel.interrupt_agent(AGENT_ID)
+            assert h.kernel.owns_work_item(request_id) is False
+
+    asyncio.run(exercise())
+
+
+def test_operator_release_drops_the_held_run_on_that_thread(make_harness) -> None:
+    """An operator release of the thread ends its parked run (#3564)."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            approvals=_Approvals(),
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            request_id, thread_key = await _park_for_approval(h)
+
+            await h.kernel.release_thread("some-other-thread")
+            assert h.kernel.owns_work_item(request_id) is True
+
+            await h.kernel.release_thread(thread_key)
+            assert h.kernel.owns_work_item(request_id) is False
 
     asyncio.run(exercise())
 

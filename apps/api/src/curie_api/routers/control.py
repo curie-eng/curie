@@ -120,9 +120,20 @@ async def get_thread_reset_state(
     reset as unconfirmed rather than a false "released". Reading only the request
     set would flip to done the instant the request was SPOPped, before -- and
     independent of whether -- the sandbox was actually released.
+
+    Once the reset is no longer pending, ``route_existed`` says what the drain
+    found (#3699): False when the key matched no route, so nothing was released
+    and the sandbox the caller meant to free is still claimed; True when a route
+    existed and was released. It stays None while the reset is pending and when
+    the worker recorded no outcome (expired, or a worker that predates it), so a
+    caller treats None as unknown, not as success or failure.
     """
     await _load_agent(session, agent_id)
-    return ThreadResetState(requested=await thread_reset_requests.is_pending(thread_key))
+    if await thread_reset_requests.is_pending(thread_key):
+        return ThreadResetState(requested=True)
+    outcome = await thread_reset_requests.result(thread_key)
+    route_existed = {"released": True, "no-route": False}.get(outcome or "")
+    return ThreadResetState(requested=False, route_existed=route_existed)
 
 
 @router.get("/budget", response_model=BudgetConfig)

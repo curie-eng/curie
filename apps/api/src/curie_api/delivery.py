@@ -21,9 +21,12 @@ other's turns.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
+import secrets
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import redis.asyncio as redis
@@ -35,6 +38,9 @@ from fastapi import Response
 from .graveyardwatcher import _text
 
 logger = logging.getLogger(__name__)
+
+# Bound cleanup waits so an unavailable Valkey cannot hold the original error.
+_FAILED_DELIVERY_CLEANUP_TIMEOUT_S = 5.0
 
 # The owner-checked enqueue, as ONE script so the ownership check and the XADD
 # are a single atomic step (Valkey runs a script single-threaded, which is
@@ -80,27 +86,90 @@ else
 end
 """
 
-# One caller's slot counter for the current window, taken atomically: INCR and
-# the window's EXPIRE cannot be two round trips, or a process that dies between
-# them leaves a counter that never expires and 429s that caller forever.
+# Record the attempt token with the increment so cleanup can verify a charge
+# even when the request never observed the result. Both keys expire together.
 _QUOTA_SCRIPT = """
-local n = redis.call('INCR', KEYS[1])
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl == -2 then
+  ttl = tonumber(ARGV[1]) * 1000
+end
+if ttl == -1 then
+  redis.call('SET', KEYS[2], ARGV[2])
+else
+  redis.call('SET', KEYS[2], ARGV[2], 'PX', math.max(ttl, 1))
+end
+local n = redis.pcall('INCR', KEYS[1])
+if type(n) == 'table' and n.err then
+  redis.call('DEL', KEYS[2])
+  return n
+end
 if n == 1 then
   redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+ttl = redis.call('PTTL', KEYS[1])
+if ttl == -1 then
+  redis.call('PERSIST', KEYS[2])
+else
+  redis.call('PEXPIRE', KEYS[2], ttl)
 end
 return n
 """
 
-# Give a claim back, and ONLY our own: used when the quota refuses a delivery we
-# have already claimed, so the refusal does not leave the `delivery_id` locked
-# for a lease's duration. The compare is what keeps a slow caller from deleting
-# a successor's claim.
-_RELEASE_SCRIPT = """
-if redis.call('GET', KEYS[1]) == ARGV[1] then
+# Claim inspection and quota refund must be one atomic operation. An enqueue
+# may have committed even when its result was lost, and its receipt preserves
+# both the stream entry and the charge. Foreign pending owners are untouched.
+# A successor's receipt also preserves this attempt's charge.
+_SETTLE_SCRIPT = """
+local cur = redis.call('GET', KEYS[1])
+if ARGV[3] == '1' then
+  if cur == ARGV[1] then
+    redis.call('DEL', KEYS[1])
+  end
+  if redis.call('GET', KEYS[3]) == ARGV[2] then
+    redis.call('DEL', KEYS[3])
+  end
+  return 1
+end
+if cur and string.sub(cur, 1, 8) ~= 'pending:' then
+  return 1
+end
+if cur == ARGV[1] then
   redis.call('DEL', KEYS[1])
+end
+if redis.call('GET', KEYS[3]) == ARGV[2] then
+  redis.call('DEL', KEYS[3])
+  if redis.call('EXISTS', KEYS[2]) == 1 then
+    redis.call('DECR', KEYS[2])
+  end
 end
 return 1
 """
+
+
+@dataclass(frozen=True)
+class BacklogReservation:
+    """One attempt's quota identity, fixed before any acquisition await."""
+
+    counter_key: str
+    token: str
+    window_s: int
+
+    @property
+    def token_key(self) -> str:
+        """The marker recording whether this attempt charged its counter."""
+
+        return f"{self.counter_key}:attempt:{self.token}"
+
+
+def backlog_reservation(*, key_prefix: str, window_s: int) -> BacklogReservation:
+    """Fix the window and token before taking a claim or quota slot."""
+
+    window = int(time.time()) // window_s
+    return BacklogReservation(
+        counter_key=f"{key_prefix}:{window}",
+        token=secrets.token_hex(16),
+        window_s=window_s,
+    )
 
 
 def sha16(delivery_id: str) -> str:
@@ -189,7 +258,7 @@ async def enqueue_owned(
 
 
 async def take_backlog_slot(
-    client: redis.Redis, *, key_prefix: str, limit: int, window_s: int
+    client: redis.Redis, *, reservation: BacklogReservation, limit: int
 ) -> bool:
     """Count ONE new delivery against this caller's window, atomically.
 
@@ -199,30 +268,71 @@ async def take_backlog_slot(
 
     Args:
         client: The Valkey client.
-        key_prefix: The counter's namespace, without the window suffix.
+        reservation: This attempt's fixed counter window and token marker.
         limit: The most new deliveries allowed per window.
-        window_s: The window length in seconds.
 
     Returns:
         True when this delivery fits inside the window's allowance.
     """
 
-    window = int(time.time()) // window_s
-    key = f"{key_prefix}:{window}"
-    count: Any = await client.eval(_QUOTA_SCRIPT, 1, key, str(window_s))
+    count: Any = await client.eval(
+        _QUOTA_SCRIPT,
+        2,
+        reservation.counter_key,
+        reservation.token_key,
+        str(reservation.window_s),
+        reservation.token,
+    )
     return int(count) <= limit
 
 
-async def release_claim(client: redis.Redis, key: str, owner: str) -> None:
-    """Give back a claim this request took but will not enqueue.
+async def settle_failed_delivery(
+    client: redis.Redis,
+    *,
+    key: str,
+    owner: str,
+    reservation: BacklogReservation,
+    preserve_quota: bool,
+) -> None:
+    """Release unfinished work without replacing the request's original error.
+
+    A receipt preserves the claim and quota, including when enqueue committed
+    before raising or cancellation. A pending or missing claim allows only this
+    reservation's token to refund its charge. Normal quota refusal removes this
+    attempt's marker and owned claim but retains the counter increment.
 
     Args:
         client: The Valkey client.
         key: This delivery's claim key.
         owner: This request's owner token, compared before the delete.
+        reservation: The original quota window and this attempt's token.
+        preserve_quota: Whether this request observed a normal quota refusal.
     """
 
-    await client.eval(_RELEASE_SCRIPT, 1, key, owner)
+    try:
+        cleanup = asyncio.create_task(
+            asyncio.wait_for(
+                client.eval(
+                    _SETTLE_SCRIPT,
+                    3,
+                    key,
+                    reservation.counter_key,
+                    reservation.token_key,
+                    owner,
+                    reservation.token,
+                    "1" if preserve_quota else "0",
+                ),
+                timeout=_FAILED_DELIVERY_CLEANUP_TIMEOUT_S,
+            )
+        )
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
+    except BaseException:
+        logger.error("ingress delivery cleanup failed for claim %s", key, exc_info=True)
 
 
 def duplicate_stream_id(current: str, response: Response) -> str | None:

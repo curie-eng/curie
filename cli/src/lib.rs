@@ -5,6 +5,7 @@
 //! the platform API's committed OpenAPI surface. Task I1.
 
 pub mod api;
+pub mod approval_wording;
 pub mod artifacts;
 pub mod bundle;
 pub mod channel;
@@ -28,18 +29,23 @@ pub mod eval_sampling;
 pub mod evals;
 pub mod examples;
 pub mod exit;
+pub mod factory_app;
+pub mod factory_intake;
+pub mod factory_quickstart;
 pub mod github_app;
 pub mod guide;
 pub mod installation;
 pub mod interactive;
 pub mod kube_context;
 pub mod local;
+pub mod local_stack_keys;
 pub mod mail_channel;
 pub mod message;
 pub mod migrate_store;
 pub mod modelpin;
 pub mod ndjson;
 pub mod observability;
+pub mod oci_registry;
 pub mod ops;
 pub mod queue;
 pub mod recipes;

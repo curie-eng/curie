@@ -29,7 +29,11 @@ STREAM="curie:runs"
 GROUP="curie-workers"
 WORKER_DEPLOYMENT="${RELEASE}-worker"
 VALKEY_STATEFULSET="${RELEASE}-valkey"
-SANDBOX_TEMPLATE="${CURIE_E2E_SANDBOX_TEMPLATE:-${RELEASE}-runner}"
+# Empty unless the operator names one: by default the hold goes on the template
+# the first invocation's real SandboxClaim was served from (see
+# resolve_claim_sandbox_template), because a deploy that hosts a connector
+# routes the agent through its own per-agent pool, not `${RELEASE}-runner`.
+SANDBOX_TEMPLATE="${CURIE_E2E_SANDBOX_TEMPLATE:-}"
 CONTROLLER_NAMESPACE="agent-sandbox-system"
 CONTROLLER_DEPLOYMENT="agent-sandbox-controller"
 GATE_CONFIGMAP="${RELEASE}-rollout-recovery-gate"
@@ -41,6 +45,7 @@ RECOVERY_BUDGET_SECONDS=180
 WORKDIR="$(mktemp -d)"
 ORIGINAL_TEMPLATE_FILE="$WORKDIR/sandbox-template.original.json"
 CLAIMS_BEFORE_FILE="$WORKDIR/claims.before"
+CLAIMS_PHASE1_FILE="$WORKDIR/claims.phase1"
 SANDBOXES_BEFORE_FILE="$WORKDIR/sandboxes.before"
 FIRST_PID=""
 SECOND_PID=""
@@ -471,6 +476,26 @@ if items:
 ' "$baseline" "$exclude"
 }
 
+# The SandboxTemplate a claim was actually served from: its warm pool's
+# sandboxTemplateRef. Fails rather than guessing, since a hold on a template the
+# agent does not use would let the sandbox schedule and void the phase.
+resolve_claim_sandbox_template() {
+    local claim="$1" pool template
+    pool="$(kubectl -n "$NAMESPACE" get sandboxclaim "$claim" \
+        -o jsonpath='{.spec.warmPoolRef.name}')"
+    if [[ -z "$pool" ]]; then
+        echo "error: SandboxClaim $claim names no warm pool; set CURIE_E2E_SANDBOX_TEMPLATE" >&2
+        return 1
+    fi
+    template="$(kubectl -n "$NAMESPACE" get sandboxwarmpool "$pool" \
+        -o jsonpath='{.spec.sandboxTemplateRef.name}')"
+    if [[ -z "$template" ]]; then
+        echo "error: SandboxWarmPool $pool names no SandboxTemplate" >&2
+        return 1
+    fi
+    printf '%s\n' "$template"
+}
+
 patch_sandbox_template_unschedulable() {
     local current patch
     kubectl -n "$NAMESPACE" get sandboxtemplate "$SANDBOX_TEMPLATE" -o json \
@@ -595,6 +620,7 @@ BASE_GENERATION="$(worker_generation)"
 BASE_OBSERVED_GENERATION="$(worker_observed_generation)"
 BASE_POD_IDENTITY="$(worker_pod_identity)"
 
+snapshot_resource_names sandboxclaims "$CLAIMS_PHASE1_FILE"
 echo "=== first invocation: reply without worker rollout or pod replacement ==="
 "$PHASE1_BIN" --json cluster message "What is the weather?" \
     --namespace "$NAMESPACE" --release "$RELEASE" \
@@ -626,6 +652,12 @@ assert_worker_identity_unchanged "completed first invocation" \
 assert_reply "first invocation" "$WORKDIR/first.json"
 assert_pel_empty "first invocation" "$OLD_CONSUMER"
 echo "first invocation kept worker generation=$BASE_GENERATION observedGeneration=$BASE_OBSERVED_GENERATION pods=$BASE_POD_IDENTITY"
+if [[ -z "$SANDBOX_TEMPLATE" ]]; then
+    FIRST_CLAIM="$(new_resource_name sandboxclaims "$CLAIMS_PHASE1_FILE")"
+    [[ -n "$FIRST_CLAIM" ]] || { echo "error: the first invocation created no SandboxClaim" >&2; exit 1; }
+    SANDBOX_TEMPLATE="$(resolve_claim_sandbox_template "$FIRST_CLAIM")"
+fi
+echo "sandbox hold target: SandboxTemplate $SANDBOX_TEMPLATE"
 
 echo "=== deliberate termination: recover a real PEL entry promptly ==="
 kubectl -n "$NAMESPACE" patch configmap "$GATE_CONFIGMAP" --type=merge \

@@ -437,8 +437,13 @@ export interface KillState {
 // the POST enqueues a reset until the worker's maintenance tick has actually
 // released the thread's sandbox, then false. Operators poll it to know the
 // release landed (mirrors the CLI reset-thread verb's wait loop).
+// `route_existed` is what the worker found once it drained the reset (#3699):
+// false when the key matched no route, so nothing was released; true when a
+// route existed and was released; null/absent while pending, when the outcome
+// expired, or against an API that predates the field.
 export interface ThreadResetState {
   requested: boolean;
+  route_existed?: boolean | null;
 }
 
 export async function getAgents(): Promise<AgentOut[]> {
@@ -896,6 +901,7 @@ export interface ApprovalOut {
   conversation_id: string;
   author: string;
   summary: string;
+  display_summary?: string | null;
   reply_channel: string;
   reply_placeholder: string | null;
   reply_endpoint: string | null;

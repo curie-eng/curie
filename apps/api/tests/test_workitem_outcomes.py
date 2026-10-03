@@ -940,6 +940,7 @@ def test_verified_repository_identity_must_match_work_item_to_bind(
                 pr_node_id="PR_example_123",
                 base_ref="main",
             ),
+            github_html_base="https://github.com",
         )
         opened = await session.execute(
             text(
@@ -2064,6 +2065,36 @@ def _actions_check_run(
 
 
 PYTHON_CI_CHECK = "Python (ruff + mypy + pytest)"
+# The repository CI policy that reproduces Curie's own layout (#3617). The API
+# no longer hardcodes it; tests configure it like an operator would.
+CURIE_PYTHON_CI_PATHS = (
+    "apps",
+    "runner",
+    "cli",
+    "adapters",
+    "packages",
+    "examples/tests",
+    "tools",
+    "release",
+)
+CURIE_PYTHON_CI_PENDING_PREFIX = "Python pytest (shard "
+CURIE_PYTHON_CI_ENV = json.dumps(
+    {
+        REPO: {
+            "check": PYTHON_CI_CHECK,
+            "paths": list(CURIE_PYTHON_CI_PATHS),
+            "pendingCheckPrefix": CURIE_PYTHON_CI_PENDING_PREFIX,
+        }
+    }
+)
+
+
+def _curie_python_ci() -> Any:
+    return factory_ci.PythonCiPolicy(
+        check=PYTHON_CI_CHECK,
+        paths=CURIE_PYTHON_CI_PATHS,
+        pending_check_prefix=CURIE_PYTHON_CI_PENDING_PREFIX,
+    )
 PYTHON_CI_PATHS = [
     "apps/api/src/curie_api/factory_ci.py",
     "apps/api/tests/test_workitem_outcomes.py",
@@ -2099,6 +2130,7 @@ def _decide_factory_ci(
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
         ci_wait_seconds=1200,
         changed_paths=[changed_path],
+        python_ci=_curie_python_ci(),
     )
 
 
@@ -2159,40 +2191,91 @@ def test_unselected_python_path_is_unverified() -> None:
     assert verdict.reason == "required_python_ci_unselected: examples/coder/foo.py"
 
 
-@pytest.mark.parametrize(
-    ("preflight", "python_check"),
-    [("missing", "success"), ("failed", "success"), ("passed", None)],
-    ids=["missing-preflight", "failed-preflight", "missing-python-check"],
-)
-def test_ci_gate_requires_unavailable_preflight_and_python_ci_for_python_changes(
-    stack: TestClient,
-    auth_headers: dict[str, str],
-    monkeypatch: pytest.MonkeyPatch,
-    preflight: str,
-    python_check: str | None,
-) -> None:
-    from curie_api import workitem_outcomes
-    from curie_api.factory_progress import (
-        VerificationObservation,
-        record_verification,
-    )
+_PYTHON_PREFLIGHT_COMMAND = "uv run pytest runner/tests -q"
 
-    agent = _agent(stack, auth_headers)
-    seeded = _completed(stack, agent)
-    if preflight != "missing":
-        observation = VerificationObservation(
-            command="uv run pytest runner/tests -q",
-            outcome="passed" if preflight == "passed" else "failed",
-            exit_status=0 if preflight == "passed" else 1,
+
+def _observation(check: str | None, outcome: str, exit_status: int | None = None) -> Any:
+    from curie_api.factory_progress import VerificationObservation
+
+    if outcome == "not_declared":
+        return VerificationObservation(
+            check=None,
+            command=None,
+            outcome="not_declared",
+            exit_status=None,
             missing_binaries=[],
             blocked_services=[],
         )
+    return VerificationObservation(
+        check=check,
+        command=_PYTHON_PREFLIGHT_COMMAND if check == "python" else "cargo test --locked",
+        outcome=outcome,
+        exit_status=0 if outcome == "passed" else exit_status,
+        missing_binaries=[],
+        blocked_services=[],
+    )
 
-        async def record(session: AsyncSession) -> Any:
+
+@pytest.mark.parametrize(
+    ("preflight", "python_check", "expected", "reason"),
+    [
+        ([], "success", ("failed", "ci_unverified"), "python_preflight_missing"),
+        (
+            [("python", "failed", 1)],
+            "success",
+            ("failed", "ci_unverified"),
+            "python_preflight_failed_exit_status_1",
+        ),
+        ([("python", "passed", 0)], None, ("failed", "ci_unverified"), None),
+        (
+            [("rust", "passed", 0), ("python", "failed", 3)],
+            "success",
+            ("failed", "ci_unverified"),
+            "python_preflight_failed_exit_status_3",
+        ),
+        ([(None, "not_declared", None)], "success", ("completed", "completed"), None),
+        ([("rust", "passed", 0)], "success", ("completed", "completed"), None),
+        (
+            [("api", "failed", 4)],
+            "success",
+            ("failed", "ci_unverified"),
+            "python_preflight_failed_exit_status_4",
+        ),
+    ],
+    ids=[
+        "missing-preflight",
+        "failed-preflight",
+        "missing-python-check",
+        "failed-python-beside-passed-rust",
+        "not-declared-ci-decides",
+        "rust-only-ci-decides",
+        "failed-check-under-another-id",
+    ],
+)
+def test_ci_gate_applies_the_python_preflight_verdict_to_python_changes(
+    stack: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    preflight: list[tuple[str | None, str, int | None]],
+    python_check: str | None,
+    expected: tuple[str, str],
+    reason: str | None,
+) -> None:
+    from curie_api import workitem_outcomes
+    from curie_api.factory_progress import record_verification
+
+    monkeypatch.setenv("GITHUB_FACTORY_PYTHON_CI", CURIE_PYTHON_CI_ENV)
+    get_settings.cache_clear()
+    agent = _agent(stack, auth_headers)
+    seeded = _completed(stack, agent)
+    for check, outcome, exit_status in preflight:
+        observation = _observation(check, outcome, exit_status)
+
+        async def record(session: AsyncSession, body: Any = observation) -> Any:
             return await record_verification(
                 session,
                 token_request_id=seeded.request_id,
-                body=observation,
+                body=body,
             )
 
         assert with_session(record).outcome == "recorded"
@@ -2274,7 +2357,24 @@ def test_ci_gate_requires_unavailable_preflight_and_python_ci_for_python_changes
         ).one()
         return str(row.status), row.terminal_cause
 
-    assert with_session(terminal_status) == ("failed", "ci_unverified")
+    assert with_session(terminal_status) == expected
+
+    if reason is not None:
+
+        async def notice_detail(session: AsyncSession) -> str | None:
+            return (
+                await session.execute(
+                    text(
+                        "SELECT detail FROM curie.factory_terminal_notices "
+                        "WHERE execution_request_id = :id"
+                    ),
+                    {"id": seeded.request_id},
+                )
+            ).scalar_one()
+
+        detail = with_session(notice_detail)
+        assert detail is not None
+        assert f"Reason: {reason}" in detail
 
 
 @pytest.mark.parametrize(
@@ -2335,6 +2435,7 @@ def test_ci_detail_adds_a_failing_actions_log_to_the_fix_report(
     assert token not in excerpt
     assert factory_ci.decide(
         detail,
+        python_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
@@ -2479,6 +2580,7 @@ def test_large_actions_log_preserves_a_bounded_diagnostic_tail(
     assert token not in excerpt
     assert factory_ci.decide(
         detail,
+        python_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
@@ -2562,6 +2664,7 @@ def test_actions_log_over_eight_mib_is_optional_enrichment_failure(
     assert detail.job_log_unavailable == {FAILING_RUN_ID}
     assert factory_ci.decide(
         detail,
+        python_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),

@@ -1648,3 +1648,174 @@ async def test_a_successful_deploy_leaves_the_database_in_charge(monkeypatch) ->
     from curie_api.schemas import WebhookResult
 
     assert await _passes(monkeypatch, WebhookResult(status="deployed")) == 2
+
+
+# --------------------------------------------------------------------------- #
+# One raising deploy must not stop the repositories behind it (#3736)
+# --------------------------------------------------------------------------- #
+BROKEN = "octo/exploding"
+FINE = "octo/steady"
+
+
+def _two_repo_harness(monkeypatch, push) -> tuple[object, dict]:
+    """The clock harness with two bound repositories whose dev branches moved."""
+
+    from curie_api import gitflow
+
+    monkeypatch.setattr(gitflow, "process_push", push)
+    return _poller_with_clock(
+        tips=Tips(
+            {
+                (BROKEN, "dev"): "f" * 40,
+                (FINE, "dev"): "g" * 40,
+                (BROKEN, "main"): None,
+                (FINE, "main"): None,
+            }
+        ),
+        bindings_for_pass=lambda: [(BROKEN, "broken-agent"), (FINE, "fine-agent")],
+    )
+
+
+@pytest.mark.anyio
+async def test_a_move_whose_deploy_raises_does_not_stop_the_pass(
+    monkeypatch, caplog
+) -> None:
+    """AC1 and AC3 of #3736: the rest of the pass runs, then the pass fails.
+
+    `process_push` maps git, archive and bundle validation errors to a rejected
+    result, but the steps after them -- a stored bundle's object read, the
+    bundle store write, database writes, the Valkey enqueue -- can raise. With
+    no per-move handling the exception escaped the loop, so every repository
+    queued behind the failing one never deployed, and the pass surfaced as one
+    opaque failure rather than one attributed failure plus real deploys.
+    """
+
+    calls: list[str] = []
+
+    async def push(session, store, settings, eval_queue, payload):
+        from curie_api.schemas import WebhookResult
+
+        repo = payload["repository"]["full_name"]
+        calls.append(repo)
+        if repo == BROKEN:
+            # Not a rejection: an unguarded step raising out of process_push.
+            raise RuntimeError("object store unreachable")
+        return WebhookResult(status="deployed")
+
+    poller, _ = _two_repo_harness(monkeypatch, push)
+    with caplog.at_level(logging.ERROR, logger="curie_api.commitpoller"):
+        # AC3: the pass must still report failure. It re-raises after the loop,
+        # which is how poll_once marks the pass failed in span and metric.
+        with pytest.raises(RuntimeError, match="object store unreachable"):
+            await poller.poll_once()
+
+    # AC1: the second repository's deploy ran, in the same pass, despite the
+    # first one raising. On the unfixed code the exception escapes the loop
+    # before this repository is ever reached.
+    assert calls == [BROKEN, FINE], calls
+    # AC1: the failure is attributed to the repository, branch and sha.
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, "a raising deploy must log at ERROR"
+    text = errors[0].getMessage()
+    assert BROKEN in text, f"the failing repository must be named: {text}"
+    assert "dev" in text, f"the failing branch must be named: {text}"
+    assert "ffffffff" in text, f"the failing sha must be named: {text}"
+
+
+@pytest.mark.anyio
+async def test_a_raising_move_is_backed_off_not_retried_first_every_pass(
+    monkeypatch,
+) -> None:
+    """AC2 of #3736: an escaped exception must earn the capped backoff.
+
+    Before this, the raising move was recorded in neither `_settled` nor
+    `_archive_backoff`, so the next pass attempted it FIRST, with a fresh full
+    mirror clone inside process_push, and blocked the same repositories behind
+    it again -- the exact every-pass re clone regression #1309 ended for
+    rejections, bypassed by the one failure shape that never returned one.
+    """
+
+    calls: list[str] = []
+
+    async def push(session, store, settings, eval_queue, payload):
+        from curie_api.schemas import WebhookResult
+
+        repo = payload["repository"]["full_name"]
+        calls.append(repo)
+        if repo == BROKEN:
+            raise RuntimeError("object store unreachable")
+        return WebhookResult(status="deployed")
+
+    poller, now = _two_repo_harness(monkeypatch, push)
+    with pytest.raises(RuntimeError):
+        await poller.poll_once()
+    # No time passes, so the base 300s backoff window is wide open on pass 2.
+    await poller.poll_once()
+
+    assert calls == [BROKEN, FINE, FINE], calls
+    assert (BROKEN, "dev") in poller._archive_backoff, (
+        "a raising deploy must earn a backoff record"
+    )
+
+
+@pytest.mark.anyio
+async def test_a_raising_deploy_recovers_once_the_backoff_has_elapsed(monkeypatch) -> None:
+    """AC4 of #3736: the record is cleared by a successful deploy, as today.
+
+    The backoff a raising move earns is the same record a retryable rejection
+    earns, so everything that already clears it must keep working: the window
+    opens after the base delay, the repaired repository attempts again, and a
+    `deployed` result drops the record rather than pausing it.
+    """
+
+    calls: list[str] = []
+
+    async def push(session, store, settings, eval_queue, payload):
+        from curie_api.schemas import WebhookResult
+
+        repo = payload["repository"]["full_name"]
+        calls.append(repo)
+        if repo == BROKEN and calls.count(BROKEN) == 1:
+            raise RuntimeError("object store unreachable")
+        return WebhookResult(status="deployed")
+
+    poller, now = _two_repo_harness(monkeypatch, push)
+    with pytest.raises(RuntimeError):
+        await poller.poll_once()
+    # Exactly _RETRY_BASE_DELAY_S: the window is "not before", so the second
+    # pass attempts the repaired repository again.
+    now["v"] += 300.0
+    await poller.poll_once()
+
+    assert calls == [BROKEN, FINE, BROKEN, FINE], calls
+    assert poller._archive_backoff == {}, "a successful deploy left failure state behind"
+    assert poller._settled == {}, "a successful deploy must leave the database in charge"
+
+
+@pytest.mark.anyio
+async def test_cancellation_from_process_push_propagates(monkeypatch) -> None:
+    """AC5 of #3736: the pass is cancellable mid deploy.
+
+    Structural, the same guarantee run_forever documents: CancelledError
+    derives from BaseException, so the per-move `except Exception` cannot catch
+    it. This pins that a future edit to that clause (say, `except
+    BaseException` for symmetry with some later fix) cannot silently swallow
+    shutdown, which is the #1263 shutdown hang again.
+    """
+
+    calls: list[str] = []
+
+    async def push(session, store, settings, eval_queue, payload):
+        from curie_api.schemas import WebhookResult
+
+        repo = payload["repository"]["full_name"]
+        calls.append(repo)
+        if repo == BROKEN:
+            raise asyncio.CancelledError()
+        return WebhookResult(status="deployed")
+
+    poller, _ = _two_repo_harness(monkeypatch, push)
+    with pytest.raises(asyncio.CancelledError):
+        await poller.poll_once()
+    assert calls == [BROKEN], "cancellation must abort the rest of the pass"
+    assert poller._archive_backoff == {}, "a cancellation is not a failure record"

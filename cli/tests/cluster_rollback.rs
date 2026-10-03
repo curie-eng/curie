@@ -405,11 +405,16 @@ async fn rollback_hands_helm_the_selected_revision() {
     );
 
     // ----- AC6: a release helm cannot find fails HERE, not as "no eligible revision" -----
+    // Use a fresh path rather than rewriting the fake Helm already executed
+    // above. Replacing an executable while its prior child is tearing down can
+    // produce load-dependent ETXTBSY on Linux (#2236).
+    let refusing_dir = tempfile::tempdir().expect("tempdir for the refusing helm");
     test_executable::install_in(
-        dir.path(),
+        refusing_dir.path(),
         "helm",
         "#!/bin/sh\necho 'Error: release: not found' >&2\nexit 1\n",
     );
+    prepend_path(refusing_dir.path());
     let err = rollback(rollback_opts(None, false))
         .await
         .expect_err("an unreadable history is a hard failure");
@@ -422,6 +427,31 @@ async fn rollback_hands_helm_the_selected_revision() {
         !shown.contains("no revision is safe"),
         "a missing release must never be reported as an ineligible history: {shown}"
     );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A spawn error that is not ENOENT must retain its real cause rather
+        // than claiming the program is absent from PATH. This is the fix pin:
+        // reversing the product diagnostic while leaving this test intact
+        // restores the misleading PATH-only message.
+        let denied_dir = tempfile::tempdir().expect("tempdir for denied helm");
+        let denied_helm = denied_dir.path().join("helm");
+        fs::write(&denied_helm, "#!/bin/sh\nexit 0\n").expect("write denied helm");
+        fs::set_permissions(&denied_helm, fs::Permissions::from_mode(0o600))
+            .expect("make helm non-executable");
+        // Use only this directory: POSIX PATH search may continue past an
+        // EACCES candidate and execute a later same-named program.
+        std::env::set_var("PATH", denied_dir.path());
+        let denied = rollback(rollback_opts(None, false))
+            .await
+            .expect_err("a non-executable helm must fail at spawn");
+        let shown = denied.to_string();
+        assert!(shown.contains("PermissionDenied"), "{shown}");
+        assert!(shown.contains("Permission denied"), "{shown}");
+        assert!(!shown.contains("is it on PATH"), "{shown}");
+    }
 
     // Restore PATH so nothing else in this process observes the fakes.
     restore_path(&original_path);

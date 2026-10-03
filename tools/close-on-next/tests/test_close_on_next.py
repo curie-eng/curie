@@ -511,8 +511,12 @@ def test_workflow_documents_the_label_path_and_triggers_on_next_and_main() -> No
     permissions = workflow.get("permissions")
     assert isinstance(permissions, dict)
     assert permissions.get("contents") == "read"
-    assert permissions.get("issues") == "write"
-    assert permissions.get("pull-requests") == "read"
+    assert "issues" not in permissions
+    assert "pull-requests" not in permissions
+    job_permissions = workflow["jobs"]["reconcile"]["permissions"]
+    assert job_permissions.get("contents") == "read"
+    assert job_permissions.get("issues") == "write"
+    assert job_permissions.get("pull-requests") == "read"
 
 
 def test_workflow_runs_self_test_before_reconcile_and_supports_dry_run() -> None:

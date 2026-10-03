@@ -234,7 +234,7 @@ impl std::fmt::Debug for GithubTokenPlan {
 /// chars). Hex keeps the value shell-, env- and URL-safe and satisfies every
 /// backing store's charset/min-length rule, and a hex `langfuse.encryptionKey`
 /// is the exact `openssl rand -hex 32` shape the chart documents.
-fn random_hex(n_bytes: usize) -> Result<String> {
+pub(crate) fn random_hex(n_bytes: usize) -> Result<String> {
     use std::fmt::Write;
     let mut buf = vec![0u8; n_bytes];
     getrandom::fill(&mut buf)
@@ -369,7 +369,7 @@ fn lookup_dotted(values: &serde_json::Value, dotted: &str) -> Option<String> {
 /// This cannot reuse [`lookup_dotted`]: helm records `--set KEY=true` as a JSON
 /// *boolean*, and `lookup_dotted` ends in `as_str()`, so it returns `None` for
 /// exactly the shape this key normally has.
-fn lookup_dotted_flag(values: &serde_json::Value, dotted: &str) -> bool {
+pub(crate) fn lookup_dotted_flag(values: &serde_json::Value, dotted: &str) -> bool {
     let mut cursor = values;
     for part in dotted.split('.') {
         let Some(next) = cursor.get(part) else {
@@ -1165,7 +1165,7 @@ const GRAFANA_CONNECTOR_REFERENCE_KEYS: &[&str] = &[
     "grafanaConnector.secretKey",
 ];
 
-fn is_grafana_connector_reference_key(key: &str) -> bool {
+pub(crate) fn is_grafana_connector_reference_key(key: &str) -> bool {
     GRAFANA_CONNECTOR_REFERENCE_KEYS.contains(&key)
 }
 
@@ -1176,7 +1176,7 @@ fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('[') || suffix.starts_with('.'))
 }
 
-fn escape_helm_set_string_value(value: &str) -> String {
+pub(crate) fn escape_helm_set_string_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
         if matches!(ch, '\\' | ',' | '{' | '}') {
@@ -2310,7 +2310,7 @@ fn stamp_config_schema(opts: &mut UpOpts, outcome: &crate::config_migrate::Migra
     }
 }
 
-fn is_external_secret_ref_key(key: &str) -> bool {
+pub(crate) fn is_external_secret_ref_key(key: &str) -> bool {
     let leaf = key.rsplit('.').next().unwrap_or(key);
     leaf == "existingSecret"
         || leaf.ends_with("ExistingSecret")
@@ -3696,7 +3696,7 @@ impl RunningInstall {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
+            .map_err(|error| command_io_error(&cmd.program, error))?;
         let mut stdout = child
             .stdout
             .take()
@@ -3736,9 +3736,7 @@ impl RunningInstall {
                         "failed to stop Helm after status error: {cleanup_error}"
                     ));
                 }
-                return Err(error).with_context(|| {
-                    format!("failed to invoke `{}`; is it on PATH?", self.program)
-                });
+                return Err(command_io_error(&self.program, error));
             }
         };
         let stdout = self
@@ -3962,6 +3960,14 @@ async fn admission_objects(namespace: &str, resources: &str) -> Option<Vec<serde
         .cloned()
 }
 
+// A hook Job the current render omits is not an admission rejection of this install.
+fn omitted_gvisor_preflight_job(event: &serde_json::Value, gvisor_job: Option<&str>) -> bool {
+    let name = admission_text(event, "/involvedObject/name");
+    admission_text(event, "/involvedObject/kind") == "Job"
+        && name.ends_with("-preflight-gvisor")
+        && gvisor_job != Some(name)
+}
+
 fn admission_rejection_excerpt(message: &str) -> String {
     let printable: String = message
         .chars()
@@ -4005,6 +4011,7 @@ async fn observe_admission_rejection(
                     admission_text(event, "/reason") == "FailedCreate"
                         && message.to_ascii_lowercase().contains("is forbidden:")
                         && fresh_admission_event(event, &baseline)
+                        && !omitted_gvisor_preflight_job(event, gvisor_job)
                         // The existing gVisor observer owns its inference and retry.
                         && !(namespace == common.namespace && gvisor_job.is_some_and(|job| {
                             admission_text(event, "/involvedObject/kind") == "Job"

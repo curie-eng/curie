@@ -12,10 +12,17 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
 
-from channel_protocol import ReplyAck, ReplyEvent, ReplyPost, ReplyUpdate, TurnCompleted
+from channel_protocol import (
+    ConfirmIntent,
+    ReplyAck,
+    ReplyEvent,
+    ReplyPost,
+    ReplyUpdate,
+    TurnCompleted,
+)
 from pydantic import TypeAdapter, ValidationError
 
-from .adapter import CHANNEL_KIND, MailAdapter
+from .adapter import APPROVAL_CARD_REF_PREFIX, APPROVER_FIELD_LABEL, CHANNEL_KIND, MailAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +214,7 @@ class EgressHandler(BaseHTTPRequestHandler):
         if isinstance(event, TurnCompleted) and not event.event_id:
             return self._respond(422, {"detail": "event_id must not be empty"})
         try:
-            status = self.dispatch(event)
+            status, ref = self.dispatch(event)
         except Exception:
             logger.error("dispatching event type=%s failed unexpectedly", event.event)
             return self._respond(500, {"detail": "adapter error"})
@@ -215,38 +222,66 @@ class EgressHandler(BaseHTTPRequestHandler):
             return self._respond(status, {"detail": "thread deleted at provider"})
         if status == 424:
             return self._respond(status, {"detail": "provider egress refused"})
-        self._respond(status, ReplyAck().model_dump())
+        self._respond(status, ReplyAck(ref=ref).model_dump())
 
-    def dispatch(self, event: ReplyEvent) -> int:
-        """Apply one validated neutral reply event."""
+    def dispatch(self, event: ReplyEvent) -> tuple[int, str | None]:
+        """Apply one validated neutral reply event; return the status and any ref.
+
+        Two refs are returned: an approval card's (ADR-0177), which the worker
+        remembers so the resume can settle that card, and the reply owner a
+        ref-less update or post was placed on, so the rest of that turn stays
+        on it.
+        """
         conversation_id = event.target.conversation_id or ""
         if isinstance(event, ReplyUpdate | ReplyPost) and event.progress is not None:
             # Deliberate progress (ADR-0130) is silent on email: one message per
             # turn has no card to edit, and appending a status line would put it
             # into the answer. Checked first, so it never reaches record_text.
-            return 200
+            return 200, None
         if isinstance(event, ReplyUpdate):
+            reply_ref = event.target.reply_ref or ""
+            if event.settled is not None and reply_ref.startswith(APPROVAL_CARD_REF_PREFIX):
+                return self.adapter.settle_approval_card(reply_ref, event.settled), None
             text = event.text or (event.message.text if event.message else None)
-            return self.adapter.record_text(
+            status, recorded_at = self.adapter.record_text_at(
                 conversation_id,
                 event.target.reply_ref,
                 text,
             )
+            # A placeholderless turn's first update names no ref and was placed
+            # on the one live reply owner; hand that ref back so the rest of the
+            # turn, and its completion, stay on it.
+            return status, recorded_at if event.target.reply_ref is None else None
         if isinstance(event, ReplyPost):
-            return self.adapter.record_text(
+            interaction = event.message.interaction
+            if isinstance(interaction, ConfirmIntent) and conversation_id:
+                return self.adapter.record_approval_card(
+                    conversation_id,
+                    interaction.id,
+                    event.message.text,
+                    requester=event.requested_by,
+                    approvers=[
+                        item.value
+                        for item in event.message.fields
+                        if item.label == APPROVER_FIELD_LABEL
+                    ],
+                )
+            status, recorded_at = self.adapter.record_text_at(
                 conversation_id,
                 event.target.reply_ref,
                 event.message.text,
                 append=True,
             )
+            # Likewise for a post that named no ref.
+            return status, recorded_at if event.target.reply_ref is None else None
         if isinstance(event, TurnCompleted):
             return self.adapter.send_reply(
                 event.event_id,
                 conversation_id,
                 event.target.reply_ref,
                 outcome=event.outcome,
-            )
-        return 200
+            ), None
+        return 200, None
 
 
 def make_server(adapter: MailAdapter, port: int) -> ThreadingHTTPServer:

@@ -376,8 +376,8 @@ def validate_allowed_callers(kind: str, callers: list[str] | None) -> list[str] 
         return None
     if not callers:
         raise ValueError(
-            "allowed_callers must not be empty: an empty list reads as \"nobody\" "
-            "to one operator and \"no limit\" to the next. Send null to let "
+            'allowed_callers must not be empty: an empty list reads as "nobody" '
+            'to one operator and "no limit" to the next. Send null to let '
             "everyone talk to the bot through this binding, or list at least one "
             "caller id."
         )
@@ -395,7 +395,7 @@ def validate_allowed_callers(kind: str, callers: list[str] | None) -> list[str] 
                     "binding's callers are exact ids starting with U, W or B "
                     "(e.g. U0123ABCD), never a @handle, a display name or an "
                     "email. Find a person's id in their profile, under "
-                    "\"Copy member ID\"."
+                    '"Copy member ID".'
                 )
         elif kind == EMAIL_KIND:
             if not _EMAIL_CALLER.match(caller):
@@ -683,8 +683,12 @@ class ApprovalApprovers(_StoredWithoutNulls):
 
     Declaring an approvers block is what lets a request sit in a broad channel
     where everyone can see it while only a narrow set may act on it. Omitting it
-    keeps the zero-setup default: the resolution-card channel's members are the
-    approvers. Notification recipients never enter this policy.
+    keeps the zero-setup default in Slack: the resolution-card channel's members
+    are the approvers. Notification recipients never enter this policy.
+
+    ``group`` and ``users`` are Slack's entries; ``emails`` is email's (ADR-0177 amendment).
+    Each surface reads only its own: a Slack card never reads ``emails``, and an
+    email card never reads ``users`` or ``group``.
     """
 
     # A typo in an optional key must not be ignored: silently dropping it would
@@ -700,6 +704,12 @@ class ApprovalApprovers(_StoredWithoutNulls):
     # (issue #420 settles the precedence rather than refusing the combination),
     # and needs no Slack lookup at all.
     users: list[str] | None = None
+    # An explicit list of approver email addresses (ADR-0177 amendment), read only for a
+    # card shown in an email thread. Separate from the binding's
+    # ``allowed_callers``: being allowed to talk to a bot is not being allowed to
+    # approve what it does. Stored lowercase, the form the mail adapter reports a
+    # verified sender in.
+    emails: list[str] | None = None
 
     @field_validator("group")
     @classmethod
@@ -734,14 +744,48 @@ class ApprovalApprovers(_StoredWithoutNulls):
                 )
         return value
 
+    @field_validator("emails")
+    @classmethod
+    def _check_emails(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        if not value:
+            # The same footgun as an empty ``users``: silent config for "nobody",
+            # so every email approval on the route could only ever expire.
+            raise ValueError("approvers emails, when present, must contain at least one address")
+        stored: list[str] = []
+        for address in value:
+            if len(address) > _CALLER_MAX_CHARS or not _EMAIL_CALLER.match(address):
+                raise ValueError(
+                    f"approvers email {address[:_CALLER_MAX_CHARS]!r} is not one bare "
+                    "email address: list exact addresses like approver@example.com, "
+                    "with no display name, no angle brackets and no domain-only or "
+                    "wildcard entries."
+                )
+            normalized = normalize_caller_id(EMAIL_KIND, address)
+            if normalized not in stored:
+                stored.append(normalized)
+        if len(stored) > MAX_ALLOWED_CALLERS:
+            raise ValueError(
+                f"approvers emails holds {len(stored)} distinct addresses; the limit "
+                f"is {MAX_ALLOWED_CALLERS} per route."
+            )
+        return stored
+
     @model_validator(mode="after")
     def _check_not_empty(self) -> "ApprovalApprovers":
-        if self.group is None and self.users is None:
+        if self.group is None and self.users is None and self.emails is None:
             raise ValueError(
-                "approvers must declare at least one of group or users; omit "
-                "the approvers block entirely to keep channel membership"
+                "approvers must declare at least one of group, users or emails; "
+                "omit the approvers block entirely to keep channel membership"
             )
         return self
+
+    @property
+    def slack_declared(self) -> bool:
+        """Whether this block names any Slack approver (``users`` or ``group``)."""
+
+        return self.users is not None or self.group is not None
 
 
 class HookPartitionConfig(BaseModel):
@@ -1218,7 +1262,8 @@ class ApprovalRequestingSurfaceTarget(BaseModel):
     channel, the card goes where the request was asked, exactly as a routeless
     approval's card already does. Who may answer then follows the channel the
     card lands on: Slack keeps its approver sets, and any other channel admits
-    the requester alone (``approvers.RequesterOnly``).
+    only an address on the route's approver ``emails`` (``approvers.EmailApprovers``,
+    ADR-0177 amendment).
 
     Strict on purpose. ``mode`` is the whole object: a stray ``kind`` or
     ``address`` beside it is a mix of the two forms, which the ADR refuses
@@ -1276,6 +1321,23 @@ class ApprovalRouteBinding(_StoredWithoutNulls):
     approvers: ApprovalApprovers | None = None
 
     @model_validator(mode="after")
+    def _emails_need_the_requesting_surface(self) -> "ApprovalRouteBinding":
+        # ADR-0177 amendment A1: only a requesting_surface route shows its card in
+        # an email thread. A fixed target is a Slack channel, where an address
+        # can never be verified, so an email list there could only admit nobody.
+        if (
+            self.approvers is not None
+            and self.approvers.emails is not None
+            and not isinstance(self.resolution, ApprovalRequestingSurfaceTarget)
+        ):
+            raise ValueError(
+                "approvers emails need a requesting_surface resolution: a fixed "
+                "target shows its card in Slack, where an email address cannot be "
+                'verified. Use {"mode": "requesting_surface"}, or list Slack users.'
+            )
+        return self
+
+    @model_validator(mode="after")
     def _targets_must_differ(self) -> "ApprovalRouteBinding":
         if isinstance(self.resolution, ApprovalRequestingSurfaceTarget):
             if self.notification is not None:
@@ -1331,6 +1393,7 @@ class ApprovalApproversOut(BaseModel):
 
     group: str | None = None
     users: list[str] | None = None
+    emails: list[str] | None = None
 
 
 class ApprovalRequestingSurfaceTargetOut(BaseModel):
@@ -1802,6 +1865,17 @@ class RepositoryCredentialOut(BaseModel):
     revision: str | None = None
 
 
+class WorkspaceCredentialOut(RepositoryCredentialOut):
+    """The workspace clone credential, plus the base a factory WorkItem froze.
+
+    The worker clones ``base_branch`` and pins ``base_commit`` (ADR 0186). Both
+    are None outside the factory and on legacy WorkItems.
+    """
+
+    base_branch: str | None = None
+    base_commit: str | None = None
+
+
 class WorkspaceSelectionRequest(BaseModel):
     conversation_id: str = Field(min_length=1)
     author: str = Field(min_length=1)
@@ -1907,11 +1981,11 @@ class PublicationCreate(BaseModel):
     def _safe_changed_paths(cls, value: list[str]) -> list[str]:
         for path in value:
             parts = path.split("/")
-            if tuple(part.casefold() for part in parts[:2]) == (
-                ".github",
-                "workflows",
-            ):
+            folded = tuple(part.casefold() for part in parts)
+            if folded[:2] == (".github", "workflows"):
                 raise ValueError("GitHub workflow changes cannot be published by this capability")
+            if folded[:1] == (".github",):
+                raise ValueError("GitHub metadata changes cannot be published by this capability")
             if (
                 not path
                 or path.startswith("/")
@@ -2002,6 +2076,52 @@ class PublicationPrecheck(BaseModel):
 
 class PublicationPrecheckResult(BaseModel):
     result: Literal["unchanged", "metadata_changed"]
+
+
+class IssueReadContextMint(BaseModel):
+    """Trusted worker identity for one factory execution's issue read (ADR 0187)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    execution_request_id: uuid.UUID
+
+
+class IssueReadContext(BaseModel):
+    """The execution scoped capability and the one issue it names."""
+
+    work_item_id: uuid.UUID
+    execution_request_id: uuid.UUID
+    repo_full_name: str
+    issue_number: int
+    capability: str
+
+
+class IssueReadRequest(BaseModel):
+    """The issue the sandbox asks for. Anything but the capability's is refused."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repo_full_name: str = Field(min_length=3, max_length=512)
+    issue_number: int = Field(gt=0)
+
+
+class IssueReadComment(BaseModel):
+    author: str | None
+    created_at: str | None
+    body: str
+
+
+class IssueReadResult(BaseModel):
+    """The issue verbatim. The platform parses and stores none of it."""
+
+    repo_full_name: str
+    issue_number: int
+    title: str
+    body: str
+    state: str | None
+    author: str | None
+    comments: list[IssueReadComment]
+    comments_truncated: bool
 
 
 class PublicationLineageAdvance(BaseModel):
@@ -2435,6 +2555,7 @@ class ApprovalOut(BaseModel):
     conversation_id: str
     author: str
     summary: str
+    display_summary: str | None = None
     reply_channel: str
     reply_placeholder: str | None
     reply_endpoint: str | None
@@ -2453,6 +2574,12 @@ class ApprovalOut(BaseModel):
     resolution_note: str | None
     created_at: datetime
     resolved_at: datetime | None
+
+
+class ApprovalCreateOut(ApprovalOut):
+    """Display attribution for creation, separate from the durable turn author."""
+
+    requested_by: str | None = None
 
 
 class ActionRecord(BaseModel):
@@ -2872,9 +2999,17 @@ class KillState(BaseModel):
 
 
 class ThreadResetState(BaseModel):
-    """Whether a thread has a pending forced-sandbox-release request (#713)."""
+    """Whether a thread has a pending forced-sandbox-release request (#713).
+
+    ``route_existed`` is what the worker found when it drained the reset
+    (#3699). None while the reset is pending, and when no outcome is recorded
+    (the record expired, or the worker predates this field). False when the
+    drained reset matched no route, so nothing was released -- usually a key
+    built by hand that left out a named bot's identity segment. True when a
+    route existed and was released."""
 
     requested: bool
+    route_existed: bool | None = None
 
 
 class CostReport(BaseModel):
@@ -2912,6 +3047,16 @@ class StateAppendIn(BaseModel):
 
     item: Any
     reserve_bytes: int | None = Field(default=None, ge=0)
+
+
+class MemoryTurnClosedIn(BaseModel):
+    """The worker reporting that a turn has ended (#3776): from now on the API
+    refuses memory writes made with that turn's per-turn credential (ADR-0188),
+    even before it expires. ``turn`` is the credential's ``turn`` claim, opaque
+    to the API."""
+
+    agent_id: uuid.UUID
+    turn: str = Field(min_length=1, max_length=512)
 
 
 class StateEntryOut(BaseModel):

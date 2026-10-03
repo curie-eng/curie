@@ -35,6 +35,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
+from .approval_wording import approval_display
 from .db import SCHEMA, Base
 from .repo_full_name import normalize_repo_full_name
 
@@ -500,6 +501,11 @@ class Approval(Base):
     # The human-readable statement of what needs approval, from the run's
     # approval request (the ACI final's approval_summary).
     summary: Mapped[str]
+    @property
+    def display_summary(self) -> str:
+        """Computed presentation; grants still bind to the stored exact fields."""
+        return approval_display(self.summary, self.granted_tool, self.granted_arguments)
+
     # The reply handle of the requesting turn, replayed onto the resume turn so
     # the resumed run streams into the same placeholder message.
     #
@@ -696,6 +702,16 @@ class WorkItem(Base):
             "AND readmit_objective IS NOT NULL)",
             name="work_items_readmit_ck",
         ),
+        CheckConstraint(
+            "(base_branch IS NULL AND base_source IS NULL AND base_commit IS NULL) OR "
+            "(base_branch IS NOT NULL AND base_source IS NOT NULL "
+            "AND base_commit IS NOT NULL)",
+            name="work_items_base_ck",
+        ),
+        CheckConstraint(
+            "base_source IS NULL OR base_source IN ('label', 'default')",
+            name="work_items_base_source_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -726,6 +742,19 @@ class WorkItem(Base):
     )
     readmit_requester: Mapped[str | None] = mapped_column(Text, default=None)
     readmit_objective: Mapped[str | None] = mapped_column(Text, default=None)
+    # The base resolved for that deferred relabel (ADR 0186). It replaces the
+    # recorded base only when the replacement request is admitted.
+    readmit_base_branch: Mapped[str | None] = mapped_column(Text, default=None)
+    readmit_base_source: Mapped[str | None] = mapped_column(Text, default=None)
+    readmit_base_commit: Mapped[str | None] = mapped_column(Text, default=None)
+    # The base resolved at admission and frozen for every later run (ADR
+    # 0186). All three are NULL on a legacy row, which uses the repository
+    # default branch. ``base_label_ignored`` is the branch a later ``base:``
+    # label names when it disagrees with the recorded one.
+    base_branch: Mapped[str | None] = mapped_column(Text, default=None)
+    base_source: Mapped[str | None] = mapped_column(Text, default=None)
+    base_commit: Mapped[str | None] = mapped_column(Text, default=None)
+    base_label_ignored: Mapped[str | None] = mapped_column(Text, default=None)
     version: Mapped[int] = mapped_column(default=1, server_default="1")
     next_sequence: Mapped[int] = mapped_column(default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(
@@ -1658,11 +1687,16 @@ class AgentAction(Base):
         platform would then offer an undo it cannot honor. Deny-by-default falls
         out of this: a third-party tool that reports neither a prior state nor a
         target lands on ``False`` without anyone declaring anything.
+
+        ``post_state`` is required too: the undo route compares the live resource
+        against it and refuses without it, so a row lacking it is not one an undo
+        can be granted on.
         """
 
         return (
             self.status == ActionStatus.succeeded
             and self.prior_state is not None
+            and self.post_state is not None
             and self.target is not None
             and self.undone_at is None
         )
@@ -2011,4 +2045,37 @@ class PrincipalTeam(Base):
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     synced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class FactoryPollCursor(Base):
+    """One repository's factory poll cursors and conditional-request tags (#3745)."""
+
+    __tablename__ = "factory_poll_cursors"
+    __table_args__ = (
+        CheckConstraint(
+            "repository_id IS NULL OR repository_id > 0",
+            name="factory_poll_cursors_repository_id_ck",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(etags) = 'object'",
+            name="factory_poll_cursors_etags_object_ck",
+        ),
+    )
+
+    repo_full_name: Mapped[str] = mapped_column(Text, primary_key=True)
+    repository_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    comments_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    review_comments_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    reviews_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    etags: Mapped[dict[str, Any]] = mapped_column(JSONB,
+        nullable=False, server_default=text("'{}'::jsonb"), default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )

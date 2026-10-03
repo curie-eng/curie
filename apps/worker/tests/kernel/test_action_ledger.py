@@ -66,8 +66,23 @@ class FakeRecorder:
             "result": frame.result,
             "detail": frame.detail,
             "status": "failed" if frame.failed else "succeeded",
-            "undoable": bool(frame.result and frame.result.get("prior")),
+            # The API's predicate (``AgentAction.undoable``), not a looser one: a
+            # fake that called a prior alone undoable would keep a receipt test
+            # green for a row the real ledger refuses to undo.
+            "undoable": bool(
+                not frame.failed
+                and frame.result
+                and all(frame.result.get(key) for key in ("prior", "post", "target"))
+            ),
         }
+
+
+_SNAPSHOT = {
+    "ok": True,
+    "prior": {"spec": {"replicas": 3}},
+    "post": {"spec": {"replicas": 10}},
+    "target": {"kind": "Deployment", "name": "api"},
+}
 
 
 def _call(call_id: str, tool: str = "scale_deployment") -> list[SideEffectFlag]:
@@ -84,7 +99,7 @@ def _call(call_id: str, tool: str = "scale_deployment") -> list[SideEffectFlag]:
             tool=tool,
             call_id=call_id,
             failed=False,
-            result={"ok": True, "prior": {"spec": {"replicas": 3}}},
+            result=_SNAPSHOT,
             detail="non-idempotent tool completed",
         ),
     ]
@@ -131,7 +146,7 @@ def test_the_completion_carries_what_the_connector_reported(make_harness) -> Non
             await h.kernel.process_event(_qevent("scale it"))
 
             _, frame = recorder.completed[0]
-            assert frame.result == {"ok": True, "prior": {"spec": {"replicas": 3}}}
+            assert frame.result == _SNAPSHOT
 
     asyncio.run(go())
 
@@ -257,7 +272,7 @@ def test_a_turn_that_changed_the_world_says_so_in_its_reply(make_harness) -> Non
 
             assert h.sink.last_text is not None
             assert "What I changed" in h.sink.last_text
-            assert "can be undone" in h.sink.last_text
+            assert "restore information recorded" in h.sink.last_text
             # The model's own answer is still the answer; the receipt is added to
             # it rather than replacing it.
             assert h.sink.last_text.startswith("done")
@@ -351,7 +366,7 @@ def test_all_mode_replies_exactly_as_the_default_install_does(make_harness) -> N
         assert replies[0] == (
             "done\n\n"
             "_What I changed:_\n"
-            "• called `scale_deployment` — can be undone\n"
+            "• scale deployment — restore information recorded\n"
             "• filed acme-invoice.pdf — failed — check before retrying"
         )
 

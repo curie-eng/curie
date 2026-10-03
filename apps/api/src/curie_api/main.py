@@ -68,6 +68,7 @@ from .routers import (
     schedules,
     state,
     turn_progress,
+    work_item_issue,
     work_item_outcomes,
     work_items,
     workspaces,
@@ -82,8 +83,15 @@ from .workitem_reconciler import WorkItemReconciler
 _LOG = logging.getLogger("curie_api")
 
 
+def _validate_forwarded_allow_ips() -> None:
+    """Require socket peer identity for every console request budget."""
+    if os.environ.get("FORWARDED_ALLOW_IPS", ""):
+        raise RuntimeError("FORWARDED_ALLOW_IPS must be empty")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    _validate_forwarded_allow_ips()
     settings = get_settings()
     # Fail closed when this image cannot serve the live schema. Migrations are
     # applied by the upgrade Job / curie-migrate, never here (#2300).
@@ -430,6 +438,7 @@ def create_app() -> FastAPI:
     app.include_router(schedules.router)
     app.include_router(hook_fire.router)
     app.include_router(state.router)
+    app.include_router(state.internal_router)
     app.include_router(memory.router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise
     # be matched by GET /approvals/{approval_id} and fail as a bad uuid.
@@ -439,6 +448,8 @@ def create_app() -> FastAPI:
     app.include_router(publication_precheck.router)
     app.include_router(publications.router)
     app.include_router(publications.internal_router)
+    app.include_router(work_item_issue.router)
+    app.include_router(work_item_issue.internal_router)
     app.include_router(work_items.router)
     app.include_router(factory_status.router)
     app.include_router(turn_progress.router)

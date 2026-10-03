@@ -13,7 +13,7 @@ use clap::ValueEnum;
 use curie_aci_protocol::{Budget, EventType, OutboundEvent, SessionStatus};
 use serde::{Deserialize, Serialize};
 
-use crate::api::{ApiClient, BudgetConfig, ChannelOutcome, RoutingCheck};
+use crate::api::{ApiClient, ChannelOutcome, RoutingCheck};
 use crate::bundle::{git_status_is_clean_for_pack, pack_tar_gz};
 use crate::docker::{self, CheckSpec, StartSpec};
 use crate::evals::{
@@ -442,7 +442,7 @@ impl crate::ui::CliOutput for InitOutput {
 }
 
 /// Scaffold and drive the existing local skill path for one first reply.
-pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
+pub async fn try_first_run(keep: bool, image: String) -> Result<SkillMessageOutput> {
     const DEMO_NAME: &str = "curie-demo";
     const DEMO_PROMPT: &str = "hello, are you there?";
 
@@ -546,36 +546,27 @@ pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
     .await;
     let teardown = stop(None, &dir).await;
 
-    let classified_failure = match message {
-        Ok(classified_failure) => classified_failure,
-        Err(message_err) => {
-            if let Err(cleanup_err) = &teardown {
-                ui.warn(&format!(
-                    "could not tear down the demo at {}: {cleanup_err}",
-                    dir.display()
-                ));
-            } else if !keep {
-                if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
-                    ui.warn(&format!(
-                        "could not remove temporary demo at {}: {cleanup_err}",
-                        dir.display()
-                    ));
-                }
-            }
-            return Err(message_err);
-        }
-    };
-
     if let Err(cleanup_err) = teardown {
-        ui.failure(&format!(
+        if let Err(message_err) = &message {
+            ui.warn(&format!("demo message failed: {message_err}"));
+        }
+        let message = format!(
             "could not tear down the demo at {}: {cleanup_err}",
             dir.display()
-        ));
-        ui.note(&format!(
+        );
+        let remedy = format!(
             "recover with: cd {} && curie skill down",
-            dir.display()
+            crate::ops::shell_quote(&dir.display().to_string())
+        );
+        let payload = serde_json::json!({ "error": &message, "fix": &remedy });
+        let failure = crate::exit::CliError::failure(message.clone())
+            .with_fix(remedy.clone())
+            .into();
+        return Err(crate::exit::operator_context(
+            crate::exit::with_json_payload(failure, payload),
+            message,
+            Some(remedy),
         ));
-        std::process::exit(1);
     }
 
     if keep {
@@ -586,19 +577,19 @@ pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
         };
         ui.note(&format!("kept ./curie-demo; next: {next}"));
     } else if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
-        ui.failure(&format!(
+        if let Err(message_err) = &message {
+            ui.warn(&format!("demo message failed: {message_err}"));
+        }
+        return Err(crate::exit::CliError::failure(format!(
             "could not remove temporary demo at {}: {cleanup_err}",
             dir.display()
-        ));
-        std::process::exit(1);
+        ))
+        .into());
     } else {
         ui.note(&format!("removed temporary demo at {}", dir.display()));
     }
 
-    if classified_failure {
-        std::process::exit(1);
-    }
-    Ok(())
+    message
 }
 
 /// Tags `docker build` applies for one platform image.
@@ -624,11 +615,22 @@ pub(crate) fn platform_image_tags(dockerfile: &str, tag: &str) -> Vec<String> {
     tags
 }
 
+/// The `docker build` command line [`build_image`] runs from the repo root,
+/// as it announces it and as a `local up --build --dry-run` plan lists it.
+pub(crate) fn build_image_command_line(dockerfile: &str, tag: &str) -> String {
+    let rendered = platform_image_tags(dockerfile, tag)
+        .iter()
+        .map(|image_tag| format!("-t {image_tag}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("docker build -f {dockerfile} {rendered} .")
+}
+
 /// Build one platform image. The single `docker build` invocation for Curie
 /// images: `curie build` and `curie local up --build` both route here (#1931).
 pub(crate) async fn build_image(dockerfile: &str, tag: &str) -> Result<()> {
     let ui = crate::ui::ui();
-    if !on_path("docker") {
+    if !crate::ops::on_path("docker") {
         bail!(
             "Docker is not installed or not on PATH. Install Docker \
              (https://docs.docker.com/get-docker/) and retry."
@@ -649,13 +651,9 @@ pub(crate) async fn build_image(dockerfile: &str, tag: &str) -> Result<()> {
         args.push(image_tag.clone());
     }
     args.push(".".to_string());
-    let rendered = tags
-        .iter()
-        .map(|image_tag| format!("-t {image_tag}"))
-        .collect::<Vec<_>>()
-        .join(" ");
     ui.note(&format!(
-        "=== docker build -f {dockerfile} {rendered} . (in {}) ===",
+        "=== {} (in {}) ===",
+        build_image_command_line(dockerfile, tag),
         root.display()
     ));
     // Inherit stdio so the build log streams to the terminal like a hand-run build.
@@ -1616,7 +1614,7 @@ impl crate::ui::CliOutput for BumpVersionOutput {
 
 /// Bail with a friendly pointer when a required tool is not on PATH.
 fn require_tool(bin: &str, hint: &str) -> Result<()> {
-    if on_path(bin) {
+    if crate::ops::on_path(bin) {
         Ok(())
     } else {
         bail!("{hint}")
@@ -1652,13 +1650,6 @@ async fn docker_image_exists(tag: &str) -> Result<bool> {
         .await
         .context("failed to invoke docker")?;
     Ok(status.success())
-}
-
-/// Whether `bin` resolves on PATH.
-fn on_path(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
-        .unwrap_or(false)
 }
 
 /// Walk up from the current directory to the repo root: the nearest ancestor
@@ -2408,6 +2399,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
                 registry: None,
                 runner_image: None,
                 force: false,
+                platforms: Vec::new(),
             })
             .await
             {
@@ -3987,7 +3979,7 @@ pub async fn send(
     event_type: EventType,
     url: Option<String>,
     r#continue: bool,
-) -> Result<bool> {
+) -> Result<SkillMessageOutput> {
     let url = resolve_url(url)?;
     let saved = state::load(Path::new(".")).unwrap_or(None);
     let bundle_warning = editable_bundle_warning(saved.as_ref(), &url);
@@ -4005,10 +3997,8 @@ pub async fn send(
             .context("resetting the runner conversation before message")?;
     }
 
-    // Under `--json`, answer tokens are suppressed on stdout (they route through
-    // `ui.answer`), so a streamed turn would exit 0 with empty stdout (#485).
-    // Accumulate the full reply and emit one JSON object at the end instead. The
-    // human path is unchanged: it streams live and this buffer is never emitted.
+    // Buffer the reply for the caller's typed result while the human path
+    // streams live. Callers emit success only after their cleanup has finished.
     let json = ui.json();
     let mut reply = String::new();
 
@@ -4042,9 +4032,8 @@ pub async fn send(
                 // pace with no per-delta newline. Track mid-line state so a later
                 // note closes an un-terminated line first.
                 Some(TurnPart::Token(token)) => {
-                    if json {
-                        reply.push_str(&token);
-                    } else {
+                    reply.push_str(&token);
+                    if !json {
                         ui.answer(&token);
                     }
                     streamed = true;
@@ -4081,34 +4070,32 @@ pub async fn send(
         step.clear();
     }
 
-    if let Some(final_event @ OutboundEvent::Final { status, .. }) = events.last() {
-        // Under `--json`, project the real final frame into one buffered turn
-        // object (reply, status, and approval metadata) rather than the
-        // streamed/human trailer (#485, #2108). Emit BEFORE any exit so a
-        // classified failure still carries its data to the consumer.
-        if json {
-            let output = SkillMessageOutput::from_final(std::mem::take(&mut reply), final_event)
-                .expect("the matched outbound event is final");
-            ui.emit(&output);
-            return Ok(*status == SessionStatus::ClassifiedFailure);
-        }
+    if let Some(final_event @ OutboundEvent::Final { status, text, .. }) = events.last() {
         // Close the streamed answer on stdout only if the last thing written was
         // un-terminated token text; if a note already added its own newline (or
         // the last token ended in one) skip it to avoid a blank line. The status
-        // trailer is a diagnostic -> stderr.
+        // trailer is rendered by the caller after success.
         if streamed && !at_line_start {
             ui.print_tokens("\n");
         }
-        ui.note(&format!("-- final ({})", status_str(status)));
-        return Ok(*status == SessionStatus::ClassifiedFailure);
+        if *status == SessionStatus::ClassifiedFailure {
+            let detail = text.trim();
+            let message = if detail.is_empty() {
+                "runner turn ended with classified-failure".to_string()
+            } else {
+                format!("runner turn ended with classified-failure: {detail}")
+            };
+            return Err(crate::exit::CliError::failure(message).into());
+        }
+        return SkillMessageOutput::from_final(reply, final_event)
+            .context("runner stream ended without a final frame");
     }
-    Ok(false)
+    bail!("runner stream ended without a final frame")
 }
 
-/// Output of `skill message` under `--json`: the full buffered reply, final
-/// session status, and approval metadata copied from the runner's final frame.
-/// The human path streams tokens live and never builds this; it exists so
-/// `--json` emits one complete object instead of empty stdout (#485, #2108).
+/// Successful streamed turn result with the full reply, final session status,
+/// and approval metadata. Human answer tokens already streamed in send, so
+/// rendering this result adds only the final status.
 #[derive(Debug)]
 pub struct SkillMessageOutput {
     pub reply: String,
@@ -4184,7 +4171,6 @@ impl crate::ui::CliOutput for SkillMessageOutput {
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
-        ui.answer(&self.reply);
         ui.note(&format!("-- final ({})", self.status));
     }
 }
@@ -5113,7 +5099,8 @@ pub struct DeployOpts {
     /// the workspace field so the server can carry the previous value forward.
     pub workspace: WorkspaceIntent,
     /// None means the caller did not pass --env, so a declared target may
-    /// supply it. An explicit flag still wins (ADR-0089).
+    /// supply it. Without a target, cluster deploy infers the sole active
+    /// environment. An explicit flag still wins (ADR-0089).
     pub env: Option<DeployEnv>,
     pub label: Option<String>,
     /// Per-agent connector secret NAMES to bind on deploy (ADR-0009, #429). Each
@@ -5603,19 +5590,12 @@ async fn prepare_deploy_with_commit_sha(
         None => None,
     };
 
-    // A target states its environment, which is the point: the flag's `dev`
-    // default is what let a prod workflow deploy to dev in silence (#1166).
-    let env_owned = opts
+    // A target states its environment. An explicit flag still wins, and an
+    // omitted environment is resolved after the agent lookup below (#3504).
+    let requested_env = opts
         .env
         .map(|e| e.as_str().to_string())
-        .or_else(|| resolved.as_ref().map(|r| r.env.clone()))
-        .unwrap_or_else(|| "dev".to_string());
-    let env = env_owned.as_str();
-    ui.note(&format!(
-        "deploying {plugin_name} ({} bytes) to {} [{env}]",
-        archive.len(),
-        opts.api_url,
-    ));
+        .or_else(|| resolved.as_ref().map(|r| r.env.clone()));
 
     // Resolve each --secret NAME to a value (env wins, else the host vault) so
     // the connector secret is bound on the agent for the worker to forward into
@@ -5734,6 +5714,70 @@ async fn prepare_deploy_with_commit_sha(
             &channel,
             opts.tier,
         )?;
+        let env = if opts.tier == DeployTier::Cluster && (opts.env.is_some() || resolved.is_none())
+        {
+            let deployments = client.list_deployments(&agent.id).await?;
+            let active_environments: BTreeSet<&str> = deployments
+                .iter()
+                .filter(|deployment| deployment.status == "active")
+                .map(|deployment| deployment.environment.as_str())
+                .collect();
+            match requested_env {
+                Some(env) => {
+                    if !active_environments.is_empty()
+                        && !active_environments.contains(env.as_str())
+                    {
+                        let current = active_environments
+                            .iter()
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let additional = if active_environments.len() == 1 {
+                            "a second environment"
+                        } else {
+                            "another environment"
+                        };
+                        ui.note(&format!(
+                            "explicit environment {env} differs from the current active \
+                             environment {current} of agent {agent_name}; creating {additional}"
+                        ));
+                    }
+                    env
+                }
+                None => match active_environments.len() {
+                    0 => "dev".to_string(),
+                    1 => {
+                        let env = active_environments
+                            .first()
+                            .expect("one active environment")
+                            .to_string();
+                        ui.note(&format!(
+                            "inferred environment {env} from the active deployments of agent \
+                             {agent_name}"
+                        ));
+                        env
+                    }
+                    _ => {
+                        return Err(crate::exit::usage(format!(
+                            "agent {agent_name} has active deployments in multiple environments \
+                             ({}); pass --env or --target to choose the deployment environment",
+                            active_environments
+                                .iter()
+                                .copied()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )));
+                    }
+                },
+            }
+        } else {
+            requested_env.unwrap_or_else(|| "dev".to_string())
+        };
+        ui.note(&format!(
+            "deploying {plugin_name} ({} bytes) to {} [{env}]",
+            archive.len(),
+            opts.api_url,
+        ));
         client
             .prepare_deploy(
                 agent,
@@ -5747,10 +5791,11 @@ async fn prepare_deploy_with_commit_sha(
                 opts.workspace,
             )
             .await
+            .map(|outcome| (outcome, env))
     }
     .await;
-    let outcome = match prepared {
-        Ok(outcome) => outcome,
+    let (outcome, env) = match prepared {
+        Ok(prepared) => prepared,
         Err(err) => {
             step.fail("failed");
             if crate::exit::is_transient_reqwest(&err) {
@@ -5766,7 +5811,7 @@ async fn prepare_deploy_with_commit_sha(
         outcome,
         plugin_name,
         label,
-        env: env.to_string(),
+        env,
         requested_repo: opts.repo,
         deploy_targets_yaml,
         connect_hint: opts.connect_hint,
@@ -6407,14 +6452,15 @@ pub async fn resume(opts: AgentActionOpts) -> Result<ResumeOutput> {
 }
 
 /// Output of `<tier> budget <agent>`: the dry-run plan, or the saved budget.
-/// `max_usd_per_day` is `None` when the platform default applies. Owns its data
-/// so it outlives the `ApiClient`.
+/// Each limit is `None` when the platform default applies. Owns its data so it
+/// outlives the `ApiClient`.
 #[derive(Debug)]
 pub enum BudgetOutput {
     DryRun(crate::ui::DryRunPlan),
     Done {
         agent: String,
         max_usd_per_day: Option<f64>,
+        max_output_tokens_per_run: Option<u64>,
     },
 }
 
@@ -6425,7 +6471,12 @@ impl crate::ui::CliOutput for BudgetOutput {
             BudgetOutput::Done {
                 agent,
                 max_usd_per_day,
-            } => serde_json::json!({"agent": agent, "max_usd_per_day": max_usd_per_day}),
+                max_output_tokens_per_run,
+            } => serde_json::json!({
+                "agent": agent,
+                "max_usd_per_day": max_usd_per_day,
+                "max_output_tokens_per_run": max_output_tokens_per_run,
+            }),
         }
     }
 
@@ -6435,42 +6486,87 @@ impl crate::ui::CliOutput for BudgetOutput {
             BudgetOutput::Done {
                 agent,
                 max_usd_per_day,
+                max_output_tokens_per_run,
             } => {
                 let usd = max_usd_per_day
                     .map(|v| format!("${v}/day"))
                     .unwrap_or_else(|| "platform default".to_string());
-                ui.payload(&format!("budget for {agent} set: max $/day {usd}"));
+                let tokens = max_output_tokens_per_run
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "platform default".to_string());
+                ui.payload(&format!(
+                    "budget for {agent} set: max output tokens/run {tokens}, max $/day {usd}"
+                ));
             }
         }
     }
 }
 
-/// `curie cluster budget <agent> --limit <n>`: set the agent budget
-/// (`PUT /agents/{id}/budget`). `--limit` sets the daily spend cap
-/// (`max_usd_per_day`, the primary `BudgetConfig` field the console surfaces as
-/// "Max $/day"); the per-run token cap is left at the platform default.
+/// Update the agent budget through `GET /agents/{id}/budget` followed by
+/// `PUT /agents/{id}/budget`. `--limit` sets `max_usd_per_day` and
+/// `--output-tokens` sets `max_output_tokens_per_run`. At least one is required;
+/// the current value of each unspecified field is preserved.
 /// `--dry-run` returns the plan and makes no request.
-pub async fn budget(opts: AgentActionOpts, limit: f64) -> Result<BudgetOutput> {
+pub async fn budget(
+    opts: AgentActionOpts,
+    limit: Option<f64>,
+    output_tokens: Option<u64>,
+) -> Result<BudgetOutput> {
     let ui = crate::ui::ui();
+    // Validated before the dry-run early return (#3710): a dry run shows what
+    // the real command would do, so it must refuse a --limit the real command
+    // would refuse instead of printing a plan for it.
+    if limit.is_none() && output_tokens.is_none() {
+        return Err(crate::exit::usage(
+            "at least one of --limit or --output-tokens is required",
+        ));
+    }
+    if let Some(limit) = limit {
+        if !limit.is_finite() || limit <= 0.0 {
+            return Err(crate::exit::usage(format!(
+                "--limit must be a finite value greater than 0 (got {limit})"
+            )));
+        }
+    }
+    if output_tokens == Some(0) {
+        return Err(crate::exit::usage(
+            "--output-tokens must be greater than 0 (got 0)",
+        ));
+    }
     if opts.dry_run {
+        let mut selected = serde_json::Map::new();
+        if let Some(limit) = limit {
+            selected.insert("max_usd_per_day".to_string(), serde_json::json!(limit));
+        }
+        if let Some(output_tokens) = output_tokens {
+            selected.insert(
+                "max_output_tokens_per_run".to_string(),
+                serde_json::json!(output_tokens),
+            );
+        }
         return Ok(BudgetOutput::DryRun(crate::ui::DryRunPlan {
-            lines: vec![format!(
-                "PUT {}/agents/<id>/budget  {{\"max_usd_per_day\":{limit}}}  (would resolve agent {:?} first)",
-                opts.api_url, opts.agent
-            )],
+            lines: vec![
+                format!(
+                    "GET {}/agents/<id>/budget  (would resolve agent {:?} first; read current fields to preserve unspecified limits)",
+                    opts.api_url, opts.agent
+                ),
+                format!(
+                    "PUT {}/agents/<id>/budget  {}  (update selected fields and preserve all unspecified current values, including platform defaults)",
+                    opts.api_url,
+                    serde_json::Value::Object(selected)
+                ),
+            ],
         }));
     }
-    if !limit.is_finite() || limit <= 0.0 {
-        return Err(crate::exit::usage(format!(
-            "--limit must be a finite value greater than 0 (got {limit})"
-        )));
-    }
-    let cfg = BudgetConfig {
-        max_output_tokens_per_run: None,
-        max_usd_per_day: Some(limit),
-    };
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
+    let mut cfg = client.get_budget(&agent.id).await?;
+    if let Some(limit) = limit {
+        cfg.max_usd_per_day = Some(limit);
+    }
+    if let Some(output_tokens) = output_tokens {
+        cfg.max_output_tokens_per_run = Some(output_tokens);
+    }
     let cl = ui.checklist();
     let step = cl.step(&format!("setting budget for {}", agent.name));
     let saved = match client.set_budget(&agent.id, &cfg).await {
@@ -6486,6 +6582,7 @@ pub async fn budget(opts: AgentActionOpts, limit: f64) -> Result<BudgetOutput> {
     Ok(BudgetOutput::Done {
         agent: agent.name,
         max_usd_per_day: saved.max_usd_per_day,
+        max_output_tokens_per_run: saved.max_output_tokens_per_run,
     })
 }
 
@@ -6504,6 +6601,11 @@ pub enum ResetThreadOutput {
         /// release the sandbox within the wait window (#735). False means the
         /// release is still pending -- queued, but not yet confirmed drained.
         released: bool,
+        /// The API reported that the drained reset found a route and released
+        /// it (#3699). `None` when it reported nothing (an older API, or the
+        /// outcome expired, or the release is still pending). A reset that
+        /// matched no route is an error, never a `Done`.
+        route_existed: Option<bool>,
     },
 }
 
@@ -6516,8 +6618,15 @@ impl crate::ui::CliOutput for ResetThreadOutput {
                 thread_key,
                 requested,
                 released,
+                route_existed,
             } => {
-                serde_json::json!({"agent": agent, "thread_key": thread_key, "requested": requested, "released": released})
+                let mut out = serde_json::json!({"agent": agent, "thread_key": thread_key, "requested": requested, "released": released});
+                // Present only when the API reported the outcome, so an older API
+                // leaves the payload exactly as it was.
+                if let Some(route_existed) = route_existed {
+                    out["route_existed"] = serde_json::json!(route_existed);
+                }
+                out
             }
         }
     }
@@ -6602,9 +6711,13 @@ pub async fn reset_thread(
     // unconfirmed, still pending".
     let wait = cl.step("waiting for the sandbox to be released");
     let deadline = Instant::now() + RESET_RELEASE_TIMEOUT;
+    let mut route_existed = None;
     let released = loop {
         match client.thread_reset_state(&agent.id, &thread_key).await {
-            Ok(state) if !state.requested => break true,
+            Ok(state) if !state.requested => {
+                route_existed = state.route_existed;
+                break true;
+            }
             Ok(_) => {}
             Err(_) => break false,
         }
@@ -6613,6 +6726,19 @@ pub async fn reset_thread(
         }
         tokio::time::sleep(RESET_RELEASE_POLL_INTERVAL).await;
     };
+    // The worker drained the reset but the key matched no route, so nothing was
+    // released and the sandbox the operator meant to free is still claimed
+    // (#3699). Say so rather than print "released".
+    if released && route_existed == Some(false) {
+        wait.fail("no route matched");
+        return Err(crate::exit::CliError::usage(
+            "no route matched this thread key; nothing was released",
+        )
+        .with_fix(
+            "check the thread key; a named bot's key carries its identity as its own segment (kind:identity:channel:conversation)",
+        )
+        .into());
+    }
     if released {
         wait.done("released");
     } else {
@@ -6624,6 +6750,7 @@ pub async fn reset_thread(
         thread_key,
         requested: true,
         released,
+        route_existed,
     })
 }
 
@@ -7151,6 +7278,11 @@ static SLACK_USERGROUP_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^S[A-Z0-9]{7,}$").expect("usergroup id re"));
 static SLACK_USER_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^[UW][A-Z0-9]{7,}$").expect("user id re"));
+/// One bare email address, mirroring the API's `_EMAIL_CALLER`: no display name,
+/// list, or wildcard (ADR-0177 amendment approver emails, ADR 0175 callers).
+static BARE_EMAIL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"^[^@\s<>,;"()*]+@[^@\s<>,;"()*]+$"#).expect("bare email re")
+});
 static CHANNEL_KIND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$").expect("channel kind re")
 });
@@ -7219,6 +7351,7 @@ fn parse_route_approvers(value: &str) -> Result<crate::api::ApprovalApprovers> {
             Ok(crate::api::ApprovalApprovers {
                 group: None,
                 users: Some(users),
+                emails: None,
             })
         }
         "group" => {
@@ -7240,6 +7373,7 @@ fn parse_route_approvers(value: &str) -> Result<crate::api::ApprovalApprovers> {
             Ok(crate::api::ApprovalApprovers {
                 group: Some(group),
                 users: None,
+                emails: None,
             })
         }
         other => Err(crate::exit::usage(format!(
@@ -7365,6 +7499,25 @@ fn build_route_bindings(
         }
         if let Some(approvers) = &binding.approvers {
             validate_parsed_approvers(name, approvers)?;
+            // ADR-0177 amendment, mirroring the API: only a requesting_surface route shows
+            // its card in an email thread. On a fixed Slack target an address
+            // can never be verified, so the list could only admit nobody.
+            if approvers.emails.is_some()
+                && matches!(
+                    binding.resolution,
+                    crate::api::ApprovalResolutionWrite::Fixed(_)
+                )
+            {
+                return Err(crate::exit::CliError::usage(format!(
+                    "route {name:?}: approvers emails need a requesting_surface resolution"
+                ))
+                .with_fix(
+                    "write the route's resolution as {\"mode\": \"requesting_surface\"} in \
+                     --routes-from, or list Slack users instead: a fixed target shows its \
+                     card in Slack, where an email address cannot be verified",
+                )
+                .into());
+            }
         }
     }
 
@@ -7520,11 +7673,27 @@ fn validate_route_channel(route: &str, channel: &str) -> Result<()> {
 /// Re-run the flag-path approver checks over a `--routes-from` block, so the two
 /// input forms cannot disagree about what a valid binding is.
 fn validate_parsed_approvers(route: &str, approvers: &crate::api::ApprovalApprovers) -> Result<()> {
-    if approvers.group.is_none() && approvers.users.is_none() {
+    if approvers.group.is_none() && approvers.users.is_none() && approvers.emails.is_none() {
         return Err(crate::exit::usage(format!(
-            "route {route:?}: an approvers block must declare group or users; omit the \
-             block entirely to keep card-channel membership"
+            "route {route:?}: an approvers block must declare group, users or emails; omit \
+             the block entirely to keep card-channel membership"
         )));
+    }
+    if let Some(emails) = &approvers.emails {
+        if emails.is_empty() {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: approvers emails, when present, must contain at least \
+                 one address"
+            )));
+        }
+        for email in emails {
+            if !BARE_EMAIL.is_match(email) {
+                return Err(crate::exit::usage(format!(
+                    "route {route:?}: approvers email {email:?} is not one bare email address \
+                     (e.g. approver@example.com, with no display name or wildcard)"
+                )));
+            }
+        }
     }
     if let Some(group) = &approvers.group {
         if !SLACK_USERGROUP_ID.is_match(group) {
@@ -7741,7 +7910,9 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                 } else {
                     ui.payload(&format!("{agent} — {} pending approval(s):", records.len()));
                     for r in records {
-                        let tool = r.granted_tool.as_deref().unwrap_or("-");
+                        let tool =
+                            crate::render::action_label(r.granted_tool.as_deref().unwrap_or(""));
+                        let display = crate::approval_wording::approval_display(r);
                         let route = r.route.as_deref().unwrap_or("(requesting channel)");
                         // A null card_channel means an older row or a direct API
                         // write that omitted the field, for which the requesting
@@ -7772,8 +7943,8 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                         ui.kv(
                             &r.id,
                             &format!(
-                                "{}: {} [tool: {tool}, route: {route}, channel: {card}, current route approvers: {approvers}, by: {}]",
-                                r.summary, r.conversation_id, r.author
+                                "{}: {} [action: {tool}, route: {route}, channel: {card}, current route approvers: {approvers}, by: {}]",
+                                display, r.conversation_id, r.author
                             ),
                         );
                     }
@@ -7917,27 +8088,39 @@ fn describe_approvers(binding: &crate::api::ApprovalRouteBindingResponse) -> Str
                 target.kind, target.address
             ),
             crate::api::ApprovalResolutionResponse::RequestingSurface(_) => {
-                "the asking channel's members in Slack, or only the person who asked on any \
-                 other channel (the default: no approvers block declared)"
+                "the asking channel's members in Slack, and nobody on any other channel \
+                 (the default: no approvers block declared)"
                     .to_string()
             }
         },
-        Some(a) => match (&a.users, &a.group) {
-            // Mirror the API's precedence in the wording rather than hiding it:
-            // `users` wins over `group`, so a binding carrying both must not read
-            // as though the group also decides.
-            (Some(users), Some(group)) => format!(
-                "users {} (an explicit list wins over group {group}; the click channel is ignored)",
-                users.join(", ")
-            ),
-            (Some(users), None) => {
-                format!("users {} (the click channel is ignored)", users.join(", "))
+        Some(a) => {
+            let slack = describe_slack_approvers(a);
+            match &a.emails {
+                Some(emails) => format!("{slack}; on email, {}", emails.join(", ")),
+                None => slack,
             }
-            (None, Some(group)) => {
-                format!("members of Slack user group {group} (the click channel is ignored)")
-            }
-            (None, None) => "unreadable: the block declares neither users nor group".to_string(),
-        },
+        }
+    }
+}
+
+/// The Slack half of an approvers block: who may answer a card shown in Slack.
+fn describe_slack_approvers(a: &crate::api::ApprovalApprovers) -> String {
+    match (&a.users, &a.group) {
+        // Mirror the API's precedence in the wording rather than hiding it:
+        // `users` wins over `group`, so a binding carrying both must not read
+        // as though the group also decides.
+        (Some(users), Some(group)) => format!(
+            "users {} (an explicit list wins over group {group}; the click channel is ignored)",
+            users.join(", ")
+        ),
+        (Some(users), None) => {
+            format!("users {} (the click channel is ignored)", users.join(", "))
+        }
+        (None, Some(group)) => {
+            format!("members of Slack user group {group} (the click channel is ignored)")
+        }
+        (None, None) if a.emails.is_some() => "nobody in Slack".to_string(),
+        (None, None) => "unreadable: the block declares neither users nor group".to_string(),
     }
 }
 
@@ -9559,7 +9742,11 @@ pub fn hook_prompt(plugin_dir: &Path, name: &str) -> Result<String> {
 }
 
 /// `skill hook fire`: run the named hook against the local runner. No run row.
-pub async fn skill_hook_fire(plugin_dir: &Path, name: &str, url: Option<String>) -> Result<bool> {
+pub async fn skill_hook_fire(
+    plugin_dir: &Path,
+    name: &str,
+    url: Option<String>,
+) -> Result<SkillMessageOutput> {
     let prompt = hook_prompt(plugin_dir, name)?;
     send(&prompt, "hook", SendType::Job.into(), url, false).await
 }
@@ -9603,7 +9790,9 @@ impl crate::ui::CliOutput for HookFireOutput {
 }
 
 fn hook_fire_path(agent: &str, name: &str) -> String {
-    format!("/agents/{agent}/hooks/{name}/fire")
+    // Delegate to the same builder `fire_hook` encodes its request with, so the
+    // dry-run plan cannot drift from the path the real request uses (#3731).
+    crate::api::hook_fire_path(agent, name)
 }
 
 /// `<tier> hook fire`: run the hook now and print the record once it settles.
@@ -14075,7 +14264,7 @@ impl crate::ui::CliOutput for ConnectorBuildOutput {
 /// The flags `curie build --plugin-dir` carries.
 pub struct ConnectorBuildOpts {
     pub plugin_dir: PathBuf,
-    /// `Some(ref)` pushes a multi-platform index there; `None` builds the host
+    /// `Some(ref)` pushes every declared (or `platforms`) platform there; `None` builds the host
     /// platform into the local Docker daemon.
     pub registry: Option<String>,
     /// The platform runner a declared runner layer builds on; `None` is the
@@ -14083,6 +14272,9 @@ pub struct ConnectorBuildOpts {
     pub runner_image: Option<String>,
     /// Replace a registry lock with a local-daemon one deliberately.
     pub force: bool,
+    /// `--platform` values narrowing each declared set; empty builds every
+    /// declared platform.
+    pub platforms: Vec<String>,
 }
 
 /// `curie build --plugin-dir <dir>`: build every connector the bundle declares
@@ -14114,7 +14306,23 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
     if let Some(runner) = &decl.runner {
         cb::check_runner_source(&plugin_dir, runner)?;
     }
-    if !on_path("docker") {
+    // Narrow every declared set before anything is built, so an undeclared
+    // `--platform` fails before minutes of builds.
+    let mut narrowed = std::collections::BTreeMap::new();
+    for (connector, spec) in &buildable {
+        if let Some(build) = &spec.build {
+            let set = cb::narrow_platforms(&build.platforms, &opts.platforms)
+                .with_context(|| format!("connectors.{connector}"))?;
+            narrowed.insert((*connector).clone(), set);
+        }
+    }
+    let runner_platforms = match &decl.runner {
+        Some(runner) => {
+            cb::narrow_platforms(&runner.build.platforms, &opts.platforms).context("runner")?
+        }
+        None => Vec::new(),
+    };
+    if !crate::ops::on_path("docker") {
         bail!(
             "Docker is not installed or not on PATH. Install Docker \
              (https://docs.docker.com/get-docker/) and retry."
@@ -14164,6 +14372,10 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
             opts.registry.as_deref(),
             &host,
             &metadata_dir,
+            narrowed
+                .get(connector)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
         ) {
             Ok(plan) => plan,
             Err(err) => {
@@ -14205,6 +14417,7 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
             base_arg,
             &host,
             &metadata_dir,
+            &runner_platforms,
         ) {
             Ok(plan) => run_one_connector_build(&plan, ui)
                 .await
@@ -14349,6 +14562,20 @@ pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
 }
 
 /// Run one connector's build and read back the immutable reference it produced.
+/// The fix for Docker's default driver refusing a multi-platform push: build
+/// the one platform the cluster runs, or switch to a docker-container builder.
+pub fn multi_platform_driver_fix(stderr: &str, host_platform: &str) -> Option<String> {
+    if !stderr.contains("Multi-platform build is not supported for the docker driver") {
+        return None;
+    }
+    Some(format!(
+        "the default Docker driver cannot push a multi-platform image. Rerun with \
+         `--platform {host_platform}` (or the architecture your cluster nodes run) to push \
+         one platform, or create a docker-container builder \
+         (`docker buildx create --driver docker-container --use`) to push them all"
+    ))
+}
+
 async fn run_one_connector_build(
     plan: &crate::connector_build::ConnectorBuildPlan,
     ui: &crate::ui::Ui,
@@ -14357,14 +14584,42 @@ async fn run_one_connector_build(
 
     let command = cb::build_argv(plan);
     ui.note(&format!("=== {} ===", command.display()));
-    // Inherit stdio so the build log streams like a hand-run build.
-    let status = tokio::process::Command::new(&command.program)
-        .args(command.argv())
-        .status()
-        .await
-        .context("failed to invoke docker")?;
+    // Inherit stdout so the build log streams like a hand-run build. A registry
+    // build tees stderr so a driver refusal can be answered with a fix.
+    let (status, stderr) = if plan.delivery == cb::Delivery::Registry {
+        use tokio::io::AsyncBufReadExt;
+        let mut child = tokio::process::Command::new(&command.program)
+            .args(command.argv())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to invoke docker")?;
+        let mut captured = String::new();
+        if let Some(pipe) = child.stderr.take() {
+            let mut lines = tokio::io::BufReader::new(pipe).lines();
+            while let Some(line) = lines.next_line().await.unwrap_or(None) {
+                eprintln!("{line}");
+                captured.push_str(&line);
+                captured.push('\n');
+            }
+        }
+        let status = child.wait().await.context("failed to wait for docker")?;
+        (status, captured)
+    } else {
+        let status = tokio::process::Command::new(&command.program)
+            .args(command.argv())
+            .status()
+            .await
+            .context("failed to invoke docker")?;
+        (status, String::new())
+    };
     if !status.success() {
-        bail!("building connector '{}' failed ({status})", plan.connector);
+        let message = format!("building connector '{}' failed ({status})", plan.connector);
+        if let Some(fix) = multi_platform_driver_fix(&stderr, &plan.host_platform) {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::failure(format!("{message}: {fix}")).with_fix(fix),
+            ));
+        }
+        bail!("{message}");
     }
     match plan.delivery {
         cb::Delivery::Registry => {
@@ -14512,6 +14767,22 @@ pub fn registry_manifest_argv(image: &str) -> crate::ops::OpsCommand {
     )
 }
 
+/// Ask docker for a single-image manifest's config blob, so a registry login
+/// is honored when the native blob fetch is refused.
+pub fn registry_config_argv(image: &str) -> crate::ops::OpsCommand {
+    crate::connector_build::plain_command(
+        "docker",
+        vec![
+            "buildx".into(),
+            "imagetools".into(),
+            "inspect".into(),
+            image.to_string(),
+            "--format".into(),
+            "{{json .Image}}".into(),
+        ],
+    )
+}
+
 /// The architectures the cluster's own nodes report.
 pub fn node_architectures_argv() -> crate::ops::OpsCommand {
     crate::connector_build::plain_command(
@@ -14554,6 +14825,28 @@ pub fn manifest_platforms(raw: &str) -> Result<std::collections::BTreeSet<String
         .collect())
 }
 
+/// The `config.digest` of a plain image manifest (one with no `manifests`
+/// array); `None` for an index or anything unparseable.
+pub fn single_manifest_config_digest(raw: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if parsed.get("manifests").is_some() {
+        return None;
+    }
+    parsed
+        .get("config")?
+        .get("digest")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The `os/architecture` an image config JSON names.
+pub fn config_platform(raw: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let os = parsed.get("os")?.as_str()?;
+    let arch = parsed.get("architecture")?.as_str()?;
+    Some(format!("{os}/{arch}"))
+}
+
 /// Refuse a cluster deploy whose locked image is gone from the registry, or
 /// whose resolved index cannot run on every node.
 ///
@@ -14565,6 +14858,7 @@ pub fn registry_preflight(
     inspect: std::result::Result<&str, String>,
     node_architectures: &std::collections::BTreeSet<String>,
     declared_platforms: &[String],
+    single_platform: Option<&str>,
 ) -> Result<()> {
     let raw = match inspect {
         Ok(raw) => raw,
@@ -14593,6 +14887,13 @@ pub fn registry_preflight(
             ),
         )
     })?;
+    // A plain single-image manifest covers the one platform its config names.
+    let covered = match single_platform {
+        Some(platform) if covered.is_empty() && single_manifest_config_digest(raw).is_some() => {
+            std::collections::BTreeSet::from([platform.to_string()])
+        }
+        _ => covered,
+    };
     let missing: Vec<String> = node_architectures
         .iter()
         .filter(|arch| !covered.contains(&format!("linux/{arch}")))
@@ -14662,10 +14963,61 @@ async fn run_registry_preflight(
     }
     let node_archs = node_architectures(&out);
 
+    // The registry is read natively first, so a host without docker can still
+    // deploy (#3503); docker, when present, is the fallback that honors a
+    // registry login.
+    let docker = crate::ops::on_path("docker");
     for entry in targets {
-        let (ok, raw, err) = crate::ops::run_capture(&registry_manifest_argv(&entry.image)).await?;
-        let inspect = if ok { Ok(raw.as_str()) } else { Err(err) };
-        registry_preflight(&entry.image, inspect, &node_archs, &entry.platforms)?;
+        let inspect = match crate::oci_registry::fetch_manifest(&entry.image).await {
+            Ok(manifest) => Ok(String::from_utf8_lossy(&manifest.raw).into_owned()),
+            Err(native) if docker => {
+                let (ok, raw, err) =
+                    crate::ops::run_capture(&registry_manifest_argv(&entry.image)).await?;
+                if ok {
+                    Ok(raw)
+                } else {
+                    Err(format!("{native:#}; docker also failed: {}", err.trim()))
+                }
+            }
+            Err(native) => Err(format!(
+                "{native:#}, and `docker` is not on PATH to ask with a registry login"
+            )),
+        };
+        // A plain manifest names its platform only in its config blob; read
+        // it natively, and on failure leave the refusal standing.
+        let single_platform = match inspect
+            .as_deref()
+            .ok()
+            .and_then(single_manifest_config_digest)
+        {
+            Some(digest) => {
+                let native = crate::oci_registry::fetch_blob(&entry.image, &digest)
+                    .await
+                    .ok()
+                    .and_then(|blob| config_platform(&String::from_utf8_lossy(&blob)));
+                match native {
+                    Some(platform) => Some(platform),
+                    None if docker => {
+                        let (ok, raw, _) =
+                            crate::ops::run_capture(&registry_config_argv(&entry.image)).await?;
+                        if ok {
+                            config_platform(&raw)
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
+        registry_preflight(
+            &entry.image,
+            inspect.as_deref().map_err(Clone::clone),
+            &node_archs,
+            &entry.platforms,
+            single_platform.as_deref(),
+        )?;
     }
     Ok(())
 }
@@ -14927,7 +15279,15 @@ pub async fn bring_up_local(
         }
     }
 
-    let overlay = cb::compose_overlay(lock, decl, identity, project, plugin_dir)?;
+    let caller_key = crate::connector_caller::generate_keypair()?;
+    let overlay = cb::compose_overlay(
+        lock,
+        decl,
+        identity,
+        project,
+        plugin_dir,
+        Some(&caller_key.verify_key),
+    )?;
     let path = cb::compose_overlay_path(plugin_dir);
     std::fs::create_dir_all(path.parent().expect("the overlay path has a parent"))?;
     std::fs::write(
@@ -15110,6 +15470,7 @@ async fn start_skill_connectors(
                 cb::stage_secret_file(plugin_dir, connector, declared_path, &value)?;
             }
         }
+        let caller_key = crate::connector_caller::generate_keypair()?;
         let start = docker::ConnectorStartSpec::from_declaration(
             connector,
             spec,
@@ -15119,6 +15480,7 @@ async fn start_skill_connectors(
             project,
             plugin_dir,
             &secret_values,
+            Some(&caller_key.verify_key),
         )?;
         docker::docker_with_env(&start.run_args(), &start.docker_env)
             .await
@@ -15128,4 +15490,97 @@ async fn start_skill_connectors(
     }
     docker::wait_for_connectors_ready(&readiness_targets, readiness_timeout).await?;
     Ok(started)
+}
+
+#[cfg(test)]
+mod single_platform_preflight_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    const DOCKER_V2_MANIFEST: &str = r#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{"mediaType":"application/vnd.docker.container.image.v1+json","size":601,"digest":"sha256:0d64a902c265bc2c08f0b5978ac2641b0ed5bf60dead4de516ace9263308097e"},"layers":[]}"#;
+
+    const OCI_INDEX: &str = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","size":500,"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","platform":{"os":"linux","architecture":"amd64"}}]}"#;
+
+    const IMAGE: &str = "localhost:5001/factory/tempo@sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+    // B3
+    #[test]
+    fn a_plain_manifest_names_its_config_digest() {
+        assert_eq!(
+            single_manifest_config_digest(DOCKER_V2_MANIFEST).as_deref(),
+            Some("sha256:0d64a902c265bc2c08f0b5978ac2641b0ed5bf60dead4de516ace9263308097e")
+        );
+    }
+
+    #[test]
+    fn an_index_has_no_single_config_digest() {
+        assert_eq!(single_manifest_config_digest(OCI_INDEX), None);
+    }
+
+    // B4
+    #[test]
+    fn registry_config_argv_asks_docker_for_the_image_config() {
+        let cmd = registry_config_argv("localhost:35719/probe:1");
+        let rendered = format!("{cmd:?}");
+        for part in [
+            "docker",
+            "buildx",
+            "imagetools",
+            "inspect",
+            "localhost:35719/probe:1",
+            "--format",
+            "{{json .Image}}",
+        ] {
+            assert!(rendered.contains(part), "{part} missing from {rendered}");
+        }
+        assert_eq!(
+            config_platform(
+                "{\n  \"architecture\": \"amd64\",\n  \"os\": \"linux\",\n  \"config\": {}\n}"
+            )
+            .as_deref(),
+            Some("linux/amd64")
+        );
+    }
+
+    #[test]
+    fn config_platform_reads_os_and_architecture() {
+        assert_eq!(
+            config_platform(r#"{"os":"linux","architecture":"amd64","config":{}}"#).as_deref(),
+            Some("linux/amd64")
+        );
+    }
+
+    // B5
+    #[test]
+    fn a_single_platform_push_deploys_to_matching_nodes() {
+        registry_preflight(
+            IMAGE,
+            Ok(DOCKER_V2_MANIFEST),
+            &BTreeSet::from(["amd64".to_string()]),
+            &["linux/amd64".to_string(), "linux/arm64".to_string()],
+            Some("linux/amd64"),
+        )
+        .expect("a single-platform amd64 push covers amd64 nodes");
+    }
+
+    #[test]
+    fn a_single_platform_push_is_refused_on_other_architecture_nodes() {
+        let error = registry_preflight(
+            IMAGE,
+            Ok(DOCKER_V2_MANIFEST),
+            &BTreeSet::from(["arm64".to_string()]),
+            &["linux/amd64".to_string(), "linux/arm64".to_string()],
+            Some("linux/amd64"),
+        )
+        .expect_err("an amd64-only push cannot run on arm64 nodes");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("arm64"),
+            "the refusal should name arm64: {text}"
+        );
+        assert!(
+            text.contains(IMAGE),
+            "the refusal should name the image: {text}"
+        );
+    }
 }

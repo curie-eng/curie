@@ -119,6 +119,8 @@ def _runner(session: _SharedQueueSession, factory_calls: list[int] | None = None
         return session
 
     return SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
         session_factory=factory,
         ceiling=0,
         tracer=RunTracer(None),

@@ -10,11 +10,14 @@ Override any field via the matching environment variable for shared or
 production deployments.
 """
 
+import json
 from functools import lru_cache
-from urllib.parse import urlsplit
+from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from aci_protocol import (
     DEAD_LETTER_STREAM_ENV,
+    EVAL_STREAM_DEFAULT,
     RUNS_STREAM_DEFAULT,
     STREAM_ENV,
     WORKER_GROUP_DEFAULT,
@@ -22,10 +25,11 @@ from aci_protocol import (
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
 from plugin_format.connector_render import ConnectorProxy
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .workspace_policy import valid_allowlist_entry
+from .e2e_connector import E2EInstall
+from .workspace_policy import valid_allowlist_entry, valid_repository_name
 
 # Dev-only default secrets. The production boot gate refuses to start when any of
 # these is still in place under ENVIRONMENT=prod.
@@ -33,6 +37,18 @@ _DEV_DEFAULT_API_KEY = "curie-dev-key"
 _DEV_DEFAULT_WEBHOOK_SECRET = "dev-webhook-secret"
 _DEV_DEFAULT_INTERNAL_WORKER_TOKEN = "curie-dev-worker-token"
 _DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = "curie-dev-approval-chat-attester"
+
+
+def valid_base_branch(name: Any) -> bool:
+    """A branch name a factory base may use: no whitespace, leading ``-`` or ``..``."""
+
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and not any(char.isspace() for char in name)
+        and not name.startswith("-")
+        and ".." not in name
+    )
 
 
 class Settings(BaseSettings):
@@ -175,9 +191,16 @@ class Settings(BaseSettings):
     # A failed label delivery is never redelivered by GitHub (#3081). The work
     # item reconciler lists labeled open issues this often and admits any with
     # no WorkItem once its label is older than the grace, so a delivery still
-    # in flight lands first. 0 disables the listing.
-    github_factory_reconcile_interval_s: float = 300.0
-    github_factory_reconcile_grace_s: float = 300.0
+    # in flight lands first. 0 disables the listing. Both are bounded the way
+    # GITHUB_FACTORY_CI_WAIT_S is: a negative or non finite value is refused at
+    # boot rather than surfacing as a mid-reconcile timedelta error (#3709).
+    github_factory_reconcile_interval_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
+    github_factory_reconcile_grace_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
+    # Polling is the default intake (#3745). Webhook mode is opt-in and keeps
+    # the missed-label backstop. The interval is a positive finite number of
+    # seconds; 45 sits in the 30 to 60 second band.
+    github_factory_intake: Literal["poll", "webhook"] = "poll"
+    github_factory_poll_interval_s: float = Field(default=45, gt=0, allow_inf_nan=False)
     # Public origin GitHub's image proxy fetches the live status card from
     # (#3077), e.g. https://curie.example.com. Empty omits the card image; the
     # status comment still carries the checklist and the result.
@@ -191,6 +214,24 @@ class Settings(BaseSettings):
         le=10800,
         validation_alias="GITHUB_FACTORY_CI_WAIT_S",
     )
+    # Required Python CI per repository (#3617), a JSON object keyed by
+    # ``owner/name`` (matched case-insensitively): ``{"check": str, "paths":
+    # [str, ...], "pendingCheckPrefix": str | null}``. A repository without an
+    # entry is judged on its own checks with no path refusal. Empty by default.
+    github_factory_python_ci: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        validation_alias="GITHUB_FACTORY_PYTHON_CI",
+    )
+    # Bases a factory ticket may start from and target, per repository
+    # (#3095, ADR 0186), a JSON object keyed by ``owner/name`` (matched
+    # case-insensitively): ``{"bases": [str, ...], "default_base": str | null}``.
+    # A ``base:<branch>`` label picks one; no label picks ``default_base``, or
+    # the repository default branch when that is unset. A repository without
+    # an entry may only use its default branch. Empty by default.
+    github_factory_bases: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        validation_alias="GITHUB_FACTORY_BASES",
+    )
     # Public model price list the factory's per-run cost estimate reads
     # (#3223), OpenRouter-shaped. Fetched at most every 6 h; any failure leaves
     # the estimate unset and the token counts are still stored. Empty disables.
@@ -202,6 +243,16 @@ class Settings(BaseSettings):
     # a private repository cannot deploy at all (#1058). Sent as a scoped
     # http.extraheader, never embedded in the clone URL.
     github_api_url: str = "https://api.github.com"
+
+    @property
+    def github_html_base(self) -> str:
+        """Derive the forge HTML base from its configured API endpoint."""
+
+        parts = urlsplit(self.github_api_url.rstrip("/"))
+        authority = "github.com" if parts.netloc == "api.github.com" else parts.netloc
+        path = parts.path.removesuffix("/api/v3")
+        return urlunsplit((parts.scheme, authority, path, "", ""))
+
     github_token: str = ""
     # GitHub App identity (ADR-0092). When both are set the platform mints a
     # one-hour token scoped to the single repository being cloned, instead of
@@ -280,14 +331,23 @@ class Settings(BaseSettings):
     # The runs stream approval resolutions enqueue resume turns onto (#244).
     # Must match the worker's CURIE_STREAM (its consumer side) -- which is why
     # the default is the shared declaration both lanes import (#492) rather than
-    # a literal mirrored here. Overridable via RUNS_STREAM (the API's historical
-    # name, which still wins if both are set) OR CURIE_STREAM (the worker's
-    # name), so an operator who moves the base stream on the worker side moves it
-    # here too and the two lanes agree on the graveyard derived from it (#668).
+    # a literal mirrored here. RUNS_STREAM remains accepted as the API's
+    # historical name, CURIE_STREAM (the worker's name) also works, and a
+    # RUNS_STREAM that disagrees with CURIE_STREAM is refused at boot rather
+    # than silently winning (#3565). The graveyard derived from it stays in
+    # agreement with the worker's (#668).
     runs_stream: str = Field(
         default=RUNS_STREAM_DEFAULT,
         validation_alias=AliasChoices("RUNS_STREAM", STREAM_ENV),
     )
+    # CURIE_STREAM read on its own so the boot check can see a disagreement
+    # with RUNS_STREAM. Not used for anything else; consumers read runs_stream.
+    curie_stream: str = Field(default="", validation_alias=STREAM_ENV)
+
+    # The eval fan-out stream the API enqueues onto (K1). Must match the worker's
+    # CURIE_EVAL_STREAM (its consumer side); the default is the shared aci_protocol
+    # declaration both lanes import (#626), not a literal mirrored here.
+    eval_stream: str = Field(default=EVAL_STREAM_DEFAULT, validation_alias="CURIE_EVAL_STREAM")
 
     # Dead-letter graveyard watcher (#531). The worker moves a permanently-failing
     # entry to the graveyard (ADR-0039, #505) and acks it; this watcher is the
@@ -353,7 +413,10 @@ class Settings(BaseSettings):
     # guarantee needs a worker-side in-flight lease (follow-up); 900s covers the
     # common single-attempt case with margin.
     resume_reconciler_enabled: bool = True
-    resume_reconciler_interval_seconds: int = 30
+    # A zero or negative interval turns run_forever into a busy spin (a
+    # graveyard scan plus a Postgres query per iteration, back to back), so
+    # boot refuses it (#3725). enabled is the off-switch, not this field.
+    resume_reconciler_interval_seconds: int = Field(default=30, gt=0)
     resume_reconciler_grace_seconds: int = 900
     resume_reconciler_batch_limit: int = 100
 
@@ -590,9 +653,16 @@ class Settings(BaseSettings):
     # upstreams can create, and a per-hook counter would let a source multiply
     # its own allowance by inventing hook names.
     hook_backlog_limit: int = 64
-    hook_backlog_window_s: int = 60
+    # Both windows floor `backlog_reservation`'s time bucket (delivery.py), so 0
+    # divides by zero -- a 500 on every new delivery AFTER the claim was taken,
+    # with the claim unreleased until `channel_delivery_lease_s` lapses -- and
+    # a negative window makes the quota script's EXPIRE delete the counter
+    # immediately, silently disabling the quota. Bounded at construction the
+    # same way as GITHUB_FACTORY_RECONCILE_INTERVAL_S (#3709): refused at boot
+    # rather than surfacing mid-delivery (#3720).
+    hook_backlog_window_s: int = Field(default=60, gt=0)
     channel_binding_backlog_limit: int = 64
-    channel_binding_backlog_window_s: int = 60
+    channel_binding_backlog_window_s: int = Field(default=60, gt=0)
     # Sandbox ResourceQuota hard limits (#3209). The chart sets all four when
     # the quota object renders, and leaves all four unset otherwise. A partial
     # set is a broken install: the agent write refuses rather than skipping the
@@ -653,6 +723,48 @@ class Settings(BaseSettings):
             "CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS", "connector_proxy_image_pull_secrets"
         ),
     )
+    e2e_connector_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("CURIE_E2E_CONNECTOR_ENABLED", "e2e_connector_enabled"),
+    )
+    e2e_connector_image: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_CONNECTOR_IMAGE", "e2e_connector_image"),
+    )
+    e2e_namespace_prefix: str = Field(
+        default="curie-e2e-",
+        validation_alias=AliasChoices("CURIE_E2E_NAMESPACE_PREFIX", "e2e_namespace_prefix"),
+    )
+    e2e_owner_label_key: str = Field(
+        default="curietech.ai/e2e-owner",
+        validation_alias=AliasChoices("CURIE_E2E_OWNER_LABEL_KEY", "e2e_owner_label_key"),
+    )
+    e2e_owner_label_value: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_OWNER_LABEL_VALUE", "e2e_owner_label_value"),
+    )
+    e2e_service_account: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_SERVICE_ACCOUNT", "e2e_service_account"),
+    )
+    e2e_service_account_namespace: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_E2E_SERVICE_ACCOUNT_NAMESPACE", "e2e_service_account_namespace"
+        ),
+    )
+    e2e_worker_cluster_role: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_WORKER_CLUSTER_ROLE", "e2e_worker_cluster_role"),
+    )
+    e2e_ttl_seconds: int = Field(
+        default=3600,
+        validation_alias=AliasChoices("CURIE_E2E_TTL_SECONDS", "e2e_ttl_seconds"),
+    )
+    e2e_pod_security: str = Field(
+        default="baseline",
+        validation_alias=AliasChoices("CURIE_E2E_POD_SECURITY", "e2e_pod_security"),
+    )
 
     def connector_proxy(self) -> ConnectorProxy | None:
         """The proxy each hosted connector renders with, or None for none."""
@@ -670,6 +782,20 @@ class Settings(BaseSettings):
                 for name in self.connector_proxy_image_pull_secrets.split(",")
                 if name.strip()
             ),
+        )
+
+    def e2e_install(self) -> E2EInstall:
+        return E2EInstall(
+            enabled=self.e2e_connector_enabled,
+            image=self.e2e_connector_image.strip(),
+            namespace_prefix=self.e2e_namespace_prefix.strip(),
+            owner_label_key=self.e2e_owner_label_key.strip(),
+            owner_label_value=self.e2e_owner_label_value.strip(),
+            service_account=self.e2e_service_account.strip(),
+            service_account_namespace=self.e2e_service_account_namespace.strip(),
+            worker_cluster_role=self.e2e_worker_cluster_role.strip(),
+            ttl_seconds=self.e2e_ttl_seconds,
+            pod_security=self.e2e_pod_security.strip() or "baseline",
         )
 
     def valkey_dsn(self) -> str:
@@ -692,6 +818,83 @@ class Settings(BaseSettings):
             return legacy_key
         return f"{legacy_key}:{self.installation_id}"
 
+    @field_validator("github_factory_python_ci", mode="before")
+    @classmethod
+    def _validate_factory_python_ci(cls, value: Any) -> dict[str, dict[str, Any]]:
+        if isinstance(value, str):
+            value = json.loads(value) if value.strip() else {}
+        if not isinstance(value, dict):
+            raise ValueError("GITHUB_FACTORY_PYTHON_CI must be a JSON object")
+        policies: dict[str, dict[str, Any]] = {}
+        for repo, policy in value.items():
+            if not isinstance(repo, str) or not valid_repository_name(repo):
+                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI key {repo!r} is not owner/name")
+            if not isinstance(policy, dict) or set(policy) - {
+                "check",
+                "paths",
+                "pendingCheckPrefix",
+            }:
+                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI[{repo!r}] has an invalid shape")
+            check = policy.get("check")
+            paths = policy.get("paths")
+            prefix = policy.get("pendingCheckPrefix")
+            if not isinstance(check, str) or not check.strip():
+                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].check must be non-empty")
+            if (
+                not isinstance(paths, list)
+                or not paths
+                or not all(
+                    isinstance(path, str)
+                    and path.strip()
+                    and not path.startswith("/")
+                    and not path.endswith("/")
+                    for path in paths
+                )
+            ):
+                raise ValueError(
+                    f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].paths must be non-empty relative"
+                    " prefixes without a leading or trailing slash"
+                )
+            if prefix is not None and (not isinstance(prefix, str) or not prefix):
+                raise ValueError(
+                    f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].pendingCheckPrefix must be a"
+                    " non-empty string or null"
+                )
+            policies[repo] = {"check": check, "paths": list(paths), "pendingCheckPrefix": prefix}
+        return policies
+
+    @field_validator("github_factory_bases", mode="before")
+    @classmethod
+    def _validate_factory_bases(cls, value: Any) -> dict[str, dict[str, Any]]:
+        if isinstance(value, str):
+            value = json.loads(value) if value.strip() else {}
+        if not isinstance(value, dict):
+            raise ValueError("GITHUB_FACTORY_BASES must be a JSON object")
+        entries: dict[str, dict[str, Any]] = {}
+        for repo, entry in value.items():
+            if not isinstance(repo, str) or not valid_repository_name(repo):
+                raise ValueError(f"GITHUB_FACTORY_BASES key {repo!r} is not owner/name")
+            if not isinstance(entry, dict) or set(entry) - {"bases", "default_base"}:
+                raise ValueError(f"GITHUB_FACTORY_BASES[{repo!r}] has an invalid shape")
+            bases = entry.get("bases")
+            if (
+                not isinstance(bases, list)
+                or not bases
+                or not all(valid_base_branch(base) for base in bases)
+                or len(set(bases)) != len(bases)
+            ):
+                raise ValueError(
+                    f"GITHUB_FACTORY_BASES[{repo!r}].bases must be a non-empty list of"
+                    " unique branch names"
+                )
+            default_base = entry.get("default_base")
+            if default_base is not None and default_base not in bases:
+                raise ValueError(
+                    f"GITHUB_FACTORY_BASES[{repo!r}].default_base must be one of its bases"
+                )
+            entries[repo] = {"bases": list(bases), "default_base": default_base}
+        return entries
+
     @model_validator(mode="after")
     def _validate_connector_proxy(self) -> "Settings":
         # At boot, not at the first render: a key the proxy cannot use would
@@ -708,6 +911,18 @@ class Settings(BaseSettings):
             self.connector_proxy()
         except ValueError as exc:
             raise ValueError(f"the connector caller proxy is misconfigured: {exc}") from None
+        return self
+
+    @model_validator(mode="after")
+    def _validate_runs_stream_agrees_with_curie_stream(self) -> "Settings":
+        # The worker and dispatcher read only CURIE_STREAM (#3565).
+        if self.curie_stream and self.curie_stream != self.runs_stream:
+            raise ValueError(
+                f"RUNS_STREAM ({self.runs_stream!r}) and CURIE_STREAM "
+                f"({self.curie_stream!r}) disagree: the worker and dispatcher read "
+                "only CURIE_STREAM, so the API would enqueue resumes onto a stream "
+                "no worker consumes; set one, or set both to the same value"
+            )
         return self
 
     @model_validator(mode="after")
@@ -755,9 +970,11 @@ class Settings(BaseSettings):
             offenders.append("GITHUB_APP_ID")
         if not self.github_app_private_key.strip():
             offenders.append("GITHUB_APP_PRIVATE_KEY")
-        if (
-            not self.github_webhook_secret.strip()
-            or self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET
+        # Polling may disable signed deliveries with a blank secret, but a
+        # published signing key must never authenticate factory deliveries.
+        if self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET or (
+            self.github_factory_intake == "webhook"
+            and not self.github_webhook_secret.strip()
         ):
             offenders.append("GITHUB_WEBHOOK_SECRET")
         label = self.github_factory_label
@@ -810,9 +1027,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _refuse_dev_defaults_in_prod(self) -> "Settings":
-        """Production boot gate (#57): with ENVIRONMENT=prod, refuse to start if a
-        shared secret is unset or still the shipped dev default, so a prod deploy
-        can never silently run on well-known credentials."""
+        """Refuse blank API keys in every environment.
+
+        Production also refuses unset shared secrets and shipped dev defaults (#57).
+        """
+        if not self.api_key.strip():
+            raise ValueError("API_KEY must be nonblank")
         attester_secret = self.approval_chat_attester_secret
         if attester_secret and not attester_secret.strip():
             raise ValueError("CURIE_APPROVAL_CHAT_ATTESTER_SECRET must be non-blank")
@@ -823,7 +1043,14 @@ class Settings(BaseSettings):
         offenders = []
         if self.api_key in ("", _DEV_DEFAULT_API_KEY):
             offenders.append("API_KEY")
-        if self.github_webhook_secret in ("", _DEV_DEFAULT_WEBHOOK_SECRET):
+        empty_poll_secret = (
+            self.github_webhook_secret == ""
+            and self.github_factory_ingress_enabled
+            and self.github_factory_intake == "poll"
+        )
+        if self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET or (
+            self.github_webhook_secret == "" and not empty_poll_secret
+        ):
             offenders.append("GITHUB_WEBHOOK_SECRET")
         if self.internal_worker_token in ("", _DEV_DEFAULT_INTERNAL_WORKER_TOKEN):
             offenders.append("CURIE_INTERNAL_WORKER_TOKEN")

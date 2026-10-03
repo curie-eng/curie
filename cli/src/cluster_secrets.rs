@@ -94,6 +94,21 @@ where
 }
 
 /// Dotted helm keys for `agentSandbox.connectorSecrets.<agent>.<NAME>`.
+/// Connector secret names that must never be bound into a sandbox.
+///
+/// `E2E_CLUSTER_KUBECONFIG` is the test cluster credential (ADR 0176). The
+/// connector pod receives it from the connector Secret. The sandbox bind map
+/// does not. The spelling is frozen in `tests/vectors/e2e-connector-sandbox.json`.
+pub const SANDBOX_WITHHELD_CONNECTOR_SECRETS: &[&str] = &["E2E_CLUSTER_KUBECONFIG"];
+
+pub fn sandbox_connector_secrets(secrets: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    secrets
+        .iter()
+        .filter(|(name, _)| !SANDBOX_WITHHELD_CONNECTOR_SECRETS.contains(&name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
 pub fn helm_secret_pairs(
     agent: &str,
     secrets: &BTreeMap<String, String>,
@@ -698,7 +713,8 @@ pub fn runner_base_verdict(
         Ok(found) => found,
         Err(reason) => {
             let fix = "confirm the release is healthy with `curie cluster status` and that \
-                       its runner image resolves in its registry, then redeploy";
+                       its runner image resolves in its registry (or pin the runner by digest \
+                       with the chart value `agentSandbox.runner.digest`), then redeploy";
             // The human presenter prints only the message, so the fix is
             // composed into it as well as carried for `--json` (#3423).
             return Err(anyhow::Error::from(
@@ -796,6 +812,40 @@ pub async fn pin_runner_reference(reference: &str) -> Result<String> {
     if reference_digest(reference).is_some() {
         return Ok(reference.to_string());
     }
+    // Native first (#3503): an operator host with only kubectl and helm has
+    // no docker, and an anonymous registry read needs none. Docker stays the
+    // fallback for a registry that needs a docker login.
+    let native = match crate::oci_registry::fetch_manifest(reference).await {
+        Ok(manifest) => {
+            return Ok(crate::connector_build::digest_pinned_ref(
+                reference,
+                &manifest.digest,
+            ))
+        }
+        Err(err) => format!("{err:#}"),
+    };
+    if !crate::ops::on_path("docker") {
+        bail!(
+            "could not resolve {reference} to a digest in its registry ({native}), and `docker` \
+             is not on PATH to ask with a registry login. Pin the release's runner by digest \
+             with the chart value `agentSandbox.runner.digest`, or run from a host where \
+             `docker buildx imagetools inspect {reference}` resolves"
+        );
+    }
+    docker_runner_digest(reference)
+        .await
+        .map(|digest| crate::connector_build::digest_pinned_ref(reference, &digest))
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "could not resolve {reference} to a digest in its registry ({native}), nor with \
+                 docker ({err:#})"
+            )
+        })
+}
+
+/// The top-level manifest digest `docker buildx imagetools inspect` reports
+/// for `reference`, which honors the host's docker registry logins.
+async fn docker_runner_digest(reference: &str) -> Result<String> {
     let inspect = OpsCommand::new(
         "docker",
         vec![
@@ -809,18 +859,15 @@ pub async fn pin_runner_reference(reference: &str) -> Result<String> {
     );
     let (ok, stdout, stderr) = crate::ops::run_capture(&inspect).await?;
     if !ok {
-        bail!(
-            "could not resolve {reference} in its registry: {}",
-            stderr.trim()
-        );
+        bail!("{}", stderr.trim());
     }
     let manifest: serde_json::Value = serde_json::from_str(stdout.trim())
         .map_err(|err| anyhow::anyhow!("the manifest of {reference} is malformed: {err}"))?;
-    let digest = manifest
+    manifest
         .get("digest")
         .and_then(|d| d.as_str())
-        .ok_or_else(|| anyhow::anyhow!("the manifest of {reference} names no digest"))?;
-    Ok(crate::connector_build::digest_pinned_ref(reference, digest))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("the manifest of {reference} names no digest"))
 }
 
 /// The installation's runner as `(reference, pinned)`, read from the
@@ -893,6 +940,29 @@ mod tests {
             ("GITHUB_PERSONAL_ACCESS_TOKEN".into(), "ghp_agent_a".into()),
             ("JIRA_TOKEN".into(), "jira-a".into()),
         ])
+    }
+
+    #[test]
+    fn the_e2e_kubeconfig_is_withheld_from_the_sandbox_bind() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/vectors/e2e-connector-sandbox.json");
+        let raw = std::fs::read_to_string(path).expect("vector");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("vector json");
+        let key = doc["kubeconfig_secret"]
+            .as_str()
+            .expect("kubeconfig_secret")
+            .to_string();
+        let mut values = secrets();
+        values.insert(key.clone(), "kubeconfig-sentinel".into());
+        let bound = sandbox_connector_secrets(&values);
+        assert!(!bound.contains_key(&key));
+        assert!(!bound.values().any(|value| value == "kubeconfig-sentinel"));
+        assert_eq!(
+            bound
+                .get("GITHUB_PERSONAL_ACCESS_TOKEN")
+                .map(String::as_str),
+            Some("ghp_agent_a")
+        );
     }
 
     #[test]

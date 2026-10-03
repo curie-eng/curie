@@ -16,6 +16,7 @@ from typing import Any
 
 import asyncpg
 import pytest
+from channel_protocol import scoped_conversation_id
 from curie_api.config import get_settings
 from curie_api.routers.state import (
     _NAMESPACE_LOCK_CLASS,
@@ -229,10 +230,23 @@ def test_app_scoped_token_is_refused_on_binding_scoped_memory(
     # #1461: channel memory lives at /state/bindings/<kind>/<address>/memory and
     # holds facts the prompt treats as remembered. The bundle's narrow state.app
     # token must be fenced off it exactly as off agent memory, on every verb,
-    # while the broad state token (the runner's memory token) still reaches it.
+    # while the runner's per-turn write credential for THIS binding still
+    # reaches it (ADR-0188: a sandbox writes channel memory only with a write
+    # credential whose binding claim names the channel).
     aid = _agent(client, auth_headers)
     app = mint(get_settings().api_key, agent=aid, scope="state.app", exp=_FAR_FUTURE)
-    broad = mint(get_settings().api_key, agent=aid, scope="state", exp=_FAR_FUTURE)
+    writer = mint(
+        get_settings().api_key,
+        agent=aid,
+        scope="state",
+        exp=_FAR_FUTURE,
+        claims={
+            "binding": "slack:C000000S01",
+            "memory": "write",
+            "sender": "U0000001",
+            "turn": "evt-1461",
+        },
+    )
     base = f"/agents/{aid}/state/bindings/slack/C000000S01/memory"
     fact = f"{base}/fact-{'a' * 32}"
     headers = {"X-API-Key": app}
@@ -248,9 +262,9 @@ def test_app_scoped_token_is_refused_on_binding_scoped_memory(
     )
     assert client.delete(fact, headers=headers).status_code == 403
 
-    ok = client.put(fact, json={"value": {"statement": "x"}}, headers={"X-API-Key": broad})
+    ok = client.put(fact, json={"value": {"statement": "x"}}, headers={"X-API-Key": writer})
     assert ok.status_code == 200, ok.text
-    assert client.get(fact, headers={"X-API-Key": broad}).status_code == 200
+    assert client.get(fact, headers={"X-API-Key": writer}).status_code == 200
 
 
 def test_namespace_enumeration_hides_reserved_from_the_app_token(
@@ -297,22 +311,77 @@ def test_app_scoped_token_works_on_a_non_reserved_namespace(
     assert client.get(url, headers=headers).json()["value"] == {"n": 1}
 
 
-def test_broad_state_token_and_platform_key_reach_reserved_namespaces(
+def test_platform_key_reaches_reserved_namespaces(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    # The loaders MUST reach memory/transcript to rehydrate: the broad ``state``
-    # token (their credential) and the platform key are both unrestricted. If this
-    # regressed, memory/history rehydration would break -- the reason the fix
-    # gates on scope, not on the namespace alone.
+    # The platform key (operators, ``curie cluster memory``) stays unrestricted
+    # on the reserved namespaces, any key, ADR-0188 included.
     aid = _agent(client, auth_headers)
-    broad = mint(get_settings().api_key, agent=aid, scope="state", exp=_FAR_FUTURE)
+    for ns in ("memory", "transcript"):
+        r = client.put(
+            f"/agents/{aid}/state/{ns}/k", json={"value": {"n": 1}}, headers=auth_headers
+        )
+        assert r.status_code == 200, f"{ns}: {r.text}"
 
-    for headers in ({"X-API-Key": broad}, auth_headers):
-        for ns in ("memory", "transcript"):
-            r = client.put(
-                f"/agents/{aid}/state/{ns}/k", json={"value": {"n": 1}}, headers=headers
-            )
-            assert r.status_code == 200, f"{ns}: {r.text}"
+
+def test_sandbox_state_token_reads_reserved_namespaces_and_writes_only_fact_keys(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # The loaders MUST reach memory/transcript to rehydrate: boot only reads
+    # memory and reads/writes transcripts, so the sandbox's state credentials
+    # keep that reach. What ADR-0188 removes is writing arbitrary memory keys:
+    # a sandbox writes only fact keys, and only with the per-turn write
+    # credential. A write to ``memory/k`` is now 403.
+    aid = _agent(client, auth_headers)
+    api_key = get_settings().api_key
+    reader = mint(
+        api_key,
+        agent=aid,
+        scope="state",
+        exp=_FAR_FUTURE,
+        claims={"binding": "slack:C000000S01", "memory": "read"},
+    )
+    writer = mint(
+        api_key,
+        agent=aid,
+        scope="state",
+        exp=_FAR_FUTURE,
+        claims={
+            "binding": "slack:C000000S01",
+            "memory": "write",
+            "sender": "U0000001",
+            "turn": "evt-reserved",
+        },
+    )
+    seeded = client.put(
+        f"/agents/{aid}/state/memory/guidance",
+        json={"value": {"text": "be brief"}},
+        headers=auth_headers,
+    )
+    assert seeded.status_code == 200, seeded.text
+
+    # Reads: memory (agent memory) and the transcript, with the read credential.
+    got = client.get(f"/agents/{aid}/state/memory/guidance", headers={"X-API-Key": reader})
+    assert got.status_code == 200, got.text
+    assert (
+        client.get(f"/agents/{aid}/state/memory", headers={"X-API-Key": reader}).status_code == 200
+    )
+    # A sandbox reaches only its own binding's thread keys (#3767).
+    thread = scoped_conversation_id("slack", "C000000S01", "1700000000.000100")
+    transcript = f"/agents/{aid}/state/transcript/{thread}"
+    t = client.put(transcript, json={"value": {"n": 1}}, headers={"X-API-Key": reader})
+    assert t.status_code == 200, t.text
+    assert client.get(transcript, headers={"X-API-Key": reader}).status_code == 200
+
+    # Fact-key writes with the write credential.
+    fact = f"/agents/{aid}/state/memory/fact-{'b' * 32}"
+    w = client.put(fact, json={"value": {"statement": "x"}}, headers={"X-API-Key": writer})
+    assert w.status_code == 200, w.text
+
+    # Any other memory key is refused, even with the write credential.
+    for headers in ({"X-API-Key": reader}, {"X-API-Key": writer}):
+        r = client.put(f"/agents/{aid}/state/memory/k", json={"value": {"n": 1}}, headers=headers)
+        assert r.status_code == 403, r.text
 
 
 def test_put_get_list_delete_round_trip(
@@ -2036,3 +2105,212 @@ def test_runtime_reads_lists_and_appends_from_the_transcript_table(
     transcripts, legacy = _transcript_storage(aid)
     assert transcripts == [("thread-one", expected, second.json()["version"])]
     assert legacy == []
+
+
+# --------------------------------------------------------------------------- #
+# Who removed what (#3673)
+# --------------------------------------------------------------------------- #
+# A delete through the state router leaves one structured line naming the
+# agent, scope, namespace, key, whether anything was removed and which kind of
+# credential made the call -- never the stored value -- plus a bounded counter.
+_STATE_MUTATION_LOGGER = "curie_api.state_mutation"
+_SECRET_VALUE = "value-that-must-never-be-logged"
+
+
+def _mutation_records(caplog: pytest.LogCaptureFixture) -> list[Any]:
+    return [r for r in caplog.records if r.name == _STATE_MUTATION_LOGGER]
+
+
+@pytest.fixture
+def mutation_metrics(
+    client: Any,
+) -> Iterator[tuple[MeterProvider, InMemoryMetricReader]]:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        metric_readers=[reader],
+        resource=build_resource(
+            "curie-api",
+            service_version="0.0.0-test",
+            service_instance_id="acme-api-mutation-test",
+            deployment_environment="test",
+        ),
+    )
+    original = client.app.state.telemetry.meter_provider
+    configure_meter_provider(provider)
+    try:
+        yield provider, reader
+    finally:
+        configure_meter_provider(original)
+        provider.shutdown()
+
+
+def _mutation_points(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> list[tuple[int, dict[str, str]]]:
+    provider, reader = metrics
+    assert provider.force_flush(timeout_millis=5000)
+    data = reader.get_metrics_data()
+    if data is None:
+        return []
+    return [
+        (int(point.value), dict(point.attributes))
+        for resource_metrics in data.resource_metrics
+        for scope_metrics in resource_metrics.scope_metrics
+        for metric in scope_metrics.metrics
+        if metric.name == "curie.state.mutation"
+        for point in metric.data.data_points
+    ]
+
+
+def test_deleting_a_state_key_records_who_removed_what(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/approvals/thread-1"
+    put = client.put(url, json={"value": {"note": _SECRET_VALUE}}, headers=auth_headers)
+    assert put.status_code == 200, put.text
+
+    with caplog.at_level("INFO", logger=_STATE_MUTATION_LOGGER):
+        deleted = client.delete(url, headers=auth_headers)
+    assert deleted.status_code == 204, deleted.text
+
+    records = _mutation_records(caplog)
+    assert len(records) == 1, [r.getMessage() for r in records]
+    fields = records[0].state_mutation
+    assert fields == {
+        "op": "delete",
+        "agent_id": aid,
+        "scope": "shared",
+        "namespace": "approvals",
+        "key": "thread-1",
+        "removed": True,
+        "principal": "platform",
+    }
+    message = records[0].getMessage()
+    # The rendered line is what reaches the JSON stderr stream, which keeps no
+    # extra fields, so every field must be in it too.
+    for part in (
+        "op=delete",
+        f"agent_id={aid}",
+        "scope=shared",
+        "namespace=approvals",
+        "key=thread-1",
+        "removed=true",
+        "principal=platform",
+    ):
+        assert part in message, message
+    assert _SECRET_VALUE not in message
+    assert _SECRET_VALUE not in repr(fields)
+
+
+def test_deleting_a_missing_state_key_is_recorded_as_nothing_removed(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    aid = _agent(client, auth_headers)
+    with caplog.at_level("INFO", logger=_STATE_MUTATION_LOGGER):
+        deleted = client.delete(f"/agents/{aid}/state/approvals/absent", headers=auth_headers)
+    assert deleted.status_code == 204, deleted.text
+
+    records = _mutation_records(caplog)
+    assert len(records) == 1, [r.getMessage() for r in records]
+    assert records[0].state_mutation["removed"] is False
+    assert records[0].state_mutation["key"] == "absent"
+    assert "removed=false" in records[0].getMessage()
+
+
+@pytest.mark.parametrize(("scope", "principal"), [("state", "state"), ("state.app", "app")])
+def test_a_scoped_token_delete_names_its_credential_kind(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    caplog: pytest.LogCaptureFixture,
+    scope: str,
+    principal: str,
+) -> None:
+    aid = _agent(client, auth_headers)
+    token = mint(get_settings().api_key, agent=aid, scope=scope, exp=_FAR_FUTURE)
+    headers = {"X-API-Key": token}
+    url = f"/agents/{aid}/state/notes/k"
+    assert client.put(url, json={"value": 1}, headers=headers).status_code == 200
+
+    with caplog.at_level("INFO", logger=_STATE_MUTATION_LOGGER):
+        assert client.delete(url, headers=headers).status_code == 204
+
+    records = _mutation_records(caplog)
+    assert len(records) == 1
+    assert records[0].state_mutation["principal"] == principal
+    assert f"principal={principal}" in records[0].getMessage()
+    assert token not in records[0].getMessage()
+
+
+def test_a_binding_scoped_delete_names_its_binding_scope(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/bindings/slack/C000000S01/notes/k"
+    assert client.put(url, json={"value": 1}, headers=auth_headers).status_code == 200
+
+    with caplog.at_level("INFO", logger=_STATE_MUTATION_LOGGER):
+        assert client.delete(url, headers=auth_headers).status_code == 204
+
+    records = _mutation_records(caplog)
+    assert len(records) == 1
+    assert records[0].state_mutation["scope"] == "slack:C000000S01"
+    assert records[0].state_mutation["removed"] is True
+
+
+def test_deleting_a_transcript_records_the_thread_it_removed(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    aid = _agent(client, auth_headers)
+    url = f"/agents/{aid}/state/transcript/thread-audit"
+    appended = client.post(
+        f"{url}/append",
+        json={"item": {"user": _SECRET_VALUE, "assistant": "done"}},
+        headers=auth_headers,
+    )
+    assert appended.status_code == 200, appended.text
+
+    with caplog.at_level("INFO", logger=_STATE_MUTATION_LOGGER):
+        assert client.delete(url, headers=auth_headers).status_code == 204
+        assert client.delete(url, headers=auth_headers).status_code == 204
+
+    records = _mutation_records(caplog)
+    assert [r.state_mutation["removed"] for r in records] == [True, False]
+    assert all(r.state_mutation["namespace"] == "transcript" for r in records)
+    assert all(r.state_mutation["key"] == "thread-audit" for r in records)
+    assert all(_SECRET_VALUE not in r.getMessage() for r in records)
+
+
+def test_state_mutations_are_counted_by_operation_and_bounded_namespace(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    mutation_metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    # Namespaces are caller-chosen, so the label folds every namespace other
+    # than the platform's reserved ones into one series. A delete that removed
+    # nothing is logged but is not a mutation.
+    aid = _agent(client, auth_headers)
+    for namespace in ("approvals", "notes"):
+        url = f"/agents/{aid}/state/{namespace}/k"
+        assert client.put(url, json={"value": 1}, headers=auth_headers).status_code == 200
+        assert client.delete(url, headers=auth_headers).status_code == 204
+    absent = client.delete(f"/agents/{aid}/state/notes/absent", headers=auth_headers)
+    assert absent.status_code == 204
+
+    assert _mutation_points(mutation_metrics) == [
+        (2, {"service.name": "curie-api", "op": "delete", "namespace": "other"})
+    ]

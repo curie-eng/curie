@@ -190,6 +190,10 @@ class SandboxHandle:
     # decision 7). False for a record written before the field existed, which
     # is what makes the one replacement after an install gains a caller key.
     carries_caller_token: bool = False
+    # The run id signed into the caller token at boot (ADR 0178), or None when
+    # this runner was not booted for a work item. Missing on a route written
+    # before the field existed, which reads as no run.
+    caller_run: str | None = None
     # Whether this runner booted with ADR 0130's model-visible tool and prompt.
     # False rehydrates legacy routes conservatively and forces one replacement
     # before an eligible turn may adopt them.
@@ -365,6 +369,14 @@ class SandboxView:
     port: int | None = None
 
 
+@dataclass(frozen=True)
+class SandboxTermination:
+    """Confirmed termination of the runner pod, with safe diagnostic text."""
+
+    reason: str
+    detail: str | None = None
+
+
 OperatingMode = Literal["Running", "Suspended"]
 
 
@@ -420,6 +432,13 @@ class SandboxClient(Protocol):
         """The scheduler's message when pod ``name`` is ``PodScheduled=False``
         with reason ``Unschedulable``; None when it is scheduled, missing, or
         unreadable."""
+
+        ...
+
+    def pod_termination(
+        self, name: str, *, since: datetime, request_timeout_seconds: float
+    ) -> SandboxTermination | None:
+        """Confirmed pod termination, or None when the evidence is absent."""
 
         ...
 

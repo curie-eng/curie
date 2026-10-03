@@ -12,6 +12,7 @@ dependencies = [
     "curie-telemetry",
     "curie-channel-protocol",
     "plugin-format",
+    "curie-e2e-connector",
     "curie-dispatcher",
     "aiohttp>=3.11",
     "slack-sdk>=3.43",

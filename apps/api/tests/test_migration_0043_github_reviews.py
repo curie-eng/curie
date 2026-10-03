@@ -3,16 +3,29 @@
 from pathlib import Path
 
 import pytest
+from _migration_support import IsolatedMigrationDb
 from alembic import command
 from alembic.config import Config
 
 from apps.api.tests.test_github_review_events import (
+    _review_stack,
     _write_actual_fenced_review_terminal,
     post_review,
     review_rows,
 )
 from apps.api.tests.test_github_review_events import review_app_key as review_app_key
-from apps.api.tests.test_github_review_events import review_stack as review_stack
+
+
+@pytest.fixture
+def review_stack(
+    isolated_migration_db: IsolatedMigrationDb,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    review_app_key: str,
+):
+    isolated_migration_db.at("head")
+    with _review_stack(request, monkeypatch, review_app_key, publish=True) as stack:
+        yield stack
 
 
 @pytest.mark.parametrize("retryable", [False, True])

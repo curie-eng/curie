@@ -98,7 +98,7 @@ def test_reset_thread_queues_a_pending_request(
             f"/agents/{agent_id}/threads/t-reset-1/reset", headers=auth_headers
         )
         assert resp.status_code == 200
-        assert resp.json() == {"requested": True}
+        assert resp.json() == {"requested": True, "route_existed": None}
         assert valkey.sismember(THREAD_RESET_SET, "t-reset-1")
 
         # Idempotent: requesting an already-pending thread again is a no-op.
@@ -133,13 +133,16 @@ def test_thread_reset_state_is_pollable_until_the_worker_drains(
         # Nothing outstanding yet.
         before = client.get(url, headers=auth_headers)
         assert before.status_code == 200
-        assert before.json() == {"requested": False}
+        assert before.json() == {"requested": False, "route_existed": None}
 
         # POST enqueues; the poll now reports the reset as still outstanding.
-        assert client.post(url, headers=auth_headers).json() == {"requested": True}
+        assert client.post(url, headers=auth_headers).json() == {
+            "requested": True,
+            "route_existed": None,
+        }
         pending = client.get(url, headers=auth_headers)
         assert pending.status_code == 200
-        assert pending.json() == {"requested": True}
+        assert pending.json() == {"requested": True, "route_existed": None}
 
         # Simulate the worker's maintenance tick draining THIS thread's request
         # (it SPOPs the member, then releases the sandbox). The poll then reads
@@ -147,7 +150,7 @@ def test_thread_reset_state_is_pollable_until_the_worker_drains(
         valkey.srem(THREAD_RESET_SET, thread)
         released = client.get(url, headers=auth_headers)
         assert released.status_code == 200
-        assert released.json() == {"requested": False}
+        assert released.json() == {"requested": False, "route_existed": None}
     finally:
         valkey.srem(THREAD_RESET_SET, thread)
 
@@ -181,17 +184,119 @@ def test_thread_reset_state_stays_pending_while_release_is_in_progress_or_failed
 
         inflight = client.get(url, headers=auth_headers)
         assert inflight.status_code == 200
-        assert inflight.json() == {"requested": True}  # not a false "released"
+        # not a false "released"
+        assert inflight.json() == {"requested": True, "route_existed": None}
 
         # Only once the worker confirms the release (SREM from the in-progress
         # set) does the poll read False -- the signal the CLI reports success on.
         valkey.srem(THREAD_RESET_INFLIGHT_SET, thread)
         done = client.get(url, headers=auth_headers)
         assert done.status_code == 200
-        assert done.json() == {"requested": False}
+        assert done.json() == {"requested": False, "route_existed": None}
     finally:
         valkey.srem(THREAD_RESET_SET, thread)
         valkey.srem(THREAD_RESET_INFLIGHT_SET, thread)
+
+
+def test_thread_reset_state_reports_whether_the_drained_reset_matched_a_route(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+) -> None:
+    """#3699: once the worker has drained a reset it leaves the outcome under
+    ``THREAD_RESET_RESULT_PREFIX + thread_key``. GET .../reset reads it only when
+    the reset is no longer pending: ``released`` is ``route_existed: true``,
+    ``no-route`` is ``route_existed: false`` (the key matched no route, so
+    nothing was released), and anything else -- an expired result, or a worker
+    that predates the result -- is ``null``. Real Valkey, no mocking."""
+    from curie_api.threadreset import (
+        THREAD_RESET_INFLIGHT_SET,
+        THREAD_RESET_RESULT_PREFIX,
+        THREAD_RESET_SET,
+    )
+
+    agent_id = _make_agent(client, auth_headers)
+    thread = "slack:C0EXAMPLE1:t-reset-result-1"
+    url = f"/agents/{agent_id}/threads/{thread}/reset"
+    result_key = f"{THREAD_RESET_RESULT_PREFIX}{thread}"
+
+    def cleanup() -> None:
+        valkey.srem(THREAD_RESET_SET, thread)
+        valkey.srem(THREAD_RESET_INFLIGHT_SET, thread)
+        valkey.delete(result_key)
+
+    cleanup()
+    try:
+        # No result recorded (expired, or a worker that predates it): unknown.
+        assert client.get(url, headers=auth_headers).json() == {
+            "requested": False,
+            "route_existed": None,
+        }
+
+        # The worker drained a reset whose key matched no route.
+        valkey.set(result_key, "no-route", ex=3600)
+        no_route = client.get(url, headers=auth_headers)
+        assert no_route.status_code == 200
+        assert no_route.json() == {"requested": False, "route_existed": False}
+
+        # The worker drained a reset that released a route.
+        valkey.set(result_key, "released", ex=3600)
+        released = client.get(url, headers=auth_headers)
+        assert released.json() == {"requested": False, "route_existed": True}
+
+        # A value this API does not know is unknown, never a guess.
+        valkey.set(result_key, "something-newer", ex=3600)
+        assert client.get(url, headers=auth_headers).json() == {
+            "requested": False,
+            "route_existed": None,
+        }
+
+        # While a reset is outstanding the result is withheld, even when an
+        # earlier reset's result is still on the key.
+        valkey.set(result_key, "no-route", ex=3600)
+        valkey.sadd(THREAD_RESET_INFLIGHT_SET, thread)
+        assert client.get(url, headers=auth_headers).json() == {
+            "requested": True,
+            "route_existed": None,
+        }
+    finally:
+        cleanup()
+
+
+def test_a_new_thread_reset_request_clears_the_previous_result(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+) -> None:
+    """#3699: a fresh request must never read the previous reset's result, so
+    the POST deletes the result key before it queues the request."""
+    from curie_api.threadreset import THREAD_RESET_RESULT_PREFIX, THREAD_RESET_SET
+
+    agent_id = _make_agent(client, auth_headers)
+    thread = "slack:C0EXAMPLE1:t-reset-result-2"
+    url = f"/agents/{agent_id}/threads/{thread}/reset"
+    result_key = f"{THREAD_RESET_RESULT_PREFIX}{thread}"
+    valkey.srem(THREAD_RESET_SET, thread)
+    valkey.set(result_key, "no-route", ex=3600)
+    try:
+        resp = client.post(url, headers=auth_headers)
+        assert resp.status_code == 200
+        assert resp.json() == {"requested": True, "route_existed": None}
+        assert valkey.exists(result_key) == 0
+        assert valkey.sismember(THREAD_RESET_SET, thread)
+
+        # The worker has not answered the new request yet: once it is no longer
+        # pending the caller still sees "unknown", not the stale no-route.
+        valkey.srem(THREAD_RESET_SET, thread)
+        assert client.get(url, headers=auth_headers).json() == {
+            "requested": False,
+            "route_existed": None,
+        }
+    finally:
+        valkey.srem(THREAD_RESET_SET, thread)
+        valkey.delete(result_key)
 
 
 def test_reset_thread_requires_a_real_agent(

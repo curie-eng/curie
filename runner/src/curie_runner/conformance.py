@@ -24,9 +24,11 @@ def _build_runner() -> SessionRunner:
     return SessionRunner(
         session_factory=FakeModelSession,
         ceiling=0,  # unbounded: conformance validates protocol shape, not budgets
+        max_usd_per_day=None,
         tracer=RunTracer(None),
         classifier=SideEffectClassifier(),
         trace_name="conformance",
+        held_secrets=frozenset(),
     )
 
 

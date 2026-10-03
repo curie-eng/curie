@@ -369,7 +369,7 @@ def approval_card(
             },
         },
         {"type": "section", "text": {"type": "mrkdwn", "text": clamped}},
-        _context_block(f"Requested by <@{requested_by}>"),
+        *([_context_block(f"Requested by <@{requested_by}>")] if requested_by else []),
         {
             "type": "actions",
             "elements": [

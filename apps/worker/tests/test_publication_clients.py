@@ -11,6 +11,7 @@ import pytest
 from channel_protocol import scoped_conversation_id
 from curie_worker.publication_clients import (
     GitHubPublicationLookup,
+    PublicationCredentialClient,
     PublicationLineageClient,
     PublicationTranscriptClient,
 )
@@ -75,6 +76,113 @@ async def test_stored_pull_number_is_the_only_identity_used_for_lineage_truth() 
     assert observed.state == "open"
     assert observed.head_sha == REVISION_HEAD
     assert observed.head_ref == BRANCH
+
+
+@pytest.mark.parametrize("html_base", ["https://github.com", "https://github.example.com/forge"])
+async def test_publication_credential_accepts_only_the_configured_clone_origin(
+    html_base: str,
+) -> None:
+    clone_url = f"{html_base}/{REPO}.git"
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"Cache-Control": "no-store"},
+            json={
+                "repo_full_name": REPO,
+                "clone_url": clone_url,
+                "authorization_header": "Bearer fixture-publication-token",
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        credential = await PublicationCredentialClient(
+            api_base_url=LINEAGE_API_BASE,
+            worker_token=WORKER_TOKEN,
+            github_html_base=html_base,
+            client=http,
+        ).redeem(PUBLICATION_ID)
+
+    assert credential.clean_clone_url == clone_url
+    assert credential.authorization_header == "Bearer fixture-publication-token"
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert requests[0].url.path == f"/v1/internal/publications/{PUBLICATION_ID}/credential"
+    assert requests[0].headers["X-Curie-Worker-Token"] == WORKER_TOKEN
+
+
+@pytest.mark.parametrize(
+    "clone_url",
+    [
+        f"https://github.com/{REPO}.git",
+        f"https://other.example.com/forge/{REPO}.git",
+        f"https://github.example.com/{REPO}.git",
+        f"https://user@github.example.com/forge/{REPO}.git",
+        f"https://github.example.com/forge/{REPO}.git?token=example",
+        f"https://github.example.com/forge/{REPO}.git#example",
+    ],
+)
+async def test_enterprise_publication_credential_refuses_foreign_clone_origins(
+    clone_url: str,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Cache-Control": "no-store"},
+            json={
+                "repo_full_name": REPO,
+                "clone_url": clone_url,
+                "authorization_header": "Bearer fixture-publication-token",
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        credential_client = PublicationCredentialClient(
+            api_base_url=LINEAGE_API_BASE,
+            worker_token=WORKER_TOKEN,
+            github_html_base="https://github.example.com/forge",
+            client=http,
+        )
+        with pytest.raises(PublicationReconcileError, match="clone URL"):
+            await credential_client.redeem(PUBLICATION_ID)
+
+
+@pytest.mark.parametrize("returned_base", ["https://github.example.com/forge", "https://github.com"])
+async def test_enterprise_lineage_lookup_validates_the_configured_html_origin(
+    returned_base: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "number": 123,
+                "html_url": f"{returned_base}/{REPO}/pull/123",
+                "state": "open",
+                "merged_at": None,
+                "head": {"ref": BRANCH, "sha": REVISION_HEAD},
+                "base": {"ref": "main"},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        lookup = GitHubPublicationLookup(
+            client, api_base_url="https://github.example.com/forge/api/v3"
+        )
+        if returned_base == "https://github.com":
+            with pytest.raises(PublicationReconcileError, match="wrong stored pull request"):
+                await lookup.read_pr_by_number(REPO, 123, "Bearer fixture-publication-token")
+        else:
+            pull = await lookup.read_pr_by_number(REPO, 123, "Bearer fixture-publication-token")
+            assert pull.url == f"{returned_base}/{REPO}/pull/123"
+
+    assert [str(request.url) for request in requests] == [
+        f"https://github.example.com/forge/api/v3/repos/{REPO}/pulls/123"
+    ]
 
 
 async def test_github_lineage_reads_refuse_empty_auth_before_network_access() -> None:

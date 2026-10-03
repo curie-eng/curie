@@ -6,6 +6,124 @@
 
 use curie_aci_protocol::{OutboundEvent, SessionStatus};
 
+/// A display label; exact tool identities remain in the wire event.
+pub fn action_label(tool: &str) -> String {
+    if tool.is_empty()
+        || !tool
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        return "action".into();
+    }
+    let name = if tool.starts_with("mcp__") {
+        let Some((prefix, suffix)) = tool.rsplit_once("__") else {
+            return "action".into();
+        };
+        if prefix == "mcp" || prefix.split("__").any(str::is_empty) {
+            return "action".into();
+        }
+        suffix
+    } else {
+        match tool {
+            "Bash" => return "shell request".into(),
+            "Skill" => return "instruction request".into(),
+            "Read" => return "read file".into(),
+            "Write" => return "write file".into(),
+            "Edit" => return "edit file".into(),
+            "MultiEdit" => return "edit files".into(),
+            "Glob" => return "find files".into(),
+            "Grep" => return "search files".into(),
+            "WebFetch" => return "fetch web page".into(),
+            "WebSearch" => return "search web".into(),
+            _ => tool,
+        }
+    };
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        return "action".into();
+    }
+    let chars: Vec<char> = name.chars().collect();
+    let mut label = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '_' || c == '-' {
+            if !label.ends_with(' ') {
+                label.push(' ');
+            }
+        } else {
+            if c.is_ascii_uppercase()
+                && i > 0
+                && (chars[i - 1].is_ascii_lowercase()
+                    || chars[i - 1].is_ascii_digit()
+                    || (chars[i - 1].is_ascii_uppercase()
+                        && chars.get(i + 1).is_some_and(char::is_ascii_lowercase)))
+                && !label.ends_with(' ')
+            {
+                label.push(' ');
+            }
+            label.extend(c.to_lowercase());
+        }
+    }
+    let label = label.trim();
+    if label.is_empty() {
+        "action".into()
+    } else {
+        label.into()
+    }
+}
+
+/// Transform generated MCP tokens in progress metadata, never answer text.
+pub fn action_text(text: &str) -> String {
+    match text {
+        "non-idempotent tool executed" => {
+            return "request started; check the outcome before retrying".into()
+        }
+        "non-idempotent tool completed" => {
+            return "request finished; check the outcome before retrying".into()
+        }
+        "tool result too large to record" => {
+            return "result too large to record; check the outcome before retrying".into()
+        }
+        _ => {}
+    }
+    let mut rendered = String::new();
+    let mut remaining = text;
+    let is_content_boundary = |c: char| c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-');
+    while let Some(start) = remaining.find("mcp__") {
+        rendered.push_str(&remaining[..start]);
+        let token = &remaining[start..];
+        let end = token
+            .char_indices()
+            .find(|(_, c)| !c.is_alphanumeric() && *c != '_' && *c != '-')
+            .map(|(i, _)| i)
+            .unwrap_or(token.len());
+        // A terminal period is sentence prose; an extension remains content.
+        let mut suffix = token[end..].chars();
+        let in_suffix = match suffix.next() {
+            Some('.') => suffix.next().is_some_and(|c| {
+                !c.is_whitespace() && !matches!(c, ')' | ']' | '}' | '"' | '\'' | '`')
+            }),
+            Some(c) => is_content_boundary(c),
+            None => false,
+        };
+        let in_content = remaining[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_content_boundary)
+            || in_suffix;
+        if in_content {
+            rendered.push_str(&token[..end]);
+        } else {
+            rendered.push_str(&action_label(&token[..end]));
+        }
+        remaining = &token[end..];
+    }
+    rendered.push_str(remaining);
+    rendered
+}
+
 /// Human-readable session status, matching the wire vocabulary.
 pub fn status_str(status: &SessionStatus) -> &'static str {
     match status {
@@ -48,18 +166,24 @@ impl TurnPrinter {
                 self.streamed_text = true;
                 Some(TurnPart::Token(text.clone()))
             }
-            OutboundEvent::ToolNote { text, tool, .. } => match tool {
-                Some(tool) => Some(TurnPart::Note(format!("  -> [{tool}] {text}"))),
-                None => Some(TurnPart::Note(format!("  -> {text}"))),
-            },
+            OutboundEvent::ToolNote { text, tool, .. } => {
+                let text = match text.strip_prefix("running tool ") {
+                    Some(name) => format!("running {}", action_label(name)),
+                    None => action_text(text),
+                };
+                Some(TurnPart::Note(match tool {
+                    Some(tool) => format!("  -> [{}] {text}", action_label(tool)),
+                    None => format!("  -> {text}"),
+                }))
+            }
             OutboundEvent::SideEffectFlag { tool, detail, .. } => {
-                let tool = tool.as_deref().unwrap_or("unknown tool");
+                let tool = action_label(tool.as_deref().unwrap_or_default());
                 let detail = detail
                     .as_deref()
-                    .map(|d| format!(": {d}"))
+                    .map(|d| format!(": {}", action_text(d)))
                     .unwrap_or_default();
                 Some(TurnPart::Note(format!(
-                    "  !  side effect via {tool}{detail}"
+                    "  !  possible change via {tool}{detail}"
                 )))
             }
             OutboundEvent::ErrorEvent {
@@ -231,6 +355,7 @@ mod tests {
             arguments: None,
             result: None,
             failed: None,
+            redacted: None,
         };
         let error = OutboundEvent::ErrorEvent {
             version: v(),
@@ -241,17 +366,135 @@ mod tests {
         assert!(matches!(printer.part_for(&note), Some(TurnPart::Note(_))));
         assert_eq!(
             part_text(printer.part_for(&note)),
-            "  -> [Bash] running echo hi"
+            "  -> [shell request] running echo hi"
         );
         assert_eq!(
             part_text(printer.part_for(&flag)),
-            "  !  side effect via Bash"
+            "  !  possible change via shell request"
         );
         // Error events route to Fail (red stderr).
         assert!(matches!(
             printer.part_for(&error),
             Some(TurnPart::Fail(f)) if f == "error [budget]: boom"
         ));
+    }
+
+    #[test]
+    fn action_labels_fail_closed_for_malformed_names() {
+        for (name, expected) in [
+            ("mcp__files__fileAttachment", "file attachment"),
+            ("mcp__one__two__HTTPDownload", "http download"),
+            ("mcp__store__save-item", "save item"),
+            ("mcp__store__", "action"),
+            ("mcp__", "action"),
+            ("mcp__a__bad.name", "action"),
+            ("", "action"),
+            ("Skill", "instruction request"),
+            ("Bash", "shell request"),
+            ("Read", "read file"),
+        ] {
+            assert_eq!(action_label(name), expected, "{name}");
+        }
+
+        assert_eq!(
+            action_text("mcp__a__save_item failed; retry?"),
+            "save item failed; retry?"
+        );
+        assert_eq!(
+            action_text("non-idempotent tool executed"),
+            "request started; check the outcome before retrying"
+        );
+        assert_eq!(
+            action_text("non-idempotent tool completed"),
+            "request finished; check the outcome before retrying"
+        );
+        assert_eq!(
+            action_text("User requested Bash examples"),
+            "User requested Bash examples"
+        );
+    }
+
+    #[test]
+    fn shared_action_wording_vectors_match_receipts() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/vectors/user-action-wording.json"))
+                .unwrap();
+        for vector in vectors["vectors"].as_array().unwrap() {
+            assert_eq!(
+                action_label(vector["tool"].as_str().unwrap_or_default()),
+                vector["label"].as_str().unwrap()
+            );
+        }
+        assert_eq!(action_label("mcp__acme__파일_첨부"), "파일 첨부");
+        assert_eq!(action_label("mcp__acme__ÜBER_첨부"), "über 첨부");
+        assert_eq!(
+            action_text(
+                "Save /tmp/mcp__a__save_item and mcp__a__save_item.txt; call `mcp__a__save_item`"
+            ),
+            "Save /tmp/mcp__a__save_item and mcp__a__save_item.txt; call `save item`"
+        );
+    }
+
+    #[test]
+    fn action_references_before_sentence_periods_keep_content_boundaries() {
+        for ending in [
+            ".",
+            ". Next action.",
+            ".\nNext action.",
+            ".\"",
+            ".)",
+            ".]",
+            ".}",
+            ".'",
+        ] {
+            assert_eq!(
+                action_text(&format!("Called mcp__acme__send_message{ending}")),
+                format!("Called send message{ending}")
+            );
+        }
+        for content in [
+            "mcp__acme__send_message.json",
+            "mcp__acme__send_message.backup.txt",
+            "./mcp__acme__send_message",
+            "/tmp/mcp__acme__send_message.json",
+            "https://example.com/mcp__acme__send_message",
+        ] {
+            assert_eq!(action_text(content), content);
+        }
+    }
+
+    // @spec plain-action-wording: all metadata consumers share content boundaries.
+    #[test]
+    fn shared_metadata_references_preserve_content_boundaries() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/vectors/user-action-wording.json"))
+                .unwrap();
+        for vector in vectors["metadata_references"].as_array().unwrap() {
+            assert_eq!(
+                action_text(vector["summary"].as_str().unwrap()),
+                vector["display"].as_str().unwrap(),
+                "{vector}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_tool_and_failed_side_effect_keep_warning_information() {
+        let mut printer = TurnPrinter::default();
+        let event = OutboundEvent::SideEffectFlag {
+            version: v(),
+            tool: None,
+            detail: Some("check before retry".into()),
+            call_id: None,
+            arguments: None,
+            result: None,
+            failed: Some(true),
+            redacted: None,
+        };
+        assert_eq!(
+            part_text(printer.part_for(&event)),
+            "  !  possible change via action: check before retry"
+        );
     }
 
     #[test]

@@ -346,7 +346,7 @@ class _StubClient(AgentMailClient):
             return 200, {"thread_id": thread_id, "messages": list(self.thread_messages)}
         return self.thread_status, self.thread_body
 
-    def reply(self, message_id: str, text: str) -> tuple[int, Any]:
+    def reply(self, message_id: str, text: str, *, reply_all: bool = False) -> tuple[int, Any]:
         self.replies.append((message_id, text))
         return 200, {"message_id": "sent-1"}
 

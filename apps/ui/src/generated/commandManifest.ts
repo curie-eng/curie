@@ -2532,7 +2532,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Takes effect at the next sandbox boot",
+              "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Off stops saving only: stored agent and channel memory stays readable. Takes effect at the next sandbox boot",
               "id": "memory_writes",
               "long": "memory-writes",
               "positional": false,
@@ -2849,7 +2849,7 @@ export const commandManifest = {
           "name": "callers"
         },
         {
-          "about": "Set an agent's daily budget (`PUT /agents/{id}/budget`)",
+          "about": "Update an agent's budget, preserving unspecified limits",
           "args": [
             {
               "global": false,
@@ -2864,7 +2864,15 @@ export const commandManifest = {
               "id": "limit",
               "long": "limit",
               "positional": false,
-              "required": true
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Output token cap for each run. Must be > 0",
+              "id": "output_tokens",
+              "long": "output-tokens",
+              "positional": false,
+              "required": false
             },
             {
               "default_values": [
@@ -4354,6 +4362,160 @@ export const commandManifest = {
           "name": "github-app"
         },
         {
+          "about": "Turn on the GitHub factory intake (label or mention triggers, repo allowlist, GitHub API egress) on an existing release",
+          "args": [
+            {
+              "global": false,
+              "help": "Select polling or webhook intake. Omit to keep the recorded mode",
+              "id": "intake",
+              "long": "intake",
+              "positional": false,
+              "possible_values": [
+                "poll",
+                "webhook"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`",
+              "id": "repos",
+              "long": "repo",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Issue label that hands an issue to the factory. Required (here or already recorded on the release); no whitespace, 50 chars max",
+              "id": "label",
+              "long": "label",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "GitHub App login (the app slug, no '@', e.g. `my-app-slug`) whose comment mention hands an issue to the factory. Required (here or already recorded on the release)",
+              "id": "mention",
+              "long": "mention",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Public base URL the factory links its progress cards to",
+              "id": "card_base_url",
+              "long": "card-base-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "File holding the GitHub webhook secret. Alternatively set CURIE_GITHUB_WEBHOOK_SECRET; never both. The secret never enters argv",
+              "id": "webhook_secret_file",
+              "long": "webhook-secret-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Give this agent egress to the GitHub API ranges published at <api>/meta (port 443). Repeatable",
+              "id": "github_api_egress",
+              "long": "github-api-egress",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Turn the factory intake off; changes nothing else",
+              "id": "disable",
+              "long": "disable",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The factory GitHub App's numeric App ID. Pair with --private-key-file. Without both, and with no App recorded on the release, the command prints the App registration link and applies nothing. Mention, allowlist, and label default from the App",
+              "id": "app_id",
+              "long": "app-id",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "File holding the App's PEM private key. Stored in a Kubernetes Secret through kubectl stdin; the key never enters argv",
+              "id": "private_key_file",
+              "long": "private-key-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the registration link for this GitHub organization instead of your personal account",
+              "id": "org",
+              "long": "org",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Helm `--timeout` in seconds for the upgrade. Default: the release's own drain contract, the `curie.ai/minimum-helm-timeout-seconds` annotation on its pre-upgrade worker drain hook (worker deliveryBudgetSeconds + reserve + Job and grace slack), never below 900. A factory install with a 10800s budget needs about 21900s",
+              "id": "timeout",
+              "long": "timeout",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Helm chart. Default: the version-pinned chart release asset on release builds; local `charts/curie` on dev builds. Pass a path or ref to override",
+              "id": "chart",
+              "long": "chart",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the commands that would run and exit without executing",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "factory"
+        },
+        {
           "about": "Drive the deployed Kubernetes release end to end with zero Slack contact",
           "args": [
             {
@@ -4897,7 +5059,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Target environment. Defaults to dev; a `--target` supplies it instead, and an explicit value here still wins over the target",
+              "help": "Target environment. Infers the sole active deployment on redeploy, or defaults to dev on a first deploy. A `--target` supplies it instead, and an explicit value wins over the target",
               "id": "env",
               "long": "env",
               "positional": false,
@@ -5176,7 +5338,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Takes effect at the next sandbox boot",
+              "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Off stops saving only: stored agent and channel memory stays readable. Takes effect at the next sandbox boot",
               "id": "memory_writes",
               "long": "memory-writes",
               "positional": false,
@@ -5680,7 +5842,7 @@ export const commandManifest = {
           "name": "channel-token"
         },
         {
-          "about": "Set an agent's budget via the platform API (`PUT /agents/{id}/budget`)",
+          "about": "Update an agent's budget, preserving unspecified limits",
           "args": [
             {
               "global": false,
@@ -5695,7 +5857,15 @@ export const commandManifest = {
               "id": "limit",
               "long": "limit",
               "positional": false,
-              "required": true
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Output token cap for each run (BudgetConfig.max_output_tokens_per_run). Must be > 0",
+              "id": "output_tokens",
+              "long": "output-tokens",
+              "positional": false,
+              "required": false
             },
             {
               "env": "CURIE_API_URL",
@@ -6786,7 +6956,158 @@ export const commandManifest = {
       ]
     },
     {
+      "about": "Bring up Curie and the dark factory without a webhook or a tunnel",
+      "hidden": false,
+      "name": "factory",
+      "subcommands": [
+        {
+          "about": "Create a cluster when none is targeted, install Curie, register the GitHub App, and on the second run deploy the published dark factory. Never opens a browser and never runs gh",
+          "args": [
+            {
+              "global": false,
+              "help": "GitHub repository the factory may work in, as owner/name",
+              "id": "repo",
+              "long": "repo",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Numeric GitHub App ID. Pair with --private-key-file. Without both, the command prints the registration link and exits after cluster up",
+              "id": "app_id",
+              "long": "app-id",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "PEM private key downloaded from the App. The path is passed through; the key contents never enter argv",
+              "id": "private_key_file",
+              "long": "private-key-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Kubernetes context. When omitted, the current kubeconfig context is used. When neither exists, a kind cluster is created",
+              "id": "context",
+              "long": "context",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the registration link for this GitHub organization instead of a personal account",
+              "id": "org",
+              "long": "org",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-factory"
+              ],
+              "global": false,
+              "help": "Kind cluster name used only when no kube context is targeted",
+              "id": "kind_name",
+              "long": "kind-name",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "z-ai/glm-5.3-flash"
+              ],
+              "global": false,
+              "help": "Model id installed by cluster up",
+              "id": "model",
+              "long": "model",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "3600"
+              ],
+              "global": false,
+              "help": "Per run execution deadline in seconds for the deployed agent",
+              "id": "execution_deadline",
+              "long": "execution-deadline",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "5"
+              ],
+              "global": false,
+              "help": "Daily USD budget for the deployed agent",
+              "id": "budget",
+              "long": "budget",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Helm chart. Default: the version pinned chart on release builds; local charts/curie on dev builds",
+              "id": "chart",
+              "long": "chart",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the steps and exit without creating a cluster or applying anything",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "quickstart"
+        }
+      ]
+    },
+    {
       "about": "Install a complete first party example workflow",
+      "args": [
+        {
+          "global": true,
+          "help": "Kubernetes context for every helm and kubectl call. Defaults to the kubeconfig current-context, which is resolved once and pinned",
+          "id": "context",
+          "long": "context",
+          "positional": false,
+          "required": false
+        }
+      ],
       "hidden": false,
       "name": "example",
       "subcommands": [
@@ -6808,7 +7129,19 @@ export const commandManifest = {
                     "true",
                     "false"
                   ],
-                  "required": true
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Install only the observability stack; do not change the Curie release or deploy the bot",
+                  "id": "observability_only",
+                  "long": "observability-only",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
                 },
                 {
                   "global": false,
@@ -6836,7 +7169,7 @@ export const commandManifest = {
                   "id": "approvers",
                   "long": "approvers",
                   "positional": false,
-                  "required": true
+                  "required": false
                 },
                 {
                   "global": false,
@@ -6895,6 +7228,67 @@ export const commandManifest = {
               ],
               "hidden": false,
               "name": "install"
+            },
+            {
+              "about": "Render the deployable SRE bot bundle without changing a cluster",
+              "args": [
+                {
+                  "global": false,
+                  "help": "New directory where the runtime bundle will be written; existing paths are refused",
+                  "id": "out",
+                  "long": "out",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Include the gated platform-upgrade connector and rendered manifests",
+                  "id": "platform_upgrade",
+                  "long": "platform-upgrade",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the Curie release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name of the Curie install. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "observability"
+                  ],
+                  "global": false,
+                  "help": "Kubernetes namespace of the retained observability stack. Default: observability",
+                  "id": "observability_namespace",
+                  "long": "observability-namespace",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "render"
             },
             {
               "about": "Provision the observability stack on an existing Curie release and require the Grafana connector token. Does not install the platform and does not deploy the SRE bot",
@@ -6958,6 +7352,28 @@ export const commandManifest = {
               "name": "provision-observability"
             }
           ]
+        },
+        {
+          "about": "Work with the dark-factory example bundle",
+          "hidden": false,
+          "name": "dark-factory",
+          "subcommands": [
+            {
+              "about": "Write the dark-factory bundle into a new or empty directory. Touches no cluster",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Directory to write the bundle into. Must not exist or be empty",
+                  "id": "out",
+                  "long": "out",
+                  "positional": false,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "render"
+            }
+          ]
         }
       ]
     },
@@ -7018,7 +7434,7 @@ export const commandManifest = {
         },
         {
           "global": false,
-          "help": "Target environment. Defaults to dev; a `--target` supplies it instead, and an explicit value here still wins over the target",
+          "help": "Target environment. Defaults to dev",
           "id": "env",
           "long": "env",
           "positional": false,
@@ -7072,7 +7488,7 @@ export const commandManifest = {
         },
         {
           "global": false,
-          "help": "Push a multi-platform index to this registry (e.g. ghcr.io/acme-corp)",
+          "help": "Push every declared platform (or the `--platform` subset) to this registry (e.g. ghcr.io/acme-corp)",
           "id": "registry",
           "long": "registry",
           "positional": false,
@@ -7096,6 +7512,14 @@ export const commandManifest = {
             "true",
             "false"
           ],
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Push only these declared platforms (repeatable; requires `--registry`), e.g. the one architecture a laptop cluster runs. The default Docker driver can push a single platform; a multi-platform push needs a docker-container builder. Without `--registry` the build is the host platform only, so `--platform` is refused there",
+          "id": "platform",
+          "long": "platform",
+          "positional": false,
           "required": false
         }
       ],

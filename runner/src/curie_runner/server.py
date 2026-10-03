@@ -30,15 +30,17 @@ from __future__ import annotations
 import contextlib
 import hmac
 import inspect
+import json
 import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from types import MappingProxyType
 from typing import TypedDict, cast
 
-from aci_protocol import Event, Interrupt, parse_inbound
+from aci_protocol import TOOL_ACCESS_STATUS_FIELD, Event, Interrupt, parse_inbound
 from aiohttp import web
 from aiohttp.typedefs import Handler, Middleware
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
+from pydantic import ValidationError
 
 from .session import SessionRunner
 from .turn_progress import ProgressCapability
@@ -192,6 +194,8 @@ async def _status(request: web.Request) -> web.Response:
         "ready": runner.ready,
         "turn_active": runner.turn_active,
         "history_durable": runner.history_durable,
+        # @spec RUNNER-TOOL-ACCESS-5: credential-free, so on both status routes.
+        TOOL_ACCESS_STATUS_FIELD: list(runner.enforced_tool_access),
     }
     if request.path == "/v1/status":
         body["turn_epoch"] = runner.active_turn_epoch
@@ -235,6 +239,25 @@ def _parse(body: object) -> Event | Interrupt:
     return cast("Event | Interrupt", parse_inbound(cast("dict[str, object]", body)))
 
 
+def _frame_error(exc: Exception) -> str:
+    """Why a frame was refused, without repeating any input value.
+
+    A rejected frame may carry a secret (``Event.memory_token``, MEMORY-TOKEN-3),
+    and pydantic's default message echoes each failing field's input, which for
+    a whole-object error is the whole frame. So a validation error is rendered
+    as location and reason only, and anything else as its type name."""
+
+    if isinstance(exc, ValidationError):
+        parts = [
+            f"{'.'.join(str(p) for p in err.get('loc', ())) or '<frame>'}: {err.get('msg', '')}"
+            for err in exc.errors(include_input=False, include_url=False, include_context=False)
+        ]
+        return "; ".join(parts) or "validation failed"
+    if isinstance(exc, json.JSONDecodeError):
+        return f"body is not JSON: {exc.msg}"
+    return type(exc).__name__
+
+
 async def _event(request: web.Request) -> web.StreamResponse:
     runner: SessionRunner = request.app[RUNNER]
     admission_header = request.headers.get(_CAPACITY_ADMISSION_HEADER)
@@ -243,7 +266,9 @@ async def _event(request: web.Request) -> web.StreamResponse:
     try:
         frame = _parse(await request.json())
     except Exception as exc:  # noqa: BLE001 - map any decode/validation error to 400
-        return web.json_response({"error": f"invalid event frame: {exc}"}, status=400)
+        return web.json_response(
+            {"error": f"invalid event frame: {_frame_error(exc)}"}, status=400
+        )
     if not isinstance(frame, Event):
         return web.json_response(
             {"error": "expected an event frame; use /v1/interrupt for interrupts"},
@@ -288,11 +313,22 @@ async def _steer(request: web.Request) -> web.Response:
     try:
         frame = _parse(await request.json())
     except Exception as exc:  # noqa: BLE001
-        return web.json_response({"error": f"invalid steer frame: {exc}"}, status=400)
+        return web.json_response(
+            {"error": f"invalid steer frame: {_frame_error(exc)}"}, status=400
+        )
     if not isinstance(frame, Event):
         return web.json_response({"error": "expected an event frame"}, status=400)
 
-    delivered = await runner.steer(frame.text, event=frame)
+    if runner.turn_active and (
+        frame.tool_access is not None or runner.live_tool_access is not None
+    ):
+        # @spec RUNNER-TOOL-ACCESS-4: a restricted turn takes no steer, and a
+        # restricted steer joins no turn; the caller opens its own turn instead.
+        return web.json_response(
+            {"error": "a restricted turn takes no steer; open a new /v1/event"},
+            status=409,
+        )
+    delivered = await runner.steer(frame.text, event=frame, tool_access=frame.tool_access)
     if not delivered:
         return web.json_response(
             {"error": "no active turn to steer; open a new /v1/event"}, status=409
@@ -305,7 +341,9 @@ async def _interrupt(request: web.Request) -> web.Response:
     try:
         frame = _parse(await request.json())
     except Exception as exc:  # noqa: BLE001
-        return web.json_response({"error": f"invalid interrupt frame: {exc}"}, status=400)
+        return web.json_response(
+            {"error": f"invalid interrupt frame: {_frame_error(exc)}"}, status=400
+        )
     if not isinstance(frame, Interrupt):
         return web.json_response({"error": "expected an interrupt frame"}, status=400)
 

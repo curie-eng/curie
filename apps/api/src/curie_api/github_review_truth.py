@@ -180,7 +180,9 @@ async def verify_feedback_truth(
         or base.get("ref") != lineage.base_ref
         or not isinstance(pr.get("html_url"), str)
         or pr["html_url"].casefold()
-        != f"https://github.com/{lineage.repo_full_name}/pull/{lineage.pr_number}".casefold()
+        != (
+            f"{settings.github_html_base}/{lineage.repo_full_name}/pull/{lineage.pr_number}"
+        ).casefold()
         or head.get("ref") != lineage.branch
     ):
         raise FeedbackIgnored("pull_request_mismatch")
@@ -241,7 +243,12 @@ async def verify_feedback_truth(
     else:
         canonical["pull_request"] = pr
         canonical["review" if feedback.event == "pull_request_review" else "comment"] = current
-    observed = parse_feedback(feedback.event, canonical, str(feedback.delivery_id))
+    observed = parse_feedback(
+        feedback.event,
+        canonical,
+        str(feedback.delivery_id),
+        github_html_base=settings.github_html_base,
+    )
     # Repository spelling may differ in a signed payload; it is case-insensitive
     # identity. The canonical URL retained for the model comes from our lineage.
     # author_association is a descriptive claim GitHub recomputes per read (a

@@ -14,9 +14,8 @@
 #   (c) NEGATIVE, schema: a mode outside the three (wrong case, a near miss,
 #       another word, empty, a number, a boolean) fails the render, and the
 #       output names the knob.
-#   (d) NEGATIVE, explicit null: Helm drops a nil key before schema
-#       validation, so no schema can see it; the template's own `required`
-#       refuses it and names the knob.
+#   (d) NULL: Helm drops a nil key before schema validation, so the
+#       template supplies the default used by a prior release's retained values.
 #   (e) RESERVED: worker.extraEnv cannot set CURIE_TURN_RECEIPT beside the
 #       value; the chart-owned refusal names worker.turnReceipt.
 #   (f) ONE CONSUMER: across the whole render the name appears on the worker
@@ -25,8 +24,8 @@
 #
 # Schema wording is not asserted, only helm's exit status and the bare knob
 # name, which is the one token every helm version prints (the reasoning is in
-# the header of worker-ttl-bounds-assertions.sh). The (d) and (e) refusals are
-# chart-owned text, so they are asserted by what they name.
+# the header of worker-ttl-bounds-assertions.sh). The (e) refusal is chart-owned
+# text, so it is asserted by what it names.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly.
 set -euo pipefail
@@ -129,8 +128,8 @@ assert_refused c turnReceipt --set-string "worker.turnReceipt="
 assert_refused c turnReceipt --set "worker.turnReceipt=1"
 assert_refused c turnReceipt --set "worker.turnReceipt=false"
 
-# (d) An explicit null never reaches the schema; the template refuses it.
-assert_refused d worker.turnReceipt --set "worker.turnReceipt=null"
+# (d) An explicit null is coalesced away and takes the upgrade-safe default.
+assert_mode d all --set "worker.turnReceipt=null"
 
 # (e) The name is chart owned, so extraEnv cannot shadow the value.
 assert_refused e CURIE_TURN_RECEIPT \

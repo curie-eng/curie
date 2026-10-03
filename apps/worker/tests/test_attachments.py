@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from aci_protocol import Attachment
+from aci_protocol import Attachment, ReplyHandle
 
 # importlib import mode does not add this test directory to sys.path.
 sys.path.insert(0, str(Path(__file__).parent))
@@ -1067,3 +1067,336 @@ def test_unique_attachment_leaf_keeps_the_extension_readable(
     attachments: Any, leaf: str, expected: str
 ) -> None:
     assert attachments.unique_attachment_leaf(leaf, {leaf}) == expected
+
+
+# --- A channel-port binding: the file comes from the adapter that sent it -----
+#
+# ADR-0153 decision 3 (#3678). A turn that arrived through ``POST
+# /channels/turns`` carries references only its own adapter can resolve, so the
+# worker asks that adapter: ``GET {binding.endpoint}/attachments/{id}`` with the
+# secret it already authenticates reply events with (``CURIE_ADAPTER_CREDENTIALS``
+# keyed by the binding's ``adapter``, sent as ``X-Curie-Adapter-Secret``). The
+# adapter is the external service here, so it is a real loopback HTTP server
+# where the test is about the request on the wire, and a stand-in transport
+# where it is about what the lane does with an answer.
+
+_ADAPTER_SECRET = "adapter-secret-placeholder"
+_OTHER_ADAPTER_SECRET = "other-adapter-secret-placeholder"
+
+
+def _email_handle(
+    endpoint: str | None = "http://mail-adapter.example.test:8080/curie/",
+    adapter: str | None = "mail-adapter",
+) -> ReplyHandle:
+    return ReplyHandle(
+        kind="email",
+        channel="inbox@example.test",
+        placeholder="msg-ref-1",
+        endpoint=endpoint,
+        adapter=adapter,
+    )
+
+
+def _channel_coordinator(
+    module: Any,
+    *,
+    transport: Any = None,
+    slack: FakeSlackFiles | None = None,
+    bounds: Any | None = None,
+    credentials: dict[str, str] | None = None,
+) -> tuple[Any, RetainingObjectStore]:
+    store = RetainingObjectStore()
+    client_kwargs: dict[str, Any] = {
+        "credentials": (
+            credentials
+            if credentials is not None
+            else {"mail-adapter": _ADAPTER_SECRET, "other-adapter": _OTHER_ADAPTER_SECRET}
+        )
+    }
+    if transport is not None:
+        client_kwargs["transport"] = transport
+    coordinator = module.AttachmentCoordinator(
+        files=slack if slack is not None else FakeSlackFiles(),
+        channel_files=module.ChannelPortFileClient(**client_kwargs),
+        objects=store,
+        limits=bounds or limits(module),
+        clock=MovableClock(),
+    )
+    return coordinator, store
+
+
+def _resolve_for(coordinator: Any, refs: list[Attachment], handle: ReplyHandle) -> Any:
+    return coordinator.resolve(
+        thread_key="email:inbox%40example.test:thread-1",
+        agent_id=AGENT_ID,
+        attachments=refs,
+        generation="gen-1",
+        handle=handle,
+    )
+
+
+class _RecordingTransport:
+    """Answers every request with one canned response and records it."""
+
+    def __init__(self, module: Any, *, status: int = 200, chunks: list[bytes] | None = None):
+        self._module = module
+        self._status = status
+        self._chunks = chunks if chunks is not None else [b"file-bytes"]
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, **request: Any) -> Any:
+        self.calls.append(request)
+        return self._module.SlackFileResponse(
+            status=self._status,
+            headers={"Content-Type": "application/octet-stream"},
+            chunks=iter(self._chunks),
+        )
+
+
+class _LoopbackAdapter:
+    """A real HTTP server playing the adapter's attachment endpoint.
+
+    It serves ``files`` (raw request path -> bytes) to a caller presenting
+    ``secret``, answers 401 to anyone else and 404 for a path it does not hold,
+    and records every request exactly as it arrived.
+    """
+
+    def __init__(self, files: dict[str, bytes], secret: str) -> None:
+        received: list[dict[str, Any]] = []
+        self.received = received
+
+        class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler's contract)
+                received.append({"path": self.path, "headers": dict(self.headers.items())})
+                if self.headers.get("X-Curie-Adapter-Secret") != secret:
+                    status, body = 401, b'{"detail":"missing or invalid credential"}'
+                elif self.path in files:
+                    status, body = 200, files[self.path]
+                else:
+                    status, body = 404, b'{"detail":"not found"}'
+                self.send_response(status)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._server.daemon_threads = True
+        self.port = int(self._server.server_address[1])
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def __enter__(self) -> _LoopbackAdapter:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+@pytest.fixture
+def no_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Loopback only: a developer's ambient proxy must not decide where it goes.
+    for var in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("no_proxy", "*")
+    monkeypatch.setenv("NO_PROXY", "*")
+
+
+def test_a_channel_port_file_is_fetched_from_its_adapter_with_that_adapters_secret(
+    attachments: Any, no_proxy: None
+) -> None:
+    """ADR-0153 decision 3, observed on the wire.
+
+    The request goes to the binding's own endpoint (trailing slash or not),
+    under ``/attachments/``, carrying the secret configured for the binding's
+    ``adapter`` and not another adapter's. The id stays the adapter's: a ``/``
+    it minted is kept, and characters that would otherwise end the path are
+    percent-encoded so the adapter decodes the id it sent. The secret
+    authenticates that one request and reaches nothing the sandbox sees.
+    """
+
+    pdf = b"%PDF-1.7 report figures"
+    notes = b"meeting notes"
+    with _LoopbackAdapter(
+        {
+            "/curie/attachments/msg-1/att-1": pdf,
+            "/curie/attachments/msg-1/att%202%3F%23": notes,
+        },
+        _ADAPTER_SECRET,
+    ) as adapter:
+        slack = FakeSlackFiles()
+        coordinator, objects = _channel_coordinator(attachments, slack=slack)
+        prepared = _resolve_for(
+            coordinator,
+            [_ref("msg-1/att-1", "report.pdf"), _ref("msg-1/att 2?#", "notes.txt")],
+            _email_handle(endpoint=f"http://127.0.0.1:{adapter.port}/curie/"),
+        )
+
+    assert [call["path"] for call in adapter.received] == [
+        "/curie/attachments/msg-1/att-1",
+        "/curie/attachments/msg-1/att%202%3F%23",
+    ]
+    assert {call["headers"].get("X-Curie-Adapter-Secret") for call in adapter.received} == {
+        _ADAPTER_SECRET
+    }, "each request must carry the binding's own adapter secret"
+    assert slack.requested == [], "a channel-port reference must never be looked up in Slack"
+    assert [objects.objects[key] for key in prepared.object_keys] == [pdf, notes]
+    assert [ref.sha256 for ref in prepared.refs] == [
+        hashlib.sha256(pdf).hexdigest(),
+        hashlib.sha256(notes).hexdigest(),
+    ]
+    exposed = [
+        *prepared.object_keys,
+        *prepared.claim_env().values(),
+        *(ref.url for ref in prepared.refs),
+    ]
+    assert not [value for value in exposed if _ADAPTER_SECRET in value]
+
+
+def test_a_slack_binding_still_fetches_through_the_slack_client(attachments: Any) -> None:
+    """The other half of the selection: every Slack install must see no change."""
+
+    transport = _RecordingTransport(attachments)
+    slack = FakeSlackFiles({"F1": [b"slack-bytes"]})
+    coordinator, objects = _channel_coordinator(attachments, transport=transport, slack=slack)
+
+    prepared = _resolve_for(
+        coordinator,
+        [_ref("F1", "report.csv")],
+        ReplyHandle(kind="slack", channel="C1", placeholder="p-1"),
+    )
+
+    assert slack.requested == ["F1"]
+    assert transport.calls == [], "a Slack file must not be requested from an adapter endpoint"
+    assert objects.objects[prepared.object_keys[0]] == b"slack-bytes"
+
+
+def test_an_id_the_adapter_does_not_hold_refuses_the_turn_and_parks_nothing(
+    attachments: Any, no_proxy: None
+) -> None:
+    """Negative: an unknown id is a 404, and the set is refused, not shrunk.
+
+    A resolve that skipped the missing file would boot the agent with the
+    others and no hint that one was lost, which is the silent drop #3678 is
+    about. The refusal is the Slack path's: ``AttachmentFetchError`` naming the
+    file, nothing stored, nothing minted. The kernel turns it into the "could
+    not make that file available" reply.
+    """
+
+    with _LoopbackAdapter(
+        {"/curie/attachments/known": b"known-bytes"}, _ADAPTER_SECRET
+    ) as adapter:
+        coordinator, objects = _channel_coordinator(attachments)
+        with pytest.raises(attachments.AttachmentFetchError) as refusal:
+            _resolve_for(
+                coordinator,
+                [_ref("known", "first.txt"), _ref("deleted", "second.txt")],
+                _email_handle(endpoint=f"http://127.0.0.1:{adapter.port}/curie"),
+            )
+
+    assert [call["path"] for call in adapter.received] == [
+        "/curie/attachments/known",
+        "/curie/attachments/deleted",
+    ]
+    assert "second.txt" in str(refusal.value)
+    assert "404" in str(refusal.value)
+    assert objects.objects == {}, "the first file's bytes survived a refused set"
+    # As on the Slack path: a capability minted for the first file is returned
+    # to nobody, and it must not point at anything that still exists.
+    assert all(key not in objects.objects for key, _ttl in objects.signed)
+
+
+@pytest.mark.parametrize("status", [401, 302, 500])
+def test_any_non_200_from_the_adapter_refuses_the_file(attachments: Any, status: int) -> None:
+    """A rejected credential, a redirect (whose target would receive the secret
+    if followed) and an adapter fault all refuse; none is stored as the file."""
+
+    transport = _RecordingTransport(attachments, status=status, chunks=[b"<html>not the file"])
+    coordinator, objects = _channel_coordinator(attachments, transport=transport)
+
+    with pytest.raises(attachments.AttachmentFetchError) as refusal:
+        _resolve_for(coordinator, [_ref("att-1", "report.pdf")], _email_handle())
+
+    assert str(status) in str(refusal.value)
+    assert objects.objects == {}
+    assert objects.signed == []
+
+
+def test_an_adapter_file_over_the_cap_is_refused_at_the_crossing_chunk(attachments: Any) -> None:
+    """Negative: the per-file cap applies to an adapter's bytes exactly as to
+    Slack's, enforced while streaming."""
+
+    transport = _RecordingTransport(attachments, chunks=chunked(b"x" * 64, 16))
+    coordinator, objects = _channel_coordinator(
+        attachments,
+        transport=transport,
+        bounds=limits(attachments, max_file_bytes=32, read_chunk_bytes=16),
+    )
+
+    with pytest.raises(attachments.AttachmentTooLargeError) as refusal:
+        _resolve_for(coordinator, [_ref("att-1", "huge.bin")], _email_handle())
+
+    assert "huge.bin" in str(refusal.value)
+    assert objects.objects == {}
+    assert objects.signed == []
+
+
+@pytest.mark.parametrize(
+    ("handle", "credentials", "stage"),
+    [
+        # The binding's adapter has no secret on this worker: the adapter would
+        # rightly answer 401, so say which credential is missing instead.
+        (_email_handle(adapter="unconfigured-adapter"), None, "credential"),
+        # No endpoint: there is nowhere to ask, and inventing one is worse.
+        (_email_handle(endpoint=None), None, "wiring"),
+        # A handle with no adapter cannot select a secret at all.
+        (_email_handle(adapter=None), None, "credential"),
+    ],
+)
+def test_a_binding_the_worker_cannot_authenticate_to_is_refused_before_any_request(
+    attachments: Any,
+    handle: ReplyHandle,
+    credentials: dict[str, str] | None,
+    stage: str,
+) -> None:
+    transport = _RecordingTransport(attachments)
+    coordinator, objects = _channel_coordinator(
+        attachments, transport=transport, credentials=credentials
+    )
+
+    with pytest.raises(attachments.AttachmentResolutionError) as refusal:
+        _resolve_for(coordinator, [_ref("att-1", "report.pdf")], handle)
+
+    assert refusal.value.stage == stage
+    assert transport.calls == []
+    assert objects.objects == {}
+
+
+def test_a_channel_port_turn_on_a_worker_with_no_adapter_credentials_is_refused(
+    attachments: Any,
+) -> None:
+    """A Slack-only worker has no channel-port client. An email turn's file is
+    refused by name there, and its id is never sent to Slack."""
+
+    slack = FakeSlackFiles({"att-1": [b"wrong-source"]})
+    coordinator = attachments.AttachmentCoordinator(
+        files=slack,
+        objects=RetainingObjectStore(),
+        limits=limits(attachments),
+        clock=MovableClock(),
+    )
+
+    with pytest.raises(attachments.AttachmentResolutionError) as refusal:
+        _resolve_for(coordinator, [_ref("att-1", "report.pdf")], _email_handle())
+
+    assert refusal.value.stage == "credential"
+    assert "email" in str(refusal.value)
+    assert slack.requested == []

@@ -305,6 +305,66 @@ fn weather_case_fails_when_fetch_capability_is_removed() {
 }
 
 #[test]
+fn sre_rollout_case_requires_two_replica_set_reads() {
+    // ToolNote exposes tool names, not call arguments or MCP results. The
+    // example's static test pins distinct old/new identities in the prompt;
+    // this integration test only proves the evaluator requires two calls.
+    let evals = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/sre-bot/evals/rollout");
+    let cases_path = evals.join("cases.json");
+    let cases = std::fs::read(&cases_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", cases_path.display()));
+    let suite: serde_json::Value = serde_json::from_slice(&cases).expect("parse rollout cases");
+    let case = &suite["cases"][0];
+    let input = case["input"].as_str().expect("rollout input").to_string();
+    assert!(
+        !input.contains("spec.template"),
+        "diff must not be pre-supplied"
+    );
+    assert!(!input.contains("exit 1"), "cause must not be pre-supplied");
+    let case_id = case["id"].as_str().expect("rollout case id");
+    let trajectory_path = evals.join("trajectory.json");
+    let trajectory: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&trajectory_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", trajectory_path.display())),
+    )
+    .expect("parse rollout trajectory");
+    let specs = trajectory["specs"].clone();
+    let get = "mcp__kubernetes__resources_get".to_string();
+
+    let (complete_bundle, _) = write_bundle(&cases, specs.clone());
+    let complete_server = runner(
+        BTreeMap::from([(input.clone(), vec![get.clone(), get.clone()])]),
+        BTreeMap::from([(input.clone(), "The templates differ.".to_string())]),
+    );
+    let complete = skill_eval(complete_bundle.path(), &complete_server);
+    assert!(
+        complete.status.success(),
+        "two reads must pass\n{}",
+        output_text(&complete)
+    );
+    assert_eq!(
+        case_result(&parsed_output(&complete), case_id)["passed"],
+        true
+    );
+
+    let (one_read_bundle, _) = write_bundle(&cases, specs);
+    let one_read_server = runner(
+        BTreeMap::from([(input.clone(), vec![get])]),
+        BTreeMap::from([(input, "The templates differ.".to_string())]),
+    );
+    let one_read = skill_eval(one_read_bundle.path(), &one_read_server);
+    assert!(
+        !one_read.status.success(),
+        "one read must fail\n{}",
+        output_text(&one_read)
+    );
+    assert_eq!(
+        case_result(&parsed_output(&one_read), case_id)["passed"],
+        false
+    );
+}
+
+#[test]
 fn skill_eval_replays_the_shared_five_mode_trajectory_vectors() {
     let vectors = vectors().vectors;
     let modes = vectors

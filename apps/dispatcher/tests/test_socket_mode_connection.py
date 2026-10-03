@@ -67,7 +67,15 @@ class _RecordingHandler:
     def __init__(self, app: App, app_token: str) -> None:
         del app, app_token
         self.events: list[str] = []
-        self.client = type("Client", (), {"message_listeners": []})()
+        self.client = type(
+            "Client",
+            (),
+            {
+                "message_listeners": [],
+                "connect": lambda _self: None,
+                "is_connected": lambda _self: False,
+            },
+        )()
         self.during_connect: Any = None
 
     def connect(self) -> None:

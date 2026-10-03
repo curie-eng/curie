@@ -880,9 +880,9 @@ def install_values(
                 }
             )
         values["agentSandbox"]["runner"]["extraEnv"] = extra_env
-        # The chart maximum, so the agent's 10800 s execution deadline and not
-        # the default 600 s worker budget bounds the run. The runner ceiling
-        # must not exceed the delivery budget.
+        # The chart default is already 10800. This assignment pins the harness
+        # to EXECUTION_BOUND_SECONDS so a later default change cannot shorten
+        # it. The runner ceiling must not exceed the delivery budget.
         values["worker"]["deliveryBudgetSeconds"] = EXECUTION_BOUND_SECONDS
         values["worker"]["runnerTotalTimeoutSeconds"] = EXECUTION_BOUND_SECONDS
     if sandbox_pod_quota is not None:

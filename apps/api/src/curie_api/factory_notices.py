@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 import uuid
 from dataclasses import dataclass
@@ -35,7 +36,7 @@ from typing import Any, Literal
 from urllib.parse import quote
 
 import httpx
-from sqlalchemy import and_, case, exists, func, literal, or_, select
+from sqlalchemy import and_, case, exists, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from starlette.concurrency import run_in_threadpool
@@ -69,6 +70,7 @@ _SECOND_LIST_OFFSET = 1_000_000
 @dataclass(frozen=True)
 class _MarkerScan:
     comment_id: int | None = None
+    body: str | None = None
     refusal: str | None = None
     unavailable: bool = False
     next_page: int | None = None
@@ -90,11 +92,12 @@ _CAUSE_TEXT = {
         "the provider limit."
     ),
     "model_error": "the model provider returned an error the run could not recover from.",
-    "budget_exceeded": (
-        "the run reached its output token limit or USD cap before it finished. "
-        "To raise the USD cap, run `curie cluster budget <agent> --limit <usd>`, then retry."
-    ),
+    "budget_exceeded": "the run reached a budget limit before it finished.",
     "runner_timeout": "the run took longer than its time limit.",
+    "sandbox_terminated": (
+        "the sandbox terminated before the run finished. Check the Kubernetes "
+        "reason below, then retry after addressing the sandbox failure."
+    ),
     "workspace_error": "the repository workspace could not be prepared for the run.",
     "history_capacity": (
         "conversation history capacity exceeded. Work may have happened. "
@@ -111,8 +114,8 @@ _CAUSE_TEXT = {
     ),
     "runner_failed": "the run ended without a result.",
     "approval_create_failed": (
-        "the requested approval could not be created. Check the publication "
-        "request or approval service, then retry."
+        "the publication request was refused, so no pull request was opened. "
+        "Read the details for the reason, fix it, then retry."
     ),
     "early_stop": "the agent stopped before doing any work on the issue.",
     "no_pull_request": "the run ended without publishing a pull request.",
@@ -142,8 +145,10 @@ _CAUSE_TEXT = {
     ),
 }
 
-# The CI gate's causes (#3097) carry their own labelled lines, not a provider message.
-_CI_DETAIL_CAUSES = frozenset({"ci_failed", "ci_timeout", "ci_unverified"})
+# Infrastructure and CI causes carry details, not a provider message.
+_DETAIL_CAUSES = frozenset(
+    {"sandbox_terminated", "ci_failed", "ci_timeout", "ci_unverified", "approval_create_failed"}
+)
 # A run that ended without publishing carries the agent's own last message
 # (#3128). That text is model-authored, so it renders inert inside a code fence.
 _AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})
@@ -153,7 +158,7 @@ _AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})
 # Failed runs that still need a person, including the classes that used to
 # collapse into runner_escalated (#3401). The status card reads this set.
 NEEDS_HUMAN_CAUSES = frozenset(
-    {"runner_escalated", "unclassified", "max_turns", "ci_failed"}
+    {"runner_escalated", "sandbox_terminated", "unclassified", "max_turns", "ci_failed"}
 )
 
 
@@ -173,9 +178,16 @@ _FAILURE_CLASS_BY_CAUSE = {
     "model_error": "server-error",
     "budget_exceeded": "budget-exceeded",
     "runner_timeout": "runner-timeout",
+    "sandbox_terminated": "sandbox-terminated",
     "workspace_error": "workspace-error",
 }
 _BACKTICK_RUN = re.compile(r"`+")
+_OUTPUT_TOKEN_BUDGET_DETAIL = re.compile(
+    r"output token budget exceeded \(max_output_tokens_per_run=([1-9][0-9]{0,19})\)"
+)
+_USD_BUDGET_DETAIL = re.compile(
+    r"USD budget exceeded \(max_usd_per_day=([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)\)"
+)
 
 
 def cause_text(cause: str) -> str:
@@ -189,6 +201,69 @@ def marker_for(request_id: uuid.UUID) -> str:
 
 
 FINAL_MARKER = "<!-- curie-status:final -->"
+
+
+def _fence_for(text: str, *, minimum: int = 1) -> str:
+    """A backtick fence longer than any backtick run in ``text``."""
+
+    longest = max((len(run) for run in _BACKTICK_RUN.findall(text)), default=0)
+    return "`" * max(minimum, longest + 1)
+
+
+def code_span(value: str) -> str:
+    """``value`` as one Markdown code span, whatever backticks it carries."""
+
+    fence = _fence_for(value)
+    # A value carrying backticks is padded so its edge backticks stay literal.
+    padded = f" {value} " if len(fence) > 1 else value
+    return f"{fence}{padded}{fence}"
+
+
+def render_base_line(work_item: WorkItem) -> str | None:
+    """The status comment's ``Base:`` line (ADR 0186), or None on a legacy row."""
+
+    if work_item.base_branch is None:
+        return None
+    if work_item.base_source == "label":
+        line = (
+            f"Base: {code_span(work_item.base_branch)} "
+            f"(from label {code_span('base:' + work_item.base_branch)})"
+        )
+    else:
+        line = f"Base: {code_span(work_item.base_branch)} (deployment default)"
+    if work_item.base_label_ignored is not None:
+        line += (
+            f" Label now says {code_span('base:' + work_item.base_label_ignored)};"
+            " the recorded base is kept."
+        )
+    return line
+
+
+async def mark_status_comment_stale(session: AsyncSession, work_item_id: uuid.UUID) -> None:
+    """Let the reconciler edit the latest finalized status comment once more.
+
+    Its body carries the ignored-label note, so a change to that note must reach
+    a comment that was already finalized. The comment re-finalizes after the edit.
+    """
+
+    latest = (
+        select(ExecutionRequest.id)
+        .where(ExecutionRequest.work_item_id == work_item_id)
+        .order_by(ExecutionRequest.sequence.desc())
+        .limit(1)
+        .scalar_subquery()
+    )
+    await session.execute(
+        update(FactoryStatusComment)
+        .where(
+            FactoryStatusComment.work_item_id == work_item_id,
+            FactoryStatusComment.execution_request_id == latest,
+            FactoryStatusComment.finalized_at.is_not(None),
+            FactoryStatusComment.refused_at.is_(None),
+        )
+        .values(finalized_at=None)
+    )
+
 
 # The four state labels the pass owns (#3077, #3221). A closed set, never a
 # prefix match: human labels, including other ``curie:`` labels, are never
@@ -267,11 +342,45 @@ def result_section(
             f"Cause: {cause}\n"
         )
     else:
-        text = f"Could not complete: {cause_text(cause)}\n"
+        sentence = cause_text(cause)
+        if cause == "budget_exceeded":
+            token_budget = _OUTPUT_TOKEN_BUDGET_DETAIL.fullmatch(detail or "")
+            usd_budget = _USD_BUDGET_DETAIL.fullmatch(detail or "")
+            if token_budget is not None:
+                sentence = (
+                    "the run reached its output token limit per run "
+                    f"(max_output_tokens_per_run={token_budget[1]}) before it finished. "
+                    "To raise the output token limit, run "
+                    "`curie cluster budget <agent> --output-tokens <tokens>`, then retry."
+                )
+            elif (
+                usd_budget is not None
+                and len(usd_budget[1]) <= 32
+                and math.isfinite(usd := float(usd_budget[1]))
+                and usd > 0
+            ):
+                sentence = (
+                    "the run reached its USD cap "
+                    f"(max_usd_per_day={usd_budget[1]}) before it finished. "
+                    "To raise the USD cap, run "
+                    "`curie cluster budget <agent> --limit <usd>`, then retry."
+                )
+            else:
+                sentence = (
+                    "the run reached a budget limit before it finished, but Curie "
+                    "cannot identify which limit from the reported detail. "
+                    "Check the agent's configured budget, then retry."
+                )
+        text = f"Could not complete: {sentence}\n"
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
             text += _agent_message_block(detail.strip())
+        elif cause == "approval_create_failed" and detail is not None and detail.strip():
+            # The API refusal can quote caller-supplied paths (#3617): one line,
+            # so it cannot add a ``Cause:`` line, and no HTML comment opener.
+            inert = _break_html_comments(" ".join(detail.split()))
+            text += f"Details: {inert}\n"
         elif cause != "history_capacity" and detail is not None and detail.strip():
-            label = "Details" if cause in _CI_DETAIL_CAUSES else "Provider message"
+            label = "Details" if cause in _DETAIL_CAUSES else "Provider message"
             text += f"{label}: {detail.strip()}\n"
         text += f"Cause: {cause}\n"
         failure_class = _FAILURE_CLASS_BY_CAUSE.get(cause)
@@ -282,6 +391,10 @@ def result_section(
     return text
 
 
+def _break_html_comments(text: str) -> str:
+    return text.replace("<!--", "<\u200b!--")
+
+
 def _agent_message_block(message: str) -> str:
     """The agent's last message, fenced so GitHub renders none of it.
 
@@ -290,9 +403,8 @@ def _agent_message_block(message: str) -> str:
     broken because the marker scan reads the raw body.
     """
 
-    message = message.replace("<!--", "<\u200b!--")
-    longest = max((len(run) for run in _BACKTICK_RUN.findall(message)), default=0)
-    fence = "`" * max(3, longest + 1)
+    message = _break_html_comments(message)
+    fence = _fence_for(message, minimum=3)
     return f"Agent's last message:\n{fence}text\n{message}\n{fence}\n"
 
 
@@ -327,6 +439,7 @@ def status_body(
     result: str | None,
     paused_for_upgrade: bool = False,
     waiting_line: str | None = None,
+    base_line: str | None = None,
 ) -> str:
     """The whole status comment. A ``result`` makes it the final body.
 
@@ -350,6 +463,8 @@ def status_body(
         parts.append(waiting_line)
     if paused_for_upgrade and pill_label == "QUEUED":
         parts.append(_PAUSED_FOR_UPGRADE_LINE)
+    if base_line is not None:
+        parts.append(base_line)
     if result is not None:
         parts.append(FINAL_MARKER)
     parts.append(marker_for(request_id))
@@ -654,8 +769,7 @@ async def _render(
     waiting_line: str | None = None
     if request.status == "queued":
         waiting_line = (
-            "This revision is waiting on the current run. "
-            "It will start when that run finishes."
+            "This revision is waiting on the current run. It will start when that run finishes."
         )
     elif request.status in {"waiting", "running", "cancellation_requested"} and pending_count:
         word = "revision" if pending_count == 1 else "revisions"
@@ -669,6 +783,7 @@ async def _render(
         result=result,
         paused_for_upgrade=paused_for_upgrade,
         waiting_line=waiting_line,
+        base_line=render_base_line(work_item),
     )
 
 
@@ -930,6 +1045,7 @@ async def _find_marker(
     marker: str,
     *,
     start_page: int,
+    app_id: str | None = None,
 ) -> _MarkerScan:
     """Find a marker, or remember the next page so a later pass can continue.
 
@@ -957,23 +1073,83 @@ async def _find_marker(
             payload = listed.json()
         except ValueError:
             return _MarkerScan(unavailable=True)
-        found = _comment_id(payload, marker)
+        found = _marked_comment(payload, marker, app_id=app_id)
         if found is not None:
-            return _MarkerScan(comment_id=found)
+            return _MarkerScan(comment_id=found[0], body=found[1])
         if not isinstance(payload, list) or len(payload) < 100:
             return _MarkerScan()
         page += 1
     return _MarkerScan(next_page=page)
 
 
-def _comment_id(payload: Any, marker: str) -> int | None:
+def _marked_comment(
+    payload: Any, marker: str, *, app_id: str | None = None
+) -> tuple[int, str] | None:
+    """The first comment carrying ``marker``.
+
+    ``app_id`` None reads every author. Otherwise only comments the app with
+    that id posted count, and an empty id matches none.
+    """
+
     if not isinstance(payload, list):
         return None
     for item in payload:
         if not isinstance(item, dict):
             continue
+        if app_id is not None:
+            via = item.get("performed_via_github_app")
+            if not app_id or not isinstance(via, dict) or str(via.get("id")) != app_id:
+                continue
         body = item.get("body")
         comment_id = item.get("id")
         if isinstance(body, str) and marker in body and type(comment_id) is int:
-            return comment_id
+            return comment_id, body
     return None
+
+
+async def upsert_issue_notice(
+    client: httpx.AsyncClient,
+    *,
+    api: str,
+    repo_path: str,
+    headers: dict[str, str],
+    issue_number: int,
+    marker: str,
+    body: str,
+    app_id: str = "",
+) -> Literal["written", "unchanged", "unavailable"]:
+    """Keep one marked issue comment carrying ``body``: post it, edit it, or leave it.
+
+    The marker scan is the same one the status comment uses. A scan that could
+    not reach the end of the list is ``unavailable``, never a second post.
+    """
+
+    comments_path = f"{repo_path}/issues/{issue_number}/comments"
+    found = await _find_marker(
+        client,
+        api,
+        comments_path,
+        headers,
+        marker,
+        start_page=1,
+        app_id=app_id.strip(),
+    )
+    if found.unavailable or found.refusal is not None or found.next_page is not None:
+        return "unavailable"
+    if found.comment_id is not None:
+        if found.body == body:
+            return "unchanged"
+        try:
+            edited = await client.patch(
+                f"{api}{repo_path}/issues/comments/{found.comment_id}",
+                headers=headers,
+                json={"body": body},
+                follow_redirects=False,
+            )
+        except httpx.HTTPError:
+            return "unavailable"
+        return "written" if edited.status_code == 200 else "unavailable"
+    posted = await _post(client, f"{api}{comments_path}", headers, body)
+    if posted is None or posted[0] != "posted":
+        return "unavailable"
+    return "written"

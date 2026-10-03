@@ -55,10 +55,12 @@ from .types import (
     RouteState,
     SandboxClient,
     SandboxHandle,
+    SandboxTermination,
     SandboxView,
     SubstrateConfig,
     SuspendedThreadError,
     UnschedulableClaimError,
+    agent_warm_pool_name,
     claim_warm_pool,
 )
 
@@ -104,6 +106,7 @@ logger = logging.getLogger(__name__)
 REAP_GRACE_MARGIN_SECONDS = 30.0
 _CONTROL_REQUEST_TIMEOUT_S = 5.0
 _GONE_READ_TIMEOUT_S = 1.0
+_POD_TERMINATION_TIMEOUT_S = 2.0
 
 
 def _poll_sleeps(config: SubstrateConfig) -> Iterator[float]:
@@ -164,6 +167,19 @@ class SandboxSubstrate:
         self._affinity = affinity
         self._config = config
 
+    def pod_termination(
+        self, handle: SandboxHandle, *, since: datetime
+    ) -> SandboxTermination | None:
+        """Read one bounded, substrate neutral diagnosis for a dropped stream."""
+
+        if handle.namespace != self._config.namespace:
+            return None
+        return self._k8s.pod_termination(
+            handle.sandbox_name,
+            since=since,
+            request_timeout_seconds=_POD_TERMINATION_TIMEOUT_S,
+        )
+
     # -- claim / lookup -------------------------------------------------------
 
     def claim(
@@ -177,6 +193,7 @@ class SandboxSubstrate:
         publication_visible_outcome_revision: int = 0,
         fresh_only: bool = False,
         runner_resources: dict[str, Any] | None = None,
+        caller_run: str | None = None,
     ) -> SandboxHandle:
         """Return the thread's live sandbox, claiming a warm one if needed.
 
@@ -230,6 +247,7 @@ class SandboxSubstrate:
                         publication_visible_outcome_revision=(publication_visible_outcome_revision),
                         fresh_only=fresh_only,
                         runner_resources=runner_resources,
+                        caller_run=caller_run,
                     )
                     outcome = "claimed"
             except Exception as exc:
@@ -394,6 +412,7 @@ class SandboxSubstrate:
         agent_name: str | None = None,
         validate_candidate: Callable[[SandboxHandle], None] | None = None,
         runner_resources: dict[str, Any] | None = None,
+        caller_run: str | None = None,
     ) -> SandboxHandle:
         """Cold create a runner, then CAS it over one retained route.
 
@@ -420,6 +439,7 @@ class SandboxSubstrate:
             generation=expected.generation + 1,
             publish=False,
             runner_resources=runner_resources,
+            caller_run=caller_run,
         )
         try:
             if validate_candidate is not None:
@@ -509,6 +529,7 @@ class SandboxSubstrate:
         workspace_materialized_head: str | None = None,
         publication_visible_outcome_revision: int | None = None,
         runner_resources: dict[str, Any] | None = None,
+        caller_run: str | None = None,
     ) -> SandboxHandle:
         """Rehydrate a suspended thread into a fresh claim.
 
@@ -569,6 +590,7 @@ class SandboxSubstrate:
                     ),
                     generation=old.generation + 1,
                     runner_resources=runner_resources,
+                    caller_run=caller_run,
                 )
             except Exception as exc:
                 error = exc
@@ -733,7 +755,10 @@ class SandboxSubstrate:
         if sandbox_name:
             sandbox_names.add(sandbox_name)
         record = self._affinity.get(thread_key)
-        if not claim_names and not sandbox_names and record is not None:
+        # The route may name a replacement claim the SQL row has not heard
+        # about (ADR 0178: a token that would outlive the deadline is handed
+        # off before the turn). That live claim is part of this thread.
+        if record is not None:
             claim_names.add(record.handle.claim_name)
             sandbox_names.add(record.handle.sandbox_name)
         if not claim_names:
@@ -1083,6 +1108,27 @@ class SandboxSubstrate:
 
     # -- internals --------------------------------------------------------------
 
+    def _existing_agent_pool(self, base_pool: str, agent_name: str | None) -> str | None:
+        """The derived per-agent warm pool when the cluster already has it."""
+
+        if not agent_name:
+            return None
+        derived = agent_warm_pool_name(base_pool, agent_name)
+        if derived == base_pool:
+            return None
+        probe = getattr(self._k8s, "warm_pool_exists", None)
+        if not callable(probe):
+            return None
+        try:
+            present = bool(probe(derived))
+        except Exception:  # noqa: BLE001 - an unreadable pool must not fail the claim
+            logger.warning(
+                "could not read SandboxWarmPool %s; the claim keeps the chart pool choice",
+                derived,
+            )
+            return None
+        return derived if present else None
+
     def _claim_fresh(
         self,
         thread_key: str,
@@ -1099,6 +1145,7 @@ class SandboxSubstrate:
         publish: bool = True,
         fresh_only: bool = False,
         runner_resources: dict[str, Any] | None = None,
+        caller_run: str | None = None,
     ) -> SandboxHandle:
         config = self._config
         nonce = uuid.uuid4().hex[:6]
@@ -1110,17 +1157,23 @@ class SandboxSubstrate:
 
         # Docker has no warm pools and passes connector secrets directly to
         # the runner. The rendered pool check applies only to Kubernetes.
-        pool = (
-            config.warm_pool
-            if isinstance(self._k8s, DockerSandboxClient)
-            else claim_warm_pool(
+        if isinstance(self._k8s, DockerSandboxClient):
+            pool = config.warm_pool
+        else:
+            pool = claim_warm_pool(
                 config.warm_pool,
                 env,
                 agent_name,
                 config.agent_pools,
                 config.connector_secret_pools,
             )
-        )
+            # A per-agent pool cloned after a hosted connector deploy is usable
+            # even when the chart did not list the agent. Absence keeps the
+            # choice above, including the generic pool and the secret refusal.
+            if pool == config.warm_pool:
+                derived = self._existing_agent_pool(config.warm_pool, agent_name)
+                if derived is not None:
+                    pool = derived
         self._k8s.create_claim(
             name,
             pool=pool,
@@ -1158,6 +1211,7 @@ class SandboxSubstrate:
             max_turns=(env or {}).get(MAX_TURNS_ENV),
             carries_caller_token=CONNECTOR_CALLER_TOKEN_ENV in (env or {}),
             carries_turn_progress=TURN_PROGRESS_ELIGIBILITY_ENV in (env or {}),
+            caller_run=caller_run,
         )
         if not publish:
             return handle

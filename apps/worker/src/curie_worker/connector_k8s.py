@@ -28,6 +28,7 @@ the same language.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from kubernetes import client as k8s_client
@@ -35,10 +36,13 @@ from kubernetes import config as k8s_config
 
 from .connector_reconcile import OWNER_LABEL
 
+logger = logging.getLogger(__name__)
+
 # Identifies this writer to the API server's field-ownership tracking. A stable
 # name matters: change it and the server treats every field as newly claimed by
 # a stranger, leaving the old manager's entries behind forever.
 FIELD_MANAGER = "curie-connector-reconciler"
+LAST_APPLIED_ANNOTATION = "kubectl.kubernetes.io/last-applied-configuration"
 
 # The only kinds a connector is made of, and the only kinds the Role grants.
 # Adding one here without adding it to the chart's RBAC produces a reconciler
@@ -103,10 +107,51 @@ class KubernetesConnectorClient:
                 # planned for deletion.
                 item["kind"] = kind
                 item["apiVersion"] = _KINDS[kind][2]
+                if kind == "Secret" and LAST_APPLIED_ANNOTATION in (
+                    item.get("metadata", {}).get("annotations") or {}
+                ):
+                    self._strip_last_applied(
+                        namespace,
+                        item["metadata"]["name"],
+                        uid=item["metadata"]["uid"],
+                        owner=owner,
+                    )
+                    item["metadata"]["annotations"].pop(LAST_APPLIED_ANNOTATION, None)
+                    logger.warning(
+                        "connector credential Secret carried kubectl last-applied metadata; "
+                        "removed stale plaintext copy owner=%s namespace=%s; rotate the credential "
+                        "if the annotation may have exposed it",
+                        owner,
+                        namespace,
+                    )
                 found.append(item)
         return found
 
     # -- writes --------------------------------------------------------------
+
+    def _strip_last_applied(self, namespace: str, name: str, *, uid: str, owner: str) -> None:
+        api, suffix = self._api("Secret")
+        getattr(api, f"patch_namespaced_{suffix}")(
+            name,
+            namespace,
+            [
+                {"op": "test", "path": "/metadata/uid", "value": uid},
+                {
+                    "op": "test",
+                    "path": "/metadata/labels/curie.dev~1connector-owner",
+                    "value": owner,
+                },
+                {
+                    "op": "remove",
+                    "path": (
+                        "/metadata/annotations/"
+                        "kubectl.kubernetes.io~1last-applied-configuration"
+                    ),
+                }
+            ],
+            _content_type="application/json-patch+json",
+            _preload_content=False,
+        )
 
     def apply(self, namespace: str, obj: dict[str, Any]) -> None:
         kind = str(obj.get("kind", ""))

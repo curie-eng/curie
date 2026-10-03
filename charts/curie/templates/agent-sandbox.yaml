@@ -168,6 +168,11 @@ roleRef:
 {{- end }}
 {{- $bf := $runner.bundleFetch }}
 {{- $wf := $runner.workspace }}
+{{- if $agent }}
+{{- with index (.Values.agentSandbox.workspaceSizeLimits | default dict) $agent }}
+{{- $wf = set (deepCopy $wf) "sizeLimit" . }}
+{{- end }}
+{{- end }}
 {{- $af := $runner.attachments | default dict }}
 {{/*
 The inbound-attachment lane is ONE switch. `worker.attachments.enabled` gates
@@ -246,13 +251,9 @@ spec:
       {{- end }}
       {{- $gvisorClass := include "curie.gvisor.runtimeClassName" . }}
       {{- if $gvisorClass }}
-      # Kernel-isolation RuntimeClass from security.gvisor.mode. In `auto` this is
-      # present only when the class was found by lookup at install time; under
-      # `helm template`/--dry-run lookup is empty, so it renders the no-gvisor shape.
-      # In `auto` with a real (non-fake) model the install is guarded by the blocking
-      # gVisor preflight, so a runsc-less real-model install fails closed rather than
-      # silently rendering this no-gvisor shape; under `helm template`/--dry-run this
-      # still renders without runtimeClassName, but no real install proceeds unprotected.
+      # Kernel-isolation RuntimeClass from security.gvisor.mode. auto with a real
+      # model stamps the class even when lookup is empty (helm template, Argo CD,
+      # Flux). Fake-model auto still omits the class when lookup is empty.
       runtimeClassName: {{ $gvisorClass }}
       {{- end }}
       {{- if $runner.dnsPolicy }}
@@ -709,12 +710,15 @@ spec:
             {{- if $agent }}
             {{- $secretName := printf "%s-agent-%s-connector-secrets" (include "curie.fullname" .) $agent }}
             {{- range $name := keys $secrets | sortAlpha }}
+            {{- /* ADR 0176: the test cluster kubeconfig stays on the connector. */}}
+            {{- if ne $name "E2E_CLUSTER_KUBECONFIG" }}
             - name: {{ $name }}
               valueFrom:
                 secretKeyRef:
                   name: {{ $secretName }}
                   key: {{ $name }}
                   optional: false
+            {{- end }}
             {{- end }}
             {{- end }}
             {{- if and $runner.fakeModel (not .Values.inference.deploy) }}
@@ -853,6 +857,17 @@ spec:
 {{- end }}
 {{- if not (regexMatch "^[^@[:space:]]+@sha256:[0-9a-f]{64}$" (toString $ref)) }}
 {{- fail (printf "agentSandbox.runnerImages.%s must be a digest reference <repository>@sha256:<64 hex> produced by curie build, got %q" $agent (toString $ref)) }}
+{{- end }}
+{{- end }}
+{{- range $agent, $limit := .Values.agentSandbox.workspaceSizeLimits | default dict }}
+{{- if or (gt (len $agent) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $agent)) }}
+{{- fail (printf "agentSandbox.workspaceSizeLimits.%s has an invalid agent name" $agent) }}
+{{- end }}
+{{- if not (regexMatch "^[1-9][0-9]*(Ki|Mi|Gi|Ti)$" (toString $limit)) }}
+{{- fail (printf "agentSandbox.workspaceSizeLimits.%s must be a binary quantity such as 24Gi, got %q" $agent (toString $limit)) }}
+{{- end }}
+{{- if not $root.Values.agentSandbox.runner.workspace.enabled }}
+{{- fail (printf "agentSandbox.workspaceSizeLimits.%s is set but agentSandbox.runner.workspace.enabled is false, so no workspace volume renders" $agent) }}
 {{- end }}
 {{- end }}
 {{ include "curie.sandboxTemplate" (dict "root" $root) | nindent 0 }}

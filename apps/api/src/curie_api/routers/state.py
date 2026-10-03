@@ -10,32 +10,55 @@ consume. It is also exposed to bundle code (#249) via the auto-mounted
 ``curie-state`` MCP server and the ``CURIE_STATE_URL`` / ``CURIE_STATE_TOKEN``
 boot-env pair, so a skill reads and writes state without shipping its own server;
 the sandbox authenticates with a scoped ``state`` token (ADR-0033), never the
-platform key.
+platform key. On the ``memory`` namespace a sandbox credential is further held to
+its own channel, to fact keys, and to the sender its per-turn credential names
+(ADR-0188); on ``transcript`` it is held to its own channel's threads (#3767).
 """
 
 import enum
 import hashlib
+import logging
+import re
 import uuid
-from typing import Annotated, Any
+from collections import OrderedDict
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Annotated, Any, Literal, NoReturn
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+import redis.asyncio as redis
+from curie_telemetry import record_metric
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from sqlalchemy import Text, cast, delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import crud, sandbox_token, transcripts
-from ..auth import verify_platform_key
+from .. import crud, sandbox_token, state_mutation, threadkeys, transcripts
+from ..auth import require_internal_worker_token, verify_platform_key
 from ..config import get_settings
 from ..deps import SessionDep
 from ..models import ThreadTranscript, WorkflowStateEntry
-from ..schemas import StateAppendIn, StateEntryOut, StateEntryPut, StateNamespaceOut
+from ..schemas import (
+    MemoryTurnClosedIn,
+    StateAppendIn,
+    StateEntryOut,
+    StateEntryPut,
+    StateNamespaceOut,
+)
 from ..transcripts import TRANSCRIPT_NAMESPACE
 from ..transcripts import json_size as _json_size
 
+logger = logging.getLogger(__name__)
+
 # Two scoped-token scopes the state router accepts (ADR-0033). The BROAD scope is
-# minted for the runner's own memory/history loaders, which MUST read and write
-# the reserved namespaces to rehydrate the agent across a suspend/resume; it
-# reaches every namespace. The NARROW scope is minted for the bundle-facing
-# ``CURIE_STATE_TOKEN`` and is refused on the reserved namespaces by
+# minted for the runner's own memory/history loaders and memory tools, which MUST
+# read the reserved namespaces to rehydrate the agent across a suspend/resume
+# (and read and write transcripts). It reaches every namespace, but on ``memory``
+# its claims narrow it (ADR-0188, ``_check_memory_reach``): ``binding`` names the
+# one channel whose memory it may reach, and ``memory`` says whether it may write
+# (only the per-turn credential the worker puts on the turn's ACI ``Event`` is
+# ``"write"``, and it carries the ``sender`` the API stamps as the fact's
+# author). On ``transcript`` the ``binding`` claim likewise holds it to its own
+# channel's threads (#3767, ``_check_transcript_reach``). The NARROW scope is
+# minted for the bundle-facing ``CURIE_STATE_TOKEN`` and is refused on the reserved namespaces by
 # ``forbid_reserved_namespace`` below -- so a skill using the mounted state
 # interface (the ``curie-state`` MCP tools or a direct ``CURIE_STATE_URL``
 # call) cannot reach the memory/history ports even by composing the URL itself.
@@ -51,44 +74,342 @@ STATE_APP_SCOPE = "state.app"
 # (``runner/src/curie_runner/state.py``) and ``memory.MEMORY_NAMESPACE`` /
 # the history transcript key -- a bundle wanting durable memory uses the remember
 # tool, not raw state. A future fixed namespace must be added here too.
-RESERVED_NAMESPACES = frozenset({"memory", TRANSCRIPT_NAMESPACE})
+MEMORY_NAMESPACE = "memory"
+RESERVED_NAMESPACES = frozenset({MEMORY_NAMESPACE, TRANSCRIPT_NAMESPACE})
+
+# The only memory keys a sandbox credential may write (ADR-0188): the fact ids
+# the runner's memory tools mint. Mirrors ``memory_facts._FACT_ID`` in the
+# runner; ``tests/test_memory_fact_key_parity.py`` pins the two. ``guidance``
+# and the legacy ``log`` are written with the platform key only. ``\Z``, not
+# ``$``: ``$`` also matches before a trailing newline.
+_FACT_KEY = re.compile(r"^fact-[0-9a-f]{32}\Z")
+
+# How long the API remembers that a turn ended (#3776): the longest a per-turn
+# memory credential can live, the worker's ``binding.SANDBOX_TOKEN_TTL_SECONDS``
+# (duplicated, since neither service imports the other's package). The record
+# only has to outlive the credential it refuses.
+MEMORY_TURN_CLOSED_TTL_S = 24 * 60 * 60
+TURN_ENDED = "this conversation's turn has ended"
 
 
 class StateCaller(enum.Enum):
     """Which credential authorized a state-router request, and thus how far it
-    reaches. PLATFORM (the shared key) and STATE (the broad scoped token, i.e.
-    the memory/history loaders) are unrestricted; APP (the narrow bundle token)
-    is refused on ``RESERVED_NAMESPACES``."""
+    reaches. PLATFORM (the shared key) is unrestricted. STATE (the broad scoped
+    token: the runner's loaders and memory tools) reaches every namespace, but
+    on ``memory`` only as far as its claims allow (ADR-0188), and on
+    ``transcript`` only its own channel's threads (#3767). APP (the narrow
+    bundle token) is refused on ``RESERVED_NAMESPACES``."""
 
     PLATFORM = "platform"
     STATE = "state"
     APP = "app"
 
 
+@dataclass(frozen=True)
+class StatePrincipal:
+    """Who a state-router request is, as far as the router needs to know.
+
+    ``binding``, ``memory``, ``sender`` and ``turn`` are the ADR-0188 claims of a
+    STATE token (all None for the platform key and the app token). A STATE token
+    with no ``memory`` claim was minted by a pre-ADR-0188 worker: ``legacy``,
+    which fails closed on memory (read-only, agent memory only)."""
+
+    caller: StateCaller
+    binding: str | None = None
+    memory: Literal["read", "write"] | None = None
+    sender: str | None = None
+    turn: str | None = None
+
+    @property
+    def legacy(self) -> bool:
+        return self.caller is StateCaller.STATE and self.memory is None
+
+
+def _str_claim(payload: dict[str, Any], name: str) -> str | None:
+    value = payload.get(name)
+    return value if isinstance(value, str) else None
+
+
+def _state_principal(payload: dict[str, Any]) -> StatePrincipal:
+    if "memory" not in payload:
+        return StatePrincipal(StateCaller.STATE)
+    # Anything but an explicit "write" is read-only: fail closed.
+    memory: Literal["read", "write"] = "write" if payload.get("memory") == "write" else "read"
+    return StatePrincipal(
+        StateCaller.STATE,
+        binding=_str_claim(payload, "binding"),
+        memory=memory,
+        sender=_str_claim(payload, "sender"),
+        turn=_str_claim(payload, "turn"),
+    )
+
+
 async def require_state_access(
     agent_id: uuid.UUID,
     x_api_key: Annotated[str | None, Header()] = None,
-) -> StateCaller:
+) -> StatePrincipal:
     """State-router auth (ADR-0033): the platform key (trusted callers) OR a
     scoped token bound to this path's ``agent_id`` (the sandbox). The broad
-    ``state`` scope (the runner's memory/history loaders) reaches every namespace;
-    the narrow app scope (the bundle-facing ``CURIE_STATE_TOKEN``) is refused on
-    the reserved namespaces by ``forbid_reserved_namespace``. Every other router
-    keeps the platform-key-only ``require_api_key``. Returns which caller
-    authenticated so the namespace guard can apply the right reach."""
+    ``state`` scope (the runner's loaders and memory tools) reaches every
+    namespace, held on ``memory`` to its claims by ``_check_memory_reach``
+    (ADR-0188); the narrow app scope (the bundle-facing ``CURIE_STATE_TOKEN``)
+    is refused on the reserved namespaces by ``forbid_reserved_namespace``.
+    Every other router keeps the platform-key-only ``require_api_key``. Returns
+    the caller and its verified claims so the guards can apply the right
+    reach."""
 
     if verify_platform_key(x_api_key):
-        return StateCaller.PLATFORM
+        return StatePrincipal(StateCaller.PLATFORM)
     if x_api_key is not None:
         api_key = get_settings().api_key
         agent = str(agent_id)
-        if sandbox_token.verify(x_api_key, api_key, agent=agent, scope=STATE_SCOPE):
-            return StateCaller.STATE
+        payload = sandbox_token.decode(x_api_key, api_key, agent=agent, scope=STATE_SCOPE)
+        if payload is not None:
+            return _state_principal(payload)
         if sandbox_token.verify(x_api_key, api_key, agent=agent, scope=STATE_APP_SCOPE):
-            return StateCaller.APP
+            return StatePrincipal(StateCaller.APP)
     raise HTTPException(
         status.HTTP_401_UNAUTHORIZED, detail="missing or invalid credential"
     )
+
+
+def _state_path(
+    namespace: str, key: str | None, kind: str | None = None, address: str | None = None
+) -> str:
+    """The request's state path, for log lines (never carries a credential)."""
+    parts = ["state"]
+    if kind is not None and address is not None:
+        parts += ["bindings", kind, address]
+    parts.append(namespace)
+    if key is not None:
+        parts.append(key)
+    return "/".join(parts)
+
+
+def _refuse(principal: StatePrincipal, agent_id: uuid.UUID, path: str, reason: str) -> NoReturn:
+    """Log and raise a 403 for a memory request the credential may not make.
+
+    The log names the agent, the path and the turn claim, never the token."""
+
+    if principal.legacy:
+        logger.warning(
+            "state: refused legacy sandbox token (no memory claim) for agent %s on %s: %s",
+            agent_id,
+            path,
+            reason,
+        )
+    else:
+        logger.warning(
+            "state: refused sandbox credential for agent %s on %s (turn %s): %s",
+            agent_id,
+            path,
+            principal.turn,
+            reason,
+        )
+    raise HTTPException(status.HTTP_403_FORBIDDEN, reason)
+
+
+def _check_memory_reach(
+    principal: StatePrincipal,
+    agent_id: uuid.UUID,
+    namespace: str,
+    *,
+    requested_binding: str | None,
+    key: str | None,
+    write: bool,
+    path: str,
+    append: bool = False,
+) -> None:
+    """ADR-0188: what a sandbox (STATE) credential may do on ``memory``.
+
+    The platform key keeps full reach, the app token is already fenced off by
+    ``forbid_reserved_namespace``, and other namespaces are unchanged. Runs
+    before ``_binding_scope``'s database lookup, so the 403 for another
+    channel cannot be used to probe which bindings exist."""
+
+    if principal.caller is not StateCaller.STATE or namespace != MEMORY_NAMESPACE:
+        return
+    if requested_binding is not None and (
+        principal.legacy or principal.binding != requested_binding
+    ):
+        _refuse(principal, agent_id, path, "credential is scoped to another channel")
+    if not write:
+        return
+    if principal.memory != "write":
+        _refuse(principal, agent_id, path, "memory credential is read-only")
+    if append:
+        _refuse(
+            principal,
+            agent_id,
+            path,
+            "memory facts are written with PUT; append is not allowed with a sandbox credential",
+        )
+    if key is None or _FACT_KEY.fullmatch(key) is None:
+        _refuse(
+            principal, agent_id, path, "only fact keys are writable with a sandbox credential"
+        )
+
+
+def _transcript_key_admitted(principal: StatePrincipal, agent_id: uuid.UUID, key: str) -> bool:
+    """Whether a non-legacy sandbox credential reaches the thread ``key`` (#3767).
+
+    A transcript key is a thread key, mapped back to its binding by
+    ``threadkeys.transcript_binding``. A bound credential reaches its own
+    binding's threads, whatever identity segment the key carries. The unbound
+    credential (a targetless cron's boot env names no binding) reaches only its
+    own agent's ``@cron`` threads. A key no producer builds maps to no binding
+    and is reached by no sandbox credential."""
+
+    key_binding = threadkeys.transcript_binding(key)
+    if key_binding is None:
+        return False
+    if principal.binding is None:
+        return key_binding == f"@cron:{agent_id}"
+    return key_binding == principal.binding
+
+
+# Agents already warned about a legacy token in this process, oldest first.
+_LEGACY_WARNED_LIMIT = 1024
+_legacy_warned: OrderedDict[uuid.UUID, None] = OrderedDict()
+
+
+def _note_legacy_transcript_use(agent_id: uuid.UUID, path: str) -> None:
+    """Log and count a pre-ADR-0188 token's transcript request, which is allowed.
+
+    Refusing it would cut off every warm sandbox's history at API deploy; the
+    window closes when the last such token expires, at most 24 hours after the
+    worker upgrade. The log names the agent and the path, never the token.
+
+    A warm sandbox makes several such requests per turn, so the warning is
+    logged once per agent per process, tracked in a small bounded set that
+    evicts the oldest agent first. The metric still counts every request."""
+
+    if agent_id not in _legacy_warned:
+        _legacy_warned[agent_id] = None
+        if len(_legacy_warned) > _LEGACY_WARNED_LIMIT:
+            _legacy_warned.popitem(last=False)
+        logger.warning(
+            "state: allowed legacy sandbox token (no memory claim) for agent %s on %s; "
+            "transcript reach is unscoped until the sandbox is replaced",
+            agent_id,
+            path,
+        )
+    record_metric(
+        "curie.state.legacy_token",
+        attributes={"service.name": "curie-api", "namespace": TRANSCRIPT_NAMESPACE},
+    )
+
+
+def _check_transcript_reach(
+    principal: StatePrincipal,
+    agent_id: uuid.UUID,
+    namespace: str,
+    *,
+    requested_binding: str | None,
+    key: str | None,
+    path: str,
+) -> None:
+    """#3767: what a sandbox (STATE) credential may reach on ``transcript``.
+
+    On a binding path, the path's binding must be the credential's; with a key,
+    the key's binding must be too (``_transcript_key_admitted``), so neither
+    can launder the other. A listing (``key`` None) is filtered afterwards by
+    ``_visible_transcripts``. A legacy token keeps its reach, with a warning and
+    a metric. The platform key is unaffected and the app token is already
+    fenced off by ``forbid_reserved_namespace``. Runs before any database read,
+    so a refused read cannot trigger pre-identity adoption either."""
+
+    if principal.caller is not StateCaller.STATE or namespace != TRANSCRIPT_NAMESPACE:
+        return
+    if principal.legacy:
+        _note_legacy_transcript_use(agent_id, path)
+        return
+    if requested_binding is not None and principal.binding != requested_binding:
+        _refuse(principal, agent_id, path, "credential is scoped to another channel")
+    if key is not None and not _transcript_key_admitted(principal, agent_id, key):
+        _refuse(
+            principal, agent_id, path, "transcript belongs to another channel or no channel"
+        )
+
+
+def _visible_transcripts(
+    principal: StatePrincipal, agent_id: uuid.UUID, namespace: str, rows: list[StateEntryOut]
+) -> list[StateEntryOut]:
+    """A transcript listing narrowed to the threads a sandbox credential reaches."""
+
+    if (
+        principal.caller is not StateCaller.STATE
+        or principal.legacy
+        or namespace != TRANSCRIPT_NAMESPACE
+    ):
+        return rows
+    return [row for row in rows if _transcript_key_admitted(principal, agent_id, row.key)]
+
+
+def _closed_turn_key(agent_id: uuid.UUID, turn: str) -> str:
+    """The Valkey record that ``turn`` of ``agent_id`` has ended (#3776). Keyed
+    by agent too, so one agent closing a turn id cannot refuse another's."""
+
+    return f"{get_settings().worker_key_prefix}:memory-turn-closed:{agent_id}:{turn}"
+
+
+async def _check_turn_open(
+    principal: StatePrincipal,
+    agent_id: uuid.UUID,
+    namespace: str,
+    request: Request,
+    path: str,
+) -> None:
+    """#3776: refuse a memory write made with a turn credential whose turn the
+    worker has reported ended, even though the credential has not expired.
+
+    Runs after ``_check_memory_reach`` on every write route. Reads are not
+    checked, and the platform key (no turn claim) is unaffected. A Valkey
+    failure is a 503, never a silently accepted write."""
+
+    if (
+        principal.caller is not StateCaller.STATE
+        or namespace != MEMORY_NAMESPACE
+        or principal.turn is None
+    ):
+        return
+    client: redis.Redis = request.app.state.valkey
+    try:
+        closed = await client.exists(_closed_turn_key(agent_id, principal.turn))
+    except (redis.RedisError, OSError) as exc:
+        logger.warning("state: could not check memory turn %s: %r", principal.turn, exc)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "could not check this credential's turn"
+        ) from exc
+    if closed:
+        _refuse(principal, agent_id, path, TURN_ENDED)
+
+
+def _stamp_author(
+    principal: StatePrincipal,
+    agent_id: uuid.UUID,
+    namespace: str,
+    data: StateEntryPut,
+    path: str,
+) -> StateEntryPut:
+    """ADR-0188: a sandbox fact's author is the per-turn credential's ``sender``
+    claim, whatever the body says, and its ``stated_at`` is the server's clock,
+    so a sandbox write cannot backdate a fact. ``session_id`` is kept as sent.
+    The platform key keeps the body as given."""
+
+    if principal.caller is not StateCaller.STATE or namespace != MEMORY_NAMESPACE:
+        return data
+    if principal.sender is None:
+        _refuse(principal, agent_id, path, "memory write credential names no sender")
+    if not isinstance(data.value, dict):
+        raise HTTPException(
+            422,
+            "a memory fact written with a sandbox credential must be a JSON object",
+        )
+    # The runner's ``memory_facts._now`` format: RFC3339 UTC with a ``Z``.
+    stated_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    stamped = {**data.value, "author": principal.sender, "stated_at": stated_at}
+    return data.model_copy(update={"value": stamped})
 
 
 async def _binding_scope(
@@ -98,20 +419,19 @@ async def _binding_scope(
     (#1525 follow-up): `"{kind}:{address}"`, once confirmed to actually belong
     to this agent.
 
-    Not a security boundary -- the caller already reached this far only by
-    presenting a credential authenticating it as THIS agent's own sandbox (or
-    the platform key), and a scope string is just a partition key within that
-    one agent's already-fully-accessible general-state store, the same as any
-    `namespace`/`key` a caller could always freely choose. Checking it against
+    For general state this is a partition key, not a permission: a sandbox
+    credential for this agent may use any of the agent's bindings, the same as
+    any `namespace`/`key` it could always freely choose. Checking it against
     `agent_channels` is a correctness guard -- a typo or a stale binding name
     fails loudly as 404 instead of silently opening a new, orphaned partition
-    that corresponds to nothing -- not an authorization check. That is also
-    why this reads the database directly rather than trusting a claim on the
-    presented credential: the credential (`sandbox_token`) authenticates WHICH
-    agent, never which of that agent's own bindings, by design (ADR-0033;
-    rejected alternative for #1525 was widening it to carry one, but a
-    same-agent partition key has no privilege for that credential to carry in
-    the first place).
+    that corresponds to nothing.
+
+    For the `memory` namespace the binding IS a permission (ADR-0188, which
+    reverses the #1525 follow-up's rejection of a binding claim for memory): one
+    channel's memory can hold a direct message, so a sandbox credential reaches
+    only the channel its `binding` claim names. That check is
+    `_check_memory_reach`, which callers run before this lookup so a 403 cannot
+    be used to learn which bindings exist.
 
     No caller here NAMES an adapter -- the state API has no such parameter --
     and an agent's rows on one pair share this one scope whichever identity
@@ -130,7 +450,7 @@ async def _binding_scope(
 
 async def forbid_reserved_namespace(
     namespace: str,
-    caller: Annotated[StateCaller, Depends(require_state_access)],
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> None:
     """Server-side backstop for the reserved-namespace rule (#249): a narrow
     app-scoped (bundle) token may not read or write the memory/transcript
@@ -138,8 +458,9 @@ async def forbid_reserved_namespace(
     platform key and the broad ``state`` token (the loaders) are unrestricted.
     Without this a skill could bypass the ``curie-state`` tool's own client-side
     refusal by composing ``CURIE_STATE_URL`` directly with the token it holds;
-    here the token it holds is simply refused."""
-    if caller is StateCaller.APP and namespace in RESERVED_NAMESPACES:
+    here the token it holds is simply refused. The broad token's narrower reach
+    on ``memory`` (ADR-0188) is ``_check_memory_reach``."""
+    if principal.caller is StateCaller.APP and namespace in RESERVED_NAMESPACES:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             f"namespace {namespace!r} is reserved by the platform "
@@ -465,8 +786,28 @@ async def _put_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def put_state(
-    agent_id: uuid.UUID, namespace: str, key: str, data: StateEntryPut, session: SessionDep
+    agent_id: uuid.UUID,
+    namespace: str,
+    key: str,
+    data: StateEntryPut,
+    session: SessionDep,
+    request: Request,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    path = _state_path(namespace, key)
+    _check_memory_reach(
+        principal, agent_id, namespace, requested_binding=None, key=key, write=True, path=path
+    )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=key,
+        path=path,
+    )
+    await _check_turn_open(principal, agent_id, namespace, request, path)
+    data = _stamp_author(principal, agent_id, namespace, data, path)
     return await _put_state(agent_id, None, namespace, key, data, session)
 
 
@@ -483,7 +824,29 @@ async def put_state_for_binding(
     key: str,
     data: StateEntryPut,
     session: SessionDep,
+    request: Request,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    path = _state_path(namespace, key, kind, address)
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
+        write=True,
+        path=path,
+    )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
+        path=path,
+    )
+    await _check_turn_open(principal, agent_id, namespace, request, path)
+    data = _stamp_author(principal, agent_id, namespace, data, path)
     scope = await _binding_scope(session, agent_id, kind, address)
     return await _put_state(agent_id, scope, namespace, key, data, session)
 
@@ -542,8 +905,31 @@ async def _append_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def append_state(
-    agent_id: uuid.UUID, namespace: str, key: str, data: StateAppendIn, session: SessionDep
+    agent_id: uuid.UUID,
+    namespace: str,
+    key: str,
+    data: StateAppendIn,
+    session: SessionDep,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=key,
+        write=True,
+        append=True,
+        path=_state_path(namespace, key),
+    )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=key,
+        path=_state_path(namespace, key),
+    )
     return await _append_state(agent_id, None, namespace, key, data, session)
 
 
@@ -560,7 +946,26 @@ async def append_state_for_binding(
     key: str,
     data: StateAppendIn,
     session: SessionDep,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
+        write=True,
+        append=True,
+        path=_state_path(namespace, key, kind, address),
+    )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
+        path=_state_path(namespace, key, kind, address),
+    )
     scope = await _binding_scope(session, agent_id, kind, address)
     return await _append_state(agent_id, scope, namespace, key, data, session)
 
@@ -570,6 +975,8 @@ async def _list_namespaces(
     scope: str | None,
     session: AsyncSession,
     caller: StateCaller,
+    *,
+    hide_memory: bool = False,
 ) -> list[StateNamespaceOut]:
     """List the namespaces stored under one scope, each with its key count and
     the most recent write time (#250). This is the enumeration the operator's
@@ -586,6 +993,10 @@ async def _list_namespaces(
     for every caller alike; an operator wanting the full picture of a
     memory=False agent calls once per binding, the same way its own bundle
     code only ever sees the one scope the worker handed it.
+
+    ``hide_memory`` drops the ``memory`` row for a sandbox credential listing a
+    binding whose memory it may not reach (ADR-0188), rather than refusing the
+    whole listing: that binding's general state stays reachable.
     """
     query = (
         select(
@@ -609,10 +1020,13 @@ async def _list_namespaces(
         # namespaces exist -- their key counts and write times are exactly what
         # the state.app scope fences off (#856).
         if not (caller is StateCaller.APP and row.namespace in RESERVED_NAMESPACES)
+        and not (hide_memory and row.namespace == MEMORY_NAMESPACE)
     ]
     # Transcripts live in their own table (ADR-0170) but are still listed here
-    # as the reserved namespace the operator's inspector already knows.
-    if caller is not StateCaller.APP:
+    # as the reserved namespace the operator's inspector already knows. Only
+    # the platform key gets that row: its count and write time cover every
+    # channel's threads, which a sandbox credential may not learn (#3767).
+    if caller is StateCaller.PLATFORM:
         threads = await transcripts.summary(session, agent_id, scope)
         if threads is not None:
             listed.append(
@@ -630,9 +1044,9 @@ async def _list_namespaces(
 async def list_namespaces(
     agent_id: uuid.UUID,
     session: SessionDep,
-    caller: Annotated[StateCaller, Depends(require_state_access)],
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> list[StateNamespaceOut]:
-    return await _list_namespaces(agent_id, None, session, caller)
+    return await _list_namespaces(agent_id, None, session, principal.caller)
 
 
 @router.get("/{agent_id}/state/bindings/{kind}/{address}", response_model=list[StateNamespaceOut])
@@ -641,10 +1055,15 @@ async def list_namespaces_for_binding(
     kind: str,
     address: str,
     session: SessionDep,
-    caller: Annotated[StateCaller, Depends(require_state_access)],
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> list[StateNamespaceOut]:
     scope = await _binding_scope(session, agent_id, kind, address)
-    return await _list_namespaces(agent_id, scope, session, caller)
+    hide_memory = principal.caller is StateCaller.STATE and (
+        principal.legacy or principal.binding != scope
+    )
+    return await _list_namespaces(
+        agent_id, scope, session, principal.caller, hide_memory=hide_memory
+    )
 
 
 async def _get_state(
@@ -680,8 +1099,30 @@ async def _get_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def get_state(
-    agent_id: uuid.UUID, namespace: str, key: str, session: SessionDep, response: Response
+    agent_id: uuid.UUID,
+    namespace: str,
+    key: str,
+    session: SessionDep,
+    response: Response,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=key,
+        write=False,
+        path=_state_path(namespace, key),
+    )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=key,
+        path=_state_path(namespace, key),
+    )
     return await _get_state(agent_id, None, namespace, key, session, response)
 
 
@@ -698,7 +1139,25 @@ async def get_state_for_binding(
     key: str,
     session: SessionDep,
     response: Response,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
+        write=False,
+        path=_state_path(namespace, key, kind, address),
+    )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
+        path=_state_path(namespace, key, kind, address),
+    )
     scope = await _binding_scope(session, agent_id, kind, address)
     return await _get_state(agent_id, scope, namespace, key, session, response)
 
@@ -727,9 +1186,30 @@ async def _list_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def list_state(
-    agent_id: uuid.UUID, namespace: str, session: SessionDep
+    agent_id: uuid.UUID,
+    namespace: str,
+    session: SessionDep,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> list[StateEntryOut]:
-    return await _list_state(agent_id, None, namespace, session)
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=None,
+        write=False,
+        path=_state_path(namespace, None),
+    )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=None,
+        path=_state_path(namespace, None),
+    )
+    rows = await _list_state(agent_id, None, namespace, session)
+    return _visible_transcripts(principal, agent_id, namespace, rows)
 
 
 @router.get(
@@ -738,10 +1218,33 @@ async def list_state(
     dependencies=[Depends(forbid_reserved_namespace)],
 )
 async def list_state_for_binding(
-    agent_id: uuid.UUID, kind: str, address: str, namespace: str, session: SessionDep
+    agent_id: uuid.UUID,
+    kind: str,
+    address: str,
+    namespace: str,
+    session: SessionDep,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> list[StateEntryOut]:
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=None,
+        write=False,
+        path=_state_path(namespace, None, kind, address),
+    )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=None,
+        path=_state_path(namespace, None, kind, address),
+    )
     scope = await _binding_scope(session, agent_id, kind, address)
-    return await _list_state(agent_id, scope, namespace, session)
+    rows = await _list_state(agent_id, scope, namespace, session)
+    return _visible_transcripts(principal, agent_id, namespace, rows)
 
 
 async def _delete_state(
@@ -751,14 +1254,31 @@ async def _delete_state(
     key: str,
     expected_version: int | None,
     session: AsyncSession,
+    caller: StateCaller,
 ) -> Response:
     # expected_version opts into compare-and-delete (#2820), so an operator
     # that exported a transcript never deletes turns appended after the export.
     # The version is a predicate of the DELETE itself, so an append that
     # commits between the read and the delete cannot be removed with it.
-    if namespace == TRANSCRIPT_NAMESPACE:
-        await transcripts.remove(session, agent_id, scope, key, expected_version)
+    #
+    # Each completed delete is recorded, including one that found nothing
+    # (#3673). A 409 raises before the record: nothing was touched.
+    def recorded(removed: bool) -> Response:
+        state_mutation.record(
+            op="delete",
+            agent_id=agent_id,
+            scope=scope,
+            namespace=namespace,
+            key=key,
+            removed=removed,
+            principal=caller.value,
+        )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    if namespace == TRANSCRIPT_NAMESPACE:
+        return recorded(
+            await transcripts.remove(session, agent_id, scope, key, expected_version)
+        )
     entry = await _get_entry(session, agent_id, scope, namespace, key)
     if expected_version is None:
         if entry is not None:
@@ -788,7 +1308,8 @@ async def _delete_state(
                 status.HTTP_409_CONFLICT,
                 f"version mismatch: expected {expected_version}, {found}",
             )
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    # Past the compare-and-delete, a versioned delete always removed its row.
+    return recorded(entry is not None)
 
 
 @router.delete(
@@ -801,9 +1322,32 @@ async def delete_state(
     namespace: str,
     key: str,
     session: SessionDep,
+    request: Request,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
     expected_version: int | None = None,
 ) -> Response:
-    return await _delete_state(agent_id, None, namespace, key, expected_version, session)
+    path = _state_path(namespace, key)
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=key,
+        write=True,
+        path=path,
+    )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=None,
+        key=key,
+        path=_state_path(namespace, key),
+    )
+    await _check_turn_open(principal, agent_id, namespace, request, path)
+    return await _delete_state(
+        agent_id, None, namespace, key, expected_version, session, principal.caller
+    )
 
 
 @router.delete(
@@ -818,7 +1362,61 @@ async def delete_state_for_binding(
     namespace: str,
     key: str,
     session: SessionDep,
+    request: Request,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
     expected_version: int | None = None,
 ) -> Response:
+    path = _state_path(namespace, key, kind, address)
+    _check_memory_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
+        write=True,
+        path=path,
+    )
+    _check_transcript_reach(
+        principal,
+        agent_id,
+        namespace,
+        requested_binding=f"{kind}:{address}",
+        key=key,
+        path=_state_path(namespace, key, kind, address),
+    )
+    await _check_turn_open(principal, agent_id, namespace, request, path)
     scope = await _binding_scope(session, agent_id, kind, address)
-    return await _delete_state(agent_id, scope, namespace, key, expected_version, session)
+    return await _delete_state(
+        agent_id, scope, namespace, key, expected_version, session, principal.caller
+    )
+
+
+# Worker-to-API (#3776): the worker reports a turn ended, so its per-turn memory
+# credential is refused from then on. The same worker-token auth as the other
+# ``/v1/internal`` routes; neither the platform key nor a sandbox token may call
+# it. The turn rides the body, not the path: a turn claim is an event id plus a
+# suffix and need not be a clean path segment.
+internal_router = APIRouter(
+    prefix="/v1/internal/memory",
+    tags=["internal-memory"],
+    dependencies=[Depends(require_internal_worker_token)],
+)
+
+
+@internal_router.post("/closed-turns", status_code=status.HTTP_204_NO_CONTENT)
+async def close_memory_turn(data: MemoryTurnClosedIn, request: Request) -> Response:
+    """Record that a turn has ended; idempotent. The record expires once no
+    credential for the turn could still be valid (``MEMORY_TURN_CLOSED_TTL_S``)."""
+
+    client: redis.Redis = request.app.state.valkey
+    try:
+        await client.set(
+            _closed_turn_key(data.agent_id, data.turn), "1", ex=MEMORY_TURN_CLOSED_TTL_S
+        )
+    except (redis.RedisError, OSError) as exc:
+        logger.warning("state: could not record memory turn %s as ended: %r", data.turn, exc)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "could not record the turn as ended"
+        ) from exc
+    logger.info("state: memory turn %s ended for agent %s", data.turn, data.agent_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

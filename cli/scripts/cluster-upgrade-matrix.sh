@@ -810,9 +810,13 @@ image_sets() {
     # a published 0.8.8 install stays on :0.8.8 and a packaged 0.10.0/0.10.1
     # chart supplies those tags. cluster upgrade has no --set, so the overlay
     # must not pin a stale repository/tag.
+    # Record the chart's published development caller pair so subsequent
+    # upgrades retain the same caller identity.
     cat <<EOF
 security.gvisor.mode=off
 security.allowDevDefaults=true
+connectorCaller.signingKey=Y3VyaWUtZGV2LWNvbm5lY3Rvci1jYWxsZXItc2VlZCE=
+connectorCaller.verifyKey=tkmNbO5SSLE0IM84sH4uJ94DxtriNZ/APXha3FiyP6c=
 api.migrate.enabled=true
 worker.replicas=1
 worker.image.pullPolicy=${pull_policy}

@@ -10,8 +10,6 @@ agent-scoped lookup by narrowing to the agent.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import time
 import uuid
 from typing import Any
@@ -175,12 +173,24 @@ def test_a_hook_reply_surface_with_two_routes_on_the_pair_is_a_conflict(
     assert added.status_code == 201, added.text
     body = b"{}"
     secret = hook_signing.derive(get_settings().api_key, agent_id=agent_id, generation=0)
-    signature = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    timestamp = str(int(time.time()))
+    signature = hook_signing.sign(
+        secret,
+        timestamp=timestamp,
+        delivery_id="two-routes-1",
+        hook="issues",
+        tool_access=None,
+        body=body,
+    )
 
     resp = hooks_client.post(
         f"/hooks/{agent_id}/issues?kind=email&address={ADDRESS}",
         content=body,
-        headers={"X-Curie-Signature-256": signature, "X-Curie-Delivery-Id": "two-routes-1"},
+        headers={
+            "X-Curie-Signature-256": signature,
+            "X-Curie-Delivery-Id": "two-routes-1",
+            "X-Curie-Timestamp": timestamp,
+        },
     )
 
     assert resp.status_code == 409, resp.text

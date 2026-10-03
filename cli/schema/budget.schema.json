@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/budget/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/budget/v2.0.json",
   "title": "curie <tier> budget --json",
-  "description": "The agent-facing payload of `curie <tier> budget <agent>`: the dry-run plan, or the saved budget (`max_usd_per_day` is null when the platform default applies).",
+  "description": "The agent-facing payload of `curie <tier> budget <agent>`: the dry-run plan, or the saved budget (each limit is null when the platform default applies).",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -40,11 +40,18 @@
             "number",
             "null"
           ]
+        },
+        "max_output_tokens_per_run": {
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
         "agent",
-        "max_usd_per_day"
+        "max_usd_per_day",
+        "max_output_tokens_per_run"
       ]
     }
   ]

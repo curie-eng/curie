@@ -1,10 +1,9 @@
 """The default dark-factory agent bundle validates and holds its discipline (#2576).
 
 Pins the parts of ``examples/dark-factory`` that must not drift: the bundle
-validates, its only MCP server is GitHub, its toolPolicy grants exactly
-``get_issue`` and ``add_issue_comment`` (the review gate hook narrows the
-comment to capped or failed reviews, #3092),
-the one skill states the factory discipline and its nine phases, the evals are
+validates, it declares no MCP server, secret or toolPolicy and reads its
+issue through the platform's ``mcp__curie__get_issue`` (ADR 0187), the one
+skill states the factory discipline and its nine phases, the evals are
 falsifiable, and no private identifier ships.
 """
 
@@ -61,30 +60,20 @@ def test_bundle_validates() -> None:
     assert _only_the_unbuilt_runner_layer(result.errors), result.errors
 
 
-def test_manifest_identity_secrets_and_policy() -> None:
+def test_manifest_declares_no_github_credential() -> None:
+    # ADR 0187: the platform reads the issue, so the bundle holds no PAT.
     manifest = _manifest()
     assert manifest["name"] == "dark-factory"
-    assert manifest["secrets"] == ["GITHUB_PERSONAL_ACCESS_TOKEN"]
-    assert manifest["toolPolicy"]["enforcement"] == TOOL_POLICY_ENFORCEMENT
+    assert "secrets" not in manifest
+    assert "toolPolicy" not in manifest
 
 
-def test_mcp_declares_only_github() -> None:
-    mcp = json.loads((BUNDLE / ".mcp.json").read_text())
-    servers = mcp["mcpServers"]
-    assert list(servers) == ["github"]
-    github = servers["github"]
-    assert github["command"] == "mcp-server-github"
-    assert github["env"] == {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"}
-
-
-def test_tool_policy_entries_are_exact() -> None:
-    # Unlisted tools are denied by the classifier (plugin-format
-    # test_tool_policy.py); this pins the entries so a widened glob such as
-    # github/* fails here.
-    policy = _manifest()["toolPolicy"]
-    assert policy["allow"] == ["github/get_issue", "github/add_issue_comment"]
-    assert policy["approvalRequired"] == []
-    assert policy["deny"] == []
+def test_bundle_ships_no_mcp_server() -> None:
+    assert not (BUNDLE / ".mcp.json").exists()
+    assert "server-github" not in (BUNDLE / "runner.Dockerfile").read_text()
+    shipped = "\n".join(p.read_text(errors="ignore") for p in BUNDLE.rglob("*") if p.is_file())
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in shipped
+    assert "add_issue_comment" not in shipped
 
 
 def test_exactly_one_skill_without_allowed_tools() -> None:
@@ -357,9 +346,9 @@ def test_example_deploys_as_dark_factory_on_the_default_model() -> None:
     assert "--agent dark-factory " in readme
     assert "surfaces dark-factory " in readme
     assert "publication-policy dark-factory " in readme
-    assert "agentSandbox.connectorEgress.dark-factory[" in readme
+    assert "--github-api-egress" not in readme
     assert "--agent factory " not in readme
-    assert "agentSandbox.runner.model=z-ai/glm-5.3-flash" in readme
+    assert "cluster up --model z-ai/glm-5.3-flash" in readme
     assert "agent `dark-factory`" in operations
     assert "`z-ai/glm-5.3-flash`" in operations
 
@@ -382,7 +371,7 @@ def test_wait_ci_section_loops_a_failed_check_back_to_implement() -> None:
     assert "untrusted" in section.lower()
     assert ".github/" in section
     assert "Could not complete:" in section
-    assert "1800" in section
+    assert "10800" in section
     assert "does not act on them yet" not in section
 
 
@@ -421,3 +410,47 @@ def test_readme_describes_the_ci_wait_and_fix_loop() -> None:
     assert "does not act on the checks yet" not in readme
     assert re.search(r"`wait_ci`.{0,80}`implement`", readme, re.DOTALL)
     assert "unverified" in readme.lower()
+
+
+def _flat(text: str) -> str:
+    return re.sub(r"\s+", " ", text)
+
+
+def test_skill_gives_service_backed_tests_a_ci_verification_path() -> None:
+    """A change whose tests need Postgres or Valkey reaches publication (#3755).
+
+    The sandbox has neither service, so the skill treats the pull request's
+    CI as those tests' run and names where their red-on-base evidence comes
+    from, instead of leaving it unobtainable.
+    """
+    _, body = _skill_parts()
+    flat = _flat(body)
+    failing_test = flat.split("(phase `failing_test`)", 1)[1].split("(phase `implement`", 1)[0]
+    assert "service-backed test" in failing_test
+    # Red-on-base keeps the new test and restores only the base source.
+    assert "keep the new test file" in failing_test
+    assert "git checkout <base-sha> -- <changed source files>" in failing_test
+    assert "must fail on the bug, not at import" in failing_test
+    implement = flat.split("(phase `implement`", 1)[1].split("(phase `review_diff`", 1)[0]
+    assert re.search(r"service-backed counts as verified for publication", implement)
+    assert re.search(r"`wait_ci` returns any failure to `implement`", implement)
+    review = flat.split("(phase `review_diff`", 1)[1].split("## Loop cap", 1)[0]
+    assert "each service-backed test with its command and missing service" in review
+    publish = flat.split("(phase `publish`)", 1)[1].split("(phase `wait_ci`)", 1)[0]
+    assert re.search(r"red-on-base was not observed in the sandbox", publish)
+    assert "red-on-base procedure from step 5" in publish
+
+
+def test_diff_reviewer_does_not_block_on_unobtainable_service_evidence() -> None:
+    """The diff reviewer stops asking for runs the sandbox cannot produce (#3755)."""
+    flat = _flat((BUNDLE / "agents" / "diff-reviewer.md").read_text())
+    assert re.search(
+        r"do not demand its run results, real-service evidence, or a red-on-base run", flat
+    )
+    assert re.search(r"criterion is verified for publication", flat)
+    assert "`wait_ci`" in flat
+    # The relaxation is bounded: a wrong test or a failed serviceless check still blocks.
+    assert re.search(
+        r"Block only when the test is wrong or misses the criterion, or a serviceless check failed",
+        flat,
+    )

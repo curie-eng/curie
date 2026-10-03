@@ -85,7 +85,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Helm
-        uses: azure/setup-helm@v5.0.1
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
 
@@ -166,12 +166,20 @@ jobs:
       - name: Reject chart-owned extraEnv duplicates
         run: bash charts/curie/ci/reserved-env-assertions.sh
 
+      # Prove worker.streamRetention.minAgeSeconds reaches the worker, is
+      # bounded by the schema, and defaults on a release with no such block.
+      - name: helm render assertions (stream retention window)
+        run: bash charts/curie/ci/stream-retention-assertions.sh
+
       # Prove the API Service keeps a stable NodePort when enabled, allows an
       # override, and omits the field for ClusterIP or explicit auto allocation.
       - name: helm render assertions (api service NodePort)
         run: |
           set -euo pipefail
           bash charts/curie/ci/api-service-nodeport-assertions.sh
+
+      - name: helm render assertions (NetworkPolicy warning)
+        run: bash charts/curie/ci/networkpolicy-notes-assertions.sh
 
       # Prove the api reads runner pods for the Logs tab from the release
       # namespace, the same namespace the worker claims sandboxes in.
@@ -287,10 +295,25 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/statefulset-metadata-rollout-assertions.sh
 
+      # Prove the compute-plane PodDisruptionBudgets (issue #1574): off by
+      # default, each enabled budget selects exactly its own Deployment's pods
+      # (a selector mutated onto another component fails the checker), an
+      # unacknowledged blocking budget refuses the render, and the dispatcher
+      # accepts only an acknowledged blocking budget.
+      - name: helm render assertions (compute-plane PodDisruptionBudgets)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/compute-pdb-assertions.sh
+
       - name: helm render assertions (otel collector durable delivery)
         run: |
           set -euo pipefail
           bash charts/curie/ci/otel-collector-durability-assertions.sh
+
+      - name: helm render assertions (exporters without exporterhelper)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/otel-collector-exporter-helper-optout-assertions.sh
 
       # Opt-in Kubernetes Events receiver for the collector (#2954): off by
       # default, namespace-scoped read-only RBAC, refused into nop-only logs.
@@ -377,6 +400,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/security-probe-byo-runner-egress-assertions.sh
 
+      # Prove a real model under security.gvisor.mode=auto stamps runtimeClassName
+      # on the runner SandboxTemplate when Helm lookup is empty, and that the
+      # security probe fails when that template lacks the class (#3558).
+      - name: helm render assertions (gVisor runtime class on the runner template)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/gvisor-runtime-class-assertions.sh
+
       # Keep the chart ClickHouse default and Langfuse pin as one supported
       # pair. ClickHouse 24.8 cannot apply Langfuse 3.225.x migration 39, so
       # the default must stay on 25.12 and AVX-required (#2210).
@@ -401,7 +432,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Helm
-        uses: azure/setup-helm@v5.0.1
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
 
@@ -500,6 +531,10 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/api-ingress-assertions.sh
+          helm template ingress-schema charts/curie \
+            --set api.ingress.enabled=true --set api.ingress.host=api.example.com \
+            -s templates/api-ingress.yaml \
+            | kubeconform -strict -summary -kubernetes-version "$KUBE_VERSION"
 
       # Prove the GitHub App credential (ADR-0092): the App ID reaches the API
       # as digits (a float renders as "4.47597e+06" and 401s every call), and a
@@ -509,6 +544,7 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/github-app-credential-assertions.sh
+          bash charts/curie/ci/api-identity-mutation-assertions.sh
 
       # Prove GitHub review ingress stays off by default, renders explicit
       # operator values, rejects invalid types/cadences, and reserves both env
@@ -732,6 +768,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/sandbox-capacity-fit-assertions.sh
 
+      # Prove worker.maxConcurrency (issue #760): it reaches the worker env as
+      # CURIE_WORKER_MAX_CONCURRENCY exactly once, the schema holds it to 1
+      # through 256, and NOTES prints replicas x maxConcurrency beside the
+      # sandbox quota ceiling (lookup stubbed to a fixture node).
+      - name: helm render assertions (worker maxConcurrency)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/worker-max-concurrency-assertions.sh
+
       # Prove the in-chart rustfs resource floors (issue #2706). Presence is
       # not the defect; the 512Mi memory ceiling is. The shipped default sat
       # under a measured 1120Mi working set, so every install OOMKilled in a
@@ -771,15 +816,12 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/live-manifest-parity-assertions.sh
 
-      # Prove the API and the worker agree about the object store. The API writes
-      # each uploaded plugin bundle to the bundle bucket and the worker reads it
-      # back, so a disagreement -- or an omission -- makes every bundle
-      # unfetchable. worker.yaml set none of the four variables, so the worker
-      # used its compose defaults (localhost:29000) and every fetch in
-      # Kubernetes hit ECONNREFUSED. Both symptoms point elsewhere: the
-      # post-deploy eval goes quiet with "unresolvable suite/bundle", and turns
-      # die as ClaimTimeoutError, whose message blames a CPU-saturated node --
-      # on the install where this was found the node was at 11% CPU.
+      # Prove the API and worker eval reader agree about the object store.
+      # Missing worker S3 variables select compose defaults (localhost:29000),
+      # so an in-cluster eval cannot fetch its suite and reports
+      # "unresolvable suite/bundle". Kubernetes chat turns fetch bundles through
+      # the sandbox bundle-fetch init container with its own S3 environment;
+      # this worker env fix does not explain turn-path ClaimTimeoutError.
       - name: helm render assertions (worker/api object store agree)
         run: |
           set -euo pipefail
@@ -905,7 +947,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Helm
-        uses: azure/setup-helm@v5.0.1
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
 
@@ -957,7 +999,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: azure/setup-helm@v5.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.17.3
       - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0

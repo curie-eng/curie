@@ -129,6 +129,21 @@ THREAD_RESET_SET = "curie:thread-reset-requests"
 # closes.
 THREAD_RESET_INFLIGHT_SET = "curie:thread-reset-inflight"
 
+# Outcome of a drained thread reset (#3699): ``THREAD_RESET_RESULT_PREFIX`` plus
+# the thread key holds ``THREAD_RESET_RELEASED`` when ``release_thread`` found a
+# route and ``THREAD_RESET_NO_ROUTE`` when the key matched none (so nothing was
+# released). The API's ``GET .../reset`` reads it once the reset is no longer
+# pending, which is how a caller learns that a hand-built key it queued freed
+# nothing. Written before the in-progress marker is cleared, so a poll that
+# reads "not pending" always finds it; it expires after
+# ``_THREAD_RESET_RESULT_TTL_S`` and the API treats an absent result as unknown.
+# The prefix is mirrored verbatim in ``apps/api/src/curie_api/threadreset.py`` and
+# frozen in tests/vectors/thread-reset-set.json.
+THREAD_RESET_RESULT_PREFIX = "curie:thread-reset-result:"
+THREAD_RESET_RELEASED = "released"
+THREAD_RESET_NO_ROUTE = "no-route"
+_THREAD_RESET_RESULT_TTL_S = 3600
+
 # Claim a thread-reset request and mark it in-progress as ONE atomic unit (#855).
 # Valkey runs a script to completion with nothing interleaved, so the claim
 # transition -- moving the key from the request set to the in-progress set --
@@ -173,7 +188,7 @@ class Consumer(StreamConsumer):
         kernel: Kernel,
         config: WorkerConfig,
         leases: DeliveryLeaseStore,
-        max_concurrency: int = 16,
+        max_concurrency: int | None = None,
         drain: UpgradeDrainGate | None = None,
     ) -> None:
         # Capacity parking requires a real delivery fence, so every runs
@@ -197,8 +212,12 @@ class Consumer(StreamConsumer):
         self._kernel = kernel
         self._config = config
         self._waits = CapacityWaitStore(redis, config)
-        self._max_concurrency = max_concurrency
-        self._sem = asyncio.Semaphore(max_concurrency)
+        # None, which the production entry point passes, sizes the lane from
+        # CURIE_WORKER_MAX_CONCURRENCY; an explicit value is for tests.
+        self._max_concurrency = (
+            config.max_concurrency if max_concurrency is None else max_concurrency
+        )
+        self._sem = asyncio.Semaphore(self._max_concurrency)
         self._inflight: set[asyncio.Task[None]] = set()
         # The reclaim/dead-letter knobs the shared base machinery reads. Built
         # after self._config is stored; handler is the bound self._dispatch. The
@@ -1009,6 +1028,21 @@ class Consumer(StreamConsumer):
         markers = Markers(self._valkey, self._config)
         await observe_completion_outbox(markers, self._valkey, self._config)
 
+    @staticmethod
+    def _record_thread_reset_outcome(outcome: str) -> None:
+        """Count one drained thread reset by outcome (#3699): ``released``,
+        ``no-route`` (the key matched no route, so nothing was freed) or
+        ``failed`` (the release raised). An operator alerts on ``no-route``."""
+
+        record_metric(
+            "curie.sandbox.lifecycle",
+            attributes={
+                "service.name": "curie-worker",
+                "operation": "thread-reset",
+                "outcome": outcome,
+            },
+        )
+
     async def _drain_thread_reset_requests(self) -> None:
         """Force-release any thread whose sandbox an operator requested reset
         for (#713). ``THREAD_RESET_SET`` mirrors
@@ -1035,6 +1069,13 @@ class Consumer(StreamConsumer):
         (``_THREAD_RESET_CLAIM_LUA``, #855), not an ``SPOP`` followed by a
         separate ``SADD`` -- see that constant's comment for why the two-round-trip
         version would reopen #812's failure at RTT scale.
+
+        A release that lands records its outcome (``released`` when a route
+        existed, ``no-route`` when the key matched none) under
+        ``THREAD_RESET_RESULT_PREFIX`` before the in-progress marker is cleared,
+        warns when nothing was released, and counts the outcome on
+        ``curie.sandbox.lifecycle`` (#3699). The API reads the record back so the
+        caller learns that a wrong key freed nothing.
 
         A release that raises or times out is logged and LEFT in the in-progress
         set: ``is_pending`` therefore stays True and the CLI reports the reset as
@@ -1080,16 +1121,35 @@ class Consumer(StreamConsumer):
                 # Release failed/timed out: leave the key in the in-progress set
                 # so `is_pending` stays True and the CLI does not report a false
                 # "released" (#812). Not re-queued -- a fresh request re-drives it.
+                # No result is recorded: the caller must see an unconfirmed reset,
+                # not a recorded outcome.
                 logger.exception("thread reset failed for %s", thread_key)
+                self._record_thread_reset_outcome("failed")
             else:
+                # Record the outcome BEFORE clearing the in-progress marker, so a
+                # poll that reads "not pending" always finds it (#3699). `released`
+                # is True iff a route existed for the key.
+                await self._valkey.set(
+                    f"{THREAD_RESET_RESULT_PREFIX}{thread_key}",
+                    THREAD_RESET_RELEASED if released else THREAD_RESET_NO_ROUTE,
+                    ex=_THREAD_RESET_RESULT_TTL_S,
+                )
                 # Release landed: clear the in-progress marker so `is_pending`
                 # flips to done -- only now, after the teardown actually
                 # completed.
                 await self._valkey.srem(THREAD_RESET_INFLIGHT_SET, thread_key)
-                logger.info(
-                    "thread reset: released sandbox for %s (route existed: %s)",
-                    thread_key,
-                    released,
+                if released:
+                    logger.info("thread reset: released sandbox for %s", thread_key)
+                else:
+                    # A key that matches no route frees nothing. A hand-built key
+                    # that left out a named bot's identity segment lands here, and
+                    # the sandbox it meant to free stays claimed.
+                    logger.warning(
+                        "thread reset: no route matched %s; nothing was released",
+                        thread_key,
+                    )
+                self._record_thread_reset_outcome(
+                    THREAD_RESET_RELEASED if released else THREAD_RESET_NO_ROUTE
                 )
             if time.monotonic() - start >= _THREAD_RESET_DRAIN_BUDGET_S:
                 logger.warning(

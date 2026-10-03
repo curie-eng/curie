@@ -90,7 +90,10 @@ than an open bag of `gen_ai.*` names.
 - The metric catalog in `packages/telemetry/schema/metrics.json` is the committed
   contract for operational counters, histograms, and gauges across turn, queue,
   thread-lock, sandbox, runner RPC, approval, completion-outbox, reply, HTTP,
-  background-loop, schedule fires, eval work, transcript-capacity, and supervised-task restarts. `record_metric`
+  background-loop, connector-reconcile skips, schedule fires, eval work,
+  transcript-capacity, state mutations, supervised-task restarts, tool results, and
+  Slack Socket Mode connection state.
+  `record_metric`
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`) rejects undeclared
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
   operation classes and outcomes, not event, run, session, sandbox, user, or
@@ -109,6 +112,29 @@ than an open bag of `gen_ai.*` names.
   per live or restarted process, never one per event, session, user, or sandbox. The
   1,000-identifier regression exercises this production resource shape as well as the
   point attributes.
+- `curie.tool.result` counts each tool result the runner sees close a call made in the
+  same turn, by `origin` and `outcome`
+  (`runner/src/curie_runner/session.py::SessionRunner._observe_tool_results`). The
+  signal is the SDK's `is_error` on the result; no payload is parsed. `origin` is
+  `platform` for Curie's own in-process tools, matched by exact live name, `connector`
+  for any other `mcp__` tool, and `builtin` for a CLI tool. A result without `is_error`
+  is `success`. An `is_error` result is `cancelled` when an operator stop cut the call
+  off, since the CLI then answers the call itself; `awaiting_approval` when the runner's
+  approval gate held that call; `refused` when the gate rejected it through `toolPolicy`
+  or an approval grant's argument check; and `unavailable` when the CLI's exact
+  unknown-tool envelope names a tool absent from its init catalog. The catalog
+  check prevents a connector's identical error text from being misclassified;
+  absent or malformed catalog evidence leaves the result as `error`. The gate
+  matches result call IDs, not tool names: a same-name sibling that reached the
+  connector can still be an `error`. A connector `error` covers its `isError`
+  result, a JSON-RPC error, and a call the turn deadline cut off (a connector
+  that holds a call until the deadline is failing). Two runner-side denials
+  outside the approval gate still count as a connector `error`: a bundle's own
+  PreToolUse deny, and the connector exclusion deny for a connector whose
+  startup probe failed (#3580 tracks keying them by call ID). A
+  connector that reports failure inside a success-shaped payload counts as `success`.
+  The metric carries no connector or tool name, so each connector `error` also logs one
+  WARNING naming the server and the tool, never the call's arguments or its result.
 
 ### Runner generation spans
 

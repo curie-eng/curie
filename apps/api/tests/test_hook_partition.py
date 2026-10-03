@@ -43,8 +43,8 @@ test module cannot reliably import another by name.
 from __future__ import annotations
 
 import hashlib
-import hmac
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -52,6 +52,7 @@ import pytest
 import redis
 from aci_protocol import QueuedTurn
 from channel_protocol import hook_conversation_id as conversation_id
+from curie_api import hook_signing
 from curie_api.config import get_settings
 from curie_api.delivery import sha16
 from curie_api.hook_partition import (
@@ -411,10 +412,6 @@ def _bind(
     return str(created.json()["id"])
 
 
-def _sign(secret: str, body: bytes) -> str:
-    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-
-
 def _secret_for(agent_id: str, generation: int = 0) -> str:
     return derive(get_settings().api_key, agent_id=agent_id, generation=generation)
 
@@ -431,11 +428,19 @@ def _post(
 ) -> Any:
     """POST one delivery, signing with `secret` unless a signature is forced."""
 
-    headers = {"Content-Type": "application/json"}
+    timestamp = str(int(time.time()))
+    headers = {"Content-Type": "application/json", "X-Curie-Timestamp": timestamp}
     if signature is not None:
         headers["X-Curie-Signature-256"] = signature
     elif secret is not None:
-        headers["X-Curie-Signature-256"] = _sign(secret, body)
+        headers["X-Curie-Signature-256"] = hook_signing.sign(
+            secret,
+            timestamp=timestamp,
+            delivery_id=delivery_id or "",
+            hook=hook,
+            tool_access=None,
+            body=body,
+        )
     if delivery_id is not None:
         headers["X-Curie-Delivery-Id"] = delivery_id
     return client.post(f"/hooks/{agent_id}/{hook}", content=body, headers=headers)

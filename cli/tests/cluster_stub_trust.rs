@@ -186,6 +186,29 @@ def relay_body(reply_ref, after):
     turn = next((item for item in state["turns"] if item["payload"]["reply_handle"].get("placeholder") == reply_ref), None)
     if turn is None or os.environ.get("CURIE_TEST_RELAY_MODE") == "timeout":
         return {"events": [], "next_cursor": after, "terminal": False}
+    if os.environ.get("CURIE_TEST_RELAY_MODE") == "approval":
+        # The turn parks on an approval: the worker posts the notice and reports
+        # awaiting-approval, which is not a terminal page.
+        payload = turn["payload"]
+        handle = payload["reply_handle"]
+        target = {
+            "kind": handle["kind"],
+            "address": handle["channel"],
+            "conversation_id": payload["conversation_id"],
+            "reply_ref": reply_ref,
+        }
+        notice = (
+            "Awaiting approval (3f2504e0-4f89-41d3-9a0c-0305e82c3301): do the risky thing\n"
+            "The session is paused and will resume once an authorized member "
+            "resolves this request."
+        )
+        events = [
+            {"version": "1.0", "event": "reply.update", "target": target, "text": notice,
+             "message": None, "settled": None, "nav": None},
+            {"version": "1.0", "event": "turn.completed", "target": target,
+             "event_id": payload["event_id"], "outcome": "awaiting-approval"},
+        ]
+        return {"events": events[after:], "next_cursor": len(events), "terminal": False}
     # The worker owns XACK. Model its terminal ordering explicitly: delivery to
     # the relay succeeds, then worker ownership leaves the PEL. This is not a
     # Redis command from the CLI; those are recorded separately above.
@@ -263,6 +286,17 @@ def serve_http(client):
             else:
                 status = "200 OK"
                 body = json.dumps(relay_body(reply_ref, after)).encode("utf-8")
+        elif method == "GET" and parsed.path == "/agents":
+            # One agent bound on the fixture channel. The binding's adapter is
+            # the identity it speaks through; `default` is the pre-identity shape.
+            adapter = os.environ.get("CURIE_TEST_AGENT_ADAPTER", "default")
+            status = "200 OK"
+            body = json.dumps([{
+                "id": "agent-ops",
+                "name": "ops",
+                "memory": False,
+                "channels": [{"kind": "slack", "address": "C0EXAMPLE1", "adapter": adapter}],
+            }]).encode("utf-8")
         else:
             status = "404 Not Found"
             body = b'{"detail":"unexpected fixture route"}'
@@ -1041,6 +1075,148 @@ fn cluster_eval_grades_through_the_message_relay_without_a_stub_or_rollout() {
     assert!(
         !log.contains("slackTrustedOrigins"),
         "cluster eval must not rewrite worker Slack trust: {log}"
+    );
+}
+
+/// The reply handle a relay turn carries when `--agent` selected a binding:
+/// the relay stays the delivery adapter, and a named binding rides in
+/// `identity` (INGRESS-CANARY-1).
+fn assert_relay_handle_names(handle: &serde_json::Value, identity: Option<&str>) {
+    assert_eq!(handle["kind"], "slack");
+    assert_eq!(handle["channel"], CHANNEL);
+    assert_eq!(
+        handle["adapter"], RELAY_ADAPTER,
+        "the relay stays the delivery adapter: {handle}"
+    );
+    match identity {
+        Some(identity) => assert_eq!(handle["identity"], identity, "{handle}"),
+        None => assert!(
+            handle["identity"].is_null(),
+            "a default binding sends no identity: {handle}"
+        ),
+    }
+}
+
+// @spec INGRESS-CANARY-1
+#[test]
+fn cluster_message_sends_a_named_agents_identity_on_the_relay_turn() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(fixture.state_home.path(), "alpha", false)
+        .args(["--agent", "ops"])
+        .env("CURIE_TEST_AGENT_ADAPTER", "ops-bot")
+        .output()
+        .expect("run cluster message --agent");
+    assert!(
+        output.status.success(),
+        "a named binding must be driven through the relay: {}",
+        describe(&output)
+    );
+    assert_eq!(json_output(&output)["reply"], "reply-alpha");
+    let state = fixture.state();
+    let turns = state["turns"].as_array().expect("recorded turns");
+    assert_eq!(turns.len(), 1, "{turns:#?}");
+    assert_relay_handle_names(&turns[0]["payload"]["reply_handle"], Some("ops-bot"));
+}
+
+// @spec INGRESS-CANARY-1
+#[test]
+fn cluster_message_sends_no_identity_for_a_default_agent() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(fixture.state_home.path(), "alpha", false)
+        .args(["--agent", "ops"])
+        .env("CURIE_TEST_AGENT_ADAPTER", "default")
+        .output()
+        .expect("run cluster message --agent");
+    assert!(output.status.success(), "{}", describe(&output));
+    let state = fixture.state();
+    assert_relay_handle_names(&state["turns"][0]["payload"]["reply_handle"], None);
+}
+
+// @spec ADR-0168 d8. The connected transport posts its placeholder with the
+// release's default bot token, so it still cannot carry a named route.
+#[test]
+fn connected_cluster_message_still_refuses_a_named_agent() {
+    let fixture = Fixture::new();
+    let slack = serve(|_request| {
+        Response::json(
+            200,
+            r#"{"ok":true,"ts":"1717171717.000900","channel":"C0EXAMPLE1"}"#,
+        )
+    });
+    let output = fixture
+        .command(fixture.state_home.path(), "connected", false)
+        .args(["--agent", "ops"])
+        .env("CURIE_TEST_AGENT_ADAPTER", "ops-bot")
+        .env("CURIE_TEST_CONNECTED", "1")
+        .env("CURIE_TEST_SLACK_BASE", &slack.base_url)
+        .env("CURIE_SLACK_BOT_TOKEN", "xoxb-example")
+        .output()
+        .expect("run connected cluster message --agent");
+    assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ops-bot"),
+        "{}",
+        describe(&output)
+    );
+    assert!(slack.recorded().is_empty(), "no placeholder was posted");
+    assert_eq!(fixture.state()["turns"], serde_json::json!([]));
+}
+
+// The approval resume does not carry the identity yet (#3683): it would resolve
+// the channel's default binding, a different agent. The CLI must not follow a
+// named turn into it, and says so instead of printing that agent's answer.
+#[test]
+fn cluster_message_does_not_follow_a_named_turns_approval_resume() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(fixture.state_home.path(), "alpha", false)
+        .args(["--agent", "ops"])
+        .env("CURIE_TEST_AGENT_ADAPTER", "ops-bot")
+        .env("CURIE_TEST_RELAY_MODE", "approval")
+        .output()
+        .expect("run cluster message --agent through an approval");
+    assert_eq!(output.status.code(), Some(3), "{}", describe(&output));
+    assert_eq!(json_output(&output)["awaiting_approval"], true);
+    let state = fixture.state();
+    assert_eq!(
+        state["http_gets"].as_array().map(Vec::len),
+        Some(1),
+        "no relay polling past the parked turn: {}",
+        state["http_gets"]
+    );
+}
+
+// @spec INGRESS-CANARY-1 WORKER-CANARY-3. The reset SADDs the key the worker
+// claimed, which names the identity; a bare key leaves the sandbox claimed.
+#[test]
+fn cluster_eval_sends_a_named_agents_identity_and_resets_its_scoped_thread() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .eval_command(fixture.state_home.path())
+        .args(["--agent", "ops"])
+        .env("CURIE_TEST_AGENT_ADAPTER", "ops-bot")
+        .output()
+        .expect("run cluster eval --agent");
+    assert!(
+        output.status.success(),
+        "a named binding must be graded through the relay: {}",
+        describe(&output)
+    );
+    let state = fixture.state();
+    let turns = state["turns"].as_array().expect("recorded turns");
+    assert_eq!(turns.len(), 1, "{turns:#?}");
+    assert_relay_handle_names(&turns[0]["payload"]["reply_handle"], Some("ops-bot"));
+    let resets = state["sadd_members"].as_array().expect("thread reset SADD");
+    assert!(!resets.is_empty(), "eval must SADD the scoped thread key");
+    assert!(
+        resets.iter().all(|member| {
+            member
+                .as_str()
+                .is_some_and(|value| value.starts_with("slack:ops-bot:C0EXAMPLE1:eval%3A"))
+        }),
+        "reset must name the identity the worker scoped the thread by: {resets:?}"
     );
 }
 

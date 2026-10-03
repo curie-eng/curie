@@ -436,13 +436,16 @@ pub struct ApprovalNotificationTargetResponse {
 /// Who may resolve a route's approvals, mirroring the committed
 /// `ApprovalApprovers`. The API settles the precedence (`users` wins over
 /// `group`); the CLI never reorders or merges them, it forwards what was asked
-/// for and lets the one authoritative validator answer.
+/// for and lets the one authoritative validator answer. `emails` is read only
+/// for a card shown in an email thread (ADR-0177 amendment), never for a Slack card.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApprovalApprovers {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub users: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emails: Option<Vec<String>>,
 }
 
 // --- The input side of the same contract (#1072) -------------------------------
@@ -563,6 +566,8 @@ pub struct ApproversInput {
     pub group: Option<String>,
     #[serde(default)]
     pub users: Option<Vec<String>>,
+    #[serde(default)]
+    pub emails: Option<Vec<String>>,
 }
 
 impl From<ApproversInput> for ApprovalApprovers {
@@ -570,6 +575,7 @@ impl From<ApproversInput> for ApprovalApprovers {
         ApprovalApprovers {
             group: input.group,
             users: input.users,
+            emails: input.emails,
         }
     }
 }
@@ -599,6 +605,8 @@ pub struct ApprovalRecord {
     pub status: String,
     pub conversation_id: String,
     pub summary: String,
+    #[serde(default)]
+    pub display_summary: Option<String>,
     #[serde(default)]
     pub expires_at: Option<String>,
     #[serde(default)]
@@ -1225,6 +1233,12 @@ pub struct KillState {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ThreadResetState {
     pub requested: bool,
+    /// What the worker found when it drained the reset (#3699): `Some(false)`
+    /// when the key matched no route, so nothing was released; `Some(true)` when
+    /// a route existed and was released; `None` while the reset is pending, when
+    /// the outcome expired, or against an API that predates the field.
+    #[serde(default)]
+    pub route_existed: Option<bool>,
 }
 
 /// The enqueued eval job's identity (`EvalTriggerResult` in openapi.json): the
@@ -1324,14 +1338,12 @@ pub struct EvalMatrix {
 }
 
 /// The per-agent budget (`BudgetConfig` in openapi.json): the request and
-/// response body of `PUT /agents/{id}/budget`. Both fields are optional; an
-/// omitted field means "platform default" server-side, so we only serialize the
-/// ones the caller set.
+/// response body of `GET /agents/{id}/budget` and `PUT /agents/{id}/budget`.
+/// A null field means "platform default". Serialize both fields so a budget
+/// update sends the complete configuration, including preserved defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BudgetConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens_per_run: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_usd_per_day: Option<f64>,
 }
 
@@ -1393,6 +1405,48 @@ fn has_local_host(endpoint: &reqwest::Url) -> bool {
         Ok(address) => address.is_loopback() || address.is_unspecified(),
         Err(_) => host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost"),
     }
+}
+
+/// The key a client for `base_url` actually sends (#3557).
+///
+/// `curie local up` stores a per-install API key, and a verb whose `--api-key`
+/// fell back to the dev sentinel should send that key instead. This is the one
+/// seam where the destination is known, so the substitution happens here and
+/// only for a loopback destination: the stored key belongs to a stack on this
+/// machine and must never reach a remote host, even when `CURIE_API_URL` points
+/// somewhere else. An explicit key is always sent as given. `stored` runs only
+/// for a loopback destination with the sentinel key; `None` keeps the sentinel.
+fn api_key_for_destination(
+    base_url: &str,
+    api_key: &str,
+    stored: impl FnOnce() -> Option<String>,
+) -> String {
+    if api_key == crate::message::DEFAULT_API_KEY && is_loopback_destination(base_url) {
+        if let Some(key) = stored().filter(|key| !key.is_empty()) {
+            return key;
+        }
+    }
+    api_key.to_string()
+}
+
+/// Whether `base_url` names this machine's loopback: `localhost`, any address
+/// in 127.0.0.0/8, or `::1`. Deliberately narrower than [`has_local_host`]: no
+/// unspecified address and no `*.localhost` names, since this gates sending a
+/// private key.
+fn is_loopback_destination(base_url: &str) -> bool {
+    let Ok(endpoint) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    endpoint
+        .host_str()
+        .is_some_and(crate::oci_registry::is_loopback_host)
+}
+
+/// The stored per-install key for the local project this process targets, or
+/// `None` on any failure (no project, no store, unreadable store).
+fn stored_local_api_key() -> Option<String> {
+    let resources = crate::local::current_resources().ok()?;
+    crate::local_stack_keys::stored_api_key(&resources.project)
 }
 
 /// Build the one kind of HTTP client this CLI makes requests with.
@@ -1832,6 +1886,41 @@ pub fn parse_trace_id(raw: &str) -> std::result::Result<String, String> {
     }
 }
 
+/// The percent-encoded request path for firing a hook:
+/// `/agents/{agent}/hooks/{name}/fire`.
+///
+/// Segments are pushed through [`reqwest::Url::path_segments_mut`], the same
+/// encoding `control_schedule` uses, so an agent name holding `#` or `?`
+/// cannot truncate the path or leak into the query string (#3731). A name
+/// without reserved characters encodes to itself. `commands::hook_fire_path`
+/// renders the same string for `--dry-run`, so the plan shows the path the
+/// request really uses.
+pub(crate) fn hook_fire_path(agent: &str, name: &str) -> String {
+    hook_agent_path(agent, name, &["fire"])
+}
+
+/// The percent-encoded request path for reading one hook run:
+/// `/agents/{agent}/hooks/{name}/runs/{run_id}`.
+pub(crate) fn hook_run_path(agent: &str, name: &str, run_id: &str) -> String {
+    hook_agent_path(agent, name, &["runs", run_id])
+}
+
+/// Percent-encode an agent hook path by pushing each segment through a
+/// throwaway URL, mirroring how `control_schedule` builds its request URL.
+fn hook_agent_path(agent: &str, name: &str, tail: &[&str]) -> String {
+    let mut url = reqwest::Url::parse("http://hook.invalid").expect("static URL base parses");
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .expect("static URL base accepts path segments");
+        segments.push("agents").push(agent).push("hooks").push(name);
+        for segment in tail {
+            segments.push(segment);
+        }
+    }
+    url.path().to_string()
+}
+
 impl ApiClient {
     /// The server caps `/approvals` results at this many rows
     /// (`apps/api/.../routers/approvals.py`: `min(max(limit, 1), 200)`); the CLI
@@ -1843,9 +1932,10 @@ impl ApiClient {
         warn_if_insecure(base_url);
         let http = http_client(base_url, Some(std::time::Duration::from_secs(5)))
             .context("building HTTP client")?;
+        let api_key = api_key_for_destination(base_url, api_key, stored_local_api_key);
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.to_string(),
+            api_key,
             http,
         })
     }
@@ -2869,16 +2959,13 @@ impl ApiClient {
     /// Force a thread's sandbox to be released: `POST
     /// /agents/{id}/threads/{thread_key}/reset` (no request body, #737). The
     /// worker's next maintenance tick deletes the thread's claim and route, so
-    /// its next message cold-creates a fresh sandbox.
+    /// its next message cold-creates a fresh sandbox. The thread key travels
+    /// as one percent-encoded path segment (#3727): see `thread_reset_url`.
     pub async fn reset_thread(&self, agent_id: &str, thread_key: &str) -> Result<ThreadResetState> {
+        let url = Self::thread_reset_url(&self.base_url, agent_id, thread_key)?;
         let resp = self
             .send_request(
-                self.http
-                    .post(format!(
-                        "{}/agents/{agent_id}/threads/{thread_key}/reset",
-                        self.base_url
-                    ))
-                    .header("X-API-Key", &self.api_key),
+                self.http.post(url).header("X-API-Key", &self.api_key),
                 "POST /agents/{id}/threads/{thread_key}/reset",
             )
             .await?;
@@ -2894,20 +2981,17 @@ impl ApiClient {
     /// from the POST until the worker's maintenance tick releases the sandbox,
     /// then flips to false -- so a caller can wait for the release to actually
     /// land (and the next message to be safe from adopting the pre-reset
-    /// sandbox) before it acts. Mirrors the POST above.
+    /// sandbox) before it acts. Mirrors the POST above, including its
+    /// percent-encoded thread key segment (#3727).
     pub async fn thread_reset_state(
         &self,
         agent_id: &str,
         thread_key: &str,
     ) -> Result<ThreadResetState> {
+        let url = Self::thread_reset_url(&self.base_url, agent_id, thread_key)?;
         let resp = self
             .send_request(
-                self.http
-                    .get(format!(
-                        "{}/agents/{agent_id}/threads/{thread_key}/reset",
-                        self.base_url
-                    ))
-                    .header("X-API-Key", &self.api_key),
+                self.http.get(url).header("X-API-Key", &self.api_key),
                 "GET /agents/{id}/threads/{thread_key}/reset",
             )
             .await?;
@@ -2916,6 +3000,48 @@ impl ApiClient {
             .json()
             .await
             .context("decoding thread reset state")
+    }
+
+    /// Build `/agents/{agent_id}/threads/{thread_key}/reset` with the thread
+    /// key as a single percent-encoded path segment (#3727). Stored thread
+    /// keys already carry `%XX` escapes (`scoped_conversation_id` applies
+    /// `quote(component, safe="")` to every component), and the platform API
+    /// decodes escapes when it reads `thread_key` -- so the key must go
+    /// through `path_segments_mut().push`, which encodes `%` as `%25` and `/`
+    /// as `%2F` (the same pattern `control_schedule` uses below), never
+    /// through string formatting. Sent raw, `github:curie-eng%2Fcurie:3698`
+    /// would arrive as `github:curie-eng/curie:3698` and match no route,
+    /// while `email:ops%40example.com:abc` would name a different thread than
+    /// the operator asked for. Characters the URL parser passes through
+    /// untouched (`:`, `.`, `@`, alphanumerics) keep today's wire form, so a
+    /// plain `slack:...` key is sent exactly as before.
+    fn thread_reset_url(base_url: &str, agent_id: &str, thread_key: &str) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(base_url)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("api URL cannot hold path segments"))?
+            .push("agents")
+            .push(agent_id)
+            .push("threads")
+            .push(thread_key)
+            .push("reset");
+        Ok(url)
+    }
+
+    /// Read the agent budget: `GET /agents/{id}/budget`.
+    pub async fn get_budget(&self, agent_id: &str) -> Result<BudgetConfig> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/agents/{agent_id}/budget", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/budget",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading the budget")
+            .await?
+            .json()
+            .await
+            .context("decoding budget")
     }
 
     /// Set the agent budget: `PUT /agents/{id}/budget` with a `BudgetConfig` body.
@@ -3192,14 +3318,11 @@ impl ApiClient {
 
     /// Start a hook now: `POST /agents/{agent}/hooks/{name}/fire`.
     pub async fn fire_hook(&self, agent: &str, name: &str) -> Result<HookFireRecord> {
+        let url =
+            reqwest::Url::parse(&format!("{}{}", self.base_url, hook_fire_path(agent, name)))?;
         let resp = self
             .send_request(
-                self.http
-                    .post(format!(
-                        "{}/agents/{agent}/hooks/{name}/fire",
-                        self.base_url
-                    ))
-                    .header("X-API-Key", &self.api_key),
+                self.http.post(url).header("X-API-Key", &self.api_key),
                 "POST /agents/{agent}/hooks/{name}/fire",
             )
             .await?;
@@ -3217,14 +3340,14 @@ impl ApiClient {
         name: &str,
         run_id: &str,
     ) -> Result<HookFireRecord> {
+        let url = reqwest::Url::parse(&format!(
+            "{}{}",
+            self.base_url,
+            hook_run_path(agent, name, run_id)
+        ))?;
         let resp = self
             .send_request(
-                self.http
-                    .get(format!(
-                        "{}/agents/{agent}/hooks/{name}/runs/{run_id}",
-                        self.base_url
-                    ))
-                    .header("X-API-Key", &self.api_key),
+                self.http.get(url).header("X-API-Key", &self.api_key),
                 "GET /agents/{agent}/hooks/{name}/runs/{id}",
             )
             .await?;
@@ -3833,9 +3956,10 @@ impl ApiClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_channel_body, agent_create_body, agent_update_body, is_insecure_endpoint,
-        mint_channel_token_body, prevalidate_series_span, validate_allowlist_entry, ChannelBinding,
-        ListedTargets, ResolvedTarget, DEFAULT_SLACK_IDENTITY,
+        add_channel_body, agent_create_body, agent_update_body, api_key_for_destination,
+        is_insecure_endpoint, mint_channel_token_body, prevalidate_series_span,
+        validate_allowlist_entry, ChannelBinding, ListedTargets, ResolvedTarget,
+        DEFAULT_SLACK_IDENTITY,
     };
 
     /// The pre-dispatch span guard allows exactly the cap (#1948): 1,000 hour
@@ -4194,6 +4318,68 @@ mod tests {
     fn https_is_always_secure() {
         assert!(!is_insecure_endpoint("https://api.example.com"));
         assert!(!is_insecure_endpoint("HTTPS://API.EXAMPLE.COM"));
+    }
+
+    // #3557: the stored install key replaces the sentinel only on loopback.
+    #[test]
+    fn stored_key_replaces_the_sentinel_for_a_loopback_destination() {
+        use crate::message::DEFAULT_API_KEY;
+        for url in [
+            "http://localhost:28080",
+            "http://LOCALHOST",
+            "http://127.0.0.1:28080",
+            "http://127.9.8.7:28080",
+            "http://[::1]:28080",
+        ] {
+            assert_eq!(
+                api_key_for_destination(url, DEFAULT_API_KEY, || Some("stored-placeholder".into())),
+                "stored-placeholder",
+                "{url}"
+            );
+        }
+        // Nothing stored, or an empty store value, keeps the sentinel.
+        assert_eq!(
+            api_key_for_destination("http://localhost:28080", DEFAULT_API_KEY, || None),
+            DEFAULT_API_KEY
+        );
+        assert_eq!(
+            api_key_for_destination("http://localhost:28080", DEFAULT_API_KEY, || Some(
+                String::new()
+            )),
+            DEFAULT_API_KEY
+        );
+    }
+
+    #[test]
+    fn stored_key_never_reaches_a_remote_destination() {
+        use crate::message::DEFAULT_API_KEY;
+        for url in [
+            "http://api.example.com",
+            "https://api.example.com:8443",
+            "http://0.0.0.0:28080",
+            "http://api.localhost:28080",
+            "http://localhost.example.com",
+            "http://10.0.0.5:28080",
+            "not a url",
+        ] {
+            assert_eq!(
+                api_key_for_destination(url, DEFAULT_API_KEY, || panic!(
+                    "the store must not be read for {url}"
+                )),
+                DEFAULT_API_KEY,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_key_is_sent_as_given_even_on_loopback() {
+        assert_eq!(
+            api_key_for_destination("http://127.0.0.1:28080", "explicit-placeholder", || panic!(
+                "the store must not be read for an explicit key"
+            )),
+            "explicit-placeholder"
+        );
     }
 
     #[test]

@@ -3,6 +3,11 @@
   "header": "X-Curie-Caller",
   "status": 403,
   "content_type": "application/json",
+  "unpaired": {
+    "why": "A signed token that carries run without work_item is malformed and refused as invalid.",
+    "token": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJydW4iOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEifQ.GENbUYfT0PWv5h5J_-m9v0LBE0A5TA7a7WdImBeLv_3y0uTueF0QWnWvA41C3FHEbXMKvwfpm0P_wHXHAKRVBQ",
+    "refusal": "invalid"
+  },
   "vectors": [
     {
       "refusal": "missing",
@@ -19,6 +24,10 @@
     {
       "refusal": "not_admitted",
       "body": {"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": "caller refused: this agent is not admitted by the connector", "data": {"curie_caller": "not_admitted"}}}
+    },
+    {
+      "refusal": "grant_required",
+      "body": {"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": "caller refused: the connector tool call has no matching grant", "data": {"curie_caller": "grant_required"}}}
     }
   ]
 }

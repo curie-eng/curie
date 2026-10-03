@@ -82,6 +82,7 @@ def _marked(sink: Any, request_id: uuid.UUID) -> list[dict[str, Any]]:
 def _admit(client: Any, github: Any, sink: Any, number: int) -> uuid.UUID:
     github.issue_number = number
     github.labels = [LABEL]
+    github.advance_label_event(number)
     sink.issue_labels[number] = {LABEL, "bug"}
     response = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
     assert response.json()["status"] == "factory_admitted", response.text
@@ -345,15 +346,66 @@ def test_a_failure_patches_the_plain_reason_and_needs_a_human(admitted: Any) -> 
     assert sink.posts == 1
 
 
+def test_sandbox_termination_comment_shows_kubernetes_reason(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9922
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+    comment_id = _notices(request_id)[0]["comment_id"]
+    sink.requests.clear()
+
+    epoch = _start_running(request_id)
+    detail = 'Kubernetes reason: Evicted: EmptyDir volume "workspace" exceeded its limit'
+    _finish_failed(client, request_id, epoch, "sandbox_terminated", detail=detail)
+    _reconcile()
+
+    assert _posts(sink) == []
+    assert [path for path, _ in _patches(sink)] == [
+        f"/repos/{REPO}/issues/comments/{comment_id}"
+    ]
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"]
+    assert body.startswith("Could not complete: the sandbox terminated")
+    assert f"Details: {detail}" in body
+    assert "Provider message:" not in body
+    assert "Cause: sandbox_terminated" in body
+    assert "Failure class: sandbox-terminated" in body
+    assert "Status: FAILED" in body
+    assert FINAL_MARKER in body
+    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
+    token = _notices(request_id)[0]["card_token"]
+    card = client.get(f"/v1/factory/cards/{token}.svg")
+    assert card.status_code == 200, card.text
+    assert "NEEDS HUMAN" in card.text
+
+
 @pytest.mark.parametrize(
-    ("number", "detail"),
+    ("number", "detail", "field", "value", "remedy"),
     [
-        (9916, "run failed"),
-        (9917, "The run reached its output token limit"),
+        (
+            9916,
+            "output token budget exceeded (max_output_tokens_per_run=64000)",
+            "max_output_tokens_per_run",
+            "64000",
+            "curie cluster budget <agent> --output-tokens <tokens>",
+        ),
+        (
+            9917,
+            "USD budget exceeded (max_usd_per_day=6.5)",
+            "max_usd_per_day",
+            "6.5",
+            "curie cluster budget <agent> --limit <usd>",
+        ),
+        (9923, "run failed", None, None, None),
     ],
 )
-def test_budget_failure_comment_names_both_limits_and_the_usd_command(
-    admitted: Any, number: int, detail: str  # noqa: F811
+def test_budget_failure_comment_identifies_the_limit_or_admits_it_is_unknown(
+    admitted: Any,  # noqa: F811
+    number: int,
+    detail: str,
+    field: str | None,
+    value: str | None,
+    remedy: str | None,
 ) -> None:
     client, github, sink = admitted
     request_id = _admit(client, github, sink, number)
@@ -373,16 +425,24 @@ def test_budget_failure_comment_names_both_limits_and_the_usd_command(
     body = comment["body"]
     headline = body.splitlines()[0]
     assert headline.startswith("Could not complete:")
-    assert "USD cap" in headline
-    assert "daily" not in headline
-    assert "output token limit" in headline
-    assert "`curie cluster budget <agent> --limit <usd>`" in headline
+    if field is None:
+        assert "cannot identify" in headline.lower()
+        assert "curie cluster budget" not in body
+        assert "--limit" not in body
+        assert "--output-tokens" not in body
+    else:
+        assert field in headline
+        assert value is not None and value in headline
+        assert f"`{remedy}`" in headline
+        other_remedy = "--limit" if field == "max_output_tokens_per_run" else "--output-tokens"
+        assert other_remedy not in body
     assert f"Provider message: {detail}" in body
     assert "Cause: budget_exceeded" in body
     assert "Status: FAILED" in body
     assert FINAL_MARKER in body
     assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
     assert sink.posts == 1
+    assert len(_marked(sink, request_id)) == 1
 
 
 def test_history_capacity_failure_notice_explains_retry(admitted: Any) -> None:  # noqa: F811
@@ -463,6 +523,7 @@ def test_relabel_while_waiting_finalizes_the_old_comment_and_opens_a_new_one(
     number = 9911
     old_id = _admit(client, github, sink, number)
     _reconcile()
+    github.advance_label_event(number)
     again = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
     assert again.json()["status"] == "factory_admitted"
     rows = _rows(

@@ -23,6 +23,7 @@ from .. import bundles, crud, deploy, hook_signing
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
+from ..e2e_connector import prepare_connectors
 from ..models import Agent, AgentChannel
 from ..publication_policy import PublicationPolicyConflict
 from ..runner_resources import RunnerResourcesError, quota_refusal
@@ -827,18 +828,34 @@ async def read_version_connectors(
             # Per-agent too: a release-scoped Secret means deploying the prod
             # agent overwrites the dev agent's token in place (#1116).
             secret_name = f"{release}-{agent_name}-connector-secrets"
-            return ConnectorManifests(
-                manifests=bundles.render_connector_manifests(
+            # ADR-0168 decision 7: every hosted connector this install renders
+            # gets the caller proxy once a key is configured. No key is a 422
+            # from the renderer's named refusal, not an ungated connector.
+            proxy = settings.connector_proxy()
+            patterns = bundles.approval_tool_patterns(Path(tmp), agent.approval_required_tools)
+            gated = {
+                name: bundles.gated_tools_for_connector(name, patterns)
+                for name in declared.connectors
+            }
+            e2e_install = settings.e2e_install()
+            try:
+                declared = prepare_connectors(declared, e2e_install)
+                manifests = bundles.render_connector_manifests(
                     declared,
                     release=release,
                     agent=agent_name,
                     namespace=namespace,
                     app_name=app_name,
                     secret_name=secret_name,
-                    # ADR-0168 decision 7: every hosted connector this install
-                    # renders gets the caller proxy once a key is configured.
-                    proxy=settings.connector_proxy(),
-                ),
+                    proxy=proxy,
+                    grant_store_url=settings.valkey_dsn() if proxy is not None else "",
+                    gated_tools=gated,
+                    e2e=e2e_install,
+                )
+            except ValueError as exc:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+            return ConnectorManifests(
+                manifests=manifests,
                 mcp_entries=bundles.connector_mcp_entries(
                     declared, release=release, agent=agent_name, namespace=namespace
                 ),

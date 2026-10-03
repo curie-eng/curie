@@ -1,0 +1,26 @@
+2026-09-18T01:09:31.2250010Z cluster: turn finalized with a reply (plumbing asserted, content deliberately not graded)
+2026-09-18T01:09:31.2250703Z cluster: reply is not the fake sentinel (live negative control)
+2026-09-18T01:09:31.2251034Z 
+2026-09-18T01:09:31.2251211Z === curie cluster eval --dry-run (suite parity) ===
+2026-09-18T01:09:31.2294331Z Kubernetes context: kind-curie-e2e (cluster kind-curie-e2e)
+2026-09-18T01:09:31.2561174Z cluster: suite parity asserted (name and count only, no ids) -- the tier's own loader reported: grade 1 case(s) from suite "weather" against the cluster tier
+2026-09-18T01:09:31.2561928Z 
+2026-09-18T01:09:31.2562175Z === curie cluster eval (REPORT ONLY, does not fail this rung: #1603) ===
+2026-09-18T01:09:31.2794014Z Kubernetes context: kind-curie-e2e (cluster kind-curie-e2e)
+2026-09-18T01:10:19.2221632Z {"bundle_digest":null,"cases":[{"id":"reports-a-temperature","outcome":"pass","output":"","passed":true,"passes":1,"policy":"majority","samples":1,"seconds":0.0}],"failed":0,"passed":1,"plumbing_ok":0,"policy":"majority","samples":1,"total":1}
+2026-09-18T01:10:19.2234194Z 
+2026-09-18T01:10:19.2234507Z === #1534 repeated cluster eval then message still claims ===
+2026-09-18T01:10:19.2235118Z === curie cluster eval (retention suite 1 of 2; report only) ===
+2026-09-18T01:10:19.2282300Z Kubernetes context: kind-curie-e2e (cluster kind-curie-e2e)
+2026-09-18T01:11:58.2208484Z {"bundle_digest":null,"cases":[{"id":"reports-a-temperature","outcome":"pass","output":"","passed":true,"passes":1,"policy":"majority","samples":1,"seconds":0.0}],"failed":0,"passed":1,"plumbing_ok":0,"policy":"majority","samples":1,"total":1}
+2026-09-18T01:11:58.2231410Z === curie cluster eval (retention suite 2 of 2; report only) ===
+2026-09-18T01:11:58.2272079Z Kubernetes context: kind-curie-e2e (cluster kind-curie-e2e)
+2026-09-18T01:12:38.4547470Z {"bundle_digest":null,"cases":[{"id":"reports-a-temperature","outcome":"pass","output":"","passed":true,"passes":1,"policy":"majority","samples":1,"seconds":0.0}],"failed":0,"passed":1,"plumbing_ok":0,"policy":"majority","samples":1,"total":1}
+2026-09-18T01:12:38.5880400Z Kubernetes context: kind-curie-e2e (cluster kind-curie-e2e)
+2026-09-18T01:12:38.8588022Z === curie cluster message after repeated eval ===
+2026-09-18T01:12:38.8941823Z {"error":"`curie cluster message` does not take an agent name. The two-positional form <AGENT> <TEXT> is the shape of `cluster versions`, `cluster kill`, and `cluster delete`, not this verb.","fix":"Pass only the message text. Route with `--channel <CHANNEL>`, or omit `--channel` when exactly one channel is bound. Example: `curie cluster message 'Who are you?'`"}
+2026-09-18T01:12:38.9649654Z cluster: expected one exact worker claim for slack:C0LOCALDEV:1789693958.855760, found 0
+2026-09-18T01:12:38.9743738Z ##[error]Process completed with exit code 1.
+2026-09-18T01:12:38.9791087Z ##[group]Run kubectl get pods -A -o wide || true
+2026-09-18T01:12:38.9791406Z kubectl get pods -A -o wide || true
+2026-09-18T01:12:38.9791759Z kubectl get events -n curie --sort-by=.lastTimestamp | tail -50 || true
