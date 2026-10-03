@@ -94,6 +94,12 @@ CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
 # binding writes, and every connector secret would be persisted as plaintext.
 CONNECTOR_SECRET_KEYS_ENV = BootEnv.env_key("connector_secret_keys")
 
+# Transport bound on every call a token-bearing create_claim makes. The per-claim
+# template is a reaper candidate once it outlives the grace and has no claim, so
+# the four calls from template create to claim create must sum (20 s) to well
+# under REAP_GRACE_MARGIN_SECONDS (30 s); a stalled call fails the claim instead.
+_CLAIM_PREPARATION_TIMEOUT_S = 5.0
+
 
 def _conditions_ready(status: dict[str, Any]) -> bool:
     for cond in status.get("conditions") or []:
@@ -450,7 +456,12 @@ class KubernetesSandboxClient:
         source_name = self._pool_template_name(pool)
         try:
             source = self._api.get_namespaced_custom_object(
-                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxtemplates", source_name
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxtemplates",
+                source_name,
+                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
             )
         except k8s_client.ApiException as exc:
             if exc.status == 404:
@@ -474,6 +485,7 @@ class KubernetesSandboxClient:
                 "metadata": {"name": names.template, "labels": labels},
                 "spec": spec,
             },
+            _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
         )
         try:
             # No controller or blockOwnerDeletion: either would need
@@ -496,6 +508,7 @@ class KubernetesSandboxClient:
                     "metadata": metadata,
                     "stringData": dict(tokens),
                 },
+                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
             )
             self._api.create_namespaced_custom_object(
                 EXT_GROUP,
@@ -508,6 +521,7 @@ class KubernetesSandboxClient:
                     "metadata": {**metadata, "name": names.pool},
                     "spec": {"replicas": 0, "sandboxTemplateRef": {"name": names.template}},
                 },
+                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
             )
         except Exception:
             self._rollback_delete("sandboxtemplates", names.template)
@@ -519,7 +533,12 @@ class KubernetesSandboxClient:
 
         try:
             obj = self._api.get_namespaced_custom_object(
-                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxwarmpools", pool
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxwarmpools",
+                pool,
+                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
             )
         except k8s_client.ApiException as exc:
             if exc.status == 404:
@@ -546,6 +565,7 @@ class KubernetesSandboxClient:
                 plural,
                 name,
                 propagation_policy="Background",
+                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
             )
         except Exception as exc:
             if isinstance(exc, k8s_client.ApiException) and exc.status == 404:
@@ -666,7 +686,12 @@ class KubernetesSandboxClient:
             return
         try:
             created = self._api.create_namespaced_custom_object(
-                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims", body
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxclaims",
+                body,
+                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
             )
         except Exception:
             self._rollback_delete("sandboxtemplates", claim_template)
@@ -693,6 +718,7 @@ class KubernetesSandboxClient:
                         ]
                     }
                 },
+                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
             )
         except Exception:
             self._rollback_delete("sandboxclaims", name)
@@ -759,7 +785,27 @@ class KubernetesSandboxClient:
             name = metadata.get("name")
             claim = (metadata.get("labels") or {}).get(CLAIM_LABEL)
             created_at = _parse_timestamp(metadata.get("creationTimestamp"))
-            if not name or claim in keep or created_at is None or created_at >= created_before:
+            if (
+                not name
+                or not claim
+                or claim in keep
+                or created_at is None
+                or created_at >= created_before
+            ):
+                continue
+            # The claim inventory behind ``keep`` predates this sweep, so a
+            # create_claim that finished since then has a live claim missing
+            # from it. Re-read that one claim; only a 404 proves it is gone.
+            try:
+                live = self.get_claim(claim, request_timeout_seconds=_CLAIM_PREPARATION_TIMEOUT_S)
+            except Exception as exc:
+                logger.warning(
+                    "claim recheck for template %s failed (%s); sparing it",
+                    name,
+                    type(exc).__name__,
+                )
+                continue
+            if live is not None:
                 continue
             try:
                 self._api.delete_namespaced_custom_object(
