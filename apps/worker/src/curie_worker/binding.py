@@ -1344,7 +1344,7 @@ class BindingResolver:
         if not 200 <= status < 300:
             logger.warning("the API refused to end memory turn %s: HTTP %s", turn, status)
 
-    def release_boot_credential_sync(self, agent_id: str, credential: str) -> None:
+    def release_boot_credential_sync(self, agent_id: str, credential: str) -> bool:
         """Tell the API this sandbox's boot credential is released (#3823).
 
         Called from the substrate when the claim that holds the token is
@@ -1375,7 +1375,7 @@ class BindingResolver:
                 credential,
                 type(exc).__name__,
             )
-            return
+            return False
         if status == 404:
             if not getattr(self, "_released_credentials_route_missing", False):
                 self._released_credentials_route_missing = True
@@ -1383,13 +1383,15 @@ class BindingResolver:
                     "the API has no released-credentials route (404); boot "
                     "tokens stay usable until they expire"
                 )
-            return
+            return False
         if not 200 <= status < 300:
             logger.warning(
                 "the API refused to release sandbox credential %s: HTTP %s",
                 credential,
                 status,
             )
+            return False
+        return True
 
 
 def boot_token_facts(token: str | None) -> tuple[str | None, str | None, int | None]:

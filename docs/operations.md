@@ -2008,9 +2008,10 @@ The boot env tokens (`CURIE_HISTORY_TOKEN`, `CURIE_MEMORY_TOKEN`, and
 and no later than 24 hours. When the worker deletes the sandbox claim, it
 tells the API, and the API refuses that credential immediately (403, "this
 sandbox credential has been released") even though it has not expired. The
-report is best effort. If it does not land, expiry is the backstop. A warm
-sandbox keeps the token it booted with until that expiry. The next new turn
-after expiry replaces the sandbox. A token minted before this change has no
+report is best effort. A failed report stays in Valkey until a later
+cleanup pass lands it, or until that record expires with the token. A warm
+sandbox keeps the token it booted with only while that token still covers the
+next turn. Otherwise the next new turn replaces the sandbox. A token minted before this change has no
 credential id. It stays valid until its own expiry. Upgrade the worker with
 or before the API. An older API answers 404 to the release report, which the
 worker logs once.

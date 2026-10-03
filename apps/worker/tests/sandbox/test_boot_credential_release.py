@@ -19,7 +19,9 @@ def test_release_reports_the_boot_credential(
 ) -> None:
     substrate = SandboxSubstrate(fake_k8s, affinity, config)
     reported: list[tuple[str, str]] = []
-    substrate.set_boot_credential_revoker(lambda agent, cred: reported.append((agent, cred)))
+    substrate.set_boot_credential_revoker(
+        lambda agent, cred: reported.append((agent, cred)) or True
+    )
     agent = "22222222-2222-4222-8222-222222222222"
     cred = uuid.uuid4().hex
     token = mint(
@@ -37,3 +39,34 @@ def test_release_reports_the_boot_credential(
     # A second release has no route left to report.
     assert not substrate.release("thread-1")
     assert reported == [(agent, cred)]
+    assert affinity.claim_credential(handle.claim_name) is None
+
+
+def test_a_failed_report_is_retried_once_the_claim_is_gone(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    calls = {"n": 0}
+
+    def revoker(agent: str, cred: str) -> bool:
+        del agent, cred
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    substrate.set_boot_credential_revoker(revoker)
+    agent = "33333333-3333-4333-8333-333333333333"
+    cred = uuid.uuid4().hex
+    token = mint(
+        "api-key",
+        agent=agent,
+        scope="state",
+        exp=int(time.time()) + 600,
+        claims={"binding": "slack:C0EXAMPLE1", "memory": "read", "cred": cred},
+    )
+    handle = substrate.claim("thread-retry", env={HISTORY_TOKEN_ENV: token})
+    assert substrate.release("thread-retry")
+    assert calls["n"] == 1
+    assert affinity.claim_credential(handle.claim_name) == (agent, cred)
+    substrate.reap_orphans()
+    assert calls["n"] == 2
+    assert affinity.claim_credential(handle.claim_name) is None

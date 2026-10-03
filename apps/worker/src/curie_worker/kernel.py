@@ -128,6 +128,7 @@ from .binding import (
     EVAL_ISOLATE_THREAD_PREFIX,
     GRANT_ARGUMENTS_ENV,
     GRANT_TOOL_ENV,
+    HISTORY_TOKEN_ENV,
     ISSUE_READ_TOKEN_ENV,
     ISSUE_READ_URL_ENV,
     MAX_TURNS_ENV,
@@ -138,6 +139,7 @@ from .binding import (
     AmbiguousRoute,
     BindingResolver,
     binding_adapter_for_handle,
+    boot_token_facts,
 )
 from .capacity_wait import (
     CapacityWaitExpired,
@@ -1803,12 +1805,17 @@ def _boots_differently(
         return True
     if handle.caller_run != caller_run:
         return True
-    # #3823: a boot state token that has already expired cannot serve another
-    # turn. The next new turn replaces the sandbox. A token with no recorded
-    # expiry is a route from before this field and is left until it expires
-    # on its own.
-    if handle.state_token_exp is not None and handle.state_token_exp <= int(time.time()):
-        return True
+    # #3823: replace a warm sandbox whose boot token cannot cover the turn
+    # this delivery is about to boot. Comparing with the new token's expiry,
+    # not with "already expired", keeps a follow-up from running past the
+    # credential and getting 401s on state. A route with no recorded expiry
+    # is from before this field and is left alone.
+    if handle.state_token_exp is not None:
+        if handle.state_token_exp <= int(time.time()):
+            return True
+        _agent, _cred, needed = boot_token_facts(env.get(HISTORY_TOKEN_ENV))
+        if needed is not None and handle.state_token_exp < needed:
+            return True
     return CONNECTOR_CALLER_TOKEN_ENV in env and not handle.carries_caller_token
 
 
