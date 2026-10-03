@@ -359,6 +359,10 @@ resources and fake provider credentials, with no real model or approval action.
   still-permitted shell tool (e.g. `Bash`) can reach the same HTTP state API
   directly. Naming `Bash` alongside the state tools closes that path today;
   removing the token itself needs a code change, not a config knob.
+  `CURIE_CHANNEL_BOUND` (optional, set by the worker when the turn has a
+  channel kind and address) adds the `SendMessage` and `PushNotification`
+  built-ins to that same removed list (#3336): neither reaches anyone from a
+  channel agent. Unset or false leaves the list exactly as configured.
   Hosted-connector Bearer secrets are a different class (#2559): the runner
   expands `Authorization: Bearer ${NAME}` into the in-memory MCP catalog at
   boot and drops `NAME` from the process environment (and from
