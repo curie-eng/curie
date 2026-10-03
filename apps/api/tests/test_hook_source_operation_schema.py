@@ -12,8 +12,6 @@ import pytest
 from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts
 from alembic import command
 from curie_api import models
-from curie_api.main import create_app
-from fastapi.testclient import TestClient
 from sqlalchemy.exc import DBAPIError
 
 
@@ -27,19 +25,14 @@ def ledger_db(isolated_migration_db: IsolatedMigrationDb) -> None:
     ), "PROTECTED-HOOK-SOURCE-10: durable attempt ledger must exist"
 
 
-def _agent(auth_headers: dict[str, str]) -> uuid.UUID:
+def _agent() -> uuid.UUID:
     """@spec PROTECTED-HOOK-SOURCE-10."""
-    with TestClient(create_app()) as client:
-        response = client.post(
-            "/agents",
-            headers=auth_headers,
-            json={
-                "name": f"ledger-test-{uuid.uuid4().hex}",
-                "channel": {"kind": "slack", "address": f"C{uuid.uuid4().hex.upper()}"},
-            },
-        )
-    assert response.status_code == 201, response.text
-    return uuid.UUID(response.json()["id"])
+    agent_id = uuid.uuid4()
+    sql_dicts(
+        "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
+        {"id": agent_id, "name": f"ledger-test-{agent_id.hex}"},
+    )
+    return agent_id
 
 
 def _attempt(agent_id: uuid.UUID, **changes: Any) -> dict[str, Any]:
@@ -109,11 +102,9 @@ def test_ledger_has_separate_exact_columns_and_composite_identity(ledger_db: Non
     assert len(policies) == 11
 
 
-def test_pending_generation_survives_and_commits_without_reallocation(
-    ledger_db: None, auth_headers: dict[str, str]
-) -> None:
+def test_pending_generation_survives_and_commits_without_reallocation(ledger_db: None) -> None:
     """@spec PROTECTED-HOOK-SOURCE-10."""
-    attempt = _attempt(_agent(auth_headers))
+    attempt = _attempt(_agent())
     _insert(attempt)
     assert sql_dicts("SELECT * FROM curie.hook_source_operations") == [attempt]
     sql_dicts(
@@ -142,11 +133,11 @@ def test_pending_generation_survives_and_commits_without_reallocation(
     ],
 )
 def test_ledger_rejects_invalid_attempts_without_persistence(
-    ledger_db: None, auth_headers: dict[str, str], changes: dict[str, Any]
+    ledger_db: None, changes: dict[str, Any]
 ) -> None:
     """@spec PROTECTED-HOOK-SOURCE-10."""
     with pytest.raises(DBAPIError):
-        _insert(_attempt(_agent(auth_headers), **changes))
+        _insert(_attempt(_agent(), **changes))
     assert sql_dicts("SELECT * FROM curie.hook_source_operations") == []
 
 
@@ -162,10 +153,10 @@ def test_ledger_rejects_invalid_attempts_without_persistence(
     ],
 )
 def test_attempt_identity_and_generation_are_immutable(
-    ledger_db: None, auth_headers: dict[str, str], field: str, value: Any
+    ledger_db: None, field: str, value: Any
 ) -> None:
     """@spec PROTECTED-HOOK-SOURCE-10."""
-    attempt = _attempt(_agent(auth_headers))
+    attempt = _attempt(_agent())
     _insert(attempt)
     with pytest.raises(DBAPIError):
         sql_dicts(
@@ -176,11 +167,9 @@ def test_attempt_identity_and_generation_are_immutable(
     assert sql_dicts("SELECT * FROM curie.hook_source_operations") == [attempt]
 
 
-def test_all_attempt_generations_are_unique_and_history_only_cascades(
-    ledger_db: None, auth_headers: dict[str, str]
-) -> None:
+def test_all_attempt_generations_are_unique_and_history_only_cascades(ledger_db: None) -> None:
     """@spec PROTECTED-HOOK-SOURCE-10."""
-    agent_id = _agent(auth_headers)
+    agent_id = _agent()
     attempt = _attempt(agent_id)
     _insert(attempt)
     with pytest.raises(DBAPIError):
@@ -194,11 +183,9 @@ def test_all_attempt_generations_are_unique_and_history_only_cascades(
     assert sql_dicts("SELECT * FROM curie.hook_source_operations") == []
 
 
-def test_committed_attempt_cannot_return_to_pending(
-    ledger_db: None, auth_headers: dict[str, str]
-) -> None:
+def test_committed_attempt_cannot_return_to_pending(ledger_db: None) -> None:
     """@spec PROTECTED-HOOK-SOURCE-10."""
-    attempt = _attempt(_agent(auth_headers), status="committed")
+    attempt = _attempt(_agent(), status="committed")
     _insert(attempt)
     with pytest.raises(DBAPIError):
         sql_dicts("UPDATE curie.hook_source_operations SET status = 'pending'")
@@ -206,11 +193,11 @@ def test_committed_attempt_cannot_return_to_pending(
 
 
 def test_additive_upgrade_backfills_only_current_policy_without_changing_it(
-    isolated_migration_db: IsolatedMigrationDb, auth_headers: dict[str, str]
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """@spec PROTECTED-HOOK-SOURCE-10."""
     isolated_migration_db.at("0075")
-    agent_id = _agent(auth_headers)
+    agent_id = _agent()
     operation_id = uuid.uuid4()
     target = {
         "mode": "ordinary",
