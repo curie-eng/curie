@@ -39,7 +39,8 @@ all three parse under `extra="forbid"` (`packages/plugin-format/src/plugin_forma
 `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTarget`), because there is no
 external producer that could legitimately carry a key the models do not know, so an unrecognised key
 is a typo rather than a future Claude Code field. The lock is the one root file no human authors --
-`curie build` writes it and the bundle carries it -- but it is part of the format all the same,
+`curie build` writes it, `curie example dark-factory render` writes a `runner:` entry into it from a
+published tag, and the bundle carries it -- but it is part of the format all the same,
 because a second consumer that ignores it deploys a different image than the one the bundle's source
 was built into. What a bundle actually is, then, is the Claude Code
 plugin shape verbatim plus a strict Curie-only overlay, not a Claude Code plugin end to end.
@@ -127,8 +128,10 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   silently replaced by the last YAML value.
 - `connectors.lock.yaml` (ADR-0113,
   `packages/plugin-format/src/plugin_format/connector_lock.py::ConnectorLockFile`) records what each
-  declared `build` resolved to. It is **generated, not authored**: `curie build` writes it and it is
-  packed into the bundle like any other file, so the platform holds the exact digest a version
+  declared `build` resolved to. It is **generated, not authored**: `curie build` writes it, and so does
+  `curie example dark-factory render`, which records a `runner:` entry for the published runner image
+  without building anything locally, so that entry trusts the release pipeline for the source-to-image
+  link rather than proving it. The lock is packed into the bundle like any other file, so the platform holds the exact digest a version
   deployed rather than that fact living in local CLI state. One
   `packages/plugin-format/src/plugin_format/connector_lock.py::ConnectorLockEntry` per built
   connector carries `image`, `delivery` (`registry` or `local-daemon`), the `platforms` the build

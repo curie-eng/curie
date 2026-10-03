@@ -45,9 +45,9 @@ PostgreSQL 16:
 - **Migrations**: the target DB must apply the **whole Alembic chain in `apps/api/alembic/versions/`**, in revision order, ending at `alembic heads`. The chain grows with the product, so it is deliberately not enumerated here: `ls apps/api/alembic/versions/` is the list, and `alembic heads` is the tip a conforming DB must reach. A single head is the invariant — a fork means two branches each added a migration (rebase and merge the heads before swapping anything). Two recent expand revisions make authenticated review feedback part of this schema contract: `0042_review_lineage_authority.py` adds immutable App-observed authority to publication lineages and the `publication_review_reservations` concurrency table; `0043_github_review_feedback.py` adds the `github_review_deliveries` audit table and the `github_review_feedback` durable feedback/outbox table. The latter stores normalized feedback and a credential-free queued turn, never a raw webhook body or GitHub credential.
 
 The application schema window keeps minimum `0070` and advances its head to
-`0073`, as recorded in `apps/api/src/curie_api/schema_compat.json`. Polling
-cursor migration `0073` follows `0072`; both existing next migrations, `0071`
-and `0072`, remain in the chain.
+`0075`, as recorded in `apps/api/src/curie_api/schema_compat.json`. Hook source
+policy migration `0075` follows polling cursor migration `0073`; the next
+migrations `0071` and `0072` remain in the chain.
 
 ## Implementations today
 
@@ -73,7 +73,10 @@ is a judgement call, not something derivable from the tree.
    (`apps/api/src/curie_api/models.py::Deployment`), which materializes as a `CREATE TYPE` in the `curie` schema.
 3. **`JSONB` column type**: `apps/api/src/curie_api/models.py::JSONB` is imported from
    `sqlalchemy.dialects.postgresql` on the same line as `UUID` and used on many columns
-   across the models; `mapped_column(JSONB` in that module is the inventory. Several are
+   across the models. The inventory is every `JSONB` column in that module, including
+   the ones whose `mapped_column(` call wraps onto a second line (for example
+   `JSONB(none_as_null=True)` on `allowed_callers` and `granted_arguments`), so a
+   single-line `mapped_column(JSONB` search undercounts. Several are
    load-bearing rather than incidental: the workflow-state store exists precisely because
    Postgres JSONB meant no new datastore was needed (see that class's docstring), the
    action ledger's `prior_state` holds a snapshot whose shape belongs to whatever resource
@@ -87,15 +90,23 @@ is a judgement call, not something derivable from the tree.
 4. **Raw dialect-specific SQL outside the ORM** — `DISTINCT ON`, which is Postgres-only,
    is written by hand in `apps/api/src/curie_api/commitpoller.py::_DEPLOYED_SQL` (executed
    through `text(...)` in `apps/api/src/curie_api/commitpoller.py::CommitPoller.poll_once`)
-   and in `apps/worker/src/curie_worker/connector_loop.py::_TARGETS_SQL`. The worker's
+   in `apps/worker/src/curie_worker/connector_loop.py::_TARGETS_SQL` and
+   `apps/worker/src/curie_worker/cron_loop.py::_TARGETS_SQL`, and in the API's
+   `apps/api/src/curie_api/routers/hook_fire.py::_IN_FORCE_SQL`,
+   `apps/api/src/curie_api/routers/schedules.py::_IN_FORCE_SQL` and
+   `apps/api/src/curie_api/routers/schedules.py::_LATEST_SQL`. The worker's
    read path adds a driver-level dependency on top of the dialect one:
    `apps/worker/src/curie_worker/binding.py::BindingResolver.resolve` decodes the JSONB
    columns with `json.loads` because asyncpg returns JSONB as a `str` for a raw-text
    `SELECT`, and `apps/worker/src/curie_worker/binding.py::_RESOLVE_SQL` orders on
    `(d.environment = 'prod')`, comparing the native enum of item 2 against a string
    literal.
-5. **`UNIQUE NULLS NOT DISTINCT` workflow-state identity** —
-   `workflow_state_entries` treats `binding_scope IS NULL` as the one real shared scope
+5. **`UNIQUE NULLS NOT DISTINCT` identity constraints**: three constraints use
+   `postgresql_nulls_not_distinct`: `agent_channels_route_key` on
+   `apps/api/src/curie_api/models.py::AgentChannel` (so route-less non-Slack rows
+   collide), `uq_thread_transcripts_agent_scope_thread` on
+   `apps/api/src/curie_api/models.py::ThreadTranscript`, and the workflow-state
+   identity below. `workflow_state_entries` treats `binding_scope IS NULL` as the one real shared scope
    identity, rather than as an absent value. This preserves the shared state of a
    `memory=True` agent (including a legacy general-state row) and the permanently
    agent-wide `memory` and `transcript` namespaces. The named
@@ -124,6 +135,21 @@ is a judgement call, not something derivable from the tree.
    `apps/api/src/curie_api/models.py::Publication` permits only one live
    publication per lineage. A target without partial unique indexes cannot express
    those database-level concurrency constraints as written.
+8. **Advisory locks**: several paths serialize on Postgres advisory locks rather
+   than row locks. Transaction-scoped `pg_advisory_xact_lock` is taken per agent and
+   hook or schedule name in
+   `apps/api/src/curie_api/routers/hook_fire.py::_LOCK_SQL`,
+   `apps/api/src/curie_api/routers/schedules.py::_LOCK_SQL`,
+   `apps/worker/src/curie_worker/cron_loop.py::_LOCK_SQL` and
+   `apps/worker/src/curie_worker/hook_runs.py::HookRunRecorder.start_guard`; per
+   agent for the namespace-count cap in
+   `apps/api/src/curie_api/routers/state.py::_enforce_caps`; per route pair in
+   `apps/api/src/curie_api/crud.py::refuse_routeless_pair_sharing`; and per GitHub
+   issue in `apps/api/src/curie_api/github_factory.py::lock_issue`. The factory poll
+   intake instead holds a session-scoped `pg_try_advisory_lock` on one connection
+   (`apps/api/src/curie_api/factory_poll_intake.py::poll_once`). The two-argument
+   int4 form and the bigint form are separate lock spaces, so a port must keep the
+   key derivation as written.
 
 Items 1 to 3 are cheap within the Postgres family: any managed Postgres speaks all three
 natively, so the DSN-only swap is unaffected by them. Item 4 is different in kind: it is
@@ -134,7 +160,8 @@ a database-level contract rather than a model type: it is native on a supported 
 Postgres, but a pre-15 server cannot represent Curie's singular NULL shared identity.
 Item 6 is a row-claim concurrency primitive: native on Postgres, not on every
 SQLAlchemy target. Item 7 makes publication uniqueness conditional on row status,
-which likewise depends on a Postgres index feature. All seven items would need rework for a different RDBMS, which is
+which likewise depends on a Postgres index feature. Item 8 is a cross-process mutex
+that lives in the database session rather than in a table. All eight items would need rework for a different RDBMS, which is
 the marker that a real port should be extracted first.
 
 ## Cross-links

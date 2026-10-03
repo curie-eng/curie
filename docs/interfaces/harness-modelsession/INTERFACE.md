@@ -154,6 +154,16 @@ walled off, called out in vision-doc Job 1:
   `runner/src/curie_runner/session.py::SessionRunner`, unlike the declared
   `McpServerReconnector` optional protocol. A second harness can therefore miss a
   load-bearing checkpoint capability without a protocol conformance failure.
+- **Read-only enforcement is not a `ModelSession` operation.** A read-only turn is
+  refused tool by tool only through the SDK fronts that wrap the session's callbacks,
+  `front_pre_tool_use_hooks` (a `HookMatcher` front) and `front_can_use_tool`
+  (`runner/src/curie_runner/tool_access.py`), plus the fake's own check against the
+  shared `TurnToolAccess`. `SessionRunner.enforced_tool_access`
+  (`runner/src/curie_runner/session.py::SessionRunner`) reports read-only as enforced on
+  `/status` whenever the runner holds a `TurnToolAccess` and has not yet sent an
+  unrestricted prompt, without asking the session. A
+  second harness must itself refuse every tool outside the read-only set, or `/status`
+  claims enforcement that is not happening.
 
 ## Cross-links
 

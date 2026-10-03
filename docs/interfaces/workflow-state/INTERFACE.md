@@ -141,6 +141,7 @@ route-state contract:
 - `replace(thread_key, record, ttl_seconds) -> None` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.replace`)
 - `replace_if_generation(...) -> bool`: the CAS primitive, replacing a route only while its claim and generation match (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.replace_if_generation`)
 - `touch(thread_key, ttl_seconds) -> bool` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.touch`)
+- `touch_if_live_claim(thread_key, claim_name, ttl_seconds) -> bool`: extend the TTL only while the route still names that claim; the substrate calls it in production (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.touch_if_live_claim`)
 - `delete_if_claim(thread_key, claim_name) -> bool` — guarded delete via a Lua script (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.delete_if_claim`, script at `apps/worker/src/curie_worker/sandbox/affinity.py::_DELETE_IF_CLAIM`)
 - `pressure_get(thread_key) -> RouteRecord | None` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.pressure_get`)
 - `pressure_candidates(...) -> PressureScanResult` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.pressure_candidates`)
