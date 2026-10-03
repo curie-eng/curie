@@ -142,7 +142,11 @@ generation in the scoped key's signed derivation bytes.
 
 No-row output has generation `"0"`, ordinary mode, null policy references and
 updated_at, closed activation, and the locked agent's current legacy counter.
-Its ordinary admission status depends on SOURCE-10 attempt history. Row
+Its ordinary admission status depends on SOURCE-10 attempt history. For both
+absent and existing policies, the GET output reports the freshly locked agent
+counter as `legacy_generation`, so another hook's activation cannot hide the
+current ordinary credential replacement requirement. This output does not alter
+the policy row's persisted counter snapshot used by SOURCE-6 fingerprints. Row
 timestamps serialize in UTC. Stable reasons contain no exception text, broker
 endpoint or credential; use `pending_history` for the absent-policy history
 case. Administrative unknown agent is 404, malformed input is 422, rotation
