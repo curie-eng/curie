@@ -177,13 +177,6 @@ SHELL_KEYWORDS = frozenset({"do", "done", "fi", "then", "else", "esac", "true", 
 # deliberate decision with the same weight as adding one to RETRY_ALLOWLIST.
 RUN_RETRY_EXEMPT: frozenset[tuple[str, str, str]] = frozenset(
     {
-        ("ci.yaml", "python-pytest", "Wait for Langfuse to serve"),
-        # The fix pin job boots the same dev stack as the pytest shards,
-        # for the same reason and with the same readiness poll: Langfuse
-        # web has no compose healthcheck, so `--wait` returns while it is
-        # merely running. A readiness poll for an external service, not a
-        # retry of anything this repository builds or gates.
-        ("fix-pin.yaml", "fix-pin", "Wait for Langfuse to serve"),
         # The candidate API has already rolled out; this only waits for the
         # temporary local port-forward to expose its external health state.
         (
@@ -611,7 +604,7 @@ def test_rule_4_no_protected_step_carries_a_retry() -> None:
         "eligible acquisition, or it is not retrying:\n" + _render(unaccounted)
     )
     # Positive exercise of `_run_retry_construct` against real workflow steps.
-    # Both readiness polls use a loop keyword together with a sleep, so all this
+    # The exempt readiness polls use a loop keyword with a sleep, so all this
     # guards is the LOOP_KEYWORDS and SLEEP_CALL half of the helper: a typo in
     # either would satisfy every rule above just as well as a clean repository.
     #

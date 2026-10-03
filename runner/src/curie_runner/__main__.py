@@ -43,7 +43,12 @@ from .approval import (
     policy_disallowed_tools,
     resolve_approval_policy,
 )
-from .config import RunnerConfig
+from .config import (
+    ALLOW_TOKENLESS_ENV,
+    RunnerConfig,
+    RunnerTokenRequiredError,
+    require_serving_token,
+)
 from .connectors import (
     build_mcp_servers,
     declared_secret_names,
@@ -986,7 +991,7 @@ def build_runner(
             cwd=workspace_cwd,
             web_search_enabled=web_search_enabled,
             policy_disallowed_tools=policy_hidden_tools,
-            disallowed_tools=config.disallowed_tools,
+            disallowed_tools=config.catalogue_disallowed_tools,
         )
 
     sdk_generation = 0
@@ -1010,7 +1015,7 @@ def build_runner(
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
                 replay_messages=conversation_replay.messages,
-                disallowed_tools=config.disallowed_tools,
+                disallowed_tools=config.catalogue_disallowed_tools,
                 # The same holder the SDK tool closes over, so the scripted
                 # progress demo runs the real handler (ADR 0130).
                 turn_progress=turn_progress,
@@ -1402,6 +1407,22 @@ def _serve() -> None:
     )
     logger.info("runner starting fake_model=%s", fake_model)
     config = RunnerConfig.from_env(os.environ)
+    # Fail closed (#3821): without a bearer the control routes serve anything
+    # that reaches the port. Checked before the harness, the credential and the
+    # boot fetches, so a misrendered template never gets as far as a session.
+    try:
+        serving_token = require_serving_token(
+            config.runner_token, allow_tokenless=config.allow_tokenless
+        )
+    except RunnerTokenRequiredError as exc:
+        logger.error("runner refused to boot: %s", exc)
+        raise
+    if serving_token is None:
+        logger.warning(
+            "runner serving its control routes without a bearer token because %s "
+            "is set; local development only",
+            ALLOW_TOKENLESS_ENV,
+        )
     logger.info(
         "runner configured session=%s model=%s port=%d harness=%s",
         config.session.session_id,
@@ -1473,7 +1494,7 @@ def _serve() -> None:
 
     snapshot_callback = capture_mounted_workspace if workspace_path is not None else None
 
-    app = create_app(runner, token=config.runner_token, snapshotter=snapshot_callback)
+    app = create_app(runner, token=serving_token, snapshotter=snapshot_callback)
 
     async def _startup(_app: web.Application) -> None:
         try:

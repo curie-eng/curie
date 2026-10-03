@@ -423,6 +423,7 @@ def create_app() -> FastAPI:
     app.include_router(hook_fire.router)
     app.include_router(state.router)
     app.include_router(state.internal_router)
+    app.include_router(state.released_router)
     app.include_router(memory.router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise
     # be matched by GET /approvals/{approval_id} and fail as a bad uuid.

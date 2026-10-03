@@ -144,6 +144,7 @@ from resilience_harness import (  # noqa: E402
     pod_uid,
     port_forward,
     post_event,
+    runner_bearer,
     thread_hash,
     unique_marker,
     wait_pod_identity_gone,
@@ -181,14 +182,16 @@ def _drive_turn(
 ) -> list[dict[str, object]]:
     """Port-forward to a claim's sandbox, assert health, post one ACI turn.
 
-    The claim's own token authenticates the turn: a resumed claim mints a
-    per-claim runner bearer that a warm-pool binding does not, so driving every
-    turn through the handle keeps both paths honest.
+    Every cluster runner enforces a bearer (#3821): a resumed claim mints a
+    per-claim runner token, while a warm-pool binding enforces the chart's
+    warm-pod token, so driving every turn through ``runner_bearer`` keeps both
+    paths honest.
     """
 
+    bearer = runner_bearer(cfg, handle.token, pod_of_sandbox(cfg, handle.sandbox_name))
     with port_forward(cfg, handle.sandbox_name, handle.port) as base:
         assert get_json(base, "/healthz") == {"ok": True}
-        return post_event(base, text, token=handle.token, user=user, ts=ts)
+        return post_event(base, text, token=bearer, user=user, ts=ts)
 
 
 def _assert_final(frames: Sequence[dict[str, object]]) -> None:

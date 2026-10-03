@@ -96,18 +96,20 @@ def test_boot_env_state_token_carries_binding_and_read() -> None:
     memory = _claims(env["CURIE_MEMORY_TOKEN"])
     assert memory["binding"] == "slack:C0123"
     assert memory["memory"] == "read"
-    # The long-lived token outlives the turn, so it never names a sender or turn.
+    # It never names a sender or turn. Those belong to the per-turn write
+    # credential. #3823 adds the shared ``cred`` id and a short expiry.
     assert "sender" not in memory
     assert "turn" not in memory
-    assert set(memory) == {"agent", "scope", "exp", "binding", "memory"}
+    assert set(memory) == {"agent", "scope", "exp", "binding", "memory", "cred"}
     # History rides the same token (transcripts are #3767's change, not this one).
     assert env["CURIE_HISTORY_TOKEN"] == env["CURIE_MEMORY_TOKEN"]
-    # The bundle-facing state.app token stays three-claim and unchanged.
+    # The bundle-facing state.app token shares that credential id.
     app = env["CURIE_STATE_TOKEN"]
     assert verify(app, _KEY, agent=str(_AGENT), scope="state.app") is True
     seg = app.split(".")[1]
     app_payload = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
-    assert set(app_payload) == {"agent", "scope", "exp"}
+    assert set(app_payload) == {"agent", "scope", "exp", "cred"}
+    assert app_payload["cred"] == memory["cred"]
 
 
 def test_boot_env_binding_claim_is_the_unquoted_binding_scope() -> None:

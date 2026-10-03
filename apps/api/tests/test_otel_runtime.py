@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -390,9 +391,30 @@ def test_background_loop_records_an_injected_database_failure_and_keeps_running(
 
     async def go() -> None:
         probe = _install(monkeypatch)
+        second_failure = asyncio.Event()
+        failure_count = 0
+
+        def observe_metric(
+            name: str,
+            value: float = 1,
+            *,
+            attributes: Mapping[str, str] | None = None,
+        ) -> None:
+            nonlocal failure_count
+            probe.record_metric(name, value, attributes=attributes)
+            if (
+                name == "curie.background.loop"
+                and attributes is not None
+                and attributes.get("outcome") == "failure"
+            ):
+                failure_count += 1
+                if failure_count == 2:
+                    second_failure.set()
+
+        monkeypatch.setattr(reconciler_module, "record_metric", observe_metric)
         failed_url = make_url(get_settings().database_url).set(
             host="127.0.0.1",
-            port=1,
+            port=refused_socket.getsockname()[1],
         )
         engine = create_async_engine(failed_url)
         sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
@@ -409,27 +431,28 @@ def test_background_loop_records_an_injected_database_failure_and_keeps_running(
             batch_limit=1,
         )
         task = asyncio.create_task(reconciler.run_forever())
+        observation = asyncio.create_task(second_failure.wait())
         try:
-            # Two recorded failures prove the loop survived the first one. The
-            # ceiling only bounds a hung loop: each pass is a refused connect, so
-            # a loaded runner, not the product, decides how long the wait takes.
-            deadline = asyncio.get_running_loop().time() + 30
-            while (
-                sum(
-                    point.name == "curie.background.loop"
-                    and point.attributes.get("outcome") == "failure"
-                    for point in probe.metrics
-                )
-                < 2
-            ):
-                assert task.done() is False
-                assert asyncio.get_running_loop().time() < deadline
-                await asyncio.sleep(0.01)
+            # The event proves the loop survived its first refused connection.
+            # The timeout only detects a hung observer or background task.
+            finished, _ = await asyncio.wait_for(
+                asyncio.wait({task, observation}, return_when=asyncio.FIRST_COMPLETED),
+                timeout=60,
+            )
+            if task in finished:
+                await task
+                raise AssertionError("background loop exited before observation")
+            assert observation in finished
             assert task.done() is False
         finally:
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            observation.cancel()
+            await asyncio.gather(observation, return_exceptions=True)
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                await asyncio.gather(task, return_exceptions=True)
             await redis_client.aclose()
             await engine.dispose()
 
@@ -439,11 +462,13 @@ def test_background_loop_records_an_injected_database_failure_and_keeps_running(
             if point.name == "curie.background.loop"
             and point.attributes.get("outcome") == "failure"
         ]
-        assert failures
+        assert len(failures) >= 2
         assert all(point.attributes.get("operation") == "resume-reconciler" for point in failures)
         assert all(
             set(point.attributes) <= {"service.name", "operation", "role", "source", "outcome"}
             for point in failures
         )
 
-    asyncio.run(go())
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as refused_socket:
+        refused_socket.bind(("127.0.0.1", 0))
+        asyncio.run(go())

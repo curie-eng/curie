@@ -1197,7 +1197,7 @@ PY
 # sanitize_exact_trace_read reaches stdout.
 query_exact_seed_trace() {
     local tier="$1" trace_id="$2" expected_csv="${3:-}" expected_decision="${4:-}" expected_state="${5:-present}" expected_tool="${6:-}"
-    local attempt code=0 private_read safe_read membership observation_count saw_valid=0
+    local attempt code=0 private_read safe_read membership observation_count saw_valid=0 saw_query_error=0
     local last_query_state="query-error"
     LAST_QUERY_MEMBERSHIP=""
     LAST_QUERY_OBSERVATION_COUNT="0"
@@ -1257,12 +1257,12 @@ PY
             continue
         fi
         if [[ "$expected_state" == "observe" && "$code" -ne 0 ]]; then
-            if (( code != 1 )) || ! python3 - "$private_read" "$trace_id" <<'PY'
+            if (( code != 1 && code != 3 )) || ! python3 - "$private_read" "$trace_id" "$code" <<'PY'
 import json
 import pathlib
 import sys
 
-source, trace_id = sys.argv[1:3]
+source, trace_id, code = sys.argv[1:4]
 try:
     value = json.loads(pathlib.Path(source).read_text())
 except (OSError, json.JSONDecodeError):
@@ -1270,7 +1270,9 @@ except (OSError, json.JSONDecodeError):
 expected = f'observability trace "{trace_id}" was not found'
 if not isinstance(value, dict) or set(value) != {"error", "fix"}:
     raise SystemExit(1)
-if value.get("error") not in {"exact trace not found", expected}:
+if code == "1" and value.get("error") not in {"exact trace not found", expected}:
+    raise SystemExit(1)
+if not isinstance(value.get("error"), str) or not value["error"].strip():
     raise SystemExit(1)
 if not isinstance(value.get("fix"), str) or not value["fix"].strip():
     raise SystemExit(1)
@@ -1279,6 +1281,12 @@ PY
                 rm -f "$private_read" "$safe_read"
                 echo "exact trace observation returned an unexpected query failure" >&2
                 return 1
+            fi
+            if (( code == 3 )); then
+                saw_query_error=1
+                last_query_state="query-error"
+            else
+                last_query_state="not-found"
             fi
             if (( attempt < OBSERVABILITY_POLL_ATTEMPTS )); then
                 sleep "$OBSERVABILITY_POLL_INTERVAL_SECONDS"
@@ -1337,7 +1345,7 @@ PY
         rm -f "$private_read" "$safe_read"
         return 0
     fi
-    if [[ "$expected_state" == "observe" ]]; then
+    if [[ "$expected_state" == "observe" && "$saw_valid" == "0" && "$saw_query_error" == "0" && "$last_query_state" == "not-found" ]]; then
         LAST_QUERY_MEMBERSHIP="false"
         LAST_QUERY_OBSERVATION_COUNT="0"
         python3 - "$trace_id" <<'PY'
@@ -1350,6 +1358,9 @@ print(json.dumps({
 PY
         rm -f "$private_read" "$safe_read"
         return 0
+    fi
+    if [[ "$expected_state" == "observe" && "$saw_query_error" == "1" && "$last_query_state" == "not-found" ]]; then
+        last_query_state="query-error"
     fi
     echo "exact trace failed the bounded ingestion poll: $last_query_state (cli exit $code)" >&2
     if [[ "$last_query_state" == "incomplete-membership" ]]; then

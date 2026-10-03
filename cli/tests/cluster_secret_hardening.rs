@@ -417,6 +417,8 @@ fn assert_parser_edge_cases_are_masked(rendered: &str, surface: &str) {
 fn pure_up() -> UpOpts {
     UpOpts {
         retained_mail_values: None,
+        retained_runner_values: None,
+        saved_credentials: None,
         common: CommonOpts {
             namespace: TARGET_NAMESPACE.to_string(),
             release: TARGET_RELEASE.to_string(),

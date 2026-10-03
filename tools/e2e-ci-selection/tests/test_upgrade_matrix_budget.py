@@ -390,6 +390,114 @@ def test_fetch_paginates_jobs_and_uses_documented_headers(tmp_path: Path) -> Non
     assert "95" in summary
 
 
+def _without_matrix_run_timestamps(job: dict[str, Any]) -> dict[str, Any]:
+    # Run 36726083300 attempt 1 failed E2E required with this shape, then a
+    # later read of the same completed job included the step timestamps.
+    cloned = json.loads(json.dumps(job))
+    for step in cloned["steps"]:
+        if step.get("name") == RUN_STEP:
+            step["started_at"] = None
+            step["completed_at"] = None
+    return cloned
+
+
+def _serve_job_pages(
+    pages: list[dict[str, Any]],
+) -> tuple[ThreadingHTTPServer, threading.Thread, list[int]]:
+    counts = [0]
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            index = min(counts[0], len(pages) - 1)
+            counts[0] += 1
+            body = json.dumps(pages[index]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, counts
+
+
+def test_jobs_api_retries_a_shard_whose_matrix_run_timestamps_arrive_late(
+    tmp_path: Path,
+) -> None:
+    images = _images_job(90)
+    shard = _job("E2E cluster upgrade matrix (s01)", job_seconds=800, run_seconds=700)
+    early = _payload(images, _without_matrix_run_timestamps(shard))
+    late = _payload(images, shard)
+    server, thread, counts = _serve_job_pages([early, late])
+    try:
+        host, port = server.server_address
+        completed = _run(
+            tmp_path,
+            extra_args=[
+                "--api-url",
+                f"http://{host}:{port}",
+                "--fetch-attempts",
+                "2",
+                "--fetch-interval-seconds",
+                "0",
+            ],
+            env_updates={
+                "GITHUB_REPOSITORY": "curie-eng/curie",
+                "GITHUB_RUN_ID": "36726083300",
+                "GITHUB_TOKEN": "example-token",
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output
+    assert counts[0] == 2
+    assert "within budget" in _summary(tmp_path).lower()
+    assert "::error" not in completed.stdout
+
+
+def test_jobs_api_still_fails_when_matrix_run_timestamps_never_arrive(tmp_path: Path) -> None:
+    images = _images_job(90)
+    shard = _without_matrix_run_timestamps(
+        _job("E2E cluster upgrade matrix (s01)", job_seconds=800, run_seconds=700)
+    )
+    server, thread, counts = _serve_job_pages([_payload(images, shard)])
+    try:
+        host, port = server.server_address
+        completed = _run(
+            tmp_path,
+            extra_args=[
+                "--api-url",
+                f"http://{host}:{port}",
+                "--fetch-attempts",
+                "2",
+                "--fetch-interval-seconds",
+                "0",
+            ],
+            env_updates={
+                "GITHUB_REPOSITORY": "curie-eng/curie",
+                "GITHUB_RUN_ID": "36726083300",
+                "GITHUB_TOKEN": "example-token",
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0
+    assert counts[0] == 2
+    assert "matrix-run" in output.lower()
+    assert "::error" in completed.stdout
+
+
 def test_e2e_required_runs_the_wall_clock_helper() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     images = workflow["jobs"]["ci-images"]

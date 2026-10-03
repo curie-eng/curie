@@ -29,12 +29,12 @@ from curie_runner.verification import (
 )
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
-_CHECK_COMMAND = "uv run pytest runner/tests -q"
+_CHECK_COMMAND = "uv run pytest unitconv/tests -q"
 _TOKEN = "sbx.example-progress-token.signature"
 _PYTHON_CHECK: dict[str, Any] = {
     "id": "python",
-    "paths": ["**/*.py", "pyproject.toml", "uv.lock"],
-    "command": ["uv", "run", "pytest", "runner/tests", "-q"],
+    "paths": ["unitconv/**/*.py", "tests/**/*.py", "pyproject.toml", "uv.lock"],
+    "command": ["uv", "run", "pytest", "unitconv/tests", "-q"],
 }
 _RUST_CHECK: dict[str, Any] = {
     "id": "rust",
@@ -101,6 +101,12 @@ def _declare(
     )
     workspace = _workspace_dir(root)
     (workspace / ".git").mkdir(parents=True, exist_ok=True)
+    foreign_tests = workspace / "unitconv" / "tests"
+    foreign_tests.mkdir(parents=True, exist_ok=True)
+    (foreign_tests / "test_conversion.py").write_text(
+        "def test_centimeters_to_meters():\n    assert 100 / 100 == 1\n",
+        encoding="utf-8",
+    )
     for base, relative, content in (
         (plugin, BUNDLE_VERIFICATION_FILE, bundle),
         (workspace, REPOSITORY_VERIFICATION_FILE, repository),
@@ -140,6 +146,7 @@ def _uv_on_path(
         root / "bin",
         "uv",
         f"printf '%s\\n' \"$*\" > '{marker}'\n"
+        'test "$1" = "run" && test "$2" = "pytest" && test -f "$3/test_conversion.py" || exit 66\n'
         f"printf '%s\\n' '{error}' >&2\n"
         f"exit {exit_status}\n",
     )
@@ -150,6 +157,9 @@ def _recording_tool(bindir: Path, name: str, order: Path, *, exit_status: int = 
         bindir,
         name,
         f"printf '%s %s\\n' '{name}' \"$*\" >> '{order}'\n"
+        'if [ "$1" = "run" ] && [ "$2" = "pytest" ]; then\n'
+        '  test -f "$3/test_conversion.py" || exit 66\n'
+        'fi\n'
         f"exit {exit_status}\n",
     )
 
@@ -166,6 +176,7 @@ def _synced_uv_on_path(root: Path, order: Path) -> Path:
         "  exit 0\n"
         "fi\n"
         'if [ "$1" = "run" ]; then\n'
+        '  test -f "$3/test_conversion.py" || exit 66\n'
         "  if [ -f .venv/ok ]; then exit 0; fi\n"
         "  printf '%s\\n' 'error: Failed to spawn: `pytest`' >&2\n"
         "  exit 2\n"
@@ -454,7 +465,7 @@ def test_synced_environment_reports_passed_after_the_lockfile_install(
 
     assert order.read_text(encoding="utf-8").splitlines() == [
         "sync --frozen",
-        "run pytest runner/tests -q",
+        "run pytest unitconv/tests -q",
     ]
     assert (_workspace_dir(tmp_path) / ".venv" / "ok").is_file()
     assert [body for body, _ in received] == [_record(outcome="passed", exit_status=0)]
@@ -475,7 +486,7 @@ def test_install_is_skipped_without_bundle_permission_and_the_check_is_not_passe
 
     received, _, prompt = _boot(tmp_path, monkeypatch, path=str(bindir), bundle=bundle)
 
-    assert order.read_text(encoding="utf-8").splitlines() == ["run pytest runner/tests -q"]
+    assert order.read_text(encoding="utf-8").splitlines() == ["run pytest unitconv/tests -q"]
     assert not (_workspace_dir(tmp_path) / ".venv").exists()
     assert [body for body, _ in received] == [
         _record(outcome="unavailable", exit_status=None, missing=["pytest"])
@@ -501,7 +512,7 @@ def test_bundle_lockfile_permission_applies_to_repository_declared_installs(
 
     assert order.read_text(encoding="utf-8").splitlines() == [
         "sync --frozen",
-        "run pytest runner/tests -q",
+        "run pytest unitconv/tests -q",
     ]
     assert [body for body, _ in received] == [_record(outcome="passed", exit_status=0)]
 
@@ -522,8 +533,8 @@ def test_bundle_declaration_loads_its_checks(tmp_path: Path) -> None:
     assert declaration.unreadable is None
     assert [check.id for check in declaration.checks] == ["python", "rust"]
     python, rust = declaration.checks
-    assert python.paths == ("**/*.py", "pyproject.toml", "uv.lock")
-    assert python.command == ("uv", "run", "pytest", "runner/tests", "-q")
+    assert python.paths == ("unitconv/**/*.py", "tests/**/*.py", "pyproject.toml", "uv.lock")
+    assert python.command == ("uv", "run", "pytest", "unitconv/tests", "-q")
     assert python.install == ("uv", "sync", "--frozen")
     assert rust.install is None
 
@@ -603,7 +614,7 @@ def test_lockfile_pinned_install_is_accepted(tmp_path: Path, install: list[str])
             id="invalid-check-id",
         ),
         pytest.param(
-            {"checks": [{**_PYTHON_CHECK, "command": "uv run pytest runner/tests -q"}]},
+            {"checks": [{**_PYTHON_CHECK, "command": "uv run pytest unitconv/tests -q"}]},
             id="shell-string-command",
         ),
         pytest.param(
@@ -667,14 +678,40 @@ def test_declared_check_that_passes_is_reported_passed(
     )
 
     assert marker.read_text(encoding="utf-8").splitlines() == [
-        "run pytest runner/tests -q"
+        "run pytest unitconv/tests -q"
     ]
+    assert (_workspace_dir(tmp_path) / "unitconv/tests/test_conversion.py").is_file()
+    assert not (_workspace_dir(tmp_path) / "runner").exists()
     assert received == [(_record(outcome="passed", exit_status=0), _TOKEN)]
     assert events == ["probe_executed", "verification_posted", "model_started"]
     assert prompt is not None
     assert _has_check_line(prompt, "python", _CHECK_COMMAND)
     assert "exit status 0" in prompt
     assert "Verification command:" not in prompt
+
+
+def test_a_declared_test_command_refuses_an_absent_foreign_test_path(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    marker = tmp_path / "uv-arguments"
+    bindir = _uv_on_path(tmp_path, marker)
+    command = "uv run pytest missing_tests -q"
+
+    received, _, _ = _boot(
+        tmp_path,
+        monkeypatch,
+        path=str(bindir),
+        bundle={
+            "checks": [
+                {**_PYTHON_CHECK, "command": ["uv", "run", "pytest", "missing_tests", "-q"]}
+            ]
+        },
+    )
+
+    assert [body for body, _ in received] == [
+        _record(command=command, outcome="failed", exit_status=66)
+    ]
+    assert not (_workspace_dir(tmp_path) / "missing_tests").exists()
 
 
 def test_declared_check_reports_missing_uv_without_network_fallback(
@@ -707,7 +744,7 @@ def test_declared_check_that_fails_is_not_reported_as_passed(
     )
 
     assert marker.read_text(encoding="utf-8").splitlines() == [
-        "run pytest runner/tests -q"
+        "run pytest unitconv/tests -q"
     ]
     assert received == [(_record(outcome="failed", exit_status=9), _TOKEN)]
     assert events == ["probe_executed", "verification_posted", "model_started"]
@@ -854,7 +891,7 @@ def test_two_declared_checks_post_two_records_in_declaration_order(
     )
 
     assert order.read_text(encoding="utf-8").splitlines() == [
-        "uv run pytest runner/tests -q",
+        "uv run pytest unitconv/tests -q",
         "cargo test --locked",
     ]
     assert [body for body, _ in received] == [

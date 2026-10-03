@@ -850,7 +850,7 @@ jobs:
       # provider won. Reading the manifests alone cannot tell an omitted
       # credential apart from one the SDK signs as an empty identity.
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Sync workspace
@@ -937,6 +937,21 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/release-record-size-assertions.sh
+
+      # Prove the candidate templates render on a PREVIOUS release's values,
+      # the way `helm upgrade --reuse-values` hands them over (#3813). Every
+      # other render here uses the candidate's own values.yaml, where every
+      # key exists, so a template dereferencing a key an older release never
+      # had (`placement` #2008, `langfuse.eventUpload`, `connectorCaller`
+      # #3505) passed them all and broke the upgrade. The step downloads the
+      # newest stable chart artifact and a pinned v0.10.3, and carries a
+      # negative control that reverts #3544's connectorCaller guard.
+      - name: helm render assertions (previous release reuse-values render)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/reuse-values-render-assertions.sh
 
   chart-assertions-retained-values:
     name: Chart render assertions (3 of 3, retained values through the real CLI)

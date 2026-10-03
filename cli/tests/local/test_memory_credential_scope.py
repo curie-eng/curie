@@ -23,9 +23,11 @@ import os
 import pathlib
 import socket
 import subprocess
+import time
 import urllib.error
 import urllib.request
 import uuid
+from base64 import urlsafe_b64decode
 from collections.abc import Iterator
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -478,3 +480,72 @@ def test_turn_token_is_refused_after_its_turn_is_closed(api_url: str) -> None:
     assert next_token
     nxt = _http(f"{ref}/{OTHER_FACT}", "PUT", {"value": _fact("next", ALICE)}, key=next_token)
     assert nxt.status == 200, nxt
+
+
+def _jwt_claims(token: str) -> dict[str, object]:
+    segment = token.split(".")[1]
+    padded = segment + "=" * (-len(segment) % 4)
+    claims: dict[str, object] = json.loads(urlsafe_b64decode(padded))
+    return claims
+
+
+def test_boot_env_token_is_refused_after_its_claim_is_released(api_url: str) -> None:
+    """#3823: a finished turn's boot token dies at the deadline plus grace,
+    and a released claim refuses it immediately while it is still unexpired.
+    """
+
+    from curie_worker.binding import BOOT_TOKEN_GRACE_SECONDS, boot_token_facts
+    from curie_worker.sandbox_token import mint
+
+    sandbox = _sandbox(api_url, memory_writes=False)
+    before = int(time.time())
+    env = sandbox.resolver.boot_env(  # type: ignore[attr-defined]
+        sandbox.resolved,
+        f"slack:{sandbox.channel_a}:1700000000.000009",
+        kind="slack",
+        address=sandbox.channel_a,
+        token_ttl_s=90,
+    )
+    after = int(time.time())
+    history = env["CURIE_HISTORY_TOKEN"]
+    state = env["CURIE_STATE_TOKEN"]
+    claims = _jwt_claims(history)
+    lifetime = 90 + BOOT_TOKEN_GRACE_SECONDS
+    assert before + lifetime <= claims["exp"] <= after + lifetime
+    assert claims["exp"] == _jwt_claims(state)["exp"]
+    memory = env["CURIE_MEMORY_REF"]
+    assert _http(memory, key=history).status == 200
+    notes = f"{api_url}/agents/{sandbox.agent_id}/state/notes"
+    assert _http(notes, key=state).status == 200
+
+    # Expiry alone, with no release report: a token already past exp is refused.
+    expired = mint(
+        API_KEY,
+        agent=sandbox.agent_id,
+        scope="state",
+        exp=int(time.time()) - 5,
+        claims={
+            "binding": f"slack:{sandbox.channel_a}",
+            "memory": "read",
+            "cred": uuid.uuid4().hex,
+        },
+    )
+    assert _http(memory, key=expired).status == 401
+
+    agent, cred, _exp = boot_token_facts(history)
+    assert agent and cred
+    sandbox.resolver.release_boot_credential_sync(agent, cred)  # type: ignore[attr-defined]
+    refused = _http(memory, key=history)
+    assert refused.status == 403, refused
+    assert "released" in json.dumps(refused.body)
+    refused_app = _http(notes, key=state)
+    assert refused_app.status == 403, refused_app
+
+    fresh = sandbox.resolver.boot_env(  # type: ignore[attr-defined]
+        sandbox.resolved,
+        f"slack:{sandbox.channel_a}:1700000000.000010",
+        kind="slack",
+        address=sandbox.channel_a,
+        token_ttl_s=90,
+    )
+    assert _http(memory, key=fresh["CURIE_HISTORY_TOKEN"]).status == 200

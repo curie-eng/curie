@@ -25,19 +25,21 @@ pub fn resolve_up_credentials(fake_model: bool, env_value: Option<String>) -> Op
     env_value.filter(|v| !v.is_empty())
 }
 
-/// The operator's model credential from the shell for `cluster up`, canonically
+/// The operator's explicit model credential from the shell, canonically
 /// `CURIE_CREDENTIALS` -- the same name the runtime plane (runner/worker/chart)
 /// uses everywhere. The CLI's historical `CURIE_MODEL_CREDENTIALS` is accepted
 /// as a deprecated alias for one release, with a warning naming the replacement,
 /// so an operator who set the one name for `skill up` isn't met with a silent
-/// no-op at `cluster up` (#496). Private storage is the final fallback. Returns
-/// None when no source has a nonempty value.
-pub fn model_credential_env() -> Result<Option<String>> {
+/// no-op at `cluster up` (#496). Returns None when neither has a nonempty value.
+///
+/// Kept apart from [`saved_model_credential`] because `cluster up` treats only
+/// this source as a request to change the release's model credential (#3848).
+pub fn explicit_model_credential_env() -> Option<String> {
     if let Some(value) = std::env::var("CURIE_CREDENTIALS")
         .ok()
         .filter(|v| !v.is_empty())
     {
-        return Ok(Some(value));
+        return Some(value);
     }
     if let Some(value) = std::env::var("CURIE_MODEL_CREDENTIALS")
         .ok()
@@ -47,17 +49,33 @@ pub fn model_credential_env() -> Result<Option<String>> {
             "warning: CURIE_MODEL_CREDENTIALS is deprecated and will be removed in a future \
              release; set CURIE_CREDENTIALS instead."
         );
-        return Ok(Some(value));
+        return Some(value);
     }
+    None
+}
+
+/// The model credential saved in Curie private storage, or None when nothing
+/// nonempty is saved. A storage read failure is a warning, not an error: the
+/// saved credential is a convenience, and the run continues without it.
+pub fn saved_model_credential() -> Option<String> {
     match crate::commands::secret_store_env("CURIE_CREDENTIALS") {
-        Ok(stored) => Ok(stored.map(|(_, value)| value)),
+        Ok(stored) => stored
+            .map(|(_, value)| value)
+            .filter(|value| !value.is_empty()),
         Err(error) => {
             crate::ui::ui().warn(&format!(
                 "Saved model credentials could not be read; continuing without them: {error}"
             ));
-            Ok(None)
+            None
         }
     }
+}
+
+/// The explicit shell credential, falling back to the saved one. For flows
+/// with no recorded release credential to protect, such as the factory
+/// quickstart; `cluster up` reads the two sources separately (#3848).
+pub fn model_credential_env() -> Result<Option<String>> {
+    Ok(explicit_model_credential_env().or_else(saved_model_credential))
 }
 
 /// The helm value key that pins the sandbox runner model in the chart.

@@ -768,7 +768,10 @@ promote:
    settings, to `<your-api-url>/github/webhook`. This requires the
    Curie API to be reachable from GitHub's servers (an ingress, a load
    balancer, or a tunnel); how you expose it is an infrastructure decision
-   this chart does not make for you.
+   this chart does not make for you. The push endpoint requires the
+   `X-GitHub-Delivery` header, which GitHub always sends. A delivery that
+   errored partway through is not reprocessed under the same delivery id, so
+   push again or let commit polling pick the commit up.
 3. **The webhook secret matches.** GitHub signs each delivery
    (`x-hub-signature-256`), verified against the chart-managed
    `githubWebhookSecret`. Retrieve the generated value from the same Secret
@@ -789,7 +792,10 @@ promote:
 Each target agent owns its own Version row for the commit SHA. Dev and prod
 versions can share one immutable stored bundle object (`bundle_ref`); they do
 not share a Version row. A dev delivery always clones, checks commit ancestry,
-archives and validates, including on redelivery. A prod delivery first looks
+archives and validates, including a new delivery (a new `X-GitHub-Delivery`
+id) of a commit it has seen before. A webhook delivery whose id already
+deployed or promoted answers `push_duplicate` and does nothing; polling has no
+delivery id and is unaffected. A prod delivery first looks
 for a stored bundle for the SHA across agents bound to this repository. When
 found, it reads `deploy.yaml` from that object and promotes those exact bytes
 without fetching the remote, creating the target agent's Version row if needed
@@ -985,6 +991,24 @@ api:
       check: "Python (ruff + mypy + pytest)"
       paths: [apps, runner, cli, adapters, packages, examples/tests, tools, release]
       pendingCheckPrefix: "Python pytest (shard "
+```
+
+Checks that must rerun after a pull request metadata edit are configured per
+repository with API env `GITHUB_FACTORY_METADATA_CI`, a JSON object, default
+`{}`, checked at boot. Each `owner/name` key is matched case insensitively.
+Each value supplies `checks` for check run names and `statuses` for commit
+status contexts. An omitted list is empty, but at least one name is required.
+Every configured guard must appear with a timestamp after the metadata edit;
+stale passing guards and unrelated fresh checks cannot satisfy that requirement.
+Checks on the unchanged commit retain their passing, pending or failing evidence.
+Without a repository policy, a metadata revision ends as `ci_unverified` with
+reason `metadata_ci_not_configured`. Ordinary commit revisions are unaffected.
+
+Set this environment value through the chart's existing `api.extraEnv` or in
+the Compose environment. For Curie's own repository, the value is:
+
+```json
+{"curie-eng/curie":{"checks":["PR body (real newlines)","Fix pin verification"],"statuses":[]}}
 ```
 
 The branch a factory ticket starts from and targets is set per repository with
@@ -2000,6 +2024,21 @@ can read and write only its own channel's threads. A sandbox booted by an older
 worker keeps its old transcript reach until it is replaced, so its history is
 not cut off at the upgrade; each such request logs a "legacy sandbox token"
 warning and counts on `curie.state.legacy_token`.
+
+### Sandbox state token lifetime (0.12.1)
+
+The boot env tokens (`CURIE_HISTORY_TOKEN`, `CURIE_MEMORY_TOKEN`, and
+`CURIE_STATE_TOKEN`) expire at the turn's stream deadline plus 60 seconds,
+and no later than 24 hours. When the worker deletes the sandbox claim, it
+tells the API, and the API refuses that credential immediately (403, "this
+sandbox credential has been released") even though it has not expired. The
+report is best effort. A failed report stays in Valkey until a later
+cleanup pass lands it, or until that record expires with the token. A warm
+sandbox keeps the token it booted with only while that token still covers the
+next turn. Otherwise the next new turn replaces the sandbox. A token minted before this change has no
+credential id. It stays valid until its own expiry. Upgrade the worker with
+or before the API. An older API answers 404 to the release report, which the
+worker logs once.
 
 ### Bundles that carry their own stdio MCP servers (0.11.0)
 

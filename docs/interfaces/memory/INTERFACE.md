@@ -135,9 +135,13 @@ The state API, not the sandbox, decides what a sandbox may do on the `memory`
 namespace (`apps/api/src/curie_api/routers/state.py::_check_memory_reach`).
 There are two sandbox credentials, both `scope="state"` tokens:
 
-- **Long-lived, read-only.** `CURIE_MEMORY_TOKEN` (and `CURIE_HISTORY_TOKEN`),
-  minted in `boot_env` with claims `{binding, memory: "read"}`. `binding` is
-  the boot binding's `"<kind>:<address>"`, or JSON null when the turn has none.
+- **Boot env, read-only.** `CURIE_MEMORY_TOKEN` (and `CURIE_HISTORY_TOKEN`),
+  minted in `boot_env` with claims `{binding, memory: "read", cred}`. `binding`
+  is the boot binding's `"<kind>:<address>"`, or JSON null when the turn has
+  none. `cred` is the credential id shared with `CURIE_STATE_TOKEN`. The token
+  expires at the turn's stream deadline plus 60 seconds, capped at 24 hours
+  (`BindingResolver.boot_env`). When the sandbox claim is
+  deleted the worker reports that id and the API refuses the token.
 - **Per turn, write.** Minted by
   `apps/worker/src/curie_worker/binding.py::BindingResolver.turn_memory_token`
   only when the agent has memory writes on, the turn names a binding and it is

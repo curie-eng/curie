@@ -9,6 +9,7 @@ streamed body, and does not disturb the valid/invalid signature outcomes.
 
 import hashlib
 import hmac
+import uuid
 from collections.abc import Iterator
 from typing import Any
 
@@ -45,9 +46,26 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
 
     monkeypatch.setattr(github_router, "process_push", _fake_push)
 
+    # The push arm claims and settles its delivery id on sessions of its own
+    # (#3820); stub both so the endpoint test still needs no DB.
+    async def _fake_claim(*_args: Any, **_kwargs: Any) -> str:
+        return "process"
+
+    async def _fake_settle(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(github_router, "claim_push_delivery", _fake_claim)
+    monkeypatch.setattr(github_router, "settle_push_delivery", _fake_settle)
+
+    class _NoDbSession:
+        # The push arm releases the request session before settling.
+        async def close(self) -> None:
+            return None
+
     app = FastAPI()
+    app.state.sessionmaker = None
     app.include_router(github_router.router)
-    app.dependency_overrides[get_session] = lambda: None
+    app.dependency_overrides[get_session] = _NoDbSession
     app.dependency_overrides[get_store] = lambda: None
     app.dependency_overrides[get_eval_queue] = lambda: None
     with TestClient(app) as test_client:
@@ -55,7 +73,11 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
 
 
 def _post(client: TestClient, body: bytes, *, event: str, sign: bool) -> Any:
-    headers = {"X-GitHub-Event": event, "Content-Type": "application/json"}
+    headers = {
+        "X-GitHub-Event": event,
+        "X-GitHub-Delivery": str(uuid.uuid4()),
+        "Content-Type": "application/json",
+    }
     if sign:
         headers["X-Hub-Signature-256"] = _sign(body)
     return client.post("/github/webhook", content=body, headers=headers)

@@ -17,7 +17,7 @@ import asyncio
 import contextlib
 import logging
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -26,8 +26,14 @@ import pytest
 import redis
 from aci_protocol import QueuedTurn, TurnSource
 from curie_telemetry import record_metric
+from curie_telemetry import tracing as telemetry_tracing
 from curie_worker import cron_loop as cron_loop_module
 from curie_worker.cron_loop import CronSchedulerLoop, _Target
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind
 from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -40,6 +46,20 @@ LEASE_S = 300.0
 # A Slack route names its identity and carries no endpoint (ADR-0168
 # decision 3); a named one proves the handle copies it from the row.
 IDENTITY = "second-bot"
+
+
+@pytest.fixture
+def cron_spans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[tuple[TracerProvider, InMemorySpanExporter]]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(telemetry_tracing, "_tracer", provider.get_tracer("curie-telemetry"))
+    try:
+        yield provider, exporter
+    finally:
+        provider.shutdown()
 
 
 def _slot() -> datetime:
@@ -334,6 +354,69 @@ async def _pass_triggers(
         await loop.one_pass(now=seed.slot + timedelta(seconds=30))
     finally:
         await client.aclose()
+
+
+@pytest.mark.parametrize("deferred", [False, True], ids=["fresh", "deferred"])
+def test_cron_enqueue_carrier_names_the_recorded_producer_span(
+    sync_redis: redis.Redis,
+    names: dict[str, str],
+    cron_spans: tuple[TracerProvider, InMemorySpanExporter],
+    deferred: bool,
+) -> None:
+    provider, exporter = cron_spans
+
+    async def body() -> None:
+        async with _seed() as seed:
+            with provider.get_tracer("test-scheduler").start_as_current_span("test.scheduler"):
+                if deferred:
+                    await seed.add_run(seed.slot, seed.slot, outcome="deferred")
+                    await _later_pass(
+                        seed, names["stream"], _trigger(seed), seed.slot + timedelta(minutes=5)
+                    )
+                else:
+                    await _pass_once(seed, names["stream"], _trigger(seed))
+                    await _pass_once(seed, names["stream"], _trigger(seed))
+            rows = sync_redis.xrange(names["stream"])
+            assert len(rows) == 1
+            fields = rows[0][1]
+            turn = QueuedTurn.model_validate_json(fields["payload"])
+            assert turn.source is TurnSource.CRON
+            assert turn.text == PROMPT
+            assert "traceparent" not in turn.model_dump()
+            carrier = fields["traceparent"].split("-")
+            spans = exporter.get_finished_spans()
+            scheduler = next(span for span in spans if span.name == "test.scheduler")
+            enqueue = [span for span in spans if span.name == "curie.queue.enqueue"]
+            assert len(enqueue) == 1
+            assert enqueue[0].kind is SpanKind.PRODUCER
+            assert enqueue[0].attributes["curie.source"] == "worker"
+            assert enqueue[0].parent.span_id == scheduler.context.span_id
+            assert enqueue[0].context.trace_id == scheduler.context.trace_id == int(carrier[1], 16)
+            assert enqueue[0].context.span_id == int(carrier[2], 16)
+
+    asyncio.run(body())
+
+
+def test_cron_enqueue_without_a_tracer_has_only_the_frozen_payload(
+    sync_redis: redis.Redis,
+    names: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        telemetry_tracing, "_tracer", trace.NoOpTracerProvider().get_tracer("test")
+    )
+
+    async def body() -> None:
+        async with _seed() as seed:
+            await _pass_once(seed, names["stream"], _trigger(seed))
+            entries = sync_redis.xrange(names["stream"])
+            assert len(entries) == 1
+            assert set(entries[0][1]) == {"payload"}
+            turn = QueuedTurn.model_validate_json(entries[0][1]["payload"])
+            assert turn.text == PROMPT
+            assert turn.source is TurnSource.CRON
+
+    asyncio.run(body())
 
 
 def test_two_loops_sharing_one_db_and_stream_fire_a_slot_exactly_once(

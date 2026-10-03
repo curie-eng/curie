@@ -105,6 +105,11 @@ impl CheckSpec {
     }
 }
 
+/// Runner-local dev flag, read by `runner/src/curie_runner/config.py`. Not a
+/// boot-env key (the ACI contract is frozen), so it is spelled here, not in
+/// `env_keys`.
+const RUNNER_ALLOW_TOKENLESS_ENV: &str = "CURIE_RUNNER_ALLOW_TOKENLESS";
+
 impl StartSpec {
     /// The `docker run` argument vector (after the `docker` executable).
     pub fn run_args(&self) -> Vec<String> {
@@ -125,6 +130,13 @@ impl StartSpec {
             format!("{}={}", env_keys::CURIE_SANDBOX_ID, self.sandbox_id),
             "-e".into(),
             format!("{}={}", env_keys::CURIE_BUDGET, self.budget_json),
+            // Runner-local dev knob (#3821), not a boot-env key: the runner
+            // refuses to boot without CURIE_RUNNER_TOKEN, but the skill-tier
+            // runner is deliberately tokenless (the CLI dials it without a
+            // bearer), so every StartSpec runner opts in. CheckSpec does not
+            // serve and does not get it.
+            "-e".into(),
+            format!("{RUNNER_ALLOW_TOKENLESS_ENV}=1"),
         ];
         // Container isolation (#631): read-only rootfs + tmpfs, cap-drop ALL,
         // no-new-privileges. Mirrors the worker Docker substrate + K8s runner.
