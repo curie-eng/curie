@@ -249,16 +249,16 @@ def test_same_instance_sibling_task_does_not_steal_a_live_hold(names: dict[str, 
             lock = _lock(redis, owner="same-pod", liveness=liveness, acquire_s=0.4)
             first = await lock.acquire(key)
 
-            async def waiter() -> str:
-                return await lock.acquire(key)
-
-            waiting = asyncio.create_task(waiter())
-            await asyncio.sleep(0.25)
-            assert not waiting.done(), "sibling task stole a live same-instance hold"
+            # Await the sibling's own outcome instead of sampling it against a
+            # sleep (#3861): a stall between that sample and the cancel let the
+            # sibling's 0.4s timeout fire first. The sibling tries a steal on
+            # every poll until its timeout, so it either steals the hold or
+            # times out, whatever the scheduling.
+            sibling = asyncio.create_task(lock.acquire(key))
+            with pytest.raises(LockAcquireTimeout):
+                stolen = await sibling
+                pytest.fail(f"sibling task stole a live same-instance hold as {stolen}")
             assert await redis.get(key) == first
-            waiting.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await waiting
             await lock.release(key, first)
 
     asyncio.run(go())
