@@ -661,6 +661,10 @@ def build(
         eval_http,
         card_store,
     )
+    cron_bundle_store = BundleStore(config)
+    owner.register_close(
+        "cron-bundle-s3", lambda: _close_sync(cron_bundle_store._client.close), order=71
+    )
     return Runtime(
         consumer=consumer,
         killswitch=killswitch,
@@ -696,7 +700,7 @@ def build(
             engine=engine,
             redis=async_redis,
             source=BundleTriggerSource(
-                BundleStore(config),
+                cron_bundle_store,
                 max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
                 max_compression_ratio=config.bundle_max_compression_ratio,
                 max_members=config.bundle_max_members,
