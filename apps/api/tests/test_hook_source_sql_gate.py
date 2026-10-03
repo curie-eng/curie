@@ -444,3 +444,97 @@ def test_disconnected_holder_cannot_authorize_an_ordinary_snapshot(gate_db: Any)
                     assert result.never_configured
 
     asyncio.run(asyncio.wait_for(scenario(), 12))
+
+
+def test_autocommit_gate_retains_actual_advisory_exclusion(gate_db: Any) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+    module = gate_module()
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        async with engines() as (gate, _work, observer):
+            autocommit = gate.execution_options(isolation_level="AUTOCOMMIT")
+            entered = asyncio.Event()
+
+            async def waiter() -> None:
+                """@spec PROTECTED-HOOK-SOURCE-2."""
+                async with module.SourceGate(observer).hold(gate_db[0]):
+                    entered.set()
+
+            async with module.SourceGate(autocommit).hold(gate_db[0]):
+                task = asyncio.create_task(waiter())
+                try:
+                    await waiting_advisory(observer)
+                    assert not entered.is_set()
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            async with module.SourceGate(observer).hold(gate_db[0]):
+                pass
+
+    asyncio.run(asyncio.wait_for(scenario(), 12))
+
+
+def test_same_pool_alias_nested_gate_is_refused_immediately(gate_db: Any) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+    module = gate_module()
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        async with engines() as (gate, _work, _observer):
+            alias = gate.execution_options(isolation_level="READ COMMITTED")
+            assert alias is not gate and alias.pool is gate.pool
+            async with module.SourceGate(gate).hold(gate_db[0]):
+                async with asyncio.timeout(2):
+                    with pytest.raises(module.SourceGateInvalid):
+                        async with module.SourceGate(alias).hold(gate_db[0]):
+                            pytest.fail("same pool nested gate acquired")
+
+    asyncio.run(asyncio.wait_for(scenario(), 12))
+
+
+def test_same_pool_alias_work_connection_is_refused(gate_db: Any) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+    module = gate_module()
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        async with engines() as (gate, _work, _observer):
+            alias = gate.execution_options(isolation_level="READ COMMITTED")
+            assert alias is not gate and alias.pool is gate.pool
+            async with module.SourceGate(gate).hold(gate_db[0]) as held:
+                async with alias.begin() as conn:
+                    with pytest.raises(module.SourceGateInvalid):
+                        await module.read_source_snapshot(held, conn, "daily-summary")
+
+    asyncio.run(asyncio.wait_for(scenario(), 12))
+
+
+def test_same_pool_alias_other_task_waits_then_proceeds(gate_db: Any) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+    module = gate_module()
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        async with engines() as (gate, _work, observer):
+            alias = gate.execution_options(isolation_level="READ COMMITTED")
+            entered = asyncio.Event()
+
+            async def waiter() -> None:
+                """@spec PROTECTED-HOOK-SOURCE-2."""
+                async with module.SourceGate(alias).hold(gate_db[0]):
+                    entered.set()
+
+            async with module.SourceGate(gate).hold(gate_db[0]):
+                task = asyncio.create_task(waiter())
+                try:
+                    await waiting_advisory(observer)
+                    assert not entered.is_set()
+                except BaseException:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    raise
+            await asyncio.wait_for(task, 5)
+            assert entered.is_set()
+
+    asyncio.run(asyncio.wait_for(scenario(), 12))
