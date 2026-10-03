@@ -487,6 +487,7 @@ class CronSchedulerLoop:
         ]
 
     async def _cron_triggers(self, target: _Target) -> list[dict[str, Any]]:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
         if not target.bundle_ref:
             # No bundle attached yet; do not cache, so a later bundle attach
             # on this same active version is picked up on the next pass.
@@ -494,7 +495,23 @@ class CronSchedulerLoop:
         cache_key = (target.version_id, target.bundle_ref)
         cached = self._triggers.get(cache_key)
         if cached is None:
-            fetched = await asyncio.to_thread(self._source.triggers, target.bundle_ref)
+            read = asyncio.create_task(asyncio.to_thread(self._source.triggers, target.bundle_ref))
+            cancelled: asyncio.CancelledError | None = None
+            while not read.done():
+                try:
+                    await asyncio.shield(read)
+                except asyncio.CancelledError as exc:
+                    if cancelled is None:
+                        cancelled = exc
+                except Exception:
+                    if cancelled is None:
+                        raise
+                    break
+            if cancelled is not None:
+                if not read.cancelled():
+                    read.exception()
+                raise cancelled
+            fetched = read.result()
             cached = [t for t in fetched if isinstance(t, dict) and t.get("type") == "cron"]
             self._triggers[cache_key] = cached
         return cached
