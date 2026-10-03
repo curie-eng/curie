@@ -148,11 +148,11 @@ The JSON after the code and `": "` has sorted keys:
 4. It is a NetworkPolicy of any name. `env_create` owns egress through its `allow` rules, and an extra policy would widen the default deny.
 5. It is a ResourceQuota or a LimitRange. `env_create` owns the namespace bounds.
 6. It is the RoleBinding `e2e-connector`.
-7. It is a Role with a rule that reaches `secrets` (resources `secrets` or `*` in API group `""` or `*`), or reaches `roles` or `rolebindings` in `rbac.authorization.k8s.io` or `*`, which could grant Secrets later.
+7. It is a Role with a rule that grants any verb other than `get`, `list`, and `watch`, or that reaches `secrets` (resources `secrets` or `*` in API group `""` or `*`) with any verb. A pod deployed to run under that Role could otherwise reach build pods, build credentials, or `env_create`'s bounds. A subresource such as `pods/exec` counts like any resource, so granting `create` on it is refused.
 8. It is a RoleBinding whose `roleRef` is not a Role, such as a ClusterRole the connector cannot read to check, or a RoleBinding to a Role refused by the rule above, whether that Role is in the same manifest or already exists in the namespace.
 9. An object of the same kind and name already exists and carries `curietech.ai/e2e-build`, such as a build Job or pod.
 
-A Role that grants only other resources, such as `configmaps`, and a Secret with any other name, deploy normally.
+A Role that grants only `get`, `list`, and `watch` on resources other than `secrets`, such as `configmaps` or `pods/log`, and a Secret with any other name, deploy normally.
 
 ### run
 
@@ -176,8 +176,8 @@ Refusals:
 1. `e2e_run_identity_required`, `e2e_environment_required`, `e2e_namespace_not_owned`: as for `deploy`.
 2. `e2e_image_not_digest`: `image` is not pinned by digest. Nothing is created.
 3. `e2e_run_argument_refused: <reason>`: `command` breaks the rules above. Nothing is created.
-4. `e2e_run_failed: <reason>`: the container waits on `InvalidImageName`, `ErrImageNeverPull`, or `ImagePullBackOff`, or the Job failed without a container exit. `ContainerCreating`, `PodInitializing`, and `ErrImagePull` keep waiting; the kubelet turns a pull failure that persists into `ImagePullBackOff`.
-5. `e2e_run_timeout`: the run passed 1200 seconds.
+4. `e2e_run_failed: <reason>`: the container waits on `InvalidImageName`, `ErrImageNeverPull`, or `ImagePullBackOff`, or the Job failed without a container exit. After the Job finishes, it is also returned when the pod list cannot be read, the Job has no pods, the `run` container reports no terminated state, or its log cannot be read; a finished run with unreadable output is never an empty success. `ContainerCreating`, `PodInitializing`, and `ErrImagePull` keep waiting; the kubelet turns a pull failure that persists into `ImagePullBackOff`.
+5. `e2e_run_timeout`: the run passed 1200 seconds. A Job that ends Failed with reason `DeadlineExceeded` is a timeout even when its container reports an exit, because the deadline kills the container (exit 137).
 
 ### logs
 

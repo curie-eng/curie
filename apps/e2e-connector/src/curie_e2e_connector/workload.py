@@ -364,17 +364,38 @@ def _rule_reaches(rule: Any, groups: tuple[str, ...], resources: tuple[str, ...]
     return False
 
 
+_READ_VERBS = frozenset({"get", "list", "watch"})
+
+
 def _dangerous_role(body: dict[str, Any]) -> str:
-    """Why a Role is refused, or "" when it is not."""
+    """Why a Role is refused, or "" when it is not.
+
+    A deployed pod running under the Role could reach build pods, build
+    credentials, or env_create's bounds, so a Role may grant only get, list
+    and watch, and never on secrets.
+    """
 
     rules = body.get("rules") or []
     if not isinstance(rules, list):
         return "rules are not a list"
     for rule in rules:
+        if not isinstance(rule, dict):
+            return "a rule is not a mapping"
+        verbs = rule.get("verbs") or []
+        if not isinstance(verbs, list) or not all(isinstance(verb, str) for verb in verbs):
+            return "a rule's verbs are not a list of strings"
+        extra = sorted(set(verbs) - _READ_VERBS)
+        if extra:
+            return (
+                f"the Role grants {', '.join(extra)}; a Role may grant only get, list and "
+                "watch, because a pod running under it could reach build pods, credentials, "
+                "or env_create's bounds"
+            )
         if _rule_reaches(rule, ("",), ("secrets",)):
-            return "the Role reaches secrets"
-        if _rule_reaches(rule, (_RBAC,), ("roles", "rolebindings")):
-            return "the Role reaches roles or rolebindings"
+            return (
+                "the Role reaches secrets, which hold the build credentials a pod running "
+                "under it could read"
+            )
     return ""
 
 
@@ -752,14 +773,23 @@ def _await_run(
         sleep(poll_seconds)
 
     succeeded, reason, message = state
-    found = _run_result(job_pods(cluster, namespace, job))
-    if found is None:
-        if not succeeded and reason == "DeadlineExceeded":
-            raise _run_timeout()
+    # activeDeadlineSeconds kills the running container, so a deadline is a
+    # timeout even when that container reports an exit.
+    if not succeeded and reason == "DeadlineExceeded":
+        raise _run_timeout()
+    failed = ClusterError(
+        f"{REFUSAL_RUN_FAILED}: {(message or reason or 'the run Job failed')[-_DETAIL_LIMIT:]}"
+    )
+    try:
+        found = _run_result(_finished_run_pods(cluster, namespace, job))
+    except ClusterError:
         if not succeeded:
-            detail = (message or reason or "the run Job failed")[-_DETAIL_LIMIT:]
-            raise ClusterError(f"{REFUSAL_RUN_FAILED}: {detail}")
-        return {"exit_code": 0, "stdout": "", "stderr": ""}
+            raise failed from None
+        raise
+    if found is None:
+        if not succeeded:
+            raise failed
+        raise ClusterError(f"{REFUSAL_RUN_FAILED}: the run container reported no exit")
     pod, terminated = found
     exit_code = terminated.get("exitCode")
     exit_code = exit_code if isinstance(exit_code, int) else (0 if succeeded else 1)
@@ -774,12 +804,34 @@ def _await_run(
     log_code, text = checked_text(
         cluster, f"/api/v1/namespaces/{namespace}/pods/{pod}/log?container=run"
     )
-    stdout = text if log_code == 200 else ""
+    if log_code != 200:
+        raise ClusterError(
+            f"{REFUSAL_RUN_FAILED}: the test cluster did not return the run log ({log_code})"
+        )
+    stdout = text
     return {
         "exit_code": exit_code,
         "stdout": tail_text(stdout.encode("utf-8"), OUTPUT_LIMIT_BYTES),
         "stderr": tail_text(stderr.encode("utf-8"), OUTPUT_LIMIT_BYTES),
     }
+
+
+def _finished_run_pods(cluster: ClusterApi, namespace: str, job: str) -> list[dict[str, Any]]:
+    """The finished run Job's pods; unlike ``job_pods``, a failed read or none is an error."""
+
+    selector = urllib.parse.quote(f"job-name={job}", safe="")
+    code, payload = checked_request(
+        cluster, "GET", f"/api/v1/namespaces/{namespace}/pods?labelSelector={selector}"
+    )
+    if code != 200:
+        raise ClusterError(
+            f"{REFUSAL_RUN_FAILED}: the test cluster did not list the run pods ({code})"
+        )
+    items = payload.get("items")
+    pods = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+    if not pods:
+        raise ClusterError(f"{REFUSAL_RUN_FAILED}: the finished run Job has no pods")
+    return pods
 
 
 def _run_timeout() -> ClusterError:
