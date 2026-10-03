@@ -193,6 +193,19 @@ def test_support_timestamp_window_matches_existing_delivery(offset: int, accepte
         "1" * 13,
         "1" * 5000,
     ],
+    ids=[
+        "missing",
+        "empty",
+        "negative",
+        "positive-sign",
+        "leading-space",
+        "trailing-space",
+        "underscore",
+        "non-ascii",
+        "decimal",
+        "13-digits",
+        "5000-digits",
+    ],
 )
 def test_support_refuses_malformed_timestamps_without_raising(timestamp: str | None) -> None:
     """@spec PROTECTED-HOOK-SOURCE-9."""
@@ -231,3 +244,17 @@ def test_support_dotted_delivery_id_refused_and_signer_raises(delivery_id: str) 
     for sign in [source.sign_support, hook_signing.sign]:
         with pytest.raises(ValueError):
             sign(key, **args)
+
+
+def test_support_non_ascii_signature_header_refuses_without_exception() -> None:
+    """@spec PROTECTED-HOOK-SOURCE-9."""
+    assert not _source().verify_support(
+        _key_oracle(),
+        timestamp=TIMESTAMP,
+        delivery_id=DELIVERY_ID,
+        hook=HOOK,
+        tool_access=None,
+        body=BODY,
+        header="sha256=é",
+        now=int(TIMESTAMP),
+    )
