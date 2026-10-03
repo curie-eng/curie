@@ -45,6 +45,10 @@ KNOWN LIMITS, stated rather than papered over
   over `apps/deployments` (including its `scale` subresource). Any other shape of
   grant is not compared, and a bundle relying on one is not covered here.
 - A bundle with no connector source, or no write-annotated tool, passes trivially.
+- A write tool also passes when the bundle's `toolPolicy` names it literally
+  (`allow`, `approvalRequired` or `deny`). The runner enforces that policy and
+  denies anything it does not match, so a literal entry is a deliberate choice; a
+  glob entry is not counted, because it classifies tools nobody looked at.
 """
 
 import argparse
@@ -82,6 +86,26 @@ def declared_gates(bundle: pathlib.Path) -> set[str]:
         for g in (manifest.get("approvalPolicy") or {}).get("gates", [])
         if g.get("gate")
     }
+
+
+def classified_tools(bundle: pathlib.Path) -> set[str]:
+    """`<server>/<tool>` names the bundle's `toolPolicy` classifies by literal name.
+
+    The runner enforces `toolPolicy` at call time and denies any tool it does not
+    match, so a write tool the owner names in `allow`, `approvalRequired` or `deny`
+    was classified on purpose rather than forgotten. Only literal entries count: a
+    glob such as `platform/*` would classify a write tool nobody looked at, which
+    is the incident this guard exists for.
+    """
+    manifest = json.loads((bundle / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+    policy = manifest.get("toolPolicy") or {}
+    names: set[str] = set()
+    for key in ("allow", "approvalRequired", "deny"):
+        for entry in policy.get(key) or []:
+            entry = str(entry).strip()
+            if not any(ch in entry for ch in "*?["):
+                names.add(entry)
+    return names
 
 
 def _callee_name(node: ast.expr) -> str:
@@ -207,6 +231,7 @@ def check(bundle: pathlib.Path) -> list[str]:
     loaded = yaml.safe_load(conn_file.read_text(encoding="utf-8")) or {}
     connectors = loaded.get("connectors") or {}
     gates = declared_gates(bundle)
+    classified = classified_tools(bundle)
     role_file = bundle / "manifests" / "write-role.yaml"
 
     for name, spec in connectors.items():
@@ -220,12 +245,12 @@ def check(bundle: pathlib.Path) -> list[str]:
                     f"explicitly with ToolAnnotations(readOnlyHint=...) rather than leaving "
                     f"a reader to guess."
                 )
-            elif not read_only and expected not in gates:
+            elif not read_only and expected not in gates and f"{name}/{tool}" not in classified:
                 problems.append(
                     f"{bundle.name} declares connector {name!r}, whose {tool} is not "
-                    f"read-only, but no approvalPolicy gate names {expected}. Enabling the "
-                    f"connector and declaring the gate are two edits; this is the one that "
-                    f"gets forgotten."
+                    f"read-only, but no approvalPolicy gate names {expected} and no "
+                    f"toolPolicy entry names {name}/{tool}. Enabling the connector and "
+                    f"declaring the gate are two edits; this is the one that gets forgotten."
                 )
 
         # Ceilings, only where both halves exist.
