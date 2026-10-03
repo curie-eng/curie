@@ -49,6 +49,34 @@ unchanged. Its actual installed-image, released-upgrade and full baseline
 verification still follows the complete producer integration. Administration
 routes and protected activation stay unavailable throughout these slices.
 
+## Shared startup prerequisite and worker ownership hold
+
+The shared installed serving resource, pure compatibility decision and actual
+source-structure probe are SOURCE-2 prerequisites. Realize the shared/API part
+independently: extract the existing decision into the internal protected-hooks
+package, install validated candidate window/known ancestry, and route API startup
+through the shared probe without changing its migration planner or non-startup
+compatibility CLI. Update the existing graph/window checkers and architecture
+seam; preserve every historical window and migration. A retained resource path
+is a checked generated mirror, never a second editable owner.
+
+Commit independent failing shared/API tests before implementation. Actual
+Postgres controls cover the old minimum refusal, current admission, future stamp
+with valid versus missing/type-invalid source structures, multiple version rows,
+real SELECT denial and deadline/cleanup behavior. An installed-wheel check with
+API absent proves shared resource/import closure; the real graph/catalog/chart
+checks prevent a source-tree-only success.
+
+Worker composition, startup, cron and its test files remain held until #3895
+actually merges and its landed ownership/intent is reviewed on a fresh base.
+Then independent new worker tests prove pre-build refusal before boot effects,
+bounded distinct gate-pool ownership, actual stop-before-dispose and cleanup
+failure/cancellation. Fatal timeout tests run only in an exclusively owned
+subprocess and do not claim normal exception propagation or successful disposal.
+Preserve landed tracing/carrier, claim-before-XADD, capacity behavior and sacred
+worker modules. Shared/API completion alone does not complete producer fencing,
+source administration exposure or runtime qualification.
+
 ## Races and boundaries to review
 
 Use actual disposable Postgres and role-scoped Valkey, not mocked dependencies.

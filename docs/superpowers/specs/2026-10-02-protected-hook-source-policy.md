@@ -110,6 +110,63 @@ ledger support must fail startup, not fall back to ordinary admission. Keep all
 previous windows, including the unwired `0.12.1` foundation, unchanged. These
 are candidate compatibility records, not a published release.
 
+The existing internal protected-hooks package owns one installed Python serving
+resource containing candidate window, known revision IDs and actual ancestry,
+and one pure serving decision shared by API and worker. Validate that resource
+against the actual Alembic graph, CLI candidate and chart; keep every prior
+registered window unchanged. Preserve existing first-parent serving ancestry
+when a revision names multiple parents; extraction does not widen the decision
+to reachability through another parent. Preserve the current presumed-compatible
+unknown future-expand rule. No duplicate numeric minimum, API application import in
+worker/shared package, source-tree runtime asset lookup or root API-asset-copy
+pattern is permitted. API retains migration kinds, planner, upgrade commands
+and non-startup compatibility CLI behavior. Retained resource paths, if needed,
+are checked generated mirrors of the single owner.
+
+Both API and standalone worker startup call the shared read-only live revision
+and required-structure probe under each caller's own configured database
+identity, before serving or producers. Worker completes the probe before
+`build` and all boot effects, within a 30-second observation deadline covering
+connection acquisition, revision read and both checks. Subsequent owned-engine
+cleanup is separately bounded; this is not a strict 30-second whole-wall-time
+claim. Missing/multiple version rows, incompatible known revision, unreadable/
+malformed metadata, unavailable database, insufficient SELECT authority or
+deadline exhaustion refuses without migration, mutation, enqueue or ordinary
+fallback. Safe stable diagnostics contain no credential, DSN or exception text.
+
+Revision compatibility alone does not prove ledger support. Independently
+probe these actual required source columns using zero-row projections and
+compatible catalog types in a read-only transaction: `curie.agents` (`id`,
+`hook_generation`); `curie.hook_source_policies` (the eleven SOURCE-1 columns);
+and `curie.hook_source_operations` (the seven SOURCE-10 columns). Require UUID
+identities, the shipped INTEGER agent counter, BIGINT source generations,
+supported textual fields and timestamp-with-time-zone times. Additive columns
+remain compatible. A known-compatible or unknown-future stamp with missing or
+unusable required structure refuses both startups. The configured schema only
+locates version metadata; current source helpers/migrations still use `curie`.
+This adds no custom-schema producer support and proves readable structure,
+not provenance, all constraints, runtime authority or qualification.
+
+Own the probe engine immediately and dispose it on every outcome. Worker
+composition owns one separate same-DSN source-gate pool: size four, overflow
+zero, checkout timeout 30 seconds, pre-ping. Register disposal before any later
+construction can fail. Preserve READ COMMITTED and gate-before-work ordering;
+gate waiters hold no work connection. Checkout timeout does not bound network
+connect or advisory-lock wait.
+
+Cleanup stops and joins supervised cron before gate disposal, with a ten-second
+stop/cancel/join budget. Each subsequent owned engine/transport close has at
+most five seconds, and an earlier close error cannot skip later attempts.
+On cooperative paths retain the primary exception/cancellation; secondary
+cleanup failures produce safe diagnostics, and failure without a primary cause
+fails shutdown. Shield only an owned bounded cleanup task; do not detach
+unbounded work. If producer join expires, perform process-level fatal exit
+within one further second, preserving safe primary-cause diagnostics. Merely
+raising/returning to `asyncio.run` is insufficient. Do not dispose gate/work
+engines under unjoined producers or claim successful termination/disposal or
+normal exception propagation after fatal exit. Fatal-path tests run only in
+an exclusively owned subprocess.
+
 ## API DTOs and credential lifecycle
 
 <!-- @spec PROTECTED-HOOK-SOURCE-3 -->
