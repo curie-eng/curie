@@ -235,13 +235,13 @@
       "result": "MemoryGuidanceOutput",
       "kind": "CliOutput",
       "schema": "memory.schema.json",
-      "version": "2.1"
+      "version": "2.2"
     },
     {
       "result": "MemoryOutput",
       "kind": "CliOutput",
       "schema": "memory.schema.json",
-      "version": "2.1"
+      "version": "2.2"
     },
     {
       "result": "MessageDryRunOutput",

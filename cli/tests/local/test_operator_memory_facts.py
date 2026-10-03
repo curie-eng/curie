@@ -17,7 +17,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import jsonschema
 import pytest
@@ -258,9 +258,10 @@ def _stale_delete_proxy(
     class Forwarder(BaseHTTPRequestHandler):
         def _forward(self) -> None:
             target = urlsplit(self.path)
+            selected = unquote(target.path) == unquote(path)
             connection = http.client.HTTPConnection(upstream.hostname, upstream.port, timeout=20)
             try:
-                if target.path == path and self.command == "DELETE":
+                if selected and self.command == "DELETE":
                     audit.delete_queries.append(parse_qs(target.query))
                     if not audit.read_versions or len(audit.delete_queries) != 1:
                         raise RuntimeError("expected one selected fact read followed by one delete")
@@ -279,7 +280,7 @@ def _stale_delete_proxy(
                 connection.request(self.command, self.path, body=body, headers=headers)
                 response = connection.getresponse()
                 raw = response.read()
-                if target.path == path and self.command == "GET" and response.status == 200:
+                if selected and self.command == "GET" and response.status == 200:
                     audit.read_versions.append(json.loads(raw)["version"])
                 self.send_response_only(response.status)
                 for key, value in response.getheaders():
@@ -415,13 +416,18 @@ def test_operator_memory_facts(memory_case: MemoryCase, tier: str) -> None:
     original = _need_http(case.api, case.paths["webhook"])
     updated_value = _fact("concurrent update survives deletion", "reader@example.com", "05")
     with _stale_delete_proxy(case, case.paths["webhook"], updated_value) as (proxy, audit):
-        _refused(
+        conflicted = _cli(
             case, tier, "--delete", OTHER_CHANNEL_FACT, "--channel", "=".join(WEBHOOK),
-            api_url=proxy, evidence="409",
+            api_url=proxy,
         )
     assert not audit.errors, audit.errors
     assert audit.read_versions == [original["version"]]
     assert audit.delete_queries == [{"expected_version": [str(original["version"])]}]
+    assert audit.updated_version == original["version"] + 1
+    assert conflicted.returncode != 0, f"unexpected success: {conflicted.stdout}"
+    conflict_text = conflicted.stdout + conflicted.stderr
+    assert "409" in conflict_text, conflict_text
+    assert '"deleted":true' not in conflict_text.replace(" ", ""), conflict_text
     retained = _need_http(case.api, case.paths["webhook"])
     assert retained["version"] == original["version"] + 1 == audit.updated_version
     assert retained["value"] == updated_value

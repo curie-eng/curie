@@ -1947,7 +1947,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
+          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -1994,6 +1994,22 @@ export const commandManifest = {
               "help": "Append this content as an operator-authored memory record",
               "id": "add",
               "long": "add",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Delete this fact from agent memory, or the selected channel",
+              "id": "delete",
+              "long": "delete",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Select the facts of this exact bound channel pair",
+              "id": "channel",
+              "long": "channel",
               "positional": false,
               "required": false
             },
@@ -6622,7 +6638,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
+          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -6688,6 +6704,22 @@ export const commandManifest = {
               "help": "Append this content as an operator-authored memory record",
               "id": "add",
               "long": "add",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Delete this fact from agent memory, or the selected channel",
+              "id": "delete",
+              "long": "delete",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Select the facts of this exact bound channel pair",
+              "id": "channel",
+              "long": "channel",
               "positional": false,
               "required": false
             },

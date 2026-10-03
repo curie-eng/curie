@@ -353,11 +353,16 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
         LocalAction::Memory {
             target,
             add,
+            delete,
+            channel,
             guidance,
-        } => match (guidance.action(), add) {
-            (Some(action), _) => emit_memory_guidance(target.into(), action).await,
-            (None, None) => emit(commands::memory(target.into()).await?),
-            (None, Some(content)) => {
+        } => match (guidance.action(), add, delete) {
+            (Some(action), _, _) => emit_memory_guidance(target.into(), action).await,
+            (None, None, Some(id)) => {
+                emit(commands::memory_delete(target.into(), id, channel).await?)
+            }
+            (None, None, None) => emit(commands::memory(target.into(), channel).await?),
+            (None, Some(content), _) => {
                 emit(commands::memory_add(target.into(), content, "local").await?)
             }
         },

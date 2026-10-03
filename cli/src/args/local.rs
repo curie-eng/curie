@@ -436,7 +436,8 @@ pub(crate) enum LocalAction {
         #[command(subcommand)]
         action: LocalHooksAction,
     },
-    /// Show what an agent has learned (its memory log; `GET /agents/{id}/memory`).
+    /// List an agent's individual facts and memory log. `--channel KIND=ADDRESS`
+    /// selects one bound channel; `--delete FACT_ID` removes one fact.
     /// `--add <content>` seeds an operator-authored record; a fresh session is
     /// required before it is injected at boot. `--guidance` shows the guidance
     /// the agent gets beside its memory tools, `--guidance-from <file>` replaces
@@ -445,8 +446,14 @@ pub(crate) enum LocalAction {
         #[command(flatten)]
         target: AgentTarget<LocalTier>,
         /// Append this content as an operator-authored memory record.
-        #[arg(long, value_name = "CONTENT")]
+        #[arg(long, value_name = "CONTENT", conflicts_with_all = ["delete", "channel"])]
         add: Option<String>,
+        /// Delete this fact from agent memory, or the selected channel.
+        #[arg(long, value_name = "FACT_ID", conflicts_with_all = ["add", "guidance", "guidance_from", "reset_guidance"])]
+        delete: Option<String>,
+        /// Select the facts of this exact bound channel pair.
+        #[arg(long, value_name = "KIND=ADDRESS", conflicts_with_all = ["add", "guidance", "guidance_from", "reset_guidance"])]
+        channel: Option<String>,
         #[command(flatten)]
         guidance: MemoryGuidanceArgs,
     },

@@ -214,6 +214,11 @@
       "omissions": []
     },
     {
+      "struct": "StateEntry",
+      "schema": "StateEntryOut",
+      "omissions": []
+    },
+    {
       "struct": "MemoryProvenance",
       "schema": "MemoryProvenanceOut",
       "omissions": []
