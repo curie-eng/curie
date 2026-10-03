@@ -1060,9 +1060,9 @@ use curie::api::{ApprovalRecord, MemoryEntry, Version};
 use curie::commands::{
     ApprovalsOutput, BudgetOutput, BumpVersionOutput, ChartCheckOutcome, ChartCheckOutput,
     CheckMatch, CheckReport, ConnectorBuildOutput, ConnectorBuildRecord, DeclaredServer,
-    DeleteOutput, DeployOutput, KillOutput, ListAgentsOutput, LocalAgentSummary, MemoryOutput,
-    ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, SkillMessageOutput, SweepRow,
-    VersionsOutput,
+    DeleteOutput, DeployOutput, KillOutput, ListAgentsOutput, LocalAgentSummary, MemoryChannel,
+    MemoryFact, MemoryOutput, ResetThreadOutput, ResumeOutput, SkillApprovalsOutput,
+    SkillMessageOutput, SweepRow, VersionsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::local::{
@@ -2316,12 +2316,79 @@ fn memory_output_validates_all_variants() {
     let list = MemoryOutput::List {
         agent: "d".to_string(),
         entries,
+        facts: vec![
+            MemoryFact {
+                id: "fact-0123456789abcdef0123456789abcdef".to_string(),
+                scope: "agent".to_string(),
+                channel: None,
+                statement: "prefer terse".to_string(),
+                author: "operator@example.com".to_string(),
+                stated_at: "2026-10-01T03:04:05.123456+00:00".to_string(),
+            },
+            MemoryFact {
+                id: "fact-11111111111111111111111111111111".to_string(),
+                scope: "channel".to_string(),
+                channel: Some(MemoryChannel {
+                    kind: "slack".to_string(),
+                    address: "C0EXAMPLE1".to_string(),
+                }),
+                statement: "prefer morning updates".to_string(),
+                author: "U0EXAMPLE1".to_string(),
+                stated_at: "2026-10-02T03:04:05Z".to_string(),
+            },
+        ],
     };
     assert_valid("memory.schema.json", &list.to_json());
-    let empty = MemoryOutput::Empty {
+    let empty = MemoryOutput::List {
         agent: "d".to_string(),
+        entries: vec![],
+        facts: vec![],
     };
     assert_valid("memory.schema.json", &empty.to_json());
+    for (scope, channel) in [
+        ("agent", None),
+        (
+            "channel",
+            Some(MemoryChannel {
+                kind: "slack".to_string(),
+                address: "C0EXAMPLE1".to_string(),
+            }),
+        ),
+    ] {
+        let deleted = MemoryOutput::Deleted {
+            agent: "d".to_string(),
+            id: "fact-0123456789abcdef0123456789abcdef".to_string(),
+            scope: scope.to_string(),
+            channel,
+        };
+        assert_valid("memory.schema.json", &deleted.to_json());
+    }
+    let schema = load_schema("memory.schema.json");
+    assert_eq!(
+        schema["$id"],
+        "https://schemas.curietech.ai/cli/memory/v2.2.json"
+    );
+    // The minor schema extension also accepts a previously emitted list.
+    assert_valid(
+        "memory.schema.json",
+        &serde_json::json!({"agent": "d", "entries": []}),
+    );
+    let v = validator(&schema);
+    let mut incomplete_fact = list.to_json();
+    incomplete_fact["facts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("author");
+    assert!(
+        !v.is_valid(&incomplete_fact),
+        "a fact must retain its stored author"
+    );
+    let mut invalid_scope = list.to_json();
+    invalid_scope["facts"][0]["scope"] = serde_json::json!("global");
+    assert!(
+        !v.is_valid(&invalid_scope),
+        "only agent and channel scopes exist"
+    );
     let dry = MemoryOutput::DryRun(DryRunPlan {
         lines: vec!["GET /memory".to_string()],
     });

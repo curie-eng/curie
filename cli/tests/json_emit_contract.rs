@@ -586,8 +586,8 @@ fn cluster_comms_disconnect_dry_run_emits_plan_not_error() {
 
 use curie::api::{MemoryEntry, Version};
 use curie::commands::{
-    ApprovalsOutput, BudgetOutput, DeleteOutput, InitOutput, KillOutput, MemoryOutput,
-    ResetThreadOutput, ResumeOutput, VersionsOutput,
+    ApprovalsOutput, BudgetOutput, DeleteOutput, InitOutput, KillOutput, MemoryChannel, MemoryFact,
+    MemoryOutput, ResetThreadOutput, ResumeOutput, VersionsOutput,
 };
 // `ObservabilityOutput` moved to the tier-aware `observability` seam (#460) so
 // both the local and cluster handlers return one type.
@@ -694,11 +694,13 @@ fn memory_output_json_shape_is_pinned() {
         json!({"dry_run": true, "plan": ["GET <api>/agents/<id>/memory"]})
     );
     assert_eq!(
-        MemoryOutput::Empty {
+        MemoryOutput::List {
             agent: "weather".to_string(),
+            entries: vec![],
+            facts: vec![],
         }
         .to_json(),
-        json!({"agent": "weather", "entries": []})
+        json!({"agent": "weather", "entries": [], "facts": []})
     );
     // `MemoryEntry::version` is deliberately NOT emitted; this exact-match pins
     // that (surfacing it later would fail here and force a contract decision).
@@ -719,6 +721,27 @@ fn memory_output_json_shape_is_pinned() {
                     provenance: Default::default(),
                 },
             ],
+            facts: vec![
+                MemoryFact {
+                    id: "fact-0123456789abcdef0123456789abcdef".to_string(),
+                    scope: "agent".to_string(),
+                    channel: None,
+                    statement: "prefer complete timestamps".to_string(),
+                    author: "operator@example.com".to_string(),
+                    stated_at: "2026-10-01T03:04:05.123456+00:00".to_string(),
+                },
+                MemoryFact {
+                    id: "fact-11111111111111111111111111111111".to_string(),
+                    scope: "channel".to_string(),
+                    channel: Some(MemoryChannel {
+                        kind: "slack".to_string(),
+                        address: "C0EXAMPLE1".to_string(),
+                    }),
+                    statement: "prefer morning updates".to_string(),
+                    author: "U0EXAMPLE1".to_string(),
+                    stated_at: "2026-10-02T03:04:05Z".to_string(),
+                },
+            ],
         }
         .to_json(),
         json!({
@@ -727,6 +750,59 @@ fn memory_output_json_shape_is_pinned() {
                 {"index": 0, "content": "user prefers celsius"},
                 {"index": 1, "content": "home airport is BOS"},
             ],
+            "facts": [
+                {
+                    "id": "fact-0123456789abcdef0123456789abcdef",
+                    "scope": "agent",
+                    "channel": null,
+                    "statement": "prefer complete timestamps",
+                    "author": "operator@example.com",
+                    "stated_at": "2026-10-01T03:04:05.123456+00:00",
+                },
+                {
+                    "id": "fact-11111111111111111111111111111111",
+                    "scope": "channel",
+                    "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+                    "statement": "prefer morning updates",
+                    "author": "U0EXAMPLE1",
+                    "stated_at": "2026-10-02T03:04:05Z",
+                },
+            ],
+        })
+    );
+    assert_eq!(
+        MemoryOutput::Deleted {
+            agent: "weather".to_string(),
+            id: "fact-0123456789abcdef0123456789abcdef".to_string(),
+            scope: "agent".to_string(),
+            channel: None,
+        }
+        .to_json(),
+        json!({
+            "agent": "weather",
+            "id": "fact-0123456789abcdef0123456789abcdef",
+            "scope": "agent",
+            "channel": null,
+            "deleted": true,
+        })
+    );
+    assert_eq!(
+        MemoryOutput::Deleted {
+            agent: "weather".to_string(),
+            id: "fact-11111111111111111111111111111111".to_string(),
+            scope: "channel".to_string(),
+            channel: Some(MemoryChannel {
+                kind: "slack".to_string(),
+                address: "C0EXAMPLE1".to_string(),
+            }),
+        }
+        .to_json(),
+        json!({
+            "agent": "weather",
+            "id": "fact-11111111111111111111111111111111",
+            "scope": "channel",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "deleted": true,
         })
     );
     assert_eq!(
