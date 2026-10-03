@@ -677,6 +677,11 @@ RUN /app/.venv/bin/pip install \\
             "opentelemetry-exporter-otlp-proto-http",
             "exact Dockerfile pin 1.44.0 is not a direct registry dependency",
         ),
+        Violation(
+            "opentelemetry-sdk",
+            "expected lock version "
+            f"{expected['opentelemetry-sdk']}, found Dockerfile version 1.44.0",
+        ),
     ]
 
 
