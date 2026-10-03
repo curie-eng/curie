@@ -32,6 +32,16 @@ jobs:
         with:
           persist-credentials: false
       - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - name: Require third party action SHA pins and version comments
         run: |
@@ -122,6 +132,8 @@ jobs:
       # build, test, or gate, so a retry there cannot hide a defect in our
       # code. Never wrap a step that builds, tests, or gates that code.
       # Enforced by tools/ci-retry-gate/tests/test_retry_eligibility.py.
+      - name: Pull Docker Hub images through the mirror
+        run: bash tools/ci/configure-docker-hub-mirror.sh
       - name: Install uv
         id: install_uv
         continue-on-error: true
@@ -442,6 +454,18 @@ jobs:
       - name: Schema baseline
         run: bash scripts/refresh-schema-baseline.sh --check
       - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
@@ -555,10 +579,34 @@ jobs:
       # syncs the environment itself, and the test invokes it with an explicit
       # repo-root `current_dir`.
       - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Install Helm for CLI consumer render tests
+        id: install_helm_for_cli_consumer_render_tests
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v3.16.4
+      - name: Back off before retrying Install Helm for CLI consumer render tests
+        if: steps.install_helm_for_cli_consumer_render_tests.outcome == 'failure'
+        run: |
+          echo "Install Helm for CLI consumer render tests failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm for CLI consumer render tests (retry)
+        if: steps.install_helm_for_cli_consumer_render_tests.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.4
@@ -657,6 +705,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash tools/ci/configure-docker-hub-mirror.sh
       - name: Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -792,6 +842,18 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Node
+        id: install_node
+        continue-on-error: true
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Back off before retrying Install Node
+        if: steps.install_node.outcome == 'failure'
+        run: |
+          echo "Install Node failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Node (retry)
+        if: steps.install_node.outcome == 'failure'
         uses: actions/setup-node@v7
         with:
           node-version: "22"
@@ -818,10 +880,36 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pnpm
+        id: install_pnpm
+        continue-on-error: true
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 9
+      - name: Back off before retrying Install pnpm
+        if: steps.install_pnpm.outcome == 'failure'
+        run: |
+          echo "Install pnpm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install pnpm (retry)
+        if: steps.install_pnpm.outcome == 'failure'
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 9
       - name: Install Node
+        id: install_node
+        continue-on-error: true
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: apps/ui/pnpm-lock.yaml
+      - name: Back off before retrying Install Node
+        if: steps.install_node.outcome == 'failure'
+        run: |
+          echo "Install Node failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Node (retry)
+        if: steps.install_node.outcome == 'failure'
         uses: actions/setup-node@v7
         with:
           node-version: "22"
@@ -859,6 +947,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash tools/ci/configure-docker-hub-mirror.sh
       - name: Generate the release compose
         run: python3 compose/generate_release_compose.py > compose.release.yaml
       # compose.release.yaml is generated from compose.dev.yaml (the single
@@ -930,10 +1020,30 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash tools/ci/configure-docker-hub-mirror.sh
       - name: Set up a cache-only buildx builder (named, NOT the default -- preserves the overlay's FROM)
         id: imagescache
+        continue-on-error: true
         uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
+          config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+          use: false
+      - name: Back off before retrying Set up a cache-only buildx builder (named, NOT the default -- preserves the overlay's FROM)
+        if: steps.imagescache.outcome == 'failure'
+        run: |
+          echo "Set up a cache-only buildx builder (named, NOT the default -- preserves the overlay's FROM) failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Set up a cache-only buildx builder (named, NOT the default -- preserves the overlay's FROM) (retry)
+        id: imagescache_retry
+        if: steps.imagescache.outcome == 'failure'
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
           use: false
       - name: Write the CI image bake definition
         run: |
@@ -952,7 +1062,7 @@ jobs:
       - name: Build the CI images in parallel
         uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
         with:
-          builder: ${{ steps.imagescache.outputs.name }}
+          builder: ${{ steps.imagescache.outcome == 'success' && steps.imagescache.outputs.name || steps.imagescache_retry.outputs.name }}
           source: .
           files: ci-images-bake.json
           push: false
@@ -1061,10 +1171,40 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash tools/ci/configure-docker-hub-mirror.sh
       - name: Set up QEMU
+        id: set_up_qemu
+        continue-on-error: true
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - name: Back off before retrying Set up QEMU
+        if: steps.set_up_qemu.outcome == 'failure'
+        run: |
+          echo "Set up QEMU failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Set up QEMU (retry)
+        if: steps.set_up_qemu.outcome == 'failure'
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Set up Buildx
+        id: set_up_buildx
+        continue-on-error: true
         uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - name: Back off before retrying Set up Buildx
+        if: steps.set_up_buildx.outcome == 'failure'
+        run: |
+          echo "Set up Buildx failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Set up Buildx (retry)
+        if: steps.set_up_buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
       - name: Build (no push)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -1444,6 +1584,18 @@ jobs:
         with:
           persist-credentials: false
       - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
@@ -1510,6 +1662,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash tools/ci/configure-docker-hub-mirror.sh
       - name: Download the curie binary built by the Rust job
         uses: actions/download-artifact@v8
         with:
@@ -1678,6 +1832,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash tools/ci/configure-docker-hub-mirror.sh
       - name: Download the curie binary built by the Rust job
         uses: actions/download-artifact@v8
         with:
@@ -1824,6 +1980,16 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       # Kind normally stays on main. Next pull requests and pushes to next
       # omit it except when a PR changes cluster runtime assertions or the
@@ -1886,6 +2052,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash tools/ci/configure-docker-hub-mirror.sh
       - name: Download the curie binary built by the Rust job
         uses: actions/download-artifact@v8
         with:
@@ -1894,6 +2062,22 @@ jobs:
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      # The images come from the ci-images job, which built them once for this
+      # run; they are loaded into the local daemon store so `kind load` picks
+      # them up with no registry round trip. The four product images drive the
+      # cluster round trip. The dispatcher is not deployed.
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -1945,6 +2129,8 @@ jobs:
       # versions. The `kind` Docker network (created here) is the bridge every
       # node container sits on; its gateway is the host address the in-cluster
       # worker reaches the reply stub through, resolved below.
+      - name: Ensure kind-registry exists
+        run: bash tools/ci/ensure-kind-registry.sh
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
@@ -1964,6 +2150,7 @@ jobs:
         run: |
           echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
           kind delete cluster --name curie-e2e 2>/dev/null || true
+          bash tools/ci/ensure-kind-registry.sh
           sleep 15
       - name: Create the kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
@@ -1978,7 +2165,12 @@ jobs:
       - name: Install Calico so NetworkPolicy is actually enforced
         run: |
           set -euo pipefail
-          kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
+            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
+            | sha256sum --check --strict
+          kubectl apply -f "$calico_manifest"
           kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
           kubectl wait --for=condition=Ready node --all --timeout=300s
       # Load the product images into the node store with no registry round trip.
@@ -1993,6 +2185,18 @@ jobs:
             kind load docker-image "$img" --name curie-e2e
           done
       - name: Install uv for publication proof
+        id: install_uv_for_publication_proof
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv for publication proof
+        if: steps.install_uv_for_publication_proof.outcome == 'failure'
+        run: |
+          echo "Install uv for publication proof failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv for publication proof (retry)
+        if: steps.install_uv_for_publication_proof.outcome == 'failure'
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
@@ -2182,7 +2386,22 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash tools/ci/configure-docker-hub-mirror.sh
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      # The fixture image delays Postgres for the Langfuse startup regression.
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -2215,6 +2434,8 @@ jobs:
           EOF
       # Disposable kind cluster. Pins both the action and the kind/node-image
       # versions.
+      - name: Ensure kind-registry exists
+        run: bash tools/ci/ensure-kind-registry.sh
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
@@ -2234,6 +2455,7 @@ jobs:
         run: |
           echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
           kind delete cluster --name curie-e2e 2>/dev/null || true
+          bash tools/ci/ensure-kind-registry.sh
           sleep 15
       - name: Create the kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
@@ -2248,7 +2470,12 @@ jobs:
       - name: Install Calico so NetworkPolicy is actually enforced
         run: |
           set -euo pipefail
-          kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
+            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
+            | sha256sum --check --strict
+          kubectl apply -f "$calico_manifest"
           kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
           kubectl wait --for=condition=Ready node --all --timeout=300s
       - name: Install YAML parser for the installation identity proof
@@ -2302,6 +2529,18 @@ jobs:
       # The connector render needs the workspace. Kept out of the assertion
       # step so that step is only the receipt runner (#3391).
       - name: Install uv for the connector readiness render
+        id: install_uv_for_the_connector_readiness_render
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv for the connector readiness render
+        if: steps.install_uv_for_the_connector_readiness_render.outcome == 'failure'
+        run: |
+          echo "Install uv for the connector readiness render failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv for the connector readiness render (retry)
+        if: steps.install_uv_for_the_connector_readiness_render.outcome == 'failure'
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
@@ -2357,6 +2596,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash tools/ci/configure-docker-hub-mirror.sh
       - name: Download the curie binary built by the Rust job
         uses: actions/download-artifact@v8
         with:
@@ -2365,6 +2606,22 @@ jobs:
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      # The images come from the ci-images job, which built them once for this
+      # run; they are loaded into the local daemon store so `kind load` picks
+      # them up with no registry round trip. The four product images drive the
+      # cluster round trip. The dispatcher is not deployed.
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -2416,6 +2673,8 @@ jobs:
       # versions. The `kind` Docker network (created here) is the bridge every
       # node container sits on; its gateway is the host address the in-cluster
       # worker reaches the reply stub through, resolved below.
+      - name: Ensure kind-registry exists
+        run: bash tools/ci/ensure-kind-registry.sh
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
@@ -2435,6 +2694,7 @@ jobs:
         run: |
           echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
           kind delete cluster --name curie-e2e 2>/dev/null || true
+          bash tools/ci/ensure-kind-registry.sh
           sleep 15
       - name: Create the kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
@@ -2449,7 +2709,12 @@ jobs:
       - name: Install Calico so NetworkPolicy is actually enforced
         run: |
           set -euo pipefail
-          kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
+            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
+            | sha256sum --check --strict
+          kubectl apply -f "$calico_manifest"
           kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
           kubectl wait --for=condition=Ready node --all --timeout=300s
       # Load the product images into the node store with no registry round trip.
@@ -2583,6 +2848,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash tools/ci/configure-docker-hub-mirror.sh
       - name: Download the candidate curie binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -2591,6 +2858,18 @@ jobs:
       - name: Make the candidate binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -2622,7 +2901,26 @@ jobs:
                   listenAddress: "127.0.0.1"
                   protocol: TCP
           EOF
+      - name: Ensure kind-registry exists
+        run: bash tools/ci/ensure-kind-registry.sh
       - name: Create the disposable kind cluster
+        id: create_the_disposable_kind_cluster
+        continue-on-error: true
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+          cluster_name: curie-upgrade
+          config: kind-upgrade-config.yaml
+      - name: Back off before retrying Create the disposable kind cluster
+        if: steps.create_the_disposable_kind_cluster.outcome == 'failure'
+        run: |
+          echo "Create the disposable kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          bash tools/ci/ensure-kind-registry.sh
+          kind delete cluster --name curie-upgrade 2>/dev/null || true
+          sleep 15
+      - name: Create the disposable kind cluster (retry)
+        if: steps.create_the_disposable_kind_cluster.outcome == 'failure'
         uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
@@ -2633,7 +2931,7 @@ jobs:
         run: |
           set -euo pipefail
           calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
-          curl -fsSL -o "$calico_manifest" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
             https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
           echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
             | sha256sum --check --strict
@@ -2973,7 +3271,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash tools/ci/configure-docker-hub-mirror.sh
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -2994,7 +3306,26 @@ jobs:
           nodes:
             - role: control-plane
           EOF
+      - name: Ensure kind-registry exists
+        run: bash tools/ci/ensure-kind-registry.sh
       - name: Create the disposable kind cluster
+        id: create_the_disposable_kind_cluster
+        continue-on-error: true
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+          cluster_name: curie-upgrade-negative
+          config: kind-upgrade-negative-config.yaml
+      - name: Back off before retrying Create the disposable kind cluster
+        if: steps.create_the_disposable_kind_cluster.outcome == 'failure'
+        run: |
+          echo "Create the disposable kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          bash tools/ci/ensure-kind-registry.sh
+          kind delete cluster --name curie-upgrade-negative 2>/dev/null || true
+          sleep 15
+      - name: Create the disposable kind cluster (retry)
+        if: steps.create_the_disposable_kind_cluster.outcome == 'failure'
         uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           version: v0.24.0
@@ -3005,7 +3336,7 @@ jobs:
         run: |
           set -euo pipefail
           calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
-          curl -fsSL -o "$calico_manifest" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
             https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
           echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
             | sha256sum --check --strict
@@ -3169,6 +3500,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash tools/ci/configure-docker-hub-mirror.sh
       - name: Download the candidate curie binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -3177,6 +3510,18 @@ jobs:
       - name: Make the candidate binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -3208,6 +3553,8 @@ jobs:
                   listenAddress: "127.0.0.1"
                   protocol: TCP
           EOF
+      - name: Ensure kind-registry exists
+        run: bash tools/ci/ensure-kind-registry.sh
       - name: Create the disposable kind cluster
         id: create_kind_cluster
         continue-on-error: true
@@ -3222,6 +3569,7 @@ jobs:
         run: |
           echo "Create the disposable kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
           kind delete cluster --name curie-upgrade-matrix 2>/dev/null || true
+          bash tools/ci/ensure-kind-registry.sh
           sleep 15
       - name: Create the disposable kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
@@ -3235,7 +3583,7 @@ jobs:
         run: |
           set -euo pipefail
           calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
-          curl -fsSL -o "$calico_manifest" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
             https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
           echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
             | sha256sum --check --strict
@@ -3402,7 +3750,21 @@ jobs:
         with:
           persist-credentials: false
       - name: Install uv for the runtime assertion gate
+        id: install_uv_for_the_runtime_assertion_gate
+        continue-on-error: true
         if: ${{ !cancelled() }}
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      # #3391: an added or changed charts/curie/ci/runtime assertion counts only
+      # when a Calico cluster job this verdict needs runs it through the
+      # receipt runner, and that exact blob left a pass receipt. The negative
+      # controls run on every verdict so the gate can never pass vacuously.
+      - name: Back off before retrying Install uv for the runtime assertion gate
+        if: ${{ !cancelled() && steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure' }}
+        run: |
+          echo "Install uv for the runtime assertion gate failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv for the runtime assertion gate (retry)
+        if: ${{ !cancelled() && steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure' }}
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       # #3391: an added or changed charts/curie/ci/runtime assertion counts only
       # when a Calico cluster job this verdict needs runs it through the

@@ -85,6 +85,19 @@ jobs:
           persist-credentials: false
 
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -92,8 +105,12 @@ jobs:
       - name: Install kubeconform
         run: |
           set -euo pipefail
-          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin kubeconform
+          kubeconform_archive="$RUNNER_TEMP/kubeconform.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -o "$kubeconform_archive" \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          sudo tar -xz -C /usr/local/bin -f "$kubeconform_archive" kubeconform
+          rm -f "$kubeconform_archive"
           kubeconform -v
           # The validate steps normalize rendered manifests through PyYAML (see
           # below). It ships on ubuntu-latest, but ensure it explicitly so this
@@ -432,6 +449,19 @@ jobs:
           persist-credentials: false
 
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -439,8 +469,12 @@ jobs:
       - name: Install kubeconform
         run: |
           set -euo pipefail
-          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin kubeconform
+          kubeconform_archive="$RUNNER_TEMP/kubeconform.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -o "$kubeconform_archive" \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          sudo tar -xz -C /usr/local/bin -f "$kubeconform_archive" kubeconform
+          rm -f "$kubeconform_archive"
           kubeconform -v
           # The validate steps normalize rendered manifests through PyYAML (see
           # below). It ships on ubuntu-latest, but ensure it explicitly so this
@@ -850,6 +884,18 @@ jobs:
       # provider won. Reading the manifests alone cannot tell an omitted
       # credential apart from one the SDK signs as an empty identity.
       - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
@@ -962,6 +1008,19 @@ jobs:
           persist-credentials: false
 
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -969,8 +1028,12 @@ jobs:
       - name: Install kubeconform
         run: |
           set -euo pipefail
-          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin kubeconform
+          kubeconform_archive="$RUNNER_TEMP/kubeconform.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -o "$kubeconform_archive" \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          sudo tar -xz -C /usr/local/bin -f "$kubeconform_archive" kubeconform
+          rm -f "$kubeconform_archive"
           kubeconform -v
           # The validate steps normalize rendered manifests through PyYAML (see
           # below). It ships on ubuntu-latest, but ensure it explicitly so this
@@ -1014,10 +1077,43 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: Pull Docker Hub images through the mirror
+        run: bash tools/ci/configure-docker-hub-mirror.sh
+      - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.17.3
-      - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.17.3
+      - name: Ensure kind-registry exists
+        run: bash tools/ci/ensure-kind-registry.sh
+      - name: Create the kind cluster
+        id: create_the_kind_cluster
+        continue-on-error: true
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          cluster_name: curie-reserved-env
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+      - name: Back off before retrying Create the kind cluster
+        if: steps.create_the_kind_cluster.outcome == 'failure'
+        run: |
+          echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          bash tools/ci/ensure-kind-registry.sh
+          kind delete cluster --name curie-reserved-env 2>/dev/null || true
+          sleep 15
+      - name: Create the kind cluster (retry)
+        if: steps.create_the_kind_cluster.outcome == 'failure'
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           cluster_name: curie-reserved-env
           node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
