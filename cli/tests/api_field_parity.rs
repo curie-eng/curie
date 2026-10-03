@@ -401,3 +401,98 @@ fn rejects_a_manifest_entry_missing_a_required_key() {
         "{vs:#?}"
     );
 }
+
+#[test]
+fn rejects_required_cli_fields_for_optional_or_nullable_api_fields() {
+    let src = "#[derive(Deserialize)] struct Mirror { omitted: String, nullable: String }";
+    let openapi = serde_json::json!({"components":{"schemas":{"Model":{
+        "type":"object", "properties":{
+            "omitted":{"type":"string"},
+            "nullable":{"anyOf":[{"type":"string"},{"type":"null"}]}
+        }, "required":["nullable"]
+    }}}});
+    let manifest = serde_json::json!({"mirrors":[{"struct":"Mirror","schema":"Model"}]});
+    let vs = violations(src, &openapi, &manifest);
+    for field in ["omitted", "nullable"] {
+        assert!(vs.iter().any(|v| matches!(v, Violation::OptionalityMismatch {
+            struct_name, field: found, ..
+        } if struct_name == "Mirror" && found == field)), "{vs:#?}");
+    }
+}
+
+#[test]
+fn honors_option_default_and_referenced_nullability() {
+    let src = r#"#[derive(Deserialize)] struct Mirror {
+        omitted: Option<String>,
+        #[serde(default)] count: u32,
+        nullable: Option<String>,
+    }"#;
+    let openapi = serde_json::json!({"components":{"schemas":{
+        "NullableText":{"anyOf":[{"type":"string"},{"type":"null"}]},
+        "Model":{"type":"object", "properties":{
+            "omitted":{"type":"string"}, "count":{"type":"integer"},
+            "nullable":{"$ref":"#/components/schemas/NullableText"}
+        }, "required":["nullable"]}
+    }}});
+    let manifest = serde_json::json!({"mirrors":[{"struct":"Mirror","schema":"Model"}]});
+    assert!(violations(src, &openapi, &manifest).is_empty());
+}
+
+#[test]
+fn serde_default_does_not_accept_api_null() {
+    let src = "#[derive(Deserialize)] struct Mirror { #[serde(default)] value: String }";
+    let openapi = serde_json::json!({"components":{"schemas":{"Model":{
+        "type":"object", "properties":{"value":{"type":["string","null"]}},
+        "required":["value"]
+    }}}});
+    let manifest = serde_json::json!({"mirrors":[{"struct":"Mirror","schema":"Model"}]});
+    assert!(violations(src, &openapi, &manifest).iter().any(|v| matches!(v,
+        Violation::OptionalityMismatch { field, .. } if field == "value")));
+}
+
+#[test]
+fn real_tree_request_bodies_match_openapi_operations() {
+    let vs = field_parity::request_violations(
+        &repo_text("cli/src/api.rs"),
+        &repo_text("cli/src/api_requests.rs"),
+        &repo_json("apps/api/openapi.json"),
+        &repo_json("cli/api-mirrors.json"),
+    );
+    assert!(vs.is_empty(), "CLI request bodies drifted from OpenAPI: {vs:#?}");
+}
+
+#[test]
+fn request_gate_rejects_missing_required_fields_and_unclassified_sends() {
+    let requests = "#[derive(Serialize, Deserialize)] struct Body { typo: String }";
+    let src = "impl Client { fn create(&self) { self.http.post(url).json::<Body>(&body); } fn new_send(&self) { self.http.post(url).json(&body); } }";
+    let openapi = serde_json::json!({"paths":{"/items":{"post":{"requestBody":{
+        "content":{"application/json":{"schema":{"$ref":"#/components/schemas/Create"}}}
+    }}}},"components":{"schemas":{"Create":{"type":"object",
+        "properties":{"name":{"type":"string"}},"required":["name"]}}}});
+    let manifest = serde_json::json!({"request_mirrors":[{"struct":"Body","schema":"Create"}],
+        "requests":[{"function":"create","struct":"Body","method":"post","path":"/items"}]});
+    let vs = field_parity::request_violations(src, requests, &openapi, &manifest);
+    assert!(has_missing_field(&vs, "Body", "name"), "{vs:#?}");
+    assert!(has_unknown_field(&vs, "Body", "typo"), "{vs:#?}");
+    assert!(vs.iter().any(|v| matches!(v, Violation::UnclassifiedRequest { function }
+        if function == "new_send")), "{vs:#?}");
+}
+
+#[test]
+fn request_gate_rejects_wrong_operation_schema_and_dynamic_json() {
+    let requests = "#[derive(Serialize, Deserialize)] struct Body { name: String }";
+    let openapi = serde_json::json!({"paths":{"/items":{"post":{"requestBody":{
+        "content":{"application/json":{"schema":{"$ref":"#/components/schemas/Create"}}}
+    }}}},"components":{"schemas":{
+        "Create":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]},
+        "Other":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
+    }}});
+    let manifest = serde_json::json!({"request_mirrors":[{"struct":"Body","schema":"Other"}],
+        "requests":[{"function":"create","struct":"Body","method":"post","path":"/items"}]});
+    let src = "impl Client { fn create(&self) { self.http.post(url).json::<Body>(&body); } }";
+    assert!(field_parity::request_violations(src, requests, &openapi, &manifest).iter().any(|v|
+        matches!(v, Violation::RequestSchemaMismatch { function, .. } if function == "create")));
+    let src = "impl Client { fn create(&self) { self.http.post(url).json(&json!({\"name\": name})); } }";
+    assert!(field_parity::request_violations(src, requests, &openapi, &manifest).iter().any(|v|
+        matches!(v, Violation::UnclassifiedRequest { function } if function == "create")));
+}

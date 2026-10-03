@@ -193,6 +193,45 @@ fn spec_rs_has_no_plugin_format_field_parity_violations() {
 }
 
 #[test]
+fn spec_gate_rejects_an_existing_schema_field_removed_from_the_real_source() {
+    let src = repo_text("cli/src/spec.rs");
+    let declaration = "    #[serde(default)]\n    pub summary: Option<String>,\n";
+    assert_eq!(
+        src.matches(declaration).count(),
+        1,
+        "the mutation must remove exactly ApprovalGateSpec.summary"
+    );
+    let drifted = src.replacen(declaration, "", 1);
+    let schema = plugin_format_schema_as_components();
+    let manifest = repo_json("cli/plugin-format-mirrors.json");
+    let scoped = manifest_for_file(&manifest, "cli/src/spec.rs");
+
+    let vs = violations(&drifted, &schema, &scoped);
+    assert!(
+        has_missing_field(&vs, "ApprovalGateSpec", "summary"),
+        "the real spec gate must reject a missing frozen schema field:\n{vs:#?}"
+    );
+}
+
+#[test]
+fn spec_gate_rejects_a_schema_field_added_without_updating_the_real_source() {
+    let src = repo_text("cli/src/spec.rs");
+    let mut schema = plugin_format_schema_as_components();
+    schema["components"]["schemas"]["ApprovalPolicy"]["properties"]
+        .as_object_mut()
+        .expect("the real ApprovalPolicy schema has properties")
+        .insert("newPolicyField".into(), serde_json::json!({ "type": "string" }));
+    let manifest = repo_json("cli/plugin-format-mirrors.json");
+    let scoped = manifest_for_file(&manifest, "cli/src/spec.rs");
+
+    let vs = violations(&src, &schema, &scoped);
+    assert!(
+        has_missing_field(&vs, "ApprovalPolicySpec", "newPolicyField"),
+        "the real spec gate must reject a schema field absent from the Rust mirror:\n{vs:#?}"
+    );
+}
+
+#[test]
 fn connector_build_rs_has_no_plugin_format_field_parity_violations() {
     // The third mirror site (ADR 0113). Without this per-file test the gate's
     // `UndeclaredStruct` check never walks `cli/src/connector_build.rs` at all,
