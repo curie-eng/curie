@@ -351,6 +351,7 @@ class RunTracer:
             if provider is not None
             else trace.get_tracer("curie-runner")
         )
+        self._live_generation: _GenerationSpan | None = None
 
     @contextmanager
     def run_span(
@@ -404,17 +405,35 @@ class RunTracer:
                 if approval_decision:
                     _set(root, SpanAttributeKey.APPROVAL_DECISION, approval_decision)
                 span = _GenerationSpan(self._tracer, root, model)
+                self._live_generation = span
                 try:
-                    yield span
-                except BaseException:
-                    span.set_abandoned()
-                    raise
-                else:
-                    span.finish_if_needed()
+                    try:
+                        yield span
+                    except BaseException:
+                        span.set_abandoned()
+                        raise
+                    else:
+                        span.finish_if_needed()
+                finally:
+                    self._live_generation = None
             except BaseException:
                 if span is None:
                     root.set_status(StatusCode.ERROR)
                 raise
+
+    def remember_turn_prompt(self, text: str, framed: str) -> None:
+        """Redact a prompt that joined the live turn, such as a steer.
+
+        No-op when no turn span is open. The user text is the recorded size.
+        An echo of the framed query is redacted without a second input record.
+        """
+
+        gen = self._live_generation
+        if gen is None:
+            return
+        gen.observe_prompt(text)
+        if framed != text:
+            gen.remember_echo(framed)
 
     def force_flush(self, *, timeout_millis: int = _EXPORT_TIMEOUT_MILLIS) -> bool:
         """Flush current spans within a hard wall clock bound."""
@@ -533,6 +552,16 @@ class _GenerationSpan:
         if text not in self._prompts:
             self._prompts.append(text)
         self.observe_input(_prompt_placeholder(text))
+
+    def remember_echo(self, text: str) -> None:
+        """Redact an exact echo of ``text`` without recording it as input.
+
+        The generation input stays the user text. The framed query is longer,
+        and a model that repeats that whole query must not export it either.
+        """
+
+        if text and text not in self._prompts:
+            self._prompts.append(text)
 
     def observe_output(self, text: str) -> None:
         """Buffer assistant text or a ``[tool_use NAME]`` marker as output."""

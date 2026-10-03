@@ -379,6 +379,22 @@
           ],
           "title": "Channel Bound"
         },
+        "channel_kind": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_CHANNEL_KIND",
+          "producer": [
+            "worker"
+          ],
+          "title": "Channel Kind"
+        },
         "channel_memory_ref": {
           "anyOf": [
             {
@@ -1896,6 +1912,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.14",
-  "title": "ACI Protocol v0.5.14"
+  "protocolVersion": "0.5.15",
+  "title": "ACI Protocol v0.5.15"
 }

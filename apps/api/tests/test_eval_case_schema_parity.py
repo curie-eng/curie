@@ -78,6 +78,13 @@ def test_expect_status_values_match_the_schema_enum() -> None:
     )
 
 
+def test_sender_is_an_optional_eval_case_field() -> None:
+    case = _schema()["$defs"]["EvalCase"]
+    assert "sender" in case["properties"]
+    assert "sender" not in case.get("required", [])
+    assert "sender" in EvalCaseOut.model_fields
+
+
 def test_eval_case_field_names_match_the_schema() -> None:
     schema = _schema()
     for model, def_name in ((EvalCaseOut, "EvalCase"), (GraderOut, "Grader")):

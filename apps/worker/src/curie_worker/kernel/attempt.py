@@ -5,7 +5,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import aiohttp
 from aci_protocol import (
@@ -1068,8 +1068,9 @@ def _backoff(self: Kernel, attempt: int) -> float:
 
 
 def _to_event(qevent: QueuedTurn) -> Event:
+    event_type: Literal["job", "message"] = "job" if qevent.source.is_job else "message"
     return Event(
-        type="message",
+        type=event_type,
         text=qevent.text,
         user=qevent.author,
         ts=qevent.conversation_id,

@@ -197,6 +197,7 @@ def _full_boot_env() -> BootEnv:
         thinking="disabled",
         deployment_environment="prod",
         channel_bound=True,
+        channel_kind="slack",
         model_env_key="MY_PROVIDER_KEY",
         metrics_temporality_preference="delta",
         max_turns=50,
@@ -565,6 +566,7 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         channel_memory_ref=_CHANNEL_MEMORY_REF,
         memory_writes=True,
         channel_bound=True,
+        channel_kind="slack",
     )
     worker_owned = set(BootEnv.env_keys(producer="worker"))
     assert set(maximal) <= worker_owned
@@ -855,6 +857,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_THINKING",
         "CURIE_DEPLOYMENT_ENVIRONMENT",
         "CURIE_CHANNEL_BOUND",
+        "CURIE_CHANNEL_KIND",
         "CURIE_MODEL_ENV_KEY",
         "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
         "CURIE_MAX_TURNS",

@@ -36,6 +36,7 @@ from curie_runner.adapter import ClaudeAgentSession, PartialMessageBoundary
 from curie_runner.approval import ApprovalGate
 from curie_runner.fake import FakeModelSession
 from curie_runner.otel import _SchemaValidatingSpanProcessor
+from curie_runner.sender_frame import frame_user_turn
 from curie_runner.session import SessionRunner
 from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
@@ -56,6 +57,11 @@ from opentelemetry.trace import (
     TraceState,
     set_span_in_context,
 )
+
+
+def _sent(text: str, user: str = "U0EXAMPLE1") -> str:
+    return frame_user_turn("message", user, text, None)
+
 
 _STREAM_BODY = "private-partial-body-PLACEHOLDER"
 _STREAM_ARGUMENT = "private-partial-argument-PLACEHOLDER"
@@ -606,7 +612,7 @@ def test_steer_during_provider_wait_preserves_generation_and_ttft(
                 tasks.start_soon(consume)
                 await session.waiting_after_boundary.wait()
                 assert runner.turn_active
-                assert session.queries == ["initial"]
+                assert session.queries == [_sent("initial")]
                 assert await runner.steer("steered follow-up") is True
                 session.release.set()
         finally:
@@ -614,7 +620,7 @@ def test_steer_during_provider_wait_preserves_generation_and_ttft(
         return parse_ndjson("".join(lines)), session
 
     events, session = anyio.run(go)
-    assert session.queries == ["initial", "steered follow-up"]
+    assert session.queries == [_sent("initial"), _sent("steered follow-up", "")]
     assert isinstance(events[-1], Final)
     assert events[-1].status is SessionStatus.DONE
 
@@ -2048,6 +2054,82 @@ def test_result_only_usage_is_never_fabricated_on_earlier_generations() -> None:
     assert final.attributes["gen_ai.usage.input_tokens"] == 40
     assert final.attributes["gen_ai.usage.output_tokens"] == 9
     assert final.attributes[_SCOPE] == "turn"
+
+
+def test_a_steered_sender_frame_is_not_exported_when_the_model_echoes_it() -> None:
+    """A steer registers its frame before the model can echo it into a trace."""
+
+    secret = "private-steer-PLACEHOLDER"
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    class EchoSteerSession:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+            self.waiting_after_boundary = anyio.Event()
+            self.release = anyio.Event()
+
+        async def connect(self) -> None:
+            return None
+
+        async def query(self, text: str) -> None:
+            self.queries.append(text)
+
+        def receive_turn(self) -> AsyncIterator[object]:
+            async def messages() -> AsyncIterator[object]:
+                yield PartialMessageBoundary(event_type="message_start")
+                self.waiting_after_boundary.set()
+                await self.release.wait()
+                yield AssistantMessage(
+                    content=[TextBlock(text=f"echo {self.queries[-1]}")],
+                    model="observed-model",
+                )
+                yield _result(text="done")
+
+            return messages()
+
+        async def interrupt(self) -> None:
+            self.release.set()
+
+        async def close(self) -> None:
+            return None
+
+    async def go() -> None:
+        session = EchoSteerSession()
+        runner = SessionRunner(
+            max_usd_per_day=None,
+            held_secrets=frozenset(),
+            session_factory=lambda: session,
+            ceiling=0,
+            tracer=RunTracer(provider),
+            classifier=SideEffectClassifier(),
+            trace_name="curie-run:steer-redaction",
+            model="configured-model",
+        )
+
+        async def consume() -> None:
+            async for _line in runner.run_turn(
+                Event(type="message", text="start", user="U0EXAMPLE1", ts="1")
+            ):
+                pass
+
+        await runner.start()
+        try:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(consume)
+                await session.waiting_after_boundary.wait()
+                frame = Event(type="message", text=secret, user="U123", ts="2")
+                assert await runner.steer(frame.text, event=frame) is True
+                session.release.set()
+        finally:
+            await runner.close()
+
+    anyio.run(go)
+    finished = list(exporter.get_finished_spans())
+    material = _span_wire_material(finished)
+    assert secret not in material
+    assert "person: U123" not in material
 
 
 def test_generations_record_the_prompt_output_and_tool_names_only() -> None:

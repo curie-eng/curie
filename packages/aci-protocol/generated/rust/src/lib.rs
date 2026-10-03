@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.14";
+pub const PROTOCOL_VERSION: &str = "0.5.15";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -219,6 +219,8 @@ pub struct BootEnv {
     #[serde(default)]
     pub channel_bound: Option<bool>,
     #[serde(default)]
+    pub channel_kind: Option<String>,
+    #[serde(default)]
     pub model_env_key: Option<String>,
     #[serde(default)]
     pub metrics_temporality_preference: Option<String>,
@@ -246,6 +248,7 @@ pub mod env_keys {
     pub const CURIE_BUNDLE_REF: &str = "CURIE_BUNDLE_REF";
     pub const CURIE_BUNDLE_VERSION: &str = "CURIE_BUNDLE_VERSION";
     pub const CURIE_CHANNEL_BOUND: &str = "CURIE_CHANNEL_BOUND";
+    pub const CURIE_CHANNEL_KIND: &str = "CURIE_CHANNEL_KIND";
     pub const CURIE_CHANNEL_MEMORY_REF: &str = "CURIE_CHANNEL_MEMORY_REF";
     pub const CURIE_CONNECTOR_AGENT: &str = "CURIE_CONNECTOR_AGENT";
     pub const CURIE_CONNECTOR_CALLER_TOKEN: &str = "CURIE_CONNECTOR_CALLER_TOKEN";
@@ -604,13 +607,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.15","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.16","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.14","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.15","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

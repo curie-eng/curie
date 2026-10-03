@@ -511,3 +511,17 @@ def test_boot_env_omits_channel_bound_when_the_kind_is_blank() -> None:
         WorkerConfig(), _resolved(), kind="", address="C0EXAMPLE1"
     )
     assert "CURIE_CHANNEL_BOUND" not in env
+
+
+def test_boot_env_emits_channel_kind_for_a_slack_binding() -> None:
+    env = _boot_env_with_channel(
+        WorkerConfig(), _resolved(), kind="slack", address="C0EXAMPLE1"
+    )
+    assert env["CURIE_CHANNEL_KIND"] == "slack"
+    assert env["CURIE_CHANNEL_BOUND"] == "1"
+
+
+def test_boot_env_omits_channel_kind_when_no_kind_is_passed() -> None:
+    env = _boot_env(WorkerConfig(), _resolved())
+    assert "CURIE_CHANNEL_KIND" not in env
+    assert "CURIE_CHANNEL_BOUND" not in env

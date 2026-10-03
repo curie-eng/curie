@@ -51,6 +51,7 @@ from curie_runner.fake import (
 )
 from curie_runner.harness.claude.approval import build_can_use_tool
 from curie_runner.otel import RunTracer
+from curie_runner.sender_frame import frame_user_turn
 from curie_runner.session import SessionRunner
 from curie_runner.side_effects import CLAUDE_READONLY_TOOLS, SideEffectClassifier
 from curie_runner.tool_access import (
@@ -62,6 +63,11 @@ from curie_telemetry import configure_meter_provider
 from curie_telemetry import metrics as curie_metrics
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+
+def _sent(text: str, user: str = "U0EXAMPLE1") -> str:
+    return frame_user_turn("message", user, text, None)
+
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 _READ_ONLY_MCP = "mcp__acme__list_files"
@@ -562,7 +568,7 @@ def test_a_read_only_turn_accepts_no_steer_and_joins_no_other_turn() -> None:
         return ordinary, restricted, into_ordinary
 
     assert anyio.run(go) == (False, False, False)
-    assert session.queries == ["first", "second"]
+    assert session.queries == [_sent("first"), _sent("second")]
 
 
 def _refused_before_the_model(
@@ -602,7 +608,7 @@ def test_a_session_that_accepted_a_steer_refuses_a_read_only_turn() -> None:
 
     frames = anyio.run(go)
     _refused_before_the_model(frames, session)
-    assert session.queries == ["first", "ordinary follow-up"]
+    assert session.queries == [_sent("first"), _sent("ordinary follow-up", "")]
 
 
 def test_a_session_that_ran_an_ordinary_turn_refuses_a_read_only_turn() -> None:
@@ -617,7 +623,7 @@ def test_a_session_that_ran_an_ordinary_turn_refuses_a_read_only_turn() -> None:
 
     assert _final(first).status is SessionStatus.DONE
     _refused_before_the_model(second, session)
-    assert session.queries == ["first"]
+    assert session.queries == [_sent("first")]
     assert runner.enforced_tool_access == ()
 
 
@@ -634,7 +640,7 @@ def test_a_session_that_ran_only_read_only_turns_runs_another() -> None:
 
     assert _final(first).status is SessionStatus.DONE
     assert _final(second).status is SessionStatus.DONE
-    assert session.queries == ["probe", "probe again"]
+    assert session.queries == [_sent("probe"), _sent("probe again")]
     assert runner.enforced_tool_access == ("read-only",)
 
 
@@ -681,7 +687,7 @@ def test_an_ordinary_slash_command_is_still_sent() -> None:
     [frames] = _drive(runner, _event("/acme-bot:probe"))
 
     assert _final(frames).status is SessionStatus.DONE
-    assert session.queries == ["/acme-bot:probe"]
+    assert session.queries == [_sent("/acme-bot:probe")]
 
 
 def test_a_read_only_turn_leaves_the_boot_grant_for_the_next_turn() -> None:
@@ -956,7 +962,7 @@ def test_an_ordinary_turn_after_a_read_only_one_runs_on_a_fresh_session() -> Non
 
     assert _final(probe).status is SessionStatus.DONE
     assert _final(ordinary).status is SessionStatus.DONE
-    assert [s.queries for s in sessions] == [["probe"], ["hello"]]
+    assert [s.queries for s in sessions] == [[_sent("probe")], [_sent("hello")]]
     assert sessions[0].connected is False, "the read-only session was left running"
 
 
@@ -966,7 +972,7 @@ def test_turns_under_one_access_keep_their_session() -> None:
     access = _access()
     ordinary_runner, ordinary_sessions = _counting_runner(access)
     _drive(ordinary_runner, _event("one"), _event("two"))
-    assert [s.queries for s in ordinary_sessions] == [["one", "two"]]
+    assert [s.queries for s in ordinary_sessions] == [[_sent("one"), _sent("two")]]
 
     restricted_runner, restricted_sessions = _counting_runner(_access())
     _drive(
@@ -974,7 +980,9 @@ def test_turns_under_one_access_keep_their_session() -> None:
         _event("probe", tool_access=ToolAccess.READ_ONLY),
         _event("probe again", tool_access=ToolAccess.READ_ONLY),
     )
-    assert [s.queries for s in restricted_sessions] == [["probe", "probe again"]]
+    assert [s.queries for s in restricted_sessions] == [
+        [_sent("probe"), _sent("probe again")]
+    ]
 
 
 def test_a_refused_progress_demo_call_gets_only_its_refusal(

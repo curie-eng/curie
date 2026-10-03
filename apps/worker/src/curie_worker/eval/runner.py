@@ -28,7 +28,14 @@ import aiohttp
 from aci_protocol import ErrorEvent, Event, Final, SessionStatus, TextDelta, ToolNote
 
 from ..runner_client import RunnerClient, RunnerError
-from .models import EvalCase, EvalCaseResult, EvalOutcome, EvalRunResult, EvalSuite
+from .models import (
+    EvalCase,
+    EvalCaseResult,
+    EvalOutcome,
+    EvalRunResult,
+    EvalSuite,
+    eval_author,
+)
 from .pricing import cost_usd
 from .sampling import SampleConfig, aggregate
 from .scorer import GraderScorer, Scorer
@@ -150,7 +157,8 @@ class EvalRunner:
         fake: bool = False,
     ) -> EvalCaseResult:
         start = time.monotonic()
-        event = Event(type="eval_case", text=case.input, user="eval", ts="0")
+        user = eval_author(case.sender, "eval")
+        event = Event(type="eval_case", text=case.input, user=user, ts="0")
         parts: list[str] = []
         trajectory: list[str] = []
         final_text: str | None = None

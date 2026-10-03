@@ -31,7 +31,7 @@ use crate::chat::{
     await_reply, await_resume, capped, continue_hint_line, continue_hint_long_line,
     failure_class_from_reply, parse_approval_id, resolve_targets, Outcome, SlackStub,
 };
-use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
+use crate::evals::{eval_author, EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
 use crate::queue::{
     self, connect, diagnostics, eval_case_turn, name_relay_identity, queue_thread_reset, speak_as,
@@ -3994,6 +3994,7 @@ async fn run_eval_turns(
                 // Thread reset (#1534) must use the same prefixed key the
                 // worker claimed.
                 let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
+                let author = eval_author(&case.sender, opts.user.as_str());
                 let (event, relay_ref) = match &transport {
                     EvalReplyTransport::Stub(stub) => {
                         let reply_endpoint = stub.base_api_url().to_string();
@@ -4002,7 +4003,7 @@ async fn run_eval_turns(
                                 eval_case_turn(
                                     "slack",
                                     &channel_id,
-                                    &opts.user,
+                                    author,
                                     &case.input,
                                     &thread_ts,
                                     &placeholder_ts,
@@ -4018,7 +4019,7 @@ async fn run_eval_turns(
                         let mut event = eval_case_turn(
                             "slack",
                             &channel_id,
-                            &opts.user,
+                            author,
                             &case.input,
                             &thread_ts,
                             reply_ref.hyphenated().to_string(),
@@ -7711,6 +7712,7 @@ mod tests {
                 case_sensitive: false,
             },
             shared_history: false,
+            sender: None,
             expect_status,
         }
     }

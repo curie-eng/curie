@@ -1607,10 +1607,12 @@ def test_production_http_timeout_handler_holds_next_query_until_ack(
             await asyncio.wait_for(second_task, timeout=1.0)
 
             assert session.interrupts == 1
+            from curie_runner.sender_frame import frame_user_turn
+
             assert session.wire == [
-                ("query", "first"),
+                ("query", frame_user_turn("message", "U0EXAMPLE1", "first", None)),
                 ("interrupt", 1),
-                ("query", "second"),
+                ("query", frame_user_turn("message", "U0EXAMPLE1", "second", None)),
             ]
             assert isinstance(second_frames[-1], Final)
             assert second_frames[-1].status is SessionStatus.DONE
