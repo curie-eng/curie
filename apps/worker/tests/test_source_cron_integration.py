@@ -21,6 +21,7 @@ from curie_protected_hooks.source_policy_sql import (
     SourceGateInvalid,
     SourceSnapshotUnavailable,
 )
+from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.bundle_store import BundleStore
 from curie_worker.config import WorkerConfig
 from curie_worker.cron_loop import BundleTriggerSource, CronPassSummary, CronSchedulerLoop
@@ -57,7 +58,12 @@ class Campaign:
         self.slot = datetime.now(UTC).replace(second=0, microsecond=0) - timedelta(minutes=1)
         self.now = self.slot + timedelta(seconds=20)
         self.start = self.slot - timedelta(seconds=1)
-        self.config = WorkerConfig(database_url=url)
+        self.config = WorkerConfig(
+            database_url=url,
+            valkey_host=VALKEY_HOST,
+            valkey_port=VALKEY_PORT,
+            valkey_password=VALKEY_PW,
+        )
         self.store = BundleStore(self.config)
         self.keys: list[str] = []
         self.stream = "test:source-cron-integration:" + uuid.uuid4().hex
