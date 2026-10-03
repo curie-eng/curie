@@ -26,6 +26,7 @@ impl PrivateHelmValues {
             "worker.adapterCredentialsExistingSecretKey",
         ]
         .into_iter()
+        .chain(RETAINED_RUNNER_FAMILIES.iter().copied())
         .filter(|key| {
             self.0
                 .pointer(&format!("/{}", key.replace('.', "/")))
@@ -48,6 +49,17 @@ pub struct UpOpts {
     /// Existing mail lifecycle and paired worker credentials, with explicit
     /// operator overrides removed. Populated by the one release-values read.
     pub retained_mail_values: Option<PrivateHelmValues>,
+    /// The recorded runner, api and dispatcher environment lists and every
+    /// per-agent connector binding, with explicit operator overrides removed.
+    /// A full upgrade otherwise resets them, and only a typed values file keeps
+    /// a numeric environment string a string (#3848).
+    pub retained_runner_values: Option<PrivateHelmValues>,
+    /// The model credential saved in Curie private storage. Unlike
+    /// [`Self::credentials`] it is not a change request: completion adopts it
+    /// only when the release records no model credential of its own, so a
+    /// saved credential for another provider cannot replace a recorded Secret
+    /// reference (#3848).
+    pub saved_credentials: Option<String>,
 
     pub common: CommonOpts,
     pub chart: String,
@@ -528,6 +540,118 @@ fn resolve_sealing_values(
     resolved
 }
 
+/// The part of a retained values document that no operator `--set` key
+/// owns. An operator key at or above a path removes that subtree; an operator
+/// key inside a list removes the whole list, because explicit list input
+/// replaces the recorded family rather than patching one index of it.
+fn without_overrides(
+    value: &serde_json::Value,
+    path: &str,
+    overridden: &std::collections::HashSet<String>,
+) -> Option<serde_json::Value> {
+    if removed_by_overrides(path, value.is_array(), overridden) {
+        return None;
+    }
+    match value {
+        serde_json::Value::Object(object) => {
+            let remaining: serde_json::Map<String, serde_json::Value> = object
+                .iter()
+                .filter_map(|(key, value)| {
+                    let child = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    without_overrides(value, &child, overridden).map(|value| (key.clone(), value))
+                })
+                .collect();
+            (!remaining.is_empty() || object.is_empty())
+                .then_some(serde_json::Value::Object(remaining))
+        }
+        _ => Some(value.clone()),
+    }
+}
+
+/// Whether [`without_overrides`] drops the node at `path`: an operator key at
+/// or above it removes it, and for a list any operator key inside it removes
+/// the whole list too. The one rule both apply and `diff` use (#3848).
+fn removed_by_overrides(
+    path: &str,
+    is_list: bool,
+    overridden: &std::collections::HashSet<String>,
+) -> bool {
+    overridden.iter().any(|key| {
+        key_is_or_descends_from(path, key) || (is_list && key_is_or_descends_from(key, path))
+    })
+}
+
+/// Whether a flattened retained runner key (`a.b[0].c` spelling, as
+/// `flatten_values` writes it) survives [`without_overrides`] given these
+/// operator or declared keys. Every enclosing node is checked with the same
+/// rule apply uses, so a declared element of a recorded list resets the rest
+/// of that list in `diff` exactly as apply drops it (#3848).
+pub(crate) fn retained_runner_key_survives(
+    key: &str,
+    overridden: &std::collections::HashSet<String>,
+) -> bool {
+    let enclosing = key
+        .char_indices()
+        .filter(|(_, ch)| matches!(ch, '.' | '['))
+        .map(|(i, ch)| (&key[..i], ch == '['));
+    !enclosing
+        .chain(std::iter::once((key, false)))
+        .any(|(path, is_list)| removed_by_overrides(path, is_list, overridden))
+}
+
+/// The recorded value families [`resolve_retained_runner_values`] carries.
+/// Three environment lists and the per-agent connector binding map
+/// `curie cluster secrets` writes.
+const RETAINED_RUNNER_FAMILIES: &[&str] = &[
+    "agentSandbox.runner.extraEnv",
+    "agentSandbox.connectorSecrets",
+    "api.extraEnv",
+    "dispatcher.extraEnv",
+];
+
+pub(crate) fn is_retained_runner_key(key: &str) -> bool {
+    RETAINED_RUNNER_FAMILIES
+        .iter()
+        .any(|family| key_is_or_descends_from(key, family))
+}
+
+/// Preserve the recorded runner, api and dispatcher environment lists and
+/// every agent's connector bindings as typed values (#3848).
+///
+/// `up` is a full upgrade, so these reset to the chart's empty default unless
+/// re-supplied, which silently unbound every agent's connector credentials and
+/// dropped the runner environment. They travel through the private values
+/// file rather than `--set`: a list of env objects has no faithful `--set`
+/// form, a numeric string such as `"8080"` becomes an integer Kubernetes then
+/// rejects, and a connector value is a credential that must stay off argv.
+/// Every agent is kept; an explicit binding replaces only its own name.
+fn resolve_retained_runner_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) -> Option<PrivateHelmValues> {
+    let existing = existing?;
+    let mut retained = serde_json::json!({});
+    for family in RETAINED_RUNNER_FAMILIES {
+        let pointer = format!("/{}", family.replace('.', "/"));
+        let Some(value) = existing.pointer(&pointer) else {
+            continue;
+        };
+        let (parent, leaf) = pointer.rsplit_once('/').expect("family pointer");
+        let mut cursor = &mut retained;
+        for part in parent.split('/').skip(1) {
+            cursor = &mut cursor[part];
+        }
+        cursor[leaf] = value.clone();
+    }
+    without_overrides(&retained, "", &operator_set_keys(operator_sets))
+        .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
+        .map(|document| PrivateHelmValues(document, BTreeMap::new()))
+}
+
 /// Preserve the installed mail surface as typed values: booleans, arrays and
 /// credential maps must not become strings when delivered through Helm -f.
 /// This family includes the paired worker credential source, because preserving
@@ -636,44 +760,6 @@ fn resolve_retained_mail_values(
                     cleared.extend(removed_leaves.into_keys().map(|key| (key, String::new())));
                 }
             }
-        }
-    }
-    fn without_overrides(
-        value: &serde_json::Value,
-        path: &str,
-        overridden: &std::collections::HashSet<String>,
-    ) -> Option<serde_json::Value> {
-        if overridden
-            .iter()
-            .any(|key| key_is_or_descends_from(path, key))
-        {
-            return None;
-        }
-        match value {
-            serde_json::Value::Object(object) => {
-                let remaining: serde_json::Map<String, serde_json::Value> = object
-                    .iter()
-                    .filter_map(|(key, value)| {
-                        let child = if path.is_empty() {
-                            key.clone()
-                        } else {
-                            format!("{path}.{key}")
-                        };
-                        without_overrides(value, &child, overridden)
-                            .map(|value| (key.clone(), value))
-                    })
-                    .collect();
-                (!remaining.is_empty() || object.is_empty())
-                    .then_some(serde_json::Value::Object(remaining))
-            }
-            serde_json::Value::Array(_)
-                if overridden
-                    .iter()
-                    .any(|key| key_is_or_descends_from(key, path)) =>
-            {
-                None
-            }
-            _ => Some(value.clone()),
         }
     }
     Ok(without_overrides(&retained, "", &overridden)
@@ -1112,8 +1198,10 @@ mod connector_caller_preservation_tests {
 /// The chart value holding the model credential. Named here so the secret
 /// classifier below cannot drift from the key `up_commands` actually masks.
 pub(crate) const MODEL_CREDENTIAL_KEY: &str = "agentSandbox.runner.credentials";
+/// The Secret the runner reads its model credential from when one is recorded.
+const MODEL_CREDENTIAL_SECRET_KEY: &str = "agentSandbox.runner.credentialsExistingSecret";
 const MODEL_CREDENTIAL_REFERENCE_KEYS: &[&str] = &[
-    "agentSandbox.runner.credentialsExistingSecret",
+    MODEL_CREDENTIAL_SECRET_KEY,
     "agentSandbox.runner.credentialsExistingSecretKey",
 ];
 const CREATED_BY_LABEL: &str = "curietech.ai/created-by";
@@ -1276,6 +1364,45 @@ fn resolve_credential_values(
         .collect()
 }
 
+/// Decide whether the model credential saved in Curie private storage is this
+/// run's model credential (#3848).
+///
+/// A saved credential is a convenience for a fresh install, not a request to
+/// change the model credential. Treating it as one replaced a recorded
+/// `credentialsExistingSecret` reference with whatever provider happened to be
+/// saved locally. So it is adopted only when nothing else owns the family: no
+/// explicit credential, no fake or local model, no operator credential or
+/// reference key, and no nonempty credential or reference recorded by the
+/// release. An adopted credential then flows exactly like an explicit one,
+/// including the post-completion provider validation and egress inference.
+fn adopt_saved_model_credential(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    let Some(saved) = opts.saved_credentials.take() else {
+        return;
+    };
+    if opts.credentials.is_some() || opts.fake_model || opts.local_model.is_some() {
+        return;
+    }
+    let overridden = operator_set_keys(operator_sets);
+    if std::iter::once(MODEL_CREDENTIAL_KEY)
+        .chain(MODEL_CREDENTIAL_REFERENCE_KEYS.iter().copied())
+        .any(|key| overridden.contains(key))
+    {
+        return;
+    }
+    if preserved_value(existing, MODEL_CREDENTIAL_KEY).is_some()
+        || preserved_value(existing, MODEL_CREDENTIAL_SECRET_KEY).is_some()
+    {
+        crate::ui::ui()
+            .note("saved model credential ignored: the release records its own model credential");
+        return;
+    }
+    opts.credentials = Some(saved);
+}
+
 /// Carry the runner configuration recorded by a prior real model install into
 /// a plain rerun. Explicit inputs replace their recorded family.
 fn resolve_preserved_runner_identity_values(
@@ -1307,6 +1434,21 @@ fn resolve_preserved_runner_identity_values(
         for (_, value) in &mut references {
             value.clear();
         }
+    }
+    // A preserved Secret reference is the release's model credential, and the
+    // chart reads it only when `fakeModel` is false. That switch is a managed
+    // key the live overlay skips, so without re-supplying it a plain rerun
+    // reverts to the fake model while keeping the reference (#3848).
+    if !opts.fake_model
+        && !overridden.contains(FAKE_MODEL_KEY)
+        && references
+            .iter()
+            .any(|(key, value)| key == MODEL_CREDENTIAL_SECRET_KEY && !value.is_empty())
+        && existing
+            .and_then(|values| values.pointer("/agentSandbox/runner/fakeModel"))
+            .is_some_and(|recorded| !crate::doctor::helm_truthy(Some(recorded)))
+    {
+        opts.set.push(format!("{FAKE_MODEL_KEY}=false"));
     }
     opts.secrets.extend(references);
     let preserve_inline_credential = opts.fake_model && opts.local_model.is_none();
@@ -1582,6 +1724,7 @@ fn is_retained_mail_key(key: &str) -> bool {
 /// two lists agree by construction rather than by a hand-kept fixture.
 pub fn is_preserved_by_up(key: &str) -> bool {
     is_retained_mail_key(key)
+        || is_retained_runner_key(key)
         || COMMS_MANAGED_KEYS.contains(&key)
         || GITHUB_APP_MANAGED_KEYS.contains(&key)
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
@@ -2246,6 +2389,7 @@ fn complete_up_opts_without_runner_egress(
         stamp_target_schema(&mut opts);
         existing
     };
+    opts.retained_runner_values = resolve_retained_runner_values(existing, &operator_sets);
     resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
     resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
     resolve_preserved_slack_trusted_origins_value(&mut opts, existing, &operator_sets);
@@ -2270,6 +2414,7 @@ fn complete_up_opts_without_runner_egress(
         opts.secrets
             .extend(resolve_preserved_values(existing, &operator_sets));
     }
+    adopt_saved_model_credential(&mut opts, existing, &operator_sets);
     resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
     let mut references =
         resolve_credential_values(existing, &operator_sets, GITHUB_TOKEN_REFERENCE_KEYS);
@@ -2390,9 +2535,7 @@ fn overlay_family_is_managed(key: &str) -> bool {
         || key_is_or_descends_from(key, SLACK_TRUSTED_ORIGINS_KEY)
         || is_grafana_connector_reference_key(key)
         || key_is_or_descends_from(key, WORKER_EXTRA_ENV_KEY)
-        || key_is_or_descends_from(key, "api.extraEnv")
-        || key_is_or_descends_from(key, "dispatcher.extraEnv")
-        || key_is_or_descends_from(key, "agentSandbox.runner.extraEnv")
+        || is_retained_runner_key(key)
         || COMMS_MANAGED_KEYS
             .iter()
             .any(|managed| key_is_or_descends_from(key, managed))
@@ -2425,6 +2568,7 @@ fn overlay_secret_refs(
         if is_external_secret_ref_key(&path)
             && !overridden.contains(&path)
             && !is_retained_mail_key(&path)
+            && !is_retained_runner_key(&path)
         {
             match child {
                 serde_json::Value::String(raw) => opts
@@ -2507,7 +2651,7 @@ fn overlay_json(
             if prefix == "config.schemaVersion" || prefix == "config.migratedFrom" {
                 return Ok(());
             }
-            if is_retained_mail_key(prefix) {
+            if is_retained_mail_key(prefix) || is_retained_runner_key(prefix) {
                 return Ok(());
             }
             if overridden.contains(prefix)
@@ -2732,7 +2876,10 @@ enum DiffParticipation {
 
 #[derive(Clone, PartialEq, Eq)]
 enum PlannedHelmValues {
-    RetainedMail(PrivateHelmValues),
+    /// A typed values document carried forward from the release: the mail
+    /// family or the runner family. Its cleared keys participate in diff;
+    /// the retained document itself is preservation, not change.
+    Retained(PrivateHelmValues),
     Set {
         flag: HelmSetFlag,
         expression: String,
@@ -2827,7 +2974,7 @@ impl UpValuePlan {
     fn append_command_args(&self, args: &mut Vec<CmdArg>) {
         for entry in &self.entries {
             match entry {
-                PlannedHelmValues::RetainedMail(values) => {
+                PlannedHelmValues::Retained(values) => {
                     args.push(CmdArg::PrivateJsonValuesFile(values.clone()));
                 }
                 PlannedHelmValues::Set {
@@ -2851,7 +2998,7 @@ impl UpValuePlan {
         let mut values = BTreeMap::new();
         for entry in &self.entries {
             match entry {
-                PlannedHelmValues::RetainedMail(retained) => {
+                PlannedHelmValues::Retained(retained) => {
                     values.extend(
                         retained
                             .1
@@ -2933,9 +3080,13 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
         );
     }
     plan.secret_file(o.secrets.clone(), DiffParticipation::Preserve);
-    if let Some(values) = &o.retained_mail_values {
+    // Retained documents precede every `--set` lane so explicit input wins.
+    for values in [&o.retained_mail_values, &o.retained_runner_values]
+        .into_iter()
+        .flatten()
+    {
         plan.entries
-            .push(PlannedHelmValues::RetainedMail(values.clone()));
+            .push(PlannedHelmValues::Retained(values.clone()));
     }
     if let Some(model) = &o.model {
         if explicit_runner_model(&o.operator_sets()).is_none() {
@@ -4703,6 +4854,12 @@ async fn run_prepared_up(
             values.keys().len()
         ));
     }
+    if let Some(values) = &opts.retained_runner_values {
+        ui.note(&format!(
+            "preserving {} runner value family(s) recorded by the release",
+            values.keys().len()
+        ));
+    }
     let preserved = resolve_preserved_values(existing.as_ref(), &operator_sets);
     if !preserved.is_empty() {
         let sealing_values = preserved
@@ -5176,6 +5333,8 @@ mod tests {
     fn opts() -> UpOpts {
         UpOpts {
             retained_mail_values: None,
+            retained_runner_values: None,
+            saved_credentials: None,
             common: common(),
             chart: "charts/curie".into(),
             no_expose: true,
@@ -5482,6 +5641,442 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // #3848: a sealed plain `cluster up` is a FULL Helm upgrade, so the runner
+    // environment and per-agent connector bindings a release recorded have to
+    // be re-supplied, typed, through a private values file, and a saved local
+    // model credential is not a request to replace the recorded one.
+    // -----------------------------------------------------------------------
+
+    const SAVED_OPENROUTER_CREDENTIAL: &str = "sk-or-v1-PLACEHOLDER-saved";
+    const RECORDED_ANTHROPIC_CREDENTIAL: &str = "sk-ant-api03-PLACEHOLDER-recorded";
+    const EXPLICIT_ANTHROPIC_CREDENTIAL: &str = "sk-ant-api03-PLACEHOLDER-explicit";
+
+    fn retained_runner_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "agentSandbox": {
+                "runner": {
+                    "extraEnv": [
+                        {"name": "PORT", "value": "8080"},
+                        {
+                            "name": "FROM_SECRET",
+                            "valueFrom": {"secretKeyRef": {"name": "s", "key": "k"}}
+                        }
+                    ]
+                },
+                "connectorSecrets": {
+                    "acme-a": {
+                        "GRAFANA_TOKEN": "placeholder-a",
+                        "GRAFANA_URL": "http://grafana.example"
+                    },
+                    "acme-b": {"GITHUB_PERSONAL_ACCESS_TOKEN": "placeholder-b"}
+                }
+            }
+        })
+    }
+
+    /// A sealed (`--dev` absent) plain rerun against `existing`.
+    fn sealed_upgrade(
+        existing: Option<&serde_json::Value>,
+        set: Vec<String>,
+        set_string: Vec<String>,
+    ) -> UpOpts {
+        complete_up_opts_without_runner_egress(
+            UpOpts {
+                set,
+                set_string,
+                ..opts()
+            },
+            existing,
+            None,
+            false,
+            true,
+        )
+        .unwrap()
+    }
+
+    /// Helm's merge of values files: maps merge, everything else replaces.
+    fn merge_helm_values(into: &mut serde_json::Value, from: &serde_json::Value) {
+        match (into, from) {
+            (serde_json::Value::Object(into), serde_json::Value::Object(from)) => {
+                for (key, value) in from {
+                    match into.get_mut(key) {
+                        Some(existing) if existing.is_object() && value.is_object() => {
+                            merge_helm_values(existing, value)
+                        }
+                        _ => {
+                            into.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+            }
+            (into, from) => *into = from.clone(),
+        }
+    }
+
+    /// What `helm upgrade` would receive from this run: the materialized argv
+    /// with every `-f` operand (a random temp path) blanked, every `-f` document
+    /// in argv order, and those documents merged. The files are read while the
+    /// guards still hold them.
+    fn helm_upgrade_inputs(opts: &UpOpts) -> (Vec<String>, Vec<String>, serde_json::Value) {
+        let commands = up_commands(opts);
+        let (materialized, _guards) = commands[0].materialize_secret_files().unwrap();
+        let bodies = secret_values_file_bodies(&materialized);
+        let mut argv = materialized.argv();
+        let mut operand_is_file = false;
+        for argument in &mut argv {
+            let is_flag = argument == "-f";
+            if operand_is_file {
+                *argument = "<values-file>".to_string();
+            }
+            operand_is_file = is_flag;
+        }
+        let mut merged = serde_json::json!({});
+        for body in &bodies {
+            let document: serde_json::Value = serde_json::from_str(body)
+                .unwrap_or_else(|error| panic!("values file is not JSON ({error}): {body}"));
+            merge_helm_values(&mut merged, &document);
+        }
+        (argv, bodies, merged)
+    }
+
+    #[test]
+    fn sealed_up_retains_recorded_runner_env_and_connector_secrets_in_a_private_file() {
+        let existing = retained_runner_fixture();
+        let opts = sealed_upgrade(Some(&existing), vec![], vec![]);
+        let (argv, bodies, merged) = helm_upgrade_inputs(&opts);
+
+        assert_eq!(
+            merged.pointer("/agentSandbox/runner/extraEnv"),
+            existing.pointer("/agentSandbox/runner/extraEnv"),
+            "a sealed up must re-supply every recorded runner extraEnv entry: {bodies:?}"
+        );
+        assert_eq!(
+            merged.pointer("/agentSandbox/runner/extraEnv/0/value"),
+            Some(&serde_json::json!("8080")),
+            "a numeric environment string must stay a JSON string, never an integer"
+        );
+        assert_eq!(
+            merged.pointer("/agentSandbox/connectorSecrets"),
+            existing.pointer("/agentSandbox/connectorSecrets"),
+            "a sealed up must re-supply every agent's connector bindings: {bodies:?}"
+        );
+
+        for private in ["placeholder-a", "placeholder-b", "8080", "grafana.example"] {
+            assert!(
+                !argv.iter().any(|argument| argument.contains(private)),
+                "retained runner value {private} reached the Helm argv: {argv:?}"
+            );
+        }
+        let shown = up_commands(&opts)[0].display();
+        for private in ["placeholder-a", "placeholder-b"] {
+            assert!(!shown.contains(private), "connector secret leaked: {shown}");
+        }
+
+        // Explicit `--set` input must be able to win, so the retained file has
+        // to precede every set lane in argv.
+        let retained_ordinal = bodies
+            .iter()
+            .position(|body| body.contains("connectorSecrets"))
+            .expect("the retained runner values file is in argv");
+        let retained_file = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, argument)| argument.as_str() == "-f")
+            .nth(retained_ordinal)
+            .map(|(index, _)| index)
+            .expect("the retained values file has a -f flag");
+        let first_set = argv
+            .iter()
+            .position(|argument| argument.starts_with("--set"))
+            .unwrap_or(argv.len());
+        assert!(
+            retained_file < first_set,
+            "retained values must precede explicit --set input: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_runner_extra_env_replaces_the_recorded_list_but_keeps_connector_secrets() {
+        let existing = retained_runner_fixture();
+        let opts = sealed_upgrade(
+            Some(&existing),
+            vec![],
+            vec![
+                "agentSandbox.runner.extraEnv[0].name=OTHER".into(),
+                "agentSandbox.runner.extraEnv[0].value=operator-value".into(),
+            ],
+        );
+        let (argv, bodies, merged) = helm_upgrade_inputs(&opts);
+
+        assert!(
+            merged.pointer("/agentSandbox/runner/extraEnv").is_none(),
+            "explicit extraEnv input replaces the recorded list as a whole: {bodies:?}"
+        );
+        assert!(
+            !bodies
+                .iter()
+                .any(|body| body.contains("FROM_SECRET") || body.contains("\"PORT\"")),
+            "no recorded runner extraEnv entry may survive an explicit list: {bodies:?}"
+        );
+        assert!(
+            argv.windows(2).any(|pair| pair[0] == "--set-string"
+                && pair[1] == "agentSandbox.runner.extraEnv[0].name=OTHER"),
+            "the explicit runner extraEnv must reach Helm: {argv:?}"
+        );
+        assert_eq!(
+            merged.pointer("/agentSandbox/connectorSecrets"),
+            existing.pointer("/agentSandbox/connectorSecrets"),
+            "an unrelated explicit input must not drop connector bindings: {bodies:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_connector_secret_replaces_only_that_binding() {
+        let existing = retained_runner_fixture();
+        let opts = sealed_upgrade(
+            Some(&existing),
+            vec!["agentSandbox.connectorSecrets.acme-a.GRAFANA_TOKEN=operator-token".into()],
+            vec![],
+        );
+        let (argv, bodies, merged) = helm_upgrade_inputs(&opts);
+
+        assert_eq!(
+            merged.pointer("/agentSandbox/connectorSecrets"),
+            Some(&serde_json::json!({
+                "acme-a": {"GRAFANA_URL": "http://grafana.example"},
+                "acme-b": {"GITHUB_PERSONAL_ACCESS_TOKEN": "placeholder-b"}
+            })),
+            "only the explicitly replaced binding leaves the retained file: {bodies:?}"
+        );
+        assert!(
+            !bodies.iter().any(|body| body.contains("placeholder-a")),
+            "the replaced recorded value must not be re-supplied: {bodies:?}"
+        );
+        assert!(
+            argv.windows(2).any(|pair| pair[0] == "--set"
+                && pair[1] == "agentSandbox.connectorSecrets.acme-a.GRAFANA_TOKEN=operator-token"),
+            "the explicit binding must reach Helm: {argv:?}"
+        );
+        assert_eq!(
+            merged.pointer("/agentSandbox/runner/extraEnv"),
+            existing.pointer("/agentSandbox/runner/extraEnv"),
+            "an explicit connector binding must not drop the runner extraEnv: {bodies:?}"
+        );
+    }
+
+    #[test]
+    fn sealed_up_retains_recorded_api_and_dispatcher_extra_env() {
+        let existing = serde_json::json!({
+            "api": {"extraEnv": [{"name": "API_PORT", "value": "9090"}]},
+            "dispatcher": {"extraEnv": [
+                {"name": "DISPATCH_FLAG", "value": "true"},
+                {"name": "DISPATCH_TOKEN", "valueFrom": {"secretKeyRef": {"name": "d", "key": "t"}}}
+            ]}
+        });
+        let opts = sealed_upgrade(Some(&existing), vec![], vec![]);
+        let (argv, bodies, merged) = helm_upgrade_inputs(&opts);
+
+        assert_eq!(
+            merged.pointer("/api/extraEnv"),
+            existing.pointer("/api/extraEnv"),
+            "a sealed up must re-supply the recorded api extraEnv typed: {bodies:?}"
+        );
+        assert_eq!(
+            merged.pointer("/dispatcher/extraEnv"),
+            existing.pointer("/dispatcher/extraEnv"),
+            "a sealed up must re-supply the recorded dispatcher extraEnv typed: {bodies:?}"
+        );
+        for private in ["9090", "DISPATCH_TOKEN"] {
+            assert!(
+                !argv.iter().any(|argument| argument.contains(private)),
+                "retained extraEnv reached the Helm argv: {argv:?}"
+            );
+        }
+    }
+
+    fn sealed_upgrade_with_saved_credential(
+        existing: Option<&serde_json::Value>,
+        explicit: Option<&str>,
+        fake_model: bool,
+        set: Vec<String>,
+    ) -> UpOpts {
+        complete_up_opts_without_runner_egress(
+            UpOpts {
+                set,
+                fake_model,
+                credentials: explicit.map(str::to_string),
+                saved_credentials: Some(SAVED_OPENROUTER_CREDENTIAL.to_string()),
+                ..opts()
+            },
+            existing,
+            None,
+            false,
+            true,
+        )
+        .unwrap()
+    }
+
+    fn assert_saved_credential_absent(opts: &UpOpts) {
+        let (argv, bodies, _) = helm_upgrade_inputs(opts);
+        assert!(
+            !bodies
+                .iter()
+                .chain(argv.iter())
+                .any(|surface| surface.contains(SAVED_OPENROUTER_CREDENTIAL)),
+            "an unrequested saved credential reached Helm: {bodies:?}"
+        );
+    }
+
+    #[test]
+    fn a_saved_credential_does_not_replace_a_recorded_credential_reference() {
+        let existing = serde_json::json!({
+            "agentSandbox": {"runner": {
+                "fakeModel": false,
+                "credentialsExistingSecret": "byo-model",
+                "credentialsExistingSecretKey": "agentCredentials"
+            }}
+        });
+        let opts = sealed_upgrade_with_saved_credential(Some(&existing), None, false, vec![]);
+
+        assert_eq!(
+            opts.credentials, None,
+            "a saved local credential is not a model credential change request"
+        );
+        assert_eq!(
+            secret_for(&opts, "agentSandbox.runner.credentialsExistingSecret"),
+            Some("byo-model"),
+            "the recorded reference must stay authoritative"
+        );
+        assert_eq!(
+            secret_for(&opts, "agentSandbox.runner.credentialsExistingSecretKey"),
+            Some("agentCredentials"),
+        );
+        let (_, _, merged) = helm_upgrade_inputs(&opts);
+        assert_eq!(
+            merged.pointer("/agentSandbox/runner/credentialsExistingSecret"),
+            Some(&serde_json::json!("byo-model")),
+        );
+        assert!(
+            merged.pointer("/agentSandbox/runner/credentials").is_none(),
+            "no inline credential may be supplied beside the recorded reference: {merged}"
+        );
+        assert_saved_credential_absent(&opts);
+    }
+
+    #[test]
+    fn a_saved_credential_does_not_replace_a_recorded_inline_credential() {
+        let existing = serde_json::json!({
+            "agentSandbox": {"runner": {
+                "fakeModel": false,
+                "credentials": RECORDED_ANTHROPIC_CREDENTIAL
+            }}
+        });
+        let opts = sealed_upgrade_with_saved_credential(Some(&existing), None, false, vec![]);
+
+        assert_eq!(
+            opts.credentials.as_deref(),
+            Some(RECORDED_ANTHROPIC_CREDENTIAL),
+            "the recorded inline credential is what this release keeps"
+        );
+        let (_, _, merged) = helm_upgrade_inputs(&opts);
+        assert_eq!(
+            merged.pointer("/agentSandbox/runner/credentials"),
+            Some(&serde_json::json!(RECORDED_ANTHROPIC_CREDENTIAL)),
+        );
+        assert_saved_credential_absent(&opts);
+    }
+
+    #[test]
+    fn a_saved_credential_is_adopted_when_the_release_records_none() {
+        for existing in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"agentSandbox": {"runner": {
+                "credentials": "",
+                "credentialsExistingSecret": ""
+            }}})),
+        ] {
+            let opts = sealed_upgrade_with_saved_credential(existing.as_ref(), None, false, vec![]);
+            assert_eq!(
+                opts.credentials.as_deref(),
+                Some(SAVED_OPENROUTER_CREDENTIAL),
+                "with nothing recorded, the saved credential is the model credential: {existing:?}"
+            );
+            let (_, _, merged) = helm_upgrade_inputs(&opts);
+            assert_eq!(
+                merged.pointer("/agentSandbox/runner/credentials"),
+                Some(&serde_json::json!(SAVED_OPENROUTER_CREDENTIAL)),
+                "the adopted credential travels through the private values file"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_credential_still_replaces_a_recorded_reference() {
+        let existing = serde_json::json!({
+            "agentSandbox": {"runner": {
+                "fakeModel": false,
+                "credentialsExistingSecret": "byo-model",
+                "credentialsExistingSecretKey": "agentCredentials"
+            }}
+        });
+        let opts = sealed_upgrade_with_saved_credential(
+            Some(&existing),
+            Some(EXPLICIT_ANTHROPIC_CREDENTIAL),
+            false,
+            vec![],
+        );
+
+        assert_eq!(
+            opts.credentials.as_deref(),
+            Some(EXPLICIT_ANTHROPIC_CREDENTIAL)
+        );
+        assert_eq!(
+            secret_for(&opts, "agentSandbox.runner.credentialsExistingSecret"),
+            Some(""),
+            "an explicit credential replaces the recorded reference family"
+        );
+        assert_saved_credential_absent(&opts);
+    }
+
+    #[test]
+    fn a_saved_credential_is_not_adopted_under_fake_model_or_an_operator_reference() {
+        let fake = sealed_upgrade_with_saved_credential(None, None, true, vec![]);
+        assert_eq!(
+            fake.credentials, None,
+            "--fake-model installs no credential"
+        );
+        assert_saved_credential_absent(&fake);
+
+        let referenced = sealed_upgrade_with_saved_credential(
+            None,
+            None,
+            false,
+            vec!["agentSandbox.runner.credentialsExistingSecret=operator-model".into()],
+        );
+        assert_eq!(
+            referenced.credentials, None,
+            "an operator reference owns the model credential family"
+        );
+        assert_saved_credential_absent(&referenced);
+    }
+
+    #[test]
+    fn diff_treats_retained_runner_families_as_preserved_by_up() {
+        for key in [
+            "agentSandbox.runner.extraEnv",
+            "agentSandbox.runner.extraEnv[0].value",
+            "agentSandbox.runner.extraEnv[1].valueFrom.secretKeyRef.name",
+            "agentSandbox.connectorSecrets",
+            "agentSandbox.connectorSecrets.acme-a.GRAFANA_TOKEN",
+            "api.extraEnv[0].name",
+            "dispatcher.extraEnv[0].value",
+        ] {
+            assert!(is_preserved_by_up(key), "{key} must be preserved by up");
+        }
+    }
+
     #[test]
     fn plain_up_escapes_commas_in_recorded_worker_extra_env_values() {
         let existing = serde_json::json!({
@@ -5617,6 +6212,8 @@ mod tests {
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
                 retained_mail_values: None,
+                retained_runner_values: None,
+                saved_credentials: None,
                 common: common(),
                 github_token: GithubTokenPlan::Untouched,
                 allow_egress_host: vec![],

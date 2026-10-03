@@ -5698,15 +5698,27 @@ async fn run(command: Option<Command>) -> Result<()> {
                     std::path::Path::new("charts/curie").is_dir(),
                 )?;
                 let chart = materialize_artifact(resolved, dry_run, "chart").await?;
-                let credentials = if fake_model || local_model.is_some() {
-                    None
+                // Only the shell credential is a change request. The saved one
+                // is adopted during completion when the release records no
+                // model credential of its own (#3848).
+                let (credentials, saved_credentials) = if fake_model || local_model.is_some() {
+                    (None, None)
                 } else {
-                    ops::resolve_up_credentials(fake_model, ops::model_credential_env()?)
+                    let credentials = ops::resolve_up_credentials(
+                        fake_model,
+                        ops::explicit_model_credential_env(),
+                    );
+                    let saved_credentials =
+                        credentials.is_none().then(ops::saved_model_credential).flatten();
+                    (credentials, saved_credentials)
                 };
                 emit(
                     ops::up(
                         UpOpts {
                             retained_mail_values: None,
+                            // Resolved by ops::up from the recorded release values.
+                            retained_runner_values: None,
+                            saved_credentials,
                             common: CommonOpts {
                                 namespace,
                                 release,
