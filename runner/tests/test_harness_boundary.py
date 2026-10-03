@@ -39,31 +39,32 @@ def lint_imports_command() -> str:
     command = shutil.which("lint-imports")
     if command is None:
         pytest.fail("lint-imports must be installed to verify the harness boundary")
+    baseline = _lint_imports(command)
+    if baseline.returncode != 0:
+        pytest.fail("the linter baseline is unavailable:\n" + baseline.stdout + baseline.stderr)
     return command
+
+
+def _lint_imports(command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [command, "--no-cache", "--no-logo"],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
 
 
 def test_actual_linter_refuses_a_new_sdk_importer_and_accepts_its_control(
     boundary_probe: Path, lint_imports_command: str
 ) -> None:
-    def lint() -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [lint_imports_command, "--no-cache", "--no-logo"],
-            cwd=_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-
-    baseline = lint()
-    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
-
     boundary_probe.write_text("BOUNDARY_CONTROL = True\n", encoding="utf-8")
-    control = lint()
+    control = _lint_imports(lint_imports_command)
     assert control.returncode == 0, control.stdout + control.stderr
 
     boundary_probe.write_text("import claude_agent_sdk\n", encoding="utf-8")
-    rejected = lint()
+    rejected = _lint_imports(lint_imports_command)
     output = rejected.stdout + rejected.stderr
     assert rejected.returncode != 0, output
     assert _PROBE_MODULE in output, output
@@ -78,10 +79,10 @@ def test_approval_core_has_no_direct_or_transitive_sdk_dependency() -> None:
     assert sdk_path is None, sdk_path
 
 
-@pytest.mark.parametrize("selected", ["rival", "claude-sdk", "claude-code"])
 def test_registered_alternate_is_refused_before_registry_discovery(
-    selected: str, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    selected = "rival"
     alternate = HarnessContribution(
         name=selected,
         readonly_tools=frozenset(),
@@ -101,14 +102,16 @@ def test_registered_alternate_is_refused_before_registry_discovery(
     assert discovery_calls == []
 
 
-def test_canonical_claude_resolves_without_registry_discovery(
+@pytest.mark.parametrize("selected", ["claude", "claude-sdk", "claude-code"])
+def test_claude_and_aliases_resolve_without_registry_discovery(
+    selected: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def unavailable_registry() -> dict[str, HarnessContribution]:
-        pytest.fail("canonical Claude boot must not discover alternate registrations")
+        pytest.fail("builtin Claude boot must not discover alternate registrations")
 
     monkeypatch.setattr(registry, "discover_contributions", unavailable_registry)
-    assert boot._resolve_harness("claude") is CLAUDE_CONTRIBUTION
+    assert boot._resolve_harness(selected) is CLAUDE_CONTRIBUTION
 
 
 def test_process_boot_refuses_non_claude_before_opening_the_listener(tmp_path: Path) -> None:
