@@ -663,11 +663,12 @@ def test_supervised_restart_metric_declares_closed_operation_domain() -> None:
             "heartbeat",
             "connectors",
             "publications",
+            "e2e-reaper",
             "other",
         ],
         "outcome": ["restart", "give_up"],
     }
-    assert definition["cardinality_bound"] == 14
+    assert definition["cardinality_bound"] == 16
 
 
 def test_reconciler_step_metrics_declare_only_the_api_and_eleven_steps() -> None:
@@ -1054,3 +1055,36 @@ def test_one_thousand_forbidden_ids_do_not_create_metric_series(
             assert point["source"] in manifest[metric_name]["attributes"]["source"]
             assert point["outcome"] in manifest[metric_name]["attributes"]["outcome"]
             assert forbidden_values.isdisjoint(point.values())
+
+
+def test_e2e_reaper_health_gauges_are_declared_with_one_worker_series_each() -> None:
+    """#3245: the reaper's liveness timestamp and its namespace counts (ADR 0176)."""
+
+    manifest = _read(_MANIFEST)["metrics"]
+    worker_only = {"service.name": ["curie-worker"]}
+
+    last_success = manifest["curie.e2e.reaper.last_success"]
+    assert last_success["type"] == "gauge"
+    assert last_success["unit"] == "s"
+    assert last_success["monotonic"] is False
+    assert last_success["attributes"] == worker_only
+    assert last_success["cardinality_bound"] == 1
+
+    expired = manifest["curie.e2e.namespaces.expired"]
+    assert expired["type"] == "gauge"
+    assert expired["unit"] == "{namespace}"
+    assert expired["monotonic"] is False
+    assert expired["attributes"] == worker_only
+    assert expired["cardinality_bound"] == 1
+
+    # Namespaces at least ten minutes past their TTL, or with none: what the
+    # page keys on, since a healthy reaper always sees a few just expired.
+    overdue = manifest["curie.e2e.namespaces.overdue"]
+    assert overdue["type"] == "gauge"
+    assert overdue["unit"] == "{namespace}"
+    assert overdue["monotonic"] is False
+    assert overdue["attributes"] == worker_only
+    assert overdue["cardinality_bound"] == 1
+
+    restart = manifest["curie.worker.supervised.restart"]["attributes"]["operation"]
+    assert "e2e-reaper" in restart

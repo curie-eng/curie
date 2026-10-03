@@ -122,6 +122,11 @@ e2eConnector:
   workerClusterRole: ""
   ttlSeconds: 3600
   podSecurity: baseline
+  # How often the worker's reaper (#3245) deletes namespaces past their TTL or
+  # whose run has finished. Enabling e2eConnector needs
+  # worker.connectorReconciler.enabled: the reaper reads the kubeconfig from
+  # the connector Secret through the reconciler's Secret list grant.
+  reaperIntervalSeconds: 60
 
 # ---------------------------------------------------------------------------
 # PriorityClass (ADR-0059 decision 5): ranks the platform -- worker, api,

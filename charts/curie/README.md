@@ -1423,6 +1423,8 @@ It creates only objects named from its run id and deletes them on exit.
 
 Turn it on only when a separate test cluster already has the identity above. Set `serviceAccount`, `serviceAccountNamespace`, and `workerClusterRole` to that identity, and set `ownerLabel.value` to the same value the test cluster admission policy expects. The connector process uses the factory worker image. `E2E_CLUSTER_KUBECONFIG`, supplied with `curie secrets`, is mounted on the connector and is omitted from the sandbox template and from the per agent sandbox Secret.
 
+`e2eConnector.enabled` also turns on the worker's end to end namespace reaper (#3245). Every `e2eConnector.reaperIntervalSeconds` (default 60, minimum 10) it deletes each namespace in the `namespacePrefix` and `ownerLabel` scope whose TTL has passed or whose run has finished, whether or not the agent called `env_destroy`. It reads `E2E_CLUSTER_KUBECONFIG` from each agent's connector Secret through the connector reconciler's Secret list grant, so `e2eConnector.enabled` also requires `worker.connectorReconciler.enabled`; the chart refuses to render without it. A worker started without that grant or without the internal worker token still runs the reaper, and every pass fails, so the stalled alert fires. The worker exports three gauges, `curie_e2e_reaper_last_success_seconds`, `curie_e2e_namespaces_expired`, and `curie_e2e_namespaces_overdue`, and the SRE example pages on `CurieE2EReaperStalled`, `CurieE2EReaperSignalAbsent`, and `CurieE2EExpiredNamespacesAccumulating`. See `apps/e2e-connector/README.md` for what each one means and how a refused child delete is handled.
+
 ## Uninstalling and CRD lifecycle
 
 `helm uninstall <release> -n <ns>` removes everything the chart templated, but

@@ -345,7 +345,8 @@
         "serviceAccountNamespace": {"type": "string"},
         "workerClusterRole": {"type": "string"},
         "ttlSeconds": {"type": "integer", "minimum": 60, "maximum": 86400},
-        "podSecurity": {"type": "string", "enum": ["baseline", "restricted"]}
+        "podSecurity": {"type": "string", "enum": ["baseline", "restricted"]},
+        "reaperIntervalSeconds": {"type": "integer", "minimum": 10}
       }
     },
     "e2eConnectorIdentity": {

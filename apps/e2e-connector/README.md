@@ -45,6 +45,29 @@ Result: `{"namespace": "<name>", "deleted": true}`.
 
 Any other name, or a namespace whose run label is not the signed run, is refused with `e2e_namespace_not_owned`. The refusal does not send a delete.
 
+## Reaper
+
+Teardown does not depend on `env_destroy`. The factory worker runs a reaper (`curie_e2e_connector.reaper`, driven by `curie_worker.e2e_reaper`) every `e2eConnector.reaperIntervalSeconds` (default 60). It reads the kubeconfig from each agent's connector Secret through the connector reconciler's Secret list grant, so the release needs `worker.connectorReconciler.enabled`.
+
+On each test cluster it lists namespaces carrying the owner label, then checks every item again for the namespace prefix and the exact owner label value. Nothing outside that scope receives a call. A scoped namespace is deleted when either holds:
+
+1. Its `curietech.ai/e2e-expires-at` annotation is in the past, missing, or unreadable.
+2. Its `curietech.ai/e2e-run` label names a request whose status is `completed`, `failed`, `expired`, or `cancelled`.
+
+The reaper deletes the namespace's SandboxClaims, Jobs, and PersistentVolumeClaims first, then the namespace. A namespace stuck in Terminating gets those deletes again on the next pass. Each delete logs one WARNING naming the namespace and the reason, `ttl` or `terminal`.
+
+A 403 on one of those child deletes does not stop the namespace delete, which is still sent. On a Terminating namespace the 403 is expected, because teardown removes the RoleBinding first, so the namespace counts as reaped. On an Active namespace it means the grant is wrong and the children it could not delete may be what holds the namespace, so the namespace is reported failed and the pass is not clean.
+
+A pass is clean only when every test cluster listed, every run status was read, and every namespace due for deletion was deleted. A connector Secret whose `E2E_CLUSTER_KUBECONFIG` is not base64 UTF-8, or is a kubeconfig the connector would refuse, fails the pass with an error naming the Secret and the reason, never its contents; the other clusters are still swept. If the reaper is enabled but cannot work at all, because `worker.connectorReconciler.enabled` is off or the worker has no internal worker token, the worker logs the reason at startup and still runs the loop, and every pass fails without loading a kube config.
+
+Three worker gauges report its health:
+
+1. `curie.e2e.reaper.last_success` (Prometheus `curie_e2e_reaper_last_success_seconds`) is the unix time of the last clean pass, recorded every pass and 0 until one succeeds, so a misconfigured reaper reads 0.
+2. `curie.e2e.namespaces.expired` (Prometheus `curie_e2e_namespaces_expired`) counts scoped namespaces past their TTL.
+3. `curie.e2e.namespaces.overdue` (Prometheus `curie_e2e_namespaces_overdue`) counts scoped namespaces at least ten minutes past their TTL, or without a readable one.
+
+Both namespace gauges are recorded only by a pass that listed every test cluster, so a listing failure holds the last full counts. A slow pass keeps reporting its stale timestamp every interval and is never cancelled or overlapped, so it still reaches deletion. The SRE example pages on three alerts: `CurieE2EReaperStalled` when the last clean pass is more than 15 minutes old, `CurieE2EReaperSignalAbsent` when the timestamp was reported in the last 7 days but not in the last 15 minutes, and `CurieE2EExpiredNamespacesAccumulating` when `curie_e2e_namespaces_overdue` stays above 0 for 15 minutes. That last alert keys on overdue rather than expired, because a healthy reaper always sees a few namespaces just past their TTL between sweeps.
+
 ## Names reserved for later issues
 
 These tools are not served yet. Their names and result fields stay as written here.
