@@ -2079,3 +2079,111 @@ class FactoryPollCursor(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+# A secret-store reference, never a value (#2909): ``env:NAME`` or
+# ``k8s-secret:name/key``. The DB CHECK and the API's 422 both use it.
+PROVIDER_REFERENCE_PATTERN = (
+    r"^(env:[A-Z_][A-Z0-9_]*"
+    r"|k8s-secret:[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?/[-._a-zA-Z0-9]{1,253})$"
+)
+PROVIDER_REFERENCE_MAX_LENGTH = 512
+# Refuses the shapes of well-known credentials the grammar above would admit
+# (a Secret key may hold hyphens, so ``k8s-secret:x/xoxb-...`` would pass):
+# a segment opening with a known token prefix, an env name that is an AWS
+# access key id, or a 32+ character hex run (signing secrets, hex tokens).
+# Best effort against a pasted value; no syntax can prove a string is not one.
+PROVIDER_REFERENCE_DENY_PATTERN = (
+    r"[:/](xox[a-z]-|xoxe\.|xapp-|gh[pousr]_|github_pat_|sk-|sk_live_|rk_live_|lin_api_|AIza|eyJ)"
+    r"|^env:(AKIA|ASIA)[A-Z0-9]{16}$"
+    r"|[0-9a-fA-F]{32}"
+)
+
+
+def _provider_reference_check(column: str) -> CheckConstraint:
+    return CheckConstraint(
+        f"{column} IS NULL OR (length({column}) <= {PROVIDER_REFERENCE_MAX_LENGTH} "
+        f"AND {column} ~ '{PROVIDER_REFERENCE_PATTERN}' "
+        f"AND {column} !~ '{PROVIDER_REFERENCE_DENY_PATTERN}')",
+        name=f"provider_installations_{column}_ck",
+    )
+
+
+class ProviderInstallation(Base):
+    """One channel identity: a bot speaking through one connected account.
+
+    #2909, ADR 0166 step 4, as amended by ADR 0168 decision 1: "An identity is
+    a provider installation." ``name`` is unique within the provider and tenant
+    and is what a binding's ``adapter`` names (decision 3): one Slack workspace
+    with two bots is two rows sharing one ``external_account_id`` but never a
+    ``name``. ``attributes`` holds whatever that provider's identity needs
+    beyond the fixed columns -- for Slack, the app-token reference alongside
+    ``credential_ref``'s bot-token reference, and later the team, app and bot
+    user ids once something resolves them.
+
+    ``credential_ref`` and ``webhook_verification_ref`` point into the
+    deployment's secret store; the CHECKs hold them to the reference grammar
+    and refuse well-known credential shapes, whoever writes them.
+    ``disconnected_at`` is set exactly while the row is disconnected. The
+    installer FK carries ``tenant_id``, so the installer must be a principal
+    of the same tenant.
+    """
+
+    __tablename__ = "provider_installations"
+    __table_args__ = (
+        CheckConstraint(
+            "provider IN ('slack', 'm365', 'github', 'jira', 'linear', "
+            "'confluence', 'quickbooks', 'other')",
+            name="provider_installations_provider_ck",
+        ),
+        CheckConstraint(
+            "status IN ('connected', 'disconnected', 'degraded')",
+            name="provider_installations_status_ck",
+        ),
+        CheckConstraint(
+            "(status = 'disconnected') = (disconnected_at IS NOT NULL)",
+            name="provider_installations_disconnected_at_ck",
+        ),
+        _provider_reference_check("credential_ref"),
+        _provider_reference_check("webhook_verification_ref"),
+        ForeignKeyConstraint(
+            ["tenant_id", "installed_by_principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="provider_installations_installer_fkey",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "name",
+            name="provider_installations_tenant_provider_name_key",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="provider_installations_tenant_id_fkey")
+    )
+    provider: Mapped[str] = mapped_column(String)
+    # Unique with (tenant_id, provider); what a binding's `adapter` names
+    # (ADR 0168 decision 3). "default" is the one identity an install need not
+    # name explicitly.
+    name: Mapped[str] = mapped_column(String, default="default", server_default="default")
+    external_account_id: Mapped[str] = mapped_column(String)
+    display_name: Mapped[str | None] = mapped_column(default=None)
+    credential_ref: Mapped[str | None] = mapped_column(default=None)
+    scopes: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
+    webhook_verification_ref: Mapped[str | None] = mapped_column(default=None)
+    # Provider-specific identity details that don't fit a fixed column (ADR
+    # 0168 decision 1): for Slack, today just the app-token reference; later,
+    # once something resolves them, the team/app/bot user ids.
+    attributes: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default="{}")
+    status: Mapped[str] = mapped_column(String, default="connected", server_default="connected")
+    installed_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    installed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    disconnected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )

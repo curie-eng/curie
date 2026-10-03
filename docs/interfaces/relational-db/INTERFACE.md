@@ -44,10 +44,11 @@ PostgreSQL 16:
 - **Two engines, one DSN** (`apps/api/src/curie_api/db.py::create_engine`, `apps/worker/src/curie_worker/run.py::build`): the API and the worker each build their own `create_async_engine(...)` from their own `database_url` setting (`apps/api/src/curie_api/config.py::Settings`, `apps/worker/src/curie_worker/config.py::WorkerConfig`), both read from `DATABASE_URL`, so a swap repoints both services. The worker never imports the API's models: it reaches the schema through hand-written SQL, both reading (`apps/worker/src/curie_worker/binding.py::_RESOLVE_SQL`, `apps/worker/src/curie_worker/binding.py::_UNDEPLOYED_BINDING_SQL`, `apps/worker/src/curie_worker/connector_loop.py::_TARGETS_SQL`) and writing (`apps/worker/src/curie_worker/publication_store.py::PostgresPublicationStore` updates `publications` / `approvals` under `FOR UPDATE ... SKIP LOCKED`). Table and column names are a second, ORM-independent coupling a conforming DB must honor.
 - **Migrations**: the target DB must apply the **whole Alembic chain in `apps/api/alembic/versions/`**, in revision order, ending at `alembic heads`. The chain grows with the product, so it is deliberately not enumerated here: `ls apps/api/alembic/versions/` is the list, and `alembic heads` is the tip a conforming DB must reach. A single head is the invariant — a fork means two branches each added a migration (rebase and merge the heads before swapping anything). Two recent expand revisions make authenticated review feedback part of this schema contract: `0042_review_lineage_authority.py` adds immutable App-observed authority to publication lineages and the `publication_review_reservations` concurrency table; `0043_github_review_feedback.py` adds the `github_review_deliveries` audit table and the `github_review_feedback` durable feedback/outbox table. The latter stores normalized feedback and a credential-free queued turn, never a raw webhook body or GitHub credential.
 
-The application schema window keeps minimum `0070` and advances its head to
-`0073`, as recorded in `apps/api/src/curie_api/schema_compat.json`. Polling
-cursor migration `0073` follows `0072`; both existing next migrations, `0071`
-and `0072`, remain in the chain.
+The application schema window keeps minimum `0074` and advances its head to
+`0075`, as recorded in `apps/api/src/curie_api/schema_compat.json`. The v0.12.0
+release raised the minimum to `0074` (`0074_agent_deploy_notifications.py`,
+following polling cursor migration `0073`). Provider installations migration
+`0075` follows it.
 
 ## Implementations today
 
@@ -83,7 +84,10 @@ is a judgement call, not something derivable from the tree.
    per hook (ADR-0134, Draft). `source_bindings` holds the operator-controlled
    workload-to-allowlisted-repository map for inbound hooks (#2572). The review-feedback
    outbox likewise stores a normalized `feedback` object and credential-free serialized
-   `turn` as JSONB.
+   `turn` as JSONB. `scopes` is `apps/api/src/curie_api/models.py::ProviderInstallation.scopes`,
+   the list of provider scopes granted to one channel identity (#2909); `attributes` is
+   the same class's `attributes`, provider-specific identity details that don't fit a
+   fixed column, such as a Slack identity's extra token reference (ADR-0168 decision 1).
 4. **Raw dialect-specific SQL outside the ORM** — `DISTINCT ON`, which is Postgres-only,
    is written by hand in `apps/api/src/curie_api/commitpoller.py::_DEPLOYED_SQL` (executed
    through `text(...)` in `apps/api/src/curie_api/commitpoller.py::CommitPoller.poll_once`)
