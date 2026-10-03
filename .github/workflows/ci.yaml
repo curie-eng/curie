@@ -174,7 +174,7 @@ jobs:
       - name: Start dev stack
         id: dev-stack
         if: steps.python-runtime.outputs.pytest == 'true'
-        run: python3 scripts/wait-for-langfuse.py --start
+        run: python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480
       # Recheck authenticated web reads and worker readiness at the test
       # boundary. A running container alone does not prove usable Langfuse.
       - name: Wait for Langfuse to serve

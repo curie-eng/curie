@@ -96,7 +96,7 @@ jobs:
       # as the Python job before executing any pinned integration selector.
       - name: Start dev stack
         if: steps.fix-pin-curie.outputs.needed == 'true'
-        run: python3 scripts/wait-for-langfuse.py --start
+        run: python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480
       - name: Wait for Langfuse to serve
         if: steps.fix-pin-curie.outputs.needed == 'true'
         run: python3 scripts/wait-for-langfuse.py

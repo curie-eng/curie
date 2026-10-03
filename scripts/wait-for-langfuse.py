@@ -59,6 +59,15 @@ class Readiness:
         return remaining
 
     def run(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        phase = {
+            "up": "startup",
+            "wait": "bucket initialization",
+            "ps": "container state",
+            "logs": "migration inspection",
+            "exec": "worker probe",
+        }.get(arguments[0], "unknown operation")
+        # Compose output can include deployment details or credentials. Publish
+        # only these fixed phase names and numeric exit codes; withhold raw output.
         try:
             result = subprocess.run(
                 [*self.compose, *arguments],
@@ -69,12 +78,14 @@ class Readiness:
             )
         except subprocess.TimeoutExpired:
             raise TimeoutError(
-                "Langfuse readiness deadline expired during Compose command"
+                "Langfuse readiness deadline expired during Compose command "
+                f"(phase={phase}, exit code unavailable)"
             ) from None
         if check and result.returncode != 0:
-            # Compose output and migration logs can carry deployment details.
-            # Inspect them locally without publishing the raw text to CI logs.
-            raise RuntimeError("Langfuse readiness Compose command failed")
+            raise RuntimeError(
+                "Langfuse readiness Compose command failed "
+                f"(phase={phase}, exit code={result.returncode})"
+            )
         return result
 
     def state(self, service: str) -> str:

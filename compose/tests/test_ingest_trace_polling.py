@@ -84,6 +84,42 @@ def test_observe_trace_query_recovers_from_exit_three_then_complete_membership(
     ]
 
 
+def test_observe_trace_query_preserves_valid_evidence_after_not_found_reads(
+    tmp_path: Path,
+) -> None:
+    result, count = _query(tmp_path, [
+        (0, _trace("curie.queue.enqueue")),
+        (1, {"error": "exact trace not found", "fix": "retry exact id"}),
+        (1, {"error": "exact trace not found", "fix": "retry exact id"}),
+    ])
+
+    assert result.returncode == 0, result.stderr
+    assert count == 3
+    evidence = json.loads(result.stdout)
+    assert evidence["trace_id"] == TRACE_ID
+    assert evidence["observation_count"] == 1
+    assert evidence["operation"] == ["curie.queue.enqueue"]
+    assert evidence["observation_type"] == ["SPAN"]
+
+
+def test_observe_trace_query_preserves_last_valid_evidence_after_exit_three(
+    tmp_path: Path,
+) -> None:
+    result, count = _query(tmp_path, [
+        (0, _trace("curie.queue.enqueue")),
+        (0, _trace("curie.queue.enqueue", "agent.run")),
+        (3, {"error": "backend query failed", "fix": "retry exact id"}),
+    ])
+
+    assert result.returncode == 0, result.stderr
+    assert count == 3
+    evidence = json.loads(result.stdout)
+    assert evidence["trace_id"] == TRACE_ID
+    assert evidence["observation_count"] == 2
+    assert evidence["operation"] == ["agent.run", "curie.queue.enqueue"]
+    assert evidence["observation_type"] == ["SPAN"]
+
+
 @pytest.mark.parametrize("mode", ["observe", "present"])
 def test_trace_query_persistent_errors_fail_without_absence_evidence(
     tmp_path: Path, mode: str,
@@ -91,6 +127,21 @@ def test_trace_query_persistent_errors_fail_without_absence_evidence(
     result, count = _query(tmp_path, [
         (3, {"error": "backend query failed", "fix": "retry exact id"}),
     ], mode=mode)
+
+    assert result.returncode == 1
+    assert count == 3
+    assert result.stdout == ""
+    assert "query-error" in result.stderr
+
+
+def test_observe_trace_query_error_then_absence_fails_without_valid_evidence(
+    tmp_path: Path,
+) -> None:
+    result, count = _query(tmp_path, [
+        (3, {"error": "backend query failed", "fix": "retry exact id"}),
+        (1, {"error": "exact trace not found", "fix": "retry exact id"}),
+        (1, {"error": "exact trace not found", "fix": "retry exact id"}),
+    ])
 
     assert result.returncode == 1
     assert count == 3

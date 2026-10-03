@@ -480,7 +480,10 @@ def _require_query_success(response: dict[str, Any]) -> str:
         normalized = text.lower()
         refused = re.search(r"\b(?:401|403)\b", normalized) or any(
             marker in normalized
-            for marker in ("authorization", "credential", "forbidden", "permission", "refused")
+            for marker in (
+                "authorization", "credential", "forbidden", "permission",
+                "refused the request", "refused datasource discovery",
+            )
         )
         temporary = re.search(r"\b(?:404|429|500|502|503|504)\b", normalized) or any(
             marker in normalized

@@ -1340,12 +1340,12 @@ PY
         echo "exact trace remained not-found through the full bounded observation poll"
         return 0
     fi
-    if [[ "$expected_state" == "observe" && "$saw_valid" == "1" && "$last_query_state" == "incomplete-membership" ]]; then
+    if [[ "$expected_state" == "observe" && "$saw_valid" == "1" ]]; then
         cat "$safe_read"
         rm -f "$private_read" "$safe_read"
         return 0
     fi
-    if [[ "$expected_state" == "observe" && "$saw_query_error" == "0" && "$last_query_state" == "not-found" ]]; then
+    if [[ "$expected_state" == "observe" && "$saw_valid" == "0" && "$saw_query_error" == "0" && "$last_query_state" == "not-found" ]]; then
         LAST_QUERY_MEMBERSHIP="false"
         LAST_QUERY_OBSERVATION_COUNT="0"
         python3 - "$trace_id" <<'PY'

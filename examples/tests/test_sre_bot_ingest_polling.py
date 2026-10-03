@@ -99,6 +99,28 @@ def test_connector_poll_retries_query_error_then_waits_for_marker(
 
 
 @pytest.mark.parametrize("candidate", [False, True])
+def test_connector_poll_retries_connection_refused_then_waits_for_marker(
+    monkeypatch: pytest.MonkeyPatch, stack: runtime.RuntimeStack, clock: Clock,
+    candidate: bool,
+) -> None:
+    # The shipped Tempo connector wraps httpx transport failures with this
+    # prefix: examples/sre-bot/connectors/tempo/server.py::_proxy.
+    budgets = _replay(monkeypatch, [
+        _result("could not reach Grafana: [Errno 111] Connection refused", error=True),
+        _result('{"traces": []}'),
+        _result('{"traces": [{"name": "example-marker"}]}'),
+    ], candidate=candidate)
+    poll = stack.eventually_candidate_call_text if candidate else stack.eventually_call_text
+
+    result = poll("tempo", "query", {}, "example-marker", timeout=3)
+
+    assert "example-marker" in result
+    assert len(budgets) == 3
+    assert budgets == [3, 2, 1]
+    assert clock.elapsed == 2
+
+
+@pytest.mark.parametrize("candidate", [False, True])
 def test_connector_poll_persistent_query_error_obeys_deadline(
     monkeypatch: pytest.MonkeyPatch, stack: runtime.RuntimeStack, clock: Clock, candidate: bool,
 ) -> None:
