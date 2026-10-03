@@ -938,6 +938,21 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/release-record-size-assertions.sh
 
+      # Prove the candidate templates render on a PREVIOUS release's values,
+      # the way `helm upgrade --reuse-values` hands them over (#3813). Every
+      # other render here uses the candidate's own values.yaml, where every
+      # key exists, so a template dereferencing a key an older release never
+      # had (`placement` #2008, `langfuse.eventUpload`, `connectorCaller`
+      # #3505) passed them all and broke the upgrade. The step downloads the
+      # newest stable chart artifact and a pinned v0.10.3, and carries a
+      # negative control that reverts #3544's connectorCaller guard.
+      - name: helm render assertions (previous release reuse-values render)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/reuse-values-render-assertions.sh
+
   chart-assertions-retained-values:
     name: Chart render assertions (3 of 3, retained values through the real CLI)
     runs-on: ubuntu-latest
