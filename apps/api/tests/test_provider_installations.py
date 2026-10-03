@@ -1250,10 +1250,10 @@ def test_lifespan_retries_until_table_appears(
     isolated_migration_db: None, env: pytest.MonkeyPatch, auth_headers: dict[str, str]
 ) -> None:
     config = _alembic_config()
-    # 0071, not further below: schema_min has since risen to 0070, so a real
-    # boot can only be one migration behind this one, never at an arbitrary
-    # earlier revision.
-    command.upgrade(config, "0071")
+    # 0074, not further below: schema_min has since risen to 0074 (the v0.12.0
+    # release), so a real boot can only be one migration behind this one,
+    # never at an arbitrary earlier revision.
+    command.upgrade(config, "0074")
     try:
         with _app(env, CANARY):
             # Boot succeeded below this migration; it now lands while the API runs.

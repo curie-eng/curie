@@ -49,7 +49,7 @@ from .models import (
     PROVIDER_REFERENCE_PATTERN,
     ProviderInstallation,
 )
-from .schemas import ProviderInstallationCreate, ProviderInstallationUpdate
+from .schemas.provider_installations import ProviderInstallationCreate, ProviderInstallationUpdate
 
 _LOG = logging.getLogger("curie_api.provider_installations")
 

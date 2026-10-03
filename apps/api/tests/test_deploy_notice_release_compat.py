@@ -31,12 +31,14 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     """@spec DEPLOY-NOTICE-RELEASE-1."""
     catalog = json.loads((ROOT / "cli/src/application_schema_windows.json").read_text())
     released = {"schema_min": "0070", "schema_head": "0073"}
-    candidate = {"schema_min": "0074", "schema_head": "0074"}
+    # The candidate keeps moving as later migrations land (#2909 added 0075);
+    # the point of this test is that `released` above never does.
+    candidate = {"schema_min": "0074", "schema_head": "0075"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == candidate
-    assert catalog["revisions"][-3:] == ["0072", "0073", "0074"]
+    assert catalog["revisions"][-4:] == ["0072", "0073", "0074", "0075"]
     for name in (
         "apps/api/src/curie_api/schema_compat.json",
         "charts/curie/files/schema-compat.json",

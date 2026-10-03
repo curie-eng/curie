@@ -21,7 +21,7 @@ from fastapi.routing import APIRoute
 from .. import provider_installations as installations
 from ..auth import require_platform_key
 from ..deps import SessionDep
-from ..schemas import (
+from ..schemas.provider_installations import (
     ProviderInstallationCreate,
     ProviderInstallationOut,
     ProviderInstallationUpdate,
