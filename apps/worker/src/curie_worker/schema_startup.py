@@ -4,19 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
+from collections.abc import Callable
 
 from curie_protected_hooks.schema_serving import SchemaServingUnavailable, assert_servable
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from .config import WorkerConfig
+from .worker_lifecycle import fatal_worker_exit, worker_warning
 
 logger = logging.getLogger(__name__)
 
 
-def _record_primary(error: BaseException) -> None:
+def _primary_code(error: BaseException | None) -> str:
     """@spec PROTECTED-HOOK-SOURCE-2."""
-    code = "schema_probe_unavailable"
+    code = "none" if error is None else "schema_probe_unavailable"
     if isinstance(error, asyncio.CancelledError):
         code = "cancelled"
     elif isinstance(error, SchemaServingUnavailable) and error.code in {
@@ -28,17 +29,20 @@ def _record_primary(error: BaseException) -> None:
         "schema_structure_unavailable",
     }:
         code = error.code
-    logger.warning("worker_schema_primary cause=%s", code)
+    return code
 
 
-async def _dispose_probe(engine: AsyncEngine) -> None:
+async def _dispose_probe(engine: AsyncEngine, primary_code: Callable[[], str]) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
     close = asyncio.create_task(engine.dispose())
     _, pending = await asyncio.wait({close}, timeout=5)
     if pending:
-        logger.error("worker_schema_cleanup_deadline")
-        os._exit(1)
-    await close
+        fatal_worker_exit(logger, "worker_schema_cleanup_deadline", primary_code())
+    try:
+        await close
+    except (Exception, asyncio.CancelledError):
+        await worker_warning(logger, "schema_cleanup_unavailable", primary_code())
+        raise
 
 
 async def assert_worker_schema(config: WorkerConfig) -> None:
@@ -52,15 +56,13 @@ async def assert_worker_schema(config: WorkerConfig) -> None:
         await assert_servable(engine, metadata_schema=config.db_schema)
     except BaseException as error:
         primary = error
-        _record_primary(error)
-    cleanup = asyncio.create_task(_dispose_probe(engine))
+    cleanup = asyncio.create_task(_dispose_probe(engine, lambda: _primary_code(primary)))
     while not cleanup.done():
         try:
             await asyncio.shield(cleanup)
         except asyncio.CancelledError as error:
             if primary is None:
                 primary = error
-                _record_primary(error)
         except Exception:
             break
     try:
@@ -68,6 +70,5 @@ async def assert_worker_schema(config: WorkerConfig) -> None:
     except (Exception, asyncio.CancelledError):
         if primary is None:
             raise SchemaServingUnavailable("schema_cleanup_unavailable") from None
-        logger.warning("schema_cleanup_unavailable")
     if primary is not None:
         raise primary
