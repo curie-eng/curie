@@ -7366,6 +7366,37 @@ mod tests {
         rest.split_whitespace().next()?.chars().next()
     }
 
+    /// Pid of the shim, published on `ready` only after that stub has exec'd.
+    #[cfg(target_os = "linux")]
+    fn pid_published_on(ready: std::fs::File) -> u32 {
+        use std::os::fd::AsRawFd;
+
+        let fd = ready.as_raw_fd();
+        // SAFETY: `fd` is the open fifo this function owns, and these fcntl
+        // commands only change that descriptor's flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "read fifo flags");
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "mark the readiness fifo nonblocking"
+        );
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pollfd` points at one stack descriptor for this fifo.
+        let ready_count = unsafe { libc::poll(&raw mut pollfd, 1, 10_000) };
+        assert_eq!(ready_count, 1, "the shim never published its pid");
+        let mut buf = [0u8; 64];
+        // SAFETY: `buf` is writable storage and `fd` is the same open fifo.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        assert!(n > 0, "the readiness fifo closed before a pid");
+        let line = std::str::from_utf8(&buf[..n as usize]).expect("pid is utf 8");
+        line.trim().parse().expect("the recorded pid is a number")
+    }
+
     /// #1031(d), second half: bounding the WAIT is not bounding the WORK. A
     /// timeout that only drops the future leaves the `docker` client running
     /// against the wedged daemon, so every timed-out `local message` strands
@@ -7376,30 +7407,57 @@ mod tests {
     #[tokio::test]
     async fn a_timed_out_probe_kills_the_docker_child_it_abandoned() {
         let temp = tempfile::tempdir().expect("create temporary directory");
-        let pidfile = temp.path().join("pid");
+        let ready_path = temp.path().join("ready");
+        use std::os::unix::ffi::OsStrExt;
+        let ready_c =
+            std::ffi::CString::new(ready_path.as_os_str().as_bytes()).expect("ready fifo path");
+        assert_eq!(
+            unsafe { libc::mkfifo(ready_c.as_ptr(), 0o600) },
+            0,
+            "create the readiness fifo: {}",
+            std::io::Error::last_os_error()
+        );
+        // Hold the fifo open for read and write before spawn. The shim's
+        // `echo` then cannot block waiting for a reader, and it cannot finish
+        // the write before this descriptor exists.
+        let ready = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&ready_path)
+            .expect("open readiness fifo");
         let script = temp.path().join("wedged-docker");
         crate::test_executable::install(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 60\n");
+        // Exec only after the stub's write descriptor is gone. A read-only
+        // reopen that we drop is the barrier: `install` has already synced
+        // and closed its own write.
+        drop(std::fs::File::open(&script).expect("stub is closed"));
 
         let cmd = OpsCommand::new(
             script.to_str().expect("shim path is UTF 8"),
-            vec![plain(pidfile.to_str().expect("pidfile path is UTF 8"))],
+            vec![plain(ready_path.to_str().expect("ready path is UTF 8"))],
         );
-        let reason = bounded_worker_probe(
-            async {
-                let (_ok, _out, _err) = run_capture(&cmd).await?;
-                Ok((None, None))
-            },
-            Duration::from_millis(300),
+        let probe = tokio::spawn(async move {
+            bounded_worker_probe(
+                async {
+                    let (_ok, _out, _err) = run_capture(&cmd).await?;
+                    Ok((None, None))
+                },
+                Duration::from_millis(300),
+            )
+            .await
+        });
+        let published = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || pid_published_on(ready)),
         )
         .await
-        .expect_err("a shim that never answers must time out");
+        .expect("the shim never published its pid");
+        let pid = published.expect("readiness read task");
+        let reason = probe
+            .await
+            .expect("probe task")
+            .expect_err("a shim that never answers must time out");
         assert!(reason.contains("did not answer within"), "{reason}");
-
-        let pid: u32 = std::fs::read_to_string(&pidfile)
-            .expect("the shim recorded its pid before sleeping")
-            .trim()
-            .parse()
-            .expect("the recorded pid is a number");
 
         // The kill is delivered on drop; give the kernel a moment to land it.
         let mut state = proc_state(pid);
