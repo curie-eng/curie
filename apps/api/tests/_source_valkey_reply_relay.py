@@ -94,7 +94,10 @@ class GenuineReplyRelay:
                 if current is not None:
                     self.writers.discard(current)
                     current.close()
-                    await current.wait_closed()
+                    try:
+                        await current.wait_closed()
+                    except ConnectionError:
+                        pass
             self.tasks.discard(task)
 
     async def close(self) -> None:
