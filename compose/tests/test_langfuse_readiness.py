@@ -36,32 +36,75 @@ calls = [json.loads(row[0]) for row in db.execute("SELECT arguments FROM calls")
 args = sys.argv[1:]
 scenario = os.environ["FAKE_DOCKER_SCENARIO"]
 retries = sum("--force-recreate" in call for call in calls)
-if "ps" in args:
-    service = args[-1]
+
+def command(call):
+    if not call or call[0] != "compose":
+        raise SystemExit(97)
+    index = 1
+    while index < len(call) and call[index] in {"-p", "-f"}:
+        index += 2
+    return call[index:]
+
+current = command(args)
+prior = [command(call) for call in calls[:-1]]
+backing = ["postgres", "valkey", "clickhouse", "rustfs"]
+if current == ["wait", "rustfs-init"]:
+    # Compose 2.24.4 includes wait; it propagates the container exit status:
+    # https://github.com/docker/compose/blob/v2.24.4/cmd/compose/wait.go
+    raise SystemExit(23 if scenario == "bucket-failure" else 0)
+elif current and current[0] == "up":
+    if current == ["up", "-d", *backing, "rustfs-init"]:
+        pass
+    elif current[:4] == ["up", "-d", "--wait", "--wait-timeout"]:
+        if len(current) < 6 or not current[4].isdigit() or int(current[4]) <= 0:
+            raise SystemExit(97)
+        if current[5:] not in [backing, ["langfuse-worker", "otel-collector"]]:
+            raise SystemExit(97)
+    elif current not in [
+        ["up", "-d", "--no-deps", "langfuse-web"],
+        ["up", "-d", "--no-deps", "--force-recreate", "langfuse-web"],
+    ]:
+        raise SystemExit(97)
+    if any(service in current for service in ["langfuse-web", "langfuse-worker"]):
+        if ["wait", "rustfs-init"] not in prior:
+            raise SystemExit(96)
+elif current[:4] == ["ps", "--all", "--format", "json"]:
+    service = current[-1]
+    if service not in {"langfuse-web", "langfuse-worker"} or len(current) != 5:
+        raise SystemExit(97)
     failed = service == "langfuse-web" and (
         scenario in {"repeated-deadlock", "migration-failure"}
         or (scenario == "deadlock-once" and retries == 0)
     )
+    running = service != "langfuse-worker" or any(
+        call[0] == "up" and "langfuse-worker" in call for call in prior
+    )
     print(json.dumps([{"Service": service,
-                      "State": "exited" if failed else "running",
+                      "State": "exited" if failed else "running" if running else "created",
                       "ExitCode": 1 if failed else 0}]))
-elif "logs" in args:
+elif current == ["logs", "--no-color", "--tail=200", "langfuse-web"]:
     if scenario == "migration-failure":
         print("Prisma migrate deploy failed: migration checksum mismatch")
     else:
         # PostgreSQL reports migration deadlock as SQLSTATE 40P01:
         # https://www.postgresql.org/docs/current/errcodes-appendix.html
         print("Prisma migrate deploy failed: ERROR deadlock detected SQLSTATE 40P01")
-elif "exec" in args:
+elif current[:5] == ["exec", "-T", "langfuse-worker", "node", "-e"]:
+    if len(current) != 6 or "http://langfuse-worker:3030/api/ready" not in current[-1]:
+        raise SystemExit(97)
     checks = sum("exec" in call for call in calls)
     raise SystemExit(0 if checks >= int(os.environ["FAKE_WORKER_READY_AFTER"]) else 1)
+else:
+    raise SystemExit(97)
 '''
 
 
 @pytest.fixture
-def web() -> Iterator[tuple[str, list[tuple[str, str | None]]]]:
+def web(request: pytest.FixtureRequest) -> Iterator[tuple[str, list[tuple[str, str | None]]]]:
     reads: list[tuple[str, str | None]] = []
     expected_auth = "Basic " + base64.b64encode(b"example-public:example-secret").decode()
+    refused_status = getattr(request, "param", None)
+    assert refused_status in (None, 401, 403)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -73,7 +116,9 @@ def web() -> Iterator[tuple[str, list[tuple[str, str | None]]]]:
             if self.path == "/api/public/health":
                 status, body = 200, {"status": "OK"}
             elif self.path.startswith("/api/public/traces?"):
-                if self.headers.get("Authorization") == expected_auth:
+                if refused_status is not None:
+                    status, body = refused_status, {"message": "Read refused"}
+                elif self.headers.get("Authorization") == expected_auth:
                     status, body = 200, {"data": [], "meta": {"page": 1, "limit": 1}}
                 else:
                     status, body = 401, {"message": "Unauthorized"}
@@ -242,6 +287,49 @@ def test_readiness_waits_for_worker_and_keeps_exact_compose_contract(
     # Compose service DNS name on the observed port and path.
     assert all("http://langfuse-worker:3030/api/ready" in call[-1] for call in worker_checks)
     assert not any("--force-recreate" in call for call in calls)
+    bucket_waits = [index for index, call in enumerate(calls)
+                    if call[-2:] == ["wait", "rustfs-init"]]
+    web_starts = [index for index, call in enumerate(calls)
+                  if "up" in call and call[-1] == "langfuse-web"]
+    worker_starts = [index for index, call in enumerate(calls)
+                     if "up" in call and "langfuse-worker" in call]
+    worker_probes = [index for index, call in enumerate(calls) if "exec" in call]
+    assert len(bucket_waits) == len(web_starts) == len(worker_starts) == 1
+    assert bucket_waits[0] < web_starts[0] < worker_starts[0] < worker_probes[0]
+
+
+def test_readiness_failed_bucket_initialization_stops_web_and_worker_startup(
+    tmp_path: Path, web: tuple[str, list[tuple[str, str | None]]],
+) -> None:
+    result, calls, _ = _run(tmp_path, web[0], scenario="bucket-failure")
+
+    assert result.returncode == 1
+    assert len([call for call in calls if call[-2:] == ["wait", "rustfs-init"]]) == 1
+    assert not any("up" in call and "langfuse-web" in call for call in calls)
+    assert not any("up" in call and "langfuse-worker" in call for call in calls)
+    assert not any("--force-recreate" in call or "exec" in call for call in calls)
+    assert web[1] == []
+    assert result.stderr.strip() == (
+        "Langfuse readiness Compose command failed (phase=bucket initialization, exit code=23)"
+    )
+
+
+@pytest.mark.parametrize("web", [401, 403], indirect=True)
+def test_readiness_authenticated_read_refusal_stops_worker_startup_without_retry(
+    tmp_path: Path, web: tuple[str, list[tuple[str, str | None]]],
+) -> None:
+    result, calls, _ = _run(tmp_path, web[0], scenario="healthy")
+
+    assert result.returncode == 1
+    assert result.stderr.strip() == "Langfuse readiness authenticated read was refused"
+    expected_auth = "Basic " + base64.b64encode(b"example-public:example-secret").decode()
+    assert web[1] == [
+        ("/api/public/health", None), ("/api/public/traces?limit=1", expected_auth),
+    ]
+    assert len([call for call in calls if "ps" in call and call[-1] == "langfuse-web"]) == 1
+    assert not any("--force-recreate" in call or "logs" in call for call in calls)
+    assert not any("up" in call and "langfuse-worker" in call for call in calls)
+    assert not any("exec" in call for call in calls)
 
 
 def test_readiness_retries_migration_deadlock_exactly_once(

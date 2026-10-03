@@ -235,7 +235,8 @@ is an exception to the CLI entry point guidance in `CLAUDE.md`.
    `CURIE_RELEASED_UPGRADE_POSTGRES_PORT`. Also export matching
    `TEST_VALKEY_HOST`, `TEST_VALKEY_PORT`, `TEST_S3_ENDPOINT_URL`,
    `TEST_LANGFUSE_HOST`, and `TEST_OTEL_COLLECTOR_ENDPOINT`. The baseline derives
-   runtime consumer variables and the Langfuse health URL from those values.
+   runtime consumer variables from those values, and the readiness helper reads
+   `TEST_LANGFUSE_HOST` for its web endpoint.
    For example:
 
    ```bash
