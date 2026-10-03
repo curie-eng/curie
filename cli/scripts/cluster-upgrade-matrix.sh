@@ -506,6 +506,112 @@ raise SystemExit(0 if ok else 1)
     rm -rf "$timing_dir"
     EVIDENCE_DIR="$saved_evidence"
     GITHUB_STEP_SUMMARY="$saved_summary"
+    if awk '/^cluster_upgrade\(\)/,/^}/' "$script_path" | awk '
+        /settle_helm_operation/ { if (!upgrade) settled=1 }
+        /cluster upgrade --yes/ { upgrade=1 }
+        END { exit (settled && upgrade) ? 0 : 1 }
+    '; then
+        log "cluster_upgrade settles helm before the next upgrade"
+    else
+        log "self-test: cluster_upgrade must settle a pending helm operation before the next upgrade"
+        failed=1
+    fi
+    if ! declare -F settle_helm_operation >/dev/null 2>&1; then
+        log "self-test: settle_helm_operation is missing"
+        failed=1
+    else
+        local probe bindir state logf saved_ns saved_kube saved_wait
+        probe="$(mktemp -d)"
+        bindir="$probe/bin"
+        state="$probe/state"
+        logf="$probe/log"
+        mkdir -p "$bindir" "$state"
+        cat >"$bindir/kubectl" <<EOF
+#!/bin/bash
+printf '%s\\n' "\$*" >>"$logf"
+if [[ "\$1" == "--kubeconfig" ]]; then
+    shift 2
+fi
+if [[ "\$1" == "get" && "\$2" == "namespace" ]]; then
+    if [[ -f "$state/phase" ]]; then
+        cat "$state/phase"
+        exit 0
+    fi
+    exit 1
+fi
+if [[ "\$1" == "create" && "\$2" == "namespace" ]]; then
+    printf 'Active' >"$state/phase"
+    exit 0
+fi
+exit 0
+EOF
+        cat >"$bindir/helm" <<EOF
+#!/bin/bash
+printf '%s\\n' "\$*" >>"$logf"
+cmd=""
+for arg in "\$@"; do
+    if [[ "\$arg" == "status" || "\$arg" == "rollback" ]]; then
+        cmd="\$arg"
+    fi
+done
+if [[ "\$cmd" == "status" ]]; then
+    if [[ -f "$state/rolled" ]]; then
+        printf '%s\\n' '{"info":{"status":"deployed"}}'
+    elif [[ "\$(cat "$state/mode" 2>/dev/null)" == "pending" ]]; then
+        printf '%s\\n' '{"info":{"status":"pending-upgrade"}}'
+    else
+        printf '%s\\n' '{"info":{"status":"deployed"}}'
+    fi
+    exit 0
+fi
+if [[ "\$cmd" == "rollback" ]]; then
+    printf '1' >"$state/rolled"
+    exit 0
+fi
+exit 0
+EOF
+        chmod +x "$bindir/kubectl" "$bindir/helm"
+        saved_ns="$NAMESPACE"
+        saved_kube="$KUBECONFIG_FILE"
+        saved_wait="${CURIE_HELM_SETTLE_WAIT_SECONDS-}"
+        NAMESPACE="acme-2590"
+        KUBECONFIG_FILE="$probe/kubeconfig"
+        export CURIE_HELM_SETTLE_WAIT_SECONDS=0
+        export PATH="$bindir:$PATH"
+        printf 'pending' >"$state/mode"
+        if ! settle_helm_operation; then
+            log "self-test: pending helm with a missing namespace did not settle"
+            failed=1
+        elif [[ "$(cat "$state/phase" 2>/dev/null)" != "Active" || ! -f "$state/rolled" ]]; then
+            log "self-test: pending helm must create the namespace and roll back"
+            failed=1
+        elif ! grep -q 'create namespace acme-2590' "$logf"; then
+            log "self-test: namespace create was not issued"
+            failed=1
+        else
+            log "pending helm created the namespace and rolled back"
+        fi
+        rm -f "$state/rolled" "$logf"
+        printf 'Active' >"$state/phase"
+        printf 'deployed' >"$state/mode"
+        if ! settle_helm_operation; then
+            log "self-test: a deployed release in an Active namespace was refused"
+            failed=1
+        elif [[ -f "$state/rolled" ]] || grep -q 'create namespace' "$logf"; then
+            log "self-test: a healthy release must not create a namespace or roll back"
+            failed=1
+        else
+            log "healthy release left the namespace and helm release alone"
+        fi
+        NAMESPACE="$saved_ns"
+        KUBECONFIG_FILE="$saved_kube"
+        if [[ -n "$saved_wait" ]]; then
+            export CURIE_HELM_SETTLE_WAIT_SECONDS="$saved_wait"
+        else
+            unset CURIE_HELM_SETTLE_WAIT_SECONDS
+        fi
+        rm -rf "$probe"
+    fi
     (( failed == 0 )) || die "self-test failed"
     log "self-test passed"
     if (( JSON )); then
