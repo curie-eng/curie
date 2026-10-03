@@ -26,6 +26,7 @@
 mod field_parity;
 
 use field_parity::{violations, Violation};
+use quote::ToTokens;
 use serde_json::Value;
 
 // ─── Loaders ─────────────────────────────────────────────────────────────────
@@ -195,13 +196,30 @@ fn spec_rs_has_no_plugin_format_field_parity_violations() {
 #[test]
 fn spec_gate_rejects_an_existing_schema_field_removed_from_the_real_source() {
     let src = repo_text("cli/src/spec.rs");
-    let declaration = "    #[serde(default)]\n    pub summary: Option<String>,\n";
+    let mut parsed = syn::parse_file(&src).expect("the real spec source parses");
+    let gate = parsed
+        .items
+        .iter_mut()
+        .find_map(|item| match item {
+            syn::Item::Struct(item) if item.ident == "ApprovalGateSpec" => Some(item),
+            _ => None,
+        })
+        .expect("the real source defines ApprovalGateSpec");
+    let syn::Fields::Named(fields) = &mut gate.fields else {
+        panic!("ApprovalGateSpec has named fields");
+    };
+    let original_count = fields.named.len();
+    fields.named = std::mem::take(&mut fields.named)
+        .into_iter()
+        .filter(|field| field.ident.as_ref().is_none_or(|name| name != "summary"))
+        .collect();
     assert_eq!(
-        src.matches(declaration).count(),
-        1,
+        fields.named.len() + 1,
+        original_count,
         "the mutation must remove exactly ApprovalGateSpec.summary"
     );
-    let drifted = src.replacen(declaration, "", 1);
+    let drifted = parsed.to_token_stream().to_string();
+    syn::parse_file(&drifted).expect("the field mutation preserves valid Rust syntax");
     let schema = plugin_format_schema_as_components();
     let manifest = repo_json("cli/plugin-format-mirrors.json");
     let scoped = manifest_for_file(&manifest, "cli/src/spec.rs");

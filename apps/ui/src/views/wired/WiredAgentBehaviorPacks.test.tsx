@@ -45,6 +45,27 @@ beforeEach(() => {
 });
 
 describe("WiredAgentBehaviorPacks (#870)", () => {
+  it("renders and edits a config with omitted optional defaults", async () => {
+    // apps/api/openapi.json declares every BehaviorPacksConfig property optional.
+    vi.mocked(getBehaviorPacks).mockResolvedValue({} as BehaviorPacksConfig);
+    vi.mocked(putBehaviorPacks).mockImplementation(async (_id, cfg) => cfg);
+    renderPanel();
+
+    expect(await screen.findByTestId("load-lines")).toHaveValue("");
+    expect(screen.getByTestId("pack-toggle-load")).not.toBeChecked();
+    expect(screen.getByText("No settings declared.")).toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("pack-toggle-load"));
+    await userEvent.type(screen.getByTestId("load-lines"), "thinking");
+    await userEvent.click(screen.getByTestId("behavior-packs-save"));
+
+    await waitFor(() => expect(putBehaviorPacks).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(putBehaviorPacks).mock.calls[0][1].load).toEqual({
+      enabled: true,
+      lines: ["thinking"],
+    });
+    expect(await screen.findByTestId("behavior-packs-saved")).toHaveTextContent("Saved");
+  });
+
   it("renders every pack with its enabled state from the GET", async () => {
     vi.mocked(getBehaviorPacks).mockResolvedValue(
       makeConfig({ load: { enabled: true, lines: ["thinking…"] } }),
