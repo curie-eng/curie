@@ -351,7 +351,7 @@ class RunTracer:
             if provider is not None
             else trace.get_tracer("curie-runner")
         )
-        self._live_generation = None
+        self._live_generation: _GenerationSpan | None = None
 
     @contextmanager
     def run_span(
