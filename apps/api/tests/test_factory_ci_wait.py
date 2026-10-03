@@ -73,6 +73,24 @@ MARKER_RE = re.compile(r"^Curie wait_ci round ([23]) of 3: ")
 _PRS = iter(range(701, 799))
 
 
+@pytest.fixture
+def _metadata_ci(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    monkeypatch.setenv(
+        "GITHUB_FACTORY_METADATA_CI",
+        json.dumps(
+            {
+                REPO: {
+                    "checks": ["Publication description guard"],
+                    "statuses": [],
+                }
+            }
+        ),
+    )
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 # --- helpers -------------------------------------------------------------------
 
 
@@ -635,7 +653,9 @@ def test_a_green_fix_round_completes_the_same_request(admitted: Any) -> None:
     assert _count_requests(number) == 1
 
 
-def test_body_only_fix_revision_repolls_checks_on_the_same_head(admitted: Any) -> None:
+def test_body_only_fix_revision_repolls_checks_on_the_same_head(
+    admitted: Any, _metadata_ci: None
+) -> None:
     client, github, sink = admitted
     number = 9707
     old_time = "2020-01-01T00:00:00Z"
@@ -643,13 +663,15 @@ def test_body_only_fix_revision_repolls_checks_on_the_same_head(admitted: Any) -
     sink.ci_scripts = {
         HEAD_A: [
             ci_entry(
-                check_run("PR body (real newlines)", conclusion="failure", started_at=old_time)
+                check_run(
+                    "Publication description guard", conclusion="failure", started_at=old_time
+                )
             ),
             ci_entry(
-                check_run("PR body (real newlines)", started_at=old_time),
+                check_run("Publication description guard", started_at=old_time),
                 check_run("unrelated", started_at=new_time),
             ),
-            ci_entry(check_run("PR body (real newlines)", started_at=new_time)),
+            ci_entry(check_run("Publication description guard", started_at=new_time)),
         ]
     }
     published = _published(client, github, sink, number)
@@ -676,12 +698,49 @@ def test_body_only_fix_revision_repolls_checks_on_the_same_head(admitted: Any) -
     assert _count_requests(number) == 1
 
 
-def test_body_only_fix_waits_for_fresh_checks_then_ends_unverified(admitted: Any) -> None:
+def test_body_only_fix_without_a_metadata_policy_ends_unverified(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GITHUB_FACTORY_METADATA_CI", raising=False)
+    get_settings.cache_clear()
+    client, github, sink = admitted
+    number = 9792
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(check_run("Publication description guard", conclusion="failure")),
+            ci_entry(check_run("Publication description guard", started_at="2999-01-01T00:00:00Z")),
+        ]
+    }
+    published = _published(client, github, sink, number)
+    _reconcile()
+    assert len(_ci_turns(published["id"])) == 1
+    _attach_fix(
+        published["work_item_id"],
+        published["id"],
+        revision=2,
+        head_sha=HEAD_A,
+        title="Correct the pull request description",
+        paths=[],
+        base_sha=HEAD_A,
+    )
+
+    _reconcile()
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    assert len(_ci_turns(published["id"])) == 1
+    assert "Reason: metadata_ci_not_configured" in _body(sink, published["id"])
+
+
+def test_body_only_fix_waits_for_fresh_checks_then_ends_unverified(
+    admitted: Any, _metadata_ci: None
+) -> None:
     client, github, sink = admitted
     number = 9790
     old_time = "2020-01-01T00:00:00Z"
     new_time = "2999-01-01T00:00:00Z"
-    old_failure = check_run("PR body (real newlines)", conclusion="failure", started_at=old_time)
+    old_failure = check_run(
+        "Publication description guard", conclusion="failure", started_at=old_time
+    )
     sink.ci_scripts = {
         HEAD_A: [
             ci_entry(old_failure),
@@ -715,19 +774,31 @@ def test_body_only_fix_waits_for_fresh_checks_then_ends_unverified(admitted: Any
     assert "Reason: checks_not_rerun" in _body(sink, published["id"])
 
 
-def test_body_only_fix_reports_only_a_fresh_unrelated_failure(admitted: Any) -> None:
+def test_body_only_fix_reports_only_a_fresh_unrelated_failure(
+    admitted: Any, _metadata_ci: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "GITHUB_FACTORY_METADATA_CI",
+        json.dumps(
+            {REPO: {
+                "checks": ["Publication description guard"],
+                "statuses": ["ci/publication-description"],
+            }}
+        ),
+    )
+    get_settings.cache_clear()
     client, github, sink = admitted
     number = 9791
     old_time = "2020-01-01T00:00:00Z"
     new_time = "2999-01-01T00:00:00Z"
     old_failure = check_run(
-        "PR body (real newlines)",
+        "Publication description guard",
         conclusion="failure",
         summary="Old body failure",
         started_at=old_time,
     )
     old_status = {
-        "context": "ci/pr-body",
+        "context": "ci/publication-description",
         "state": "failure",
         "description": "Old status failure",
         "created_at": old_time,

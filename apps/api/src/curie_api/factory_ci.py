@@ -231,6 +231,24 @@ def python_ci_policy(settings: Settings, repo_full_name: str) -> PythonCiPolicy 
         pending_check_prefix=value.get("pendingCheckPrefix"),
     )
 
+
+@dataclass(frozen=True)
+class MetadataCiPolicy:
+    """Repository checks and statuses that must rerun after a metadata edit."""
+
+    checks: tuple[str, ...]
+    statuses: tuple[str, ...]
+
+
+def metadata_ci_policy(settings: Settings, repo_full_name: str) -> MetadataCiPolicy | None:
+    """The configured metadata policy, matched case insensitively."""
+
+    value = entry_for_repo(settings.github_factory_metadata_ci, repo_full_name)
+    if value is None:
+        return None
+    return MetadataCiPolicy(checks=tuple(value["checks"]), statuses=tuple(value["statuses"]))
+
+
 VerdictKind = Literal["green", "no_ci", "failing", "pending", "timed_out", "unverified"]
 GateResult = Literal["settled", "waiting", "fixing", "continued"]
 
@@ -315,11 +333,9 @@ def _fresh_ci_detail(detail: CiDetail, fresh_after: datetime) -> CiDetail:
     )
 
 
-_METADATA_EDIT_CHECKS = frozenset({"PR body (real newlines)", "Fix pin verification"})
-_METADATA_EDIT_STATUSES = frozenset({"ci/pr-body"})
-
-
-def _metadata_revision_detail(detail: CiDetail, fresh_after: datetime) -> CiDetail:
+def _metadata_revision_detail(
+    detail: CiDetail, fresh_after: datetime, metadata_ci: MetadataCiPolicy
+) -> CiDetail:
     fresh = _fresh_ci_detail(detail, fresh_after)
     fresh_names = {run.get("name") for run in fresh.check_runs}
     fresh_contexts = {item.get("context") for item in fresh.statuses}
@@ -328,12 +344,12 @@ def _metadata_revision_detail(detail: CiDetail, fresh_after: datetime) -> CiDeta
         check_runs=fresh.check_runs + [
             run for run in detail.check_runs
             if run.get("name") not in fresh_names
-            and run.get("name") not in _METADATA_EDIT_CHECKS
+            and run.get("name") not in metadata_ci.checks
         ],
         statuses=fresh.statuses + [
             item for item in detail.statuses
             if item.get("context") not in fresh_contexts
-            and item.get("context") not in _METADATA_EDIT_STATUSES
+            and item.get("context") not in metadata_ci.statuses
         ],
     )
 
@@ -347,6 +363,7 @@ def decide(
     ci_wait_seconds: int,
     changed_paths: Sequence[str],
     python_ci: PythonCiPolicy | None,
+    metadata_ci: MetadataCiPolicy | None,
     prior_round_had_checks: bool = False,
     fresh_after: datetime | None = None,
 ) -> Verdict:
@@ -354,6 +371,7 @@ def decide(
 
     ``python_ci`` is the repository's required Python CI; ``None`` judges a
     Python change on the repository's own checks like any other change.
+    ``metadata_ci`` declares which checks a metadata revision must refresh.
     """
 
     unselected_path = _unselected_python_path(changed_paths, python_ci)
@@ -366,6 +384,8 @@ def decide(
 
     ci_deadline = min(published_at + timedelta(seconds=ci_wait_seconds), execution_deadline)
     expired = now >= ci_deadline
+    if fresh_after is not None and metadata_ci is None:
+        return Verdict(kind="unverified", reason="metadata_ci_not_configured")
     if detail.state != "observed" or detail.reason is not None:
         reason = detail.reason or "github_error"
         if reason in TRANSIENT:
@@ -376,34 +396,30 @@ def decide(
     check_runs = detail.check_runs
     statuses = detail.statuses
     if fresh_after is not None:
+        assert metadata_ci is not None
         fresh = _fresh_ci_detail(detail, fresh_after)
         fresh_runs, fresh_statuses = fresh.check_runs, fresh.statuses
         fresh_names = {run.get("name") for run in fresh_runs}
-        missing_rerun = any(
-            run.get("name") in _METADATA_EDIT_CHECKS
-            and run.get("name") not in fresh_names
-            for run in check_runs
-        )
+        missing_rerun = any(name not in fresh_names for name in metadata_ci.checks)
         fresh_contexts = {item.get("context") for item in fresh_statuses}
         missing_rerun = missing_rerun or any(
-            item.get("context") in _METADATA_EDIT_STATUSES
-            and item.get("context") not in fresh_contexts
-            for item in statuses
+            context not in fresh_contexts for context in metadata_ci.statuses
         )
+        effective = _metadata_revision_detail(detail, fresh_after, metadata_ci)
         fresh_failure = any(
             run.get("status") == "completed"
             and run.get("conclusion") in _FAILING_CONCLUSIONS
             for run in fresh_runs
         ) or any(item.get("state") in _FAILING_STATES for item in fresh_statuses)
         unchanged_failure = any(
-            run.get("name") not in _METADATA_EDIT_CHECKS
+            run.get("name") not in metadata_ci.checks
             and run.get("status") == "completed"
             and run.get("conclusion") in _FAILING_CONCLUSIONS
-            for run in check_runs
+            for run in effective.check_runs
         ) or any(
-            item.get("context") not in _METADATA_EDIT_STATUSES
+            item.get("context") not in metadata_ci.statuses
             and item.get("state") in _FAILING_STATES
-            for item in statuses
+            for item in effective.statuses
         )
         if (
             not fresh_failure
@@ -416,7 +432,6 @@ def decide(
             )
         # A PR metadata edit reruns body checks, but it does not rerun the main
         # suite on the unchanged commit. Keep its passing or pending evidence.
-        effective = _metadata_revision_detail(detail, fresh_after)
         check_runs, statuses = effective.check_runs, effective.statuses
 
     required_python_runs = [
@@ -820,6 +835,9 @@ async def gate(
     changed_paths = _publication_changed_paths(facts.publications)
     changed_python_paths = _python_paths(changed_paths)
     python_ci = python_ci_policy(settings, lineage.repo_full_name or work_item.repo_full_name)
+    metadata_ci = metadata_ci_policy(
+        settings, lineage.repo_full_name or work_item.repo_full_name
+    )
     unselected_path = _unselected_python_path(changed_paths, python_ci)
     preflight_verdict: Verdict | None = None
     if unselected_path is not None:
@@ -880,6 +898,7 @@ async def gate(
                 ci_wait_seconds=settings.github_factory_ci_wait_s,
                 changed_paths=changed_paths,
                 python_ci=python_ci,
+                metadata_ci=metadata_ci,
                 prior_round_had_checks=round_ > 1,
                 fresh_after=fresh_after,
             )
@@ -919,6 +938,9 @@ async def gate(
     pr_url = lineage.pr_url
     if verdict.kind == "failing" and round_ < CI_MAX_ROUNDS:
         assert detail is not None
+        if fresh_after is not None:
+            assert metadata_ci is not None
+            detail = _metadata_revision_detail(detail, fresh_after, metadata_ci)
         return await _continue(
             sessionmaker,
             valkey,
@@ -933,8 +955,7 @@ async def gate(
                 pr_url or "",
                 head_sha,
                 round_ + 1,
-                _metadata_revision_detail(detail, fresh_after)
-                if fresh_after is not None else detail,
+                detail,
             ),
             owner=owner,
             now=now,

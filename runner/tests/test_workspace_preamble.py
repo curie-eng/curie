@@ -124,7 +124,7 @@ def test_workspace_preamble_forbids_a_substitute_test_runner() -> None:
 
 # --- declared verification checks (#3521) ------------------------------------------
 
-_PYTHON_COMMAND = "uv run pytest runner/tests -q"
+_PYTHON_COMMAND = "uv run pytest unitconv/tests -q"
 _RUST_COMMAND = "cargo test --locked"
 
 
