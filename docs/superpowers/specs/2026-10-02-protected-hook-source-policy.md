@@ -168,7 +168,11 @@ gate waiters hold no work connection. Checkout timeout does not bound network
 connect or advisory-lock wait.
 
 Cleanup stops and joins supervised cron before gate disposal, with a ten-second
-stop/cancel/join budget. Each subsequent owned engine/transport close has at
+stop/cancel/join budget. Thread-backed scheduled bundle reads keep an owned
+task until the synchronous read finishes, even after supervisor cancellation.
+Cancellation of the waiting coroutine is not thread completion. A read that
+remains active keeps cron unjoined so the same producer budget reaches fatal
+exit. Each subsequent owned engine/transport close has at
 most five seconds, and an earlier close error cannot skip later attempts.
 On cooperative paths retain the primary exception/cancellation; secondary
 cleanup failures produce safe diagnostics, and failure without a primary cause
