@@ -2145,6 +2145,13 @@ jobs:
       # neither reads nor disturbs the release installed above.
       - name: Mail-adapter external-collector egress enforces (not just rendered)
         run: bash scripts/check-mail-adapter-otel-egress.sh charts/curie
+      # #3853: a credential free redeploy must clear the API secret names and
+      # the Helm binding, then a turn must start. Runs after the enforcement
+      # checks because the redeploy helm-upgrades the release.
+      - name: Credential free redeploy clears stale secret metadata
+        env:
+          CURIE_BIN: cli/target/release/curie
+        run: bash cli/scripts/credential-free-redeploy-cluster.sh
       # Surface why on any failure above: pod states, recent events, and the
       # worker/runner logs are what localize a reachability or scheduling break.
       - name: Dump cluster diagnostics on failure

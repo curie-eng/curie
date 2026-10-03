@@ -2797,12 +2797,15 @@ impl ApiClient {
         commit_sha: Option<&str>,
         workspace: WorkspaceIntent,
     ) -> Result<PreparedDeployOutcome> {
-        // Bind per-agent connector secrets (ADR-0009, #429). A PATCH covers both
-        // a freshly created agent and a redeploy that rotates a value; an empty
-        // map leaves the agent's current secrets untouched.
-        if !secrets.is_empty() {
-            self.update_agent_secrets(&agent.id, secrets).await?;
-        }
+        // Bind per-agent connector secrets (ADR-0009, #429). A PATCH covers a
+        // freshly created agent, a redeploy that rotates a value, and a
+        // redeploy whose bundle declares none. The API clears on `{}`. Skipping
+        // that write left the previous names on the agent while the cluster
+        // bind removed the Helm secret, so the worker still required a
+        // per-agent warm pool the chart no longer rendered (#3853).
+        // The returned row is not kept: resolve_agent already reconciled the
+        // channel and repo, and this response is only the secret write.
+        self.update_agent_secrets(&agent.id, secrets).await?;
         let version = self
             .create_version(&agent.id, version_label, created_by, commit_sha)
             .await?;

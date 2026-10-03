@@ -135,6 +135,7 @@ fn assert_command_deploy_wire(server: &MockServer, commit_sha: Option<&str>) {
         vec![
             ("GET".to_string(), "/agents".to_string()),
             ("POST".to_string(), "/agents".to_string()),
+            ("PATCH".to_string(), format!("/agents/{AGENT_ID}")),
             ("POST".to_string(), format!("/agents/{AGENT_ID}/versions"),),
             (
                 "PUT".to_string(),
@@ -144,10 +145,10 @@ fn assert_command_deploy_wire(server: &MockServer, commit_sha: Option<&str>) {
         ]
     );
 
-    let version_request = &recorded[2];
+    let version_request = &recorded[3];
     let version_body: serde_json::Value =
         serde_json::from_slice(&version_request.body).expect("version body should be JSON");
-    let deployment_request = &recorded[4];
+    let deployment_request = &recorded[5];
     let deployment_body: serde_json::Value =
         serde_json::from_slice(&deployment_request.body).expect("deployment body should be JSON");
 
@@ -372,6 +373,12 @@ fn route(method: &str, path: &str) -> Response {
                 r#"{{"id":"{DEPLOYMENT_ID}","agent_id":"{AGENT_ID}","version_id":"{VERSION_ID}","environment":"dev","status":"active","deployed_at":"2026-07-05T00:00:00Z"}}"#
             ),
         ),
+        ("PATCH", p) if p == format!("/agents/{AGENT_ID}") => Response::json(
+            200,
+            &format!(
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#local-dev"}}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"##
+            ),
+        ),
         other => panic!("unexpected request: {other:?}"),
     }
 }
@@ -417,6 +424,7 @@ async fn deploy_walks_the_full_contract_flow_with_auth() {
         vec![
             ("GET".to_string(), "/agents".to_string()),
             ("POST".to_string(), "/agents".to_string()),
+            ("PATCH".to_string(), format!("/agents/{AGENT_ID}")),
             ("POST".to_string(), format!("/agents/{AGENT_ID}/versions")),
             (
                 "PUT".to_string(),
@@ -430,7 +438,7 @@ async fn deploy_walks_the_full_contract_flow_with_auth() {
     }
 
     // The bundle upload is multipart with the archive under the `file` field.
-    let upload = &recorded[3];
+    let upload = &recorded[4];
     assert!(upload
         .header("content-type")
         .unwrap()
@@ -565,11 +573,6 @@ fn assert_no_patch(server: &MockServer) {
         patches.iter().all(empty_secret_declaration),
         "only an empty secret declaration may be patched, got {patches:?}"
     );
-    assert_eq!(
-        patches.len(),
-        1,
-        "the deploy must clear connector secrets with one empty declaration, got {patches:?}"
-    );
 }
 
 /// The path the channel subresource lives at (ADR-0118, S3): a binding is
@@ -625,7 +628,6 @@ fn assert_no_binding_write(server: &MockServer) {
         writes.is_empty(),
         "no binding write should have been issued, got {writes:?}"
     );
-    assert_no_patch(server);
 }
 
 /// The recorded `(method, path)` flow, for order assertions.
@@ -1897,7 +1899,17 @@ async fn redeploy_without_connector_secrets_clears_the_agent_record() {
     });
     let client = ApiClient::new(&server.base_url, "k").unwrap();
     run_deploy(&client, None, None).await;
-    assert_no_patch(&server);
+    let patches = patch_bodies(&server);
+    assert_eq!(
+        patches.len(),
+        1,
+        "the deploy must clear connector secrets with one empty declaration, got {patches:?}"
+    );
+    assert!(
+        empty_secret_declaration(&patches[0]),
+        "the declaration must be an empty secret map, got {}",
+        patches[0]
+    );
 }
 
 /// A nonempty declaration replaces the stored map, and a second agent's row
