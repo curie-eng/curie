@@ -19,9 +19,10 @@ Role grants the worker ``list`` on Secrets. No new RBAC and no new copy of the
 credential; the API would need one mounted.
 
 The Kubernetes-shaped sweep lives in ``curie_e2e_connector.reaper`` next to
-env_create. This module supplies the clusters, the run statuses and the
-health signal. The cluster calls are synchronous, so they run in a worker
-thread rather than blocking the event loop the kernel is using.
+env_create. This module supplies the targets (a cluster plus the registry whose
+images the run pushed, #3246), the run statuses and the health signal. The
+cluster calls are synchronous, so they run in a worker thread rather than
+blocking the event loop the kernel is using.
 
 The health signal is three gauges. ``curie.e2e.reaper.last_success`` is the
 unix time of the last clean pass, recorded every pass and 0 until one
@@ -52,7 +53,7 @@ from datetime import UTC, datetime
 from functools import partial
 from typing import Any, Protocol
 
-from curie_e2e_connector.contract import KUBECONFIG_SECRET
+from curie_e2e_connector.contract import KUBECONFIG_SECRET, REGISTRY_PUSH_SECRET
 from curie_e2e_connector.kube import (
     ClusterApi,
     ClusterError,
@@ -62,9 +63,19 @@ from curie_e2e_connector.kube import (
 from curie_e2e_connector.reaper import (
     Scope,
     ScopedNamespace,
+    SweepTarget,
     is_expired,
     scoped_namespaces,
     sweep,
+)
+from curie_e2e_connector.registry import (
+    CompositeRegistry,
+    DockerRegistry,
+    RegistryApi,
+    RegistryError,
+    RegistrySettings,
+    parse_docker_config,
+    registry_client,
 )
 from curie_telemetry import record_metric
 
@@ -82,7 +93,7 @@ _OVERDUE = "curie.e2e.namespaces.overdue"
 _CONNECTOR_SECRET_SUFFIX = "-connector-secrets"
 
 RequestStatus = Callable[[uuid.UUID], Awaitable[str | None]]
-ClusterSource = Callable[[], Sequence[ClusterApi]]
+ClusterSource = Callable[[], Sequence[SweepTarget]]
 
 
 class _RequestReader(Protocol):
@@ -110,11 +121,20 @@ def request_status_lookup(client: _RequestReader) -> RequestStatus:
 
 
 def connector_secret_clusters(
-    core: Any, *, namespace: str, release: str, timeout: float
-) -> list[ClusterApi]:
-    """One client per distinct test cluster kubeconfig in this release's connector Secrets.
+    core: Any, *, namespace: str, release: str, timeout: float, registry: RegistrySettings
+) -> list[SweepTarget]:
+    """One target per distinct kubeconfig in this release's connector Secrets.
 
-    Two agents sharing a kubeconfig share a client, so a cluster is swept once.
+    A cluster is swept once however many agents share it, so its namespaces are
+    counted and reaped once. The target's registry is built from the
+    ``E2E_REGISTRY_PUSH_CONFIG`` of every Secret sharing that kubeconfig: one
+    client per distinct push config (anonymous when absent), combined in a
+    ``CompositeRegistry`` when there are several, so each repository is reached
+    with whichever agent's credential the registry accepts. A push config that
+    is not base64 UTF-8 JSON, or holds an unsupported credential form, becomes
+    a registry whose every call raises ``RegistryError`` naming only the
+    Secret; it is tried after the usable ones, so it fails only namespaces no
+    other credential can clean.
     A kubeconfig that is not base64 UTF-8, or that the connector would refuse,
     becomes a refused entry whose every request raises ``ClusterError`` naming
     the Secret and the reason, so the pass fails rather than silently sweeping
@@ -123,8 +143,9 @@ def connector_secret_clusters(
 
     prefix = f"{release}-"
     secrets = core.list_namespaced_secret(namespace, _request_timeout=timeout)
-    seen: set[str] = set()
-    clusters: list[ClusterApi] = []
+    # kubeconfig text -> (first Secret naming it, distinct push configs in order)
+    clusters: dict[str, tuple[str, dict[str, tuple[str, str, str | None]]]] = {}
+    targets: list[SweepTarget] = []
     for secret in secrets.items or []:
         name = getattr(secret.metadata, "name", None) or ""
         if not (
@@ -139,18 +160,80 @@ def connector_secret_clusters(
         try:
             text = base64.b64decode(encoded, validate=True).decode("utf-8")
         except (binascii.Error, ValueError):
-            clusters.append(_RefusedCluster(name, f"{KUBECONFIG_SECRET} is not base64 UTF-8"))
+            targets.append(
+                SweepTarget(
+                    _RefusedCluster(name, f"{KUBECONFIG_SECRET} is not base64 UTF-8"),
+                    _RefusedRegistry(name, "kubeconfig unusable", registry),
+                )
+            )
             continue
-        if text in seen:
-            continue
-        seen.add(text)
+        push_encoded = (secret.data or {}).get(REGISTRY_PUSH_SECRET)
+        push_text = ""
+        push_error: str | None = None
+        if push_encoded:
+            try:
+                push_text = base64.b64decode(push_encoded, validate=True).decode("utf-8")
+            except (binascii.Error, ValueError):
+                push_error = f"{REGISTRY_PUSH_SECRET} is not base64 UTF-8"
+        push_key = push_text if push_error is None else f"\0{push_encoded}"
+        _first, pushes = clusters.setdefault(text, (name, {}))
+        pushes.setdefault(push_key, (name, push_text, push_error))
+    for text, (name, pushes) in clusters.items():
         try:
             client = client_from_kubeconfig_text(text, timeout=timeout)
         except ClusterError as exc:
-            clusters.append(_RefusedCluster(name, str(exc)))
+            targets.append(
+                SweepTarget(
+                    _RefusedCluster(name, str(exc)),
+                    _RefusedRegistry(name, "kubeconfig unusable", registry),
+                )
+            )
             continue
-        clusters.append(HttpxCluster(client))
-    return clusters
+        built = [
+            _registry_for(secret, push_text, push_error, registry, timeout)
+            for secret, push_text, push_error in pushes.values()
+        ]
+        # Usable credentials first, so a broken push config only decides the
+        # namespaces every usable one was refused on.
+        built.sort(key=lambda candidate: isinstance(candidate, _RefusedRegistry))
+        combined: RegistryApi = built[0] if len(built) == 1 else CompositeRegistry(built)
+        targets.append(SweepTarget(HttpxCluster(client), combined))
+    return targets
+
+
+def _registry_for(
+    secret: str,
+    push_text: str,
+    push_error: str | None,
+    settings: RegistrySettings,
+    timeout: float,
+) -> RegistryApi:
+    if push_error is not None:
+        return _RefusedRegistry(secret, push_error, settings)
+    try:
+        auths = parse_docker_config(push_text)
+    except RegistryError:
+        return _RefusedRegistry(
+            secret, f"{REGISTRY_PUSH_SECRET} is not a supported docker config", settings
+        )
+    return DockerRegistry(auths, settings=settings, client=registry_client(timeout))
+
+
+class _RefusedRegistry(RegistryApi):
+    """A connector Secret whose push config cannot be used. Every call fails."""
+
+    def __init__(self, secret: str, reason: str, settings: RegistrySettings) -> None:
+        self.settings = settings
+        self._message = f"secret={secret} has an unusable registry push config: {reason}"
+
+    def list_tags(self, repo: str) -> list[str]:
+        raise RegistryError(self._message)
+
+    def resolve(self, repo: str, tag: str) -> str | None:
+        raise RegistryError(self._message)
+
+    def delete_manifest(self, repo: str, digest: str) -> None:
+        raise RegistryError(self._message)
 
 
 class _RefusedCluster(ClusterApi):
@@ -204,22 +287,32 @@ class E2EReaperLoop:
         statuses: dict[uuid.UUID, str | None] = {}
         failed_lookups: set[uuid.UUID] = set()
         try:
-            clusters = await asyncio.to_thread(self._clusters)
+            targets = await asyncio.to_thread(self._clusters)
         except Exception:
             logger.exception("e2e reaper could not read the connector Secrets")
-            clusters = []
+            targets = []
             ok = listed_all = False
-        for cluster in clusters:
+        for target in targets:
             try:
-                found = await asyncio.to_thread(scoped_namespaces, cluster, self._scope)
+                found = await asyncio.to_thread(scoped_namespaces, target.cluster, self._scope)
             except ClusterError as exc:
                 logger.warning("e2e reaper could not list namespaces: %s", exc)
                 ok = listed_all = False
                 continue
             terminal = await self._terminal_runs(found, statuses, failed_lookups)
             result = await asyncio.to_thread(
-                partial(sweep, cluster, self._scope, found, now=now, terminal_runs=terminal)
+                partial(
+                    sweep,
+                    target.cluster,
+                    self._scope,
+                    found,
+                    registry=target.registry,
+                    now=now,
+                    terminal_runs=terminal,
+                )
             )
+            for name in result.deferred:
+                logger.info("e2e reaper deferred namespace=%s to the next pass", name)
             expired += result.expired
             overdue += result.overdue
             by_name = {namespace.name: namespace for namespace in found}

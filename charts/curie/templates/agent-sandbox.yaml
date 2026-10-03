@@ -719,7 +719,7 @@ spec:
             {{- $secretName := printf "%s-agent-%s-connector-secrets" (include "curie.fullname" .) $agent }}
             {{- range $name := keys $secrets | sortAlpha }}
             {{- /* ADR 0176: the test cluster kubeconfig stays on the connector. */}}
-            {{- if ne $name "E2E_CLUSTER_KUBECONFIG" }}
+            {{- if not (has $name (list "E2E_CLUSTER_KUBECONFIG" "E2E_REGISTRY_PUSH_CONFIG" "E2E_BUILD_CACHE_CONFIG")) }}
             - name: {{ $name }}
               valueFrom:
                 secretKeyRef:

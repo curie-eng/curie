@@ -558,8 +558,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         publication_creator=(
             approval_client
             if config.publication_enabled
-            and env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower()
-            == "kubernetes"
+            and env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower() == "kubernetes"
             else None
         ),
         # The same client, handed in twice under the two roles the kernel needs
@@ -709,9 +708,7 @@ _SUPERVISED_OPERATIONS = frozenset(
 )
 
 
-def _restart_delay_s(
-    consecutive_failures: int, *, base_s: float, max_s: float
-) -> float:
+def _restart_delay_s(consecutive_failures: int, *, base_s: float, max_s: float) -> float:
     """Delay before restart number ``consecutive_failures`` (1-based).
 
     Doubles from ``base_s`` per consecutive crash and never exceeds ``max_s``
@@ -984,6 +981,7 @@ def _build_e2e_reaper(
             scope=scope,
             interval_s=config.e2e_reaper_interval_s,
         )
+    from curie_e2e_connector.registry import RegistrySettings
     from kubernetes import client as k8s_client
     from kubernetes import config as k8s_config
 
@@ -1001,6 +999,15 @@ def _build_e2e_reaper(
             namespace=config.connector_namespace,
             release=config.connector_release,
             timeout=30,
+            registry=RegistrySettings(
+                prefix=config.e2e_registry,
+                insecure=config.e2e_registry_insecure,
+                token_hosts=tuple(
+                    host.strip()
+                    for host in config.e2e_registry_token_hosts.split(",")
+                    if host.strip()
+                ),
+            ),
         ),
         request_status=request_status_lookup(work_items),
         scope=scope,
@@ -1018,9 +1025,10 @@ def _build_publication_loop(
 ) -> PublicationReconcileLoop | None:
     """Build the worker-owned Kubernetes publication lane, never a local twin."""
 
-    if not config.publication_enabled or env.get(
-        "CURIE_SANDBOX_SUBSTRATE", "kubernetes"
-    ).lower() != "kubernetes":
+    if (
+        not config.publication_enabled
+        or env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower() != "kubernetes"
+    ):
         return None
     namespace = config.publication_namespace
     cluster = KubernetesPublicationCluster(namespace)
@@ -1073,9 +1081,7 @@ def _build_publication_loop(
             git_user_name=config.publication_git_user_name,
             git_user_email=config.publication_git_user_email,
             github_api_url=config.publication_github_api_url,
-            active_deadline_seconds=(
-                config.publication_job_active_deadline_seconds
-            ),
+            active_deadline_seconds=(config.publication_job_active_deadline_seconds),
             git_timeout_seconds=config.publication_git_command_timeout_seconds,
             cpu_request=config.publication_cpu_request,
             cpu_limit=config.publication_cpu_limit,
@@ -1227,7 +1233,7 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
                         **policy,
                     )
                 ]
-                    if getattr(rt, "publication_loop", None) is not None
+                if getattr(rt, "publication_loop", None) is not None
                 else []
             ),
             *(

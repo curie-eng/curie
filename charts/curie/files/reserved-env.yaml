@@ -25,6 +25,9 @@ worker:
   CURIE_E2E_OWNER_LABEL_KEY: e2eConnector.ownerLabel.key
   CURIE_E2E_OWNER_LABEL_VALUE: e2eConnector.ownerLabel.value
   CURIE_E2E_REAPER_INTERVAL_S: e2eConnector.reaperIntervalSeconds
+  CURIE_E2E_REGISTRY: e2eConnector.registry
+  CURIE_E2E_REGISTRY_INSECURE: e2eConnector.registryInsecure
+  CURIE_E2E_REGISTRY_TOKEN_HOSTS: e2eConnector.registryTokenHosts
   CURIE_FAKE_MODEL: agentSandbox.runner.fakeModel
   CURIE_HEARTBEAT_FILE: the chart-managed heartbeat path (remove this override)
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
@@ -114,14 +117,23 @@ api:
   CURIE_CONNECTOR_PROXY_IMAGE: worker.image
   CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY: worker.image.pullPolicy
   CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS: worker.imagePullSecrets
+  CURIE_E2E_BUILDER_IMAGE: e2eConnector.builderImage
+  CURIE_E2E_BUILD_CACHE_REPO: e2eConnector.buildCacheRepo
+  CURIE_E2E_BUILD_TIMEOUT_SECONDS: e2eConnector.buildTimeoutSeconds
   CURIE_E2E_CONNECTOR_ENABLED: e2eConnector.enabled
   CURIE_E2E_CONNECTOR_IMAGE: worker.image
+  CURIE_E2E_GIT_IMAGE: e2eConnector.gitImage
   CURIE_E2E_NAMESPACE_PREFIX: e2eConnector.namespacePrefix
   CURIE_E2E_OWNER_LABEL_KEY: e2eConnector.ownerLabel.key
   CURIE_E2E_OWNER_LABEL_VALUE: e2eConnector.ownerLabel.value
   CURIE_E2E_POD_SECURITY: e2eConnector.podSecurity
+  CURIE_E2E_PUSH_IMAGE: e2eConnector.pushImage
+  CURIE_E2E_REGISTRY: e2eConnector.registry
+  CURIE_E2E_REGISTRY_INSECURE: e2eConnector.registryInsecure
+  CURIE_E2E_REGISTRY_TOKEN_HOSTS: e2eConnector.registryTokenHosts
   CURIE_E2E_SERVICE_ACCOUNT: e2eConnector.serviceAccount
   CURIE_E2E_SERVICE_ACCOUNT_NAMESPACE: e2eConnector.serviceAccountNamespace
+  CURIE_E2E_SOURCE_HOSTS: e2eConnector.sourceHosts
   CURIE_E2E_TTL_SECONDS: e2eConnector.ttlSeconds
   CURIE_E2E_WORKER_CLUSTER_ROLE: e2eConnector.workerClusterRole
   CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)

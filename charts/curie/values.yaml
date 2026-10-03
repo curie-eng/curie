@@ -127,6 +127,36 @@ e2eConnector:
   # worker.connectorReconciler.enabled: the reaper reads the kubeconfig from
   # the connector Secret through the reconciler's Secret list grant.
   reaperIntervalSeconds: 60
+  # Daemonless image builds (#3246, ADR 0176 decision 6). The registry prefix
+  # the build pushes under, as <registry>/<namespace>/<name>. Empty means
+  # image_build refuses with e2e_registry_not_configured. The push credential
+  # is E2E_REGISTRY_PUSH_CONFIG (a docker config.json stored with
+  # `curie secrets`); it never reaches the sandbox or a build container that
+  # runs Dockerfile RUN steps. The registry must allow manifest deletes and
+  # run garbage collection, because teardown deletes every image a run pushed.
+  registry: ""
+  # Remote layer cache repository. null renders <registry>/cache; an explicit
+  # "" disables the cache. The cache is used only when this is non empty AND
+  # E2E_BUILD_CACHE_CONFIG is stored, so an authenticated registry needs that
+  # config to cache at all. WARNING: that credential is mounted in the build
+  # container, so Dockerfile RUN steps can read it. Scope it to the cache
+  # repository only, never to the push repositories.
+  buildCacheRepo: null
+  # Plain http to the registry (and the cache). Never enable it on a registry
+  # that is reachable beyond the test cluster network.
+  registryInsecure: false
+  # Hosts, beyond the registry itself, whose https token realm may receive the
+  # push credential. Entries without a port mean 443.
+  registryTokenHosts: []
+  # Empty means the digest pinned default in the connector.
+  builderImage: ""
+  gitImage: ""
+  pushImage: ""
+  # Wall clock limit for one build, 60 to 3600 seconds.
+  buildTimeoutSeconds: 1200
+  # https hosts a build may fetch its commit from.
+  sourceHosts:
+    - github.com
 
 # ---------------------------------------------------------------------------
 # PriorityClass (ADR-0059 decision 5): ranks the platform -- worker, api,

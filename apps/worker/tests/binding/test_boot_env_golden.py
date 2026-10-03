@@ -290,16 +290,22 @@ def test_the_e2e_kubeconfig_is_withheld_from_the_sandbox() -> None:
 
     vector_path = Path(__file__).resolve().parents[4] / "tests/vectors/e2e-connector-sandbox.json"
     vector = json.loads(vector_path.read_text())
-    secret = vector["kubeconfig_secret"]
+    withheld = vector["withheld_from_sandbox"]
+    assert vector["kubeconfig_secret"] in withheld
+    assert vector["registry_push_secret"] in withheld
+    assert vector["build_cache_secret"] in withheld
+    # Each withheld name carries its own sentinel so a leak names the secret.
+    sentinels = {name: f"{name.lower()}-sentinel" for name in withheld}
     env = _boot_env(
         WorkerConfig(),
-        _resolved(secrets={secret: "kubeconfig-sentinel", "GITHUB_TOKEN": "ghp-1"}),
+        _resolved(secrets={**sentinels, "GITHUB_TOKEN": "ghp-1"}),
     )
 
     rendered = json.dumps(env)
-    assert "kubeconfig-sentinel" not in rendered
-    assert secret not in env
-    assert secret not in env.get("CURIE_CONNECTOR_SECRET_KEYS", "")
+    for secret, sentinel in sentinels.items():
+        assert sentinel not in rendered, secret
+        assert secret not in env, secret
+        assert secret not in env.get("CURIE_CONNECTOR_SECRET_KEYS", ""), secret
     assert env["GITHUB_TOKEN"] == "ghp-1"
 
 

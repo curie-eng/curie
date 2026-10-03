@@ -15,6 +15,11 @@ CONNECTOR_NAME = "e2e"
 SENTINEL_IMAGE = "curie-e2e-connector"
 KUBECONFIG_SECRET = "E2E_CLUSTER_KUBECONFIG"
 KUBECONFIG_MOUNT = "/secrets/kubeconfig"
+REGISTRY_PUSH_SECRET = "E2E_REGISTRY_PUSH_CONFIG"
+REGISTRY_PUSH_MOUNT = "/secrets/registry/config.json"
+BUILD_CACHE_SECRET = "E2E_BUILD_CACHE_CONFIG"
+BUILD_CACHE_MOUNT = "/secrets/registry-cache/config.json"
+WITHHELD_FROM_SANDBOX = (KUBECONFIG_SECRET, REGISTRY_PUSH_SECRET, BUILD_CACHE_SECRET)
 SERVER_MODULE = "curie_e2e_connector"
 REFUSAL_NOT_CONFIGURED = "e2e_connector_not_configured"
 REFUSAL_MISCONFIGURED = "e2e_connector_misconfigured"
@@ -29,6 +34,15 @@ PLATFORM_ENV = (
     "E2E_WORKER_CLUSTER_ROLE",
     "E2E_TTL_SECONDS",
     "E2E_POD_SECURITY",
+    "E2E_REGISTRY",
+    "E2E_BUILD_CACHE_REPO",
+    "E2E_REGISTRY_INSECURE",
+    "E2E_REGISTRY_TOKEN_HOSTS",
+    "E2E_BUILDER_IMAGE",
+    "E2E_GIT_IMAGE",
+    "E2E_PUSH_IMAGE",
+    "E2E_BUILD_TIMEOUT_SECONDS",
+    "E2E_SOURCE_HOSTS",
     "PORT",
 )
 
@@ -47,6 +61,15 @@ class E2EInstall:
     worker_cluster_role: str = ""
     ttl_seconds: int = 3600
     pod_security: str = "baseline"
+    registry: str = ""
+    build_cache_repo: str = ""
+    registry_insecure: bool = False
+    registry_token_hosts: str = ""
+    builder_image: str = ""
+    git_image: str = ""
+    push_image: str = ""
+    build_timeout_seconds: int = 1200
+    source_hosts: str = "github.com"
     port: int = 8000
 
     def platform_env(self) -> dict[str, str]:
@@ -60,6 +83,15 @@ class E2EInstall:
             "E2E_WORKER_CLUSTER_ROLE": self.worker_cluster_role,
             "E2E_TTL_SECONDS": str(self.ttl_seconds),
             "E2E_POD_SECURITY": self.pod_security,
+            "E2E_REGISTRY": self.registry,
+            "E2E_BUILD_CACHE_REPO": self.build_cache_repo,
+            "E2E_REGISTRY_INSECURE": "true" if self.registry_insecure else "false",
+            "E2E_REGISTRY_TOKEN_HOSTS": self.registry_token_hosts,
+            "E2E_BUILDER_IMAGE": self.builder_image,
+            "E2E_GIT_IMAGE": self.git_image,
+            "E2E_PUSH_IMAGE": self.push_image,
+            "E2E_BUILD_TIMEOUT_SECONDS": str(self.build_timeout_seconds),
+            "E2E_SOURCE_HOSTS": self.source_hosts,
             "PORT": str(self.port),
         }
 
@@ -90,9 +122,10 @@ def prepare_connectors(connectors: ConnectorsFile, install: E2EInstall) -> Conne
         )
         if not str(value).strip()
     ]
-    bad_bounds = install.ttl_seconds < 60 or install.pod_security not in (
-        "baseline",
-        "restricted",
+    bad_bounds = (
+        install.ttl_seconds < 60
+        or install.pod_security not in ("baseline", "restricted")
+        or not 60 <= install.build_timeout_seconds <= 3600
     )
     if missing or bad_bounds:
         detail = ", ".join(missing) if missing else "ttl or pod security"
@@ -104,10 +137,19 @@ def prepare_connectors(connectors: ConnectorsFile, install: E2EInstall) -> Conne
         )
     files = dict(spec.secret_files)
     files[KUBECONFIG_SECRET] = KUBECONFIG_MOUNT
+    declared = {item if isinstance(item, str) else item.name for item in spec.secrets} | set(files)
+    # A push or cache config mounts only when the bundle declares it, and only
+    # at its fixed path, so the connector never reads a bundle chosen location.
+    for name, mount in (
+        (REGISTRY_PUSH_SECRET, REGISTRY_PUSH_MOUNT),
+        (BUILD_CACHE_SECRET, BUILD_CACHE_MOUNT),
+    ):
+        if name in declared:
+            files[name] = mount
     secrets = [
         item
         for item in spec.secrets
-        if not (isinstance(item, str) and item == KUBECONFIG_SECRET)
+        if (item if isinstance(item, str) else item.name) not in WITHHELD_FROM_SANDBOX
     ]
     env = {key: value for key, value in spec.env.items() if key not in PLATFORM_ENV}
     env.update(install.platform_env())

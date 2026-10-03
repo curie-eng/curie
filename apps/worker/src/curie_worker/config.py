@@ -1317,6 +1317,13 @@ class WorkerConfig(BaseSettings):
     e2e_reaper_interval_s: float = Field(
         default=60.0, gt=0, validation_alias="CURIE_E2E_REAPER_INTERVAL_S"
     )
+    e2e_registry: str = Field(default="", validation_alias="CURIE_E2E_REGISTRY")
+    e2e_registry_insecure: bool = Field(
+        default=False, validation_alias="CURIE_E2E_REGISTRY_INSECURE"
+    )
+    e2e_registry_token_hosts: str = Field(
+        default="", validation_alias="CURIE_E2E_REGISTRY_TOKEN_HOSTS"
+    )
     report_max_attempts: int = 3
     report_backoff_base_s: float = Field(default=0.5, gt=0)
     # Langfuse for recording eval scores (the matrix reads them back by version).
