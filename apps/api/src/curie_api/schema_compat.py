@@ -24,6 +24,8 @@ from typing import Any
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from curie_protected_hooks.schema_serving import AppWindow, load_window
+from curie_protected_hooks.schema_serving import can_serve as shared_can_serve
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -37,7 +39,6 @@ KIND_CONTRACT = "contract"
 KIND_IRREVERSIBLE = "irreversible"
 _VALID_KINDS = {KIND_EXPAND, KIND_CONTRACT, KIND_IRREVERSIBLE}
 
-_WINDOW_RESOURCE = "schema_compat.json"
 _KINDS_RESOURCE = "revision_kinds.json"
 
 def _default_alembic() -> Path:
@@ -53,16 +54,6 @@ def _default_alembic() -> Path:
 
 
 _DEFAULT_ALEMBIC = _default_alembic()
-
-
-@dataclass(frozen=True)
-class AppWindow:
-    schema_min: str
-    schema_head: str
-
-    def __post_init__(self) -> None:
-        if not self.schema_min or not self.schema_head:
-            raise ValueError("schema_min and schema_head must be non-empty")
 
 
 @dataclass(frozen=True)
@@ -83,14 +74,6 @@ class CompatDecision:
     forward_only: bool
     outcome: str | None = None
     source_head: str | None = None
-
-
-def load_window() -> AppWindow:
-    payload = json.loads(files("curie_api").joinpath(_WINDOW_RESOURCE).read_text())
-    return AppWindow(
-        schema_min=str(payload["schema_min"]),
-        schema_head=str(payload["schema_head"]),
-    )
 
 
 def load_kinds() -> dict[str, str]:
@@ -143,58 +126,34 @@ def current_revision() -> str | None:
     raise RuntimeError("current_revision() cannot run inside an event loop")
 
 
-def _walk_down(script: ScriptDirectory, revision: str) -> list[str]:
-    chain: list[str] = []
-    seen: set[str] = set()
-    rev: str | None = revision
-    while rev and rev not in seen:
-        seen.add(rev)
-        chain.append(rev)
-        try:
-            rec = script.get_revision(rev)
-        except Exception:
-            break
-        down = rec.down_revision
-        next_rev: str | None
-        if isinstance(down, (list, tuple)):
-            next_rev = str(down[0]) if down else None
-        elif down is None:
-            next_rev = None
-        else:
-            next_rev = str(down)
-        rev = next_rev
-    return chain
-
-
-def _is_at_or_after(script: ScriptDirectory, current: str, minimum: str) -> bool:
-    return minimum in _walk_down(script, current)
-
-
 def can_serve(
     current: str | None,
     window: AppWindow,
     known_revisions: Iterable[str],
     script: ScriptDirectory | None = None,
 ) -> bool:
-    """True when this application can start against ``current``.
-
-    Unknown future revisions (not in this build's script) are treated as a
-    compatible expand so N-1 can keep serving after N's schema expansion.
-    A known revision older than ``schema_min`` is not servable.
-    """
-    if current is None:
-        return False
-    known = set(known_revisions)
-    if current not in known:
-        return True
-    if current == window.schema_min or current == window.schema_head:
-        return True
+    """@spec PROTECTED-HOOK-SOURCE-2."""
     if script is None:
+        return shared_can_serve(current, window, known_revisions)
+    known = set(known_revisions)
+    if current is None or current not in known or current in (
+        window.schema_min, window.schema_head
+    ):
+        return shared_can_serve(current, window, known)
+    parents: dict[str, tuple[str, ...]] = {}
+    revision: str | None = current
+    while revision is not None and revision not in parents:
         try:
-            script = _script(_alembic_config())
+            record = script.get_revision(revision)
+            down = record.down_revision
         except Exception:
-            return False
-    return _is_at_or_after(script, current, window.schema_min)
+            break
+        links = tuple(str(parent) for parent in down) if isinstance(down, (tuple, list)) else (
+            (str(down),) if down is not None else ()
+        )
+        parents[revision] = links
+        revision = links[0] if links else None
+    return shared_can_serve(current, window, known, parents)
 
 
 def plan_upgrade(
