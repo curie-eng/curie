@@ -218,7 +218,11 @@ def test_malformed_mutation_is_422_before_any_change(admin_agent: uuid.UUID, cas
     module = admin_module()
     args: list[Any] = [str(admin_agent), HOOK, "0", str(uuid.uuid4()), dict(PROTECTED)]
     args[["agent", "hook", "expected", "operation", "target"].index(case)] = (
-        dict(PROTECTED, extra="secret-input") if case == "target" else "secret-input"
+        dict(PROTECTED, extra="secret-input")
+        if case == "target"
+        else "secret-input/"
+        if case == "hook"
+        else "secret-input"
     )
     before = state(admin_agent)
 
