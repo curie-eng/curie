@@ -711,16 +711,6 @@ def test_a_successful_deploy_does_not_warn(caplog) -> None:
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
-def test_both_lanes_use_the_same_reporter() -> None:
-    # AC2: shared, not duplicated, so the two cannot drift. The webhook router
-    # must call the same function rather than keep its own copy.
-    from pathlib import Path
-
-    router = Path("apps/api/src/curie_api/routers/github.py").read_text()
-    assert "log_push_outcome" in router
-    assert "def _log_outcome" not in router, "the router kept a private copy"
-
-
 # --------------------------------------------------------------------------- #
 # Throttling backs off instead of re-asking (#1269)
 # --------------------------------------------------------------------------- #

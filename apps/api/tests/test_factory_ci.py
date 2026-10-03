@@ -20,7 +20,7 @@ from typing import Any
 import pytest
 from channel_protocol import work_item_events
 from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
-from curie_api import factory_ci, workitems
+from curie_api import factory_ci
 from curie_api.config import Settings
 from curie_api.workitem_outcomes import CiDetail
 from pydantic import ValidationError
@@ -155,14 +155,6 @@ def test_bounds_are_the_planned_constants() -> None:
     assert factory_ci.CI_MAX_ROUNDS == 3
     assert set(factory_ci.PERMANENT_UNREADABLE) == set(PERMANENT)
     assert set(factory_ci.TRANSIENT) == set(TRANSIENT)
-
-
-def test_ci_causes_match_the_literal_set_in_workitems() -> None:
-    assert factory_ci.CI_CAUSES == frozenset({"ci_failed", "ci_timeout", "ci_unverified"})
-    assert "ci_fix_unpublished" not in factory_ci.CI_CAUSES
-    source = inspect.getsource(workitems)
-    literal = re.search(r"\{\s*\"ci_failed\",\s*\"ci_timeout\",\s*\"ci_unverified\"\s*\}", source)
-    assert literal is not None, "workitems must keep the CI cause literal equal to CI_CAUSES"
 
 
 def test_continuation_event_id_is_the_worker_contract() -> None:

@@ -6773,9 +6773,7 @@ def test_streaming_turn_route_survives_the_reaper_past_its_ttl(
     # disables the refresh and must see the claim reaped, proving the TTL
     # really expires inside this test.
     async def go() -> None:
-        async with make_harness() as h:
-            h.substrate._config = replace(h.substrate._config, route_ttl_seconds=1)
-            h.kernel._route_ttl_seconds = 1
+        async with make_harness(substrate_env={"CURIE_ROUTE_TTL_SECONDS": "1"}) as h:
             calls: list[tuple[str, str]] = []
             inner = h.substrate.touch_live
 

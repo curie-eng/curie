@@ -4,13 +4,15 @@ import base64
 import hashlib
 import hmac
 import io
+import json
+import logging
 import subprocess
 import tarfile
 from pathlib import Path
 from unittest import mock
 
 import pytest
-from curie_api.config import Settings
+from curie_api.config import Settings, get_settings
 from curie_api.gitflow import (
     CloneOriginMismatch,
     GitFlowError,
@@ -19,6 +21,7 @@ from curie_api.gitflow import (
     verify_signature,
 )
 from curie_api.models import Environment
+from fastapi.testclient import TestClient
 
 SECRET = "top-secret"
 _VALID_SHA1 = "a" * 40
@@ -857,6 +860,65 @@ def test_rejected_push_is_logged_loudly() -> None:
     rendered = log.warning.call_args.args[0] % log.warning.call_args.args[1:]
     assert "acme/private-bundle" in rendered
     assert "git.archive_failed" in rendered
+
+
+def test_a_rejected_webhook_deploy_warns_from_the_router(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The reporter's direct test cannot detect a missing router call. Drive a
+    # signed push through the real API and git flow so the webhook's warning is
+    # checked even though GitHub receives a successful HTTP acknowledgment.
+    repo = "acme-corp/acme-bot"
+    created = client.post(
+        "/agents",
+        json={
+            "name": "acme-bot",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "repo_full_name": repo,
+        },
+        headers=auth_headers,
+    )
+    assert created.status_code == 201, created.text
+    settings = get_settings()
+    payload = {
+        "ref": f"refs/heads/{settings.dev_branch}",
+        "after": _VALID_SHA1,
+        "repository": {
+            "full_name": repo.upper(),
+            "clone_url": f"https://github.com/{repo}.git",
+        },
+    }
+    body = json.dumps(payload).encode()
+    signature = "sha256=" + hmac.new(
+        settings.github_webhook_secret.encode(), body, hashlib.sha256
+    ).hexdigest()
+    with caplog.at_level(logging.WARNING, logger="curie_api.gitflow"):
+        response = client.post(
+            "/github/webhook",
+            content=body,
+            headers={
+                "X-GitHub-Event": "push",
+                "X-Hub-Signature-256": signature,
+                "Content-Type": "application/json",
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "rejected", result
+    assert [error["code"] for error in result["errors"]] == ["git.repository_case_mismatch"]
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "curie_api.gitflow" and record.levelno == logging.WARNING
+    ]
+    assert any(
+        "github webhook" in message and "git.repository_case_mismatch" in message
+        for message in warnings
+    ), warnings
 
 
 def test_successful_push_does_not_warn() -> None:

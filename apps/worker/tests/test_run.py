@@ -1278,8 +1278,48 @@ def test_build_wires_dedicated_single_attempt_pressure_clients(
     asyncio.run(exercise())
 
 
-# --- VALKEY_TLS env -> WorkerConfig.valkey_tls (the seam the chart actually
-# drives; a field that only works via kwargs is not wired) ------------------
+@pytest.mark.parametrize(("raw", "expected"), [(None, 16), ("4", 4)])
+def test_max_concurrency_environment_sizes_the_production_runs_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+    sync_redis: redis.Redis,
+    raw: str | None,
+    expected: int,
+) -> None:
+    if raw is None:
+        monkeypatch.delenv("CURIE_WORKER_MAX_CONCURRENCY", raising=False)
+    else:
+        monkeypatch.setenv("CURIE_WORKER_MAX_CONCURRENCY", raw)
+    endpoint = sync_redis.connection_pool.connection_kwargs
+    config = WorkerConfig(
+        fake_model=True,
+        valkey_host=str(endpoint["host"]),
+        valkey_port=int(endpoint["port"]),
+        valkey_password=str(endpoint.get("password") or ""),
+        valkey_db=int(endpoint.get("db", 0)),
+        s3_access_key="PLACEHOLDER",
+        s3_secret_key="PLACEHOLDER",
+    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
+
+    async def exercise() -> None:
+        runtime = run.build(config, {"CURIE_SANDBOX_SUBSTRATE": "docker"})
+        try:
+            assert runtime.consumer._max_concurrency == expected
+            assert runtime.consumer._transfer_capacity() == expected
+        finally:
+            runtime.consumer._kernel._substrate._affinity._redis.close()
+            await runtime.runner.close()
+            await runtime.sink.aclose()
+            await runtime.eval_http.aclose()
+            await runtime.async_redis.aclose()
+            await runtime.pressure_async_redis.aclose()
+            await runtime.eval_redis.aclose()
+            await runtime.engine.dispose()
+
+    asyncio.run(exercise())
+
+
+# VALKEY_TLS environment reaches WorkerConfig through the chart's configuration.
 
 
 def test_valkey_tls_env_reaches_the_worker_config(

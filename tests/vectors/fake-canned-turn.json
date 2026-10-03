@@ -1,0 +1,54 @@
+[
+  {
+    "version": "0.5.14",
+    "type": "text_delta",
+    "text": "Looking into it"
+  },
+  {
+    "version": "0.5.14",
+    "type": "tool_note",
+    "text": "running tool Bash",
+    "tool": "Bash"
+  },
+  {
+    "version": "0.5.14",
+    "type": "side_effect_flag",
+    "tool": "Bash",
+    "detail": "non-idempotent tool executed",
+    "call_id": "t1",
+    "arguments": {"command": "echo hi"},
+    "result": null,
+    "failed": null,
+    "redacted": null
+  },
+  {
+    "version": "0.5.14",
+    "type": "side_effect_flag",
+    "tool": "Bash",
+    "detail": "non-idempotent tool completed",
+    "call_id": "t1",
+    "arguments": null,
+    "result": null,
+    "failed": false,
+    "redacted": null
+  },
+  {
+    "version": "0.5.14",
+    "type": "text_delta",
+    "text": "\n\nall done"
+  },
+  {
+    "version": "0.5.14",
+    "type": "final",
+    "text": "all done",
+    "status": "done",
+    "approval_summary": null,
+    "approval_route": null,
+    "approval_gate_kind": null,
+    "approval_granted_tool": null,
+    "approval_granted_arguments": null,
+    "approval_display": null,
+    "input_tokens": 20,
+    "output_tokens": 8
+  }
+]

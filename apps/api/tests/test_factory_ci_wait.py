@@ -1157,16 +1157,45 @@ def test_pending_forever_times_out_inside_the_ci_wait(admitted: Any) -> None:
     assert "build" in body
 
 
-def test_ci_timeout_wins_over_the_execution_deadline(admitted: Any) -> None:
+@pytest.mark.parametrize(
+    ("entry", "cause", "summary"),
+    [
+        (ci_failing(), "ci_failed", "Failing checks:"),
+        (ci_entry(check_status=403), "ci_unverified", "Reason: github_forbidden"),
+        (ci_pending(), "ci_timeout", "Pending checks:"),
+    ],
+    ids=["ci_failed", "ci_unverified", "ci_timeout"],
+)
+def test_ci_verdict_wins_over_the_execution_deadline(
+    admitted: Any, entry: Any, cause: str, summary: str
+) -> None:
     client, github, sink = admitted
     number = 9721
-    sink.ci_script = [ci_pending()]
+    sink.ci_script = [entry]
     published = _published(client, github, sink, number)
+    if cause == "ci_failed":
+        # A failing verdict settles only after the three publication rounds.
+        for revision, head_sha in ((2, HEAD_B), (3, HEAD_C)):
+            _attach_fix(
+                published["work_item_id"],
+                published["id"],
+                revision=revision,
+                head_sha=head_sha,
+                title=f"Fix round {revision}",
+                paths=["src/widget.txt"],
+            )
+    deadline = _all(number)[0]["execution_deadline"]
+    past = int((deadline - _database_now()).total_seconds()) + 2
 
-    _reconcile_later(1900)
+    _reconcile_later(past)
 
-    assert _terminal(number) == ("failed", "ci_timeout")
-    assert "Pending checks:" in _body(sink, published["id"])
+    assert _terminal(number) == ("failed", cause)
+    terminal_at = _rows(
+        "SELECT terminal_at FROM curie.execution_requests WHERE id = :id",
+        {"id": published["id"]},
+    )[0]["terminal_at"]
+    assert terminal_at > deadline
+    assert summary in _body(sink, published["id"])
 
 
 def test_transient_errors_until_the_deadline_end_as_ci_timeout(admitted: Any) -> None:
