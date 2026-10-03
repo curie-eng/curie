@@ -128,6 +128,7 @@ from .binding import (
     EVAL_ISOLATE_THREAD_PREFIX,
     GRANT_ARGUMENTS_ENV,
     GRANT_TOOL_ENV,
+    HISTORY_TOKEN_ENV,
     ISSUE_READ_TOKEN_ENV,
     ISSUE_READ_URL_ENV,
     MAX_TURNS_ENV,
@@ -138,6 +139,7 @@ from .binding import (
     AmbiguousRoute,
     BindingResolver,
     binding_adapter_for_handle,
+    boot_token_facts,
 )
 from .capacity_wait import (
     CapacityWaitExpired,
@@ -1803,6 +1805,17 @@ def _boots_differently(
         return True
     if handle.caller_run != caller_run:
         return True
+    # #3823: replace a warm sandbox whose boot token cannot cover the turn
+    # this delivery is about to boot. Comparing with the new token's expiry,
+    # not with "already expired", keeps a follow-up from running past the
+    # credential and getting 401s on state. A route with no recorded expiry
+    # is from before this field and is left alone.
+    if handle.state_token_exp is not None:
+        if handle.state_token_exp <= int(time.time()):
+            return True
+        _agent, _cred, needed = boot_token_facts(env.get(HISTORY_TOKEN_ENV))
+        if needed is not None and handle.state_token_exp < needed:
+            return True
     return CONNECTOR_CALLER_TOKEN_ENV in env and not handle.carries_caller_token
 
 
@@ -1902,6 +1915,12 @@ class Kernel:
         # absent the kernel runs a generic sandbox (the F1 behavior); when present
         # it resolves channel -> agent -> bundle/budget and gates killed agents.
         self._binding = binding
+        revoker = getattr(self._substrate, "set_boot_credential_revoker", None)
+        poster = (
+            getattr(binding, "release_boot_credential_sync", None) if binding is not None else None
+        )
+        if revoker is not None and poster is not None:
+            revoker(poster)
         # The trusted repository preparation lane. It is optional for generic
         # and legacy deployments. A turn that requires a repository refuses when
         # this lane is unavailable instead of booting an empty directory.
@@ -3002,7 +3021,11 @@ class Kernel:
                 # No kind/address: there is no binding to scope the state
                 # namespace to. No approval grant, resumed kind or decision
                 # either: a targetless turn is never a resume.
-                boot_env = binding.boot_env(resolved, thread_key)
+                boot_env = binding.boot_env(
+                    resolved,
+                    thread_key,
+                    token_ttl_s=self._runner.turn_deadline_s(_remaining_budget(lease)),
+                )
                 workspace_deployment_id = resolved.deployment_id
                 packs = binding.packs_for(resolved)
                 approval_routes = resolved.approval_routes
@@ -3143,6 +3166,7 @@ class Kernel:
                 boot_env_kwargs: dict[str, Any] = {
                     "kind": handle.kind,
                     "address": handle.channel,
+                    "token_ttl_s": self._runner.turn_deadline_s(_remaining_budget(lease)),
                 }
                 # The internal thread key is channel-scoped, so it no longer
                 # starts with the eval marker carried by conversation_id.

@@ -92,7 +92,7 @@ reserved ones (and write transcripts) to rehydrate the agent across a
 suspend/resume. On the `memory` namespace its claims narrow it (ADR-0188,
 `apps/api/src/curie_api/routers/state.py::_check_memory_reach`): the `binding`
 claim names the one channel whose memory it reaches, the boot-env token is
-`memory: "read"`, and only the per-turn write credential on `Event.memory_token`
+`memory: "read"` and carries a `cred` id, and only the per-turn write credential on `Event.memory_token`
 may write, only fact keys, with the API stamping its `sender` claim as the
 author. A token with no `memory` claim (a pre-ADR-0188 worker's) fails closed
 there. On `transcript` the `binding` claim holds it to its own channel's threads
