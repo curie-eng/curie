@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from curie_api import approval_principal
+from curie_api import approval_principal, sandbox_token
 from curie_api.config import get_settings
 
 SUBJECT = "U0EXAMPLE1"
@@ -153,12 +153,12 @@ def test_principal_token_fails_closed_on_tamper_expiry_scope_and_claim_shape() -
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
-        payload_segment = approval_principal._b64url(payload)
+        payload_segment = sandbox_token.b64url(payload)
         signing_input = f"apr.{payload_segment}"
         signing_key = (
             api_key if kind == "operator" else get_settings().approval_chat_attester_secret
         )
-        forged = f"{signing_input}.{approval_principal._signature(signing_key, signing_input)}"
+        forged = f"{signing_input}.{sandbox_token.signature(signing_key, signing_input)}"
         assert (
             approval_principal.verify_claims(
                 forged,

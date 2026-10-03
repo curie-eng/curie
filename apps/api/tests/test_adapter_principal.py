@@ -22,9 +22,9 @@ from typing import Any
 import pytest
 import redis
 from curie_api import adapter_principal, approval_principal, channel_token, sandbox_token
-from curie_api.adapter_principal import _b64url, _signature
 from curie_api.config import get_settings
 from curie_api.main import create_app
+from curie_api.sandbox_token import b64url, signature
 from fastapi.testclient import TestClient
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -721,8 +721,8 @@ def test_verify_refuses_other_prefixes_and_malformed_claims() -> None:
     apr_payload = json.dumps(
         {"sub": "op", "kind": "operator", "exp": now + 60}, separators=(",", ":"), sort_keys=True
     ).encode()
-    apr_signing_input = f"apr.{_b64url(apr_payload)}"
-    apr_token = f"{apr_signing_input}.{_signature(key, apr_signing_input)}"
+    apr_signing_input = f"apr.{b64url(apr_payload)}"
+    apr_token = f"{apr_signing_input}.{signature(key, apr_signing_input)}"
     assert adapter_principal.verify(apr_token, key, scope="approvals:read", now=now) is None
 
     # An adp token is never accepted where an approval-principal is expected.
@@ -745,8 +745,8 @@ def test_verify_refuses_other_prefixes_and_malformed_claims() -> None:
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
-    signing_input = f"adp.{_b64url(with_extra)}"
-    extra_token = f"{signing_input}.{_signature(key, signing_input)}"
+    signing_input = f"adp.{b64url(with_extra)}"
+    extra_token = f"{signing_input}.{signature(key, signing_input)}"
     assert adapter_principal.verify(extra_token, key, scope="approvals:read", now=now) is None
 
     # Unsorted bindings list.
@@ -763,8 +763,8 @@ def test_verify_refuses_other_prefixes_and_malformed_claims() -> None:
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
-    signing_input = f"adp.{_b64url(with_unsorted)}"
-    unsorted_token = f"{signing_input}.{_signature(key, signing_input)}"
+    signing_input = f"adp.{b64url(with_unsorted)}"
+    unsorted_token = f"{signing_input}.{signature(key, signing_input)}"
     assert adapter_principal.verify(unsorted_token, key, scope="approvals:read", now=now) is None
 
 

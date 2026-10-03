@@ -33,8 +33,9 @@ from typing import Any
 import httpx
 import pytest
 import redis
-from curie_api import approval_principal, crud
+from curie_api import approval_principal
 from curie_api.config import get_settings
+from curie_api.crud import approvals as crud_approvals
 from curie_api.deps import get_approver_sets
 from curie_api.main import create_app
 from curie_api.routers.console import SESSION_COOKIE
@@ -610,7 +611,7 @@ def test_recover_rolls_back_entirely_when_the_audit_append_fails(
 
     # The atomic function builds its audit row from this ORM class, exactly as
     # append_approval_audit does; patching it is the seam between the two writes.
-    monkeypatch.setattr(crud, "ApprovalAuditEntry", _explode)
+    monkeypatch.setattr(crud_approvals, "ApprovalAuditEntry", _explode)
 
     with pytest.raises(RuntimeError):
         recovery_client.post(
@@ -877,7 +878,7 @@ def test_publication_settlement_and_recovery_roll_back_together(
 
     approval_id, publication_id = _seed_pending_publication()
 
-    original = crud.get_publication_by_approval
+    original = crud_approvals.get_publication_by_approval
 
     async def _bump_then_read(session: Any, wanted_id: Any) -> Any:
         publication = await original(session, wanted_id)
@@ -897,7 +898,7 @@ def test_publication_settlement_and_recovery_roll_back_together(
             bump.join(timeout=30)
         return publication
 
-    crud.get_publication_by_approval = _bump_then_read  # type: ignore[assignment]
+    crud_approvals.get_publication_by_approval = _bump_then_read  # type: ignore[assignment]
     try:
         conflicted = recovery_client.post(
             f"/approvals/{approval_id}/recover",
@@ -905,7 +906,7 @@ def test_publication_settlement_and_recovery_roll_back_together(
             headers=_operator_headers(base=auth_headers),
         )
     finally:
-        crud.get_publication_by_approval = original  # type: ignore[assignment]
+        crud_approvals.get_publication_by_approval = original  # type: ignore[assignment]
 
     assert conflicted.status_code == 409, conflicted.text
     assert "publication" in conflicted.json()["detail"]

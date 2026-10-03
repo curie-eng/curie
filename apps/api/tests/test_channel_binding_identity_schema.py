@@ -7,12 +7,8 @@ field name. A row an older writer left NULL still reads as `default`.
 
 import pytest
 from curie_api.models import AgentChannel
-from curie_api.schemas import (
-    ApprovalNotificationTarget,
-    ChannelBindingOut,
-    ChannelBindingPatch,
-    ChannelBindingWrite,
-)
+from curie_api.schemas.approvals import ApprovalNotificationTarget
+from curie_api.schemas.channels import ChannelBindingOut, ChannelBindingPatch, ChannelBindingWrite
 from pydantic import ValidationError
 
 

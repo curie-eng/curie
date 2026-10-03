@@ -5,7 +5,7 @@ import uuid
 import pytest
 from curie_api.config import Settings
 from curie_api.killswitch import KILL_CHANNEL, kill_key
-from curie_api.schemas import BudgetConfig
+from curie_api.schemas.control import BudgetConfig
 from pydantic import ValidationError
 
 

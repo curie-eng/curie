@@ -48,7 +48,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
-from curie_api.schemas import _validate_channel_binding
+from curie_api.schemas.channels import validate_channel_binding
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 GATE_SCRIPT = REPO_ROOT / "scripts" / "check-released-upgrade.py"
@@ -1088,7 +1088,7 @@ def test_every_legacy_fixture_address_is_rejected_by_the_live_validator(
         if not agent.legacy:
             continue
         with pytest.raises(ValueError):
-            _validate_channel_binding(agent.kind, agent.address)
+            validate_channel_binding(agent.kind, agent.address)
 
 
 def test_the_valid_fixture_address_is_accepted_by_the_live_validator(
@@ -1097,7 +1097,7 @@ def test_the_valid_fixture_address_is_accepted_by_the_live_validator(
     for agent in gate.SEED_FIXTURE:
         if agent.legacy:
             continue
-        assert _validate_channel_binding(agent.kind, agent.address) == agent.address
+        assert validate_channel_binding(agent.kind, agent.address) == agent.address
 
 
 def test_the_seeded_approval_route_reuses_a_rejected_legacy_address(

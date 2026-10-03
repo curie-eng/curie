@@ -110,7 +110,7 @@ async def test_notice_persistence_failure_retries_after_deploy_is_already_record
 ) -> None:
     """A poller must keep its failed notice obligation when the deploy is settled."""
     from curie_api import gitflow
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
 
     deployed = {"value": False}
     deploy_calls = {"n": 0}
@@ -263,7 +263,7 @@ async def test_a_cli_deployment_at_the_branch_tip_does_not_suppress_git_flow(
     from curie_api.commitpoller import CommitPoller
     from curie_api.config import Settings
     from curie_api.models import Agent, AgentVersion, Deployment, Environment
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     sha = "branch-tip"
@@ -324,7 +324,7 @@ async def test_a_git_flow_deployment_at_the_branch_tip_settles_the_poll_baseline
     from curie_api.commitpoller import CommitPoller
     from curie_api.config import Settings
     from curie_api.models import Agent, AgentVersion, Deployment, Environment
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     sha = "branch-tip"
@@ -385,7 +385,7 @@ async def test_a_console_rollback_does_not_redefine_the_git_flow_poll_baseline(
     from curie_api.commitpoller import CommitPoller
     from curie_api.config import Settings
     from curie_api.models import Agent, AgentVersion, Deployment, Environment
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     older_sha = "git-flow-commit-a"
@@ -471,7 +471,7 @@ async def test_a_deployment_sha_does_not_forge_a_git_flow_poll_baseline(
     from curie_api.commitpoller import CommitPoller
     from curie_api.config import Settings
     from curie_api.models import Agent, AgentVersion, Deployment, Environment
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     version_sha = "git-flow-commit-a"
@@ -586,7 +586,7 @@ async def _capture_pushes(
     seen: list[dict] = []
 
     async def capture(session, store, settings, eval_queue, payload):
-        from curie_api.schemas import WebhookResult
+        from curie_api.schemas.deployments import WebhookResult
 
         seen.append(payload)
         return WebhookResult(status="deployed")
@@ -655,7 +655,7 @@ async def test_a_rejected_polled_deploy_warns_from_the_poller(monkeypatch, caplo
     # earlier version of this test called log_push_outcome itself and passed
     # even with the poller's call deleted -- it proved the logger worked, not
     # that the poller used it.
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
 
     rejected = WebhookResult(
         status="rejected", errors=[{"code": "deploy.unknown_agent", "message": "no such agent"}]
@@ -681,7 +681,7 @@ def test_a_rejected_polled_deploy_warns_with_its_codes(caplog) -> None:
     # work it did not do -- on the lane with no GitHub delivery UI to fall back
     # on, because polling exists for clusters GitHub cannot reach.
     from curie_api.gitflow import log_push_outcome
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
 
     rejected = WebhookResult(
         status="rejected", errors=[{"code": "deploy.unknown_agent", "message": "no such agent"}]
@@ -700,7 +700,7 @@ def test_a_rejected_polled_deploy_warns_with_its_codes(caplog) -> None:
 
 def test_a_successful_deploy_does_not_warn(caplog) -> None:
     from curie_api.gitflow import log_push_outcome
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
 
     with caplog.at_level(logging.WARNING, logger="curie_api.gitflow"):
         log_push_outcome(
@@ -1116,7 +1116,7 @@ async def test_an_ignored_branch_is_not_recloned_every_pass(monkeypatch) -> None
     interval -- roughly 1,440 full mirror clones a day at the recommended 60s.
     """
 
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
 
     assert await _passes(monkeypatch, WebhookResult(status="ignored")) == 1
 
@@ -1124,7 +1124,7 @@ async def test_an_ignored_branch_is_not_recloned_every_pass(monkeypatch) -> None
 @pytest.mark.anyio
 async def test_an_intrinsically_rejected_commit_is_not_recloned(monkeypatch) -> None:
     # An ambiguous environment is fixed only by changing the commit.
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
 
     rejected = WebhookResult(status="rejected", errors=[{"code": "deploy.ambiguous_env"}])
     assert await _passes(
@@ -1146,7 +1146,7 @@ async def test_an_intrinsically_rejected_commit_is_not_recloned(monkeypatch) -> 
 )
 async def test_a_topology_rejection_waits_for_a_binding_change(monkeypatch, code: str) -> None:
     """Stable topology suppresses clones and one binding change reopens it."""
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
 
     rejected = WebhookResult(status="rejected", errors=[{"code": code}])
     assert await _passes(
@@ -1164,7 +1164,7 @@ async def test_a_topology_rejection_waits_for_a_binding_change(monkeypatch, code
 
 def _archive_failure(*extra_codes: str):
     """A rejection carrying `git.archive_failed` plus any extra codes."""
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
 
     codes = ["git.archive_failed", *extra_codes]
     return WebhookResult(status="rejected", errors=[{"code": code} for code in codes])
@@ -1207,7 +1207,7 @@ async def test_an_archive_failure_recovers_once_the_backoff_has_elapsed(monkeypa
     past the filter -- or that got a second rejection -- would leave one behind.
     """
 
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
 
     calls, poller = await _run_passes(
         monkeypatch,
@@ -1367,7 +1367,7 @@ async def test_a_successful_deploy_resets_the_attempt_count(monkeypatch) -> None
     reporting a stalled lane one failure early.
     """
 
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
 
     calls, poller = await _run_passes(
         monkeypatch,
@@ -1575,8 +1575,9 @@ async def test_process_push_reports_a_clone_timeout_as_archive_failed(monkeypatc
     `crud.get_agents_by_repo`.
     """
 
-    from curie_api import crud, gitflow
+    from curie_api import gitflow
     from curie_api.config import Settings
+    from curie_api.crud import agents as crud_agents
 
     class StubAgent:
         repo_full_name = REPO
@@ -1585,7 +1586,7 @@ async def test_process_push_reports_a_clone_timeout_as_archive_failed(monkeypatc
     async def one_agent(session, full_name):
         return [StubAgent()]
 
-    monkeypatch.setattr(crud, "get_agents_by_repo", one_agent)
+    monkeypatch.setattr(crud_agents, "get_agents_by_repo", one_agent)
     monkeypatch.setattr("curie_api.gitflow.subprocess.run", _timing_out_git([]))
 
     result = await gitflow.process_push(
@@ -1612,7 +1613,7 @@ async def test_a_permanently_timing_out_repository_stops_being_recloned(
     lane reports itself stalled instead of going quiet.
     """
 
-    from curie_api import crud
+    from curie_api.crud import agents as crud_agents
 
     class StubAgent:
         repo_full_name = REPO
@@ -1622,7 +1623,7 @@ async def test_a_permanently_timing_out_repository_stops_being_recloned(
         return [StubAgent()]
 
     clones: list[list[str]] = []
-    monkeypatch.setattr(crud, "get_agents_by_repo", one_agent)
+    monkeypatch.setattr(crud_agents, "get_agents_by_repo", one_agent)
     monkeypatch.setattr("curie_api.gitflow.subprocess.run", _timing_out_git(clones))
 
     # The same plumbing `_run_passes` builds, minus its counting stub: this test
@@ -1645,7 +1646,7 @@ async def test_a_permanently_timing_out_repository_stops_being_recloned(
 async def test_a_successful_deploy_leaves_the_database_in_charge(monkeypatch) -> None:
     # After a real deploy the Deployment row is the memory. Keeping a private
     # copy too would mean two sources disagreeing after a rollback.
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
 
     assert await _passes(monkeypatch, WebhookResult(status="deployed")) == 2
 
@@ -1693,7 +1694,7 @@ async def test_a_move_whose_deploy_raises_does_not_stop_the_pass(
     calls: list[str] = []
 
     async def push(session, store, settings, eval_queue, payload):
-        from curie_api.schemas import WebhookResult
+        from curie_api.schemas.deployments import WebhookResult
 
         repo = payload["repository"]["full_name"]
         calls.append(repo)
@@ -1738,7 +1739,7 @@ async def test_a_raising_move_is_backed_off_not_retried_first_every_pass(
     calls: list[str] = []
 
     async def push(session, store, settings, eval_queue, payload):
-        from curie_api.schemas import WebhookResult
+        from curie_api.schemas.deployments import WebhookResult
 
         repo = payload["repository"]["full_name"]
         calls.append(repo)
@@ -1771,7 +1772,7 @@ async def test_a_raising_deploy_recovers_once_the_backoff_has_elapsed(monkeypatc
     calls: list[str] = []
 
     async def push(session, store, settings, eval_queue, payload):
-        from curie_api.schemas import WebhookResult
+        from curie_api.schemas.deployments import WebhookResult
 
         repo = payload["repository"]["full_name"]
         calls.append(repo)
@@ -1806,7 +1807,7 @@ async def test_cancellation_from_process_push_propagates(monkeypatch) -> None:
     calls: list[str] = []
 
     async def push(session, store, settings, eval_queue, payload):
-        from curie_api.schemas import WebhookResult
+        from curie_api.schemas.deployments import WebhookResult
 
         repo = payload["repository"]["full_name"]
         calls.append(repo)

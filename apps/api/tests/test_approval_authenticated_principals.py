@@ -17,8 +17,9 @@ from typing import Any
 
 import pytest
 import redis
-from curie_api import approval_principal, crud
+from curie_api import approval_principal
 from curie_api.config import get_settings
+from curie_api.crud import console as crud_console
 from curie_api.deps import get_approver_sets
 from curie_api.main import create_app
 from curie_api.models import ConsoleSession
@@ -215,9 +216,9 @@ def _revoke_console_session(token: str) -> None:
         engine = create_async_engine(get_settings().database_url)
         try:
             async with AsyncSession(engine) as session:
-                row = await crud.live_console_session(session, token)
+                row = await crud_console.live_console_session(session, token)
                 assert row is not None
-                await crud.revoke_console_session(session, row)
+                await crud_console.revoke_console_session(session, row)
         finally:
             await engine.dispose()
 
@@ -637,7 +638,7 @@ def test_null_subject_console_session_cannot_be_an_approval_principal(
         engine = create_async_engine(get_settings().database_url)
         try:
             async with AsyncSession(engine) as session:
-                code = crud.new_login_code()
+                code = crud_console.new_login_code()
                 await session.execute(
                     text(
                         "INSERT INTO curie.console_sessions "
@@ -646,8 +647,8 @@ def test_null_subject_console_session_cannot_be_an_approval_principal(
                     ),
                     {
                         "id": uuid.uuid4(),
-                        "code_hash": crud.hash_console_credential(code),
-                        "expires_at": datetime.now(UTC).replace(tzinfo=None) + crud.LOGIN_CODE_TTL,
+                        "code_hash": crud_console.hash_console_credential(code),
+                        "expires_at": datetime.now(UTC).replace(tzinfo=None) + crud_console.LOGIN_CODE_TTL,
                     },
                 )
                 await session.commit()

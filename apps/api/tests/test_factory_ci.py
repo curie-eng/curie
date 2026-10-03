@@ -20,9 +20,10 @@ from typing import Any
 import pytest
 from channel_protocol import work_item_events
 from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
-from curie_api import factory_ci, workitems
+from curie_api import factory_ci
 from curie_api.config import Settings
 from curie_api.workitem_outcomes import CiDetail
+from curie_api.workitems import lifecycle as workitems
 from pydantic import ValidationError
 
 HEAD = "a1" * 20
