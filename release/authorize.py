@@ -118,6 +118,7 @@ REQUIRED_CHECK_NAMES = frozenset(
         "Build CI images (no push)",
         "Build sre-bot-tempo image (no push)",
         "Build sre-bot-self-upgrade image (no push)",
+        "Build github-activity-github image (no push)",
         "Dispatcher image imports resolve",
         "Repository toolchain proof (runner image)",
         "Eval falsifiability gate (fake model, offline)",
