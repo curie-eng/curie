@@ -197,6 +197,7 @@ def _full_boot_env() -> BootEnv:
         thinking="disabled",
         deployment_environment="prod",
         channel_bound=True,
+        channel_kind="slack",
         model_env_key="MY_PROVIDER_KEY",
         metrics_temporality_preference="delta",
         max_turns=50,

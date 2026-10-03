@@ -269,6 +269,7 @@ fn case_requiring(expected: &str) -> EvalCase {
             case_sensitive: false,
         },
         shared_history: false,
+        sender: None,
         expect_status: ExpectedStatus::Done,
     }
 }

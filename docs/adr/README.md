@@ -214,4 +214,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0189 | [Deployed agents see only their bundle's skills](0189-deployed-agents-see-only-their-bundles-skills.md) | Accepted |
 | 0190 | [Automated hook sources cannot widen their tool access](0190-automated-hook-sources-cannot-widen-their-tool-access.md) | Accepted |
 | 0191 | [Protected hooks use a separately authorized delivery lane](0191-protected-hook-delivery-authority.md) | Accepted |
+| 0192 | [The model sees the platform sender](0192-the-model-sees-the-platform-sender.md) | Accepted |
 <!-- END GENERATED: adr-index -->

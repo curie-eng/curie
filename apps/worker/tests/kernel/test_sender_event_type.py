@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
-from curie_worker.kernel import Kernel
+from curie_worker.kernel.core import Kernel
 
 
 def _turn(source: TurnSource) -> QueuedTurn:

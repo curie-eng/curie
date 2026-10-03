@@ -499,6 +499,12 @@ class BootEnv(_AciModel):
     channel_bound: bool | None = Field(
         default=None, json_schema_extra=_env("CURIE_CHANNEL_BOUND", "worker")
     )
+    # The channel kind of this boot (#3818). The worker binding passes the
+    # turn's kind when it is non-empty. Absent means the boot has no kind.
+    # It is not part of SessionConfig. Blank parses as unset.
+    channel_kind: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_CHANNEL_KIND", "worker")
+    )
     # Which env var(s) carry the model credential (#514): a bare name or a JSON
     # array of them, walked in order. Unset, the runner falls back to
     # CURIE_CREDENTIALS, which is today's behavior.
@@ -639,6 +645,7 @@ class BootEnv(_AciModel):
         connector_namespace: str | None = None,
         connector_caller_token: str | None = None,
         channel_bound: bool | None = None,
+        channel_kind: str | None = None,
     ) -> dict[str, str]:
         """Render the worker binding's boot-env subset.
 
@@ -716,6 +723,8 @@ class BootEnv(_AciModel):
                 env[cls.env_key("connector_caller_token")] = connector_caller_token
         if channel_bound:
             env[cls.env_key("channel_bound")] = "1"
+        if channel_kind:
+            env[cls.env_key("channel_kind")] = channel_kind
         return env
 
     def to_env(self) -> dict[str, str]:
@@ -800,6 +809,8 @@ class BootEnv(_AciModel):
             env[self.env_key("deployment_environment")] = self.deployment_environment
         if self.channel_bound is not None:
             env[self.env_key("channel_bound")] = "1" if self.channel_bound else "0"
+        if self.channel_kind:
+            env[self.env_key("channel_kind")] = self.channel_kind
         if self.model_env_key is not None:
             env[self.env_key("model_env_key")] = self.model_env_key
         if self.metrics_temporality_preference is not None:
@@ -874,6 +885,7 @@ class BootEnv(_AciModel):
             thinking=_str_or_none(env.get("CURIE_THINKING")),
             deployment_environment=_str_or_none(env.get("CURIE_DEPLOYMENT_ENVIRONMENT")),
             channel_bound=_fake_model_or_none(env.get("CURIE_CHANNEL_BOUND")),
+            channel_kind=_str_or_none(env.get("CURIE_CHANNEL_KIND")),
             model_env_key=_str_or_none(env.get("CURIE_MODEL_ENV_KEY")),
             metrics_temporality_preference=_str_or_none(
                 env.get("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE")

@@ -140,6 +140,12 @@ pub struct EvalCase {
     /// suite that never wrote the field).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shared_history: bool,
+    /// Optional platform sender for this case (#3818). Omitted suites keep
+    /// decoding: absent means `None`, and serialization skips `None` so a
+    /// scaffolded case stays byte-identical to one that never wrote the field.
+    /// A set value is the turn author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
     #[serde(default)]
     pub expect_status: ExpectedStatus,
 }
@@ -785,6 +791,7 @@ mod tests {
             input: "hi".into(),
             grader: g,
             shared_history: false,
+            sender: None,
             expect_status,
         }
     }
@@ -1244,6 +1251,7 @@ mod tests {
                     input: "hi".into(),
                     grader: grader(GraderKind::Contains, "hi", false),
                     shared_history: false,
+                    sender: None,
                     expect_status: ExpectedStatus::Done,
                 })
                 .collect(),

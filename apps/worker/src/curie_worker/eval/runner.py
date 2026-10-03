@@ -150,7 +150,8 @@ class EvalRunner:
         fake: bool = False,
     ) -> EvalCaseResult:
         start = time.monotonic()
-        event = Event(type="eval_case", text=case.input, user="eval", ts="0")
+        user = case.sender if case.sender else "eval"
+        event = Event(type="eval_case", text=case.input, user=user, ts="0")
         parts: list[str] = []
         trajectory: list[str] = []
         final_text: str | None = None

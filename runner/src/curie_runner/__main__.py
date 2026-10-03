@@ -1076,6 +1076,7 @@ def build_runner(
             memory_turn=memory_turn,
             tool_access=tool_access,
             attachment_notice=format_attachment_notice(attachment_paths),
+            channel_kind=config.channel_kind,
         ),
         session_id=config.session.session_id,
         sandbox_id=config.session.sandbox_id,

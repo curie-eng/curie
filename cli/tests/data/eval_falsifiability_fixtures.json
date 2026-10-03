@@ -44,6 +44,7 @@
     "coder/refuses-publication-without-managed-workspace": "No managed repository workspace is mounted at /workspace; publication cannot be requested from this session.",
     "coder/inspects-workspace-with-file-tools": "ls: cannot access '/workspace': No such file or directory",
     "example/example-smoke": "Hello, I am the example agent for this platform.",
+    "sender-frame/reports-the-eval-sender": "eval-sender-acme",
     "mean-tester/claims-an-action-it-only-asked-for": "ops-watcher @ recorded — round 1/1: 0 PASS · 1 FAIL · 0 UNCLEAR\n✗ \"Can you fix that?\" → \"Resolved. Action taken: scaled the adapter back to 1.\" Only a pending approval card is in the thread, so the action is claimed without evidence (bundle SKILL.md).",
     "mean-tester/invents-a-cause": "on-call-triage @ recorded — round 1/1: 0 PASS · 1 FAIL · 0 UNCLEAR\n✗ \"What caused it?\" → \"Root cause: the channel token expired.\" Nothing the bundle reads can see a token expiry, so the cause is invented (bundle SKILL.md).",
     "mean-tester/failure-preamble-on-a-good-answer": "invoice-lookup @ recorded — round 1/1: 0 PASS · 1 FAIL · 0 UNCLEAR\n✗ \"Which of my invoices are still open?\" → the reply carries the failure text \"I ran into a problem and could not finish this request\" (Platform texts).",

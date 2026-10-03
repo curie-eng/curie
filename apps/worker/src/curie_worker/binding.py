@@ -1206,6 +1206,7 @@ class BindingResolver:
             state_url=state_url,
             state_token=app_state_token,
             channel_bound=True if kind and address else None,
+            channel_kind=kind if kind else None,
         )
         # #517/#669 opt-in false-completion check: NOT a BootEnv.render_worker
         # kwarg (it is deliberately kept out of the frozen ACI contract, see

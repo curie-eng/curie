@@ -78,6 +78,7 @@ from .memory_facts import MemoryTurn
 from .otel import RunTracer, _GenerationSpan
 from .progress import ProgressActivity
 from .redact import OutboundRedactor
+from .sender_frame import frame_user_turn
 from .side_effects import SideEffectClassifier
 from .tool_access import (
     ENFORCED_TOOL_ACCESS,
@@ -309,6 +310,7 @@ class SessionRunner:
         memory_turn: MemoryTurn | None = None,
         tool_access: TurnToolAccess | None = None,
         attachment_notice: str | None = None,
+        channel_kind: str | None = None,
     ) -> None:
         self._factory = session_factory
         # The attachments this boot found, named on the first prompt sent
@@ -316,6 +318,8 @@ class SessionRunner:
         # file, so that prompt is the message that carried them. Cleared once
         # sent, so a later turn in this warm sandbox names none.
         self._attachment_notice = attachment_notice
+        # None is an unbound boot (#3818), the same framing path as a kind.
+        self._channel_kind = channel_kind
         self._held_secrets = held_secrets
         # The per-turn tool access every call decision reads (RUNNER-TOOL-ACCESS-2).
         # None means this session cannot enforce one, so it refuses a restricted
@@ -853,11 +857,15 @@ class SessionRunner:
         self._unrestricted_prompt_sent = True
         if event is not None and self._memory_turn is not None:
             self._memory_turn.begin(event)
-        await self._session.query(text)
+        if event is not None:
+            framed = frame_user_turn(event.type, event.user, text, self._channel_kind)
+        else:
+            framed = frame_user_turn("message", "", text, self._channel_kind)
+        await self._session.query(framed)
         if self._active_state is not None:
             self._active_state.assistant_group = None
             self._active_state.history_messages.append(
-                ConversationMessage(role="user", content=text)
+                ConversationMessage(role="user", content=framed)
             )
         return True
 
@@ -1451,8 +1459,6 @@ class SessionRunner:
 
         assert self._session is not None
         gen.query_observed()
-        # The prompt text never reaches OTel (e2e ladder gate); record its size only.
-        gen.observe_prompt(event.text)
         if self._tool_access is not None:
             # @spec RUNNER-TOOL-ACCESS-4: in force from this prompt until the next.
             self._tool_access.begin(event.tool_access)
@@ -1461,10 +1467,12 @@ class SessionRunner:
         else:
             self._read_only_prompt_sent = True
         self._result_pending = True
-        prompt = event.text
+        prompt = frame_user_turn(event.type, event.user, event.text, self._channel_kind)
         if self._attachment_notice is not None:
-            prompt = f"{event.text}\n\n{self._attachment_notice}"
+            prompt = f"{prompt}\n\n{self._attachment_notice}"
             self._attachment_notice = None
+        # The prompt text never reaches OTel (e2e ladder gate); record its size only.
+        gen.observe_prompt(prompt)
         state.prompt_text = prompt
         await self._session.query(prompt)
         async for message in self._session.receive_turn():

@@ -30,12 +30,17 @@ class EvalCaseOut(BaseModel):
     terminal session status the case asserts, default ``done``. A promoted trace
     is a completed conversation, so the emitted case keeps the default; a human
     edits it to ``awaiting-approval`` when the case should assert an approval gate
-    held. Do not let this literal drift from the schema's ``ExpectedStatus`` enum."""
+    held. Do not let this literal drift from the schema's ``ExpectedStatus`` enum.
+
+    ``sender`` mirrors the worker's optional eval-case sender (#3818). A promoted
+    trace has no suite sender, so the field stays unset. Omitted suites still
+    decode."""
 
     id: str
     input: str
     grader: GraderOut
     shared_history: bool = False
+    sender: str | None = None
     expect_status: Literal["done", "awaiting-approval"] = "done"
 
 

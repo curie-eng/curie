@@ -3994,6 +3994,7 @@ async fn run_eval_turns(
                 // Thread reset (#1534) must use the same prefixed key the
                 // worker claimed.
                 let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
+                let author = case.sender.as_deref().unwrap_or(opts.user.as_str());
                 let (event, relay_ref) = match &transport {
                     EvalReplyTransport::Stub(stub) => {
                         let reply_endpoint = stub.base_api_url().to_string();
@@ -4002,7 +4003,7 @@ async fn run_eval_turns(
                                 eval_case_turn(
                                     "slack",
                                     &channel_id,
-                                    &opts.user,
+                                    author,
                                     &case.input,
                                     &thread_ts,
                                     &placeholder_ts,
@@ -4018,7 +4019,7 @@ async fn run_eval_turns(
                         let mut event = eval_case_turn(
                             "slack",
                             &channel_id,
-                            &opts.user,
+                            author,
                             &case.input,
                             &thread_ts,
                             reply_ref.hyphenated().to_string(),
@@ -7711,6 +7712,7 @@ mod tests {
                 case_sensitive: false,
             },
             shared_history: false,
+            sender: None,
             expect_status,
         }
     }

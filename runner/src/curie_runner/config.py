@@ -112,6 +112,8 @@ class RunnerConfig:
     # the operator's CURIE_MEMORY_MAX_FACTS or the default of 200. One number
     # for both, so a saved fact is never left out of the prompt.
     memory_max_facts: int = MAX_FACTS_PER_MEMORY
+    # Channel kind of this boot (#3818). None is an unbound boot.
+    channel_kind: str | None = None
 
     @property
     def memory_writes_on(self) -> bool:
@@ -201,4 +203,5 @@ class RunnerConfig:
                 if boot.memory_max_facts is not None
                 else MAX_FACTS_PER_MEMORY
             ),
+            channel_kind=boot.channel_kind,
         )

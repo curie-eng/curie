@@ -161,8 +161,12 @@ def test_a_later_message_to_the_same_runner_names_no_file(tmp_path: Path) -> Non
 
     queries = _serve(runner, ["file the revised notes", "thanks, that is all"])
 
-    assert queries[1] == "thanks, that is all"
-    assert store.turns[1].messages[0].content == "thanks, that is all"
+    later = queries[1]
+    user_at = later.index("[user-message")
+    end_at = later.index("[end-user-message")
+    assert "thanks, that is all" in later[user_at:end_at]
+    assert str(mount / "notes.md") not in later
+    assert store.turns[1].messages[0].content == later
 
 
 def test_a_boot_with_no_files_sends_the_message_unchanged(tmp_path: Path) -> None:
@@ -175,7 +179,11 @@ def test_a_boot_with_no_files_sends_the_message_unchanged(tmp_path: Path) -> Non
         attachments_path=_mount(tmp_path, {}),
     )
 
-    assert _serve(runner, ["what can you do?"]) == ["what can you do?"]
+    sent = _serve(runner, ["what can you do?"])[0]
+    user_at = sent.index("[user-message")
+    end_at = sent.index("[end-user-message")
+    assert "what can you do?" in sent[user_at:end_at]
+    assert "absolute paths" not in sent
 
 
 def test_the_system_prompt_does_not_say_the_current_message_carried_them(

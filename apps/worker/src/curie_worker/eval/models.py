@@ -153,6 +153,12 @@ class EvalCase(BaseModel):
     default, so it is a backward-compatible addition to the frozen eval-case
     schema (ADR-0019): an existing suite that omits it keeps decoding.
 
+    ``sender`` is the platform user id the eval driver stamps on the turn
+    (#3818). It is optional and defaults to ``None``, the same way
+    ``shared_history`` stayed optional: an existing suite that omits it keeps
+    decoding. A driver that sees ``None`` or an empty string keeps today's
+    author. A non-empty value is that turn's author.
+
     ``expect_status`` asserts the turn's terminal session status: it defaults to
     ``done`` (keeping every pre-existing case unchanged), or ``awaiting-approval``
     to assert an approval gate blocked the action -- so a gate holding is a green
@@ -165,6 +171,7 @@ class EvalCase(BaseModel):
     input: str
     grader: Grader
     shared_history: bool = False
+    sender: str | None = None
     expect_status: ExpectedStatus = ExpectedStatus.DONE
 
 

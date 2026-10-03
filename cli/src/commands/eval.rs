@@ -282,7 +282,12 @@ pub(super) async fn run_suite_cases(
             }
             let started = Instant::now();
             let events = client
-                .send_event(EventType::EvalCase, &case.input, "U-eval", |_| {})
+                .send_event(
+                    EventType::EvalCase,
+                    &case.input,
+                    case.sender.as_deref().unwrap_or("U-eval"),
+                    |_| {},
+                )
                 .await?;
             let elapsed = started.elapsed().as_secs_f64();
             let sample_completed = turn_completed(case, &events);
