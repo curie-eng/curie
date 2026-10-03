@@ -18,6 +18,16 @@
 # the policy is broader than declared) and the script FAILS -- it does not
 # skip and it does not pass. A green run on a non-enforcing cluster would
 # be worse than no check at all.
+#
+# A last leg (check_broad_private, #3842 AC3) proves a broad route no longer
+# reaches a private-range peer. A runner-labelled pod first reaches a
+# controlled private pod peer under a hand-written policy of the pre-change
+# shape (0.0.0.0/0 except only 169.254.0.0/16), proving the path exists; the
+# same pod is then held to the chart-rendered policies for
+# allowedEgress 0.0.0.0/0 and must be refused, while an identical peer named
+# by a narrow /32 entry stays reachable (the re-allow path, and proof the
+# rendered policy is live). Plain TCP connects only, never HTTP(S), so a TLS
+# or HTTP error cannot pass for a connectivity result.
 set -euo pipefail
 
 CHART="${1:-${CURIE_RUNNER_BYO_CHART:-charts/curie}}"
@@ -427,6 +437,249 @@ PASS -- the same silent drop a SaaS collector behind rotating IPs would see
   cleanup_and_settle
 }
 
+# Broad route vs private peer (#3842 AC3). Two identical http-echo pods whose
+# pod IPs are private (kind's pod CIDR): TARGET is reached only through the
+# broad route, CONTROL is also named by a narrow /32 entry. Never the API
+# server or a node address: NetworkPolicy permits node-local traffic, so those
+# would not measure the except list.
+check_broad_private() {
+  local port=5678
+  ALLOWED_POD="runner-broad-private-control"
+  UNDECLARED_POD="runner-broad-private-target"
+  PROBE_POD="runner-broad-private-probe"
+  # Never created; a real name keeps the shared cleanup's delete well-formed.
+  MISMATCH_SVC="runner-broad-private-unused"
+  local prechange_policy="runner-broad-private-prechange"
+
+  echo ""
+  echo "== broad route 0.0.0.0/0 vs a private-range pod peer (TCP ${port}, #3842) =="
+
+  cleanup_and_settle
+  kubectl -n "$NS" delete networkpolicy "$prechange_policy" \
+    --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
+
+  kubectl -n "$NS" apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $UNDECLARED_POD
+  labels:
+    app.kubernetes.io/name: runner-byo-target
+spec:
+  restartPolicy: Never
+  containers:
+    - name: target
+      image: $TARGET_IMAGE
+      args: ["-listen=:$port", "-text=target"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $ALLOWED_POD
+  labels:
+    app.kubernetes.io/name: runner-byo-target
+spec:
+  restartPolicy: Never
+  containers:
+    - name: target
+      image: $TARGET_IMAGE
+      args: ["-listen=:$port", "-text=control"]
+YAML
+  kubectl -n "$NS" wait --for=condition=Ready \
+    "pod/$UNDECLARED_POD" "pod/$ALLOWED_POD" --timeout=180s >/dev/null \
+    || fail "the broad-route private peers did not become ready in $NS"
+
+  local target_ip control_ip
+  target_ip="$(kubectl -n "$NS" get pod "$UNDECLARED_POD" -o jsonpath='{.status.podIP}')"
+  control_ip="$(kubectl -n "$NS" get pod "$ALLOWED_POD" -o jsonpath='{.status.podIP}')"
+  [ -n "$target_ip" ] && [ -n "$control_ip" ] || fail "could not read the private peers' pod IPs"
+  [ "$target_ip" != "$control_ip" ] || fail "both private peers report $target_ip; the legs cannot be told apart"
+  python3 - "$target_ip" "$control_ip" <<'PY' || fail "the private peers are not inside 10.0.0.0/8, 172.16.0.0/12 or 192.168.0.0/16 (target=$target_ip control=$control_ip); this leg needs a private-range pod peer and cannot measure the except list otherwise"
+import ipaddress, sys
+nets = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+for raw in sys.argv[1:]:
+    ip = ipaddress.ip_address(raw)
+    if ip.version != 4 or not any(ip in n for n in nets):
+        sys.exit(1)
+PY
+  echo "  ok  private peers: target $target_ip (broad route only), control $control_ip (also a narrow /32)"
+
+  local values_file="$TMP/broad-private.yaml"
+  cat >"$values_file" <<EOF
+security:
+  networkPolicy:
+    allowedEgress:
+      - cidr: 0.0.0.0/0
+        ports: [{ protocol: TCP, port: ${port} }]
+      - cidr: ${control_ip}/32
+        ports: [{ protocol: TCP, port: ${port} }]
+EOF
+  local render_out="$TMP/broad-private-render"
+  rm -rf -- "$render_out"
+  mkdir -p "$render_out"
+  # --output-dir, never a pipe (a piped render has truncated silently while
+  # exiting 0); helm refuses --show-only together with --output-dir, so the
+  # whole chart renders and only security-networkpolicy.yaml is read.
+  helm template curie "$CHART" -n "$NS" \
+    --values "$values_file" \
+    --output-dir "$render_out" >/dev/null \
+    || fail "rendering templates/security-networkpolicy.yaml with allowedEgress 0.0.0.0/0 failed"
+  local rendered_file
+  rendered_file="$(find "$render_out" -name security-networkpolicy.yaml -print -quit)"
+  [ -n "$rendered_file" ] && [ -s "$rendered_file" ] \
+    || fail "helm wrote no security-networkpolicy.yaml under $render_out"
+
+  local policy
+  policy="$(extract_policies "-runner-allow-egress" <"$rendered_file")" \
+    || fail "could not extract default-deny, allow-dns, and allow-egress from the broad-route render"
+
+  # STRUCTURAL GUARD: the rendered broad rule must except a range holding the
+  # target, and the narrow control rule must carry no except. Otherwise the
+  # packets below test something other than the private-range except.
+  local policy_file="$TMP/broad-private-policies.yaml"
+  printf '%s\n' "$policy" >"$policy_file"
+  python3 - "$policy_file" "$target_ip" "$control_ip" <<'PY' \
+    || fail "the rendered allow-egress does not except the target's private range under 0.0.0.0/0, or excepts the narrow control"
+import ipaddress, pathlib, sys, yaml
+target, control = (ipaddress.ip_address(a) for a in sys.argv[2:])
+docs = [d for d in yaml.safe_load_all(pathlib.Path(sys.argv[1]).read_text()) if isinstance(d, dict)]
+allow = [d for d in docs if d["metadata"]["name"].endswith("-runner-allow-egress")][0]
+blocks = {}
+for rule in allow["spec"]["egress"]:
+    for peer in rule.get("to") or []:
+        block = peer.get("ipBlock") or {}
+        blocks[block.get("cidr")] = block.get("except") or []
+broad = blocks.get("0.0.0.0/0")
+if broad is None:
+    sys.exit("no 0.0.0.0/0 rule rendered")
+if not any(target in ipaddress.ip_network(e) for e in broad):
+    sys.exit(f"0.0.0.0/0 excepts {broad}, none of which holds {target}")
+if blocks.get(f"{control}/32") != []:
+    sys.exit(f"{control}/32 must render with no except, got {blocks.get(f'{control}/32')!r}")
+print(f"  ok  rendered 0.0.0.0/0 excepts {broad}; {control}/32 has no except")
+PY
+
+  local selector
+  selector="$(echo "$policy" | selector_from_byo "-runner-allow-egress")" \
+    || fail "could not derive the probe labels from the rendered allow-egress podSelector"
+  local selector_json
+  selector_json="$(echo "$policy" | python3 -c '
+import json, sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin) if isinstance(d, dict)]
+allow = [d for d in docs if d["metadata"]["name"].endswith("-runner-allow-egress")][0]
+print(json.dumps(allow["spec"]["podSelector"]))
+')"
+  local base_policies
+  base_policies="$(echo "$policy" | python3 -c '
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin) if isinstance(d, dict)]
+keep = [d for d in docs if not d["metadata"]["name"].endswith("-runner-allow-egress")]
+names = [d["metadata"]["name"] for d in keep]
+if len(keep) != 2:
+    sys.exit("expected default-deny and allow-dns, got " + ", ".join(names))
+print("---\n".join(yaml.safe_dump(d) for d in keep))
+')" || fail "could not split default-deny and allow-dns out of the broad-route render"
+  local allow_policy
+  allow_policy="$(echo "$policy" | python3 -c '
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin) if isinstance(d, dict)]
+print(yaml.safe_dump([d for d in docs if d["metadata"]["name"].endswith("-runner-allow-egress")][0]))
+')"
+
+  # nc's exit status is the measurement. It is echoed from inside the pod so a
+  # kubectl exec failure (no rc line) is never mistaken for a refused connect.
+  tcp_rc() {
+    local out
+    out="$(kubectl -n "$NS" exec "$PROBE_POD" -- \
+      sh -c "nc -z -w 5 $1 $port >/dev/null 2>&1; echo rc=\$?" 2>&1 || true)"
+    case "$out" in
+      *rc=0*) echo 0 ;;
+      *rc=[1-9]*) echo 1 ;;
+      *) fail "could not run nc in $PROBE_POD: $out" ;;
+    esac
+  }
+
+  # ---------------------------------------------------------------------------
+  # LEG 1, non-vacuity: under the PRE-CHANGE shape the private peer is reached.
+  # ---------------------------------------------------------------------------
+  kubectl -n "$NS" apply -f - >/dev/null <<<"$base_policies" \
+    || fail "could not apply the rendered default-deny and allow-dns into $NS"
+  kubectl -n "$NS" apply -f - >/dev/null <<YAML || fail "could not apply the pre-change broad-route policy"
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: $prechange_policy
+  labels:
+    curie.dev/check: runner-byo-egress
+spec:
+  podSelector: $selector_json
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [169.254.0.0/16]
+      ports:
+        - { protocol: TCP, port: $port }
+YAML
+
+  kubectl -n "$NS" run "$PROBE_POD" --image="$PROBE_IMAGE" --restart=Never \
+    --image-pull-policy=IfNotPresent \
+    --labels="$selector" --command -- sleep 600 >/dev/null \
+    || fail "could not create the probe pod $PROBE_POD in $NS"
+  kubectl -n "$NS" wait --for=condition=Ready "pod/$PROBE_POD" --timeout=180s >/dev/null \
+    || fail "the probe pod did not become ready in $NS"
+
+  local rc="" i
+  for i in $(seq 1 6); do
+    rc="$(tcp_rc "$target_ip")"
+    [ "$rc" = 0 ] && break
+    sleep 5
+  done
+  [ "$rc" = 0 ] || fail "NON-VACUITY: under the pre-change policy (0.0.0.0/0 except only 169.254.0.0/16) the private peer $target_ip:$port was NOT reachable.
+
+The leg below would then prove nothing: a refusal there could be this same
+missing path rather than the private-range except. Fix the cluster (pod
+networking, the probe image, the peer) before trusting the candidate leg."
+  echo "  ok  pre-change shape: private peer $target_ip:$port is reachable (the path exists)"
+
+  # ---------------------------------------------------------------------------
+  # LEG 2: the chart-rendered policies refuse the same peer.
+  # ---------------------------------------------------------------------------
+  kubectl -n "$NS" delete networkpolicy "$prechange_policy" --wait=true --timeout=90s >/dev/null \
+    || fail "could not delete the pre-change policy"
+  kubectl -n "$NS" apply -f - >/dev/null <<<"$allow_policy" \
+    || fail "could not apply the rendered allow-egress policy"
+
+  # The control proves the rendered policy is live and selects the probe;
+  # without it, a refusal could be default-deny before the allow lands.
+  for i in $(seq 1 6); do
+    rc="$(tcp_rc "$control_ip")"
+    [ "$rc" = 0 ] && break
+    sleep 5
+  done
+  [ "$rc" = 0 ] || fail "under the rendered policies the narrow /32 control $control_ip:$port was NOT reachable.
+
+The re-allow path for a private peer is a narrow allowedEgress entry, so this is
+a policy defect (or the rendered policy never selected the probe), and a
+refusal of the target below would prove nothing."
+  echo "  ok  rendered policies: narrow /32 control $control_ip:$port is reachable (re-allow path, policy live)"
+
+  for i in $(seq 1 6); do
+    rc="$(tcp_rc "$target_ip")"
+    [ "$rc" != 0 ] && break
+    sleep 5
+  done
+  [ "$rc" != 0 ] || fail "AC3: under the chart-rendered policies for allowedEgress 0.0.0.0/0 the private peer $target_ip:$port is STILL reachable.
+
+The pre-change leg reached it and the identical /32 control is reachable, so
+the CNI is enforcing and the rendered broad route does not except the private
+range holding $target_ip (#3842)."
+  echo "  ok  rendered policies: private peer $target_ip:$port is refused through the broad route"
+
+  cleanup_and_settle
+}
+
 RUSTFS_VALUES="$(cat <<EOF
 rustfs:
   deploy: false
@@ -496,5 +749,6 @@ check_key rustfs 9000 "-runner-allow-object-store" "$RUSTFS_VALUES"
 check_key sts 8443 "-runner-allow-object-store" "$STS_VALUES"
 check_key otel 4318 "-runner-allow-collector-endpoint" "$OTEL_VALUES"
 check_key api 8000 "-runner-allow-api-endpoint" "$API_VALUES"
+check_broad_private
 
-echo "== runner BYO egress enforces: undeclared peer blocked, declared peer reachable, mismatch hostname blocked (rustfs/sts/otel/api) =="
+echo "== runner BYO egress enforces: undeclared peer blocked, declared peer reachable, mismatch hostname blocked (rustfs/sts/otel/api); a broad route refuses a private peer it reached before #3842 =="

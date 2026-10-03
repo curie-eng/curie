@@ -201,6 +201,10 @@ class FakeSandboxClient:
     termination_reads: list[str] = field(default_factory=list)
     created: list[str] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
+    # Every claim-scoped template sweep the substrate asked for, as
+    # ``(keep, created_before)``; ``template_reap_error`` makes the sweep raise.
+    template_reaps: list[tuple[set[str], datetime]] = field(default_factory=list)
+    template_reap_error: BaseException | None = None
 
     def create_claim(
         self,
@@ -266,6 +270,12 @@ class FakeSandboxClient:
                 assert view is not None
                 views.append(view)
         return views
+
+    def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
+        self.template_reaps.append((set(keep), created_before))
+        if self.template_reap_error is not None:
+            raise self.template_reap_error
+        return []
 
     def get_sandbox(
         self, name: str, *, request_timeout_seconds: float

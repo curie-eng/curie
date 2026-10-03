@@ -17,11 +17,16 @@
 #
 # Eight assertions:
 #   (a) With the reconciler DISABLED (the default), the worker Role grants
-#       nothing on the four connector kinds.
+#       nothing on deployments, services, or networkpolicies, and its only
+#       secrets rule is the per-claim token grant (#3842): exactly `create`,
+#       nothing that reads, patches, or deletes a Secret.
 #   (b) Disabled render still grants the two agent-sandbox CRD rules, so the
 #       gate did not swallow the pre-existing rules.
 #   (c) Enabled render grants exactly {create,list,patch,delete} on each of the
-#       four kinds -- create present, and no extra verb sneaking in.
+#       four kinds -- create present, and no extra verb sneaking in. Verbs are
+#       the union across every rule naming the kind, because secrets is now
+#       granted by two rules (the per-claim token create and the reconciler's);
+#       taking only the last rule would hide a verb another rule adds.
 #   (d) No `get` and no `watch`: nothing in the client reads a single object or
 #       opens a watch, and an unused verb is an unexplained one.
 #   (e) The four kinds match CONNECTOR_KINDS in the worker source. The Python
@@ -76,12 +81,32 @@ ENABLED="$(render true)"
 DISABLED_RULES="$(worker_role_rules "$DISABLED")"
 ENABLED_RULES="$(worker_role_rules "$ENABLED")"
 
-# (a) Off by default means no grant at all.
-for resource in deployments services secrets networkpolicies; do
+# (a) Off by default means no grant at all on the connector kinds...
+for resource in deployments services networkpolicies; do
   if grep -q "$resource" <<<"$DISABLED_RULES"; then
     fail a "worker Role grants $resource with the reconciler disabled; the RBAC gate is not working"
   fi
 done
+# ...and Secrets only through the per-claim token rule (#3842): create, and
+# nothing else, in exactly one rule that names only secrets.
+python3 - "$DISABLED_RULES" <<'PY' || exit 1
+import sys, yaml
+rules = [r for r in yaml.safe_load(sys.argv[1]) if "secrets" in (r.get("resources") or [])]
+if len(rules) != 1:
+    print(f"FAIL [a] expected exactly one secrets rule with the reconciler disabled, found {len(rules)}: {rules!r}", file=sys.stderr)
+    sys.exit(1)
+rule = rules[0]
+if rule.get("apiGroups") != [""] or rule.get("resources") != ["secrets"]:
+    print(f"FAIL [a] the disabled secrets rule must name only core secrets, got {rule!r}", file=sys.stderr)
+    sys.exit(1)
+if rule.get("verbs") != ["create"]:
+    print(
+        f"FAIL [a] the disabled secrets rule grants {rule.get('verbs')!r}, expected ['create']; "
+        "the per-claim token Secret is create-only and the reconciler is off",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
 
 # (b) ...without having eaten the rules that were already there.
 grep -q "sandboxclaims" <<<"$DISABLED_RULES" || fail b "the disabled render lost the sandboxclaims rule"
@@ -103,7 +128,7 @@ for rule in rules:
     for group in rule["apiGroups"]:
         for resource in rule["resources"]:
             if (group, resource) in want:
-                seen[(group, resource)] = set(rule["verbs"])
+                seen.setdefault((group, resource), set()).update(rule["verbs"])
 missing = want - set(seen)
 if missing:
     print(f"FAIL [c] no rule grants {sorted(missing)}", file=sys.stderr)

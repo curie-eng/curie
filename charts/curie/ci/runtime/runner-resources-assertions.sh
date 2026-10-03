@@ -72,8 +72,18 @@ QUOTA_ENV = (
     "CURIE_SANDBOX_QUOTA_LIMITS_MEMORY",
 )
 CONTAINER_COUNT_ENV = "CURIE_SANDBOX_RUNNER_RESOURCE_CONTAINERS"
-TEMPLATE_RESOURCES = ("sandboxtemplates", "sandboxwarmpools")
-TEMPLATE_VERBS = {"get", "create", "patch"}
+# Per resource (#3842): per-claim template copies need `delete` for rollback
+# and `list` for the reaper sweep; the claim-cleanup admission policy admits a
+# delete only of a template carrying curietech.ai/sandbox-claim. Warm pools are
+# still only read and written, never listed or deleted by the worker.
+TEMPLATE_VERBS = {
+    "sandboxtemplates": {"get", "create", "patch", "list", "delete"},
+    "sandboxwarmpools": {"get", "create", "patch"},
+}
+# The per-claim token Secret (#3842) is create-only: the worker-secrets
+# admission policy admits only Opaque `*-tokens` Secrets carrying the claim
+# label, and nothing here lets the worker read a Secret back.
+SECRET_VERBS = {"create"}
 TEMPLATE_GROUP = "extensions.agents.x-k8s.io"
 
 
@@ -224,7 +234,7 @@ def assert_worker_role(docs):
     roles = labeled(docs, "Role", "worker")
     if len(roles) != 1:
         sys.exit(f"expected one worker Role, found {len(roles)}")
-    for resource in TEMPLATE_RESOURCES:
+    for resource, want in TEMPLATE_VERBS.items():
         matched = [
             rule
             for rule in (roles[0].get("rules") or [])
@@ -238,12 +248,33 @@ def assert_worker_role(docs):
             if groups != [TEMPLATE_GROUP]:
                 sys.exit(f"{resource} apiGroups are {groups!r}, expected [{TEMPLATE_GROUP!r}]")
             verbs.update(rule.get("verbs") or [])
-        if verbs != TEMPLATE_VERBS:
+        if verbs != want:
             sys.exit(
-                f"{resource} verbs are {sorted(verbs)}, expected {sorted(TEMPLATE_VERBS)} "
-                "(get, create, patch only; list and delete are not granted)"
+                f"{resource} verbs are {sorted(verbs)}, expected {sorted(want)} "
+                "(sandboxtemplates: get, create, patch, list, delete for per-claim "
+                "copies; sandboxwarmpools: get, create, patch only, list and delete "
+                "are not granted)"
             )
-
+    # The reconciler is disabled in both renders this script reads, so every
+    # secrets rule here is the per-claim token grant, never the reconciler's.
+    secret_rules = [
+        rule
+        for rule in (roles[0].get("rules") or [])
+        if "secrets" in (rule.get("resources") or [])
+    ]
+    if len(secret_rules) != 1:
+        sys.exit(
+            f"expected exactly one secrets rule with the reconciler disabled, found "
+            f"{len(secret_rules)}: {secret_rules!r}"
+        )
+    rule = secret_rules[0]
+    if rule.get("apiGroups") != [""] or rule.get("resources") != ["secrets"]:
+        sys.exit(f"the secrets rule must name only core secrets, got {rule!r}")
+    if set(rule.get("verbs") or []) != SECRET_VERBS:
+        sys.exit(
+            f"secrets verbs are {sorted(rule.get('verbs') or [])}, expected "
+            f"{sorted(SECRET_VERBS)} (create only; no get, list, or watch)"
+        )
 
 enabled, disabled, values_path = sys.argv[1:]
 enabled_docs = load_docs(enabled)

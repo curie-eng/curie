@@ -1330,6 +1330,84 @@ def test_reap_orphans_skips_and_warns_on_a_claim_of_unknown_age(
     assert warned, "an unknown-age skip must name the claim at WARNING"
 
 
+def test_reap_orphans_sweeps_claim_templates_with_observed_claims_kept(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #3842: a worker crash between creating a claim's per-claim template and
+    # binding the template to the claim leaves a labelled template no claim
+    # owns, so garbage collection never removes it (nor its token Secret).
+    # The reaper sweeps those, keeping every claim it still observes and
+    # sparing anything younger than the same bind-window cutoff it uses for
+    # claims.
+    live = substrate.claim("T-live")
+    orphan = substrate.claim("T-orphan")
+    young = substrate.claim("T-young")
+    affinity.delete_if_claim("T-orphan", orphan.claim_name)
+    affinity.delete_if_claim("T-young", young.claim_name)
+
+    frozen = datetime.now(UTC)
+
+    class _FrozenClock:
+        @staticmethod
+        def now(tz: object = None) -> datetime:
+            return frozen
+
+    monkeypatch.setattr("curie_worker.sandbox.substrate.datetime", _FrozenClock)
+    fake_k8s.claims[live.claim_name].created_at = frozen - timedelta(seconds=33.0)
+    fake_k8s.claims[orphan.claim_name].created_at = frozen - timedelta(seconds=33.0)
+    fake_k8s.claims[young.claim_name].created_at = frozen - timedelta(seconds=1.0)
+
+    assert substrate.reap_orphans() == [orphan.claim_name]
+
+    # One sweep per tick. keep is what the cluster still has after this pass:
+    # the routed claim and the in-flight one, never the claim just reaped.
+    # The cutoff is the claim grace (2.0 + 30.0) as literals, for the same
+    # reason the grace tests above spell it out.
+    assert fake_k8s.template_reaps == [
+        ({live.claim_name, young.claim_name}, frozen - timedelta(seconds=32.0))
+    ]
+
+
+def test_reap_orphans_survives_a_template_sweep_failure(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The sweep is best effort: an RBAC gap or API error on templates must
+    # cost only the sweep, never claim reaping or the inventory metric.
+    recorded: list[tuple[float, float]] = []
+    monkeypatch.setattr(
+        "curie_worker.sandbox.substrate._record_inventory",
+        lambda *, active, suspended: recorded.append((active, suspended)),
+    )
+    live = substrate.claim("T-live")
+    orphan = substrate.claim("T-orphan")
+    affinity.delete_if_claim("T-orphan", orphan.claim_name)
+    fake_k8s.claims[orphan.claim_name].created_at = datetime.now(UTC) - timedelta(seconds=33.0)
+
+    class _SweepRefused(RuntimeError):
+        pass
+
+    fake_k8s.template_reap_error = _SweepRefused("sandboxtemplates is forbidden: secret-ish detail")
+
+    with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.substrate"):
+        assert substrate.reap_orphans() == [orphan.claim_name]
+
+    assert len(fake_k8s.template_reaps) == 1, "the sweep must have been attempted"
+    assert orphan.claim_name not in fake_k8s.claims
+    assert live.claim_name in fake_k8s.claims
+    assert recorded == [(1.0, 0.0)], "inventory must still be recorded"
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("_SweepRefused" in r.getMessage() for r in warnings)
+    # Exception class only: the API error text is not logged.
+    assert all("secret-ish detail" not in r.getMessage() for r in warnings)
+
+
 def test_claim_rebinds_when_sandbox_died_under_live_route(
     substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient, affinity: AffinityStore
 ) -> None:

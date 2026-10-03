@@ -83,8 +83,20 @@
 #      IPv4-mapped ::ffff:169.254.169.254 counts as metadata everywhere; and
 #      ::/0 renders exactly one IPv6 except, fd00:ec2::254/128, while an
 #      IPv4-mapped ::ffff:0:0/96 allowedEgress entry is refused.
+#      #3842 widens 32: a broad route also excepts every private range it
+#      strictly contains, so ::/0 excepts fd00:ec2::254/128, fc00::/7 and
+#      fe80::/10, and 0.0.0.0/0 excepts 169.254.0.0/16, 10.0.0.0/8,
+#      100.64.0.0/10, 172.16.0.0/12 and 192.168.0.0/16.
 #  33. #3083: agentSandbox.registryEgress opens nothing by default, passes the
 #      shared floor, and renders one policy per declaring agent.
+#  34. #3842: split default routes 0.0.0.0/1 and 128.0.0.0/1 each except
+#      exactly the private ranges they contain; a narrow private entry
+#      (10.20.0.5/32) renders no except, so it stays the re-allow path for a
+#      private peer; security.networkPolicy.clusterCidrs adds a range under a
+#      broad route that contains it and not under a narrow one; an invalid
+#      clusterCidrs entry fails render naming the key; and runner ingress
+#      admits only this release's worker pods (a podSelector equal to the
+#      worker Deployment's selector, no namespaceSelector).
 #  15. An in-chart dispatcher.apiBaseUrl (this release's API Service) is not
 #      external: api.deploy=true does not require api.egress.
 #
@@ -1348,7 +1360,7 @@ ui:
 EOF
 must_fail_naming "api.egress IPv4-mapped metadata host" "api.egress entry \"::ffff:169.254.169.254/128\" must not cover" "$MAPPED_API"
 
-echo "=== Assertion 32: allowedEgress ::/0 excepts only fd00:ec2::254/128 (a mapped except is not same-family); 0.0.0.0/0 still excepts 169.254.0.0/16 (#2643) ==="
+echo "=== Assertion 32: allowedEgress ::/0 excepts IPv6 metadata then ULA and link-local (a mapped except is not same-family); 0.0.0.0/0 excepts metadata then every private range (#2643, #3842) ==="
 BROAD_VALUES="$TMP/broad.yaml"
 cat > "$BROAD_VALUES" <<EOF
 security:
@@ -1360,15 +1372,21 @@ security:
         ports: [{ protocol: TCP, port: 443 }]
 EOF
 BROAD_OUT="$(render_dir broad --values "$BROAD_VALUES")" || fail "allowedEgress ::/0 and 0.0.0.0/0 on 443 must render"
-python3 - "$BROAD_OUT" "$ALLOW_EGRESS" <<'PYEOF' || fail "broad allowedEgress must carve out every metadata address"
+python3 - "$BROAD_OUT" "$ALLOW_EGRESS" <<'PYEOF' || fail "broad allowedEgress must carve out every metadata address and every private range"
 import pathlib, sys, yaml
 out, name = sys.argv[1], sys.argv[2]
 for path in pathlib.Path(out).rglob("*.yaml"):
     for doc in yaml.safe_load_all(path.read_text()):
         if doc and doc.get("kind") == "NetworkPolicy" and doc["metadata"]["name"] == name:
             blocks = {r["to"][0]["ipBlock"]["cidr"]: r["to"][0]["ipBlock"].get("except") for r in doc["spec"]["egress"]}
-            assert blocks["::/0"] == ["fd00:ec2::254/128"], blocks
-            assert blocks["0.0.0.0/0"] == ["169.254.0.0/16"], blocks
+            assert blocks["::/0"] == ["fd00:ec2::254/128", "fc00::/7", "fe80::/10"], blocks
+            assert blocks["0.0.0.0/0"] == [
+                "169.254.0.0/16",
+                "10.0.0.0/8",
+                "100.64.0.0/10",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+            ], blocks
             print(f"ok: {name} excepts {blocks}")
             sys.exit(0)
 sys.exit(f"{name} did not render")
@@ -1440,6 +1458,119 @@ assert env.get("CURIE_AGENT_SANDBOX_POOLS") == "factory", env.get("CURIE_AGENT_S
 # A registry-only pool carries no connector secrets (#2943).
 assert env.get("CURIE_AGENT_CONNECTOR_SECRET_POOLS") == "", env.get("CURIE_AGENT_CONNECTOR_SECRET_POOLS")
 print(f"ok: {template} labels agent factory's pods and the worker routes factory claims to it")
+PYEOF
+
+echo "=== Assertion 34: broad routes except the private ranges they contain; narrow private peers stay allowed; runner ingress admits only worker pods (#3842) ==="
+PRIV_VALUES="$TMP/private-except.yaml"
+cat > "$PRIV_VALUES" <<EOF
+security:
+  networkPolicy:
+    clusterCidrs:
+      - 198.18.0.0/15
+    allowedEgress:
+      - cidr: 0.0.0.0/0
+        ports: [{ protocol: TCP, port: 443 }]
+      - cidr: 0.0.0.0/1
+        ports: [{ protocol: TCP, port: 443 }]
+      - cidr: 128.0.0.0/1
+        ports: [{ protocol: TCP, port: 443 }]
+      - cidr: 10.20.0.5/32
+        ports: [{ protocol: TCP, port: 443 }]
+      - cidr: 160.79.104.0/23
+        ports: [{ protocol: TCP, port: 443 }]
+EOF
+PRIV_OUT="$(render_dir private-except --values "$PRIV_VALUES")" \
+  || fail "allowedEgress broad, split, and narrow private routes with a valid clusterCidrs entry must render"
+python3 - "$PRIV_OUT" "$ALLOW_EGRESS" <<'PYEOF' || fail "assertion 34 (i)-(iii): private-range excepts under broad routes"
+import pathlib, sys, yaml
+out, name = sys.argv[1], sys.argv[2]
+policy = None
+for path in pathlib.Path(out).rglob("*.yaml"):
+    for doc in yaml.safe_load_all(path.read_text()):
+        if doc and doc.get("kind") == "NetworkPolicy" and doc["metadata"]["name"] == name:
+            policy = doc
+if policy is None:
+    sys.exit(f"{name} did not render")
+blocks = {}
+for rule in policy["spec"]["egress"]:
+    for peer in rule["to"]:
+        block = peer["ipBlock"]
+        if block["cidr"] in blocks:
+            sys.exit(f"{block['cidr']} rendered twice in {name}")
+        blocks[block["cidr"]] = block.get("except")
+for cidr, excepts in blocks.items():
+    if excepts is not None and len(excepts) != len(set(excepts)):
+        sys.exit(f"{cidr} except list has duplicates: {excepts}")
+# (iii) a clusterCidrs entry rides every broad route that contains it.
+want_default = [
+    "169.254.0.0/16", "10.0.0.0/8", "100.64.0.0/10",
+    "172.16.0.0/12", "192.168.0.0/16", "198.18.0.0/15",
+]
+if blocks.get("0.0.0.0/0") != want_default:
+    sys.exit(f"0.0.0.0/0 excepts {blocks.get('0.0.0.0/0')}, want {want_default}")
+# (i) each half of a split default route excepts exactly what it contains.
+low = {"10.0.0.0/8", "100.64.0.0/10"}
+high = {"169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "198.18.0.0/15"}
+if set(blocks.get("0.0.0.0/1") or []) != low:
+    sys.exit(f"0.0.0.0/1 excepts {blocks.get('0.0.0.0/1')}, want exactly {sorted(low)}")
+if set(blocks.get("128.0.0.0/1") or []) != high:
+    sys.exit(f"128.0.0.0/1 excepts {blocks.get('128.0.0.0/1')}, want exactly {sorted(high)}")
+# (ii) a narrow private peer is the re-allow path: no except at all.
+if "10.20.0.5/32" not in blocks or blocks["10.20.0.5/32"] is not None:
+    sys.exit(f"10.20.0.5/32 must render with no except, got {blocks.get('10.20.0.5/32', 'missing')}")
+# (iii) a narrow public route that contains no private range gets none.
+if "160.79.104.0/23" not in blocks or blocks["160.79.104.0/23"] is not None:
+    sys.exit(f"160.79.104.0/23 must render with no except, got {blocks.get('160.79.104.0/23', 'missing')}")
+print(f"ok: {name} excepts {blocks}")
+PYEOF
+
+cc_values() {
+  local name="$1"
+  local entry="$2"
+  local file="$TMP/cc-${name}.yaml"
+  cat > "$file" <<EOF
+security:
+  networkPolicy:
+    clusterCidrs:
+      - ${entry}
+EOF
+  printf '%s\n' "$file"
+}
+# (iv) refusal, with the valid 198.18.0.0/15 render above as its liveness pair.
+must_fail_naming "clusterCidrs not a CIDR" "security.networkPolicy.clusterCidrs" \
+  "$(cc_values notcidr '"not-a-cidr"')"
+must_fail_naming "clusterCidrs prefix zero" "security.networkPolicy.clusterCidrs" \
+  "$(cc_values slash0 '"0.0.0.0/0"')"
+
+# (v) runner ingress: only this release's worker pods, same namespace by
+# construction, so no namespaceSelector. The expected labels are read from the
+# rendered worker Deployment, and the worker pod template must carry them, so
+# the peer cannot select nothing.
+python3 - "$PRIV_OUT" "${RELEASE}-runner-ingress" "${RELEASE}-worker" <<'PYEOF' || fail "assertion 34 (v): runner ingress admits only worker pods"
+import pathlib, sys, yaml
+out, name, worker = sys.argv[1:]
+docs = [d for p in pathlib.Path(out).rglob("*.yaml") for d in yaml.safe_load_all(p.read_text()) if d]
+pols = [d for d in docs if d.get("kind") == "NetworkPolicy" and d["metadata"]["name"] == name]
+if len(pols) != 1:
+    sys.exit(f"expected one {name}, found {len(pols)}")
+deps = [d for d in docs if d.get("kind") == "Deployment" and d["metadata"]["name"] == worker]
+if len(deps) != 1:
+    sys.exit(f"expected one {worker} Deployment, found {len(deps)}")
+selector = deps[0]["spec"]["selector"]["matchLabels"]
+if selector.get("app.kubernetes.io/component") != "worker":
+    sys.exit(f"{worker} selector is not the worker component: {selector}")
+pod_labels = deps[0]["spec"]["template"]["metadata"]["labels"]
+if any(pod_labels.get(k) != v for k, v in selector.items()):
+    sys.exit(f"{worker} pod labels {pod_labels} do not carry its selector {selector}")
+ingress = pols[0]["spec"]["ingress"]
+if len(ingress) != 1:
+    sys.exit(f"{name} has {len(ingress)} ingress rules, want 1: {ingress}")
+peers = ingress[0]["from"]
+if peers != [{"podSelector": {"matchLabels": selector}}]:
+    sys.exit(f"{name} peers are {peers}, want exactly [podSelector {selector}] and no namespaceSelector")
+if not ingress[0].get("ports"):
+    sys.exit(f"{name} lost its ACI port restriction: {ingress[0]}")
+print(f"ok: {name} admits only pods matching {selector}")
 PYEOF
 
 echo
