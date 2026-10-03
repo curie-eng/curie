@@ -86,6 +86,12 @@ delivery claim attempt, validate the gate context's current task, live ownership
 and transaction, and probe its held database connection. Loss detected before
 that first effect refuses without a claim. This probe does not make a later
 database disconnect atomic with an already started broker operation.
+Signed ingress repeats that held-connection probe before backlog reservation,
+workspace selection and owned enqueue after prior awaited work completes.
+Acquire the workspace work connection before its probe. Before failed-delivery
+settlement, probe again; detected gate loss leaves already-created claims or
+quota to their existing expiry/recovery rather than authorizing more writes.
+Secondary settlement or diagnostic failure preserves the original refusal.
 A lock waiter must not retain a work/claim connection. Pass an acquired gate
 context to inner helpers; never reacquire the same agent lock on another
 connection. Close the outer transaction on every error or cancellation path.
