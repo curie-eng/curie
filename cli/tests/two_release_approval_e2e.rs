@@ -12,18 +12,38 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
+/// Read a repository file by its repo-relative path. A missing or unreadable
+/// file panics naming its path: an empty-string fallback would let every
+/// negative assertion on it pass vacuously (#3826).
+fn repo_text(relative: &str) -> String {
+    let path = repo_root().join(relative);
+    fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
 fn workflow_text() -> String {
-    fs::read_to_string(repo_root().join(".github/workflows/two-release-approval-e2e.yaml"))
-        .unwrap_or_default()
+    repo_text(".github/workflows/two-release-approval-e2e.yaml")
 }
 
 fn script_text() -> String {
-    fs::read_to_string(repo_root().join("cli/scripts/two-release-approval-e2e.sh"))
-        .unwrap_or_default()
+    repo_text("cli/scripts/two-release-approval-e2e.sh")
 }
 
 fn main_rs() -> String {
-    fs::read_to_string(repo_root().join("cli/src/main.rs")).unwrap_or_default()
+    repo_text("cli/src/main.rs")
+}
+
+#[test]
+fn repo_text_panics_naming_a_missing_file() {
+    let missing = "cli/scripts/renamed-away-3826.sh";
+    let panic = std::panic::catch_unwind(|| repo_text(missing))
+        .expect_err("a missing repository file must not read as empty text");
+    let message = panic
+        .downcast_ref::<String>()
+        .expect("the read panic must carry a formatted message");
+    assert!(
+        message.contains(missing),
+        "the read panic must name the missing path: {message}"
+    );
 }
 
 fn count_lines_containing(text: &str, needle: &str) -> usize {
@@ -257,6 +277,12 @@ fn script_does_not_pass_by_retrying_until_acked() {
     );
     let body = uncommented_logical_lines(&text).join("\n");
     assert!(
+        body.contains(r#"api_json "$consumer_url/approvals/${approval_id}/resolve" POST"#)
+            && body.contains(r#"api_json "$owner_url/approvals/${approval_id}/resolve" POST"#),
+        "the one-shot B miss then A hit resolve path must be live script code; \
+         file contents:\n{text}"
+    );
+    assert!(
         !body.contains("deliver_until_acked"),
         "the Helm fixture must not pass by looping until a release acks"
     );
@@ -338,6 +364,11 @@ fn workflow_pairs_every_checkout_with_persist_credentials_false() {
 #[test]
 fn workflow_never_echoes_secrets_on_a_run_line() {
     let text = workflow_text();
+    assert!(
+        text.contains("secrets.CI_SLACK_APP_TOKEN") && text.contains("secrets.CI_SLACK_BOT_TOKEN"),
+        "the two-release workflow must reference the CI Slack token secrets, or \
+         the run-line check below inspects nothing; file contents:\n{text}"
+    );
     for line in text.lines() {
         if line.contains("secrets.") {
             assert!(
@@ -356,6 +387,10 @@ fn create_approval_id_parser_does_not_raise_none_on_success() {
         !text.is_empty(),
         "cli/scripts/two-release-approval-e2e.sh must exist"
     );
+    assert!(
+        text.contains("print(body[\"id\"])"),
+        "200/201 must print body[\"id\"]; file contents:\n{text}"
+    );
     let bad: Vec<String> = uncommented_logical_lines(&text)
         .into_iter()
         .filter(|line| line.contains("raise SystemExit") && line.contains("else None"))
@@ -364,10 +399,6 @@ fn create_approval_id_parser_does_not_raise_none_on_success() {
         bad.is_empty(),
         "create-id parser must use if/raise/print; `raise SystemExit(...) if \
          cond else None` raises None on 200/201. matching lines: {bad:?}"
-    );
-    assert!(
-        text.contains("print(body[\"id\"])"),
-        "200/201 must print body[\"id\"]; file contents:\n{text}"
     );
 }
 
@@ -579,13 +610,13 @@ fn one_shot_resolve_posts_do_not_loop() {
     );
     let body = uncommented_logical_lines(&text).join("\n");
     assert!(
-        !body.contains("deliver_until_acked"),
-        "the Helm fixture must not pass by looping until a release acks"
-    );
-    assert!(
         text.contains(r#"api_json "$consumer_url/approvals/${approval_id}/resolve" POST"#)
             && text.contains(r#"api_json "$owner_url/approvals/${approval_id}/resolve" POST"#),
         "one-shot B then A resolve must use api_json POST /resolve; file contents:\n{text}"
+    );
+    assert!(
+        !body.contains("deliver_until_acked"),
+        "the Helm fixture must not pass by looping until a release acks"
     );
     let resolve_posts = uncommented_logical_lines(&text)
         .into_iter()
