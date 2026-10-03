@@ -26,8 +26,13 @@
 # same pod is then held to the chart-rendered policies for
 # allowedEgress 0.0.0.0/0 and must be refused, while an identical peer named
 # by a narrow /32 entry stays reachable (the re-allow path, and proof the
-# rendered policy is live). Plain TCP connects only, never HTTP(S), so a TLS
-# or HTTP error cannot pass for a connectivity result.
+# rendered policy is live). A public TCP control with NO narrow entry closes
+# the other side: it is reachable with no policy, unreachable under
+# default-deny alone, and reachable again through the same rendered broad
+# rule that refuses the private peer, so a broad rule that also drops public
+# destinations fails. That control needs public egress from the cluster and
+# FAILS, never skips, without it. Plain TCP connects only, never HTTP(S), so a
+# TLS or HTTP error cannot pass for a connectivity result.
 set -euo pipefail
 
 CHART="${1:-${CURIE_RUNNER_BYO_CHART:-charts/curie}}"
@@ -54,6 +59,11 @@ PROBE_POD=""
 MISMATCH_SVC=""
 CHECK_LABEL="curie.dev/check=runner-byo-egress"
 DUMMY_CIDR="192.0.2.40/32"
+# Public anycast TCP peer for the broad-route liveness control. It must be a
+# stable public IPv4 address outside every private-range except, reachable
+# from a GitHub-hosted runner, and must have NO narrow allowedEgress entry.
+PUBLIC_TCP_IP="${CURIE_RUNNER_BYO_PUBLIC_TCP_IP:-1.1.1.1}"
+PUBLIC_TCP_PORT="${CURIE_RUNNER_BYO_PUBLIC_TCP_PORT:-443}"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -441,9 +451,14 @@ PASS -- the same silent drop a SaaS collector behind rotating IPs would see
 # pod IPs are private (kind's pod CIDR): TARGET is reached only through the
 # broad route, CONTROL is also named by a narrow /32 entry. Never the API
 # server or a node address: NetworkPolicy permits node-local traffic, so those
-# would not measure the except list.
+# would not measure the except list. A public TCP peer with no narrow entry
+# ($PUBLIC_TCP_IP:$PUBLIC_TCP_PORT) proves the broad rule still carries public
+# traffic: baseline reachable, refused under default-deny alone, reachable
+# again under the rendered broad rule.
 check_broad_private() {
   local port=5678
+  local public_ip="$PUBLIC_TCP_IP"
+  local public_port="$PUBLIC_TCP_PORT"
   ALLOWED_POD="runner-broad-private-control"
   UNDECLARED_POD="runner-broad-private-target"
   PROBE_POD="runner-broad-private-probe"
@@ -503,6 +518,14 @@ for raw in sys.argv[1:]:
         sys.exit(1)
 PY
   echo "  ok  private peers: target $target_ip (broad route only), control $control_ip (also a narrow /32)"
+  [ "$public_port" != "$port" ] \
+    || fail "the public control port $public_port equals the private peers' port; the public leg must ride its own broad-rule port"
+  python3 - "$public_ip" <<'PY' || fail "the public control $public_ip is not a public IPv4 address; the broad-route liveness leg needs a destination outside every private range"
+import ipaddress, sys
+ip = ipaddress.ip_address(sys.argv[1])
+if ip.version != 4 or not ip.is_global:
+    sys.exit(1)
+PY
 
   local values_file="$TMP/broad-private.yaml"
   cat >"$values_file" <<EOF
@@ -510,7 +533,7 @@ security:
   networkPolicy:
     allowedEgress:
       - cidr: 0.0.0.0/0
-        ports: [{ protocol: TCP, port: ${port} }]
+        ports: [{ protocol: TCP, port: ${port} }, { protocol: TCP, port: ${public_port} }]
       - cidr: ${control_ip}/32
         ports: [{ protocol: TCP, port: ${port} }]
 EOF
@@ -538,25 +561,39 @@ EOF
   # packets below test something other than the private-range except.
   local policy_file="$TMP/broad-private-policies.yaml"
   printf '%s\n' "$policy" >"$policy_file"
-  python3 - "$policy_file" "$target_ip" "$control_ip" <<'PY' \
-    || fail "the rendered allow-egress does not except the target's private range under 0.0.0.0/0, or excepts the narrow control"
+  python3 - "$policy_file" "$target_ip" "$control_ip" "$public_ip" "$public_port" <<'PY' \
+    || fail "the rendered allow-egress does not except the target's private range under 0.0.0.0/0, excepts the narrow control, or does not carry the public control through the broad rule alone"
 import ipaddress, pathlib, sys, yaml
-target, control = (ipaddress.ip_address(a) for a in sys.argv[2:])
+target, control, public = (ipaddress.ip_address(a) for a in sys.argv[2:5])
+public_port = int(sys.argv[5])
 docs = [d for d in yaml.safe_load_all(pathlib.Path(sys.argv[1]).read_text()) if isinstance(d, dict)]
 allow = [d for d in docs if d["metadata"]["name"].endswith("-runner-allow-egress")][0]
 blocks = {}
+broad_ports = set()
 for rule in allow["spec"]["egress"]:
     for peer in rule.get("to") or []:
         block = peer.get("ipBlock") or {}
-        blocks[block.get("cidr")] = block.get("except") or []
+        cidr = block.get("cidr")
+        blocks[cidr] = block.get("except") or []
+        net = ipaddress.ip_network(cidr) if cidr else None
+        if net is not None and public in net and cidr != "0.0.0.0/0":
+            sys.exit(f"{cidr} is a narrow entry covering the public control {public}; the leg must reach it through the broad rule only")
+        if cidr == "0.0.0.0/0":
+            broad_ports.update(
+                int(p["port"]) for p in rule.get("ports") or [] if p.get("protocol", "TCP") == "TCP"
+            )
 broad = blocks.get("0.0.0.0/0")
 if broad is None:
     sys.exit("no 0.0.0.0/0 rule rendered")
 if not any(target in ipaddress.ip_network(e) for e in broad):
     sys.exit(f"0.0.0.0/0 excepts {broad}, none of which holds {target}")
+if any(public in ipaddress.ip_network(e) for e in broad):
+    sys.exit(f"0.0.0.0/0 excepts {broad}, which holds the public control {public}")
+if public_port not in broad_ports:
+    sys.exit(f"0.0.0.0/0 renders TCP ports {sorted(broad_ports)}, not the public control port {public_port}")
 if blocks.get(f"{control}/32") != []:
     sys.exit(f"{control}/32 must render with no except, got {blocks.get(f'{control}/32')!r}")
-print(f"  ok  rendered 0.0.0.0/0 excepts {broad}; {control}/32 has no except")
+print(f"  ok  rendered 0.0.0.0/0 excepts {broad} and carries TCP {public_port}; {control}/32 has no except; no narrow entry covers {public}")
 PY
 
   local selector
@@ -591,7 +628,7 @@ print(yaml.safe_dump([d for d in docs if d["metadata"]["name"].endswith("-runner
   tcp_rc() {
     local out
     out="$(kubectl -n "$NS" exec "$PROBE_POD" -- \
-      sh -c "nc -z -w 5 $1 $port >/dev/null 2>&1; echo rc=\$?" 2>&1 || true)"
+      sh -c "nc -z -w 5 $1 ${2:-$port} >/dev/null 2>&1; echo rc=\$?" 2>&1 || true)"
     case "$out" in
       *rc=0*) echo 0 ;;
       *rc=[1-9]*) echo 1 ;;
@@ -599,11 +636,54 @@ print(yaml.safe_dump([d for d in docs if d["metadata"]["name"].endswith("-runner
     esac
   }
 
+  # The probe starts before any policy exists, so the public baseline below is
+  # measured with no NetworkPolicy selecting it.
+  kubectl -n "$NS" run "$PROBE_POD" --image="$PROBE_IMAGE" --restart=Never \
+    --image-pull-policy=IfNotPresent \
+    --labels="$selector" --command -- sleep 600 >/dev/null \
+    || fail "could not create the probe pod $PROBE_POD in $NS"
+  kubectl -n "$NS" wait --for=condition=Ready "pod/$PROBE_POD" --timeout=180s >/dev/null \
+    || fail "the probe pod did not become ready in $NS"
+
+  local rc="" i
+
   # ---------------------------------------------------------------------------
-  # LEG 1, non-vacuity: under the PRE-CHANGE shape the private peer is reached.
+  # LEG 0a, baseline: with no policy the public control is reachable.
+  # ---------------------------------------------------------------------------
+  for i in $(seq 1 6); do
+    rc="$(tcp_rc "$public_ip" "$public_port")"
+    [ "$rc" = 0 ] && break
+    sleep 5
+  done
+  [ "$rc" = 0 ] || fail "BASELINE: with no NetworkPolicy the public control $public_ip:$public_port was NOT reachable from $PROBE_POD.
+
+This leg proves the rendered broad rule still carries public traffic, which
+needs public TCP egress from the cluster. It does not skip without it: a
+missing baseline would make the reachable-again leg below unmeasurable. Give
+the cluster public egress, or point CURIE_RUNNER_BYO_PUBLIC_TCP_IP and
+CURIE_RUNNER_BYO_PUBLIC_TCP_PORT at a public TCP peer it can reach."
+  echo "  ok  baseline: public control $public_ip:$public_port is reachable with no policy"
+
+  # ---------------------------------------------------------------------------
+  # LEG 0b, non-vacuity: default-deny alone refuses the public control.
   # ---------------------------------------------------------------------------
   kubectl -n "$NS" apply -f - >/dev/null <<<"$base_policies" \
     || fail "could not apply the rendered default-deny and allow-dns into $NS"
+  for i in $(seq 1 6); do
+    rc="$(tcp_rc "$public_ip" "$public_port")"
+    [ "$rc" != 0 ] && break
+    sleep 5
+  done
+  [ "$rc" != 0 ] || fail "NON-VACUITY: under the rendered default-deny and allow-dns alone the public control $public_ip:$public_port is STILL reachable.
+
+Either the CNI does not enforce NetworkPolicy or default-deny does not select
+the probe, so reaching the public control through the broad rule later would
+prove nothing about that rule."
+  echo "  ok  default-deny only: public control $public_ip:$public_port is refused"
+
+  # ---------------------------------------------------------------------------
+  # LEG 1, non-vacuity: under the PRE-CHANGE shape the private peer is reached.
+  # ---------------------------------------------------------------------------
   kubectl -n "$NS" apply -f - >/dev/null <<YAML || fail "could not apply the pre-change broad-route policy"
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -623,14 +703,6 @@ spec:
         - { protocol: TCP, port: $port }
 YAML
 
-  kubectl -n "$NS" run "$PROBE_POD" --image="$PROBE_IMAGE" --restart=Never \
-    --image-pull-policy=IfNotPresent \
-    --labels="$selector" --command -- sleep 600 >/dev/null \
-    || fail "could not create the probe pod $PROBE_POD in $NS"
-  kubectl -n "$NS" wait --for=condition=Ready "pod/$PROBE_POD" --timeout=180s >/dev/null \
-    || fail "the probe pod did not become ready in $NS"
-
-  local rc="" i
   for i in $(seq 1 6); do
     rc="$(tcp_rc "$target_ip")"
     [ "$rc" = 0 ] && break
@@ -676,6 +748,22 @@ The pre-change leg reached it and the identical /32 control is reachable, so
 the CNI is enforcing and the rendered broad route does not except the private
 range holding $target_ip (#3842)."
   echo "  ok  rendered policies: private peer $target_ip:$port is refused through the broad route"
+
+  # Liveness for the same rendered policies: the broad rule still carries a
+  # public destination that has no narrow entry. A broad rule that refuses the
+  # private peer by also dropping public traffic fails here.
+  for i in $(seq 1 6); do
+    rc="$(tcp_rc "$public_ip" "$public_port")"
+    [ "$rc" = 0 ] && break
+    sleep 5
+  done
+  [ "$rc" = 0 ] || fail "under the chart-rendered policies for allowedEgress 0.0.0.0/0 the public control $public_ip:$public_port was NOT reachable.
+
+It was reachable with no policy and refused under default-deny alone, and no
+narrow entry names it, so the rendered broad rule itself drops public
+destinations. Refusing the private peer that way is a false refusal that would
+also cut runners off from public model endpoints (#3842)."
+  echo "  ok  rendered policies: public control $public_ip:$public_port is reachable through the broad route alone"
 
   cleanup_and_settle
 }
@@ -751,4 +839,4 @@ check_key otel 4318 "-runner-allow-collector-endpoint" "$OTEL_VALUES"
 check_key api 8000 "-runner-allow-api-endpoint" "$API_VALUES"
 check_broad_private
 
-echo "== runner BYO egress enforces: undeclared peer blocked, declared peer reachable, mismatch hostname blocked (rustfs/sts/otel/api); a broad route refuses a private peer it reached before #3842 =="
+echo "== runner BYO egress enforces: undeclared peer blocked, declared peer reachable, mismatch hostname blocked (rustfs/sts/otel/api); a broad route refuses a private peer it reached before #3842 and still reaches a public peer =="

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import secrets
 from datetime import UTC, datetime, timedelta
@@ -26,6 +27,7 @@ from curie_worker.sandbox.k8s import (
     KubernetesSandboxClient,
     _claim_view,
 )
+from curie_worker.sandbox.substrate import REAP_GRACE_MARGIN_SECONDS
 from curie_worker.sandbox.types import SubstrateConfig
 
 # Captured live with `kubectl get sandboxclaims` in JSON form. The controller's
@@ -131,6 +133,11 @@ class _FakeApi:
     propagation. ``failures`` keyed by ``(verb, plural)`` injects an API error
     on that call (``plural`` is ``"secrets"`` for the core Secret create);
     ``delete_failures`` keyed by object name does the same for one delete.
+
+    ``calls`` records ``(verb, plural, kwargs)`` for every write and read, so a
+    test can check the transport bound each call carried. A read of an absent
+    plural in ``stub_plurals`` answers a legacy stub instead of a 404; clear it
+    for a test that needs the API server's real 404 on an absent claim.
     """
 
     def __init__(self) -> None:
@@ -145,6 +152,8 @@ class _FakeApi:
         self.delete_failures: dict[str, BaseException] = {}
         self._uid = 0
         self.request_timeouts: list[tuple[str, float]] = []
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.stub_plurals: set[str] = set(_LEGACY_STUB_PLURALS)
         self.quota: object | None = None
         self.quota_error: BaseException | None = None
         self.pod: object | None = None
@@ -194,10 +203,11 @@ class _FakeApi:
         namespace: str,
         plural: str,
         body: dict[str, Any],
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         del group, version
         assert namespace == "test-ns"
+        self.calls.append(("create", plural, dict(kwargs)))
         self._fail("create", plural)
         name = body["metadata"]["name"]
         if (plural, name) in self.objects:
@@ -221,15 +231,22 @@ class _FakeApi:
         _request_timeout: float | None = None,
     ) -> dict[str, Any]:
         del group, version, namespace
+        self.calls.append(
+            (
+                "get",
+                plural,
+                {} if _request_timeout is None else {"_request_timeout": _request_timeout},
+            )
+        )
         if _request_timeout is not None:
             self.request_timeouts.append((f"get:{plural}:{name}", _request_timeout))
         self._fail("get", plural)
         stored = self.objects.get((plural, name))
         if stored is not None:
             return copy.deepcopy(stored)
-        if plural == "sandboxclaims":
+        if plural == "sandboxclaims" and plural in self.stub_plurals:
             return {"metadata": {"name": name}}
-        if plural == "sandboxes":
+        if plural == "sandboxes" and plural in self.stub_plurals:
             return {
                 "metadata": {"name": name},
                 "spec": {"operatingMode": "Running"},
@@ -245,9 +262,10 @@ class _FakeApi:
         plural: str,
         name: str,
         body: Any,
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         del group, version, namespace
+        self.calls.append(("patch", plural, dict(kwargs)))
         self._fail("patch", plural)
         stored = self.objects.get((plural, name))
         if stored is None:
@@ -268,9 +286,19 @@ class _FakeApi:
         name: str,
         *,
         _request_timeout: float | None = None,
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> object:
         del group, version, namespace
+        self.calls.append(
+            (
+                "delete",
+                plural,
+                {
+                    **kwargs,
+                    **({} if _request_timeout is None else {"_request_timeout": _request_timeout}),
+                },
+            )
+        )
         if _request_timeout is not None:
             self.request_timeouts.append((f"delete:{plural}:{name}", _request_timeout))
         self.deletes.append((plural, name))
@@ -322,7 +350,8 @@ class _FakeApi:
 
     # -- CoreV1Api ---------------------------------------------------------------
 
-    def create_namespaced_secret(self, namespace: str, body: Any, **_kwargs: Any) -> Any:
+    def create_namespaced_secret(self, namespace: str, body: Any, **kwargs: Any) -> Any:
+        self.calls.append(("create", "secrets", dict(kwargs)))
         self._fail("create", "secrets")
         self.secret_namespaces.append(namespace)
         # A dict or a V1Secret model, normalized to the wire JSON the API
@@ -1320,9 +1349,7 @@ def test_pod_event_fallback_uses_only_the_current_pod_uid() -> None:
     api = _FakeApi()
     api.pod = SimpleNamespace(
         metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
-        status=SimpleNamespace(
-            phase="Failed", reason=None, message=None, container_statuses=[]
-        ),
+        status=SimpleNamespace(phase="Failed", reason=None, message=None, container_statuses=[]),
     )
     api.events = [
         SimpleNamespace(
@@ -1359,9 +1386,7 @@ def test_stale_pod_event_cannot_supply_a_failed_pods_cause() -> None:
     api = _FakeApi()
     api.pod = SimpleNamespace(
         metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
-        status=SimpleNamespace(
-            phase="Failed", reason=None, message=None, container_statuses=[]
-        ),
+        status=SimpleNamespace(phase="Failed", reason=None, message=None, container_statuses=[]),
     )
     api.events = [
         SimpleNamespace(
@@ -1385,9 +1410,7 @@ def test_running_pod_without_termination_or_matching_event_has_no_cause() -> Non
     since = datetime.now(UTC) - timedelta(seconds=5)
     api.pod = SimpleNamespace(
         metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
-        status=SimpleNamespace(
-            phase="Running", reason=None, message=None, container_statuses=[]
-        ),
+        status=SimpleNamespace(phase="Running", reason=None, message=None, container_statuses=[]),
     )
     api.events = [
         SimpleNamespace(
@@ -1399,12 +1422,7 @@ def test_running_pod_without_termination_or_matching_event_has_no_cause() -> Non
         )
     ]
 
-    assert (
-        _client(api).pod_termination(
-            "sbx-1", request_timeout_seconds=0.5, since=since
-        )
-        is None
-    )
+    assert _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since) is None
 
 
 def test_recent_eviction_event_explains_a_still_running_pod() -> None:
@@ -1442,9 +1460,12 @@ def test_oom_event_alone_does_not_identify_runner_in_running_pod() -> None:
         )
     ]
 
-    assert _client(api).pod_termination(
-        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
-    ) is None
+    assert (
+        _client(api).pod_termination(
+            "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+        )
+        is None
+    )
 
 
 def test_terminated_sidecar_does_not_hide_runner_state() -> None:
@@ -1503,9 +1524,7 @@ def test_only_recent_oom_last_state_explains_a_running_pod(recent: bool) -> None
         ),
     )
 
-    termination = _client(api).pod_termination(
-        "sbx-1", request_timeout_seconds=0.5, since=since
-    )
+    termination = _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since)
 
     if recent:
         assert termination is not None
@@ -2035,9 +2054,7 @@ def test_token_free_claim_with_runner_resources_keeps_the_agent_resources_path()
     assert api.secrets == {}
     assert ("sandboxtemplates", f"{claim}-resources") not in api.objects
     assert ("sandboxtemplates", "curie-agent-acme-a-resources") in api.objects
-    assert _claim_body(api)["spec"]["warmPoolRef"] == {
-        "name": "curie-agent-acme-a-resources-pool"
-    }
+    assert _claim_body(api)["spec"]["warmPoolRef"] == {"name": "curie-agent-acme-a-resources-pool"}
     assert not any(
         _CLAIM_LABEL in (obj["metadata"].get("labels") or {}) for obj in api.objects.values()
     )
@@ -2045,6 +2062,7 @@ def test_token_free_claim_with_runner_resources_keeps_the_agent_resources_path()
 
 def test_reap_claim_templates_deletes_only_unkept_old_labelled_templates() -> None:
     api = _FakeApi()
+    api.stub_plurals.clear()  # an absent claim is a real 404 here
     cutoff = datetime(2026, 10, 3, 12, 0, tzinfo=UTC)
     old = "2026-10-03T11:00:00Z"
     young = "2026-10-03T12:00:01Z"
@@ -2101,3 +2119,127 @@ def test_reap_claim_templates_deletes_only_unkept_old_labelled_templates() -> No
         "gone-raced-resources",
     }
     assert api.lists and all(plural == "sandboxtemplates" for plural, _ in api.lists)
+
+
+_REAP_CUTOFF = datetime(2026, 10, 3, 12, 0, tzinfo=UTC)
+_OLD = "2026-10-03T11:00:00Z"
+
+
+def _orphan_template(api: _FakeApi, claim: str) -> str:
+    """Seed one labelled per-claim template old enough to be a sweep candidate."""
+
+    name = f"{claim}-resources"
+    api.seed(
+        "sandboxtemplates",
+        name,
+        _chart_template_spec(),
+        labels={_MANAGED_BY[0]: _MANAGED_BY[1], _CLAIM_LABEL: claim},
+        created=_OLD,
+    )
+    return name
+
+
+def test_reap_spares_a_template_whose_claim_appeared_after_the_inventory() -> None:
+    # Finding 1 interleaving: the substrate's claim inventory was listed before
+    # an in-flight create_claim finished, so the claim is not in ``keep``, but
+    # by the time the sweep reaches the template the claim exists. Deleting the
+    # template then would strand a live claim with no template, Secret or pool.
+    api = _FakeApi()
+    api.stub_plurals.clear()
+    claim = "inflight"
+    template = _orphan_template(api, claim)
+    api.seed("sandboxclaims", claim, {"warmPoolRef": {"name": f"{claim}-resources-pool"}})
+
+    deleted = _client(api).reap_claim_templates(keep=set(), created_before=_REAP_CUTOFF)
+
+    assert deleted == []
+    assert ("sandboxtemplates", template) in api.objects
+    assert ("sandboxtemplates", template) not in api.deletes
+    # The spare came from a fresh read of that claim, not from luck.
+    assert ("get", "sandboxclaims") in {(verb, plural) for verb, plural, _ in api.calls}
+
+
+def test_reap_still_deletes_an_old_template_whose_claim_is_truly_gone() -> None:
+    # Liveness pair for the recheck: a fresh claim read that 404s still lets
+    # the crash-window orphan, and with it its Secret and pool, be collected.
+    api = _FakeApi()
+    api.stub_plurals.clear()
+    claim = "gone"
+    template = _orphan_template(api, claim)
+
+    deleted = _client(api).reap_claim_templates(keep=set(), created_before=_REAP_CUTOFF)
+
+    assert deleted == [template]
+    assert ("sandboxtemplates", template) not in api.objects
+
+
+def test_reap_spares_a_template_when_the_claim_recheck_fails() -> None:
+    # Fail-safe direction: a claim read that errors with anything but 404 is no
+    # evidence the claim is gone, so the template is kept for the next tick.
+    api = _FakeApi()
+    api.stub_plurals.clear()
+    claim = "unknown"
+    template = _orphan_template(api, claim)
+    api.failures[("get", "sandboxclaims")] = k8s_module.k8s_client.ApiException(
+        status=503, reason="ServiceUnavailable"
+    )
+
+    deleted = _client(api).reap_claim_templates(keep=set(), created_before=_REAP_CUTOFF)
+
+    assert deleted == []
+    assert ("sandboxtemplates", template) in api.objects
+    assert ("sandboxtemplates", template) not in api.deletes
+
+
+def _finite_positive(timeout: object) -> bool:
+    values = timeout if isinstance(timeout, tuple) else (timeout,)
+    return bool(values) and all(
+        isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0
+        for v in values
+    )
+
+
+def _bound(timeout: object) -> float:
+    values = timeout if isinstance(timeout, tuple) else (timeout,)
+    return float(sum(values))  # type: ignore[arg-type]
+
+
+def test_token_claim_preparation_bounds_every_kubernetes_call() -> None:
+    # Finding 1 part (a): an unbounded call between creating the per-claim
+    # template and creating its claim lets the template age past the reaper
+    # grace mid-creation. Every call carries a finite positive transport bound.
+    api = _FakeApi()
+    _seed_chart(api)
+    claim = _claim_name()
+
+    _client(api).create_claim(
+        claim,
+        pool="curie-agent-acme-a-runner-pool",
+        agent_name="acme-a",
+        env={"CURIE_BUDGET": "{}", **_scoped_token_env()},
+    )
+
+    made = [(verb, plural) for verb, plural, _ in api.calls]
+    for expected in (
+        ("get", "sandboxwarmpools"),
+        ("get", "sandboxtemplates"),
+        ("create", "sandboxtemplates"),
+        ("create", "secrets"),
+        ("create", "sandboxwarmpools"),
+        ("create", "sandboxclaims"),
+        ("patch", "sandboxtemplates"),
+    ):
+        assert expected in made, (expected, made)
+    unbounded = [
+        (verb, plural, kwargs.get("_request_timeout"))
+        for verb, plural, kwargs in api.calls
+        if not _finite_positive(kwargs.get("_request_timeout"))
+    ]
+    assert unbounded == []
+    # From the moment the template exists until its claim does, the summed
+    # worst case stays under the reaper's margin, so the template cannot age
+    # into a candidate while its creator is still working.
+    start = made.index(("create", "sandboxtemplates"))
+    end = made.index(("create", "sandboxclaims"))
+    window = sum(_bound(kwargs["_request_timeout"]) for _, _, kwargs in api.calls[start : end + 1])
+    assert window < REAP_GRACE_MARGIN_SECONDS, window
