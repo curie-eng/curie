@@ -848,7 +848,7 @@ features. API and packaged chart require schema `0074` because agent reads
 include the new column. The CLI candidate is v0.13.0 with window
 `0074` through `0074`; the published v0.12.0 and v0.12.0-rc.1 windows
 remain `0070` through `0073`.
- The API first records selected recipients in a durable PostgreSQL outbox;
+The API first records selected recipients in a durable PostgreSQL outbox;
 its reconciler retries Valkey publication after a transient outage or API
 restart. An unavailable outbox returns HTTP 503 to the webhook instead of a
 false success, with the push's own result under `detail.result`. Inspect the `<runs-stream>:deploy-notices[:<installation-id>]:dead`
