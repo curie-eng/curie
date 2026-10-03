@@ -194,8 +194,16 @@ absent namespace "$NS" || fail "namespace $NS already exists or cannot be looked
 if absent crd "$TEMPLATE_CRD"; then
   CREATED_CRD=1
   k apply -f "$CHART/crds/crd-sandboxtemplates.yaml" >/dev/null || fail "apply the SandboxTemplate CRD"
-  k wait --for=condition=Established "crd/$TEMPLATE_CRD" --timeout=60s >/dev/null \
-    || fail "the SandboxTemplate CRD did not become Established"
+  # Poll rather than `kubectl wait`: a CRD read before the API server writes
+  # status.conditions makes `wait` fail at once instead of waiting.
+  established=""
+  for _ in $(seq 1 60); do
+    established="$(k get crd "$TEMPLATE_CRD" \
+      -o jsonpath='{.status.conditions[?(@.type=="Established")].status}' 2>/dev/null || true)"
+    [[ "$established" == "True" ]] && break
+    sleep 1
+  done
+  [[ "$established" == "True" ]] || fail "the SandboxTemplate CRD did not become Established"
   echo "installed $TEMPLATE_CRD for this run (deleted on exit)"
 else
   k get crd "$TEMPLATE_CRD" -o name >/dev/null || fail "could not read $TEMPLATE_CRD"
