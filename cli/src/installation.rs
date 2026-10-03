@@ -1339,6 +1339,10 @@ fn plan_installation_inner(
         .and_then(|name| resolved.get(name).cloned());
     let up = crate::ops::UpOpts {
         retained_mail_values: None,
+        retained_runner_values: None,
+        // The model credential is explicit here, named by `curie.yaml`; a
+        // saved local credential plays no part in apply (#3848).
+        saved_credentials: None,
         common: crate::ops::CommonOpts {
             namespace: cfg.install.namespace.clone(),
             release: cfg.install.release.clone(),
@@ -2124,6 +2128,11 @@ pub fn diff_plan(
     }
 
     let mut entries: Vec<DiffEntry> = Vec::new();
+    // Apply drops a retained runner entry a declared key overrides, including
+    // the whole recorded list when one element of it is declared, so `diff`
+    // asks the same rule rather than calling every family key preserved (#3848).
+    let declared_keys: std::collections::HashSet<String> =
+        declared.keys().map(|key| key.trim().to_string()).collect();
 
     for (key, want) in declared {
         let kind = match current.get(key) {
@@ -2144,7 +2153,9 @@ pub fn diff_plan(
         if declared.contains_key(key) {
             continue;
         }
-        let kind = if crate::ops::is_preserved_by_up(key) {
+        let survives = !crate::ops::is_retained_runner_key(key)
+            || crate::ops::retained_runner_key_survives(key, &declared_keys);
+        let kind = if crate::ops::is_preserved_by_up(key) && survives {
             DiffKind::Preserved
         } else {
             DiffKind::Reset
@@ -3514,6 +3525,112 @@ mod diff_tests {
         );
         assert_eq!(entries[0].kind, DiffKind::Reset);
         assert!(entries[0].kind.is_change(), "a reset is a real change");
+    }
+
+    fn retained_family_live() -> serde_json::Value {
+        live(serde_json::json!({
+            "agentSandbox": {
+                "runner": {"extraEnv": [
+                    {"name": "A", "value": "1"},
+                    {"name": "B", "value": "2"}
+                ]},
+                "connectorSecrets": {
+                    "acme-a": {"T": "x", "U": "y"},
+                    "acme-b": {"G": "z"}
+                }
+            }
+        }))
+    }
+
+    fn kinds_of(entries: &[DiffEntry], keys: &[&str]) -> Vec<(String, DiffKind)> {
+        keys.iter()
+            .map(|key| (key.to_string(), *kind_of(entries, key)))
+            .collect()
+    }
+
+    /// #3848: a declared key under the runner env LIST replaces the whole
+    /// recorded list on apply, so the undeclared live elements are resets,
+    /// not preserved.
+    #[test]
+    fn a_declared_runner_env_element_resets_the_undeclared_rest_of_the_list() {
+        let declared = BTreeMap::from([
+            (
+                "agentSandbox.runner.extraEnv[0].name".to_string(),
+                "C".to_string(),
+            ),
+            (
+                "agentSandbox.runner.extraEnv[0].value".to_string(),
+                "3".to_string(),
+            ),
+        ]);
+        let entries = diff_plan(&declared, Some(&retained_family_live()));
+        assert_eq!(
+            kinds_of(
+                &entries,
+                &[
+                    "agentSandbox.runner.extraEnv[1].name",
+                    "agentSandbox.runner.extraEnv[1].value",
+                ]
+            ),
+            vec![
+                (
+                    "agentSandbox.runner.extraEnv[1].name".to_string(),
+                    DiffKind::Reset
+                ),
+                (
+                    "agentSandbox.runner.extraEnv[1].value".to_string(),
+                    DiffKind::Reset
+                ),
+            ]
+        );
+    }
+
+    /// Liveness: a narrow connector secret override must not reset siblings.
+    #[test]
+    fn a_declared_connector_secret_leaf_leaves_its_siblings_preserved() {
+        let declared = BTreeMap::from([(
+            "agentSandbox.connectorSecrets.acme-a.T".to_string(),
+            "new".to_string(),
+        )]);
+        let entries = diff_plan(&declared, Some(&retained_family_live()));
+        for key in [
+            "agentSandbox.connectorSecrets.acme-a.U",
+            "agentSandbox.connectorSecrets.acme-b.G",
+        ] {
+            assert_eq!(kind_of(&entries, key), &DiffKind::Preserved, "{key}");
+        }
+    }
+
+    /// A declared whole-agent value replaces that agent's recorded map; other
+    /// agents stay retained.
+    #[test]
+    fn a_declared_whole_agent_connector_value_resets_only_that_agent() {
+        let declared = BTreeMap::from([(
+            "agentSandbox.connectorSecrets.acme-a".to_string(),
+            "{}".to_string(),
+        )]);
+        let entries = diff_plan(&declared, Some(&retained_family_live()));
+        for key in [
+            "agentSandbox.connectorSecrets.acme-a.T",
+            "agentSandbox.connectorSecrets.acme-a.U",
+        ] {
+            assert_eq!(kind_of(&entries, key), &DiffKind::Reset, "{key}");
+        }
+        assert_eq!(
+            kind_of(&entries, "agentSandbox.connectorSecrets.acme-b.G"),
+            &DiffKind::Preserved
+        );
+    }
+
+    /// Liveness: with nothing declared in the family, every recorded runner
+    /// env and connector secret key is carried forward.
+    #[test]
+    fn undeclared_retained_families_are_all_preserved() {
+        let entries = diff_plan(&BTreeMap::new(), Some(&retained_family_live()));
+        assert!(!entries.is_empty());
+        for entry in &entries {
+            assert_eq!(entry.kind, DiffKind::Preserved, "{}", entry.key);
+        }
     }
 
     /// `helm get values` returns real passwords. None may reach the output.
