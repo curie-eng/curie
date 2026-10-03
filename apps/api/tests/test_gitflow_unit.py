@@ -840,7 +840,7 @@ def test_rejected_push_is_logged_loudly() -> None:
     # Moved from the webhook router into gitflow (#1268) so the polling lane
     # shares it. Same behaviour; the lane is now named in the record.
     from curie_api.gitflow import log_push_outcome
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
 
     result = WebhookResult(
         status="rejected",
@@ -863,7 +863,7 @@ def test_successful_push_does_not_warn() -> None:
     # Moved from the webhook router into gitflow (#1268) so the polling lane
     # shares it. Same behaviour; the lane is now named in the record.
     from curie_api.gitflow import log_push_outcome
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
 
     with mock.patch("curie_api.gitflow.logger") as log:
         log_push_outcome(WebhookResult(status="deployed"), {}, source="github webhook")

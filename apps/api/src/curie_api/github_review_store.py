@@ -18,10 +18,14 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.concurrency import run_in_threadpool
 
-from . import crud
+from curie_api.crud import errors as crud_errors
+from curie_api.crud import lineages as crud_lineages
+from curie_api.factory_notices import find_marker
+from curie_api.schemas.channels import BUILTIN_CLUSTER_MESSAGE_ADAPTER
+from curie_api.schemas.publications import ReviewRevisionReserve
+
 from .config import Settings
 from .delivery import backlog_reservation, enqueue_owned, take_backlog_slot
-from .factory_notices import _find_marker
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_review_audit import settle_review_delivery
 from .github_review_events import (
@@ -43,7 +47,6 @@ from .models import (
     ThreadWorkspace,
 )
 from .repo_full_name import repo_url_path
-from .schemas import BUILTIN_CLUSTER_MESSAGE_ADAPTER, ReviewRevisionReserve
 from .threadkeys import route_thread_key_matches
 from .wirebody import stored_turn_matches
 from .workspace_policy import repository_is_allowed
@@ -689,7 +692,7 @@ class GitHubReviewReconciler:
                                     continue
                                 consumed = True
                             else:
-                                await crud.cancel_review_revision(
+                                await crud_lineages.cancel_review_revision(
                                     session, reservation.id, origin_key=row.event_id,
                                     expected_version=reservation.version,
                                 )
@@ -808,7 +811,7 @@ class GitHubReviewReconciler:
         headers = github_headers(token)
         assert row.notice_marker is not None
         marker = f"<!-- curie-review-history-capacity:{row.notice_marker} -->"
-        scan = await _find_marker(
+        scan = await find_marker(
             self._client, api, comments_path, headers, marker,
             start_page=row.notice_scan_page,
         )
@@ -957,7 +960,7 @@ async def reserve_queued_feedback(
     if verified_head != expected_head_sha:
         raise FeedbackIgnored("stale_feedback_head")
     try:
-        reservation, locked_lineage, _ = await crud.reserve_review_revision(
+        reservation, locked_lineage, _ = await crud_lineages.reserve_review_revision(
             session,
             ReviewRevisionReserve(
                 repository_id=context.truth.repository_id,
@@ -966,7 +969,7 @@ async def reserve_queued_feedback(
                 origin_key=row.event_id,
             ),
         )
-    except crud.PublicationLineageConflict:
+    except crud_errors.PublicationLineageConflict:
         raise FeedbackIgnored("feedback_revision_conflict") from None
     # reserve_review_revision refreshes and locks the lineage and its captured
     # binding. Compare the provider result and caller snapshot again only after

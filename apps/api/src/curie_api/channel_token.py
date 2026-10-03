@@ -14,12 +14,12 @@ and widening would also have broken the byte-identical api/worker twin of
 ``sandbox_token``. Prefix ``chn``, its own claims, nothing shared but the shape.
 
 **The claims are ``{channel_id, generation, scope, exp}``, deliberately NOT
-``(kind, address)`` (plan D5).** ``crud.update_channel_binding`` mutates the
+``(kind, address)`` (plan D5).** ``crud.channels.update_channel_binding`` mutates the
 binding row IN PLACE and ``delete_agent`` frees the pair for reuse, so a token
 claiming the PAIR does not go inert when the route changes hands -- it goes live
 again against the new owner. The row id is a stable identity and ``generation``
 is what makes a rebind or a remint observable to a credential minted before it.
-``crud.delete_channel_binding`` is the third case and needs no counter: the row
+``crud.channels.delete_channel_binding`` is the third case and needs no counter: the row
 is gone, so the ``channel_id`` in the claim resolves to nothing and every token
 naming that binding is dead by construction.
 """
@@ -34,9 +34,9 @@ from dataclasses import dataclass
 # The base64url/HMAC primitives, borrowed rather than copied. The sibling-module
 # decision above is about the CLAIMS and the mint/verify surface; these three
 # carry no claims at all, so there is no reason for a second copy of them. The
-# import direction is one-way -- `sandbox_token` is untouched, so its
-# byte-identical api/worker twin still holds.
-from .sandbox_token import _b64url, _b64url_decode, _signature
+# import direction remains one way. The shared helpers have public names in
+# both sandbox_token copies, which retain identical source and behavior.
+from curie_api.sandbox_token import b64url, b64url_decode, signature
 
 _PREFIX = "chn"
 
@@ -65,9 +65,9 @@ def mint(
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
-    payload_seg = _b64url(payload)
+    payload_seg = b64url(payload)
     signing_input = f"{_PREFIX}.{payload_seg}"
-    return f"{signing_input}.{_signature(api_key, signing_input)}"
+    return f"{signing_input}.{signature(api_key, signing_input)}"
 
 
 @dataclass(frozen=True)
@@ -105,7 +105,7 @@ def verify_claims(
         return None
     if prefix != _PREFIX:
         return None
-    expected_sig = _signature(api_key, f"{_PREFIX}.{payload_seg}")
+    expected_sig = signature(api_key, f"{_PREFIX}.{payload_seg}")
     try:
         signature_ok = hmac.compare_digest(sig_seg, expected_sig)
     except TypeError:
@@ -113,7 +113,7 @@ def verify_claims(
     if not signature_ok:
         return None
     try:
-        payload = json.loads(_b64url_decode(payload_seg))
+        payload = json.loads(b64url_decode(payload_seg))
     except (ValueError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):

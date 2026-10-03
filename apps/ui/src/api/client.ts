@@ -35,7 +35,7 @@ export interface ChannelBindingWrite extends ChannelBinding {
 // The worker resolves an agent's binding against `channel.address`, not a
 // bare `slack_channel` column. This is the console's fast local check for the
 // Slack kind; it is a soft check (warns, never blocks) because
-// the authoritative gate lives server-side (apps/api schemas.py).
+// the authoritative gate lives in apps/api/src/curie_api/schemas/channels.py.
 export const SLACK_ADDRESS_RE = /^[CDG][A-Z0-9]+$/;
 
 export interface AgentOut {
@@ -1028,7 +1028,7 @@ export async function resolveApproval(approvalId: string, input: ApprovalResolve
 
 // ---- Behavior packs: per-agent opt-in deterministic behaviors (#870) ----
 //
-// Shapes mirror apps/api schemas.BehaviorPacksConfig verbatim. The packs ride on
+// Shapes mirror apps/api schemas.agents.BehaviorPacksConfig verbatim. The packs ride on
 // the agent's stored config (like BudgetConfig mirrors the ACI Budget), so the
 // shape is duplicated here rather than shared. A NULL agent row reads back as the
 // all-off default; the API always returns the fully-defaulted object.

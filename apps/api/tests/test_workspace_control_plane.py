@@ -480,7 +480,7 @@ def test_workspace_credential_resolution_does_not_block_the_event_loop(
     """A synchronous installation-token mint must run outside FastAPI's loop."""
 
     from curie_api.routers.workspaces import redeem_workspace_credential
-    from curie_api.schemas import WorkspaceCredentialRequest
+    from curie_api.schemas.workspaces import WorkspaceCredentialRequest
 
     agent_id, version_id = _create_agent_version(worker_client, auth_headers)
     deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=True)

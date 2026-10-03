@@ -12,7 +12,7 @@ from uuid import UUID
 
 import pytest
 from channel_protocol import scoped_conversation_id
-from curie_api import workitem_dispatch, workitems
+from curie_api import workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.routers import work_items
@@ -27,6 +27,7 @@ from curie_api.workitem_dispatch import (
     record_termination,
     start,
 )
+from curie_api.workitems import lifecycle as workitems
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine

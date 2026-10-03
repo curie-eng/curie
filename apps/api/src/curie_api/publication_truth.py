@@ -15,7 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from starlette.concurrency import run_in_threadpool
 
-from . import crud
+from curie_api.crud import lineages as crud_lineages
+
 from .config import Settings
 from .github_app import GitHubAppError, GitHubCredentials
 from .github_review_truth import github_headers, repository_identity_matches
@@ -173,7 +174,9 @@ async def read_publication_authority(
         installation_id=lineage.github_installation_id,
         pr_node_id=lineage.github_pr_node_id,
         base_ref=lineage.base_ref,
-        has_inflight_push=await crud.publication_lineage_has_inflight_push(session, lineage),
+        has_inflight_push=await crud_lineages.publication_lineage_has_inflight_push(
+            session, lineage
+        ),
     )
 
 

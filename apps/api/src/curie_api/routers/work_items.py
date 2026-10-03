@@ -9,12 +9,13 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
+from curie_api.workitems.lifecycle import WorkItemConflict, WorkItemOutcome
+
 from .. import workitem_dispatch
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import SessionDep
 from ..workitem_dispatch import DispatchConflict
-from ..workitems import WorkItemConflict, WorkItemOutcome
 
 router = APIRouter(
     prefix="/v1/internal/work-items",

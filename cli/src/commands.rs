@@ -7270,10 +7270,10 @@ pub struct ApprovalCmd {
 // anywhere aborts the whole invocation with nothing sent.
 
 /// Slack ID shapes, mirroring the authoritative validators in
-/// `apps/api/src/curie_api/schemas.py`. The API is the gate for every caller and
+/// `apps/api/src/curie_api/schemas/channels.py`. The API is the gate for every caller and
 /// re-checks all of these; these exist only so a typo is answered locally with a
 /// fix hint instead of a round trip (the same split the API's own
-/// `_validate_channel_binding` docstring describes).
+/// `validate_channel_binding` docstring describes).
 static SLACK_USERGROUP_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^S[A-Z0-9]{7,}$").expect("usergroup id re"));
 static SLACK_USER_ID: std::sync::LazyLock<regex::Regex> =
@@ -8641,7 +8641,7 @@ pub async fn observability(open: bool) -> Result<crate::observability::Observabi
 
 /// Reject a channel binding this CLI can cheaply prove is wrong before a round
 /// trip. Dispatches on `kind`, mirroring the API's kind-dispatched
-/// `_validate_channel_binding`: a kind with no local rule passes here and is
+/// `validate_channel_binding`: a kind with no local rule passes here and is
 /// answered authoritatively by the API.
 ///
 /// The `slack` arm rejects a `#name` rather than a channel ID: real Slack

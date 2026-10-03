@@ -9,9 +9,9 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
-from curie_api import workitems
 from curie_api.config import get_settings
 from curie_api.models import ThreadPublicationLineage
+from curie_api.workitems import lifecycle as workitems
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine

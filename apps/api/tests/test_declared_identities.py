@@ -16,7 +16,7 @@ import pytest
 from aci_protocol.slack_identities import IDENTITY_NAME_PATTERN
 from curie_api.config import Settings, get_settings
 from curie_api.identities import declared_identities, refuse_undeclared
-from curie_api.schemas import _CHANNEL_KIND, ChannelBindingWrite
+from curie_api.schemas.channels import CHANNEL_KIND, ChannelBindingWrite
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import text
@@ -118,7 +118,7 @@ def test_every_name_the_declaration_admits_is_one_a_binding_can_name(name: str) 
     stricter: a declared name no binding could carry is a dead identity."""
 
     if re.fullmatch(IDENTITY_NAME_PATTERN, name):
-        assert _CHANNEL_KIND.fullmatch(name), name
+        assert CHANNEL_KIND.fullmatch(name), name
     if name in {"sales--eu", "-sales", "sales-", "Sales"}:
         assert not re.fullmatch(IDENTITY_NAME_PATTERN, name), name
 

@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 from curie_api.config import get_settings
-from curie_api.schemas import AgentCreate, AgentUpdate
+from curie_api.schemas.agents import AgentCreate, AgentUpdate
 from pydantic import ValidationError
 from sqlalchemy import event
 from sqlalchemy import text as sql_text

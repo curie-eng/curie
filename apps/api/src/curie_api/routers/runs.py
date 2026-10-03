@@ -6,12 +6,14 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from curie_api.schemas.evals import EvalCaseOut
+from curie_api.schemas.observability import TraceTree
+
 from ..auth import require_api_key
 from ..deps import LangfuseDep
 from ..evalcase import trace_to_eval_case
 from ..langfuse import build_tree, hoist_approval_decision, hoist_sandbox_id
 from ..metrics import agent_trace_filter
-from ..schemas import EvalCaseOut, TraceTree
 
 router = APIRouter(
     prefix="/langfuse",

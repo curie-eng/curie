@@ -28,8 +28,17 @@ from typing import Any
 import pytest
 import redis
 from aci_protocol import STREAM_PAYLOAD_FIELD
-from curie_api import bundles, crud
+from curie_api import bundles
 from curie_api.config import get_settings
+from curie_api.crud import (
+    agents as crud_agents,
+)
+from curie_api.crud import (
+    deployments as crud_deployments,
+)
+from curie_api.crud import (
+    versions as crud_versions,
+)
 from curie_api.deps import get_eval_queue
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_test_support.scaffold import scaffolded_deploy_yaml
@@ -168,7 +177,7 @@ def _insert_partial_version(agent_id: str, sha: str) -> None:
         engine = create_async_engine(get_settings().database_url)
         maker = async_sessionmaker(engine, expire_on_commit=False)
         async with maker() as session:
-            await crud.create_version_row(
+            await crud_versions.create_version_row(
                 session,
                 uuid.UUID(agent_id),
                 version_label=sha[:12],
@@ -538,7 +547,7 @@ def test_success_notice_reloads_opt_in_and_binding_after_push_started(
     """A slow clone must not notify a channel removed during that clone."""
     from curie_api.deploy_notice import DeployNoticeQueue
     from curie_api.models import Agent, AgentChannel
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
     from redis.asyncio import Redis
     from sqlalchemy import update
 
@@ -553,7 +562,7 @@ def test_success_notice_reloads_opt_in_and_binding_after_push_started(
         valkey = Redis.from_url(settings.valkey_dsn(), decode_responses=True)
         try:
             async with maker() as stale, maker() as writer:
-                agent = await crud.get_agent(stale, uuid.UUID(agent_id))
+                agent = await crud_agents.get_agent(stale, uuid.UUID(agent_id))
                 assert agent is not None
                 assert agent.deploy_notifications is False
                 assert [binding.address for binding in agent.channels] == ["C000000G01"]
@@ -655,7 +664,7 @@ def test_notice_outbox_recovers_after_valkey_outage_and_api_restart(
     """The recipient decision survives an unavailable stream and queue restart."""
     from curie_api.deploy_notice import DeployNoticeQueue
     from curie_api.models import DeployNoticeOutbox
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
     from redis.asyncio import Redis
     from sqlalchemy import select
 
@@ -870,7 +879,7 @@ def test_concurrent_rejections_share_one_repository_notice_budget(
 ) -> None:
     """@spec docs/operations.md#automatically-with-git-flow."""
     from curie_api.deploy_notice import DeployNoticeQueue
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
     from redis.asyncio import Redis
 
     _register_agent(client, auth_headers)
@@ -924,7 +933,7 @@ def test_deploy_notices_are_bounded_per_repository(
     notices older than the window stop counting.
     """
     from curie_api.deploy_notice import DeployNoticeQueue
-    from curie_api.schemas import WebhookResult
+    from curie_api.schemas.deployments import WebhookResult
     from redis.asyncio import Redis
 
     _register_agent(client, auth_headers)
@@ -2165,7 +2174,8 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
 ) -> None:
     """A rejected sha deploys on the next pass after its target is created."""
     from curie_api.commitpoller import CommitPoller
-    from curie_api.schemas import AgentCreate, ChannelBinding
+    from curie_api.schemas.agents import AgentCreate
+    from curie_api.schemas.channels import ChannelBinding
 
     _register(client, auth_headers, "bootstrap_agent", "C000000R01")
     files = {
@@ -2210,8 +2220,8 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
             assert "deploy.unknown_agent" in caplog.text
 
             async with maker() as session:
-                assert await crud.list_deployments(session) == []
-                repaired = await crud.create_agent(
+                assert await crud_deployments.list_deployments(session) == []
+                repaired = await crud_agents.create_agent(
                     session,
                     AgentCreate(
                         name="repairedagent",

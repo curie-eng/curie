@@ -19,7 +19,7 @@ import json
 from pathlib import Path
 
 import pytest
-from curie_api.schemas import EvalCaseOut, GraderOut
+from curie_api.schemas.evals import EvalCaseOut, GraderOut
 from jsonschema import Draft202012Validator
 
 _SCHEMA_PATH = (

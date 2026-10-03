@@ -187,7 +187,7 @@ class Agent(Base):
     # around a turn (a sampled "working..." line, a canned greeting reply). Stored
     # as JSON here and resolved onto the deployment by the worker's binding layer;
     # NULL means no packs (the platform default). The shape is validated by
-    # schemas.BehaviorPacksConfig on write and parsed by
+    # schemas.agents.BehaviorPacksConfig on write and parsed by
     # curie_worker.behaviorpacks.BehaviorPacks on read.
     behavior_packs: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     # Per-agent permission gates (#245, ADR-0010): tool names whose calls
@@ -304,7 +304,7 @@ class AgentChannel(Base):
     channel kind the platform has never heard of without a schema change.
 
     `kind` names the owning adapter, selects the address-shape validator
-    (`schemas._validate_channel_binding`), AND routes: since ADR-0096 phase 2 the
+    (`schemas.channels.validate_channel_binding`), AND routes: since ADR-0096 phase 2 the
     queue wire carries a required `ReplyHandle.kind`, so the worker resolves on
     the PAIR and the uniqueness below widened to match (migration 0023). The
     widening was only safe once no address-only consumer could run -- a
@@ -357,7 +357,7 @@ class AgentChannel(Base):
         #
         # PLAIN index on agent_id, because dropping that uniqueness dropped the
         # column's only index with it (migration 0030 recreates it as this).
-        # `crud.lock_agent_bindings` filters and orders by agent_id under
+        # `crud.channels.lock_agent_bindings` filters and orders by agent_id under
         # `FOR UPDATE` on every add, move and delete; unindexed, each of those
         # scans the whole table while holding locks.
         Index("ix_agent_channels_agent_id", "agent_id"),

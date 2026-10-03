@@ -19,11 +19,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
+from curie_api.routers.schedules import read_triggers, resolve_agent
+from curie_api.schemas.schedules import HookFireOut, ScheduleOutcome
+
 from ..auth import require_api_key
 from ..db import SCHEMA
 from ..deps import SessionDep, StoreDep
-from ..schemas import HookFireOut, ScheduleOutcome
-from .schedules import _read_triggers, _resolve_agent
 
 router = APIRouter(dependencies=[Depends(require_api_key)])
 
@@ -180,7 +181,7 @@ async def fire_hook(
 ) -> HookFireOut:
     """Run one named cron hook now and return its run record."""
 
-    selected = await _resolve_agent(session, agent_id)
+    selected = await resolve_agent(session, agent_id)
     deployment = (
         (await session.execute(_sql(_IN_FORCE_SQL), {"agent_id": selected.id})).mappings().first()
     )
@@ -188,7 +189,7 @@ async def fire_hook(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent has no in-force bundle")
     try:
         data = await store.get(str(deployment["bundle_ref"]))
-        declared = await run_in_threadpool(_read_triggers, data)
+        declared = await run_in_threadpool(read_triggers, data)
     except Exception as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, "stored bundle could not be read") from exc
     trigger = _cron(declared, name)
@@ -292,7 +293,7 @@ async def get_hook_run(
 ) -> HookFireOut:
     """Read one test-fire record, including a turn that has not settled."""
 
-    selected = await _resolve_agent(session, agent_id)
+    selected = await resolve_agent(session, agent_id)
     row = (
         (
             await session.execute(

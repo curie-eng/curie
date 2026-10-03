@@ -51,7 +51,7 @@ import hmac
 import json
 import time
 
-from .sandbox_token import _signature
+from curie_api.sandbox_token import signature
 
 # The header an upstream presents its signature in. Named for this platform
 # rather than borrowing GitHub's ``X-Hub-Signature-256``: a hook source is any
@@ -96,7 +96,7 @@ def derive(api_key: str, *, agent_id: str, generation: int) -> str:
         The secret, base64url-encoded, safe to hand to an operator verbatim.
     """
 
-    return _signature(api_key, f"{_LABEL}:{agent_id}:{generation}")
+    return signature(api_key, f"{_LABEL}:{agent_id}:{generation}")
 
 
 def _material(

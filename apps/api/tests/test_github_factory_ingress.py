@@ -951,7 +951,8 @@ def _mark_running(request_id: uuid.UUID) -> None:
 
 
 def _assert_publication_refused(work_item_id: uuid.UUID) -> None:
-    from curie_api import crud
+    from curie_api.crud import errors as crud_errors
+    from curie_api.crud import publications as crud_publications
 
     async def go() -> None:
         engine = create_async_engine(get_settings().database_url)
@@ -965,8 +966,8 @@ def _assert_publication_refused(work_item_id: uuid.UUID) -> None:
                         {"id": work_item_id},
                     )
                 ).one()
-                with pytest.raises(crud.PublicationLineageConflict) as caught:
-                    await crud._refuse_fenced_work_item(
+                with pytest.raises(crud_errors.PublicationLineageConflict) as caught:
+                    await crud_publications._refuse_fenced_work_item(
                         session,
                         agent_id=row.agent_id,
                         conversation_id=row.conversation_id,

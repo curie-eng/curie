@@ -4,10 +4,14 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from .. import crud, deploy
+from curie_api.crud import agents as crud_agents
+from curie_api.crud import deployments as crud_deployments
+from curie_api.crud import versions as crud_versions
+from curie_api.schemas.deployments import DeploymentCreate, DeploymentOut
+
+from .. import deploy
 from ..auth import require_api_key
 from ..deps import SessionDep, StoreDep
-from ..schemas import DeploymentCreate, DeploymentOut
 
 router = APIRouter(
     prefix="/deployments",
@@ -20,7 +24,7 @@ router = APIRouter(
 async def create_deployment(
     data: DeploymentCreate, session: SessionDep, store: StoreDep
 ) -> DeploymentOut:
-    agent = await crud.get_agent(session, data.agent_id)
+    agent = await crud_agents.get_agent(session, data.agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     if (
@@ -31,7 +35,7 @@ async def create_deployment(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "workspace_enabled must be true or false when provided",
         )
-    version = await crud.get_version(session, data.version_id)
+    version = await crud_versions.get_version(session, data.version_id)
     if version is None or version.agent_id != data.agent_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "version not found")
     # Revalidate the stored bundle against the CURRENT size/ratio caps before
@@ -51,7 +55,7 @@ async def create_deployment(
         await deploy.check_approval_route_bindings(store, version, agent.approval_routes)
     except deploy.ApprovalRoutesUnbound as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-    deployment = await crud.create_deployment(session, data)
+    deployment = await crud_deployments.create_deployment(session, data)
     return DeploymentOut.model_validate(deployment)
 
 
@@ -59,7 +63,7 @@ async def create_deployment(
 async def list_deployments(
     session: SessionDep, agent_id: uuid.UUID | None = None
 ) -> list[DeploymentOut]:
-    deployments = await crud.list_deployments(session, agent_id)
+    deployments = await crud_deployments.list_deployments(session, agent_id)
     return [DeploymentOut.model_validate(d) for d in deployments]
 
 
@@ -67,7 +71,7 @@ async def list_deployments(
 async def get_deployment(
     deployment_id: uuid.UUID, session: SessionDep
 ) -> DeploymentOut:
-    deployment = await crud.get_deployment(session, deployment_id)
+    deployment = await crud_deployments.get_deployment(session, deployment_id)
     if deployment is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "deployment not found")
     return DeploymentOut.model_validate(deployment)
@@ -75,7 +79,7 @@ async def get_deployment(
 
 @router.delete("/{deployment_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def end_deployment(deployment_id: uuid.UUID, session: SessionDep) -> None:
-    deployment = await crud.get_deployment(session, deployment_id)
+    deployment = await crud_deployments.get_deployment(session, deployment_id)
     if deployment is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "deployment not found")
-    await crud.end_deployment(session, deployment)
+    await crud_deployments.end_deployment(session, deployment)

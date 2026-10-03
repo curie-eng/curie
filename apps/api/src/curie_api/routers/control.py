@@ -9,20 +9,15 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from .. import crud
+from curie_api.crud import agents as crud_agents
+from curie_api.schemas.agents import BehaviorPacksConfig, enforce_behavior_packs_size
+from curie_api.schemas.control import BudgetConfig, CostReport, KillState, ThreadResetState
+
 from .. import metrics as metrics_service
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import KillSwitchDep, LangfuseDep, SessionDep, ThreadResetRequestsDep
 from ..models import Agent
-from ..schemas import (
-    BehaviorPacksConfig,
-    BudgetConfig,
-    CostReport,
-    KillState,
-    ThreadResetState,
-    enforce_behavior_packs_size,
-)
 
 router = APIRouter(
     prefix="/agents/{agent_id}",
@@ -32,7 +27,7 @@ router = APIRouter(
 
 
 async def _load_agent(session: SessionDep, agent_id: uuid.UUID) -> Agent:
-    agent = await crud.get_agent(session, agent_id)
+    agent = await crud_agents.get_agent(session, agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     return agent
@@ -147,7 +142,7 @@ async def put_budget(
     agent_id: uuid.UUID, config: BudgetConfig, session: SessionDep
 ) -> BudgetConfig:
     agent = await _load_agent(session, agent_id)
-    updated = await crud.update_budget(
+    updated = await crud_agents.update_budget(
         session,
         agent,
         config.max_usd_per_day,
@@ -173,7 +168,7 @@ async def put_behavior_packs(
 ) -> BehaviorPacksConfig:
     agent = await _load_agent(session, agent_id)
     enforce_behavior_packs_size(config)
-    updated = await crud.update_behavior_packs(session, agent, config.model_dump())
+    updated = await crud_agents.update_behavior_packs(session, agent, config.model_dump())
     return BehaviorPacksConfig.model_validate(updated.behavior_packs)
 
 

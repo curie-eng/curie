@@ -45,7 +45,7 @@ in code now:
 
 - **The durable record + resolve-once semantics (landed, #244).** The `Approval` table
   (`apps/api/src/curie_api/models.py`) with the resolve-once compare-and-set
-  (`crud.claim_approval_resolution`, a conditional `UPDATE ... WHERE status='pending'`) behind
+  (`crud.approvals.claim_approval_resolution`, a conditional `UPDATE ... WHERE status='pending'`) behind
   `POST /approvals/{id}/resolve`; losers of the claim race get 409 naming who resolved it,
   a past-SLA record flips to expired (410) and now also enqueues the expiry resume turn
   (#412, below) so the late resolver's dead end no longer strands the session. Creation is
@@ -67,7 +67,7 @@ in code now:
   code `approval.rejected_in_thread` (frozen with the worker in
   `tests/vectors/approval-reraise-refusal.json`), a request for an approval a person
   rejected in the same thread when nobody has asked for it since
-  (`apps/api/src/curie_api/crud.py::find_rejected_reraise`). "The same approval" is the
+  (`apps/api/src/curie_api/crud/approvals.py::find_rejected_reraise`). "The same approval" is the
   same agent, conversation, route, gate kind and gated tool; the model-authored summary is
   deliberately not part of it, so a reworded retry is still a retry. "Nobody has asked" is
   read off the request's `dedupe_key`: a resume turn's event id is
@@ -136,20 +136,20 @@ in code now:
   resolver stayed `pending` forever, since the only expiry path lived inside the resolve
   endpoint. A periodic sweeper in the API lifespan (`apps/api/src/curie_api/sweeper.py`,
   `run_expiry_sweeper` driving `sweep_expired_approvals`) now flips lapsed `pending` records
-  to `expired` through the same `crud.expire_approval` compare-and-set, appends an `expired`
+  to `expired` through the same `crud.approvals.expire_approval` compare-and-set, appends an `expired`
   audit row (`authorizer="ExpirySweeper"`), and enqueues a platform-authored (`author="system"`)
   resume turn so the suspended session resumes down its timeout branch (ADR-0003). The
   single-wakeup guarantee comes from the pending-guarded compare-and-set in
-  `crud.expire_approval`: only the flip winner (the sweeper or a racing resolver) enqueues.
+  `crud.approvals.expire_approval`: only the flip winner (the sweeper or a racing resolver) enqueues.
   Both paths also reuse the deterministic `resume_event_id(approval.id)`, but that shared key
   only keeps a redelivery of an already-terminally-handled turn from re-running; it does not
   collapse a duplicate landing while the resumed turn is still in flight. Cadence is `approval_sweep_interval_s` (env
   `APPROVAL_SWEEP_INTERVAL_S`, Helm `api.approvalSweepIntervalSeconds`, default 30s; `<= 0`
   disables). A failure after the flip but before the audit/enqueue (a Valkey blip, a pod
   shutdown mid-batch) no longer drops that wakeup. Both expiry paths mark `resumed_at` only
-  once the enqueue succeeded (`crud.mark_approval_resumed`), so a flipped record with a NULL
+  once the enqueue succeeded (`crud.approvals.mark_approval_resumed`), so a flipped record with a NULL
   `resumed_at` is an owed wake, and #418 widened the reconciler's work-list
-  (`apps/api/src/curie_api/crud.py::list_resolved_unresumed`) to include `expired` rows, which
+  (`apps/api/src/curie_api/crud/approvals.py::list_resolved_unresumed`) to include `expired` rows, which
   the pending-guarded sweeper can never re-select. The backstop is the resume reconciler
   (`apps/api/src/curie_api/resumereconciler.py::ResumeReconciler`, #411), which re-enqueues
   every owed wake past a grace horizon. In Helm, `api.resumeReconciler.graceSeconds` derives
@@ -312,7 +312,7 @@ in code now:
   fallback — authority must never silently widen. This is distinct from genuinely
   agent-less generic approvals. ADR-0123 brings resolve time into line
   with that creation-time rule: the API's `get_approval_route_binding` channel fallback
-  (`apps/api/src/curie_api/crud.py`) now applies only to a **routeless** approval, so a
+  (`apps/api/src/curie_api/crud/approvals.py`) now applies only to a **routeless** approval, so a
   routed approval with no binding is refused at BOTH ends of the lifecycle — no approval is
   created for it, and one already pending stops being resolvable. The
   card's transport follows the same split (#451): a bound channel that differs from the
@@ -448,7 +448,7 @@ Slack feature.
 - **`ExplicitUsers`** (#420, `approvers.py`), a literal allowlist of user IDs. Pure, no I/O.
   It owes Slack no *lookup*, but it can still only be **configured with Slack-validated user
   IDs**: the binding schema rejects anything that is not a Slack `U`/`W`-prefixed ID
-  (`apps/api/src/curie_api/schemas.py::_SLACK_USER_ID`), never a handle or a name, so even this
+  (`apps/api/src/curie_api/schemas/channels.py::SLACK_USER_ID`), never a handle or a name, so even this
   "Slack-free" set is expressed in Slack-shaped identifiers. It is the only set eligible
   for `operator` principals; Console principals may use it or a verified user group. It
   refuses `adapter` principals: its entries are Slack IDs, and only the Slack dispatcher
@@ -461,7 +461,7 @@ Slack feature.
   `apps/api/src/curie_api/approvers.py::card_on_requesting_surface`) and that conversation is email. It
   admits an actor whose address is on the list, compared lowercase, and only through an
   `adapter` principal: the resolve route has already checked that the adapter serves the
-  binding the card went to (`apps/api/src/curie_api/crud.py::_approval_served`) and that the
+  binding the card went to (`apps/api/src/curie_api/crud/approvals.py::_approval_served`) and that the
   binding's `allowed_callers` admit the sender (`apps/api/src/curie_api/routers/approvals.py::_admit_adapter_answer`,
   ADR 0175), and no `chat`, `console` or `operator` principal is eligible, whatever subject
   it names. The person who asked is admitted only if their address is listed. An empty
@@ -626,7 +626,8 @@ process for `slack_usergroup_cache_ttl_s` (env `SLACK_USERGROUP_CACHE_TTL_S`, de
 selector, so the authorizer and the resolve endpoint depend on ports rather than a provider.
 
 This narrows the coupling; it does not make the path provider-neutral. **The binding schema
-is still Slack-shaped**: `schemas.py` validates usergroup IDs as `S...` and channel IDs as
+is still Slack-shaped**: `apps/api/src/curie_api/schemas/approvals.py` and
+`apps/api/src/curie_api/schemas/channels.py` validate usergroup IDs as `S...` and channel IDs as
 `C...`, so a non-Slack provider would need a schema change plus an adapter and a selector.
 What the ports buy is dependency direction — #420 is the first outbound Slack call
 `apps/api` makes, and the authorization decision must not be what holds that client — plus

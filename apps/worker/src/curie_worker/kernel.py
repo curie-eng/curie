@@ -1077,12 +1077,12 @@ def _valid_notification_endpoint(endpoint: Any) -> bool:
 # ADR-0177 decision 1: the other form of a route's resolution. The card is shown
 # in the conversation that asked, on whatever channel that is, exactly as a
 # routeless approval's card already is. Mirrors the API's
-# ``ApprovalRequestingSurfaceTarget`` (``schemas.REQUESTING_SURFACE_MODE``).
+# ``ApprovalRequestingSurfaceTarget`` (``schemas.approvals.REQUESTING_SURFACE_MODE``).
 _REQUESTING_SURFACE = {"mode": "requesting_surface"}
 
 # ADR-0177 amendment: the channels whose approvals are answered from a route's approver
 # ``emails``. Only email today: the mail adapter's kind, and the API's
-# ``schemas.EMAIL_KIND``. A set rather than a comparison, because the question
+# ``schemas.channels.EMAIL_KIND``. A set rather than a comparison, because the question
 # the raise path asks is "does this channel read an email list", not "which
 # channel is this" (the reply seam stays kind-free, see test_reply_wire).
 _APPROVER_EMAIL_KINDS = frozenset({"email"})
@@ -8311,7 +8311,7 @@ class Kernel:
         # own transport. A route-bound channel has no such thread and is policy,
         # not a per-turn reply: it posts top-level over the worker's configured
         # Slack transport, because ``ApprovalRouteBinding.resolution`` is
-        # Slack-only by construction (``schemas.py`` validates the explicit
+        # Slack-only by construction (``schemas.approvals`` validates the explicit
         # pair), and the authorizer proves membership of that channel through a
         # verified Slack card click. Notification transport never feeds this
         # comparison or these route fields.

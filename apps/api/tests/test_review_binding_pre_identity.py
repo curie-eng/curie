@@ -19,8 +19,9 @@ from typing import Any
 
 import pytest
 from channel_protocol import scoped_conversation_id
-from curie_api import crud
 from curie_api.config import get_settings
+from curie_api.crud import errors as crud_errors
+from curie_api.crud import lineages as crud_lineages
 from curie_api.github_review_events import FeedbackIgnored, UnverifiedFeedback
 from curie_api.github_review_store import review_context
 from curie_api.models import (
@@ -165,7 +166,7 @@ def test_require_review_binding_accepts_a_mail_lineage_keyed_before_the_identity
             lineage_conversation_id=old_key,
             reply_conversation_id=MAIL_THREAD,
         )
-        resolved = await crud._require_review_binding(session, lineage)
+        resolved = await crud_lineages.require_review_binding(session, lineage)
         assert resolved.id == binding.id
 
     _with_session(body)
@@ -187,8 +188,8 @@ def test_require_review_binding_refuses_a_bare_slack_lineage_after_a_named_rebin
             lineage_conversation_id=bare_key,
             reply_conversation_id=SLACK_TS,
         )
-        with pytest.raises(crud.PublicationLineageConflict) as caught:
-            await crud._require_review_binding(session, lineage)
+        with pytest.raises(crud_errors.PublicationLineageConflict) as caught:
+            await crud_lineages.require_review_binding(session, lineage)
         assert caught.value.code == "publication.review_ineligible"
 
     _with_session(body)

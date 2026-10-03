@@ -297,24 +297,24 @@ def _clock_offset(seconds: float) -> Iterator[None]:
     """Shift the database clock both the reconciler and the finish route read."""
 
     import curie_api.workitem_dispatch as workitem_dispatch
-    import curie_api.workitems as workitems
+    import curie_api.workitems.lifecycle as workitems
 
-    original = workitems._database_now
+    original = workitems.database_now
 
     async def later(session: AsyncSession) -> Any:
         real = await original(session)
         return real + timedelta(seconds=seconds)
 
-    workitems._database_now = later
-    dispatch_original = getattr(workitem_dispatch, "_database_now", None)
+    workitems.database_now = later
+    dispatch_original = getattr(workitem_dispatch, "database_now", None)
     if dispatch_original is not None:
-        workitem_dispatch._database_now = later  # type: ignore[attr-defined]
+        workitem_dispatch.database_now = later  # type: ignore[attr-defined]
     try:
         yield
     finally:
-        workitems._database_now = original
+        workitems.database_now = original
         if dispatch_original is not None:
-            workitem_dispatch._database_now = dispatch_original  # type: ignore[attr-defined]
+            workitem_dispatch.database_now = dispatch_original  # type: ignore[attr-defined]
 
 
 def _body(sink: _CommentServer, request_id: uuid.UUID) -> str:
@@ -1398,7 +1398,7 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
 ) -> None:
     """Each CI read takes a full poll interval, so older requests are due every pass."""
 
-    import curie_api.workitems as workitems
+    import curie_api.workitems.lifecycle as workitems
     from curie_api import factory_ci, workitem_outcomes
 
     client, github, sink = admitted
@@ -1412,7 +1412,7 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
     later = _published(client, github, sink, 9759, head_sha=green_head)
 
     elapsed = [0.0]
-    original_now = workitems._database_now
+    original_now = workitems.database_now
     original_observe = workitem_outcomes.observe_ci_detail
 
     async def now(session: AsyncSession) -> Any:
@@ -1423,7 +1423,7 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
         elapsed[0] += factory_ci.CI_POLL_SECONDS
         return detail
 
-    monkeypatch.setattr(workitems, "_database_now", now)
+    monkeypatch.setattr(workitems, "database_now", now)
     monkeypatch.setattr(workitem_outcomes, "observe_ci_detail", slow_observe)
 
     _passes_on_one_reconciler(3)

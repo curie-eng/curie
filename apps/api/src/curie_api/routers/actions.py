@@ -28,11 +28,9 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
-from .. import crud
-from ..auth import require_api_key
-from ..deps import ApproverSetSelectorDep, SessionDep
-from ..models import ActionAuditEntry, ActionStatus, AgentAction, Approval
-from ..schemas import (
+from curie_api.crud import actions as crud_actions
+from curie_api.crud import approvals as crud_approvals
+from curie_api.schemas.actions import (
     ActionAuditOut,
     ActionComplete,
     ActionOut,
@@ -41,6 +39,10 @@ from ..schemas import (
     ActionUndo,
     ActionUndoOut,
 )
+
+from ..auth import require_api_key
+from ..deps import ApproverSetSelectorDep, SessionDep
+from ..models import ActionAuditEntry, ActionStatus, AgentAction, Approval
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +60,10 @@ async def record_action(
     """
 
     try:
-        action = await crud.create_action(session, data)
+        action = await crud_actions.create_action(session, data)
     except IntegrityError as exc:
         await session.rollback()
-        existing = await crud.get_action_by_dedupe_key(session, data.dedupe_key)
+        existing = await crud_actions.get_action_by_dedupe_key(session, data.dedupe_key)
         if existing is None:  # raced with a delete; surface the conflict as-is
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "action violates a uniqueness constraint"
@@ -80,7 +82,7 @@ async def list_actions(
 ) -> list[ActionOut]:
     """A conversation's actions, oldest first -- the order a receipt lists them."""
 
-    actions = await crud.list_actions(
+    actions = await crud_actions.list_actions(
         session,
         conversation_id=conversation_id,
         agent_id=agent_id,
@@ -91,7 +93,7 @@ async def list_actions(
 
 @router.get("/{action_id}", response_model=ActionOut)
 async def get_action(action_id: uuid.UUID, session: SessionDep) -> ActionOut:
-    action = await crud.get_action(session, action_id)
+    action = await crud_actions.get_action(session, action_id)
     if action is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "action not found")
     return ActionOut.model_validate(action)
@@ -108,10 +110,10 @@ async def complete_action(
     answer for a connector that replied in prose -- nothing has to declare it.
     """
 
-    action = await crud.get_action(session, action_id)
+    action = await crud_actions.get_action(session, action_id)
     if action is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "action not found")
-    completed = await crud.complete_action(session, action, data)
+    completed = await crud_actions.complete_action(session, action, data)
     return ActionOut.model_validate(completed)
 
 
@@ -123,10 +125,10 @@ async def get_action_audit(action_id: uuid.UUID, session: SessionDep) -> list[Ac
     the record did not move -- so this is the only place the reason survives.
     """
 
-    action = await crud.get_action(session, action_id)
+    action = await crud_actions.get_action(session, action_id)
     if action is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "action not found")
-    entries = await crud.list_action_audit(session, action_id)
+    entries = await crud_actions.list_action_audit(session, action_id)
     return [ActionAuditOut.model_validate(e) for e in entries]
 
 
@@ -167,7 +169,7 @@ async def _authorize_undo(
         # deleted approval turn a gated action into a freely undoable one.
         return UNGATED, False, "the approval that gated this action can no longer be read"
 
-    binding = await crud.get_approval_route_binding(session, approval)
+    binding = await crud_approvals.get_approval_route_binding(session, approval)
     approver_set = approver_sets(approval, binding)
     verdict = await approver_set.contains(data.actor, data.actor_channel)
     if verdict.undetermined:
@@ -238,7 +240,7 @@ async def undo_action(
     a conflict message.
     """
 
-    action = await crud.get_action(session, action_id)
+    action = await crud_actions.get_action(session, action_id)
     if action is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "action not found")
 
@@ -326,7 +328,7 @@ async def undo_action(
         )
 
     assert action.target is not None and action.prior_state is not None  # narrowed above
-    claimed = await crud.claim_action_undo(session, action, actor=data.actor)
+    claimed = await crud_actions.claim_action_undo(session, action, actor=data.actor)
     if claimed is None:
         await _refuse(
             session,

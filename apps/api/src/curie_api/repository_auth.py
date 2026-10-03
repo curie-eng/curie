@@ -2,8 +2,10 @@
 
 from urllib.parse import urlsplit
 
+from curie_api.gitflow import clone_credential_env
+
 from .config import Settings
-from .gitflow import _clone_credential_env, trusted_clone_url
+from .gitflow import trusted_clone_url
 from .github_app import credentials_for
 
 
@@ -28,7 +30,7 @@ def resolve_repository_credential(
         or origin.password is not None
     ):
         raise ValueError("managed repository origin is not canonical configured GitHub HTTPS")
-    env = _clone_credential_env(
+    env = clone_credential_env(
         clone_url,
         settings,
         repo_full_name=repo_full_name,

@@ -37,17 +37,18 @@ from typing import Annotated
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
 
-from .. import crud
-from ..approval_auth import CONSOLE_SESSION_COOKIE, set_console_session_cookie
-from ..auth import require_platform_key
-from ..deps import SessionDep
-from ..rate_limit import require_rate_limit
-from ..schemas import (
+from curie_api.crud import console as crud_console
+from curie_api.schemas.console import (
     ConsoleLoginCodeMint,
     ConsoleLoginCodeOut,
     ConsoleSessionExchange,
     ConsoleSessionOut,
 )
+
+from ..approval_auth import CONSOLE_SESSION_COOKIE, set_console_session_cookie
+from ..auth import require_platform_key
+from ..deps import SessionDep
+from ..rate_limit import require_rate_limit
 
 router = APIRouter(prefix="/console", tags=["console"])
 
@@ -75,7 +76,7 @@ async def create_login_code(
     data: ConsoleLoginCodeMint, session: SessionDep, response: Response
 ) -> ConsoleLoginCodeOut:
     """Mint a single-use login code for an operator to copy into the console."""
-    code, row = await crud.create_console_login_code(session, subject=data.subject)
+    code, row = await crud_console.create_console_login_code(session, subject=data.subject)
     response.headers["Cache-Control"] = "no-store"
     return ConsoleLoginCodeOut(
         code=code,
@@ -97,7 +98,7 @@ async def exchange_login_code(
     expired one and a revoked row are indistinguishable to the caller, so this
     endpoint cannot be used to enumerate which codes exist.
     """
-    exchanged = await crud.exchange_console_login_code(session, data.code)
+    exchanged = await crud_console.exchange_console_login_code(session, data.code)
     if exchanged is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -127,7 +128,7 @@ async def current_session(
 ) -> ConsoleSessionOut:
     """Return the immutable subject of the live session in the HttpOnly cookie."""
 
-    row = await crud.live_console_session(session, console_session or "")
+    row = await crud_console.live_console_session(session, console_session or "")
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

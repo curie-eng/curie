@@ -693,7 +693,7 @@ def test_resume_turn_selector_domain_matches_resumable_statuses() -> None:
     Pure unit: no DB, no Valkey -- the selector is a function of the record.
     """
 
-    from curie_api import crud
+    from curie_api.crud import approvals as crud_approvals
     from curie_api.resumequeue import resume_turn_for
 
     approved = resume_turn_for(_detached_approval(ApprovalStatus.approved))
@@ -713,7 +713,7 @@ def test_resume_turn_selector_domain_matches_resumable_statuses() -> None:
         resume_turn_for(_detached_approval(ApprovalStatus.pending, resolved_by=None))
 
     assert {s for s in ApprovalStatus if s is not ApprovalStatus.pending} == set(
-        crud._RESUMABLE_STATUSES
+        crud_approvals._RESUMABLE_STATUSES
     )
 
 

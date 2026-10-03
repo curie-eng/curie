@@ -6,18 +6,21 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from starlette.concurrency import run_in_threadpool
 
-from .. import crud
-from ..auth import require_internal_worker_token
-from ..config import get_settings
-from ..deps import SessionDep
-from ..models import Deployment, WorkItem
-from ..repository_auth import resolve_repository_credential
-from ..schemas import (
+from curie_api.crud import deployments as crud_deployments
+from curie_api.crud import publications as crud_publications
+from curie_api.crud import workspaces as crud_workspaces
+from curie_api.schemas.workspaces import (
     WorkspaceCredentialOut,
     WorkspaceCredentialRequest,
     WorkspaceSelectionOut,
     WorkspaceSelectionRequest,
 )
+
+from ..auth import require_internal_worker_token
+from ..config import get_settings
+from ..deps import SessionDep
+from ..models import Deployment, WorkItem
+from ..repository_auth import resolve_repository_credential
 from ..workspace_policy import credential_mode, repository_is_allowed
 
 router = APIRouter(prefix="/v1/internal/workspaces", tags=["internal-workspaces"])
@@ -26,7 +29,7 @@ router = APIRouter(prefix="/v1/internal/workspaces", tags=["internal-workspaces"
 async def _workspace_deployment(
     session: SessionDep, deployment_id: uuid.UUID
 ) -> Deployment:
-    deployment = await crud.get_deployment(session, deployment_id)
+    deployment = await crud_deployments.get_deployment(session, deployment_id)
     if deployment is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "deployment not found")
     return deployment
@@ -55,7 +58,7 @@ async def select_workspace_repository(
     """Select once per agent/thread, or validate and reuse the winner."""
 
     deployment = await _workspace_deployment(session, deployment_id)
-    selected = await crud.get_thread_workspace(
+    selected = await crud_workspaces.get_thread_workspace(
         session,
         agent_id=deployment.agent_id,
         conversation_id=data.conversation_id,
@@ -64,7 +67,7 @@ async def select_workspace_repository(
         if data.repo_full_name is None:
             return WorkspaceSelectionOut(repo_full_name=None)
         _require_allowed(data.repo_full_name)
-        selected, _ = await crud.select_thread_workspace(
+        selected, _ = await crud_workspaces.select_thread_workspace(
             session,
             agent_id=deployment.agent_id,
             deployment_id=deployment.id,
@@ -102,9 +105,9 @@ async def redeem_workspace_credential(
     response: Response,
 ) -> WorkspaceCredentialOut:
     response.headers["Cache-Control"] = "no-store"
-    deployment = await crud.get_deployment(session, deployment_id)
+    deployment = await crud_deployments.get_deployment(session, deployment_id)
     if deployment is None:
-        await crud.append_credential_redemption_audit(
+        await crud_publications.append_credential_redemption_audit(
             session,
             purpose="workspace_clone",
             outcome="refused",
@@ -118,7 +121,7 @@ async def redeem_workspace_credential(
             "deployment not found",
             headers={"Cache-Control": "no-store"},
         )
-    selected = await crud.get_thread_workspace(
+    selected = await crud_workspaces.get_thread_workspace(
         session,
         agent_id=deployment.agent_id,
         conversation_id=data.conversation_id,
@@ -128,7 +131,7 @@ async def redeem_workspace_credential(
     else:
         repo = selected.repo_full_name
     if repo is None or selected is None:
-        await crud.append_credential_redemption_audit(
+        await crud_publications.append_credential_redemption_audit(
             session,
             purpose="workspace_clone",
             outcome="refused",
@@ -144,7 +147,7 @@ async def redeem_workspace_credential(
         )
     settings = get_settings()
     if not repository_is_allowed(repo, settings.github_repo_allowlist):
-        await crud.append_credential_redemption_audit(
+        await crud_publications.append_credential_redemption_audit(
             session,
             purpose="workspace_clone",
             outcome="refused",
@@ -179,7 +182,7 @@ async def redeem_workspace_credential(
             resolve_repository_credential, repo, settings
         )
     except Exception as exc:
-        await crud.append_credential_redemption_audit(
+        await crud_publications.append_credential_redemption_audit(
             session,
             purpose="workspace_clone",
             outcome="refused",
@@ -193,7 +196,7 @@ async def redeem_workspace_credential(
             "operator repository credential could not be resolved",
             headers={"Cache-Control": "no-store"},
         ) from exc
-    await crud.append_credential_redemption_audit(
+    await crud_publications.append_credential_redemption_audit(
         session,
         purpose="workspace_clone",
         outcome="issued",

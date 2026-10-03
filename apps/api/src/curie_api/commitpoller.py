@@ -55,10 +55,11 @@ import httpx
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
 
+from curie_api.schemas.deployments import WebhookResult
+
 from .config import Settings
 from .models import GIT_FLOW_CREATED_BY
 from .repo_full_name import InvalidRepoFullName, repo_url_path
-from .schemas import WebhookResult
 
 logger = logging.getLogger(__name__)
 

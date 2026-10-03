@@ -18,8 +18,9 @@ from collections.abc import Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from curie_api.schemas.observability import MetricPoint, MetricSeries, MetricsSummary
+
 from .langfuse import LangfuseClient
-from .schemas import MetricPoint, MetricSeries, MetricsSummary
 
 
 def agent_trace_filter(agent_id: uuid.UUID | str) -> str:

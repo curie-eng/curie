@@ -24,10 +24,10 @@ import uuid
 from typing import Any
 
 import pytest
-from curie_api import crud
 from curie_api.config import get_settings
+from curie_api.crud import actions as crud_actions
 from curie_api.models import AgentAction
-from curie_api.schemas import ActionComplete
+from curie_api.schemas.actions import ActionComplete
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -213,12 +213,12 @@ def test_two_sessions_with_a_stale_pending_record_cannot_replace_the_first_compl
                 second = await second_session.get(AgentAction, action_id)
                 assert first is not None and second is not None
                 assert first.status == second.status == "pending"
-                winner = await crud.complete_action(
+                winner = await crud_actions.complete_action(
                     first_session,
                     first,
                     ActionComplete.model_validate(_complete_body(prior_state={"winner": 1})),
                 )
-                loser = await crud.complete_action(
+                loser = await crud_actions.complete_action(
                     second_session,
                     second,
                     ActionComplete.model_validate(_complete_body(prior_state={"loser": 2})),

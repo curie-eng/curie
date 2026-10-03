@@ -87,7 +87,7 @@ over OTLP-HTTP to the collector (`runner/src/curie_runner/otel.py`), and the
 collector is the single component that authenticates and forwards to Langfuse
 (`charts/curie/templates/otel-collector.yaml`, needed because Langfuse OTLP
 ingest is HTTP-only). On the read side the UI consumes only our API's schemas
-(`ObservationNode`, `MetricsSummary` in `apps/api/src/curie_api/schemas.py`).
+(`ObservationNode`, `MetricsSummary` in `apps/api/src/curie_api/schemas/observability.py`).
 
 **Current adapter:** `apps/api/src/curie_api/langfuse.py` (trace list, tree
 reconstruction from `parentObservationId`, metrics queries) plus

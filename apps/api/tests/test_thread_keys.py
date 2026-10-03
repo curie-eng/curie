@@ -13,8 +13,16 @@ from typing import Any
 
 import pytest
 from channel_protocol import scoped_conversation_id
-from curie_api import crud
 from curie_api.config import get_settings
+from curie_api.crud import (
+    errors as crud_errors,
+)
+from curie_api.crud import (
+    lineages as crud_lineages,
+)
+from curie_api.crud import (
+    publications as crud_publications,
+)
 from curie_api.threadkeys import (
     pre_identity_thread_key,
     route_thread_key,
@@ -238,7 +246,7 @@ def test_a_cancelled_work_item_keyed_before_the_identity_still_fences_publicatio
         agent_id, work_item_id, version = await _legacy_mail_work_item(session)
         cancelled = await cancel(session, work_item_id=work_item_id, expected_version=version)
         assert getattr(cancelled, "work_item", None) is not None, cancelled
-        conflict = await crud.publication_cancellation_conflict(
+        conflict = await crud_publications.publication_cancellation_conflict(
             session, agent_id=agent_id, conversation_id=NEW_KEY
         )
         assert conflict is not None
@@ -304,7 +312,7 @@ def test_a_cancelled_legacy_work_item_still_fences_publication_after_its_binding
             text("DELETE FROM curie.agent_channels WHERE agent_id = :id"), {"id": agent_id}
         )
         await session.commit()
-        conflict = await crud.publication_cancellation_conflict(
+        conflict = await crud_publications.publication_cancellation_conflict(
             session, agent_id=agent_id, conversation_id=NEW_KEY
         )
         assert conflict is not None
@@ -367,8 +375,8 @@ def test_refuse_fenced_work_item_still_fences_a_cancelled_legacy_work_item(
         agent_id, work_item_id, version = await _legacy_mail_work_item(session)
         cancelled = await cancel(session, work_item_id=work_item_id, expected_version=version)
         assert getattr(cancelled, "work_item", None) is not None, cancelled
-        with pytest.raises(crud.PublicationLineageConflict) as caught:
-            await crud._refuse_fenced_work_item(
+        with pytest.raises(crud_errors.PublicationLineageConflict) as caught:
+            await crud_publications._refuse_fenced_work_item(
                 session,
                 agent_id=agent_id,
                 conversation_id=NEW_KEY,
@@ -437,7 +445,7 @@ async def _bind_lineage(
         github_installation_id=None,
     )
     publication: Any = SimpleNamespace(execution_request_id=request_id)
-    await crud._bind_running_work_item_lineage(
+    await crud_lineages._bind_running_work_item_lineage(
         session, publication=publication, lineage=lineage, identity=None
     )
 

@@ -3,7 +3,7 @@
 A signed delivery may name a workload. The operator map, not the model and not
 a URL inside the untrusted payload, is what may select a coding target. Missing,
 ambiguous, or unauthorized mappings visibly stop coding. This module is imported
-by ``schemas.py`` and ``routers/hooks.py`` and must not import either back.
+by ``schemas.agents`` and ``routers/hooks.py`` and must not import either back.
 """
 
 from __future__ import annotations

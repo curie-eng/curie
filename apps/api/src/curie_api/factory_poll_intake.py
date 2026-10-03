@@ -33,9 +33,10 @@ from sqlalchemy import desc, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.concurrency import run_in_threadpool
 
+from curie_api.factory_label_reconcile import bound_repositories, last_label_event, parse_time
+
 from . import github_factory
 from .config import Settings
-from .factory_label_reconcile import _bound_repositories, _last_label_event, _parse_time
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_factory_events import FactoryNotice, mentions_login
 from .github_factory_review import admit_parsed_feedback
@@ -93,7 +94,7 @@ def _advance(current: datetime | None, items: list[Any], *keys: str) -> datetime
         if not isinstance(item, dict):
             continue
         raw = next((item.get(key) for key in keys if isinstance(item.get(key), str)), None)
-        parsed = _parse_time(raw)
+        parsed = parse_time(raw)
         if parsed is not None and (newest is None or parsed > newest):
             newest = parsed
     return newest
@@ -161,7 +162,7 @@ async def _label_already_admitted(
     live run. A later label event still readmits.
     """
 
-    event_at = _parse_time(event.get("created_at"))
+    event_at = parse_time(event.get("created_at"))
     if event_at is None:
         return False
     async with sessionmaker() as session:
@@ -205,7 +206,7 @@ async def _poll_locked(
     client: httpx.AsyncClient,
 ) -> None:
     async with sessionmaker() as session:
-        repositories = await _bound_repositories(session)
+        repositories = await bound_repositories(session)
     for repository in repositories:
         try:
             repo = normalize_repo_full_name(repository)
@@ -409,7 +410,7 @@ async def _admit_labeled(
             events = await _events(
                 client, api=api, token=token, repo_path=repo_path, number=number
             )
-            event = _last_label_event(events, label)
+            event = last_label_event(events, label)
             if event is None or type(event.get("id")) is not int:
                 continue
             sender = _human_actor(event)

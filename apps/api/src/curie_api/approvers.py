@@ -28,8 +28,9 @@ from typing import Any, Protocol
 
 from aci_protocol.turn import SLACK_KIND
 
+from curie_api.schemas.channels import EMAIL_KIND, SLACK_CHANNEL_ID
+
 from .models import Approval
-from .schemas import EMAIL_KIND, SLACK_CHANNEL_ID
 
 # The audit vocabulary is FROZEN, and each set pins its own ``audit_name`` to the
 # class name it had before ADR-0034 turned it from an authorizer into a set. The
@@ -287,7 +288,7 @@ class EmailApprovers:
     a Slack click cannot prove they hold an email address, so each is refused
     before membership is read, whatever address it names. The router has already
     checked that the adapter serves the thread's binding
-    (``crud._approval_served``) and that the binding's ``allowed_callers``
+    (``crud.approvals._approval_served``) and that the binding's ``allowed_callers``
     admit the sender (ADR 0175), so "a verified, listed sender of the serving
     adapter" is the conjunction of those checks and this one.
 
