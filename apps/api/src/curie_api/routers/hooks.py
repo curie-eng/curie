@@ -51,6 +51,7 @@ from datetime import UTC, datetime
 from html import escape
 from typing import Annotated, Any
 
+import anyio
 import redis.asyncio as redis
 from aci_protocol import (
     STREAM_PAYLOAD_FIELD,
@@ -535,6 +536,7 @@ async def ingest_hook(
             await source.ensure_live()
             if await claim_delivery(client, key, owner, settings.channel_delivery_lease_s):
                 try:
+                    await source.ensure_live()
                     if not await take_backlog_slot(
                         client,
                         reservation=reservation,
@@ -557,6 +559,8 @@ async def ingest_hook(
                             headers={"Retry-After": str(settings.hook_backlog_window_s)},
                         )
                     if mapping.selects_workspace and mapping.repository is not None:
+                        await session.connection()
+                        await source.ensure_live()
                         await crud.select_thread_workspace(
                             session,
                             agent_id=agent.id,
@@ -580,47 +584,55 @@ async def ingest_hook(
                     carrier: dict[str, str] = {}
                     enqueue_error: Exception | None = None
                     enqueue_result: tuple[bool, str] | None = None
-                    with operation_span(
-                        "curie.queue.enqueue",
-                        kind=SpanKind.PRODUCER,
-                        attributes={"service.name": "curie-api", "source": "api"},
-                    ) as span:
-                        inject_trace_context(carrier)
-                        try:
-                            enqueue_result = await enqueue_owned(
-                                client,
-                                key=key,
-                                stream=settings.runs_stream,
-                                owner=owner,
-                                payload=turn.model_dump_json(),
-                                payload_field=STREAM_PAYLOAD_FIELD,
-                                lease_s=settings.channel_delivery_lease_s,
-                                transport_field=(
-                                    TRACEPARENT_STREAM_FIELD
-                                    if TRACEPARENT_STREAM_FIELD in carrier
-                                    else None
-                                ),
-                                transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
-                            )
-                        except Exception as exc:
-                            enqueue_error = exc
-                            span.set_status(StatusCode.ERROR)
-                            span.add_event("queue.enqueue.failed", {"outcome": "failure"})
-                        else:
-                            assert enqueue_result is not None
-                            span.add_event(
-                                "queue.enqueued" if enqueue_result[0] else "queue.duplicate",
-                                {"outcome": "success" if enqueue_result[0] else "pending"},
-                            )
-                    if enqueue_error is not None:
-                        record_metric(
+                    await source.ensure_live()
+                    try:
+                        with operation_span(
                             "curie.queue.enqueue",
-                            attributes={
-                                "service.name": "curie-api",
-                                "source": "api",
-                                "outcome": "failure",
-                            },
-                        )
+                            kind=SpanKind.PRODUCER,
+                            attributes={"service.name": "curie-api", "source": "api"},
+                        ) as span:
+                            inject_trace_context(carrier)
+                            try:
+                                enqueue_result = await enqueue_owned(
+                                    client,
+                                    key=key,
+                                    stream=settings.runs_stream,
+                                    owner=owner,
+                                    payload=turn.model_dump_json(),
+                                    payload_field=STREAM_PAYLOAD_FIELD,
+                                    lease_s=settings.channel_delivery_lease_s,
+                                    transport_field=(
+                                        TRACEPARENT_STREAM_FIELD
+                                        if TRACEPARENT_STREAM_FIELD in carrier
+                                        else None
+                                    ),
+                                    transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+                                )
+                            except Exception as exc:
+                                enqueue_error = exc
+                                span.set_status(StatusCode.ERROR)
+                                span.add_event("queue.enqueue.failed", {"outcome": "failure"})
+                            else:
+                                assert enqueue_result is not None
+                                span.add_event(
+                                    "queue.enqueued" if enqueue_result[0] else "queue.duplicate",
+                                    {"outcome": "success" if enqueue_result[0] else "pending"},
+                                )
+                    except Exception:
+                        if enqueue_error is None:
+                            raise
+                    if enqueue_error is not None:
+                        try:
+                            record_metric(
+                                "curie.queue.enqueue",
+                                attributes={
+                                    "service.name": "curie-api",
+                                    "source": "api",
+                                    "outcome": "failure",
+                                },
+                            )
+                        except Exception:
+                            pass
                         raise enqueue_error
                     assert enqueue_result is not None
                     enqueued, current = enqueue_result
@@ -668,13 +680,18 @@ async def ingest_hook(
                         client, settings.runs_stream, current, response, event_id, tool_access
                     )
                 except BaseException:
-                    await settle_failed_delivery(
-                        client,
-                        key=key,
-                        owner=owner,
-                        reservation=reservation,
-                        preserve_quota=preserve_quota,
-                    )
+                    try:
+                        with anyio.fail_after(5, shield=True):
+                            await source.ensure_live()
+                            await settle_failed_delivery(
+                                client,
+                                key=key,
+                                owner=owner,
+                                reservation=reservation,
+                                preserve_quota=preserve_quota,
+                            )
+                    except BaseException:
+                        pass
                     raise
             held = await client.get(key)
             if held is not None:
