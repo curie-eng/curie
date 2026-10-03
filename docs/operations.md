@@ -987,6 +987,24 @@ api:
       pendingCheckPrefix: "Python pytest (shard "
 ```
 
+Checks that must rerun after a pull request metadata edit are configured per
+repository with API env `GITHUB_FACTORY_METADATA_CI`, a JSON object, default
+`{}`, checked at boot. Each `owner/name` key is matched case insensitively.
+Each value supplies `checks` for check run names and `statuses` for commit
+status contexts. An omitted list is empty, but at least one name is required.
+Every configured guard must appear with a timestamp after the metadata edit;
+stale passing guards and unrelated fresh checks cannot satisfy that requirement.
+Checks on the unchanged commit retain their passing, pending or failing evidence.
+Without a repository policy, a metadata revision ends as `ci_unverified` with
+reason `metadata_ci_not_configured`. Ordinary commit revisions are unaffected.
+
+Set this environment value through the chart's existing `api.extraEnv` or in
+the Compose environment. For Curie's own repository, the value is:
+
+```json
+{"curie-eng/curie":{"checks":["PR body (real newlines)","Fix pin verification"],"statuses":[]}}
+```
+
 The branch a factory ticket starts from and targets is set per repository with
 `api.githubFactoryBases` (API env `GITHUB_FACTORY_BASES`, a JSON object, default
 `{}`, checked at boot). Each key is an `owner/name`, matched case-insensitively;
