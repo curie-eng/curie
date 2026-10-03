@@ -29,6 +29,8 @@ ENV UV_COMPILE_BYTECODE=1 \
 COPY pyproject.toml uv.lock ./
 COPY packages/aci-protocol/pyproject.toml packages/aci-protocol/
 COPY packages/channel-protocol/pyproject.toml packages/channel-protocol/
+# @spec PROTECTED-HOOK-LANE-1: resolve the complete internal workspace.
+COPY packages/protected-hooks/pyproject.toml packages/protected-hooks/
 COPY packages/plugin-format/pyproject.toml packages/plugin-format/
 COPY packages/telemetry-schema/pyproject.toml packages/telemetry-schema/
 COPY packages/test-support/pyproject.toml packages/test-support/
