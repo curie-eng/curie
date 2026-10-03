@@ -78,9 +78,7 @@ DELETE = ToolAnnotations(
 # HTTP
 # --------------------------------------------------------------------------- #
 def _client() -> httpx.Client:
-    return httpx.Client(
-        base_url=API_URL, headers={"X-API-Key": PLATFORM_KEY}, timeout=TIMEOUT
-    )
+    return httpx.Client(base_url=API_URL, headers={"X-API-Key": PLATFORM_KEY}, timeout=TIMEOUT)
 
 
 def _call(method: str, path: str, **kwargs: Any) -> Any:
@@ -125,9 +123,7 @@ def _agent_summary(agent: dict[str, Any]) -> dict[str, Any]:
     return {
         "name": agent["name"],
         "id": agent["id"],
-        "channels": [
-            f"{c.get('kind')}:{c.get('address')}" for c in agent.get("channels") or []
-        ],
+        "channels": [f"{c.get('kind')}:{c.get('address')}" for c in agent.get("channels") or []],
         "model": agent.get("model"),
         "repo": agent.get("repo_full_name"),
         "created_at": agent.get("created_at"),
@@ -232,8 +228,19 @@ def list_approvals(status: str = "", agent: str = "", limit: int = 20) -> dict[s
         params["status_filter"] = status.strip()
     if agent.strip():
         params["agent_id"] = _agent(agent)["id"]
-    keep = ("id", "agent_id", "summary", "gate_kind", "granted_tool", "status",
-            "route", "created_at", "expires_at", "resolved_at", "resolved_by")
+    keep = (
+        "id",
+        "agent_id",
+        "summary",
+        "gate_kind",
+        "granted_tool",
+        "status",
+        "route",
+        "created_at",
+        "expires_at",
+        "resolved_at",
+        "resolved_by",
+    )
     rows = _call("GET", "/approvals", params=params)
     return _capped([{k: row.get(k) for k in keep} for row in rows])
 
@@ -397,11 +404,13 @@ class BearerAuth:
         if scope["type"] == "http":
             supplied = dict(scope.get("headers") or []).get(b"authorization", b"")
             if not hmac.compare_digest(supplied, self.expected):
-                await send({
-                    "type": "http.response.start",
-                    "status": 401,
-                    "headers": [(b"content-type", b"text/plain")],
-                })
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 401,
+                        "headers": [(b"content-type", b"text/plain")],
+                    }
+                )
                 await send({"type": "http.response.body", "body": b"unauthorized"})
                 return
         await self.app(scope, receive, send)
