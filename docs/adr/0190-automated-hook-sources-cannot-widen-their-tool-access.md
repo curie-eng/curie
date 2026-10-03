@@ -2,14 +2,15 @@
 
 Date: 2026-10-02
 
-Status: Draft
+Status: Accepted
 
 Tracked in [#3603](https://github.com/curie-eng/curie/issues/3603).
-No implementation is authorized until explicit maintainer acceptance is
-published under ADR 0085 and ADR 0102. The consumption fencing mechanism
-below remains a decision required before acceptance.
+This acceptance establishes the source authority and fail-closed invariants
+below. It does not claim that they are implemented. Concrete configuration
+and fencing mechanisms remain deferred under #3603; affected implementation
+must first publish their reviewed contract.
 
-Once Accepted, this ADR supersedes the ordinary-tools authorization in
+This ADR supersedes the ordinary-tools authorization in
 [ADR 0099](0099-hooks-are-bundle-declared-turns-the-system-starts.md)
 only for hooks an operator explicitly restricts. For credentials used by
 restricted sources it also amends the per-agent hook-secret boundary in
@@ -42,7 +43,7 @@ The example email intake checks explicit reply coordinates at startup and
 in the receipt. Its policy is optional in the hook URL; it does not require
 `read-only` or verify that policy in the receipt.
 
-## Proposed decision
+## Decision
 
 ### Source authority
 
@@ -112,16 +113,23 @@ negative observations cover the actual ingress, worker and runner, including
 unsupported artifact combinations and an ordinary human turn afterward.
 No receipt alone closes the execution or delivery criterion.
 
-## Decision required before acceptance
+## Deferred mechanism selection
 
-Maintainers must select the authoritative hook-policy configuration surface
-and the source credential and consumption fencing contracts, including
-authorized hook names, authenticated worker membership, old-consumer
-exclusion, eligible runner artifact selection and rolling-upgrade behavior. No
-implementation of a guessed marker, registration or queue topology is
-authorized by this Draft. The realizing API admission and worker consumption
-paths are tracked by #3603; acceptance must name them and settle their
-boundary.
+The accepted boundary is operator-controlled source authority, exclusive
+consumption by compatible workers and checked runner selection. The exact
+configuration surface, source credential format, worker membership proof,
+stream access control and rolling-upgrade protocol remain open design work
+under [#3603](https://github.com/curie-eng/curie/issues/3603), owned by its
+author jw3329 with API and worker maintainer review. Candidate mechanisms
+remain proposals until that contract is reviewed; this ADR selects neither
+a guessed marker nor a queue topology.
+
+The interim behavior is unchanged: installations requiring these guarantees
+must not install the automated intake. The realizing API admission and worker
+consumption paths remain unimplemented. Before their implementation opens,
+#3603 must record the chosen configuration and consumption contracts and the
+actual ingress, worker and runner paths that realize them. Acceptance of
+these invariants does not close the issue or clear the installation gate.
 
 ## Alternatives considered
 

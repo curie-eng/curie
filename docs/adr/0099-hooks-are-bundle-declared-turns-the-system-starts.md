@@ -4,6 +4,9 @@ Date: 2026-08-06
 
 Status: Accepted
 
+Partially superseded by [ADR 0190](0190-automated-hook-sources-cannot-widen-their-tool-access.md)
+for ordinary-tool authorization of operator-restricted hooks only.
+
 Decides the semantics a bundle-declared background turn runs with, and is the
 decision the per-agent cron scheduler (issue
 [#268](https://github.com/curie-eng/curie/issues/268), part of Epic
