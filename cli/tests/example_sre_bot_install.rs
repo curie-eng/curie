@@ -712,20 +712,13 @@ exit 64
                     Response::json(200, &agent.to_string())
                 }
                 ("PATCH", path) if path == format!("/agents/{AGENT_ID}") => {
-                    // `set_approval_routes` (cli/src/api.rs) PATCHes
-                    // `{"approval_routes": {...}}` and decodes the response as
-                    // `Agent`. `ApprovalRouteBindingWrite` and
-                    // `ApprovalRouteBindingResponse` share the same field names
-                    // on the wire (resolution/notification/approvers), so the
-                    // request body's `approval_routes` value can be echoed back
-                    // verbatim as the response's `approval_routes`. The updated
-                    // agent is written back into `agent_state` so the next `GET
-                    // /agents` (the deploy step's own `resolve_agent` lookup)
-                    // sees the bound routes instead of a fresh, routeless agent.
-                    let routes = serde_json::from_slice::<Value>(&request.body)
-                        .ok()
-                        .and_then(|body| body.get("approval_routes").cloned())
-                        .unwrap_or_else(|| json!({}));
+                    // `set_approval_routes` PATCHes `{"approval_routes": {...}}`.
+                    // A deploy also PATCHes `{"secrets": ...}` (#3853). Only a
+                    // body that carries `approval_routes` replaces that map.
+                    // A secret declaration must not wipe the routes the next
+                    // resolve reads back.
+                    let body = serde_json::from_slice::<Value>(&request.body)
+                        .unwrap_or_else(|_| json!({}));
                     let mut agent = agent_state.clone().unwrap_or_else(|| {
                         json!({
                             "id": AGENT_ID,
@@ -735,7 +728,9 @@ exit 64
                             "memory": false,
                         })
                     });
-                    agent["approval_routes"] = routes;
+                    if let Some(routes) = body.get("approval_routes") {
+                        agent["approval_routes"] = routes.clone();
+                    }
                     *agent_state = Some(agent.clone());
                     Response::json(200, &agent.to_string())
                 }
@@ -2163,9 +2158,7 @@ fn publication_gate_survives_both_embedded_installer_modes_with_operator_approve
             .api
             .recorded()
             .into_iter()
-            .find(|request| {
-                request.method == "PATCH" && request.path == format!("/agents/{AGENT_ID}")
-            })
+            .find(route_patch)
             .expect("install must bind sre-approvals before uploading the bundle");
         let route_body: Value = serde_json::from_slice(&route_write.body)
             .expect("approval route request must remain valid JSON");
@@ -4212,6 +4205,17 @@ fn blank_approver_ids_are_refused_before_any_cluster_mutation() {
     }
 }
 
+fn route_patch(request: &support::Request) -> bool {
+    request.method == "PATCH"
+        && request.path == format!("/agents/{AGENT_ID}")
+        && !serde_json::from_slice::<Value>(&request.body)
+            .ok()
+            .is_some_and(|body| {
+                body.as_object()
+                    .is_some_and(|obj| obj.len() == 1 && obj.contains_key("secrets"))
+            })
+}
+
 fn full_install_fixture() -> Fixture {
     Fixture::with_modes(
         nodes(vec![node("node-a", "4Gi", true)]),
@@ -4242,9 +4246,7 @@ fn rerun_moves_route_narrows_users_preserves_other_routes_and_reports_rebound() 
     let requests = fixture.api.recorded();
     let route_writes: Vec<_> = requests
         .iter()
-        .filter(|request| {
-            request.method == "PATCH" && request.path == format!("/agents/{AGENT_ID}")
-        })
+        .filter(|request| route_patch(request))
         .collect();
     assert_eq!(
         route_writes.len(),
@@ -4253,9 +4255,7 @@ fn rerun_moves_route_narrows_users_preserves_other_routes_and_reports_rebound() 
     );
     let route_write_index = requests
         .iter()
-        .position(|request| {
-            request.method == "PATCH" && request.path == format!("/agents/{AGENT_ID}")
-        })
+        .position(route_patch)
         .expect("rerun must send a route PATCH");
     let deployment_index = requests
         .iter()
@@ -4298,9 +4298,7 @@ fn rerun_moves_route_narrows_users_preserves_other_routes_and_reports_rebound() 
     let all_requests = fixture.api.recorded();
     let second_requests = &all_requests[first_request_count..];
     assert!(
-        !second_requests
-            .iter()
-            .any(|request| request.method == "PATCH"),
+        !second_requests.iter().any(route_patch),
         "identical rerun must send no additional route PATCH: {second_requests:?}"
     );
     assert_eq!(
@@ -4339,7 +4337,7 @@ fn a_needed_route_write_that_would_drop_a_notification_is_refused_before_deploy(
     );
     let requests = fixture.api.recorded();
     assert!(
-        !requests.iter().any(|request| request.method == "PATCH"),
+        !requests.iter().any(route_patch),
         "no route write may be sent: {requests:?}"
     );
     assert!(
@@ -4375,7 +4373,7 @@ fn an_identical_binding_with_a_notification_elsewhere_proceeds_without_a_route_w
     );
     let requests = fixture.api.recorded();
     assert!(
-        !requests.iter().any(|request| request.method == "PATCH"),
+        !requests.iter().any(route_patch),
         "no route write may be sent when nothing changes: {requests:?}"
     );
     assert!(
