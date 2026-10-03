@@ -306,3 +306,25 @@ one. Probe keys were deleted afterward. This confirms isolation during a script
 is not rollback of prior commands. Expected wrong-type refusals must be checked
 before writes. Partial intent recovery must inspect the reserved explicit ID
 and committed binding rather than blindly append a second entry.
+
+## Existing legacy counter datatype
+
+Observed 2026-10-03 against disposable local PostgreSQL with `asyncpg` 0.31.0.
+The following read-only SQL was executed through an authenticated connection;
+no credential, customer identity or local endpoint is reproduced here.
+
+```sql
+SHOW server_version;
+SELECT data_type, udt_name, column_default, is_nullable
+FROM information_schema.columns
+WHERE table_schema = 'curie'
+  AND table_name = 'agents'
+  AND column_name = 'hook_generation';
+```
+
+The server reported `16.15`; the column query returned
+`('integer', 'int4', '0', 'NO')`. The existing counter is therefore a non-null
+Postgres INTEGER with default zero, not the new source policy's BIGINT.
+This read measured type/default/nullability only; it did not mutate a counter
+or exercise overflow. Source administration must check the positive int4
+limit before revocation rather than assume BIGINT allocation or reset a key.

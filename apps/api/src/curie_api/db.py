@@ -27,5 +27,16 @@ def create_engine() -> AsyncEngine:
     return create_async_engine(get_settings().database_url, pool_pre_ping=True)
 
 
+def create_source_gate_engine() -> AsyncEngine:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+    return create_async_engine(
+        get_settings().database_url,
+        pool_size=4,
+        max_overflow=0,
+        pool_timeout=30,
+        pool_pre_ping=True,
+    )
+
+
 def create_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False)

@@ -41,8 +41,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 CONTRACT = "0041"
-# The window floor: the newest contract revision (0070, ADR-0168 decision 3).
-APP_SCHEMA_MIN = "0070"
+# @spec PROTECTED-HOOK-SOURCE-2: ledger-dependent candidate requires schema0076.
+APP_SCHEMA_MIN = "0076"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -71,12 +71,14 @@ def _exec(sql: str, params: dict[str, Any] | None = None) -> None:
 
 
 def test_released_application_declares_a_machine_readable_window() -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
     window = load_window()
     assert window.schema_min == APP_SCHEMA_MIN
     assert window.schema_head == HEAD
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
-    assert kinds[APP_SCHEMA_MIN] == KIND_CONTRACT
+    assert kinds[APP_SCHEMA_MIN] == KIND_EXPAND
+    assert kinds["0070"] == KIND_CONTRACT
     assert kinds[REVIEW_SCHEMA_MIN] == KIND_CONTRACT
     if HEAD != APP_SCHEMA_MIN:
         assert kinds[HEAD] == KIND_EXPAND
@@ -102,14 +104,16 @@ def test_planner_refuses_0041_contract_without_forward_only() -> None:
 
 
 def test_the_route_identity_contract_raises_the_floor_and_needs_forward_only() -> None:
-    """0070 (ADR-0168 decision 3) is a contract, as 0041 was: the app that
+    """@spec PROTECTED-HOOK-SOURCE-2.
+
+    0070 (ADR-0168 decision 3) is a contract, as 0041 was: the app that
     stores `default` cannot serve a database whose 0024 check refuses it."""
     kinds = load_kinds()
     assert kinds["0070"] == KIND_CONTRACT
-    assert load_window().schema_min == "0070"
+    retained_window = AppWindow(schema_min="0070", schema_head="0075")
     decision = plan_upgrade(
         current_revision="0069",
-        window=load_window(),
+        window=retained_window,
         kinds=kinds,
         pending=("0070",),
         forward_only=False,
