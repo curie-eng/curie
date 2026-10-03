@@ -401,7 +401,9 @@ def _without_matrix_run_timestamps(job: dict[str, Any]) -> dict[str, Any]:
     return cloned
 
 
-def _serve_job_pages(pages: list[dict[str, Any]]) -> tuple[ThreadingHTTPServer, threading.Thread, list[int]]:
+def _serve_job_pages(
+    pages: list[dict[str, Any]],
+) -> tuple[ThreadingHTTPServer, threading.Thread, list[int]]:
     counts = [0]
 
     class Handler(BaseHTTPRequestHandler):

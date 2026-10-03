@@ -646,6 +646,82 @@ helm_ns() {
     helm --kubeconfig "$KUBECONFIG_FILE" -n "$NAMESPACE" "$@"
 }
 
+namespace_phase() {
+    kubectl --kubeconfig "$KUBECONFIG_FILE" get namespace "$NAMESPACE" \
+        -o jsonpath='{.status.phase}' 2>/dev/null || true
+}
+
+# Helm upgrade does not create the release namespace. A shard that assumes
+# acme-2590 still exists fails the next step when the previous operation
+# removed it.
+ensure_namespace() {
+    local phase wait_s deadline
+    phase="$(namespace_phase)"
+    if [[ "$phase" == "Active" ]]; then
+        return 0
+    fi
+    wait_s="${CURIE_HELM_SETTLE_WAIT_SECONDS:-30}"
+    if [[ "$phase" == "Terminating" ]]; then
+        deadline=$((SECONDS + wait_s))
+        while [[ "$phase" == "Terminating" ]] && (( SECONDS < deadline )); do
+            sleep 1
+            phase="$(namespace_phase)"
+        done
+    fi
+    phase="$(namespace_phase)"
+    if [[ "$phase" == "Active" ]]; then
+        return 0
+    fi
+    if [[ -n "$phase" ]]; then
+        die "namespace $NAMESPACE is $phase; refusing to use it"
+    fi
+    log "creating namespace $NAMESPACE"
+    kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace "$NAMESPACE"
+}
+
+# A killed `helm upgrade` leaves the release pending, and the next upgrade
+# then fails with "another operation is in progress" (run 36125059536, s14).
+# Poll while a live operation can finish, then roll back a stuck pending
+# release. A deployed release returns without a rollback.
+settle_helm_operation() {
+    local wait_s deadline st
+    ensure_namespace
+    wait_s="${CURIE_HELM_SETTLE_WAIT_SECONDS:-30}"
+    deadline=$((SECONDS + wait_s))
+    st=""
+    while true; do
+        st="$(helm_release_status)"
+        case "$st" in
+            pending-upgrade|pending-rollback|pending-install|uninstalling)
+                if (( SECONDS >= deadline )); then
+                    break
+                fi
+                sleep 1
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    done
+    log "helm status stayed ${st:-unknown}; rolling back so the next upgrade can start"
+    recover_helm_lock
+    deadline=$((SECONDS + wait_s))
+    while true; do
+        st="$(helm_release_status)"
+        case "$st" in
+            pending-upgrade|pending-rollback|pending-install|uninstalling)
+                if (( SECONDS >= deadline )); then
+                    die "helm status stayed $st after rollback"
+                fi
+                sleep 1
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    done
+}
+
 fullname() {
     printf '%s-curie' "$RELEASE"
 }
@@ -1134,6 +1210,7 @@ cluster_upgrade() {
     shift 2
     local extra=("$@")
     refuse_soak "$NAMESPACE" "$RELEASE"
+    settle_helm_operation
     if [[ "$to" == "0.10.0" || "$to" == "0.10.1" ]]; then
         exclusive_kind_tag "$to"
     fi
