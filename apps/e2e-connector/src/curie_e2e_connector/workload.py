@@ -372,7 +372,7 @@ def _dangerous_role(body: dict[str, Any]) -> str:
 
     A deployed pod running under the Role could reach build pods, build
     credentials, or env_create's bounds, so a Role may grant only get, list
-    and watch, and never on secrets.
+    and watch, and never on secrets, pods, or a pods subresource.
     """
 
     rules = body.get("rules") or []
@@ -395,6 +395,14 @@ def _dangerous_role(body: dict[str, Any]) -> str:
             return (
                 "the Role reaches secrets, which hold the build credentials a pod running "
                 "under it could read"
+            )
+        # Exec and attach work over a GET WebSocket, and a build pod's logs,
+        # status and termination messages bypass image_build's redaction, so
+        # pods and every pods/<subresource> are out even for read verbs.
+        if _rule_reaches(rule, ("",), ("pods",)):
+            return (
+                "the Role reaches pods or a pods subresource, which would let a pod running "
+                "under it exec into or read a build pod"
             )
     return ""
 

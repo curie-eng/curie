@@ -148,11 +148,11 @@ The JSON after the code and `": "` has sorted keys:
 4. It is a NetworkPolicy of any name. `env_create` owns egress through its `allow` rules, and an extra policy would widen the default deny.
 5. It is a ResourceQuota or a LimitRange. `env_create` owns the namespace bounds.
 6. It is the RoleBinding `e2e-connector`.
-7. It is a Role with a rule that grants any verb other than `get`, `list`, and `watch`, or that reaches `secrets` (resources `secrets` or `*` in API group `""` or `*`) with any verb. A pod deployed to run under that Role could otherwise reach build pods, build credentials, or `env_create`'s bounds. A subresource such as `pods/exec` counts like any resource, so granting `create` on it is refused.
+7. It is a Role with a rule that grants any verb other than `get`, `list`, and `watch`, or that reaches `secrets`, `pods`, or any `pods/<subresource>` (or `*`) in API group `""` or `*`, with any verb. A pod deployed to run under that Role could otherwise reach build pods, build credentials, or `env_create`'s bounds. Read verbs on pods are refused too: exec and attach work over a GET WebSocket, and a build pod's logs, status and termination messages would bypass `image_build`'s credential redaction. Read pod logs through the `logs` tool instead.
 8. It is a RoleBinding whose `roleRef` is not a Role, such as a ClusterRole the connector cannot read to check, or a RoleBinding to a Role refused by the rule above, whether that Role is in the same manifest or already exists in the namespace.
 9. An object of the same kind and name already exists and carries `curietech.ai/e2e-build`, such as a build Job or pod.
 
-A Role that grants only `get`, `list`, and `watch` on resources other than `secrets`, such as `configmaps` or `pods/log`, and a Secret with any other name, deploy normally.
+A Role that grants only `get`, `list`, and `watch` on resources other than `secrets` and pods, such as `configmaps`, `services`, or `events`, and a Secret with any other name, deploy normally.
 
 ### run
 
