@@ -15,6 +15,8 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
+  issues: read
 
 jobs:
   pr-body:
@@ -26,11 +28,13 @@ jobs:
           persist-credentials: false
       # Keep untrusted PR text out of shell source. github-script reads the
       # payload directly and writes its bytes to a runner-owned temporary file.
-      - name: Write the pull request body and title to temporary files
+      - name: Write the pull request body, title, changed files, and open waiver issues
         uses: actions/github-script@v9
         env:
           PR_BODY_FILE: ${{ runner.temp }}/curie-pr-body.md
           PR_TITLE_FILE: ${{ runner.temp }}/curie-pr-title.txt
+          PR_CHANGED_FILES_FILE: ${{ runner.temp }}/curie-pr-changed-files.json
+          PR_OPEN_ISSUES_FILE: ${{ runner.temp }}/curie-pr-open-issues.json
         with:
           script: |
             const fs = require("node:fs");
@@ -44,17 +48,112 @@ jobs:
               core.setFailed("pull request title must be a string or null");
               return;
             }
+            const pullNumber = context.payload.pull_request?.number;
+            if (!Number.isSafeInteger(pullNumber) || pullNumber <= 0) {
+              throw new Error("pull request number is required");
+            }
+            const repo = { owner: context.repo.owner, repo: context.repo.repo };
+            // The REST list caps results at 3000. Compare the current API count
+            // so a truncated list cannot silently omit protected paths.
+            // https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files
+            // https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+            const { data: pull } = await github.rest.pulls.get({ ...repo, pull_number: pullNumber });
+            if (!Number.isSafeInteger(pull.changed_files) || pull.changed_files < 0 || pull.changed_files > 3000) {
+              throw new Error("changed file metadata cannot be obtained completely");
+            }
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...repo, pull_number: pullNumber, per_page: 100,
+            });
+            if (files.length !== pull.changed_files) {
+              throw new Error("changed file metadata is incomplete");
+            }
+            const changedFiles = new Set();
+            for (const file of files) {
+              if (typeof file.filename !== "string" || !file.filename) {
+                throw new Error("changed file metadata has no filename");
+              }
+              changedFiles.add(file.filename);
+              if (file.status === "renamed") {
+                if (typeof file.previous_filename !== "string" || !file.previous_filename) {
+                  throw new Error("renamed file metadata has no prior filename");
+                }
+                changedFiles.add(file.previous_filename);
+              }
+            }
+            // Match the shell guard: HTML comments and code blocks are
+            // invisible, including unterminated fences.
+            const uncommented = body.replace(/<!--[\s\S]*?(?:-->|$)/g, "");
+            const visible = [];
+            let fence = null;
+            for (const line of uncommented.split(/\r?\n/)) {
+              if (fence) {
+                const closing = new RegExp("^ {0,3}" + fence.character + "{" + fence.length + ",}\\s*$");
+                if (closing.test(line)) fence = null;
+                continue;
+              }
+              const opening = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+              if (opening) {
+                fence = { character: opening[1][0], length: opening[1].length };
+              } else if (!/^(?: {4}| {0,3}\t)/.test(line)) {
+                visible.push(line);
+              }
+            }
+            const waiverIssues = new Set();
+            for (const line of visible) {
+              for (const cell of line.split(/(?<!\\)\|/)) {
+                const text = cell.replace(/(`+).*?\1/g, "");
+                const waiver = text.match(/(?:^|\s)Discovery waiver:\s*(.+)$/i);
+                if (!waiver) continue;
+                const references = waiver[1].replace(/\[[^\]]*\]\([^)]*\)/g, "");
+                for (const match of references.matchAll(/(?<![\w/])#([1-9][0-9]*)\b/g)) {
+                  const number = Number(match[1]);
+                  if (!Number.isSafeInteger(number)) throw new Error("waiver issue number is invalid");
+                  waiverIssues.add(number);
+                }
+              }
+            }
+            if (waiverIssues.size > 100) throw new Error("too many waiver issue references");
+            const numbers = [...waiverIssues];
+            const openIssues = [];
+            // issueOrPullRequest resolves only within this repository. The
+            // typename and Issue state exclude PRs and closed issues.
+            // https://docs.github.com/en/graphql/reference/objects#repository
+            // https://docs.github.com/en/graphql/reference/objects#issue
+            for (let offset = 0; offset < numbers.length; offset += 50) {
+              const batch = numbers.slice(offset, offset + 50);
+              const fields = batch.map(number =>
+                `issue${number}: issueOrPullRequest(number: ${number}) { __typename ... on Issue { number state } }`
+              ).join("\n");
+              const result = await github.graphql(
+                `query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { ${fields} } }`,
+                { owner: repo.owner, repo: repo.repo },
+              );
+              if (!result.repository) throw new Error("waiver repository lookup failed");
+              for (const number of batch) {
+                const issue = result.repository[`issue${number}`];
+                if (issue === undefined) throw new Error("waiver issue lookup was incomplete");
+                if (issue?.__typename === "Issue" && issue.state === "OPEN" && issue.number === number) {
+                  openIssues.push(number);
+                }
+              }
+            }
+            // Do not catch API failures or publish partial success snapshots.
             fs.writeFileSync(process.env.PR_BODY_FILE, body, { encoding: "utf8", mode: 0o600 });
             fs.writeFileSync(process.env.PR_TITLE_FILE, title, { encoding: "utf8", mode: 0o600 });
+            fs.writeFileSync(process.env.PR_CHANGED_FILES_FILE, JSON.stringify([...changedFiles]), { encoding: "utf8", mode: 0o600 });
+            fs.writeFileSync(process.env.PR_OPEN_ISSUES_FILE, JSON.stringify(openIssues), { encoding: "utf8", mode: 0o600 });
       # Prove both branches of the matcher can still be reached before trusting
       # its verdict against the event payload.
       - name: PR body guard self-test
         run: bash scripts/check-pr-body.sh --self-test
-      - name: Reject literal newline escapes, AI attribution, and empty patch-release sections
+      - name: Check body guards and required tier evidence
         env:
           PR_BODY_FILE: ${{ runner.temp }}/curie-pr-body.md
           PR_TITLE_FILE: ${{ runner.temp }}/curie-pr-title.txt
+          PR_CHANGED_FILES_FILE: ${{ runner.temp }}/curie-pr-changed-files.json
+          PR_OPEN_ISSUES_FILE: ${{ runner.temp }}/curie-pr-open-issues.json
         run: |
           set -euo pipefail
-          trap 'rm -f -- "$PR_BODY_FILE" "$PR_TITLE_FILE"' EXIT
-          bash scripts/check-pr-body.sh "$PR_BODY_FILE" --title-file "$PR_TITLE_FILE"
+          trap 'rm -f -- "$PR_BODY_FILE" "$PR_TITLE_FILE" "$PR_CHANGED_FILES_FILE" "$PR_OPEN_ISSUES_FILE"' EXIT
+          bash scripts/check-pr-body.sh "$PR_BODY_FILE" --title-file "$PR_TITLE_FILE" \
+            --changed-files-file "$PR_CHANGED_FILES_FILE" --open-issues-file "$PR_OPEN_ISSUES_FILE"
