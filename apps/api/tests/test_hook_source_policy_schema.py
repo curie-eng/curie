@@ -10,7 +10,6 @@ import pytest
 from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts
 from alembic import command
 from curie_api import models
-from curie_api.main import create_app
 from fastapi.testclient import TestClient
 from sqlalchemy import BigInteger, DateTime, String
 from sqlalchemy.dialects.postgresql import UUID
@@ -226,12 +225,15 @@ def test_source_policy_key_is_per_agent_and_hook_and_agent_delete_cascades(
 
 
 def test_source_policy_additive_upgrade_preserves_existing_agent(
-    isolated_migration_db: IsolatedMigrationDb, auth_headers: dict[str, str]
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     """@spec PROTECTED-HOOK-SOURCE-1."""
     isolated_migration_db.at("0073")
-    with TestClient(create_app()) as client:
-        agent_id = _agent(client, auth_headers)
+    agent_id = uuid.uuid4()
+    sql_dicts(
+        "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
+        {"id": agent_id, "name": f"source-schema-{uuid.uuid4().hex}"},
+    )
     before = sql_dicts("SELECT * FROM curie.agents WHERE id = :id", {"id": agent_id})
     command.upgrade(alembic_config(), "head")
     _columns()
