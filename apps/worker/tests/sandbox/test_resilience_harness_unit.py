@@ -2,14 +2,16 @@
 
 These run with no cluster and no dev stack: they exercise the pure functions in
 ``resilience_harness.py`` (``thread_hash``, ``unique_marker``, ``final_frame``,
-``collected_text``, ``detect_cross_talk``, ``pod_identity_gone``) plus the pod
-read and wait helpers with ``kubectl`` stubbed out. They are deliberately not
+``collected_text``, ``detect_cross_talk``, ``pod_identity_gone``,
+``runner_token_secret_ref``) plus the pod read, wait and bearer helpers with
+``kubectl`` stubbed out. They are deliberately not
 gated by ``CURIE_SANDBOX_E2E`` so the harness logic stays covered in default CI
 collection.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import subprocess
@@ -29,6 +31,8 @@ from resilience_harness import (  # noqa: E402
     final_frame,
     pod_identity_gone,
     read_pod,
+    runner_bearer,
+    runner_token_secret_ref,
     thread_hash,
     unique_marker,
     wait_pod_identity_gone,
@@ -437,3 +441,87 @@ def test_post_event_sends_no_bearer_for_a_tokenless_claim(
 ) -> None:
     headers = _captured_post_event(monkeypatch, "")
     assert "Authorization" not in headers
+
+
+# -- warm-pod runner bearer (#3821) -------------------------------------------
+
+_TOKEN_REF = {
+    "name": "CURIE_RUNNER_TOKEN",
+    "valueFrom": {
+        "secretKeyRef": {"name": "acme-curie-runner-token", "key": "runnerToken", "optional": False}
+    },
+}
+
+
+def _runner_pod(
+    *, runner_env: list[dict[str, object]], others: list[dict[str, object]] | None = None
+) -> dict[str, object]:
+    containers: list[dict[str, object]] = [{"name": "runner", "env": runner_env}]
+    return {
+        "metadata": {"name": "sbx-1", "uid": OLD_UID},
+        "spec": {"initContainers": [], "containers": [*(others or []), *containers]},
+    }
+
+
+def test_runner_token_secret_ref_reads_the_chart_secret_ref() -> None:
+    pod = _runner_pod(runner_env=[{"name": "CURIE_RUNNER_PORT", "value": "8080"}, _TOKEN_REF])
+
+    assert runner_token_secret_ref(pod) == ("acme-curie-runner-token", "runnerToken")
+
+
+def test_runner_token_secret_ref_is_none_for_a_plain_value() -> None:
+    # A bound claim's per-claim injection overrides the ref with a plain value.
+    pod = _runner_pod(runner_env=[{"name": "CURIE_RUNNER_TOKEN", "value": "tok-claim"}])
+
+    assert runner_token_secret_ref(pod) is None
+
+
+def test_runner_token_secret_ref_is_none_when_absent() -> None:
+    pod = _runner_pod(runner_env=[{"name": "CURIE_RUNNER_PORT", "value": "8080"}])
+
+    assert runner_token_secret_ref(pod) is None
+    assert runner_token_secret_ref({"metadata": {"name": "sbx-1"}}) is None
+
+
+def test_runner_token_secret_ref_ignores_entries_outside_the_runner_container() -> None:
+    # Only the runner's own env is the bearer it enforces.
+    pod = _runner_pod(
+        runner_env=[{"name": "CURIE_RUNNER_PORT", "value": "8080"}],
+        others=[{"name": "sidecar", "env": [_TOKEN_REF]}],
+    )
+    spec = pod["spec"]
+    assert isinstance(spec, dict)
+    spec["initContainers"] = [{"name": "runner", "env": [_TOKEN_REF]}]
+
+    assert runner_token_secret_ref(pod) is None
+
+
+def test_runner_bearer_prefers_the_claim_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_kubectl(cfg: object, *args: str) -> str:
+        raise AssertionError(f"a claim token needs no Secret read, got kubectl {args}")
+
+    monkeypatch.setattr(resilience_harness, "kubectl", no_kubectl)
+
+    assert runner_bearer(_cfg(), "tok-claim", _runner_pod(runner_env=[_TOKEN_REF])) == "tok-claim"
+
+
+def test_runner_bearer_reads_the_warm_pod_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def fake_kubectl(cfg: object, *args: str) -> str:
+        calls.append(args)
+        return base64.b64encode(b"warm-token-example").decode()
+
+    monkeypatch.setattr(resilience_harness, "kubectl", fake_kubectl)
+
+    assert runner_bearer(_cfg(), "", _runner_pod(runner_env=[_TOKEN_REF])) == "warm-token-example"
+    assert calls == [
+        ("get", "secret", "acme-curie-runner-token", "-o", "jsonpath={.data.runnerToken}")
+    ]
+
+
+def test_runner_bearer_refuses_a_runner_with_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(resilience_harness, "kubectl", lambda cfg, *args: "")
+
+    with pytest.raises(AssertionError, match="#3821"):
+        runner_bearer(_cfg(), "", _runner_pod(runner_env=[]))

@@ -770,6 +770,17 @@ spec:
               value: {{ printf "{\"max_output_tokens_per_run\":%d,\"max_usd_per_day\":%v}" (int $runner.budget.maxOutputTokensPerRun) $runner.budget.maxUsdPerDay | quote }}
             - name: CURIE_RUNNER_PORT
               value: {{ $runner.port | quote }}
+            # Fail closed (#3821): the runner refuses to boot without a bearer,
+            # so the warm template always carries the chart-owned token. The
+            # worker's per-claim Overrides injection replaces it with the
+            # per-claim minted token on every bound claim, exactly like the
+            # CURIE_CREDENTIALS warm-pod fallback above.
+            - name: CURIE_RUNNER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.runnerTokenSecretName" . }}
+                  key: runnerToken
+                  optional: false
             {{- if $wf.enabled }}
             # Kubernetes owns the emptyDir mount root; make the intended checkout
             # explicit without mutating repository config or carrying a secret.

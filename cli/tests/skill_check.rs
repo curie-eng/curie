@@ -196,6 +196,9 @@ fn check_run_args_are_the_exact_offline_argv() {
     assert!(!joined.contains("CURIE_SANDBOX_ID"));
     assert!(!joined.contains("CURIE_BUDGET"));
     assert!(!joined.contains("CURIE_FAKE_MODEL"));
+    // Check mode serves no control routes, so it never needs the tokenless
+    // dev flag that `curie skill up` sets (#3821).
+    assert!(!joined.contains("CURIE_RUNNER_ALLOW_TOKENLESS"));
     // No credential env of any kind (spike-verified credential-free connect).
     assert!(!joined.contains("ANTHROPIC"));
     assert!(!joined.contains("CLAUDE_CODE_OAUTH_TOKEN"));

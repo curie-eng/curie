@@ -102,9 +102,40 @@ _KNOB_TABLE = [
     ),
     pytest.param({"CURIE_RUNNER_TOKEN": "abc123"}, "runner_token", "abc123", id="token-read"),
     pytest.param({}, "runner_token", None, id="token-absent"),
-    # The token is enforced only when configured (#63), so an empty value must
-    # read as unset rather than turning on enforcement with an unusable token.
+    # An empty value must read as unset rather than as an unusable token (#63);
+    # the process entrypoint then refuses to boot on it (#3821), not the parse.
     pytest.param({"CURIE_RUNNER_TOKEN": ""}, "runner_token", None, id="token-empty-is-unset"),
+    # CURIE_RUNNER_ALLOW_TOKENLESS is a runner-local dev knob (#3821), not a
+    # BootEnv key. Only 1/true (any case, trimmed) turns it on: unlike
+    # CURIE_FAKE_MODEL, "yes" is off, so nobody harmonizes the two later.
+    pytest.param({}, "allow_tokenless", False, id="allow-tokenless-default-off"),
+    pytest.param(
+        {"CURIE_RUNNER_ALLOW_TOKENLESS": "1"}, "allow_tokenless", True, id="allow-tokenless-1"
+    ),
+    pytest.param(
+        {"CURIE_RUNNER_ALLOW_TOKENLESS": "true"}, "allow_tokenless", True, id="allow-tokenless-true"
+    ),
+    pytest.param(
+        {"CURIE_RUNNER_ALLOW_TOKENLESS": " TRUE "},
+        "allow_tokenless",
+        True,
+        id="allow-tokenless-true-any-case-trimmed",
+    ),
+    pytest.param(
+        {"CURIE_RUNNER_ALLOW_TOKENLESS": "0"}, "allow_tokenless", False, id="allow-tokenless-0"
+    ),
+    pytest.param(
+        {"CURIE_RUNNER_ALLOW_TOKENLESS": "yes"}, "allow_tokenless", False, id="allow-tokenless-yes"
+    ),
+    pytest.param(
+        {"CURIE_RUNNER_ALLOW_TOKENLESS": "false"},
+        "allow_tokenless",
+        False,
+        id="allow-tokenless-false",
+    ),
+    pytest.param(
+        {"CURIE_RUNNER_ALLOW_TOKENLESS": ""}, "allow_tokenless", False, id="allow-tokenless-empty"
+    ),
 ]
 
 

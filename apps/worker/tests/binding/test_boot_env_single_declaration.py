@@ -378,6 +378,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # runner-local SDK deny list (#2429); read by the runner from its own env
         # via extraEnv, unset keeps every tool available. Not a boot contract key.
         "CURIE_DISALLOWED_TOOLS",
+        # runner-local dev flag (#3821); read by runner/src/curie_runner/config.py
+        # to let a local skill-tier runner serve without a bearer token. Emitted
+        # only by the CLI skill tier, reserved in the chart, never injected by
+        # the worker. Not a boot contract key.
+        "CURIE_RUNNER_ALLOW_TOKENLESS",
         # Delivery budget and ownership lease (ADR-0131, #1971), read from the
         # WORKER's env by WorkerConfig. Never a sandbox boot key: they govern
         # how the worker paces and reclaims its own delivery loop, not

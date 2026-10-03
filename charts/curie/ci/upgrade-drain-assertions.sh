@@ -475,6 +475,9 @@ def one(docs, *, kind, component=None):
 
 
 def managed_secret(docs):
+    # Exactly one release Secret owns the installation identity. Selected by
+    # that key rather than by count: the chart also owns the runner token
+    # Secret (#3821), which carries no installationId.
     secrets = [
         doc
         for doc in docs
@@ -483,8 +486,11 @@ def managed_secret(docs):
             "app.kubernetes.io/instance"
         )
         == "t"
+        and "installationId" in (doc.get("stringData") or {})
     ]
-    assert len(secrets) == 1, f"expected one release-managed Secret, found {len(secrets)}"
+    assert len(secrets) == 1, (
+        f"expected one release Secret carrying installationId, found {len(secrets)}"
+    )
     secret = secrets[0]
     installation_id = (secret.get("stringData") or {}).get("installationId")
     assert isinstance(installation_id, str) and installation_id.strip(), (

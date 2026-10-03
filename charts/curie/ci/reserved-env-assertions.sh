@@ -79,6 +79,12 @@ with tempfile.TemporaryDirectory() as tmp:
         ("worker", "SLACK_API_BASE_URL", "worker.slackApiBaseUrl"),
         ("worker", "CURIE_CONNECTOR_RECONCILE", "worker.connectorReconciler.enabled"),
         ("agentSandbox.runner", "ANTHROPIC_BASE_URL", "inference.service.port"),
+        # The runner fails closed without a bearer (#3821): the chart owns its
+        # token and a cluster runner may never opt out of it, so neither name is
+        # operator-settable. The token row is explicit so it holds even if the
+        # template's entry moves behind a condition the baseline render skips.
+        ("agentSandbox.runner", "CURIE_RUNNER_TOKEN", "the chart-managed runner token Secret"),
+        ("agentSandbox.runner", "CURIE_RUNNER_ALLOW_TOKENLESS", "a cluster runner always serves a bearer"),
     ]:
         result, _ = render(chart, "--set", f"{workload}.extraEnv[0].name={name}", "--set-string", f"{workload}.extraEnv[0].value=conflict", ok=False)
         assert result.returncode != 0 and replacement in result.stderr, result.stderr
