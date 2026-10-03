@@ -861,6 +861,9 @@ class SessionRunner:
             framed = frame_user_turn(event.type, event.user, text, self._channel_kind)
         else:
             framed = frame_user_turn("message", "", text, self._channel_kind)
+        # Same redaction as a turn start: the user text is the recorded size,
+        # and an echo of the framed query does not reach the trace.
+        self._tracer.remember_turn_prompt(text, framed)
         await self._session.query(framed)
         if self._active_state is not None:
             self._active_state.assistant_group = None

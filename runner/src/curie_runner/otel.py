@@ -351,6 +351,7 @@ class RunTracer:
             if provider is not None
             else trace.get_tracer("curie-runner")
         )
+        self._live_generation = None
 
     @contextmanager
     def run_span(
@@ -404,17 +405,35 @@ class RunTracer:
                 if approval_decision:
                     _set(root, SpanAttributeKey.APPROVAL_DECISION, approval_decision)
                 span = _GenerationSpan(self._tracer, root, model)
+                self._live_generation = span
                 try:
-                    yield span
-                except BaseException:
-                    span.set_abandoned()
-                    raise
-                else:
-                    span.finish_if_needed()
+                    try:
+                        yield span
+                    except BaseException:
+                        span.set_abandoned()
+                        raise
+                    else:
+                        span.finish_if_needed()
+                finally:
+                    self._live_generation = None
             except BaseException:
                 if span is None:
                     root.set_status(StatusCode.ERROR)
                 raise
+
+    def remember_turn_prompt(self, text: str, framed: str) -> None:
+        """Redact a prompt that joined the live turn, such as a steer.
+
+        No-op when no turn span is open. The user text is the recorded size.
+        An echo of the framed query is redacted without a second input record.
+        """
+
+        gen = self._live_generation
+        if gen is None:
+            return
+        gen.observe_prompt(text)
+        if framed != text:
+            gen.remember_echo(framed)
 
     def force_flush(self, *, timeout_millis: int = _EXPORT_TIMEOUT_MILLIS) -> bool:
         """Flush current spans within a hard wall clock bound."""
