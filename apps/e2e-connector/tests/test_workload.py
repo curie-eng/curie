@@ -246,6 +246,9 @@ class FakeCluster(ClusterApi):
         self.pod_script: list[dict[str, Any]] = [RUNNING, terminated(0)]
         self.job_gets = 0
         self.logs: dict[str, str] = {f"{RUN_JOB}-x7k2p": "hello from run\n"}
+        # Forced answers for the run pod list and the run pod log read.
+        self.pod_list_answer: tuple[int, dict[str, Any]] | None = None
+        self.log_answer: tuple[int, str] | None = None
         self.events: list[dict[str, Any]] = []
 
     # Call log views
@@ -306,6 +309,8 @@ class FakeCluster(ClusterApi):
             return 200, {"kind": "Job", "metadata": {"name": RUN_JOB}, "status": status}
 
         if method == "GET" and bare == f"{CORE}/pods" and "labelSelector" in query:
+            if self.pod_list_answer is not None:
+                return self.pod_list_answer
             job = query["labelSelector"].removeprefix("job-name=")
             if job != RUN_JOB or self.job_gets == 0:
                 return 200, {"kind": "PodList", "items": []}
@@ -345,6 +350,8 @@ class FakeCluster(ClusterApi):
         bare = urllib.parse.urlsplit(path).path
         prefix = f"{CORE}/pods/"
         if bare.startswith(prefix) and bare.endswith("/log"):
+            if self.log_answer is not None:
+                return self.log_answer
             pod = bare.removeprefix(prefix).removesuffix("/log")
             if pod in self.logs:
                 return 200, self.logs[pod]
@@ -910,6 +917,78 @@ def test_a_rolebinding_to_an_existing_role_that_reads_secrets_is_refused() -> No
     ]
 
 
+# A deployed Role may grant only get, list and watch, never on secrets. Every
+# other verb is a write or a privilege verb (escalate, bind, impersonate), and
+# a subresource such as pods/exec is checked like any resource
+# (https://kubernetes.io/docs/reference/access-authn-authz/rbac/#referring-to-resources).
+WRITE_VERB_ROLES = [
+    pytest.param(
+        {"apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"], "verbs": ["create"]},
+        id="networkpolicies-create",
+    ),
+    pytest.param({"apiGroups": [""], "resources": ["pods"], "verbs": ["create"]}, id="pods-create"),
+    pytest.param(
+        {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["create"]}, id="pods-exec-create"
+    ),
+    pytest.param({"apiGroups": [""], "resources": ["pods"], "verbs": ["patch"]}, id="pods-patch"),
+    pytest.param(
+        {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["delete"]}, id="jobs-delete"
+    ),
+    pytest.param(
+        {"apiGroups": [""], "resources": ["configmaps"], "verbs": ["*"]}, id="configmaps-star"
+    ),
+]
+
+
+@pytest.mark.parametrize("rule", WRITE_VERB_ROLES)
+def test_a_role_granting_any_verb_beyond_read_is_refused(rule: dict[str, Any]) -> None:
+    cluster = FakeCluster()
+
+    exc = refuse_deploy(
+        cluster,
+        manifest(role("writer", [CONFIGMAP_RULE, rule]), rolebinding("writer-binding", "writer")),
+        REFUSAL_DEPLOY_OBJECT,
+    )
+
+    objects = refusal_json(exc)["objects"]
+    assert any(o["kind"] == "Role" and o["name"] == "writer" and o["reason"] for o in objects)
+
+
+def test_a_rolebinding_to_an_existing_role_granting_pods_exec_is_refused() -> None:
+    cluster = FakeCluster()
+    exec_rule = {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["create"]}
+    cluster.existing[f"{RBAC}/roles/shell"] = {
+        **role("shell", [exec_rule]),
+        "metadata": {"name": "shell", "namespace": NS, "resourceVersion": "5"},
+    }
+
+    exc = refuse_deploy(
+        cluster, manifest(rolebinding("shell-binding", "shell")), REFUSAL_DEPLOY_OBJECT
+    )
+
+    assert [(o["kind"], o["name"]) for o in refusal_json(exc)["objects"]] == [
+        ("RoleBinding", "shell-binding")
+    ]
+
+
+def test_a_read_only_role_over_configmaps_and_pod_logs_deploys() -> None:
+    cluster = FakeCluster()
+    rules = [
+        {"apiGroups": [""], "resources": ["configmaps"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get", "list", "watch"]},
+    ]
+
+    result = run_deploy(
+        cluster, manifest(role("observer", rules), rolebinding("observer-binding", "observer"))
+    )
+
+    assert result["applied"] == [
+        {"kind": "Role", "name": "observer"},
+        {"kind": "RoleBinding", "name": "observer-binding"},
+    ]
+    assert [path for path, _body in cluster.posts()] == [f"{RBAC}/roles", f"{RBAC}/rolebindings"]
+
+
 def test_a_job_that_would_replace_a_build_job_is_refused() -> None:
     cluster = FakeCluster()
     build_job = "e2e-build-0a1b2c3d"
@@ -1111,6 +1190,73 @@ def test_run_output_keeps_only_the_last_output_limit_bytes() -> None:
     result = run(cluster)
 
     assert result["stdout"] == "y" * OUTPUT_LIMIT_BYTES
+
+
+# A Complete Job whose output cannot be read is a failed run, never an empty
+# success.
+
+
+def refuse_run(cluster: FakeCluster, code: str) -> None:
+    with pytest.raises(ClusterError) as exc:
+        run(cluster)
+    assert str(exc.value).startswith(f"{code}: "), str(exc.value)
+    assert_run_job_deleted(cluster)
+
+
+def test_a_pod_list_error_after_completion_fails_the_run() -> None:
+    cluster = FakeCluster()
+    cluster.job_script = [COMPLETE]
+    cluster.pod_list_answer = (500, {"kind": "Status", "status": "Failure", "code": 500})
+
+    refuse_run(cluster, REFUSAL_RUN_FAILED)
+
+
+def test_no_pods_after_completion_fails_the_run() -> None:
+    cluster = FakeCluster()
+    cluster.job_script = [COMPLETE]
+    cluster.pod_list_answer = (200, {"kind": "PodList", "items": []})
+
+    refuse_run(cluster, REFUSAL_RUN_FAILED)
+
+
+def test_a_run_container_with_no_terminated_state_fails_the_run() -> None:
+    cluster = FakeCluster()
+    cluster.job_script = [COMPLETE]
+    cluster.pod_script = [RUNNING]
+
+    refuse_run(cluster, REFUSAL_RUN_FAILED)
+
+
+@pytest.mark.parametrize("status", [404, 500])
+def test_an_unreadable_run_log_fails_the_run(status: int) -> None:
+    cluster = FakeCluster()
+    cluster.log_answer = (status, "unavailable")
+
+    refuse_run(cluster, REFUSAL_RUN_FAILED)
+
+
+# activeDeadlineSeconds ends a Job with condition Failed, reason
+# DeadlineExceeded, and terminates its running pods, so the run container
+# reports exitCode 137 (SIGKILL)
+# (https://kubernetes.io/docs/concepts/workloads/controllers/job/#job-termination-and-cleanup).
+DEADLINE_EXCEEDED: dict[str, Any] = {
+    "failed": 1,
+    "conditions": [
+        condition(
+            "Failed",
+            reason="DeadlineExceeded",
+            message="Job was active longer than specified deadline",
+        )
+    ],
+}
+
+
+def test_a_deadline_exceeded_job_with_a_killed_container_times_out() -> None:
+    cluster = FakeCluster()
+    cluster.job_script = [ACTIVE, DEADLINE_EXCEEDED]
+    cluster.pod_script = [RUNNING, terminated(137)]
+
+    refuse_run(cluster, REFUSAL_RUN_TIMEOUT)
 
 
 # AC2: logs
