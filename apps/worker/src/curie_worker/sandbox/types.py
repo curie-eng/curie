@@ -415,6 +415,16 @@ class SandboxClient(Protocol):
 
     def list_claims(self, *, label_selector: str) -> list[ClaimView]: ...
 
+    def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
+        """Delete claim-scoped templates whose claim is gone; return their names.
+
+        A template is kept when its claim is in ``keep`` or it was created at or
+        after ``created_before``, or its age is unknown. Substrates that create
+        no claim-scoped objects return ``[]``.
+        """
+
+        ...
+
     def get_sandbox(
         self, name: str, *, request_timeout_seconds: float
     ) -> SandboxView | None: ...

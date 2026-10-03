@@ -90,6 +90,19 @@ def prepare_resources_claim(
     return owned_pool
 
 
+def claim_resources_spec(spec: dict[str, Any], resources: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``spec`` with ``resources`` on every container.
+
+    The shape is validated before the copy, so a refused override writes
+    nothing. ``spec`` itself is not changed.
+    """
+
+    _validate_resources(resources)
+    copied = copy.deepcopy(spec)
+    _replace_resources(copied, resources)
+    return copied
+
+
 def _owned_names(pool: str, agent_name: str) -> tuple[str, str]:
     stem = pool[: -len(_RUNNER_POOL_SUFFIX)]
     agent_suffix = f"-agent-{agent_name}"

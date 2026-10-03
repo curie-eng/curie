@@ -11,6 +11,7 @@ the k8scratch e2e test.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from datetime import UTC, datetime
@@ -22,6 +23,13 @@ from kubernetes import config as k8s_config
 
 from ..attachments import ATTACHMENTS_REF_ENV
 from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
+from .claim_tokens import (
+    CLAIM_LABEL,
+    ClaimObjectNames,
+    claim_object_names,
+    claim_template_spec,
+    split_claim_tokens,
+)
 from .quota import quota_has_live_headroom, quota_rejection_is_valid
 from .resources import prepare_resources_claim
 from .types import (
@@ -34,6 +42,8 @@ from .types import (
     SandboxView,
     filter_agent_child_env,
 )
+
+logger = logging.getLogger(__name__)
 
 CORE_GROUP = "agents.x-k8s.io"
 CORE_VERSION = "v1beta1"
@@ -419,6 +429,131 @@ class KubernetesSandboxClient:
             EXT_GROUP, EXT_VERSION, self._namespace, plural, name, body
         )
 
+    def _claim_scoped_pool(
+        self,
+        claim: str,
+        pool: str,
+        tokens: dict[str, str],
+        runner_resources: dict[str, Any] | None,
+    ) -> ClaimObjectNames:
+        """Write the per-claim template, token Secret and pool; return their names.
+
+        The source template is the one ``pool``'s ``sandboxTemplateRef`` names,
+        so per-agent connector ``secretKeyRef`` entries (#1488) survive the copy.
+        Every refusal (name too long, missing pool or template, no runner
+        container, invalid resources) is raised before the first write. The
+        Secret and pool are owned by the template, so deleting the template on
+        a later failure removes all three.
+        """
+
+        names = claim_object_names(claim)
+        source_name = self._pool_template_name(pool)
+        try:
+            source = self._api.get_namespaced_custom_object(
+                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxtemplates", source_name
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status == 404:
+                raise ValueError(f"source template {source_name} is missing") from exc
+            raise
+        spec = claim_template_spec(
+            source.get("spec") or {},
+            secret_name=names.secret,
+            token_names=sorted(tokens),
+            runner_resources=runner_resources,
+        )
+        labels = {MANAGED_BY_LABEL: MANAGED_BY_VALUE, CLAIM_LABEL: claim}
+        created = self._api.create_namespaced_custom_object(
+            EXT_GROUP,
+            EXT_VERSION,
+            self._namespace,
+            "sandboxtemplates",
+            {
+                "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
+                "kind": "SandboxTemplate",
+                "metadata": {"name": names.template, "labels": labels},
+                "spec": spec,
+            },
+        )
+        try:
+            # No controller or blockOwnerDeletion: either would need
+            # ``finalizers`` RBAC the worker is not granted.
+            owner = {
+                "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
+                "kind": "SandboxTemplate",
+                "name": names.template,
+                "uid": created["metadata"]["uid"],
+            }
+            metadata = {"name": names.secret, "labels": labels, "ownerReferences": [owner]}
+            # Token values are never logged; ``stringData`` is the only place
+            # they are written.
+            self._core_api.create_namespaced_secret(
+                self._namespace,
+                {
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "type": "Opaque",
+                    "metadata": metadata,
+                    "stringData": dict(tokens),
+                },
+            )
+            self._api.create_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxwarmpools",
+                {
+                    "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
+                    "kind": "SandboxWarmPool",
+                    "metadata": {**metadata, "name": names.pool},
+                    "spec": {"replicas": 0, "sandboxTemplateRef": {"name": names.template}},
+                },
+            )
+        except Exception:
+            self._rollback_delete("sandboxtemplates", names.template)
+            raise
+        return names
+
+    def _pool_template_name(self, pool: str) -> str:
+        """The template ``pool``'s ``sandboxTemplateRef`` names; a missing pool refuses."""
+
+        try:
+            obj = self._api.get_namespaced_custom_object(
+                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxwarmpools", pool
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status == 404:
+                raise ValueError(f"source pool {pool} is missing") from exc
+            raise
+        ref = (obj.get("spec") or {}).get("sandboxTemplateRef") or {}
+        name = ref.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"source pool {pool} names no sandboxTemplateRef")
+        return name
+
+    def _rollback_delete(self, plural: str, name: str) -> None:
+        """Delete one object a failed claim created; never mask the original error.
+
+        A failed delete is logged by exception class only and left to the
+        reaper's per-claim template sweep.
+        """
+
+        try:
+            self._api.delete_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                plural,
+                name,
+                propagation_policy="Background",
+            )
+        except Exception as exc:
+            if isinstance(exc, k8s_client.ApiException) and exc.status == 404:
+                return
+            logger.warning(
+                "rollback delete of %s %s failed (%s)", plural, name, type(exc).__name__
+            )
+
     # -- SandboxClaim (extensions group) ------------------------------------
 
     def create_claim(
@@ -431,9 +566,19 @@ class KubernetesSandboxClient:
         runner_resources: dict[str, Any] | None = None,
         agent_name: str | None = None,
     ) -> None:
-        if runner_resources is not None:
-            pool = self._resources_pool(pool, agent_name, runner_resources)
         env = filter_agent_child_env(env)
+        # Scoped tokens never ride the value-only claim (#3842): they go to a
+        # per-claim Secret read by a per-claim template copy, which also
+        # carries any runner resources override. A token-free claim keeps the
+        # chart pool or the per-agent resources pool.
+        tokens, env = split_claim_tokens(env)
+        claim_template: str | None = None
+        if tokens:
+            claim_names = self._claim_scoped_pool(name, pool, tokens, runner_resources)
+            pool = claim_names.pool
+            claim_template = claim_names.template
+        elif runner_resources is not None:
+            pool = self._resources_pool(pool, agent_name, runner_resources)
         body: dict[str, Any] = {
             "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
             "kind": "SandboxClaim",
@@ -450,7 +595,9 @@ class KubernetesSandboxClient:
             # claim: the credential reaches the runner via the template's
             # secretKeyRef, and connector secrets are delivered the same way via
             # the per-agent template (#1488). The marker var naming the
-            # connector-secret keys is stripped too.
+            # connector-secret keys is stripped too. Scoped tokens were already
+            # split off above and reach the runner through the per-claim
+            # Secret (#3842).
             marker = env.get(CONNECTOR_SECRET_KEYS_ENV, "")
             stripped = {
                 CREDENTIALS_ENV,
@@ -512,9 +659,45 @@ class KubernetesSandboxClient:
                         }
                     )
             body["spec"]["env"] = entries
-        self._api.create_namespaced_custom_object(
-            EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims", body
-        )
+        if claim_template is None:
+            self._api.create_namespaced_custom_object(
+                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims", body
+            )
+            return
+        try:
+            created = self._api.create_namespaced_custom_object(
+                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims", body
+            )
+        except Exception:
+            self._rollback_delete("sandboxtemplates", claim_template)
+            raise
+        # Hand the template (and through it the Secret and pool) to the claim,
+        # so garbage collection removes all three when the claim goes by any
+        # path. Until this lands only the reaper's template sweep covers them.
+        try:
+            self._api.patch_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxtemplates",
+                claim_template,
+                {
+                    "metadata": {
+                        "ownerReferences": [
+                            {
+                                "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
+                                "kind": "SandboxClaim",
+                                "name": name,
+                                "uid": created["metadata"]["uid"],
+                            }
+                        ]
+                    }
+                },
+            )
+        except Exception:
+            self._rollback_delete("sandboxclaims", name)
+            self._rollback_delete("sandboxtemplates", claim_template)
+            raise
 
     def get_claim(
         self, name: str, *, request_timeout_seconds: float
@@ -551,6 +734,47 @@ class KubernetesSandboxClient:
             label_selector=label_selector,
         )
         return [_claim_view(item) for item in result.get("items", [])]
+
+    def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
+        """Delete per-claim templates whose claim is gone; return their names.
+
+        Only templates this substrate labelled for a claim are candidates, never
+        the chart's. A template whose claim is in ``keep``, that is not older
+        than ``created_before``, or whose age is unreadable is spared, the same
+        fail-safe direction as claim reaping. Deleting one removes its token
+        Secret and pool by ownerReference; a 404 means garbage collection got
+        there first and counts as deleted.
+        """
+
+        result = self._api.list_namespaced_custom_object(
+            EXT_GROUP,
+            EXT_VERSION,
+            self._namespace,
+            "sandboxtemplates",
+            label_selector=f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},{CLAIM_LABEL}",
+        )
+        deleted: list[str] = []
+        for item in result.get("items", []):
+            metadata = item.get("metadata") or {}
+            name = metadata.get("name")
+            claim = (metadata.get("labels") or {}).get(CLAIM_LABEL)
+            created_at = _parse_timestamp(metadata.get("creationTimestamp"))
+            if not name or claim in keep or created_at is None or created_at >= created_before:
+                continue
+            try:
+                self._api.delete_namespaced_custom_object(
+                    EXT_GROUP,
+                    EXT_VERSION,
+                    self._namespace,
+                    "sandboxtemplates",
+                    name,
+                    propagation_policy="Background",
+                )
+            except k8s_client.ApiException as exc:
+                if exc.status != 404:
+                    raise
+            deleted.append(name)
+        return deleted
 
     # -- Sandbox (core group) ------------------------------------------------
 
