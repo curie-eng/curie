@@ -335,7 +335,7 @@ def test_operator_memory_facts(memory_case: MemoryCase, tier: str) -> None:
     for fact in case.expected_facts:
         for value in (fact["id"], fact["statement"], fact["author"], fact["stated_at"][:10]):
             assert value in human.stdout, human.stdout
-    assert "agent" in human.stdout.lower()
+    assert "(agent)" in human.stdout, human.stdout
     assert SLACK[1] in human.stdout and WEBHOOK[1] in human.stdout
     assert "not a canonical fact" not in human.stdout
 
@@ -368,8 +368,9 @@ def test_operator_memory_facts(memory_case: MemoryCase, tier: str) -> None:
         ("--guidance-from", str(case.guidance_file)), ("--reset-guidance",),
     ):
         for selection in (("--delete", FACT), ("--channel", "=".join(SLACK))):
-            _refused(case, tier, *action, *selection, evidence="cannot be used")
-            assert _snapshot(case) == before
+            for first, second in ((action, selection), (selection, action)):
+                _refused(case, tier, *first, *second, evidence="cannot be used")
+                assert _snapshot(case) == before
 
     added = _json_cli(case, tier, "--add", "second operator note")
     assert added == {

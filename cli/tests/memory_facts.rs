@@ -210,10 +210,12 @@ fn delete_and_channel_selection_conflict_with_add_and_every_guidance_flag() {
                 vec!["--delete", FACT],
                 vec!["--channel", "slack=C0EXAMPLE1"],
             ] {
-                let mut flags = action.clone();
-                flags.extend(selection);
-                flags.extend(["--dry-run", "--json"]);
-                refused(tier, &flags, "cannot be used");
+                for (first, second) in [(&action, &selection), (&selection, &action)] {
+                    let mut flags = first.clone();
+                    flags.extend(second.iter().copied());
+                    flags.extend(["--dry-run", "--json"]);
+                    refused(tier, &flags, "cannot be used");
+                }
             }
         }
     }
