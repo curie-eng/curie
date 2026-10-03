@@ -80,7 +80,7 @@ ACTIVITY: dict[str, Any] = {
     "tool_calls": 37,
     "last_tool": "Bash",
 }
-PYTHON_COMMAND = "uv run pytest runner/tests -q"
+PYTHON_COMMAND = "uv run pytest unitconv/tests -q"
 NOT_DECLARED: dict[str, Any] = {
     "check": None,
     "command": None,
