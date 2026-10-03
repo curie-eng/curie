@@ -335,7 +335,9 @@ def _serve_kwargs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         model="fake-model",
         port=8080,
         harness="claude",
-        runner_token=None,
+        # A real token, not the dev flag: this drives production boot (#3821).
+        runner_token="runner-test-token",
+        allow_tokenless=False,
     )
     monkeypatch.setenv("CURIE_FAKE_MODEL", "1")
     monkeypatch.setattr(RunnerConfig, "from_env", lambda _env: config)

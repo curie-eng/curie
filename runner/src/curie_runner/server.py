@@ -147,19 +147,25 @@ def create_app(
     """Build the aiohttp application bound to a started SessionRunner.
 
     When ``token`` is set, the runner control routes require a matching bearer
-    token; when it is ``None`` the app is a pass-through (CLI, fake-model CI,
-    and pre-token sandboxes stay unauthenticated).
+    token. A ``None`` token builds an unauthenticated app, which exists only for
+    in-process tests and for a process booted with the explicit
+    ``CURIE_RUNNER_ALLOW_TOKENLESS`` dev flag: the process entrypoint refuses to
+    boot tokenless otherwise (``curie_runner.config.require_serving_token``,
+    #3821).
     """
 
-    # A falsy token (None or empty string) means no enforcement: an empty token
-    # would make ``Bearer `` with an empty value compare-equal, so treat it as
-    # pass-through rather than an unusable enforce-on state.
+    # A falsy token (None or empty string) means no enforcement, which
+    # production never reaches: ``_serve`` refuses a blank token unless the dev
+    # flag is set. An empty token would make ``Bearer `` with an empty value
+    # compare-equal, so treat it as pass-through rather than an unusable
+    # enforce-on state.
     middlewares = [_auth_middleware(token)] if token else []
     app = web.Application(middlewares=middlewares)
     app[RUNNER] = runner
     app[SNAPSHOTTER] = snapshotter
     # An identity-bearing response exists only when middleware above enforces a
-    # non-empty bearer. Legacy/tokenless apps keep both status routes probe-only.
+    # non-empty bearer. Tokenless apps (dev flag or in-process tests) keep both
+    # status routes probe-only.
     app[STATUS_ATTESTATION] = _bound_status_attestation(runner) if token else None
     app.add_routes(
         [

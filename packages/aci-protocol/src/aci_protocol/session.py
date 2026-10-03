@@ -315,7 +315,8 @@ class BootEnv(_AciModel):
         default=None, json_schema_extra=_env("CURIE_BUNDLE_VERSION", "worker")
     )
     # Per-claim bearer token the runner enforces on its ACI POST routes (#63).
-    # Enforced only when configured, so local/fake sandboxes are unaffected.
+    # Required: a runner without it refuses to boot unless its runner-local dev
+    # flag explicitly allows tokenless serving (#3821).
     runner_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_RUNNER_TOKEN", "worker")
     )

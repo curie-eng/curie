@@ -29,6 +29,7 @@ INDEXED = ("CURIE_SLACK_APP_TOKEN__", "CURIE_SLACK_BOT_TOKEN__", "CURIE_SLACK_SI
 # Generated credentials differ on every render; compare these by key set only.
 RANDOM_DOCS = {
     ("Secret", SECRET),
+    ("Secret", "acme-curie-runner-token"),
     ("Job", "acme-curie-upgrade-drain"),
     ("Job", "acme-curie-upgrade-drain-attest"),
     ("Job", "acme-curie-upgrade-drain-release"),
