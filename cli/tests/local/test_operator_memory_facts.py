@@ -289,7 +289,7 @@ def _stale_delete_proxy(
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
-            except Exception as error:
+            except (OSError, http.client.HTTPException, RuntimeError, ValueError) as error:
                 audit.errors.append(str(error))
                 self.close_connection = True
             finally:
