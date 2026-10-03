@@ -50,6 +50,33 @@ MAX_EXECUTION_DEADLINE_SECONDS = 10800
 GIT_FLOW_CREATED_BY = "git-flow"
 
 
+class DeployNoticeOutbox(Base):
+    """Credential-free, installation-scoped notice owed after git-flow settles."""
+
+    __tablename__ = "deploy_notice_outbox"
+    __table_args__ = (
+        Index(
+            "ix_deploy_notice_outbox_pending",
+            "stream",
+            "created_at",
+            postgresql_where=text("enqueued_at IS NULL"),
+        ),
+        Index("ix_deploy_notice_outbox_enqueued_at", "enqueued_at"),
+        Index("ix_deploy_notice_outbox_repo_window", "stream", "repo", "created_at"),
+        {"schema": SCHEMA},
+    )
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    stream: Mapped[str] = mapped_column(Text)
+    # Case-folded repository full name, which the per-repository notice bound
+    # counts by (docs/operations.md).
+    repo: Mapped[str] = mapped_column(Text)
+    payload: Mapped[str] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(server_default="0", default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
 class Environment(enum.StrEnum):
     prod = "prod"
     dev = "dev"
@@ -121,6 +148,9 @@ class Agent(Base):
     # sharing a repository is intended, two sharing a channel is silent
     # shadowing.
     repo_full_name: Mapped[str | None] = mapped_column(default=None, index=True)
+    # Success notices are opt-in; a rejected push is always reported to bound
+    # Slack channels because no deployment row may exist to inspect afterward.
+    deploy_notifications: Mapped[bool] = mapped_column(default=False, server_default="false")
 
     @validates("repo_full_name")
     def _validate_repo_full_name(self, _key: str, value: str | None) -> str | None:

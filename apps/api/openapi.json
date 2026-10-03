@@ -851,6 +851,11 @@
           "channel": {
             "$ref": "#/components/schemas/ChannelBindingWrite"
           },
+          "deploy_notifications": {
+            "default": false,
+            "title": "Deploy Notifications",
+            "type": "boolean"
+          },
           "hook_partitions": {
             "anyOf": [
               {
@@ -1025,6 +1030,10 @@
             "title": "Created At",
             "type": "string"
           },
+          "deploy_notifications": {
+            "title": "Deploy Notifications",
+            "type": "boolean"
+          },
           "execution_deadline_seconds": {
             "anyOf": [
               {
@@ -1177,6 +1186,7 @@
           "name",
           "channels",
           "repo_full_name",
+          "deploy_notifications",
           "behavior_packs",
           "model",
           "thinking",
@@ -1261,6 +1271,17 @@
               }
             ],
             "title": "Approval Routes"
+          },
+          "deploy_notifications": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deploy Notifications"
           },
           "execution_deadline_seconds": {
             "anyOf": [

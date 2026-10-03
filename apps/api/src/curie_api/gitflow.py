@@ -402,7 +402,10 @@ def log_push_outcome(result: WebhookResult, payload: dict[str, object], *, sourc
     )
 
 
-def _rejected(exc: deploy.ApprovalRoutesUnbound | deploy.BundleTooLarge) -> WebhookResult:
+def _rejected(
+    exc: deploy.ApprovalRoutesUnbound | deploy.BundleTooLarge,
+    agent_id: uuid.UUID | None = None,
+) -> WebhookResult:
     """The rejection envelope for the two refusals `process_push` shares with the API.
 
     `approval_routes.unbound` (#2436) can fire at three sites -- the two bundle
@@ -418,6 +421,7 @@ def _rejected(exc: deploy.ApprovalRoutesUnbound | deploy.BundleTooLarge) -> Webh
 
     return WebhookResult(
         status="rejected",
+        agent_id=agent_id,
         errors=[{"code": exc.code, "message": str(exc)}],
     )
 
@@ -459,6 +463,15 @@ async def process_push(
     # solely to narrow `str | None` to `str` for the origin derivation below.
     repo_agents = [a for a in repo_agents if a.repo_full_name is not None]
     if not repo_agents:
+        casing_matches = await crud.get_agents_by_repo_casefold(session, full_name)
+        if casing_matches:
+            return WebhookResult(
+                status="rejected",
+                errors=[{
+                    "code": "git.repository_case_mismatch",
+                    "message": "the push repository casing differs from the stored agent binding",
+                }],
+            )
         return WebhookResult(status="ignored")
 
     # The trust model does not move (ADR-0091). The origin is still derived from
@@ -713,7 +726,7 @@ async def process_push(
                 # extract is the only bounds check the attached object gets, so
                 # an over-cap legacy sibling is refused here and is not attached
                 # (ADR-0059 decision 3).
-                return _rejected(exc)
+                return _rejected(exc, agent.id)
             version = await crud.attach_bundle(
                 session, version, str(sibling.bundle_ref), str(sibling.bundle_sha256)
             )
@@ -730,7 +743,7 @@ async def process_push(
                     archive, agent.approval_routes, version.id, settings
                 )
             except deploy.ApprovalRoutesUnbound as exc:
-                return _rejected(exc)
+                return _rejected(exc, agent.id)
             await deploy.store_bundle(
                 store, session, agent.id, version, archive, extension, content_type
             )
@@ -758,7 +771,7 @@ async def process_push(
         try:
             await deploy.revalidate_stored_bundle(store, version, settings)
         except deploy.BundleTooLarge as exc:
-            return _rejected(exc)
+            return _rejected(exc, agent.id)
 
     # The declared/bound approval-route join at the moment the version becomes
     # the thing that boots (#2436), the push-side twin of the 422 that
@@ -789,7 +802,7 @@ async def process_push(
             # this block rather than of that one: it stays ahead of
             # `approval_routes.unbound` on the reuse path (ADR-0059 decision 3)
             # even if the revalidation is ever moved or narrowed.
-            return _rejected(exc)
+            return _rejected(exc, agent.id)
 
     deployment = await crud.create_deployment_row(
         session,

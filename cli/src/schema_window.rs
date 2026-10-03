@@ -435,8 +435,9 @@ mod tests {
 
     #[test]
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
+        // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "0070");
+        assert_eq!(candidate.schema_min, "0074");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -444,12 +445,13 @@ mod tests {
 
         let retained = candidate_window(&candidate.schema_min, &candidate.schema_head)
             .expect("candidate bounds are catalogued and ordered");
-        assert_eq!(retained.schema_min, "0070");
-        assert_eq!(retained.schema_head, "0073");
-        assert!(live_in_window("0070", &retained));
-        assert!(live_in_window("0071", &retained));
-        assert!(live_in_window("0072", &retained));
-        assert!(live_in_window("0073", &retained));
+        assert_eq!(retained.schema_min, "0074");
+        assert_eq!(retained.schema_head, "0074");
+        assert!(!live_in_window("0070", &retained));
+        assert!(!live_in_window("0071", &retained));
+        assert!(!live_in_window("0072", &retained));
+        assert!(!live_in_window("0073", &retained));
+        assert!(live_in_window("0074", &retained));
         assert!(!live_in_window("0069", &retained));
 
         assert_eq!(window_for("0.10.1").unwrap().schema_head, "0058");
@@ -462,6 +464,11 @@ mod tests {
         let released = window_for("0.11.0").expect("0.11.0 remains catalogued");
         assert_eq!(released.schema_min, "0070");
         assert_eq!(released.schema_head, "0070");
+        for version in ["0.12.0", "0.12.0-rc.1"] {
+            let released = window_for(version).expect("released window remains catalogued");
+            assert_eq!(released.schema_min, "0070");
+            assert_eq!(released.schema_head, "0073");
+        }
     }
 
     #[test]

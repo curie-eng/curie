@@ -614,6 +614,39 @@ def test_deadline_halted_is_a_declared_terminal_turn_outcome(
         assert manifest[name]["cardinality_bound"] == 216
 
 
+def test_deploy_notice_suppressed_is_two_closed_series() -> None:
+    """Withheld git-flow notices are counted by reason, never by repository."""
+
+    definition = _read(_MANIFEST)["metrics"]["curie.deploy_notice.suppressed"]
+    assert definition["type"] == "counter"
+    assert definition["unit"] == "{outcome}"
+    assert definition["monotonic"] is True
+    assert definition["attributes"] == {
+        "service.name": ["curie-api"],
+        "reason": ["no_nonprod_recipient", "rate_limited"],
+    }
+    assert definition["cardinality_bound"] == 2
+
+
+def test_deploy_notice_suppressed_rejects_a_repository_label_by_execution(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    del metrics
+    record_metric(
+        "curie.deploy_notice.suppressed",
+        attributes={"service.name": "curie-api", "reason": "rate_limited"},
+    )
+    with pytest.raises(ValueError, match="undeclared attribute"):
+        record_metric(
+            "curie.deploy_notice.suppressed",
+            attributes={
+                "service.name": "curie-api",
+                "reason": "rate_limited",
+                "repository": "acme-corp/acme-bot",
+            },
+        )
+
+
 def test_supervised_restart_metric_declares_closed_operation_domain() -> None:
     manifest = _read(_MANIFEST)["metrics"]
     definition = manifest["curie.worker.supervised.restart"]

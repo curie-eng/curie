@@ -41,8 +41,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 CONTRACT = "0041"
-# The window floor: the newest contract revision (0070, ADR-0168 decision 3).
-APP_SCHEMA_MIN = "0070"
+# @spec DEPLOY-NOTICE-RELEASE-1.
+# Agent reads include the 0074 deploy-notification column unconditionally.
+APP_SCHEMA_MIN = "0074"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -76,7 +77,8 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert window.schema_head == HEAD
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
-    assert kinds[APP_SCHEMA_MIN] == KIND_CONTRACT
+    assert kinds["0070"] == KIND_CONTRACT
+    assert kinds[APP_SCHEMA_MIN] == KIND_EXPAND
     assert kinds[REVIEW_SCHEMA_MIN] == KIND_CONTRACT
     if HEAD != APP_SCHEMA_MIN:
         assert kinds[HEAD] == KIND_EXPAND
@@ -106,7 +108,7 @@ def test_the_route_identity_contract_raises_the_floor_and_needs_forward_only() -
     stores `default` cannot serve a database whose 0024 check refuses it."""
     kinds = load_kinds()
     assert kinds["0070"] == KIND_CONTRACT
-    assert load_window().schema_min == "0070"
+    assert load_window().schema_min == APP_SCHEMA_MIN
     decision = plan_upgrade(
         current_revision="0069",
         window=load_window(),
@@ -116,6 +118,15 @@ def test_the_route_identity_contract_raises_the_floor_and_needs_forward_only() -
     )
     assert decision.action == "refuse"
     assert "0070" in decision.reason
+
+
+def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> None:
+    """@spec DEPLOY-NOTICE-RELEASE-1."""
+    window = load_window()
+    known = {"0070", "0071", "0072", "0073", "0074"}
+    for released in ("0070", "0071", "0072", "0073"):
+        assert can_serve(released, window, known) is False
+    assert can_serve("0074", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

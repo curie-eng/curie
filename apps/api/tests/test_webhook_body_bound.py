@@ -45,8 +45,16 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
 
     monkeypatch.setattr(github_router, "process_push", _fake_push)
 
+    class _NoNotices:
+        """The app lifespan installs the deploy notice queue (#1331); this
+        minimal app has none, and the size gate is all these tests read."""
+
+        async def publish(self, *_args: Any, **_kwargs: Any) -> int:
+            return 0
+
     app = FastAPI()
     app.include_router(github_router.router)
+    app.state.deploy_notice_queue = _NoNotices()
     app.dependency_overrides[get_session] = lambda: None
     app.dependency_overrides[get_store] = lambda: None
     app.dependency_overrides[get_eval_queue] = lambda: None

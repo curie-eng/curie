@@ -58,6 +58,7 @@ from opentelemetry.trace import SpanKind, StatusCode
 from .config import Settings
 from .models import GIT_FLOW_CREATED_BY
 from .repo_full_name import InvalidRepoFullName, repo_url_path
+from .schemas import WebhookResult
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +395,7 @@ class CommitPoller:
         store: Any,
         settings: Settings,
         eval_queue: Any,
+        notice_queue: Any | None = None,
         tips: BranchTip,
         interval_seconds: float,
         clock: Callable[[], float] = time.monotonic,
@@ -402,6 +404,7 @@ class CommitPoller:
         self._store = store
         self._settings = settings
         self._eval_queue = eval_queue
+        self._notice_queue = notice_queue
         self._tips = tips
         self._interval = interval_seconds
         # Monotonic, not wall clock: a backoff window must not be skipped or
@@ -417,6 +420,11 @@ class CommitPoller:
         # geometrically growing, capped delay before earning another clone
         # (#1309). Keyed the same way as _settled, per (repository, branch).
         self._archive_backoff: dict[tuple[str, str], ArchiveBackoff] = {}
+        # Only for a Postgres write failure AFTER process_push has settled.
+        # Ordinary Valkey failures are already durable in deploy_notice_outbox.
+        self._pending_notices: dict[
+            tuple[str, str, str], tuple[WebhookResult, dict[str, object]]
+        ] = {}
 
     async def run_forever(self) -> None:
         logger.info("commit poller started interval=%ss", self._interval)
@@ -486,6 +494,23 @@ class CommitPoller:
         from sqlalchemy import text
 
         from . import gitflow
+
+        # A successful deployment disappears from moves_to_deploy on the next
+        # pass. Retry any notice whose SQL outbox insert failed before checking
+        # branch tips, or that success would erase its last in-process chance.
+        if self._notice_queue is not None:
+            for pending_key, (pending_result, pending_payload) in list(
+                self._pending_notices.items()
+            ):
+                try:
+                    async with self._session_factory() as notice_session:
+                        await self._notice_queue.publish(
+                            notice_session, pending_result, pending_payload, self._settings
+                        )
+                except Exception:
+                    logger.exception("could not persist pending git-flow deploy notice")
+                else:
+                    self._pending_notices.pop(pending_key, None)
 
         schema = self._settings.db_schema
         branch_for_env = {
@@ -629,6 +654,19 @@ class CommitPoller:
             # rejection as "deployed" at INFO is #1066 again, and this is the
             # lane with no GitHub delivery UI to fall back on.
             gitflow.log_push_outcome(result, move.as_push_payload(), source="commit poll")
+            if self._notice_queue is not None:
+                notice_payload = move.as_push_payload()
+                notice_key = (move.repo_full_name, move.branch, move.sha)
+                try:
+                    async with self._session_factory() as notice_session:
+                        await self._notice_queue.publish(
+                            notice_session, result, notice_payload, self._settings
+                        )
+                except Exception:
+                    self._pending_notices[notice_key] = (result, notice_payload)
+                    logger.exception("could not persist git-flow deploy notice from commit poll")
+                else:
+                    self._pending_notices.pop(notice_key, None)
 
             if result.status in ("deployed", "promoted"):
                 # A Deployment row exists now, so the database is the memory

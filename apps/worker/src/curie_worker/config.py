@@ -1557,3 +1557,11 @@ class WorkerConfig(BaseSettings):
         ``eval_stream`` and needs no self-targeting validator.
         """
         return f"{self.eval_stream}:dead"
+
+    def deploy_notice_stream_name(self) -> str:
+        """Match the API producer within this run stream and installation."""
+        base = f"{self.stream}:deploy-notices"
+        return f"{base}:{self.installation_id}" if self.installation_id else base
+
+    def deploy_notice_group_name(self) -> str:
+        return f"{self.consumer_group}-deploy-notices"

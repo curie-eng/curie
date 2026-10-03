@@ -235,4 +235,19 @@ async def github_webhook(
 
     result = await process_push(session, store, settings, eval_queue, payload)
     log_push_outcome(result, payload, source="github webhook")
+    try:
+        await request.app.state.deploy_notice_queue.publish(session, result, payload, settings)
+    except Exception as exc:
+        # A Valkey failure is retained in the SQL outbox and returns normally.
+        # Failure here means the notice may not have been recorded; do not
+        # falsely acknowledge the webhook as fully handled, but keep the push's
+        # own outcome in the delivery body GitHub shows.
+        logger.exception("could not persist git-flow deploy notice")
+        raise HTTPException(
+            503,
+            {
+                "code": "git.notice_outbox_unavailable",
+                "result": result.model_dump(mode="json"),
+            },
+        ) from exc
     return result

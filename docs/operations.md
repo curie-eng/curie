@@ -725,7 +725,9 @@ promote:
 
 1. **The agent's repo and bundle targets agree.** This applies to both
    delivery paths. The API finds candidate agents by matching the payload's
-   `repository.full_name` against their `repo_full_name`, with exact casing.
+   `repository.full_name` against their `repo_full_name`, with exact casing. A case-only mismatch is rejected with
+   `git.repository_case_mismatch`; an unrelated repository stays ignored.
+   Correct the stored binding to match canonical repository casing.
    Create the binding with `curie <tier> deploy --repo owner/name`, or bind an
    existing unbound agent with a later deploy. The CLI refuses to replace a
    different binding; `PATCH /agents/{id}` can explicitly change
@@ -797,6 +799,61 @@ and a Deployment row. Without a stored bundle, prod clones and validates too.
 The stored-bundle prod path verifies the clone origin and SHA format but does
 not recheck remote branch ancestry. These rules apply to webhook and polling
 because both use the same push flow.
+
+Git-flow rejections send a top-level Slack notice even when success notices
+are off. A rejection after the push resolved its target agent, such as an
+unbound approval route on a prod promote, goes only to that agent's channels.
+A rejection before the target is known, such as `git.archive_failed` or
+`git.repository_case_mismatch`, can belong to any agent built from the
+repository, so it goes only to the Slack channels of the repository's non-prod
+bindings. It never reaches a channel bound to a prod deployment: a Slack channel
+counts as prod when any agent bound to it, through any bot identity, has an
+active prod deployment, and an agent with an active prod deployment has no
+non-prod bindings. When no non-prod channel remains, including when a bound
+repository has no Slack bindings at all, the rejection posts nothing; the API logs it at WARNING with the repository, commit and codes, and
+counts it in `curie.deploy_notice.suppressed` with
+`reason="no_nonprod_recipient"`. The notice includes the commit prefix and
+stable error codes; for `git.archive_failed`, check the API's clone credential
+and repository access. An unrelated repository has no bound recipient and
+remains ignored.
+
+Deploy notices are rate limited per repository, so a holder of the webhook
+secret cannot flood a channel with forged pushes. Each installation records at
+most 20 notices (one notice is one post to one channel) per repository in any
+rolling 60 minutes, matching the repository name case-insensitively. Concurrent
+pushes serialize their budget check and outbox insertion under a transaction
+scoped PostgreSQL advisory lock keyed by an unambiguous text encoding of the
+installation stream and canonical repository name. A push
+outcome whose new notices would pass that bound records none of them; the API
+logs it at WARNING and counts it in `curie.deploy_notice.suppressed` with
+`reason="rate_limited"`. A redelivered outcome whose notices are already
+recorded adds nothing and is not counted against the bound. To also receive
+successful deploy and promotion notices, opt each agent in through
+`PATCH /agents/<agent-id>` with `{"deploy_notifications": true}` and the
+normal API key. The default is `false`; this setting does not affect rejection
+notices. A success notice follows each deployment that changes the active
+version in its environment, a rollback to an earlier sha included; a
+redelivered push for the version already active changes nothing and posts
+nothing. Multiple Slack bindings each receive a notice through their configured
+bot identity. Notice delivery uses the worker's bounded retry and dead-letter
+path.
+
+<!-- @spec DEPLOY-NOTICE-RELEASE-1 -->
+Deploy notices ship after v0.12.0. Their additive migration is `0074`,
+following the released polling-cursor migration `0073`. Applying it to a
+v0.12.0 database preserves the released work-item base and poll cursors,
+defaults existing agents to success notices off, and creates the retry outbox.
+Downgrading only this migration removes notice state and keeps those released
+features. API and packaged chart require schema `0074` because agent reads
+include the new column. The CLI candidate is v0.13.0 with window
+`0074` through `0074`; the published v0.12.0 and v0.12.0-rc.1 windows
+remain `0070` through `0073`.
+The API first records selected recipients in a durable PostgreSQL outbox;
+its reconciler retries Valkey publication after a transient outage or API
+restart. An unavailable outbox returns HTTP 503 to the webhook instead of a
+false success, with the push's own result under `detail.result`. Inspect the `<runs-stream>:deploy-notices[:<installation-id>]:dead`
+stream if Slack delivery keeps failing. The stream follows the configured runs
+stream and installation ID, so installations sharing Valkey remain isolated.
 
 ### Accepting review feedback from GitHub
 
