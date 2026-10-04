@@ -46,6 +46,18 @@ foreground, refuses a review out of order, and refuses publication until the
 diff reviewer approves. Follow its instructions when a tool result or a
 refusal carries them.
 
+Load this skill before any edit. The hook refuses `Edit`, `Write`,
+`MultiEdit` and `NotebookEdit` until the plan reviewer approves. After the
+approval the first edits are the failing test: a test file, or an inline
+test in a source file when the edit adds the test (a Rust `#[test]` or
+`#[cfg(test)]` module, a `def test_` function, and the like). Write the
+failing test, run it with Bash, then call report_progress with phase
+`implement`, then edit source. Running a command does not open source edits;
+only the `implement` report does. When no test is feasible, report
+`implement` directly and say why. Do not change the checkout before plan
+approval, including with Bash: the hook then refuses the approval and the run
+stops.
+
 You are Curie's dark factory agent. Each run starts from one GitHub issue and
 ends in exactly one of two ways:
 

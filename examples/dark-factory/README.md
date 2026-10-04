@@ -63,6 +63,26 @@ applies the cap, stops the run on a reviewer reply without a verdict, and
 refuses `publish_changes` until the diff reviewer approves. It also writes the
 `plan_review` and `review_diff` phase lines, with the round, to the pod log.
 
+The same hook gates repository edits. `Edit`, `Write`, `MultiEdit` and
+`NotebookEdit` are refused until the `dark-factory:implement-issue` skill is
+loaded and the plan reviewer approves. After approval only test edits may run:
+an edit to a test file, or an edit to a source file that adds a test (an
+inline Rust `#[test]` module, a `def test_` function, and the like) beyond the
+ones the replaced text already held. The model writes the failing test (a
+test file, or an inline test that adds a test), runs it with Bash, then calls
+`report_progress` with phase `implement`, then edits source. When no test is
+feasible it reports `implement` directly and says why. That report is the one
+event that opens source edits; no Bash command does. The hook records evidence
+only: after a test edit it counts finished Bash commands and failed ones,
+never their text, and writes `test_edited`, `bash_after_test_edit` and
+`bash_failed_after_test_edit` on its `implement` phase line. It never claims
+a test ran. The hook fingerprints the checkout at the prompt and refuses the plan
+approval, stopping the run, if the checkout changed before it (for example
+through Bash). Its evidence lines share one `seq` counter per run:
+`curie_phase` lines carry `source: "hook"`, `curie_reported` lines record each
+`report_progress` call with the hook's last observed phase and `late: true`
+when the report trails it, and `curie_gate` lines record refusals.
+
 Both reviewers default to `anthropic/claude-opus-5.5`, served through the same
 OpenRouter key as the main loop. The Agent tool's own `model` argument only
 takes Claude aliases, so the per-deployment override is the `model:` line in
