@@ -222,6 +222,41 @@ class _SQLVisitor(ast.NodeVisitor):
         value = ast.BinOp(left=node.target, op=node.op, right=node.value)
         _assign(node.target, value, self.environment)
 
+    def _forget(self, target: ast.expr) -> None:
+        for child in ast.walk(target):
+            if isinstance(child, ast.Name):
+                for key in list(self.environment):
+                    if key == child.id or key.startswith(f"{child.id}."):
+                        del self.environment[key]
+
+    def visit_For(self, node: ast.For) -> None:
+        self.visit(node.iter)
+        self._forget(node.target)
+        for statement in [*node.body, *node.orelse]:
+            self.visit(statement)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self.visit(node.iter)
+        self._forget(node.target)
+        for statement in [*node.body, *node.orelse]:
+            self.visit(statement)
+
+    def visit_With(self, node: ast.With) -> None:
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self._forget(item.optional_vars)
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self._forget(item.optional_vars)
+        for statement in node.body:
+            self.visit(statement)
+
     def visit_If(self, node: ast.If) -> None:
         self.visit(node.test)
         before = self.environment.copy()

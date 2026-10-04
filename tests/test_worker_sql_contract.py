@@ -160,6 +160,59 @@ def test_unresolved_sql_expression_is_rejected(tmp_path: Path) -> None:
         discover_statements(tmp_path, "curie")
 
 
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "for sql in dynamic:",
+        "async for sql in dynamic:",
+        "with dynamic as sql:",
+        "async with dynamic as sql:",
+    ],
+    ids=["for", "async_for", "with", "async_with"],
+)
+def test_dynamic_scope_binding_cannot_reuse_an_earlier_sql_string(
+    tmp_path: Path, binding: str
+) -> None:
+    relative = _write_worker(
+        tmp_path,
+        "from sqlalchemy import text\n"
+        "async def statement(dynamic):\n"
+        '    sql = "SELECT name FROM curie.agents"\n'
+        f"    {binding}\n"
+        "        return text(sql)\n",
+    )
+
+    with pytest.raises(ValueError, match=relative):
+        discover_statements(tmp_path, "curie")
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "for item in dynamic:",
+        "async for item in dynamic:",
+        "with dynamic as item:",
+        "async with dynamic as item:",
+    ],
+    ids=["for", "async_for", "with", "async_with"],
+)
+def test_unrelated_scope_binding_preserves_a_static_sql_string(
+    tmp_path: Path, binding: str
+) -> None:
+    _write_worker(
+        tmp_path,
+        "from sqlalchemy import text\n"
+        "async def statement(dynamic):\n"
+        '    sql = "SELECT name FROM curie.agents"\n'
+        f"    {binding}\n"
+        "        return text(sql)\n",
+    )
+
+    statements = discover_statements(tmp_path, "curie")
+    assert len(statements) == 1
+    assert statements[0][1] == "SELECT name FROM curie.agents"
+
+
 def test_new_worker_sql_using_a_missing_column_is_rejected(
     tmp_path: Path, migrated_database_url: str
 ) -> None:
