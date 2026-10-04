@@ -2226,13 +2226,17 @@ worker:
     # Size it to span the expected rollout: the flag is what keeps replacement
     # Pods from reclaiming mid-roll.
     quiesceTtlSeconds: 1800
+    # Shared by drain, attest and release. Worker dependency imports peaked at
+    # approximately 148Mi in subprocess measurements. Both memory defaults give
+    # more than 2x headroom; size both the request and limit to at least twice
+    # the deployed worker image's measured peak when overriding this block.
     resources:
       requests:
         cpu: 10m
-        memory: 64Mi
+        memory: 384Mi
       limits:
         cpu: 200m
-        memory: 128Mi
+        memory: 384Mi
   # The Slack assistant-thread "shimmer" (#1182): the animated caption Slack
   # shows next to the app's name while a turn runs. On by default -- the
   # placeholder message only changes when the model emits text, so a model that

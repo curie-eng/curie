@@ -41,6 +41,10 @@ helm template t "$CHART" \
   > "$TMP/byo-credentials.yaml"
 helm template t "$CHART" --set worker.upgradeDrain.enabled=false > "$TMP/disabled.yaml"
 helm template t "$CHART" --set worker.deploy=false > "$TMP/no-worker.yaml"
+helm template t "$CHART" \
+  --set-string worker.upgradeDrain.resources.requests.memory=512Mi \
+  --set-string worker.upgradeDrain.resources.limits.memory=768Mi \
+  > "$TMP/custom-memory.yaml"
 
 # --- the two render-time refusals -------------------------------------------
 #
@@ -90,13 +94,14 @@ helm template t "$CHART" \
   --set worker.upgradeDrain.timeoutSeconds=120 \
   --set worker.upgradeDrain.quiesceTtlSeconds=300 > "$TMP/small.yaml"
 
-python3 - "$TMP/default.yaml" "$TMP/disabled.yaml" "$TMP/no-worker.yaml" "$TMP/small.yaml" "$TMP/raised.yaml" "$TMP/equal-ttl.yaml" "$TMP/short-ttl.yaml" <<'PY'
+python3 - "$TMP/default.yaml" "$TMP/disabled.yaml" "$TMP/no-worker.yaml" "$TMP/small.yaml" "$TMP/raised.yaml" "$TMP/equal-ttl.yaml" "$TMP/short-ttl.yaml" "$TMP/custom-memory.yaml" <<'PY'
 import sys
 
 import yaml
 
 default_path, disabled_path, no_worker_path, small_path, raised_path = sys.argv[1:6]
 equal_ttl_path, short_ttl_path = sys.argv[6:8]
+custom_memory_path = sys.argv[8]
 
 DRAIN = "upgrade-drain"
 RELEASE = "upgrade-drain-release"
@@ -141,6 +146,40 @@ for component in (DRAIN, RELEASE, ATTEST):
         len(jobs.get(component, [])) == 1,
         f"expected exactly one {component} Job, found {len(jobs.get(component, []))}",
     )
+
+# All hook modes import the worker dependency tree. Keep their shared sizing
+# and the operator override wired through the rendered containers.
+for path, label, request_memory, limit_memory in (
+    (default_path, "default", "384Mi", "384Mi"),
+    (custom_memory_path, "custom-memory", "512Mi", "768Mi"),
+):
+    rendered_jobs = jobs_by_component(load(path))
+    for component in (DRAIN, RELEASE, ATTEST):
+        matching = rendered_jobs.get(component, [])
+        if len(matching) != 1:
+            check(False, f"the {label} render lacks exactly one {component} Job")
+            continue
+        pod = (matching[0].get("spec") or {}).get("template", {}).get("spec", {})
+        containers = pod.get("containers") or []
+        if len(containers) != 1:
+            check(False, f"the {label} {component} Job lacks exactly one container")
+            continue
+        resources = containers[0].get("resources") or {}
+        for key, expected_memory, expected_cpu in (
+            ("requests", request_memory, "10m"),
+            ("limits", limit_memory, "200m"),
+        ):
+            configured = resources.get(key) or {}
+            check(
+                configured.get("memory") == expected_memory,
+                f"the {label} {component} {key}.memory is {configured.get('memory')!r}, "
+                f"expected {expected_memory!r}",
+            )
+            check(
+                configured.get("cpu") == expected_cpu,
+                f"the {label} {component} {key}.cpu is {configured.get('cpu')!r}, "
+                f"expected {expected_cpu!r}",
+            )
 
 if not failures:
     drain = jobs[DRAIN][0]

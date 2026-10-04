@@ -250,7 +250,10 @@
               "maximum": 86400,
               "description": "Roll hold: lifetime of the fleet-wide quiesce flag after a clean drain, capped at the effective drain wait (issue #3127). While the gate waits, the flag is a short lease renewed every poll, so a killed gate releases the fleet within one lease. Finite by construction, so an upgrade killed between the two hooks cannot leave the fleet permanently unable to claim."
             },
-            "resources": {"type": "object"}
+            "resources": {
+              "type": "object",
+              "description": "Shared resources for the drain, attest and release hook Jobs. Worker dependency imports peaked at approximately 148Mi in subprocess measurements, so the default memory request and limit are both 384Mi. When overriding, size both memory request and limit to at least twice the deployed worker image's measured peak."
+            }
           }
         },
         "workspace": {
