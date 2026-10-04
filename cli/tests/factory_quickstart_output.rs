@@ -68,7 +68,7 @@ if tool == 'helm':
             role = 'platform' if args[-1] == 'priorityClasses.sandbox.create=false' else 'sandbox'
             emit({'kind':'PriorityClass','metadata':{'name':'curie-'+role}})
         if 'preflight-gvisor' in template and os.environ.get('QUICKSTART_GVISOR_RETRY') == '1' and 'security.gvisor.mode=off' not in args:
-            emit({'kind':'Job','metadata':{'name':release+'-preflight-gvisor'}})
+            emit({'kind':'Job','metadata':{'name':release+'-preflight-gvisor'},'spec':{'template':{'spec':{'runtimeClassName':'gvisor'}}}})
         print('Error: could not find template '+template+' in chart', file=sys.stderr); sys.exit(1)
     if args[0] == 'upgrade':
         for index, argument in enumerate(args[:-1]):
@@ -92,6 +92,7 @@ if tool == 'kubectl':
     if 'rollout' in args or 'label' in args or 'patch' in args: print('fixture command completed'); sys.exit(0)
     if 'get' in args:
         ix = args.index('get'); kind = args[ix+1]; name = args[ix+2] if len(args) > ix+2 else ''
+        if kind == 'runtimeclass': print('Error from server (Forbidden): runtimeclasses.node.k8s.io "'+name+'" is forbidden: User "fixture" cannot get resource "runtimeclasses" in API group "node.k8s.io" at the cluster scope', file=sys.stderr); sys.exit(1)
         if kind == 'events' and '--watch' in args:
             deadline = time.monotonic() + 5
             while not (root / 'retried').exists():
