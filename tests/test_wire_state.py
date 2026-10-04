@@ -26,9 +26,8 @@ def test_all_existing_wire_sites_are_declared() -> None:
     literals = scan_key_literals(ROOT)
     assert any("cli/src/queue.rs" in site for site in producers)
     assert any("capacity_wait" in site for site in producers)
-    # These ownership protected sites remain declared without migration.
-    assert any("curie_worker/kernel/" in site for site in literals)
-    assert any("curie_worker/markers.py" in site for site in literals)
+    # The consumer's ownership protected literals remain declared without migration.
+    assert any("curie_worker/consumer.py" in site for site in literals)
 
 
 @pytest.mark.parametrize(
@@ -56,6 +55,22 @@ def test_undeclared_producer_is_rejected(tmp_path: Path, relative: str, source: 
     assert any(relative in error for error in validate_inventory(tmp_path))
 
 
+def test_duplicate_producer_in_an_inventoried_scope_is_rejected(tmp_path: Path) -> None:
+    relative = "apps/dispatcher/src/curie_dispatcher/queue.py"
+    source = (ROOT / relative).read_text(encoding="utf-8")
+    statement = "            stream_id = redis_client.xadd(config.stream, fields)\n"
+    assert source.count(statement) == 1
+    _write(tmp_path, relative, source)
+    producers = scan_producers(tmp_path)
+    errors = set(validate_inventory(tmp_path))
+
+    _write(tmp_path, relative, source.replace(statement, statement + statement))
+
+    assert len(scan_producers(tmp_path)) == len(producers) + 1
+    new_errors = set(validate_inventory(tmp_path)) - errors
+    assert any(relative in error for error in new_errors)
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -70,6 +85,29 @@ def test_undeclared_producer_is_rejected(tmp_path: Path, relative: str, source: 
 def test_undeclared_key_literal_is_rejected(tmp_path: Path, source: str) -> None:
     relative = "apps/api/src/curie_api/new_key.py"
     _write(tmp_path, relative, source)
+    assert any(relative in site for site in scan_key_literals(tmp_path))
+    assert any(relative in error for error in validate_inventory(tmp_path))
+
+
+def test_duplicate_literal_in_an_inventoried_scope_is_rejected(tmp_path: Path) -> None:
+    relative = "apps/worker/src/curie_worker/consumer.py"
+    source = (ROOT / relative).read_text(encoding="utf-8")
+    statement = 'THREAD_RESET_SET = "curie:thread-reset-requests"\n'
+    assert source.count(statement) == 1
+    _write(tmp_path, relative, source)
+    literals = scan_key_literals(tmp_path)
+    errors = set(validate_inventory(tmp_path))
+
+    _write(tmp_path, relative, source.replace(statement, statement + statement))
+
+    assert len(scan_key_literals(tmp_path)) == len(literals) + 1
+    new_errors = set(validate_inventory(tmp_path)) - errors
+    assert any(relative in error for error in new_errors)
+
+
+def test_undeclared_rust_key_literal_is_rejected(tmp_path: Path) -> None:
+    relative = "cli/src/new_key.rs"
+    _write(tmp_path, relative, 'pub const KEY: &str = "curie:undeclared:key";\n')
     assert any(relative in site for site in scan_key_literals(tmp_path))
     assert any(relative in error for error in validate_inventory(tmp_path))
 
