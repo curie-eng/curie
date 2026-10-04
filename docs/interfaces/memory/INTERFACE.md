@@ -228,9 +228,10 @@ change.
   Its consumers are the CLI (`cli/src/api.rs`, behind `curie local memory` /
   `curie local memory --add` and `curie cluster memory` /
   `curie cluster memory --add`) and the console (`apps/ui/src/api/client.ts`). Unlike
-  the sandbox path it is platform-key-only (`require_api_key`), so the scoped
-  memory token cannot reach it. This is coherent today (one loader plus the facts
-  store, one backing store, and the router says so in its own docstring), but it is the precise leak
+  the sandbox path it accepts the platform key or a live console session through
+  `require_api_key`, and the scoped sandbox token still cannot reach it. This is
+  coherent today (one loader plus the facts store, one backing store, and the
+  router says so in its own docstring), but it is the precise leak
   a real second loader would trip over: an `s3://` store would satisfy the port
   and still leave every operator read returning an empty list and every edit and
   delete 404ing, because the operator plane is addressing a Postgres row that

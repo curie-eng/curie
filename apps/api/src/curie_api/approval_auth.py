@@ -18,14 +18,13 @@ from urllib.parse import urlsplit
 from fastapi import Cookie, Depends, Header, HTTPException, Request, Response, status
 
 from . import adapter_principal, approval_principal, crud
-from .auth import require_api_key
+from .auth import CONSOLE_SESSION_COOKIE, require_api_key
 from .config import get_settings
 from .deps import SessionDep
 
 APPROVAL_PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
 ADAPTER_PRINCIPAL_HEADER = "X-Curie-Adapter-Principal"
 APPROVAL_ACTOR_HEADER = "X-Curie-Approval-Actor"
-CONSOLE_SESSION_COOKIE = "__Host-curie_console_session"
 _SAFE_ORIGIN_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _DEFAULT_ORIGIN_PORTS = {"http": 80, "https": 443}
 
@@ -282,20 +281,22 @@ def platform_key_or_adapter(
     ``scope`` (ADR-0154), returning the adapter's claims or None for the key.
 
     Exactly one credential: both together are ambiguous and fail closed, as
-    the resolver's credentials do. The platform-key half is ``require_api_key``
-    unchanged, detail string included.
+    the resolver's credentials do. The platform-key half is ``require_api_key``,
+    and a live console session is that same half. An adapter plus the platform
+    key, or an adapter plus a session cookie, fails closed before verification.
     """
 
     async def dependency(
+        request: Request,
         x_api_key: Annotated[str | None, Header()] = None,
         x_curie_adapter_principal: Annotated[
             str | None, Header(alias=ADAPTER_PRINCIPAL_HEADER)
         ] = None,
     ) -> adapter_principal.AdapterClaims | None:
         if x_curie_adapter_principal is None:
-            await require_api_key(x_api_key)
+            await require_api_key(request, x_api_key)
             return None
-        if x_api_key is not None:
+        if x_api_key is not None or request.cookies.get(CONSOLE_SESSION_COOKIE):
             raise _unauthorized("ambiguous credentials")
         claims = adapter_principal.verify(
             x_curie_adapter_principal, get_settings().api_key, scope=scope
