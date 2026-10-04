@@ -4581,6 +4581,14 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Bind this digest-pinned runner image in the same helm upgrade as the intake settings (`AGENT=ghcr.io/example/runner@sha256:<digest>`). The chart is still `--chart`. The values mode stays `--reuse-values`",
+              "id": "runner_image",
+              "long": "runner-image",
+              "positional": false,
+              "required": false
+            },
+            {
               "default_values": [
                 "curie"
               ],

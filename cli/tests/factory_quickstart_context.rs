@@ -40,6 +40,7 @@ fn plan_input() -> PlanInput {
         credential_in_env: false,
         release_has_real_model: false,
         interactive: false,
+        release_at_target: false,
     }
 }
 

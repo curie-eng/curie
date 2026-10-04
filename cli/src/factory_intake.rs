@@ -45,6 +45,16 @@ pub struct FactoryIntakeOpts {
     /// `api.githubFactoryIntake` when this run must select a mode. `None`
     /// leaves the recorded value unchanged.
     pub intake: Option<String>,
+    /// Digest-pinned runner image bound in the same upgrade as the intake
+    /// settings. `None` leaves `agentSandbox.runnerImages` unchanged.
+    pub runner_binding: Option<RunnerImageBinding>,
+}
+
+/// A runner image to set at `agentSandbox.runnerImages.<agent>` (#3934).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerImageBinding {
+    pub agent: String,
+    pub image: String,
 }
 
 /// Helm's floor for this command, matching `curie cluster upgrade`'s default.
@@ -243,10 +253,44 @@ pub fn intake_values(opts: &FactoryIntakeOpts, cidrs: &[String]) -> serde_json::
             .collect();
         values["agentSandbox"] = serde_json::json!({ "connectorEgress": egress });
     }
+    // The quickstart finish upgrade is this one document. The chart is the
+    // caller's `--chart` (the chart `cluster up` already installed), not a
+    // second chart resolved from the release archive. `--reuse-values` merges
+    // these additive keys onto the release. A null clear still belongs to
+    // `bind_if_changed` (`--reset-then-reuse-values`, ADR 0173 decision 5);
+    // this document only sets a digest.
+    if let Some(binding) = &opts.runner_binding {
+        insert_runner_image(&mut values, &binding.agent, &binding.image);
+    }
     values
 }
 
+fn insert_runner_image(values: &mut serde_json::Value, agent: &str, image: &str) {
+    let root = values.as_object_mut().expect("intake values are an object");
+    let sandbox = root
+        .entry("agentSandbox")
+        .or_insert_with(|| serde_json::json!({}));
+    if !sandbox.is_object() {
+        *sandbox = serde_json::json!({});
+    }
+    let images = sandbox
+        .as_object_mut()
+        .expect("agentSandbox is an object")
+        .entry("runnerImages")
+        .or_insert_with(|| serde_json::json!({}));
+    if !images.is_object() {
+        *images = serde_json::json!({});
+    }
+    images
+        .as_object_mut()
+        .expect("runnerImages is an object")
+        .insert(agent.to_string(), serde_json::json!(image));
+}
+
 fn helm_upgrade(opts: &FactoryIntakeOpts, values_file: &Path, timeout_seconds: u64) -> OpsCommand {
+    // One chart source (the caller's chart) and one values mode
+    // (`--reuse-values -f`). Intake settings and a runner binding share this
+    // upgrade so a quickstart finish does not helm-upgrade the release twice.
     OpsCommand::new(
         "helm",
         vec![
@@ -814,6 +858,7 @@ mod tests {
             private_key_file: None,
             org: None,
             intake: None,
+            runner_binding: None,
         }
     }
 
@@ -909,6 +954,38 @@ mod tests {
                 .any(|c| c.program == "kubectl" && argv(c).iter().any(|a| a == "restart")),
             "the api must be restarted after the upgrade"
         );
+    }
+
+    #[test]
+    fn intake_values_bind_a_runner_image_in_the_same_document() {
+        let mut o = opts();
+        o.runner_binding = Some(RunnerImageBinding {
+            agent: "dark-factory".into(),
+            image: "ghcr.io/curie-eng/curie-dark-factory-runner@sha256:abcd".into(),
+        });
+        let values = intake_values(&o, &cidrs());
+        assert_eq!(
+            values["agentSandbox"]["runnerImages"]["dark-factory"],
+            serde_json::json!("ghcr.io/curie-eng/curie-dark-factory-runner@sha256:abcd")
+        );
+        assert!(values["agentSandbox"].get("connectorEgress").is_some());
+        let commands = intake_commands(
+            &o,
+            Path::new("/tmp/curie-factory-values.json"),
+            HELM_TIMEOUT_FLOOR_SECS,
+        );
+        let helm = commands
+            .iter()
+            .find(|c| c.program == "helm")
+            .expect("a helm upgrade command");
+        let args = argv(helm);
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_str() == "upgrade").count(),
+            1
+        );
+        assert!(args.iter().any(|arg| arg == "--reuse-values"), "{args:?}");
+        assert!(args.iter().any(|arg| arg == "charts/curie"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--reset-then-reuse-values"));
     }
 
     // C5

@@ -68,6 +68,9 @@ pub struct PlanInput {
     pub credential_in_env: bool,
     pub release_has_real_model: bool,
     pub interactive: bool,
+    /// The release is already the chart and the quickstart values, so this
+    /// plan must not invoke `cluster up`.
+    pub release_at_target: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +121,8 @@ pub struct Planned {
     pub kind_cluster: Option<String>,
     pub credential: CredentialDecision,
     pub actions: Vec<Action>,
+    /// `cluster up` was left out because the release is already at the target.
+    pub skipped_cluster_up: bool,
 }
 
 #[derive(Debug)]
@@ -561,7 +566,12 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         up.push("--set".into());
         up.push(GVISOR_OFF_SET.into());
     }
-    actions.push(Action::Cluster { args: up });
+    // ADR 0114 and ADR 0193 keep install-fact inference inside `cluster up`.
+    // The skip stays here: quickstart does not invoke `cluster up` when the
+    // release is already that chart and these values.
+    if !input.release_at_target {
+        actions.push(Action::Cluster { args: up });
+    }
 
     if finishing {
         actions.push(Action::Intake(Box::new(finish_intake_opts(
@@ -603,6 +613,7 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
             input.interactive,
         ),
         actions,
+        skipped_cluster_up: input.release_at_target,
     })
 }
 
@@ -626,6 +637,7 @@ fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIntakeOpts {
         private_key_file: input.private_key_file.as_ref().map(PathBuf::from),
         org: input.org.clone(),
         intake: Some(POLL_INTAKE.into()),
+        runner_binding: None,
     }
 }
 
@@ -653,6 +665,11 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                     .to_string(),
             );
         }
+    }
+    if planned.skipped_cluster_up {
+        lines.push(
+            "skip cluster up: the release is already at the target chart and values".to_string(),
+        );
     }
     for action in &planned.actions {
         match action {
@@ -693,7 +710,7 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 lines.push(format!(
-                    "configure factory intake api.githubFactoryIntake={intake} for {} with --app-id {} --private-key-file {} and no webhook secret",
+                    "configure factory intake api.githubFactoryIntake={intake} for {} with --app-id {} --private-key-file {} and no webhook secret; the same helm upgrade binds the dark factory runner image",
                     opts.repos.join(","),
                     opts.app_id.as_deref().unwrap_or(""),
                     opts.private_key_file
@@ -788,6 +805,98 @@ fn check_prerequisites(
     .into())
 }
 
+/// True when `metadata` names `chart_version` and `values` already hold the
+/// quickstart install: the requested model, a real model, and gVisor off on a
+/// kind target.
+pub fn quickstart_release_matches(
+    chart_version: &str,
+    metadata: &serde_json::Value,
+    values: &serde_json::Value,
+    model: &str,
+    kind_target: bool,
+) -> bool {
+    let deployed = metadata
+        .get("version")
+        .and_then(|value| value.as_str())
+        .filter(|version| !version.is_empty())
+        .or_else(|| {
+            metadata
+                .get("chart")
+                .and_then(|value| value.as_str())
+                .and_then(|chart| chart.rsplit_once('-').map(|(_, version)| version))
+        });
+    if deployed != Some(chart_version) {
+        return false;
+    }
+    let recorded_model = values
+        .pointer("/agentSandbox/runner/model")
+        .and_then(|value| value.as_str());
+    let real_model =
+        values.pointer("/agentSandbox/runner/fakeModel") == Some(&serde_json::json!(false));
+    let gvisor_off = values
+        .pointer("/security/gvisor/mode")
+        .and_then(|value| value.as_str())
+        == Some("off");
+    recorded_model == Some(model) && real_model && (!kind_target || gvisor_off)
+}
+
+async fn capture_helm_json(cmd: &crate::ops::OpsCommand) -> Result<Option<serde_json::Value>> {
+    let (ok, stdout, _) = crate::ops::run_capture(cmd).await?;
+    if !ok {
+        return Ok(None);
+    }
+    Ok(serde_json::from_str(&stdout).ok())
+}
+
+/// Values and metadata of the revision the release is serving. `None` when
+/// helm has no `deployed` revision: a failed install can still carry the
+/// target chart and values, and that must not count as installed (#3934).
+async fn deployed_release_snapshot(
+    common: &CommonOpts,
+) -> Result<Option<(serde_json::Value, serde_json::Value)>> {
+    let Some(history) = capture_helm_json(&crate::ops::helm_history_cmd(common)).await? else {
+        return Ok(None);
+    };
+    let revision = match crate::cluster_secrets::serving_revision(&history, &common.release) {
+        Ok(revision) => revision,
+        Err(_) => return Ok(None),
+    };
+    let values = capture_helm_json(&crate::cluster_secrets::helm_get_json(
+        common, "values", false, revision,
+    ))
+    .await?;
+    let metadata = capture_helm_json(&crate::cluster_secrets::helm_get_json(
+        common, "metadata", false, revision,
+    ))
+    .await?;
+    Ok(match (values, metadata) {
+        (Some(values), Some(metadata)) => Some((values, metadata)),
+        _ => None,
+    })
+}
+
+async fn release_matches_quickstart_target(
+    opts: &QuickstartOpts,
+    kind_target: bool,
+) -> Result<bool> {
+    let common = CommonOpts {
+        namespace: opts.namespace.clone(),
+        release: opts.release.clone(),
+        dry_run: false,
+    };
+    let chart_version = crate::ops::chart_version(&opts.chart).await?;
+    let Some((values, metadata)) = deployed_release_snapshot(&common).await? else {
+        return Ok(false);
+    };
+    Ok(quickstart_release_matches(
+        &chart_version,
+        &metadata,
+        &values,
+        &opts.model,
+        kind_target,
+    ))
+}
+
 pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     let current = if opts.context.is_some() {
         None
@@ -834,6 +943,12 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     } else {
         release_model_recorded(&opts).await?
     };
+    let release_at_target = match &targeted {
+        Some(context) if !opts.dry_run => {
+            release_matches_quickstart_target(&opts, is_kind_context(context)).await?
+        }
+        _ => false,
+    };
     let planned = quickstart_plan(&PlanInput {
         repo: opts.repo.clone(),
         app_id: opts.app_id.clone(),
@@ -856,6 +971,7 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
         release_has_real_model,
         // Dry-run reports a non-kind current context instead of refusing it.
         interactive: opts.dry_run || real_interactive,
+        release_at_target,
     })?;
     if opts.dry_run {
         let mut planned = planned;
@@ -897,8 +1013,12 @@ async fn execute(
     mut release_has_real_model: bool,
 ) -> Result<QuickstartOutput> {
     crate::ui::ui().note(&format!("Kubernetes context: {}", planned.context));
+    if planned.skipped_cluster_up {
+        crate::ui::ui().note("release already at the target chart and values; skipping cluster up");
+    }
     let mut prompted = false;
     let mut intake_json = serde_json::Value::Null;
+    let mut rendered_image: Option<String> = None;
     let mut credit_remaining_usd = None;
     for action in &planned.actions {
         if matches!(action, Action::Deploy { .. }) {
@@ -955,6 +1075,43 @@ async fn execute(
                 });
             }
             Action::Intake(intake) => {
+                crate::ui::ui().note("Rendering factory bundle");
+                let image =
+                    render_published_bundle(&intake.common.namespace, &intake.common.release)
+                        .await
+                        .map_err(|error| {
+                            let (_, fix) = crate::exit::classify(&error);
+                            step_error(
+                                Path::new("curie"),
+                                &[
+                                    "--plugin-dir".into(),
+                                    bundle_dir(&intake.common.namespace, &intake.common.release)
+                                        .display()
+                                        .to_string(),
+                                ],
+                                "Rendering factory bundle",
+                                error,
+                                fix.as_deref(),
+                            )
+                        })?;
+                rendered_image = Some(image.clone());
+                // ADR 0173 decision 5: refuse a layer built on another runner
+                // before this upgrade binds `agentSandbox.runnerImages`.
+                // `cluster deploy` repeats the check; it must not be the first
+                // time the release learns the image.
+                let bundle = bundle_dir(&intake.common.namespace, &intake.common.release);
+                if let Err(error) =
+                    crate::cluster_secrets::check_layered_runner_base(&intake.common, &bundle).await
+                {
+                    let (_, fix) = crate::exit::classify(&error);
+                    return Err(step_error(
+                        Path::new("curie"),
+                        &["--plugin-dir".into(), bundle.display().to_string()],
+                        "Checking the runner base",
+                        error,
+                        fix.as_deref(),
+                    ));
+                }
                 let mut args = vec![
                     "cluster".into(),
                     "factory".into(),
@@ -982,6 +1139,8 @@ async fn execute(
                 if let Some(org) = &intake.org {
                     args.extend(["--org".into(), org.clone()]);
                 }
+                args.push("--runner-image".into());
+                args.push(format!("{AGENT_NAME}={image}"));
                 intake_json = run_self(&args, "Configuring factory intake").await?;
                 if intake_json.get("github_app").is_none() {
                     return Err(step_error(
@@ -1004,20 +1163,25 @@ async fn execute(
                 deadline_seconds,
                 budget_usd,
             } => {
-                crate::ui::ui().note("Rendering factory bundle");
                 let dir = bundle_dir(namespace, release);
-                let image = render_published_bundle(namespace, release)
-                    .await
-                    .map_err(|error| {
-                        let (_, fix) = crate::exit::classify(&error);
-                        step_error(
-                            Path::new("curie"),
-                            &["--plugin-dir".into(), dir.display().to_string()],
-                            "Rendering factory bundle",
-                            error,
-                            fix.as_deref(),
-                        )
-                    })?;
+                let image = match rendered_image.clone() {
+                    Some(image) => image,
+                    None => {
+                        crate::ui::ui().note("Rendering factory bundle");
+                        render_published_bundle(namespace, release)
+                            .await
+                            .map_err(|error| {
+                                let (_, fix) = crate::exit::classify(&error);
+                                step_error(
+                                    Path::new("curie"),
+                                    &["--plugin-dir".into(), dir.display().to_string()],
+                                    "Rendering factory bundle",
+                                    error,
+                                    fix.as_deref(),
+                                )
+                            })?
+                    }
+                };
                 run_self(
                     &[
                         "cluster".into(),
@@ -1498,7 +1662,61 @@ mod tests {
             credential_in_env: false,
             release_has_real_model: false,
             interactive: true,
+            release_at_target: false,
         }
+    }
+
+    #[test]
+    fn a_matching_release_skips_cluster_up_and_a_model_change_does_not() {
+        let metadata = serde_json::json!({"version": "0.12.2", "chart": "curie-0.12.2"});
+        let values = serde_json::json!({
+            "security": {"gvisor": {"mode": "off"}},
+            "agentSandbox": {"runner": {"model": DEFAULT_MODEL, "fakeModel": false}}
+        });
+        assert!(quickstart_release_matches(
+            "0.12.2",
+            &metadata,
+            &values,
+            DEFAULT_MODEL,
+            true
+        ));
+        assert!(!quickstart_release_matches(
+            "0.12.1",
+            &metadata,
+            &values,
+            DEFAULT_MODEL,
+            true
+        ));
+        assert!(!quickstart_release_matches(
+            "0.12.2",
+            &metadata,
+            &values,
+            "other/model",
+            true
+        ));
+        let mut drifted = values.clone();
+        drifted["security"]["gvisor"]["mode"] = serde_json::json!("auto");
+        assert!(!quickstart_release_matches(
+            "0.12.2",
+            &metadata,
+            &drifted,
+            DEFAULT_MODEL,
+            true
+        ));
+        assert!(quickstart_release_matches(
+            "0.12.2",
+            &metadata,
+            &drifted,
+            DEFAULT_MODEL,
+            false
+        ));
+        let mut input = base();
+        input.release_at_target = true;
+        input.current_context = Some("kind-curie-factory".into());
+        let lines = describe(&quickstart_plan(&input).unwrap());
+        let text = lines.join("\n");
+        assert!(text.contains("skip cluster up"), "{text}");
+        assert!(!text.contains("curie cluster up"), "{text}");
     }
 
     #[test]
