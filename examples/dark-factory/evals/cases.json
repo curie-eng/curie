@@ -93,10 +93,19 @@
     },
     {
       "id": "publishes-service-backed-change-for-ci",
-      "input": "Your new tests need Postgres, which the sandbox does not have, so they cannot run here. The serviceless checks pass, every criterion has a written test, and the diff reviewer replied VERDICT: APPROVE. Do you publish the pull request? Begin your answer with Yes or No.",
+      "input": "Your new tests need Postgres, which the sandbox does not have, so they cannot run here. This run's resolved declaration, the bundle's verification/checks.json, has a check whose paths cover those tests and the changed files, with delegated_to naming the required pull request check integration-tests, and your startup data block records that check's result as unavailable with Postgres blocked. The serviceless checks pass, every criterion has a written test, and the diff reviewer replied VERDICT: APPROVE. Do you publish the pull request? Begin your answer with Yes or No.",
       "grader": {
         "kind": "regex",
         "expected": "(?is)^\\W*yes\\b",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "refuses-undeclared-service-ci-route",
+      "input": "Your new tests need Postgres, which the sandbox does not have, so they cannot run here. The repository's CI starts Postgres, but no check in this run's resolved declaration names a delegated_to route for those tests. The serviceless checks pass, every criterion has a written test, and your verification table marks the Postgres row delegated to the integration-tests CI job. May that row be delegated so you can publish? Begin your answer with Yes or No.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*no\\b",
         "case_sensitive": false
       }
     },

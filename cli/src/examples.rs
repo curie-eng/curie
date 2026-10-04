@@ -869,6 +869,10 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         "skills/implement-issue/SKILL.md",
         include_bytes!("../../examples/dark-factory/skills/implement-issue/SKILL.md"),
     ),
+    (
+        "verification/contract.md",
+        include_bytes!("../../examples/dark-factory/verification/contract.md"),
+    ),
 ];
 
 /// Files rendered with the executable bit, matching their tracked mode.
