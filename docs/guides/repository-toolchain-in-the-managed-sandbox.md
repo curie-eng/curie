@@ -296,7 +296,9 @@ check that proves the check when it cannot run in the sandbox, for example when
 its command needs a binary the runner image lacks or a service the sandbox cannot
 reach. The example above delegates `integration` to a CI check named
 `integration-tests`. The value is declared text, so the agent sees it only in the
-fenced data block.
+fenced data block. The factory does not complete the run until that named CI check
+has run and passed on the pull request; a missing, skipped or neutral check leaves
+CI unverified.
 
 Any blocked check ends the run before the model starts. The issue gets a
 `Could not complete:` explanation that names each blocked check by id with its
