@@ -52,9 +52,17 @@
       "language": "python",
       "purpose": "Runs enqueue firing an admitted scheduled hook"
     },
+    "apps/worker/src/curie_worker/markers.py:Markers.publish_successor:1": {
+      "language": "python",
+      "purpose": "Runs enqueue of a sweep continuation on a leaseless settle (ADR-0160)"
+    },
     "apps/worker/src/curie_worker/markers.py:module:1": {
       "language": "lua",
       "purpose": "Ownership protected worker completion outbox stream publication"
+    },
+    "apps/worker/src/curie_worker/markers.py:module:2": {
+      "language": "lua",
+      "purpose": "Fenced runs enqueue of a sweep continuation with the predecessor settle (ADR-0160)"
     },
     "apps/worker/src/curie_worker/progress.py:module:1": {
       "language": "lua",

@@ -29,6 +29,7 @@ from ..runner_client import (
 )
 from ..sandbox import SandboxSubstrate
 from ..sibling_turns import SiblingTurnLimit
+from ..sweep import SweepCoverage
 from ..threadlock import ThreadLock
 from ..workitem_dispatch import (
     WorkItemDispatchClient,
@@ -51,6 +52,7 @@ from . import (
     memory,
     publication,
     routing,
+    sweep_slices,
     work_items,
     workspace,
 )
@@ -83,6 +85,7 @@ class Kernel:
         actions: ActionRecorder | None = None,
         card_store: ApprovalCardStore | None = None,
         hook_runs: HookRunRecorder | None = None,
+        sweep: SweepCoverage | None = None,
         route_ttl_seconds: int = 3600,
         suspended_route_ttl_seconds: int = 86400,
         work_items: WorkItemDispatchClient | None = None,
@@ -133,6 +136,10 @@ class Kernel:
         # card teardown -- the resolve-click path still heals a card on click.
         self._card_store = card_store
         self._hook_runs = hook_runs
+        # ADR-0160 (#2878): the coverage reads behind a long scheduled sweep's
+        # continuation and its stop notice. None runs every cron turn exactly
+        # as before.
+        self._sweep = sweep
         self._route_ttl_seconds = route_ttl_seconds
         self._suspended_route_ttl_seconds = suspended_route_ttl_seconds
         self._work_items = work_items
@@ -247,7 +254,13 @@ class Kernel:
     release_thread = delivery.release_thread
     interrupt_agent = delivery.interrupt_agent
     _close_hook_run_after_error = hooks._close_hook_run_after_error
+    _post_notice_after_error = hooks._post_notice_after_error
     _start_turn_under_hook_control = hooks._start_turn_under_hook_control
+    _sweep_run = sweep_slices._sweep_run
+    _sweep_read = sweep_slices._sweep_read
+    _continue_sweep = sweep_slices._continue_sweep
+    _coverage_notice = sweep_slices._coverage_notice
+    _post_coverage_notice = sweep_slices._post_coverage_notice
     process_event = lifecycle.process_event
     _process_event = lifecycle._process_event
     _acquire_order_entry = lifecycle._acquire_order_entry

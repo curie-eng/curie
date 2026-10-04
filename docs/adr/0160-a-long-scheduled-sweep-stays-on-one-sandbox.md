@@ -8,6 +8,8 @@ keeps the one sandbox it already has.
 
 Status: Accepted
 
+**Superseded in part by [ADR-0188](0188-the-sandbox-memory-credential-is-scoped-to-its-own-channel.md)** (back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)): ADR-0188 decision 3 replaces this record's checkpoint store. A per-source checkpoint is a memory fact under a `fact-` key, written with the per-turn write credential of ADR-0188 decision 4, not an append to the memory log through the runner memory port.
+
 Maintainer acceptance for this record is its merge onto the feature train.
 The decision is published here so implementation can follow it. No
 implementation lands with this record. Issue

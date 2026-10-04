@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from aci_protocol import (
     QueuedTurn,
+    TurnSource,
 )
 from channel_protocol.reply import (
     REPLY_WIRE_VERSION,
@@ -13,6 +16,7 @@ from channel_protocol.reply import (
     TurnStatus,
 )
 
+from .. import sweep
 from ..behaviorpacks import (
     BehaviorPacks,
     sample_load,
@@ -49,6 +53,7 @@ async def _complete(
     lease: DeliveryLease | None = None,
     hook_outcome: HookRunOutcome | None = None,
     turn: failures.TurnOutcome | None = None,
+    successor: QueuedTurn | None = None,
 ) -> None:
     """The terminal ordering, at every durable ``mark_done`` call site.
 
@@ -76,6 +81,11 @@ async def _complete(
     second sanctioned source -- no adapter can write to the stream, so the
     handle is trustworthy). A terminal path that marked done without a record
     would be a completion nothing could ever recover.
+    ``successor`` is the next slice of a long scheduled sweep (ADR-0160,
+    #2878), published atomically with this settle by
+    ``Markers.settle_fenced_and_publish``; the hook run stays open. A sweep
+    that stopped instead gets its coverage notice posted here, and only once
+    the settle was won.
     A targetless cron turn (#2963) is the one exception: no adapter is
     waiting, so no completion is owed, and ``_settle_targetless`` marks it
     done with no record.
@@ -180,6 +190,16 @@ async def _complete(
                 qevent.event_id,
                 exc.code,
             )
+    if (
+        hook_outcome is None
+        and successor is None
+        and qevent.source is TurnSource.CRON
+        and sweep.parse_continuation(qevent.event_id) is not None
+    ):
+        # A continuation that ends without an outcome of its own (refused
+        # before runner admission, a drop, an already-terminal row) is a
+        # sweep stop: close it so the stop is recorded and reported (#2878).
+        hook_outcome = "failed"
     if hook_outcome is None and routing._is_targetless(qevent):
         # A targeted terminal that started nothing (an escalation, a refused
         # admission or workspace) leaves the row open for a human reading the
@@ -188,6 +208,7 @@ async def _complete(
         # an attempt started and ended ok, otherwise "failed" (#2963).
         hook_outcome = "failed"
     hook_carry = constants._HOOK_RUN_CARRY.get()
+    notice: str | None = None
     if (
         hook_outcome is not None
         and hook_carry is not None
@@ -195,7 +216,12 @@ async def _complete(
         and hook_carry.ref is not None
         and not (claim._is_fenced(lease) and lease is not None and lease.lost.is_set())
     ):
-        await hook_carry.recorder.close(hook_carry.ref, hook_outcome)
+        if await hook_carry.recorder.close(hook_carry.ref, hook_outcome):
+            # Computed now, posted only once the settle below is won. Kept on
+            # the carry until then, so a settle that raises still leaves the
+            # notice to the error close (#2878).
+            notice = await self._coverage_notice(qevent, hook_outcome)
+            hook_carry.notice_pending = notice
     event_id = qevent.event_id
     if routing._is_targetless(qevent):
         await self._settle_targetless(qevent, outcome, telemetry_outcome, lease)
@@ -222,20 +248,25 @@ async def _complete(
     )
     if claim._is_fenced(lease):
         assert lease is not None  # narrowed by _is_fenced
-        fenced = await self._markers.settle_fenced(
-            event_id,
-            record,
-            # The delivery this lease was GRANTED for, carried on the lease
-            # itself. Not `self._config.stream`: the fence must be checked
-            # against the exact keys the lease was acquired on, and the
-            # lease is the only thing that knows which entry that was.
-            stream=lease.stream,
-            group=lease.group,
-            entry_id=lease.entry_id,
-            owner=lease.owner,
-            generation=lease.generation,
-            marker_value=marker_value,
-        )
+        if successor is not None:
+            fenced = await _settle_and_publish(
+                self, event_id, record, lease, marker_value=marker_value, successor=successor
+            )
+        else:
+            fenced = await self._markers.settle_fenced(
+                event_id,
+                record,
+                # The delivery this lease was GRANTED for, carried on the lease
+                # itself. Not `self._config.stream`: the fence must be checked
+                # against the exact keys the lease was acquired on, and the
+                # lease is the only thing that knows which entry that was.
+                stream=lease.stream,
+                group=lease.group,
+                entry_id=lease.entry_id,
+                owner=lease.owner,
+                generation=lease.generation,
+                marker_value=marker_value,
+            )
         if fenced is None:
             # The single most diagnostic line in this feature: it is the
             # only record that a turn ran to a terminal outcome and then
@@ -257,12 +288,27 @@ async def _complete(
             # the consumer's pre-ACK check is what keeps this owner from
             # acking a delivery it just failed to settle.
             lease.lost.set()
+            if hook_carry is not None:
+                # The replacement owns this delivery's report.
+                hook_carry.notice_pending = None
             return
         generation = fenced
     else:
         generation = await self._markers.mark_completion_pending(event_id, record)
+        if successor is not None:
+            # Leaseless and NOT atomic: no fence to publish behind. A crash
+            # here leaves a successor and a pending predecessor, whose
+            # redelivery escalates on its side-effect marker while the
+            # successor drops at the terminal-row preamble.
+            await self._markers.publish_successor(self._config.stream, successor.model_dump_json())
         await self._markers.mark_done(event_id, marker_value=marker_value)
     constants._LIFECYCLE_OUTCOME.set(telemetry_outcome)
+    if notice is not None:
+        # Claimed before the post, so a cancellation during or after it can
+        # never make the error close post the same notice again.
+        if hook_carry is not None:
+            hook_carry.notice_pending = None
+        await self._post_coverage_notice(qevent, route, notice)
     await self._deliver_completion(record, generation=generation)
     attributes = {
         "service.name": "curie-worker",
@@ -282,6 +328,58 @@ async def _complete(
     except ValueError:
         duration = 0.0
     log.record_metric("curie.turn.duration", duration, attributes=attributes)
+
+
+async def _settle_and_publish(
+    self: Kernel,
+    event_id: str,
+    record: CompletionRecord,
+    lease: DeliveryLease,
+    *,
+    marker_value: DoneMarkerValue,
+    successor: QueuedTurn,
+) -> str | None:
+    """The fenced settle that also publishes a sweep's next slice (#2878).
+
+    The record generation is chosen here, so a lost reply can be told apart
+    from a script that never ran: the script sets the published marker to it
+    beside the successor XADD, so if the marker holds ours, the successor
+    exists and this slice is settled. Otherwise the error stands and the carry
+    keeps the run open, because the successor may still exist.
+    """
+    record_generation = uuid.uuid4().hex
+    hook_carry = constants._HOOK_RUN_CARRY.get()
+    if hook_carry is not None:
+        hook_carry.successor_maybe_published = True
+    try:
+        return await self._markers.settle_fenced_and_publish(
+            event_id,
+            record,
+            stream=lease.stream,
+            group=lease.group,
+            entry_id=lease.entry_id,
+            owner=lease.owner,
+            generation=lease.generation,
+            marker_value=marker_value,
+            successor_stream=lease.stream,
+            successor_payload=successor.model_dump_json(),
+            record_generation=record_generation,
+        )
+    except Exception:
+        try:
+            stored = await asyncio.wait_for(
+                self._markers.sweep_published_generation(event_id), timeout=5.0
+            )
+        except Exception:  # noqa: BLE001 - unknown is not committed; the original stands
+            logger.warning("could not read the outcome of sweep slice %s's settle", event_id)
+            stored = None
+        if stored != record_generation:
+            raise
+        logger.warning(
+            "sweep slice %s settled and published its successor; its reply was lost",
+            event_id,
+        )
+        return record_generation
 
 
 async def _settle_targetless(

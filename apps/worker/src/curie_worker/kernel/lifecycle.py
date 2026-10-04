@@ -17,6 +17,7 @@ from channel_protocol.reply import (
 from curie_internal import sandbox_token
 from opentelemetry.trace import SpanKind, StatusCode
 
+from .. import sweep
 from ..behaviorpacks import (
     BehaviorPacks,
 )
@@ -267,9 +268,12 @@ async def _process_event(
                 return
             # Renew the claim lease before the turn starts, so time spent
             # queued never lets the hook's next fire reclaim a live run.
-            # A run reclaimed since the read above is terminal (#2931).
+            # A run reclaimed since the read above is terminal (#2931). The
+            # margin covers a budget-cut sweep slice's interrupt and coverage
+            # read before it renews again (#2878).
             if hook_state.outcome is not None or not await self._hook_runs.renew(
-                qevent.hook_run, self._config.effective_hook_claim_lease_s
+                qevent.hook_run,
+                self._config.effective_hook_claim_lease_s + sweep.HOOK_LEASE_START_MARGIN_S,
             ):
                 logger.info(
                     "cron event %s belongs to an already terminal hook run; dropping",
@@ -288,6 +292,7 @@ async def _process_event(
             hook_carry.recorder = self._hook_runs
             hook_carry.ref = qevent.hook_run
             hook_carry.agent_id = hook_state.agent_id
+            hook_carry.state = hook_state
             expiry = retry_expiry(event_id)
             hook_carry.retry_expires_at = expiry
             if expiry is not None and datetime.now(UTC) >= expiry:
@@ -928,6 +933,29 @@ async def _process_event(
                     return
                 remaining = lease.remaining_s()
                 if remaining <= constants._MIN_ATTEMPT_BUDGET_S:
+                    if (
+                        sweep.parse_continuation(event_id) is not None
+                        and qevent.source is TurnSource.CRON
+                        and hook_carry is not None
+                        and not hook_carry.any_attempt_started
+                    ):
+                        # A sweep continuation that spent its budget waiting
+                        # on the previous slice to wind down ran nothing of
+                        # its own: it stops with the coverage notice alone,
+                        # not a delivery-deadline escalation (#2878).
+                        logger.info(
+                            "sweep continuation %s spent its budget before it started",
+                            event_id,
+                        )
+                        await self._complete(
+                            qevent,
+                            route,
+                            "dropped",
+                            telemetry_outcome="deadline_halted",
+                            lease=lease,
+                            hook_outcome="failed",
+                        )
+                        return
                     # DISTINCT from the model-spend ``budget-exceeded``
                     # classification: this is the wall-clock delivery
                     # deadline, and conflating the two would make both
@@ -967,6 +995,19 @@ async def _process_event(
                     memory_grant=memory_grant,
                 )
             except failures._WorkItemDeferred:
+                return
+            except failures.SweepClaimGone as exc:
+                # ADR-0160: a continuation never claims, resumes or hands off
+                # a sandbox. The sweep stops; ``_complete`` posts the notice.
+                logger.info("sweep continuation %s stopped: %s", event_id, exc)
+                await self._complete(
+                    qevent,
+                    route,
+                    "dropped",
+                    telemetry_outcome="interrupted",
+                    lease=lease,
+                    hook_outcome="failed",
+                )
                 return
             except WorkItemStartRefused as exc:
                 logger.info(
@@ -1010,6 +1051,49 @@ async def _process_event(
                             exc.code,
                         )
                     return
+                if (
+                    qevent.source is TurnSource.CRON
+                    and not targetless
+                    and sweep.parse_continuation(event_id) is not None
+                ):
+                    if isinstance(busy, failures.HookPaused):
+                        # Paused (or the run closed) between slices: the
+                        # sweep stops and reports, never defers (#2878).
+                        await self._complete(
+                            qevent,
+                            route,
+                            "dropped",
+                            telemetry_outcome="interrupted",
+                            lease=lease,
+                            hook_outcome="blocked",
+                        )
+                        return
+                    if isinstance(busy, failures.LiveSessionBusy):
+                        # The previous slice's interrupted turn is still
+                        # winding down in this same session. Deferring would
+                        # restart the sweep later in a fresh session, so wait
+                        # inside this delivery's own budget; the loop top
+                        # stops it once that is spent. The order lock stays
+                        # held: only this hook's deliveries reach its thread.
+                        backoff_s = min(self._backoff(attempt), sweep.MAX_BUSY_PROBE_INTERVAL_S)
+                        if lease is not None:
+                            backoff_s = min(backoff_s, max(0.0, lease.remaining_s()))
+                        elif attempt >= self._config.max_attempts:
+                            await self._complete(
+                                qevent,
+                                route,
+                                "dropped",
+                                telemetry_outcome="interrupted",
+                                lease=lease,
+                                hook_outcome="failed",
+                            )
+                            return
+                        logger.info(
+                            "sweep continuation %s waiting for the previous slice to wind down",
+                            event_id,
+                        )
+                        await asyncio.sleep(backoff_s)
+                        continue
                 if qevent.source is TurnSource.CRON and (
                     isinstance(busy, failures.HookPaused)
                     or (
@@ -1132,6 +1216,21 @@ async def _process_event(
                     hook_outcome=hooks._hook_success_outcome(),
                     turn=outcome,
                 )
+                return
+
+            # ADR-0160: a sweep slice cut by the delivery budget is a slice
+            # boundary, checked before the side-effect halt because every real
+            # sweep writes memory or runs a tool. With no checkpoint showing
+            # progress it falls through to the handling below unchanged.
+            if (
+                qevent.source is TurnSource.CRON
+                and not targetless
+                and self._sweep is not None
+                and lease is not None
+                and outcome.classification in sweep.BUDGET_CUT_CLASSIFICATIONS
+                and lease.remaining_s() <= constants._MIN_ATTEMPT_BUDGET_S
+                and await self._continue_sweep(qevent, route, lease, outcome)
+            ):
                 return
 
             if outcome.saw_side_effect:

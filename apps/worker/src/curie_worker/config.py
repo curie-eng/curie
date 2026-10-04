@@ -1422,6 +1422,12 @@ class WorkerConfig(BaseSettings):
     def done_key(self, event_id: str) -> str:
         return keyspace.done_key(self.key_prefix, event_id)
 
+    def sweep_published_key(self, event_id: str) -> str:
+        # Set beside a sweep slice's successor XADD (ADR-0160, #2878). Unlike
+        # the completion record, an outbox clear never deletes it, so a retried
+        # publishing settle still recognizes its own earlier run.
+        return f"{self.key_prefix}:sweep-published:{event_id}"
+
     def side_effect_key(self, event_id: str) -> str:
         return f"{self.key_prefix}:sidefx:{event_id}"
 

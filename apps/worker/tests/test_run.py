@@ -1278,6 +1278,50 @@ def test_build_wires_dedicated_single_attempt_pressure_clients(
     asyncio.run(exercise())
 
 
+def test_build_wires_the_sweep_coverage_into_the_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+    sync_redis: redis.Redis,
+) -> None:
+    """ADR-0160 (#2878): the kernel reads sweep coverage through the SAME trigger
+    source the cron scheduler fires from, so the sweep date is computed in the
+    zone the slot was scheduled in. Driving a budget cut through ``build()``
+    itself needs a live runner image and API; the production factory ``build()``
+    calls is exercised end to end in ``kernel/test_sweep_continuation.py``."""
+    from curie_worker.sweep import SweepCoverage
+
+    endpoint = sync_redis.connection_pool.connection_kwargs
+    config = WorkerConfig(
+        fake_model=True,
+        valkey_host=str(endpoint["host"]),
+        valkey_port=int(endpoint["port"]),
+        valkey_password=str(endpoint.get("password") or ""),
+        valkey_db=int(endpoint.get("db", 0)),
+        s3_access_key="PLACEHOLDER",
+        s3_secret_key="PLACEHOLDER",
+    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
+
+    async def exercise() -> None:
+        runtime = run.build(config, {"CURIE_SANDBOX_SUBSTRATE": "docker"})
+        affinity_redis = runtime.consumer._kernel._substrate._affinity._redis
+        try:
+            sweep = runtime.consumer._kernel._sweep
+            assert isinstance(sweep, SweepCoverage)
+            assert runtime.cron_loop is not None
+            assert sweep._trigger_source is runtime.cron_loop._source
+        finally:
+            affinity_redis.close()
+            await runtime.runner.close()
+            await runtime.sink.aclose()
+            await runtime.eval_http.aclose()
+            await runtime.async_redis.aclose()
+            await runtime.pressure_async_redis.aclose()
+            await runtime.eval_redis.aclose()
+            await runtime.engine.dispose()
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize(("raw", "expected"), [(None, 16), ("4", 4)])
 def test_max_concurrency_environment_sizes_the_production_runs_consumer(
     monkeypatch: pytest.MonkeyPatch,

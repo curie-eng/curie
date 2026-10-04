@@ -103,10 +103,7 @@ class HookRunSeed:
         async with self.engine.connect() as conn:
             row = (
                 await conn.execute(
-                    text(
-                        "SELECT outcome, ended_at FROM curie.hook_runs "
-                        "WHERE id = :run_id"
-                    ),
+                    text("SELECT outcome, ended_at FROM curie.hook_runs WHERE id = :run_id"),
                     {"run_id": self.run_id},
                 )
             ).one_or_none()
@@ -277,9 +274,7 @@ class FakeSink:
         # so this double records the intent, not blocks. The endpoint is the
         # transport the post is delivered through (#451): None means the worker's
         # default Slack transport.
-        self.posts: list[
-            tuple[str, OutboundMessage, str, str | None, str | None]
-        ] = []
+        self.posts: list[tuple[str, OutboundMessage, str, str | None, str | None]] = []
         # In-place edits of an already-posted message (settling the approval
         # card: expired in #419, resolved in #1084):
         # (channel, ts, message, endpoint, settled) per update_message. Like
@@ -517,9 +512,7 @@ class FakeK8s:
             name=sandbox_name, port=self._take_port(sandbox_name)
         )
 
-    def get_claim(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> ClaimView | None:
+    def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
         assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None:
@@ -556,9 +549,7 @@ class FakeK8s:
         self.template_reaps.append((set(keep), created_before))
         return []
 
-    def get_sandbox(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> SandboxView | None:
+    def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None:
         assert request_timeout_seconds > 0
         sandbox = self.sandboxes.get(name)
         if sandbox is None:
@@ -789,9 +780,7 @@ class FakeRunner:
     async def _steer(self, request: web.Request) -> web.Response:
         self.steer_headers.append(dict(request.headers))
         body = await request.json()
-        if not self.turn_active or (
-            self._admission_gate is not None and not self.turn_ready
-        ):
+        if not self.turn_active or (self._admission_gate is not None and not self.turn_ready):
             return web.json_response({"error": "no active turn"}, status=409)
         self.steers.append(body["text"])
         return web.json_response({"ok": True})
@@ -982,7 +971,10 @@ def make_harness(
     -- a real ``ReplySinkRouter`` for the adapter-selection tests, T-B3/T-B4);
     ``sibling_limit_factory`` builds the kernel's sibling limit from the
     harness's own Valkey client and config, and ``progress_factory`` its
-    deliberate progress store the same way; the rest are config overrides.
+    deliberate progress store the same way, and ``sweep_factory`` its
+    ``SweepCoverage`` (ADR-0160, #2878; omitted, the kernel has no sweep
+    service and every cron turn runs exactly as before); the rest are config
+    overrides.
     ``runner_total_timeout_s`` is an ordinary
     config override: it drives BOTH the ``WorkerConfig`` and the
     ``RunnerClient``'s streaming budget (mirroring ``run.py``), so a test that
@@ -1024,6 +1016,7 @@ async def kernel_harness(
     hook_runs: object | None = None,
     sibling_limit_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     progress_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
+    sweep_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel wired to a fake runner and real Valkey."""
@@ -1129,9 +1122,7 @@ async def kernel_harness(
         approval_reader=approval_reader,  # type: ignore[arg-type]
         actions=actions,  # type: ignore[arg-type]
         publication_creator=publication_creator,  # type: ignore[arg-type]
-        workspace=(
-            workspace_factory(substrate) if workspace_factory else None
-        ),  # type: ignore[arg-type]
+        workspace=(workspace_factory(substrate) if workspace_factory else None),  # type: ignore[arg-type]
         card_store=card_store,
         route_ttl_seconds=substrate._config.route_ttl_seconds,
         suspended_route_ttl_seconds=substrate._config.suspended_route_ttl_seconds,
@@ -1146,6 +1137,7 @@ async def kernel_harness(
             if progress_factory is not None
             else {}
         ),
+        **({"sweep": sweep_factory(async_redis, config)} if sweep_factory is not None else {}),
     )
     killswitch = None
     if with_killswitch:

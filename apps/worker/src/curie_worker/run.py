@@ -48,7 +48,7 @@ from .config import WorkerConfig
 from .connector_loop import ConnectorReconcileLoop, HttpManifestSource
 from .consumer import Consumer
 from .consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
-from .cron_loop import BundleTriggerSource, CronSchedulerLoop
+from .cron_loop import BundleTriggerSource, CronSchedulerLoop, TriggerSource
 from .dead_letter_alert import install_dead_letter_alerting
 from .delivery_lease import DeliveryLeaseStore
 from .deploy_notice import DeployNoticeConsumer
@@ -88,6 +88,7 @@ from .sandbox import (
 from .sibling_turns import build_sibling_limit
 from .slack_tokens import slack_bot_tokens
 from .stream_retention import StreamRetention, build_stream_retention
+from .sweep import SweepCoverage
 from .threadlock import ThreadLock
 from .upgrade_drain import UpgradeDrainGate
 from .workitem_dispatch import WorkItemDispatchClient
@@ -281,6 +282,25 @@ def _workspace_limits(config: WorkerConfig) -> WorkspaceLimits:
         max_compression_ratio=config.workspace_max_compression_ratio,
         reference_ttl_seconds=config.workspace_reference_ttl_seconds,
         max_concurrent_clones=config.workspace_max_concurrent_clones,
+    )
+
+
+def build_sweep_coverage(
+    config: WorkerConfig,
+    *,
+    engine: AsyncEngine,
+    trigger_source: TriggerSource,
+    client: httpx.AsyncClient,
+) -> SweepCoverage:
+    """The kernel's sweep coverage reader (ADR-0160, #2878), on the platform key."""
+
+    return SweepCoverage(
+        engine=engine,
+        db_schema=config.db_schema,
+        trigger_source=trigger_source,
+        client=client,
+        api_base_url=config.api_base_url,
+        api_key=config.api_key,
     )
 
 
@@ -523,6 +543,14 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         if config.internal_worker_token
         else None
     )
+    # One bundle trigger source, shared: the cron loop fires slots from it, and
+    # a sweep's coverage read dates the slot in the same trigger's zone (#2878).
+    trigger_source = BundleTriggerSource(
+        BundleStore(config),
+        max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
+        max_compression_ratio=config.bundle_max_compression_ratio,
+        max_members=config.bundle_max_members,
+    )
     kernel = Kernel(
         substrate=substrate,
         runner=runner,
@@ -568,6 +596,9 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         actions=action_client,
         card_store=card_store,
         hook_runs=HookRunRecorder(engine, config.db_schema),
+        sweep=build_sweep_coverage(
+            config, engine=engine, trigger_source=trigger_source, client=eval_http
+        ),
         route_ttl_seconds=sub_config.route_ttl_seconds,
         suspended_route_ttl_seconds=sub_config.suspended_route_ttl_seconds,
         work_items=work_items,
@@ -675,12 +706,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         cron_loop=CronSchedulerLoop(
             engine=engine,
             redis=async_redis,
-            source=BundleTriggerSource(
-                BundleStore(config),
-                max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
-                max_compression_ratio=config.bundle_max_compression_ratio,
-                max_members=config.bundle_max_members,
-            ),
+            source=trigger_source,
             is_killed=killswitch.is_killed,
             db_schema=config.db_schema,
             stream=config.stream,
