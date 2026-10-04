@@ -94,6 +94,45 @@ def test_refuses_runtime_changes_after_the_snapshot_pin(tmp_path):
         )
 
 
+def test_version_only_paths_are_the_shared_set_plus_that_releases_snapshot():
+    """#3858: the selector and the tag gate share this one definition."""
+    module = load_module()
+
+    assert module.version_only_paths("v0.11.2") == frozenset(
+        {
+            "charts/curie/Chart.yaml",
+            "cli/Cargo.lock",
+            "cli/Cargo.toml",
+            "docs/architecture-atlas/versions.json",
+            "docs/architecture-atlas/snapshots/v0.11.2.json",
+        }
+    )
+    assert module.version_only_paths("v0.11.2") == module.VERSION_ONLY_PATHS | {
+        "docs/architecture-atlas/snapshots/v0.11.2.json"
+    }
+    assert (
+        "docs/architecture-atlas/snapshots/v0.11.2.json"
+        not in module.version_only_paths("v0.12.0-rc.1")
+    )
+
+
+def test_refuses_another_releases_snapshot_after_the_pin(tmp_path):
+    """#3858: only the release's own snapshot is version-only, not any snapshot."""
+    module = load_module()
+    atlas_dir = write_atlas(tmp_path, commit="b" * 40)
+
+    with pytest.raises(module.AtlasError, match="v9.9.9"):
+        module.require_release_snapshot(
+            atlas_dir,
+            "v1.2.3",
+            "a" * 40,
+            changed_paths=[
+                "cli/Cargo.toml",
+                "docs/architecture-atlas/snapshots/v9.9.9.json",
+            ],
+        )
+
+
 def test_refuses_a_snapshot_whose_metadata_does_not_match_the_manifest(tmp_path):
     module = load_module()
     atlas_dir = write_atlas(tmp_path)

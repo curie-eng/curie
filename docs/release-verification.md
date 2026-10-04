@@ -35,6 +35,13 @@ patch release PR whose title matches `Prepare the vX.Y.Z release` when either
 section is missing, comment-only, or empty of those contents. Feature releases
 (`vX.Y.0`) are not this gate.
 
+The preparation PR's own CI run is proof for every rung CI ran on that tree.
+For a version-only preparation PR, that is the local-release rung, version
+consistency, the schema window, the release tests, and chart lint. Do not rerun
+those locally. Live proof is a separate thing: it still names a run URL that
+re-verified each trigger. At tag time the gate accepts the version-only parent's
+checks under [ADR 0195](adr/0195-a-version-only-delta-reuses-its-parents-checks.md).
+
 When an open issue is moved out of the milestone within 24 hours of the cut,
 comment on that issue naming the release it moved from. That is a process
 rule: the PR-body gate does not observe milestone moves. A milestone that

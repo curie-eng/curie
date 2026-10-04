@@ -1047,10 +1047,15 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     assert job.get("name") == "Python (ruff + mypy + pytest)"
     # The suite runs in the python-pytest shards; the required job only waits
     # for them to aggregate their results, and always() keeps it from skipping.
-    assert job.get("needs") == "python-pytest"
+    assert job.get("needs") == ["changes", "python-pytest"]
     assert job.get("if") == "always()", "the required Python check must not be skippable"
     shard_job, steps = _python_job(document, "python-pytest")
-    assert "needs" not in shard_job and "if" not in shard_job
+    # #3858: the shards wait for the `changes` selection and run only when it
+    # selected pytest; the required job above still reports either way.
+    shard_needs = shard_job.get("needs")
+    shard_needs = [shard_needs] if isinstance(shard_needs, str) else list(shard_needs or [])
+    assert "changes" in shard_needs
+    assert shard_job.get("if") == "${{ needs.changes.outputs.pytest == 'true' }}"
 
     permissions = job.get("permissions")
     assert isinstance(permissions, dict), "the Python job must declare job level permissions"

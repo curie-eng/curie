@@ -110,6 +110,12 @@ jobs:
   # on the critical path of every required run.
   python-pytest:
     name: Python pytest (shard ${{ matrix.shard }}/3)
+    # Job-level gate (#3858): an unselected run (docs-only or version-only)
+    # skips the shards instead of booting three runners that only record a
+    # skip. The required `python` job below still reports, and its aggregate
+    # step accepts the skipped shard job only when it too selected no pytest.
+    needs: [changes]
+    if: ${{ needs.changes.outputs.pytest == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -152,17 +158,16 @@ jobs:
           python-version: "3.13"
       - name: Sync workspace
         run: uv sync
-      # Docs-only diffs still run ruff/mypy/docs/alembic/wire-lock above. Reuse
-      # ignored_prefixes from .github/e2e-selection.yaml so a guides edit does
-      # not boot postgres; packages/, apps/, runner/, examples/tests/, cli,
-      # uv.lock, and pyproject.toml still select pytest. The required check
-      # name stays `Python (ruff + mypy + pytest)` so the ruleset gates the
-      # suite when it is selected.
+      # The job-level gate above already skips the shards when `changes` did
+      # not select pytest. The shard still recomputes the selection itself and
+      # records it, so the required job can cross-check that every shard agreed
+      # with its own decision. Every event other than a pull request selects
+      # everything, as `changes` does (#3858).
       - name: Decide whether compose and pytest are needed
         id: python-runtime
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
             uv run python tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --push
@@ -254,10 +259,13 @@ jobs:
 
   python:
     name: Python (ruff + mypy + pytest)
-    # `needs` only orders this job after the shards; `always()` keeps it
+    # `needs` orders this job after the shards; `always()` keeps it
     # running (and so reporting the required check) whatever the shards did.
-    # A failed, cancelled, or skipped shard fails the aggregate step below.
-    needs: python-pytest
+    # A failed or cancelled shard fails the aggregate step below, and so does a
+    # skipped shard job unless this job also selected no pytest (#3858). It also
+    # needs `changes` so a failed or disagreeing selection cannot pass as a
+    # legitimate skip.
+    needs: [changes, python-pytest]
     if: always()
     runs-on: ubuntu-latest
     # A job-level block REPLACES the workflow-level one, so `contents: read` is
@@ -337,14 +345,17 @@ jobs:
       # Docs-only diffs still run ruff/mypy/docs/alembic/wire-lock above. Reuse
       # ignored_prefixes from .github/e2e-selection.yaml so a guides edit does
       # not boot postgres; packages/, apps/, runner/, examples/tests/, cli,
-      # uv.lock, and pyproject.toml still select pytest. The required check
-      # name stays `Python (ruff + mypy + pytest)` so the ruleset gates the
-      # suite when it is selected.
+      # uv.lock, and pyproject.toml still select pytest, except on a
+      # version-only release bump, which reuses the proof its base already has
+      # (#3858). Every event other than a pull request selects everything, as
+      # `changes` does. The required check name stays
+      # `Python (ruff + mypy + pytest)` so the ruleset gates the suite when it
+      # is selected.
       - name: Decide whether compose and pytest are needed
         id: python-runtime
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
             uv run python tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --push
@@ -356,6 +367,12 @@ jobs:
               --base "origin/$base" \
               --head HEAD
           fi
+      # The shards run release/tests whenever pytest is selected. When it is
+      # not (a docs-only or version-only diff), run them here so a release bump
+      # still proves the tag gate and release tooling on the new commit (#3858).
+      - name: Release tests
+        if: steps.python-runtime.outputs.pytest == 'false'
+        run: uv run pytest -q release/tests
       # The committed-lock test only proves the lock matches the current wire; it
       # passes even if the lock was regenerated without a version bump. Compare
       # against the BASE branch's lock so an unbumped wire change actually fails
@@ -368,31 +385,56 @@ jobs:
           git show "origin/${{ github.base_ref || 'main' }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
           uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
       - name: Download shard results
+        if: steps.python-runtime.outputs.pytest == 'true'
         uses: actions/download-artifact@v8
         with:
           pattern: python-pytest-shard-*
           path: shard-results
           merge-multiple: true
-      # Keep the required Python check honest: every shard must have reported,
-      # agreed with this job's own selection, and matched it (a selected skip or
-      # an unselected run fails), and the shard jobs themselves must have
-      # succeeded, so a real test failure in any shard fails this check.
+      # Keep the required Python check honest. When this job selected pytest,
+      # every shard must have reported, agreed with that selection, and run it,
+      # and the shard jobs themselves must have succeeded, so a real test
+      # failure in any shard fails this check. When it did not, the shard job
+      # must have been skipped by its job-level gate and left no shard record
+      # (#3858); a shard job that ran, or any record, means the two selections
+      # disagreed.
       - name: Require pytest outcome to match selection
         if: success()
         env:
           PYTEST_SELECTED: ${{ steps.python-runtime.outputs.pytest }}
           SHARDS_RESULT: ${{ needs.python-pytest.result }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHANGES_PYTEST: ${{ needs.changes.outputs.pytest }}
           SHARD_COUNT: "3"
           SHARD_RESULTS_DIR: shard-results
         run: |
           set -euo pipefail
-          expected=skipped
-          if [[ "$PYTEST_SELECTED" == "true" ]]; then
-            expected=success
-          elif [[ "$PYTEST_SELECTED" != "false" ]]; then
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "the changes job finished $CHANGES_RESULT; pytest selection cannot be trusted" >&2
+            exit 1
+          fi
+          if [[ "$CHANGES_PYTEST" != "$PYTEST_SELECTED" ]]; then
+            echo "changes job selected pytest=${CHANGES_PYTEST:-<empty>}, but this job selected ${PYTEST_SELECTED:-<empty>}" >&2
+            exit 1
+          fi
+          if [[ "$PYTEST_SELECTED" == "false" ]]; then
+            if [[ "$SHARDS_RESULT" != "skipped" ]]; then
+              echo "pytest was not selected, but the shards finished $SHARDS_RESULT" >&2
+              exit 1
+            fi
+            if [[ -d "$SHARD_RESULTS_DIR" ]] \
+              && [[ -n "$(find "$SHARD_RESULTS_DIR" -type f -print -quit)" ]]; then
+              echo "pytest was not selected, but a shard reported a result" >&2
+              exit 1
+            fi
+            echo "Python pytest not selected; the shard job was skipped"
+            exit 0
+          fi
+          if [[ "$PYTEST_SELECTED" != "true" ]]; then
             echo "pytest selection must be true or false, got ${PYTEST_SELECTED:-<empty>}" >&2
             exit 1
           fi
+          expected=success
           if [[ "$SHARDS_RESULT" != "success" ]]; then
             echo "pytest shards finished $SHARDS_RESULT" >&2
             exit 1
@@ -483,6 +525,7 @@ jobs:
   # a path the list misses is still caught before a release.
   rust-select:
     name: Select Rust tests
+    needs: [changes]
     runs-on: ubuntu-latest
     outputs:
       tests: ${{ steps.select.outputs.tests }}
@@ -495,11 +538,19 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          VERSION_ONLY: ${{ needs.changes.outputs.version_only }}
         run: |
           set -euo pipefail
           if [ "$EVENT" != "pull_request" ]; then
             echo "tests=true ($EVENT always runs the Rust tests)"
             echo "tests=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A version-only release bump (#3858) reuses the base's Rust proof;
+          # rust-lint still checks version consistency and clippy on it.
+          if [ "$VERSION_ONLY" = "true" ]; then
+            echo "Version-only change; skipping the Rust test partitions."
+            echo "tests=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git fetch --quiet origin "$BASE_REF"
@@ -1973,6 +2024,8 @@ jobs:
       skill_local_tiers: ${{ steps.filter.outputs.skill_local_tiers }}
       images: ${{ steps.filter.outputs.images }}
       cli_release: ${{ steps.filter.outputs.cli_release }}
+      pytest: ${{ steps.filter.outputs.pytest }}
+      version_only: ${{ steps.filter.outputs.version_only }}
       runtime_assertions: ${{ steps.runtime.outputs.runtime_assertions }}
     steps:
       - uses: actions/checkout@v7
