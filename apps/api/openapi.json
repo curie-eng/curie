@@ -7754,7 +7754,7 @@
       },
       "VerificationObservation": {
         "additionalProperties": false,
-        "description": "One declared check's sandbox result recorded before the model starts.\n\n``check`` is the declared check id and ``command`` the exact command the\nrunner ran for it. ``not_declared`` records that neither the bundle nor the\nrepository declared a check, so no command ran: its check, command and\nexit_status are null and it carries no blockers.",
+        "description": "One declared check's sandbox result recorded before the model starts.\n\n``check`` is the declared check id and ``command`` the exact command the\nrunner ran for it. ``not_declared`` records that neither the bundle nor the\nrepository declared a check, so no command ran: its check, command and\nexit_status are null and it carries no blockers. ``delegated_to`` optionally\nnames the required CI check that stands in for a declared check; it is\nnever valid on ``not_declared``.",
         "properties": {
           "blocked_services": {
             "items": {
@@ -7788,6 +7788,19 @@
               }
             ],
             "title": "Command"
+          },
+          "delegated_to": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delegated To"
           },
           "exit_status": {
             "anyOf": [
