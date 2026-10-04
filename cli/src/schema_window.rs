@@ -448,19 +448,21 @@ mod tests {
             .expect("candidate bounds are catalogued and ordered");
         assert!(live_in_window("0076", &current));
         assert!(!live_in_window("0075", &current));
-        let retained = window_for("0.12.1").expect("prior foundation remains catalogued");
+        let retained = window_for("0.12.0").expect("published foundation remains catalogued");
         assert_eq!(retained.schema_min, "0070");
-        assert_eq!(retained.schema_head, "0075");
+        assert_eq!(retained.schema_head, "0073");
         assert!(live_in_window("0070", &retained));
         assert!(live_in_window("0071", &retained));
         assert!(live_in_window("0072", &retained));
         assert!(live_in_window("0073", &retained));
-        assert!(live_in_window("0075", &retained));
+        assert!(!live_in_window("0075", &retained));
         assert!(!live_in_window("0069", &retained));
 
-        let candidate_release = window_for("0.12.1").expect("prior foundation remains catalogued");
-        assert_eq!(candidate_release.schema_min, retained.schema_min);
-        assert_eq!(candidate_release.schema_head, retained.schema_head);
+        let candidate_release = window_for("0.12.1").expect("promoted candidate is catalogued");
+        assert_eq!(candidate_release.schema_min, candidate.schema_min);
+        assert_eq!(candidate_release.schema_head, candidate.schema_head);
+        assert!(live_in_window("0076", &candidate_release));
+        assert!(!live_in_window("0075", &candidate_release));
         let stable = window_for("0.12.0").expect("released window remains catalogued");
         assert_eq!(stable.schema_min, "0070");
         assert_eq!(stable.schema_head, "0073");
