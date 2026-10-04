@@ -103,11 +103,18 @@ def test_every_worker_text_statement_plans_against_migrations(
         constructor_names.update(f"{module}.text" for module in module_aliases)
         for module, imported in module_aliases.items():
             if imported == "sqlalchemy":
-                constructor_names.update(
-                    {f"{module}.sql.text", f"{module}.sql.expression.text"}
-                )
+                constructor_names.update({f"{module}.sql.text", f"{module}.sql.expression.text"})
             elif imported == "sqlalchemy.sql":
                 constructor_names.add(f"{module}.expression.text")
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            for alias in node.names:
+                local = alias.asname or alias.name
+                if node.module == "sqlalchemy" and alias.name == "sql":
+                    constructor_names.update({f"{local}.text", f"{local}.expression.text"})
+                elif node.module == "sqlalchemy.sql" and alias.name == "expression":
+                    constructor_names.add(f"{local}.text")
         expected.update(
             f"{path.relative_to(ROOT).as_posix()}:{node.lineno}"
             for node in ast.walk(tree)
@@ -149,6 +156,8 @@ def test_publication_result_sql_discovers_filtered_and_unfiltered_branches() -> 
         ("import sqlalchemy as sa", "sa.text"),
         ("import sqlalchemy as sa", "sa.sql.text"),
         ("import sqlalchemy", "sqlalchemy.sql.expression.text"),
+        ("from sqlalchemy import sql as sa_sql", "sa_sql.expression.text"),
+        ("from sqlalchemy.sql import expression as expr", "expr.text"),
     ],
 )
 def test_sql_discovery_accepts_sqlalchemy_constructor_spellings(
@@ -264,11 +273,36 @@ _BRANCHING_SQL = [
         "    else:\n"
         '        sql = "{second_sql}"\n'
     ),
+    (
+        '    sql = "{second_sql}"\n'
+        "    while flag:\n"
+        '        sql = "{first_sql}"\n'
+        "        flag = False\n"
+        "        continue\n"
+        '        sql = "{second_sql}"\n'
+    ),
+    (
+        '    sql = "{second_sql}"\n'
+        "    for item in flag:\n"
+        '        sql = "{first_sql}"\n'
+        "        continue\n"
+        '        sql = "{second_sql}"\n'
+    ),
 ]
 
 
 @pytest.mark.parametrize(
-    "branch", _BRANCHING_SQL, ids=["try_except", "match", "while", "while_else", "for_else"]
+    "branch",
+    _BRANCHING_SQL,
+    ids=[
+        "try_except",
+        "match",
+        "while",
+        "while_else",
+        "for_else",
+        "while_continue",
+        "for_continue",
+    ],
 )
 def test_sql_branch_discovery_cannot_hide_an_earlier_missing_column(
     tmp_path: Path, branch: str
@@ -294,7 +328,17 @@ def test_sql_branch_discovery_cannot_hide_an_earlier_missing_column(
 
 
 @pytest.mark.parametrize(
-    "branch", _BRANCHING_SQL, ids=["try_except", "match", "while", "while_else", "for_else"]
+    "branch",
+    _BRANCHING_SQL,
+    ids=[
+        "try_except",
+        "match",
+        "while",
+        "while_else",
+        "for_else",
+        "while_continue",
+        "for_continue",
+    ],
 )
 def test_sql_branch_discovery_accepts_valid_sql_in_every_branch(
     tmp_path: Path, branch: str
