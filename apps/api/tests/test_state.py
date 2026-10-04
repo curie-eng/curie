@@ -23,7 +23,7 @@ from curie_api.routers.state import (
     _json_size,
     _namespace_lock_key,
 )
-from curie_api.sandbox_token import mint
+from curie_internal.sandbox_token import mint
 from curie_telemetry import build_resource, configure_meter_provider
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader

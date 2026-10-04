@@ -29,8 +29,8 @@ import json
 from typing import Any
 
 import pytest
-from curie_api import sandbox_token
 from curie_api.channel_token import CHANNEL_ENQUEUE_SCOPE, mint, verify
+from curie_internal import sandbox_token
 
 KEY = "curie-dev-key"
 OTHER_KEY = "some-other-platform-key"

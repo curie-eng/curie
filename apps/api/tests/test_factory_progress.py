@@ -23,10 +23,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from curie_api import sandbox_token
 from curie_api.config import get_settings
 from curie_api.factory_progress import phase_view, pill_for
 from curie_api.models import ExecutionRequestPhaseReport
+from curie_internal import sandbox_token
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     _label,
     _request,

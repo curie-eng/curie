@@ -31,6 +31,7 @@ import json
 import time
 import uuid
 
+from curie_internal.sandbox_token import verify
 from curie_worker.binding import (
     SANDBOX_TOKEN_TTL_SECONDS,
     BindingResolver,
@@ -38,7 +39,6 @@ from curie_worker.binding import (
     inject_connector_secrets,
 )
 from curie_worker.config import WorkerConfig
-from curie_worker.sandbox_token import verify
 from nacl.signing import SigningKey
 
 _AGENT = uuid.UUID("11111111-1111-4111-8111-111111111111")

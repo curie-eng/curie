@@ -37,7 +37,6 @@ from curie_api.models import Approval
 from curie_api.resumequeue import ResumeQueue
 from curie_api.resumereconciler import ResumeReconciler
 from curie_api.routers import approvals as approvals_module
-from curie_api.sandbox_token import mint
 from curie_api.slack_approvers import SlackApproverSetSelector
 from curie_api.slack_usergroups import SlackUserGroupClient
 from curie_api.sweeper import (
@@ -45,6 +44,7 @@ from curie_api.sweeper import (
     run_expiry_sweeper,
     sweep_expired_approvals,
 )
+from curie_internal.sandbox_token import mint
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     extract_trace_context,
