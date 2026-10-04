@@ -146,7 +146,29 @@ expect_render_fail() {
 }
 expect_render_fail "agentSandbox.runnerImages.factory" --set-string "agentSandbox.runnerImages.factory=ghcr.io/acme/factory-runner:1.0"
 expect_render_fail "agentSandbox.runnerImages.factory" --set-string "agentSandbox.runnerImages.factory=ghcr.io/acme/factory-runner:1.0@sha256:abc"
+expect_render_fail "agentSandbox.runnerImages.factory" --set-string "agentSandbox.runnerImages.factory=null"
 expect_render_fail "agentSandbox.runnerImages.Bad_Name" --set-string "agentSandbox.runnerImages.Bad_Name=$DIGEST_A"
+
+# A retained values file that simply omits a stale agent does not render that
+# digest. The sibling layer and the connector secret stay. A null map entry is
+# not this case: the string "null" above is still refused.
+cat >"$TMP/layered-values.json" <<EOF
+{"agentSandbox":{"runnerImages":{"factory":"$DIGEST_A","acme-other":"$DIGEST_B"},"connectorSecrets":{"factory":{"API_TOKEN":"acme-secret"}}}}
+EOF
+render -f "$TMP/layered-values.json" >"$TMP/both-values.yaml" || fail "values render"
+grep -q "$DIGEST_A" "$TMP/both-values.yaml" || fail "factory digest missing from values render"
+grep -q "$DIGEST_B" "$TMP/both-values.yaml" || fail "sibling digest missing from values render"
+python3 - <<PY
+import json
+path = "$TMP/layered-values.json"
+doc = json.load(open(path))
+del doc["agentSandbox"]["runnerImages"]["factory"]
+json.dump(doc, open(path, "w"))
+PY
+render -f "$TMP/layered-values.json" >"$TMP/omitted.yaml" || fail "omitted key render"
+if grep -q "$DIGEST_A" "$TMP/omitted.yaml"; then fail "omitted factory digest still rendered"; fi
+grep -q "$DIGEST_B" "$TMP/omitted.yaml" || fail "sibling digest dropped when factory was omitted"
+grep -q "acme-secret" "$TMP/omitted.yaml" || fail "connector secret dropped when factory was omitted"
 
 # (f) the invariant checker must reject a prewarm that drops the digest container.
 python3 - "$TMP/layered.yaml" "$TMP/mutated.yaml" <<'PY'

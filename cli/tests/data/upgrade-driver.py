@@ -163,6 +163,7 @@ BASE = {
     "compat_metadata": None,
     "drain_annotation": "auto",
     "drain_render_fails": False,
+    "upgrade_fails": False,
 }
 
 SCENARIOS = {
@@ -228,6 +229,8 @@ SCENARIOS = {
     "drain-annotation-missing": {"drain_annotation": None},
     "drain-annotation-invalid": {"drain_annotation": "many"},
     "drain-render-fails": {"drain_render_fails": True},
+    # Helm exits 1 with the chart's nil digest refusal and creates no revision.
+    "helm-upgrade-fails": {"upgrade_fails": True},
     # Every checkpoint write fails, starting with the first one before any
     # mutation.
     "persist-fails": {"checkpoint_patch_fails": "always"},
@@ -750,10 +753,20 @@ if program == "helm":
         values = flag_value("-f")
         if values:
             capture("values", ".yaml", values)
+        if scenario["upgrade_fails"]:
+            print(
+                "Error: execution error at (curie/templates/agent-sandbox.yaml:870:4): "
+                'agentSandbox.runnerImages.acme-bot must be a digest reference, got "<nil>"',
+                file=sys.stderr,
+            )
+            sys.exit(1)
         print("Release accepted")
         sys.exit(0)
 
 if program == "kubectl":
+    if args[:1] == ["-n"] and "delete" in args and "sandboxclaim" in args:
+        print("sandboxclaim deleted")
+        sys.exit(0)
     if scenario["workloads_fail"] and args[:3] == ["get", WORKLOADS, "-n"]:
         print("Error from server (Forbidden): workloads is forbidden", file=sys.stderr)
         sys.exit(1)
