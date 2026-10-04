@@ -302,17 +302,14 @@ class ConnectorsFile(BaseModel):
 
 _NAME_RE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
 
-# The two keys Curie's own platform MCP servers occupy on
-# ``ClaudeAgentOptions.mcp_servers``: the approval server and the durable
-# state server. A connector declaring one of these names replaces a platform
-# server in the agent's session -- silently, since both ride the same map a
-# declared connector rides -- and the agent loses ``request_approval`` or the
-# state tools with nothing logged until a skill calls one.
+# Reserve the existing approval and durable state server keys, plus the
+# channel read capability identity. A connector declaring a reserved name
+# could replace the platform server in the session's MCP map and displace
+# the capability named below.
 #
-# The fence is these two exact names, not the ``curie-`` prefix, so a
-# legitimate connector called ``curie-docs`` stays legal.
+# The fence matches exact names, so ``curie-docs`` remains legal.
 #
-# The real owners are ``runner/src/curie_runner/approval.py``
+# The existing active server owners are ``runner/src/curie_runner/approval.py``
 # ``APPROVAL_SERVER_NAME`` and ``runner/src/curie_runner/state.py``
 # ``STATE_SERVER_NAME``. ``runner`` depends on ``plugin-format``, never the
 # reverse, so this validator cannot import those constants and re-enumerates
