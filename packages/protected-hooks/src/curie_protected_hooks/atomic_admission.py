@@ -10,7 +10,7 @@ import hashlib
 import json
 from typing import Any
 
-from aci_protocol.turn import QueuedTurn
+from aci_protocol.ndjson import parse_queued_turn
 from redis import Redis
 
 from .admission_records import (
@@ -438,7 +438,7 @@ class AtomicAdmission:
             else:
                 if request is None:
                     raise AdmissionUnavailable()
-                turn = QueuedTurn.model_validate_json(request.queued_payload)
+                turn = parse_queued_turn(request.queued_payload)
                 keys[6] = prefix + "binding:" + turn.event_id
                 if not match:
                     params.update(

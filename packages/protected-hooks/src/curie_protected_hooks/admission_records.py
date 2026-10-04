@@ -9,7 +9,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
-from aci_protocol.turn import QueuedTurn, TurnSource
+from aci_protocol.ndjson import parse_queued_turn
+from aci_protocol.turn import TurnSource
 
 from .authority_records import _scalar
 from .source_policy_records import canonical_hook, canonical_uuid, policy_fingerprint
@@ -386,7 +387,7 @@ class AdmissionRequest:
             _require(len(policy_bytes) <= _MAX_METADATA)
             payload = _decode(queued_payload, _MAX_PAYLOAD)
             _require(type(payload) is dict)
-            turn = QueuedTurn.model_validate_json(queued_payload)
+            turn = parse_queued_turn(queued_payload)
             _require(
                 turn.source in (TurnSource.WEBHOOK, TurnSource.CRON)
                 and turn.tool_access == "read-only"
