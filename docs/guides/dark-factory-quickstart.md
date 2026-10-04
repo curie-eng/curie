@@ -23,7 +23,7 @@ the factory run.
 | [`kubectl`](https://kubernetes.io/docs/tasks/tools/) | Kubernetes operations, required for every context |
 | [`helm`](https://helm.sh/docs/intro/install/) | Curie installation, required for every context |
 | `curie` | this command ([releases](https://github.com/curie-eng/curie/releases)) |
-| An [OpenRouter](https://openrouter.ai/) API key (`sk-or-`) | the factory model, `z-ai/glm-5.3-flash` by default. The command asks once, or reads `CURIE_CREDENTIALS`. |
+| An [OpenRouter](https://openrouter.ai/) API key (`sk-or-`) | the factory model, `z-ai/glm-5.3-flash` by default, and the reviewers, which run `anthropic/claude-opus-5.5`. A run needs about 5 USD of credit. The command asks once, or reads `CURIE_CREDENTIALS`. |
 | A GitHub account | your own GitHub App and the trial repository |
 
 The command checks all required tools on `PATH` before running any command or
@@ -89,10 +89,19 @@ again to the same result.
 By default, each run prints the Kubernetes context once and one line for each
 step it performs. Cluster installation inference notices remain visible. The
 first run ends with the App link and registration steps; the second ends with
-three lines summarizing readiness, intake and the deployed image. Pass
+four lines summarizing readiness, the reviewer model and per-run credit, intake
+and the deployed image. Pass
 `--debug` to see the chained commands and their detailed output. The printed
 rerun command omits namespace, release and model flags when they match the
 defaults.
+
+Before deploying, the second run reads the key's remaining credit from
+OpenRouter (the smaller of the key's limit and the account balance). It warns
+when that is below 5 USD, the credit one factory run needs. When it cannot read
+the credit, for example because the key only lives in the cluster, it prints
+`OpenRouter credit not checked` and continues. The check never stops the
+command. The ready output names the reviewer model and the per-run credit. A run
+that runs out of credit ends with the out-of-credits cause on the issue.
 
 The second run configures these values:
 

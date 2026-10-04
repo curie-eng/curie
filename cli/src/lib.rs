@@ -46,6 +46,7 @@ pub mod modelpin;
 pub mod ndjson;
 pub mod observability;
 pub mod oci_registry;
+pub mod openrouter_credit;
 pub mod ops;
 pub mod queue;
 pub mod recipes;

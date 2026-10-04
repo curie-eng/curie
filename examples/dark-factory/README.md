@@ -90,6 +90,17 @@ each file under `agents/`: change it in the bundle you deploy. Opus 5.5 needs
 the runner's bundled Claude Code CLI 2.1.280 or later (claude-agent-sdk
 0.2.158 or later).
 
+The runner image caps every model request at 16000 output tokens
+(`CLAUDE_CODE_MAX_OUTPUT_TOKENS` in [`runner.Dockerfile`](runner.Dockerfile)).
+Claude Code otherwise asks for up to 64000 output tokens per Opus request, and
+OpenRouter reserves credit for that whole ceiling, so a low balance refused
+every reviewer call. A verdict needs a few thousand tokens. Claude Code has no
+per-subagent ceiling, so the cap applies to the factory model's requests too.
+Plan on 5 USD of OpenRouter credit per run. Both the account balance and the
+key's own limit count, and the smaller one is what a run can spend. When
+OpenRouter refuses a reviewer call for credit (HTTP 402), the run ends with the
+out-of-credits cause and the review is not retried.
+
 ## What the bundle can reach
 
 - **The checkout.** Curie mounts the issue's repository at `/workspace` and

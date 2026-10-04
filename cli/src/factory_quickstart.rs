@@ -26,6 +26,11 @@ pub const DEFAULT_BUDGET_USD: f64 = 5.0;
 pub const AGENT_NAME: &str = "dark-factory";
 pub const GVISOR_OFF_SET: &str = "security.gvisor.mode=off";
 pub const POLL_INTAKE: &str = "poll";
+/// The model the factory's plan and diff reviewers run. It must match the
+/// dark-factory bundle's `progress/phases.json` and agent frontmatter.
+pub const REVIEWER_MODEL: &str = "anthropic/claude-opus-5.5";
+/// The OpenRouter credit one factory run should have available (#3935).
+pub const RUN_CREDIT_USD: f64 = 5.0;
 
 #[derive(Debug, Clone)]
 pub struct QuickstartOpts {
@@ -139,6 +144,8 @@ pub enum QuickstartOutput {
         agent: String,
         deadline_seconds: u32,
         budget_usd: f64,
+        /// OpenRouter credit left to the model credential, when it was read.
+        credit_remaining_usd: Option<f64>,
     },
 }
 
@@ -173,6 +180,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 agent,
                 deadline_seconds,
                 budget_usd,
+                credit_remaining_usd,
             } => serde_json::json!({
                 "phase": "ready",
                 "context": context,
@@ -191,6 +199,9 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 "agent": agent,
                 "execution_deadline_seconds": deadline_seconds,
                 "budget_usd": budget_usd,
+                "reviewer_model": REVIEWER_MODEL,
+                "run_credit_usd": RUN_CREDIT_USD,
+                "credit_remaining_usd": credit_remaining_usd,
             }),
         }
     }
@@ -219,6 +230,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 agent,
                 deadline_seconds,
                 budget_usd,
+                credit_remaining_usd,
                 ..
             } => {
                 let mention_note = if *mention_inferred {
@@ -240,6 +252,14 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 ));
                 ui.payload(&format!(
                     "Deployed {agent} from {runner_image}. Execution deadline {deadline_seconds}s. Publication auto. Budget {budget_usd} USD."
+                ));
+                // Worded apart from the pre-deploy low-credit warning.
+                let credit_left = credit_remaining_usd
+                    .map(|left| format!(" The key has {left:.2} USD left."))
+                    .unwrap_or_default();
+                ui.payload(&format!(
+                    "Reviewers run {REVIEWER_MODEL}. Plan on {} USD of OpenRouter credit per run.{credit_left}",
+                    budget_display(RUN_CREDIT_USD)
                 ));
             }
         }
@@ -854,7 +874,7 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
                 .into(),
         );
     }
-    execute(&planned).await
+    execute(&planned, &opts, release_has_real_model).await
 }
 
 async fn release_model_recorded(opts: &QuickstartOpts) -> Result<bool> {
@@ -871,13 +891,30 @@ async fn release_model_recorded(opts: &QuickstartOpts) -> Result<bool> {
     })
 }
 
-async fn execute(planned: &Planned) -> Result<QuickstartOutput> {
+async fn execute(
+    planned: &Planned,
+    opts: &QuickstartOpts,
+    mut release_has_real_model: bool,
+) -> Result<QuickstartOutput> {
     crate::ui::ui().note(&format!("Kubernetes context: {}", planned.context));
     let mut prompted = false;
     let mut intake_json = serde_json::Value::Null;
+    let mut credit_remaining_usd = None;
     for action in &planned.actions {
+        if matches!(action, Action::Deploy { .. }) {
+            credit_remaining_usd = check_credit(release_has_real_model).await;
+        }
         if matches!(action, Action::Cluster { .. }) && !prompted {
             prompted = true;
+            if planned.kind_cluster.is_some() {
+                // The plan could not read the release: the context did not
+                // exist yet. Read it now, before `cluster up` records a key.
+                // It only picks the key the credit check reads, so a failed
+                // read never stops the install; it skips the saved key instead.
+                release_has_real_model =
+                    crate::kube_context::pin_for_cluster_command(Some(&planned.context)).is_err()
+                        || release_model_recorded(opts).await.unwrap_or(true);
+            }
             ensure_credential(&planned.credential)?;
         }
         match action {
@@ -1096,11 +1133,67 @@ async fn execute(planned: &Planned) -> Result<QuickstartOutput> {
                     agent: AGENT_NAME.into(),
                     deadline_seconds: *deadline_seconds,
                     budget_usd: *budget_usd,
+                    credit_remaining_usd,
                 });
             }
         }
     }
     Err(CliError::failure("quickstart plan produced no result").into())
+}
+
+/// The key whose OpenRouter credit to check. An explicit key wins because
+/// `cluster up` deploys it. The saved key counts only when the release records
+/// no model; otherwise `cluster up` keeps the release's recorded key (#3848)
+/// and the saved key's balance would belong to a different key.
+pub fn credit_check_key(
+    explicit: Option<String>,
+    saved: Option<String>,
+    release_has_real_model: bool,
+) -> Option<String> {
+    explicit.or(if release_has_real_model { None } else { saved })
+}
+
+/// Warns before deploy when the model credential has less OpenRouter credit
+/// than one factory run needs, because a reviewer refused for credit ends the
+/// run (#3935). Never fails the command; returns the credit left when known.
+async fn check_credit(release_has_real_model: bool) -> Option<f64> {
+    let ui = crate::ui::ui();
+    let key = match credit_check_key(
+        crate::ops::explicit_model_credential_env(),
+        crate::ops::saved_model_credential(),
+        release_has_real_model,
+    ) {
+        Some(key) => key,
+        None if release_has_real_model => {
+            ui.note("OpenRouter credit not checked: the deployed key is the one recorded in the cluster");
+            return None;
+        }
+        None => {
+            ui.note("OpenRouter credit not checked: no local model credential");
+            return None;
+        }
+    };
+    match crate::openrouter_credit::remaining_credit_usd(&key).await {
+        Ok(Some(left)) => {
+            if left < RUN_CREDIT_USD {
+                ui.warn(&format!(
+                    "OpenRouter credit left: {left:.2} USD, below the {} USD one factory run needs. The reviewers run {REVIEWER_MODEL}. Add credit at https://openrouter.ai/settings/credits before labelling an issue.",
+                    budget_display(RUN_CREDIT_USD)
+                ));
+            }
+            Some(left)
+        }
+        Ok(None) => {
+            ui.note("OpenRouter credit not checked: the key has no limit and the account balance is not readable");
+            None
+        }
+        Err(error) => {
+            // The error is built without the key; the replace is a backstop.
+            let reason = format!("{error:#}").replace(&key, "<key>");
+            ui.note(&format!("OpenRouter credit not checked: {reason}"));
+            None
+        }
+    }
 }
 
 fn budget_display(value: f64) -> String {

@@ -3,6 +3,8 @@
 //! platform API peers are fixtures. The Kubernetes wire shapes follow the
 //! Deployment and Pod references cited in `cluster_convergence.rs`; GitHub
 //! responses follow the REST App endpoints cited in `factory_github_app.rs`.
+//! OpenRouter responses follow the `/key` and `/credits` shapes recorded from
+//! the real API on 2026-10-04 and cited in `openrouter_credit.rs` (#3935).
 
 #![cfg(unix)]
 
@@ -162,15 +164,47 @@ fn platform(req: &Request) -> Response {
     Response::json(200, &result.to_string())
 }
 
+/// The fake account balance a default fixture reports: ample, so the key's
+/// 73.49 USD limit is the remaining credit and no warning prints.
+const AMPLE_ACCOUNT_LEFT: f64 = 200.0;
+const KEY_LIMIT_LEFT: f64 = 73.49;
+
+/// A fake OpenRouter with the recorded 2026-10-04 shapes. The key has 73.49
+/// USD of its limit left; the account has `account_left` USD left.
+fn openrouter(account_left: f64) -> MockServer {
+    serve(move |req| {
+        let path = req.path.split('?').next().unwrap();
+        if req.method == "GET" && path.ends_with("/key") {
+            Response::json(
+                200,
+                &json!({"data":{"label":"sk-or-v1-PLACEHOLDER","is_management_key":false,"is_provisioning_key":false,"limit":300,"limit_reset":null,"limit_remaining":KEY_LIMIT_LEFT,"include_byok_in_limit":false,"usage":226.51,"usage_daily":0.11,"usage_weekly":19.44,"usage_monthly":5.74,"is_free_tier":false,"expires_at":null}}).to_string(),
+            )
+        } else if req.method == "GET" && path.ends_with("/credits") {
+            Response::json(
+                200,
+                &json!({"data":{"total_credits":800.0,"total_usage":800.0 - account_left}})
+                    .to_string(),
+            )
+        } else {
+            Response::json(404, r#"{"error":{"message":"Not Found","code":404}}"#)
+        }
+    })
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     github: MockServer,
     platform: MockServer,
     registry: MockServer,
+    openrouter: MockServer,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_credit(AMPLE_ACCOUNT_LEFT)
+    }
+
+    fn with_credit(account_left: f64) -> Self {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("bin")).unwrap();
         for tool in ["helm", "kubectl", "kind", "docker"] {
@@ -261,6 +295,7 @@ impl Fixture {
             github,
             platform: serve(platform),
             registry,
+            openrouter: openrouter(account_left),
         }
     }
 
@@ -281,6 +316,7 @@ impl Fixture {
             .env("TMPDIR", self.dir.path())
             .env("CURIE_CREDENTIALS", "sk-or-fixture")
             .env("CURIE_GITHUB_API_URL", &self.github.base_url)
+            .env("CURIE_OPENROUTER_API_URL", &self.openrouter.base_url)
             .env("CURIE_API_URL", &self.platform.base_url)
             .env("CURIE_API_KEY", "fixture-key")
             .env_remove(curie::factory_intake::WEBHOOK_SECRET_ENV)
@@ -390,8 +426,10 @@ fn assert_short_pass(code: i32, shown: &str, second: bool, surface: &str) {
         usize::from(!second),
         "{shown}"
     );
+    // The ready pass grew by exactly one line, the reviewer model and run
+    // credit line (#3935).
     assert!(
-        shown.lines().count() <= if second { 18 } else { 14 },
+        shown.lines().count() <= if second { 19 } else { 14 },
         "line budget exceeded: {shown}"
     );
     for noise in [
@@ -450,6 +488,17 @@ fn assert_short_pass(code: i32, shown: &str, second: bool, surface: &str) {
         assert!(shown.contains("Factory quickstart ready"), "{shown}");
         assert!(shown.contains("Intake poll. App acme-factory."), "{shown}");
         assert!(shown.contains("Deployed dark-factory"), "{shown}");
+        assert_eq!(
+            shown
+                .lines()
+                .filter(
+                    |line| line.contains("Reviewers run anthropic/claude-opus-5.5")
+                        && line.contains("5 USD")
+                )
+                .count(),
+            1,
+            "{shown}"
+        );
     } else {
         assert!(
             shown.contains("https://github.com/settings/apps/new"),
@@ -715,4 +764,224 @@ fn a_json_second_pass_is_one_ready_object_and_custom_rerun_flags_are_retained() 
     ] {
         assert!(rerun.contains(flag), "{rerun}");
     }
+}
+
+#[test]
+fn low_openrouter_credit_warns_before_the_factory_deploys() {
+    let fixture = Fixture::with_credit(1.0);
+    let (code, shown) = fixture.run(true, &["--color", "never"]);
+    assert_eq!(code, 0, "a low balance warns, it never fails: {shown}");
+    let lines: Vec<&str> = shown.lines().collect();
+    let warning = lines
+        .iter()
+        .position(|line| {
+            line.contains("OpenRouter credit left") && line.contains("anthropic/claude-opus-5.5")
+        })
+        .unwrap_or_else(|| panic!("no credit warning: {shown}"));
+    let deploy = lines
+        .iter()
+        .position(|line| *line == "Deploying dark factory")
+        .unwrap_or_else(|| panic!("no deploy step: {shown}"));
+    assert!(
+        warning < deploy,
+        "the warning must precede the deploy: {shown}"
+    );
+    assert!(!shown.contains("OpenRouter credit not checked"), "{shown}");
+    let requests = fixture.openrouter.recorded();
+    assert!(
+        !requests.is_empty(),
+        "the credit check never reached OpenRouter"
+    );
+    for request in &requests {
+        assert_eq!(
+            request.header("authorization"),
+            Some("Bearer sk-or-fixture"),
+            "the check must use the bound model credential: {request:?}"
+        );
+    }
+}
+
+#[test]
+fn ample_openrouter_credit_prints_no_credit_line() {
+    let fixture = Fixture::new();
+    let (code, shown) = fixture.run(true, &["--color", "never"]);
+    assert_eq!(code, 0, "{shown}");
+    assert!(!shown.contains("OpenRouter credit left"), "{shown}");
+    assert!(!shown.contains("OpenRouter credit not checked"), "{shown}");
+    assert!(
+        !fixture.openrouter.recorded().is_empty(),
+        "the credit check never reached OpenRouter"
+    );
+}
+
+#[test]
+fn a_json_ready_object_names_the_reviewer_model_and_run_credit() {
+    let fixture = Fixture::new();
+    let output = fixture.command(true, &["--json"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+    assert_eq!(body["phase"], "ready", "{body}");
+    assert_eq!(
+        body["reviewer_model"], "anthropic/claude-opus-5.5",
+        "{body}"
+    );
+    assert_eq!(body["run_credit_usd"], json!(5.0), "{body}");
+    let remaining = body["credit_remaining_usd"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("credit_remaining_usd is not a number: {body}"));
+    assert!(
+        (remaining - KEY_LIMIT_LEFT.min(AMPLE_ACCOUNT_LEFT)).abs() < 1e-9,
+        "{body}"
+    );
+}
+
+const SAVED_KEY: &str = "sk-or-saved-PLACEHOLDER";
+
+impl Fixture {
+    /// Saves `SAVED_KEY` as CURIE_CREDENTIALS through the real `secrets set`
+    /// verb, into a config dir private to this fixture.
+    fn save_credential(&self) {
+        let seed = Command::new(env!("CARGO_BIN_EXE_curie"))
+            .args(["secrets", "set", "CURIE_CREDENTIALS", "--from-env", "SEED"])
+            .env("CURIE_CONFIG_DIR", self.dir.path().join("cfg"))
+            .env("HOME", self.dir.path())
+            .env("SEED", SAVED_KEY)
+            .env_remove("CURIE_CREDENTIALS")
+            .env_remove("CURIE_MODEL_CREDENTIALS")
+            .output()
+            .unwrap();
+        assert!(
+            seed.status.success(),
+            "seed saved credential: {}",
+            String::from_utf8_lossy(&seed.stderr)
+        );
+    }
+
+    /// The release's recorded helm values, as `helm get values` answers them.
+    fn record_values(&self, values: Value) {
+        fs::write(self.dir.path().join("values"), values.to_string()).unwrap();
+    }
+
+    /// A second pass whose shell carries `explicit` as CURIE_CREDENTIALS, or no
+    /// model credential at all, with the fixture's saved credential store.
+    fn run_with_saved(&self, explicit: Option<&str>) -> (i32, String) {
+        let mut cmd = self.command(true, &["--color", "never"]);
+        cmd.env("CURIE_CONFIG_DIR", self.dir.path().join("cfg"))
+            .env_remove("CURIE_MODEL_CREDENTIALS");
+        match explicit {
+            Some(key) => cmd.env("CURIE_CREDENTIALS", key),
+            None => cmd.env_remove("CURIE_CREDENTIALS"),
+        };
+        let output = cmd.stdin(Stdio::null()).output().unwrap();
+        (
+            output.status.code().unwrap_or(1),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )
+    }
+
+    fn openrouter_bearers(&self) -> Vec<String> {
+        self.openrouter
+            .recorded()
+            .iter()
+            .filter_map(|request| request.header("authorization").map(str::to_string))
+            .collect()
+    }
+}
+
+#[test]
+fn a_saved_key_is_not_checked_when_the_release_keeps_its_recorded_credential() {
+    // #3935 review: with no shell credential and a release that already records
+    // a real model, `cluster up` keeps the release's recorded credential, so the
+    // saved key is not the one the reviewers spend. Checking it would report
+    // another key's balance as the factory's.
+    let fixture = Fixture::new();
+    fixture.save_credential();
+    // The default fixture release records fakeModel false; stated here so the
+    // test does not lean on that default.
+    let mut values: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.dir.path().join("values")).unwrap())
+            .unwrap();
+    values["agentSandbox"]["runner"]["fakeModel"] = json!(false);
+    fixture.record_values(values);
+
+    let (code, shown) = fixture.run_with_saved(None);
+
+    assert_eq!(code, 0, "{shown}");
+    assert_eq!(
+        shown.matches("OpenRouter credit not checked").count(),
+        1,
+        "{shown}"
+    );
+    let bearers = fixture.openrouter_bearers();
+    assert!(
+        !bearers
+            .iter()
+            .any(|bearer| bearer == &format!("Bearer {SAVED_KEY}")),
+        "the saved key was checked although the release keeps its own: {bearers:?}"
+    );
+}
+
+#[test]
+fn an_explicit_key_is_checked_even_when_a_saved_key_and_a_recorded_model_exist() {
+    // Liveness: the shell credential is the one `cluster up` deploys, so it is
+    // the one checked, whatever is saved or recorded.
+    let fixture = Fixture::new();
+    fixture.save_credential();
+
+    let (code, shown) = fixture.run_with_saved(Some("sk-or-explicit-PLACEHOLDER"));
+
+    assert_eq!(code, 0, "{shown}");
+    assert!(!shown.contains("OpenRouter credit not checked"), "{shown}");
+    let bearers = fixture.openrouter_bearers();
+    assert!(
+        !bearers.is_empty(),
+        "the credit check never reached OpenRouter"
+    );
+    assert!(
+        bearers
+            .iter()
+            .all(|bearer| bearer == "Bearer sk-or-explicit-PLACEHOLDER"),
+        "{bearers:?}"
+    );
+}
+
+#[test]
+fn a_saved_key_is_checked_when_the_release_records_no_model() {
+    // Liveness: on a release with no real model recorded, the saved key is the
+    // one `cluster up` deploys, so it is the one checked.
+    let fixture = Fixture::new();
+    fixture.save_credential();
+    let mut values: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.dir.path().join("values")).unwrap())
+            .unwrap();
+    values["agentSandbox"]["runner"]
+        .as_object_mut()
+        .unwrap()
+        .remove("fakeModel");
+    fixture.record_values(values);
+
+    let (code, shown) = fixture.run_with_saved(None);
+
+    assert_eq!(code, 0, "{shown}");
+    assert!(!shown.contains("OpenRouter credit not checked"), "{shown}");
+    let bearers = fixture.openrouter_bearers();
+    assert!(
+        !bearers.is_empty(),
+        "the credit check never reached OpenRouter"
+    );
+    assert!(
+        bearers
+            .iter()
+            .all(|bearer| bearer == &format!("Bearer {SAVED_KEY}")),
+        "{bearers:?}"
+    );
 }
