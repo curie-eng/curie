@@ -107,9 +107,11 @@ describe("WiredAgentBehaviorPacks (#870)", () => {
     await waitFor(() => expect(putBehaviorPacks).toHaveBeenCalledTimes(1));
     const [id, sent] = vi.mocked(putBehaviorPacks).mock.calls[0];
     expect(id).toBe("a1");
-    expect(sent.greeting.enabled).toBe(true);
+    expect(sent.greeting).toBeDefined();
+    expect(sent.load).toBeDefined();
+    expect(sent.greeting?.enabled).toBe(true);
     // The rest of the config is round-tripped untouched.
-    expect(sent.load.enabled).toBe(false);
+    expect(sent.load?.enabled).toBe(false);
     expect(await screen.findByTestId("behavior-packs-saved")).toHaveTextContent("Saved");
   });
 
@@ -126,7 +128,8 @@ describe("WiredAgentBehaviorPacks (#870)", () => {
 
     await waitFor(() => expect(putBehaviorPacks).toHaveBeenCalledTimes(1));
     const [, sent] = vi.mocked(putBehaviorPacks).mock.calls[0];
-    expect(sent.load.lines).toEqual(["one", "two"]);
+    expect(sent.load).toBeDefined();
+    expect(sent.load?.lines).toEqual(["one", "two"]);
   });
 
   it("round-trips the read-only settings pack unchanged", async () => {

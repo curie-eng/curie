@@ -37,6 +37,7 @@ const mkVersion = (id: string, version_label: string, created_at: string): Versi
   version_label,
   bundle_ref: "r",
   bundle_sha256: "s",
+  commit_sha: null,
   created_by: "ui",
   created_at,
 });
@@ -55,6 +56,7 @@ const mkDep = (
   commit_sha: null,
   status,
   deployed_at,
+  workspace_enabled: false,
 });
 
 // [FIXTURE-ONLY] ADR-0118: AgentOut carries `channels` (plural); unused by any
@@ -64,6 +66,16 @@ const AGENT: AgentOut = {
   name: "deal-desk",
   channels: [{ kind: "slack", address: "#revenue-ops" }],
   model: null,
+  approval_required_tools: null,
+  approval_routes: null,
+  behavior_packs: null,
+  deploy_notifications: true,
+  hook_partitions: null,
+  memory: false,
+  repo_full_name: null,
+  secrets: null,
+  source_bindings: null,
+  thinking: null,
   created_at: "2026-06-01T00:00:00Z",
 };
 

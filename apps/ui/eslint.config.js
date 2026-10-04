@@ -14,6 +14,8 @@ export default [
       "node_modules",
       // Codegen artifact (scripts/gen-command-manifest.mjs); not authored here.
       "src/generated",
+      // Codegen artifact (scripts/gen-api-types.mjs); not authored here.
+      "src/api/generated.ts",
     ],
   },
   js.configs.recommended,

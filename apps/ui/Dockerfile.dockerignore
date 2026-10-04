@@ -1,10 +1,9 @@
 # Per-Dockerfile ignore (BuildKit honors <dockerfile>.dockerignore over the
 # context-root .dockerignore). The UI image builds from the REPO ROOT to reach
-# the frozen ACI generated TS the @aci alias points at, so this trims the root
-# context to what the Vite build needs -- the UI sources + lockfile and
-# packages/aci-protocol/generated stay; everything else (the Python trees, the
-# Rust CLI, the runner, docs, other packages, installed deps and build output)
-# is dropped.
+# the shared wording vector, so this trims the root context to what the Vite
+# build needs -- the UI sources + lockfile and that one vector stay; everything
+# else (the Python trees, the Rust CLI, the runner, docs, other packages,
+# installed deps and build output) is dropped.
 .git
 **/node_modules
 **/.venv
@@ -31,9 +30,7 @@ tests/*
 !tests/vectors
 tests/vectors/*
 !tests/vectors/user-action-wording.json
-packages/plugin-format
-packages/aci-protocol/src
-packages/aci-protocol/tests
+packages
 *.md
 **/*.md
 **/.env

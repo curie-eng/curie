@@ -53,6 +53,16 @@ const AGENT: AgentOut = {
   name: "deal-desk",
   channels: [{ kind: "slack", address: "C0123ABCD" }],
   model: null,
+  approval_required_tools: null,
+  approval_routes: null,
+  behavior_packs: null,
+  deploy_notifications: true,
+  hook_partitions: null,
+  memory: false,
+  repo_full_name: null,
+  secrets: null,
+  source_bindings: null,
+  thinking: null,
   created_at: "2026-07-01T00:00:00Z",
 };
 
@@ -62,6 +72,7 @@ const version = (id: string, label: string): VersionOut => ({
   version_label: label,
   bundle_ref: "ref",
   bundle_sha256: "sha",
+  commit_sha: null,
   created_by: "ui",
   created_at: "2026-07-01T00:00:00Z",
 });
@@ -74,6 +85,7 @@ const deployment = (version_id: string, environment: "prod" | "dev", deployed_at
   commit_sha: null,
   status: "active",
   deployed_at,
+  workspace_enabled: false,
 });
 
 // v1 is the prod-active version (what the editor loads); v2 is the dev-active
