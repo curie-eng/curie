@@ -38,6 +38,50 @@ ns = os.environ.get('QUICKSTART_NAMESPACE', 'curie')
 release = os.environ.get('QUICKSTART_RELEASE', 'curie')
 def emit(value):
     print(json.dumps(value)); sys.exit(0)
+def deep_merge(dst, src):
+    for key, value in src.items():
+        if isinstance(value, dict) and isinstance(dst.get(key), dict):
+            deep_merge(dst[key], value)
+        else:
+            dst[key] = value
+def apply_set(doc, expression):
+    for item in expression.split(','):
+        if '=' not in item or '[' in item or '{' in item:
+            continue
+        path, raw = item.split('=', 1)
+        cursor = doc
+        parts = path.split('.')
+        for part in parts[:-1]:
+            nxt = cursor.get(part)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                cursor[part] = nxt
+            cursor = nxt
+        cursor[parts[-1]] = {'true': True, 'false': False, 'null': None}.get(raw, raw)
+def record_upgrade(args):
+    try:
+        doc = json.loads((root / 'values').read_text())
+    except Exception:
+        doc = {}
+    if not isinstance(doc, dict):
+        doc = {}
+    index = 0
+    while index < len(args):
+        if args[index] in ['-f', '--values'] and index + 1 < len(args):
+            try:
+                overlay = json.loads(Path(args[index + 1]).read_text())
+            except Exception:
+                overlay = None
+            if isinstance(overlay, dict):
+                deep_merge(doc, overlay)
+            index += 2
+            continue
+        if args[index] in ['--set', '--set-string'] and index + 1 < len(args):
+            apply_set(doc, args[index + 1])
+            index += 2
+            continue
+        index += 1
+    (root / 'values').write_text(json.dumps(doc))
 def absent(kind, name):
     print('Error from server (NotFound): ' + kind + ' "' + name + '" not found', file=sys.stderr)
     sys.exit(1)
@@ -59,9 +103,9 @@ if tool == 'kind':
 if tool == 'helm':
     if args[:2] == ['get','values']: print((root / 'values').read_text()); sys.exit(0)
     if args[:2] == ['get','hooks']: sys.exit(0)
-    if args[:2] == ['get','metadata']: emit({'appVersion':os.environ['QUICKSTART_VERSION']})
+    if args[:2] == ['get','metadata']: emit({'appVersion':os.environ['QUICKSTART_VERSION'],'version':os.environ['QUICKSTART_VERSION'],'chart':'curie-'+os.environ['QUICKSTART_VERSION']})
     if args[:2] == ['get','manifest']: emit(deployment)
-    if args[0] == 'history': emit([{'revision':1,'status':'deployed'}])
+    if args[0] == 'history': emit([{'revision':1,'status':os.environ.get('QUICKSTART_REVISION_STATUS','deployed')}])
     if args[0] == 'status': emit({'version':1,'info':{'status':'deployed'},'hooks':[]})
     if args[:2] == ['show','chart']: print('name: curie\nversion: '+os.environ['QUICKSTART_VERSION']+'\nappVersion: '+os.environ['QUICKSTART_VERSION']); sys.exit(0)
     if args[0] == 'template':
@@ -79,10 +123,14 @@ if tool == 'helm':
                     values_log.write(json.dumps(Path(args[index+1]).read_text()) + '\n')
         if os.environ.get('QUICKSTART_FAIL') == 'up':
             print('Error: fixture install refused at '+str(root / 'cached-chart'), file=sys.stderr); sys.exit(1)
+        if os.environ.get('QUICKSTART_FAIL') == 'merged' and '--install' not in args and not (root / 'merged-failed').exists():
+            (root / 'merged-failed').touch()
+            print('Error: fixture merged upgrade refused', file=sys.stderr); sys.exit(1)
         if os.environ.get('QUICKSTART_GVISOR_RETRY') == '1' and not (root / 'retried').exists():
             (root / 'retried').touch()
             time.sleep(10)
             print('Error: pods "fixture" is forbidden: RuntimeClass "gvisor" not found', file=sys.stderr); sys.exit(1)
+        record_upgrade(args)
         print('Release accepted'); sys.exit(0)
     if args[0] == 'uninstall': sys.exit(0)
 if tool == 'kubectl':
@@ -447,37 +495,56 @@ fn assert_short_pass(code: i32, shown: &str, second: bool, surface: &str) {
             "unexpected child output {noise}: {shown}"
         );
     }
-    assert!(shown.contains("inferred model provider"), "{shown}");
-    assert!(shown.contains("inferred reuse of PriorityClass"), "{shown}");
-    assert!(
-        shown.contains("inferred reuse of `agent-sandbox-controller`"),
+    assert_eq!(
+        shown
+            .lines()
+            .filter(|line| *line == "Installing Curie")
+            .count(),
+        usize::from(!second),
         "{shown}"
     );
-    for equivalent_override in [
-        "--allow-egress-host openrouter",
-        "--set priorityClasses.platform.create=false",
-        "--set priorityClasses.sandbox.create=false",
-        "--set agentSandbox.controller.deploy=false",
-    ] {
+    if second {
         assert!(
-            shown.contains(equivalent_override),
-            "missing {equivalent_override}: {shown}"
+            shown.contains("skipping cluster up"),
+            "second pass still installed: {shown}"
         );
+    } else {
+        assert!(shown.contains("inferred model provider"), "{shown}");
+        assert!(shown.contains("inferred reuse of PriorityClass"), "{shown}");
+        assert!(
+            shown.contains("inferred reuse of `agent-sandbox-controller`"),
+            "{shown}"
+        );
+        for equivalent_override in [
+            "--allow-egress-host openrouter",
+            "--set priorityClasses.platform.create=false",
+            "--set priorityClasses.sandbox.create=false",
+            "--set agentSandbox.controller.deploy=false",
+        ] {
+            assert!(
+                shown.contains(equivalent_override),
+                "missing {equivalent_override}: {shown}"
+            );
+        }
     }
-    for step in ["Scaling CoreDNS", "Installing Curie"].into_iter().chain(
-        second
-            .then_some([
-                "Configuring factory intake",
-                "Rendering factory bundle",
-                "Deploying dark factory",
-                "Binding GitHub repository",
-                "Setting execution deadline",
-                "Setting publication policy",
-                "Setting factory budget",
-            ])
-            .into_iter()
-            .flatten(),
-    ) {
+    for step in ["Scaling CoreDNS"]
+        .into_iter()
+        .chain((!second).then_some("Installing Curie"))
+        .chain(
+            second
+                .then_some([
+                    "Configuring factory intake",
+                    "Rendering factory bundle",
+                    "Deploying dark factory",
+                    "Binding GitHub repository",
+                    "Setting execution deadline",
+                    "Setting publication policy",
+                    "Setting factory budget",
+                ])
+                .into_iter()
+                .flatten(),
+        )
+    {
         assert_eq!(
             shown.lines().filter(|line| *line == step).count(),
             1,
@@ -516,6 +583,29 @@ fn assert_short_pass(code: i32, shown: &str, second: bool, surface: &str) {
             shown.lines().count()
         );
     }
+}
+
+fn helm_upgrade_calls(fixture: &Fixture) -> Vec<Vec<String>> {
+    let text = fs::read_to_string(fixture.dir.path().join("calls")).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let call: Vec<String> = serde_json::from_str(line).ok()?;
+            (call.first().map(String::as_str) == Some("helm")
+                && call.get(1).map(String::as_str) == Some("upgrade"))
+            .then_some(call)
+        })
+        .collect()
+}
+
+fn intake_documents(fixture: &Fixture) -> Vec<Value> {
+    let text = fs::read_to_string(fixture.dir.path().join("helm-values")).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let document: String = serde_json::from_str(line).ok()?;
+            let values: Value = serde_json::from_str(&document).ok()?;
+            (values.pointer("/api/githubFactoryIntake") == Some(&json!("poll"))).then_some(values)
+        })
+        .collect()
 }
 
 #[test]
@@ -569,6 +659,153 @@ fn both_default_passes_stay_within_the_line_budget_against_a_fake_cluster() {
             "the ready path did not apply {field}"
         );
     }
+    let upgrades = helm_upgrade_calls(&fixture);
+    assert_eq!(
+        upgrades.len(),
+        2,
+        "first pass installs once and the second pass upgrades once: {upgrades:?}"
+    );
+    assert!(
+        upgrades[0].iter().any(|arg| arg == "--install"),
+        "the first pass is cluster up: {upgrades:?}"
+    );
+    assert!(
+        !upgrades[1]
+            .iter()
+            .any(|arg| arg == "--install" || arg == "--reset-then-reuse-values"),
+        "the second pass is one reuse-values upgrade: {:?}",
+        upgrades[1]
+    );
+    assert!(
+        upgrades[1].iter().any(|arg| arg == "--reuse-values"),
+        "{:?}",
+        upgrades[1]
+    );
+    let documents = intake_documents(&fixture);
+    assert_eq!(documents.len(), 1, "{documents:?}");
+    let image = documents[0]
+        .pointer("/agentSandbox/runnerImages/dark-factory")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    assert!(
+        image.contains("@sha256:"),
+        "the one upgrade must bind the runner image: {documents:?}"
+    );
+}
+
+#[test]
+fn a_failed_merged_upgrade_rerun_applies_the_same_values() {
+    let fixture = Fixture::new();
+    let (code, shown) = fixture.run(false, &["--color", "never"]);
+    assert_eq!(code, 0, "{shown}");
+    let failed = fixture
+        .command(true, &["--color", "never"])
+        .env("QUICKSTART_FAIL", "merged")
+        .output()
+        .unwrap();
+    let failed_shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&failed.stdout),
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    assert!(!failed.status.success(), "{failed_shown}");
+    assert!(
+        failed_shown.contains("Configuring factory intake failed"),
+        "{failed_shown}"
+    );
+    let attempted = intake_documents(&fixture);
+    assert_eq!(attempted.len(), 1, "{attempted:?}");
+    let again = fixture
+        .command(true, &["--color", "never"])
+        .env("QUICKSTART_FAIL", "merged")
+        .output()
+        .unwrap();
+    let again_shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&again.stdout),
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert!(again.status.success(), "{again_shown}");
+    let applied = intake_documents(&fixture);
+    assert_eq!(applied.len(), 2, "{applied:?}");
+    assert_eq!(
+        attempted[0], applied[1],
+        "rerun drifted from the failed upgrade"
+    );
+    let upgrades = helm_upgrade_calls(&fixture);
+    let finish = upgrades
+        .iter()
+        .filter(|argv| !argv.iter().any(|arg| arg == "--install"))
+        .count();
+    assert_eq!(
+        finish, 2,
+        "failed attempt plus the converging rerun: {upgrades:?}"
+    );
+}
+
+#[test]
+fn a_failed_revision_still_runs_cluster_up() {
+    let fixture = Fixture::new();
+    let (code, shown) = fixture.run(false, &["--color", "never"]);
+    assert_eq!(code, 0, "{shown}");
+    let before = helm_upgrade_calls(&fixture).len();
+    let output = fixture
+        .command(false, &["--color", "never"])
+        .env("QUICKSTART_REVISION_STATUS", "failed")
+        .output()
+        .unwrap();
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{shown}");
+    assert!(shown.contains("Installing Curie"), "{shown}");
+    assert!(!shown.contains("skipping cluster up"), "{shown}");
+    let upgrades = helm_upgrade_calls(&fixture);
+    assert!(
+        upgrades.len() > before
+            && upgrades
+                .last()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--install"),
+        "a failed revision must be repaired by cluster up: {upgrades:?}"
+    );
+}
+
+#[test]
+fn a_different_runner_base_is_refused_before_the_binding_upgrade() {
+    let fixture = Fixture::new();
+    let (code, shown) = fixture.run(false, &["--color", "never"]);
+    assert_eq!(code, 0, "{shown}");
+    let mut values: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.dir.path().join("values")).unwrap())
+            .unwrap();
+    values["agentSandbox"]["runner"]["digest"] =
+        json!("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    fixture.record_values(values);
+    let before = helm_upgrade_calls(&fixture).len();
+    let output = fixture
+        .command(true, &["--color", "never"])
+        .output()
+        .unwrap();
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{shown}");
+    assert!(shown.contains("Checking the runner base failed"), "{shown}");
+    assert!(
+        shown.contains("another base") || shown.contains("was built on"),
+        "{shown}"
+    );
+    assert_eq!(
+        helm_upgrade_calls(&fixture).len(),
+        before,
+        "the binding upgrade ran before the refusal: {shown}"
+    );
 }
 
 #[test]
@@ -588,6 +825,9 @@ fn debug_reveals_chained_detail_and_default_failure_reports_one_pathless_error()
     assert_eq!(code, 0, "{shown}");
     assert!(shown.contains("helm upgrade"), "{shown}");
     assert!(shown.contains("Release accepted"), "{shown}");
+    // A fresh fixture is not yet at the target release, so this failure still
+    // enters cluster up. The debug run above already is, and would skip it.
+    let fixture = Fixture::new();
     let mut cmd = fixture.command(false, &["--color", "never"]);
     let output = cmd.env("QUICKSTART_FAIL", "up").output().unwrap();
     let shown = format!(

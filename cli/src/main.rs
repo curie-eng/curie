@@ -3151,6 +3151,11 @@ enum ClusterAction {
         /// 900. A factory install with a 10800s budget needs about 21900s.
         #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
+        /// Bind this digest-pinned runner image in the same helm upgrade as
+        /// the intake settings (`AGENT=ghcr.io/example/runner@sha256:<digest>`).
+        /// The chart is still `--chart`. The values mode stays `--reuse-values`.
+        #[arg(long, value_name = "AGENT=IMAGE")]
+        runner_image: Option<String>,
         /// Kubernetes namespace.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
@@ -4284,6 +4289,31 @@ fn cluster_connector_bind_values(
         }
     }
     Ok(curie::cluster_secrets::sandbox_connector_secrets(&values))
+}
+
+fn parse_runner_image_binding(raw: &str) -> Result<curie::factory_intake::RunnerImageBinding> {
+    let (agent, image) = raw.split_once('=').ok_or_else(|| {
+        curie::exit::CliError::usage("--runner-image must be AGENT=IMAGE")
+            .with_fix("pass dark-factory=ghcr.io/example/runner@sha256:<64 hex digits>")
+    })?;
+    let digest = image
+        .split_once("@sha256:")
+        .map(|(_, digest)| digest)
+        .filter(|digest| digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()));
+    if agent.is_empty()
+        || !agent.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        || digest.is_none()
+    {
+        return Err(curie::exit::CliError::usage(
+            "--runner-image must name an agent and a digest-pinned image",
+        )
+        .with_fix("pass dark-factory=ghcr.io/example/runner@sha256:<64 hex digits>")
+        .into());
+    }
+    Ok(curie::factory_intake::RunnerImageBinding {
+        agent: agent.to_string(),
+        image: image.to_string(),
+    })
 }
 
 async fn bind_cluster_connector_secrets(
@@ -6086,11 +6116,16 @@ async fn run(command: Option<Command>) -> Result<()> {
                 private_key_file,
                 org,
                 timeout,
+                runner_image,
                 namespace,
                 release,
                 chart,
                 dry_run,
             } => {
+                let runner_binding = runner_image
+                    .as_deref()
+                    .map(parse_runner_image_binding)
+                    .transpose()?;
                 let webhook_secret = if disable {
                     None
                 } else {
@@ -6124,6 +6159,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         private_key_file,
                         org,
                         intake,
+                        runner_binding,
                     })
                     .await?,
                 )
