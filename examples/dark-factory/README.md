@@ -62,6 +62,14 @@ the right reviewer, strips `isolation` and `model`, forces
 applies the cap, stops the run on a reviewer reply without a verdict, and
 refuses `publish_changes` until the diff reviewer approves. It also writes the
 `plan_review` and `review_diff` phase lines, with the round, to the pod log.
+It hands the agent and both reviewers the same verification contract,
+[`verification/contract.md`](verification/contract.md): the per-criterion
+verification table, when a check that needs an absent service may be delegated
+to a required pull request check, what always blocks, and the `VERIFICATION:`
+block each reviewer returns, which the hook records as a
+`curie_gate: verification_classified` line. When the bundle ships a
+`verification/checks.json`, both reviewers also get it after the contract.
+Without the contract no review runs.
 
 The same hook gates repository edits. `Edit`, `Write`, `MultiEdit` and
 `NotebookEdit` are refused until the `dark-factory:implement-issue` skill is

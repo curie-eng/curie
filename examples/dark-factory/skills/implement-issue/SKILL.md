@@ -133,6 +133,18 @@ the diff reviewer approved; that approval covers the diff it read. List
 diff-review notes in the pull request body as notes you did not address.
 Never start another review round only to address notes.
 
+## Verification contract
+
+The review gate hook gives you the bundle's verification contract with your
+first message and with every `wait_ci` round message, and appends the same
+text to every plan review and diff review call. It defines the verification
+table your plan carries (one row per acceptance criterion: the check, where it
+runs, the evidence required before publication, and any delegation to required
+pull request CI), when a check that needs an absent service may be delegated,
+and what always blocks. Follow it in every phase below; the repository's own
+instructions still apply. Keep the table current from `plan` through every
+`implement` round and every `wait_ci` round.
+
 ## 1. Read the issue (phase `read_issue`)
 
 Call report_progress with phase `read_issue`.
@@ -174,8 +186,9 @@ documents; a CI workflow file may show them, and you may read it, but not
 edit it. Find the code the change touches and the existing tests next to it.
 
 Before editing, write a short plan in your reply: the files you will change,
-the test you will add or change, and which acceptance criterion each edit
-serves. Keep the scope to the criteria. No drive-by refactors, renames,
+the test you will add or change, which acceptance criterion each edit serves,
+and the verification table the verification contract defines. Keep the scope
+to the criteria. No drive-by refactors, renames,
 reformatting or dependency upgrades. On round 2 or 3, revise the plan to
 answer every finding from the previous plan review, and say how.
 
@@ -188,7 +201,8 @@ Call the `Agent` tool (also called Task) with exactly these arguments:
 - `subagent_type`: `"dark-factory:plan-reviewer"` (required; never omit it)
 - `description`: `"Plan review round <n>"`
 - `prompt`: the issue link and text, your numbered acceptance criteria, the
-  full plan, and, from round 2 on, the previous round's findings.
+  full plan with its verification table, and, from round 2 on, the previous
+  round's findings.
 - `run_in_background`: `false` (required; never omit it)
 
 Do not pass `isolation` or `model`. Wait for the foreground call to return
@@ -216,16 +230,11 @@ Where a test is feasible, write the test for the new behavior first and run
 it. Confirm it fails, and fails for the reason the issue describes, before
 you change the code. When the new test needs a service the sandbox lacks
 (Postgres, Valkey, or another server the repository's CI starts), it cannot
-run here, and a failure at import or connection is not the red you need. Write
-the test anyway and record it as a service-backed test: its exact command, the
-missing service, and the line in the base code it exercises that your change
-fixes. Its green run comes from the pull request's CI, which starts the
-services. Its red-on-base run is a defined procedure for a machine with those
-services, not this sandbox: keep the new test file, restore only the changed
-non-test files from the base with `git checkout <base-sha> -- <changed source
-files>`, start the services the repository documents, and run the recorded
-command; it must fail on the bug, not at import. Put that procedure in the
-pull request body. Do not stop for want of a red run you cannot obtain. When a test is not feasible (documentation, pure
+run here, and a failure at import or connection is not the red you need.
+Write the test anyway. The verification contract decides whether it may be
+delegated to required pull request CI, what you record for it, and the
+procedure the pull request body carries. Do not stop for want of a red run
+you cannot obtain. When a test is not feasible (documentation, pure
 configuration, or a project with no test framework), say so and say how you
 will verify the change instead.
 
@@ -274,20 +283,14 @@ this agent at a registry mirror or proxy with a fixed address, as the bundle
 README describes.
 
 Run every available check for the changed area. Record the exact command,
-exit status and result for each check you run. If Postgres or another required
-service is absent from the sandbox, record which check it blocks and the
-missing service. Name each blocked check and its cause in the pull request body;
-never claim it passed. A blocked service check can be left to the
-repository's independent pull request CI only when the functional acceptance
-criteria are verified by checks you did run. A real product check failure or
-an unmet criterion still requires a fix or a stated stop reason.
-A criterion whose only test is service-backed counts as verified for
-publication when the test is written, the serviceless checks pass, and the
-diff reviewer approves the test as exercising that criterion. The pull
-request's required CI, which starts the services, is that test's run, and
-`wait_ci` returns any failure to `implement`. Never fake a
-missing package, service or file with a stub, a mock presented as real, or a
-fixed result.
+exit status and result for each check you run, and update the verification
+table. When Postgres or another service the sandbox lacks blocks a check,
+record which check it blocks and the missing service; the verification
+contract decides whether that check is delegated or blocks publication. Name
+each blocked or delegated check and its cause in the pull request body; never
+claim it passed. A real product check failure or an unmet criterion still
+requires a fix or a stated stop reason. Never fake a missing package, service
+or file with a stub, a mock presented as real, or a fixed result.
 
 ## 7. Diff review (phase `review_diff`, same `round` as the implement pass)
 
@@ -296,9 +299,9 @@ Call report_progress with phase `review_diff` and round `<n>`.
 Call the `Agent` tool exactly as in step 4, with `subagent_type`
 `"dark-factory:diff-reviewer"` (required; never omit it), `description`
 `"Diff review round <n>"`, and a `prompt` with the issue link and text, your
-numbered acceptance criteria, each check you ran with its exit status, each
-service-backed test with its command and missing service, and,
-from round 2 on, the previous round's findings.
+numbered acceptance criteria, each check you ran with its exit status, the
+current verification table, for each delegated row the declared check entry
+it relies on, and, from round 2 on, the previous round's findings.
 The reviewer reads the diff in `/workspace` itself. Do not pass `isolation` or
 `model`. Set `run_in_background` to `false`; wait for the foreground call to
 return before any other tool call.
@@ -331,13 +334,10 @@ there yourself.
 
 Call report_progress with phase `publish`.
 
-**Publish** only when every functional criterion is met and verified, every
-available product check passes, and the diff reviewer's latest verdict is
-`VERDICT: APPROVE`. Checks blocked by an absent service must be named with
-their causes in the pull request body and left to the independent pull request
-CI. For each service-backed test, the body also states that red-on-base was
-not observed in the sandbox and gives the red-on-base procedure from step 5,
-with the base commit and the changed source files filled in. Never treat a failed check or an unmet criterion as a service gap. First
+**Publish** only when every row of the verification table is satisfied as the
+verification contract requires, every available product check passes, and the
+diff reviewer's latest verdict is `VERDICT: APPROVE`. Never treat a failed
+check or an unmet criterion as a service gap. First
 read the repository's pull request conventions: `AGENTS.md` and `CONTRIBUTING.md`, the pull request
 template (often under `.github/`), and any CI job that checks pull request
 bodies. Follow them in the pull request's title and body, including required
@@ -348,8 +348,9 @@ repository's conventions win. Call `mcp__curie__publish_changes` once, with:
   `Add inch to centimeter conversion (#12)`.
 - `body`: a short summary of the change, then `Closes #<number>`, then a
   checklist that maps each acceptance criterion to its evidence, then the
-  checks you ran with their results, then every service blocked check with its
-  exact command and missing service, then the plan and diff review rounds it
+  checks you ran with their results, then the verification table with every
+  delegated or blocked check, its cause and the evidence the verification
+  contract requires, then the plan and diff review rounds it
   took, then anything else you did not verify or deliberately declined, and
   any reviewer `NOTES:` you did not address.
 
