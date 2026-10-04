@@ -24,9 +24,9 @@ string rather than a `const`. Artifact sync is enforced by the
 schema-compat gate (`tests/test_schema_compat.py`); an unbumped wire change is
 caught by the wire-lock gate (`tests/test_wire_lock.py`).
 
-## Contract surface (v0.5.0)
+## Contract surface (v0.5.16)
 
-`PROTOCOL_VERSION = "0.5.0"` is embedded in the schema and in every outbound
+`PROTOCOL_VERSION = "0.5.16"` is embedded in the schema and in every outbound
 event.
 
 `QueuedTurn.reply_handle` may be absent only when `source` is `cron` and
@@ -52,10 +52,79 @@ before processing. Targetless cron execution is deferred to a separate change.
 
 **Inbound channel messages** (discriminated union on `kind`):
 
-- `Event` = `{kind: "event", type: message|job|eval_case, text, user, ts, session_id?, history_ref?}`.
-  `session_id` and `history_ref` are nullable strings carrying conversation-scoped
-  identity after a sandbox is bound; older producers may omit either field.
-- `Interrupt` = `{kind: "interrupt", reason}`
+1. `Event` = `{kind: "event", type: message|job|eval_case, text, user, ts, session_id?, history_ref?, channel_read?}`.
+   `session_id` and `history_ref` are nullable strings carrying conversation scoped
+   identity after a sandbox is bound; older producers may omit either field.
+2. `Interrupt` = `{kind: "interrupt", reason}`
+
+**Channel read capability contract**
+
+`Event.channel_read` is an optional `ChannelReadCapability`, defaulting to null.
+A present object requires both `url` and `token` as nonempty strict strings;
+Python producers and readers validate the URL as HTTP or HTTPS. The URL is the
+configured trusted platform read proxy, never a provider endpoint or a model
+supplied address. Valid URL syntax alone establishes no endpoint trust.
+Generated Rust and TypeScript preserve the optional parent and required pair;
+they do not independently enforce Python URL or string length validation.
+Python representations omit the token and event field; generated Rust `Debug`
+redacts the token in both the capability and enclosing event. Serialization
+retains the pair for authenticated transport.
+
+The marker `CHANNEL_READ_STATUS_FIELD = "channel_read"` names a status key that
+a server may advertise as literal boolean `true` only after actual enforcement.
+Missing, false or malformed advertisements mean unsupported. A producer must
+refuse a granted channel read turn on an unsupported server. Older tolerant
+readers can ignore the optional object for wire compatibility, but that does
+not establish enforcement support.
+
+The following are required obligations for the implementing change in #2877
+under ADR 0100. This prerequisite defines the transport, grant and reserved
+identity; it advertises no enforcement, issues no token, mounts no server and
+implements no Slack read operation or runtime lifecycle.
+
+1. The kernel is the only issuer and delivery producer. Bundles, ingress,
+   hooks, model text, CLI skill events and queued turns cannot supply this
+   credential. Delivery is limited to authenticated worker to runner
+   `/v1/event` and `/v1/steer` requests after enforcement support is verified.
+   It changes neither `BootEnv` nor `SessionConfig` and reuses no memory, state,
+   progress, issue read or provider credential.
+2. The dedicated signed token carries audience `channel.read`, authenticated
+   agent identity, pinned deployment and bundle grant identity, logical turn
+   identity, fresh credential identity or generation and finite expiry. It
+   authorizes only channel reads. The provider bot token stays in the platform.
+3. A logical turn is the admitted platform run, not its reusable sandbox or
+   session. Each fresh turn gets a new identity and eight successful pages.
+   Issuance and request verification share authoritative active turn and
+   revocation state. A token without a live matching turn is refused before
+   expiry as well as after it.
+4. Every read checks signed audience, expiry, agent, deployment grant, active
+   logical turn and remaining page budget, then resolves live `agent_channels`
+   bindings and adapter membership. Removing a binding or membership revokes
+   access on the next read. A token carries no broad fixed channel allowlist.
+   Provenance, message and thread identifiers and cursors never choose an
+   unauthorized channel. The bundle grant chooses no channel or workspace.
+5. The trusted original inbound `(kind, address)` binding is the omitted
+   channel default; a turn without one must supply an explicit pair. Steer
+   preserves this default, agent, deployment and logical turn budget. The
+   runner rejects mismatched scope and atomically replaces or clears the
+   capability before admitting further reads. Null or an omitted field clears
+   the previous capability rather than retaining an earlier token.
+6. Completion, interruption, classified failure, cancellation, disconnection,
+   admission failure and suspension clear the runner capability and revoke the
+   issuer's active generation. Cleanup covers every terminal path and `finally`;
+   expiry alone is insufficient. Tokens never enter environment variables,
+   subprocesses, hooks, model arguments, logs, telemetry, transcripts,
+   checkpoints or persisted session state.
+7. An approval or checkpoint resume gets a fresh generation for the same
+   logical turn only for a genuine continuation. The old generation stays
+   revoked and successful page counters stay in the platform ledger.
+   Rehydration cannot renew the budget. A subsequent turn, including a new
+   event after the 409 steer finish race, requires a new logical identity and
+   newly issued capability.
+8. Concurrent requests and rotations use atomic platform accounting so reads
+   cannot exceed eight successful pages. Cursor binding and page accounting
+   belong to #2877. A refused read is a capability or authorization failure,
+   never an empty successful page.
 
 **Outbound NDJSON response events** (discriminated union on `type`, each carries
 `version`):

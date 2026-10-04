@@ -113,6 +113,43 @@ def test_unmatched_tool_is_denied() -> None:
     assert classify_tool(policy, "grafana/delete_datasource") == ToolPolicyDecision.DENY
 
 
+@pytest.mark.parametrize(
+    ("collections", "expected"),
+    [
+        ({"allow": ["curie-slack/history"]}, ToolPolicyDecision.ALLOW),
+        ({"approvalRequired": ["curie-slack/history"]}, ToolPolicyDecision.APPROVAL_REQUIRED),
+        ({"deny": ["curie-slack/history"]}, ToolPolicyDecision.DENY),
+        (
+            {"allow": ["curie-slack/history"], "approvalRequired": ["curie-slack/*"]},
+            ToolPolicyDecision.APPROVAL_REQUIRED,
+        ),
+        (
+            {
+                "allow": ["curie-slack/hist*"],
+                "approvalRequired": ["curie-slack/*"],
+                "deny": ["curie-slack/history"],
+            },
+            ToolPolicyDecision.DENY,
+        ),
+        ({"allow": ["curie-slack/replies"]}, ToolPolicyDecision.DENY),
+    ],
+)
+def test_channel_read_grant_does_not_override_tool_policy(
+    collections: dict[str, list[str]], expected: ToolPolicyDecision
+) -> None:
+    manifest = PluginManifest.model_validate(
+        {
+            "name": "acme-bot",
+            "channelRead": True,
+            "toolPolicy": {"enforcement": TOOL_POLICY_ENFORCEMENT, **collections},
+        }
+    )
+    assert manifest.channelRead is True
+    policy = load_tool_policy(manifest, enforces=TOOL_POLICY_ENFORCEMENT)
+    assert policy is not None
+    assert classify_tool(policy, "curie-slack/history") is expected
+
+
 def test_a_newly_advertised_tool_the_policy_never_mentions_is_denied() -> None:
     """Server drift fails CLOSED: a sixth tool appearing after the policy was written is denied.
 

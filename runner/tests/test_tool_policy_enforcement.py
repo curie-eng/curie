@@ -450,6 +450,39 @@ def test_a_bundle_with_no_policy_is_unchanged() -> None:
     assert _hook_call(gate, "Bash") == {}
 
 
+@pytest.mark.parametrize("interceptor", ["hook", "callback"])
+@pytest.mark.parametrize("decision", ["allow", "approval", "deny", "unmatched"])
+def test_channel_read_tools_remain_inside_policy_scope(
+    interceptor: str, decision: str
+) -> None:
+    from plugin_format.connectors import CHANNEL_READ_SERVER_NAME
+
+    collections = {
+        "allow": {"allow": ["curie-slack/history"]},
+        "approval": {"approval_required": ["curie-slack/history"]},
+        "deny": {"deny": ["curie-slack/history"]},
+        "unmatched": {"allow": ["curie-slack/replies"]},
+    }
+    gate = ApprovalGate(
+        tool_policy=_policy(**collections[decision]),
+        bundle_name="acme-bot",
+        connector_servers={CHANNEL_READ_SERVER_NAME},
+        mcp_servers=set(),
+        state_server_mounted=True,
+    )
+    reason = _interception_reason(gate, f"mcp__{CHANNEL_READ_SERVER_NAME}__history", interceptor)
+    if decision == "allow":
+        assert reason == ""
+        _assert_no_approval_was_recorded(gate)
+    elif decision == "approval":
+        assert reason
+        assert "not permitted for this agent" not in reason
+        assert gate.pending_summary is not None
+    else:
+        assert "not permitted for this agent" in reason
+        _assert_no_approval_was_recorded(gate)
+
+
 @pytest.mark.parametrize(
     "tool",
     ["mcp__k8s-write__restart_deployment", "mcp__k8s-write__something_new"],

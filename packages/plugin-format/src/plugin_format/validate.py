@@ -33,8 +33,8 @@ from .connector_lock import (
     validate_connector_lock,
 )
 from .connectors import (
+    CHANNEL_READ_SERVER_NAME,
     CONNECTORS_FILE,
-    RESERVED_CONNECTOR_NAMES,
     ConnectorsFile,
     validate_connectors,
 )
@@ -75,6 +75,10 @@ from .yaml_loader import DuplicateKeyError, safe_load_unique
 # to validate both the inline object and a declared hooks file.
 _HOOKS_ADAPTER = TypeAdapter(dict[str, list[HookMatcherConfig]])
 _TRIGGERS_ADAPTER = TypeAdapter(list[TriggerDeclaration])
+
+# The two existing platform exemptions are separate from the reserved names.
+# The reserved channel read server remains subject to toolPolicy when granted.
+_TOOL_POLICY_EXEMPT_PLATFORM_SERVERS = frozenset({"curie", "curie-state"})
 
 # Claude Code plugin names are kebab-case: lowercase alphanumerics and hyphens.
 _NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
@@ -865,6 +869,14 @@ def _validate_mcp_object(obj: object, location: str, c: _Collector) -> set[str] 
         return None
 
     for name, server in config.mcpServers.items():
+        if name == CHANNEL_READ_SERVER_NAME:
+            c.error(
+                "mcp.reserved_name",
+                f"mcp server {name!r} is reserved for the platform owned channel read "
+                "capability. A bundle cannot declare it; use channelRead: true to "
+                "grant the capability and toolPolicy to restrict its tools.",
+                location,
+            )
         if server.command is None and server.url is None:
             c.error(
                 "mcp.server_incomplete",
@@ -1441,9 +1453,9 @@ def _validate_tool_policy(
 
     # The declared-server cross-check. A pattern whose server segment is a
     # LITERAL name (``literal_server_segment`` returns ``None`` for a wildcarded
-    # or malformed one) must name a server the bundle actually declares, in
-    # either the MCP map or connectors.yaml -- a typo'd segment is an inert rule
-    # the author believes is live. A wildcard segment is the deliberate escape
+    # or malformed one) must name a declared server or the granted channel read
+    # capability. An unknown literal names an inert rule the author believes
+    # is live. A wildcard segment is the deliberate escape
     # hatch for a bundle whose servers are not statically declared and is never
     # cross-checked; that makes this check advisory, which is accepted, because
     # the property that actually defends the capability is classify_tool's
@@ -1453,23 +1465,29 @@ def _validate_tool_policy(
         if mcp_servers is not None and connector_servers is not None
         else None
     )
+    if expected_servers is not None and manifest.channelRead:
+        expected_servers.add(CHANNEL_READ_SERVER_NAME)
     if expected_servers is not None:
         for collection, i, pattern in policy_patterns(policy):
             server = literal_server_segment(pattern)
+            if server == CHANNEL_READ_SERVER_NAME and not manifest.channelRead:
+                c.error(
+                    "channel_read.grant_required",
+                    f"tool pattern {pattern!r} names {CHANNEL_READ_SERVER_NAME!r}, but "
+                    "channelRead is not true. Grant the capability with channelRead: true "
+                    "before declaring a policy for its tools. Its server name is reserved "
+                    "and cannot be declared by the bundle.",
+                    f"plugin.json (toolPolicy.{collection}[{i}])",
+                )
+                continue
             if server is None or server in expected_servers:
                 continue
-            # Same error, better message, and NOTHING new is rejected here
-            # (#2286). The branch sits INSIDE the undeclared case on purpose: a
-            # reserved name is only reserved against connectors.yaml, so a
-            # bundle may legally declare a plugin-mounted mcpServers entry
-            # called `curie`, whose live names carry the plugin infix and stay
-            # fully inside policy scope. That bundle passes the guard above and
-            # never reaches this line. What lands here is the dead end: a
-            # pattern naming a server the bundle does not declare and, because
-            # the platform owns the name, cannot declare as a connector either.
-            # The generic advice would send that author in a circle, telling
-            # them to declare exactly what `connectors.reserved_name` refuses.
-            if server in RESERVED_CONNECTOR_NAMES:
+            # Only the existing two exempt identities use this diagnostic.
+            # A bundle may plugin mount either name with the plugin infix and
+            # full policy scope; those declarations pass the guard above.
+            # An undeclared literal cannot become a connector, so generic
+            # advice to declare it would contradict the reserved name check.
+            if server in _TOOL_POLICY_EXEMPT_PLATFORM_SERVERS:
                 c.error(
                     "tool_policy.platform_server",
                     _platform_tool_policy_server_message(pattern, server),
@@ -1538,9 +1556,9 @@ def _platform_tool_policy_server_message(pattern: str, server: str) -> str:
     the author is still looking: the pattern cannot be made live, and the thing
     it was reaching for was never in danger.
 
-    The reserved set is imported rather than retyped for the #453/#544 reason:
-    a second copy of a name list owned by a different module is how a validator
-    and the thing it validates drift into disagreeing.
+    Only the two existing exempt platform servers use this diagnostic.
+    Reservation does not imply exemption: the channel read capability remains
+    policy governed and has its own unavailable grant diagnostic.
     """
 
     return (

@@ -123,6 +123,46 @@ class ToolAccess(StrEnum):
 TOOL_ACCESS_STATUS_FIELD: TypingFinal = "tool_access"
 
 
+#: A server advertises literal boolean true at this status key only after it
+#: enforces the channel read contract. Missing, false or malformed means
+#: unsupported; a producer must refuse a granted turn on an unsupported server.
+#: This prerequisite defines the marker but advertises no enforcement.
+CHANNEL_READ_STATUS_FIELD: TypingFinal = "channel_read"
+
+
+class ChannelReadCapability(_AciModel):
+    """Dedicated proxy authority for one admitted logical turn under ADR 0100.
+
+    Only the kernel may issue and send it, over authenticated event or steer
+    control requests to a server advertising enforcement. The configured URL
+    identifies the trusted platform proxy, not a provider endpoint. HTTP URL
+    syntax alone establishes no trust; the implementing lanes must verify the
+    trusted configuration. The provider credential remains in the platform.
+
+    The signed token binds audience ``channel.read``, agent, deployment, bundle
+    grant, logical turn, credential generation and finite expiry. Every read
+    requires a live matching turn, current binding and adapter membership, and
+    atomic successful page accounting. Renewal preserves the logical turn and
+    its budget, revokes the old generation, and never extends channel scope.
+    A steer cannot change the original inbound binding or authenticated scope.
+    Terminal paths revoke and clear the capability; null on a steer clears it.
+
+    Tokens must stay out of environment variables, hooks, subprocesses, model
+    arguments, logs, telemetry, transcripts, checkpoints and persisted state.
+    This model declares the transport contract. It issues no token and supplies
+    no read operation, authorization, renewal or runtime revocation behavior.
+    """
+
+    url: str = Field(min_length=1, strict=True, json_schema_extra={"format": "uri"})
+    token: str = Field(min_length=1, strict=True, repr=False)
+
+    @field_validator("url")
+    @classmethod
+    def _validate_proxy_url(cls, value: str) -> str:
+        HttpUrl(value)
+        return value
+
+
 class PublicationContext(_AciModel):
     """API issued authority and observation for one execution's publication read.
 
@@ -183,6 +223,15 @@ class Event(_AciModel):
     MEMORY-TOKEN-2). ``repr=False`` keeps the value out of ``repr(event)`` and
     log ``%r``; a consumer must not place it in env, logs, hook or subprocess
     input, or persisted state (MEMORY-TOKEN-3).
+
+    ``channel_read`` pairs a trusted platform proxy URL with a dedicated
+    ephemeral signed credential for one logical turn. Only the kernel sends it
+    on authenticated ``/v1/event`` and ``/v1/steer`` requests after the server
+    advertises actual enforcement under ``CHANNEL_READ_STATUS_FIELD``. Missing
+    or null means no capability, and a steer clears any previous capability.
+    It is not a BootEnv or SessionConfig field and reuses no other credential.
+    The nested type defines the required scope and lifecycle; these models do
+    not advertise enforcement or implement that lifecycle.
     """
 
     kind: Literal["event"] = "event"
@@ -195,6 +244,7 @@ class Event(_AciModel):
     publication_context: PublicationContext | None = None
     tool_access: ToolAccess | None = None  # @spec TOOL-ACCESS-1 TOOL-ACCESS-2
     memory_token: str | None = Field(default=None, repr=False)  # @spec MEMORY-TOKEN-1
+    channel_read: ChannelReadCapability | None = Field(default=None, repr=False)
 
 
 class Interrupt(_AciModel):

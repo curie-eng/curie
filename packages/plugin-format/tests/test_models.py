@@ -22,6 +22,50 @@ def test_manifest_accepts_and_keeps_unknown_keys() -> None:
     assert manifest.model_dump().get("futureField") == 42
 
 
+@pytest.mark.parametrize("grant", [False, True])
+def test_manifest_channel_read_accepts_only_boolean_grants(grant: bool) -> None:
+    manifest = PluginManifest.model_validate(
+        {"name": "acme-bot", "channelRead": grant, "futureClaudeField": {"enabled": True}}
+    )
+    assert manifest.channelRead is grant
+    dumped = manifest.model_dump()
+    assert dumped["channelRead"] is grant
+    assert dumped["futureClaudeField"] == {"enabled": True}
+    assert PluginManifest.model_validate(dumped).channelRead is grant
+
+
+def test_manifest_channel_read_defaults_to_false() -> None:
+    manifest = PluginManifest.model_validate({"name": "acme-bot", "futureClaudeField": 42})
+    assert manifest.channelRead is False
+    assert manifest.model_dump()["channelRead"] is False
+    assert manifest.model_dump()["futureClaudeField"] == 42
+
+
+@pytest.mark.parametrize(
+    "grant",
+    [
+        None,
+        0,
+        1,
+        0.0,
+        1.0,
+        "",
+        "true",
+        "false",
+        "yes",
+        [],
+        ["C0EXAMPLE1"],
+        {},
+        {"channels": ["C0EXAMPLE1"]},
+        {"workspace": "example", "token": "example-token"},
+    ],
+)
+def test_manifest_channel_read_rejects_coercion_and_selector_objects(grant: object) -> None:
+    with pytest.raises(ValidationError) as exc:
+        PluginManifest.model_validate({"name": "acme-bot", "channelRead": grant})
+    assert any(error["loc"] == ("channelRead",) for error in exc.value.errors())
+
+
 def test_manifest_author_may_be_string_or_object() -> None:
     assert PluginManifest.model_validate({"name": "d", "author": "Jane"}).author == "Jane"
     obj = PluginManifest.model_validate({"name": "d", "author": {"name": "Jane"}})

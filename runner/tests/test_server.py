@@ -121,6 +121,22 @@ def test_healthz_status_and_event_round_trip() -> None:
     anyio.run(go)
 
 
+def test_current_runner_does_not_advertise_channel_read_enforcement() -> None:
+    from aci_protocol import CHANNEL_READ_STATUS_FIELD
+
+    runner, _ = _runner()
+
+    async def go() -> None:
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
+            for path, headers in (("/status", {}), ("/v1/status", _AUTH)):
+                response = await client.get(path, headers=headers)
+                assert response.status == 200
+                assert CHANNEL_READ_STATUS_FIELD not in await response.json()
+
+    anyio.run(go)
+
+
 def test_event_header_uses_explicit_parent_and_missing_or_malformed_is_safe_root() -> None:
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
@@ -753,6 +769,39 @@ def test_probe_endpoints_never_gated(path: str) -> None:
 # runner logs while serving a turn may carry it.
 
 _MEMORY_TOKEN = "sbx.eyJtZW1vcnkiOiJ3cml0ZSJ9.turn-memory-sentinel"
+
+
+def test_bad_channel_read_frames_never_echo_the_nested_credential(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    token = "channel.read.example.nested-credential-sentinel"
+    capability = {"url": "https://api.example.com/channel-read", "token": token}
+    bad_frames = [
+        {**_EVENT_FRAME, "channel_read": {"token": token}},
+        {**_EVENT_FRAME, "channel_read": {**capability, "url": "file:///tmp/channel-read"}},
+        {**_EVENT_FRAME, "channel_read": {**capability, "token": {"secret": token}}},
+        {**_EVENT_FRAME, "channel_read": capability, "text": {"invalid": True}},
+    ]
+    missing_text = {**_EVENT_FRAME, "channel_read": capability}
+    del missing_text["text"]
+    bad_frames.append(missing_text)
+    runner, _ = _runner()
+
+    async def go() -> None:
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner, token=_TOKEN))) as client:
+            for frame in bad_frames:
+                for path in ("/v1/event", "/v1/steer"):
+                    response = await client.post(path, json=frame, headers=_AUTH)
+                    body = await response.text()
+                    assert response.status == 400, (path, response.status, body)
+                    assert token not in body
+                    assert "nested-credential-sentinel" not in body
+
+    with caplog.at_level(logging.DEBUG):
+        anyio.run(go)
+    assert "nested-credential-sentinel" not in caplog.text
+    assert all("nested-credential-sentinel" not in repr(record.args) for record in caplog.records)
 
 
 def test_bad_event_error_does_not_echo_memory_token() -> None:

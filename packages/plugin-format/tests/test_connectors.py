@@ -570,17 +570,34 @@ def test_key_defaults_to_the_env_var_name() -> None:
 # --------------------------------------------------------------------------- #
 # Names Curie's own platform MCP servers occupy -- #1200
 # --------------------------------------------------------------------------- #
-RESERVED_NAMES = ["curie", "curie-state"]
+RESERVED_NAMES = ["curie", "curie-state", "curie-slack"]
 
 
 @pytest.mark.parametrize("name", RESERVED_NAMES)
 def test_a_reserved_platform_server_name_is_rejected(name: str) -> None:
-    # `curie` is the approval server and `curie-state` the durable state server.
-    # Both ride the same mcp_servers map a declared connector rides, so a
+    # Platform server names share the map a declared connector rides, so a
     # connector claiming the name replaces the platform server in the agent's
     # session -- the agent quietly loses request_approval or the state tools,
     # with nothing logged and nothing failing until a skill calls one.
     assert "connectors.reserved_name" in _codes({"connectors": {name: {"image": "x:1"}}})
+
+
+def test_channel_read_server_identity_is_canonical_and_reserved() -> None:
+    from plugin_format.connectors import CHANNEL_READ_SERVER_NAME, RESERVED_CONNECTOR_NAMES
+
+    assert CHANNEL_READ_SERVER_NAME == "curie-slack"
+    assert RESERVED_CONNECTOR_NAMES == {"curie", "curie-state", CHANNEL_READ_SERVER_NAME}
+
+
+def test_channel_read_connector_refusal_names_its_own_capability() -> None:
+    _, errors = validate_connectors({"connectors": {"curie-slack": {"image": "x:1"}}})
+    message = next(message for code, message in errors if code == "connectors.reserved_name")
+    assert "curie-slack" in message
+    assert "channel" in message.lower()
+    assert "read" in message.lower()
+    assert "platform" in message.lower()
+    assert "request_approval" not in message
+    assert "durable-state" not in message
 
 
 @pytest.mark.parametrize("name", RESERVED_NAMES)

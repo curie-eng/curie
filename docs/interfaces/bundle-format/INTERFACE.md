@@ -24,9 +24,9 @@ The frozen bundle/plugin manifest format: the **Claude Code plugin shape verbati
 distribution wedge. What is swappable is the harness that consumes a bundle; what stays fixed is
 the shape a bundle must have to be accepted. The base is the Claude Code plugin shape, and the
 models are lenient (`extra="allow"`) rather than strict so any bundle written for Claude Code
-validates unchanged. On top of that base the package **does add six Curie authoring
-extensions** — `systemPrompt`, `starterPrompts`, `secrets`, `triggers`, `approvalPolicy`,
-`toolPolicy` on `packages/plugin-format/src/plugin_format/models.py::PluginManifest`, optional
+validates unchanged. On top of that base the package **does add seven Curie authoring
+extensions**: `systemPrompt`, `starterPrompts`, `secrets`, `triggers`, `approvalPolicy`,
+`toolPolicy` and `channelRead` on `packages/plugin-format/src/plugin_format/models.py::PluginManifest`, optional
 fields Claude Code does not define. Leniency is what lets the Claude Code base and these
 extensions coexist; the earlier "does not invent format extensions" framing was wrong.
 
@@ -411,11 +411,17 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   takes an `enforces_tool_policy` handshake argument and REFUSES a policy-bearing bundle from any
   caller that does not name `curie/mcp-tool-policy@1`; `load_tool_policy` raises rather than
   returning a policy such a caller would not apply.
-  **Curie's own platform-owned MCP servers, `curie` and `curie-state`, are outside `toolPolicy`
-  scope entirely** (#2286, ADR-0139). A bundle cannot declare them as connectors
-  (`packages/plugin-format/src/plugin_format/connectors.py::RESERVED_CONNECTOR_NAMES`), so it
-  cannot express a policy over them, and the runtime exempts the tools those servers actually
-  published through `runner/src/curie_runner/approval.py::is_platform_owned_tool` before
+  **The existing platform servers `curie` and `curie-state` retain their `toolPolicy`
+  exemption** (#2286, ADR 0139). Their names are reserved against connectors;
+  a bundle may still plugin mount either name with the plugin infix and full
+  policy scope. Reservation does not imply mounting, publication or exemption.
+  The reserved `curie-slack` capability is fully governed by policy when the
+  manifest grants `channelRead: true`, and a bundle cannot declare it in any MCP
+  map or in `connectors.yaml`. Without the grant a literal policy pattern gets
+  `channel_read.grant_required`. This prerequisite defines the grant and
+  reservation but mounts no server. The runtime exempts only exact platform
+  tool names published by the existing two servers through
+  `runner/src/curie_runner/approval.py::is_platform_owned_tool` before
   `classify_tool` is ever consulted. The exemption is exact live tool names, not the
   `mcp__<server>__` prefix: `strict_mcp_config` is off, so the CLI also loads ambient project
   and user MCP servers, and a prefix match would exempt every tool of one keyed `curie__extra`
@@ -433,7 +439,7 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   configuration may add restrictions but may not hollow out operator or platform controls, and the
   same predicate decides both directions; platform-scope patterns for an operator-level need would
   be new semantics and belong to a future `@2` enforcement id. A bundle's own plugin-mounted
-  `mcpServers` entry named `curie` is a different server, carries the `plugin_<bundle>_` infix in
+  `mcpServers` entry named `curie` or `curie-state` is a different server, carries the `plugin_<bundle>_` infix in
   its live names, and stays fully in scope.
 
 Their validators live alongside the others in `validate.py` (`triggers.*` / `approval_policy.*` /

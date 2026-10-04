@@ -167,7 +167,7 @@ def test_the_runner_status_advertisement_key_is_tool_access() -> None:
 def test_the_schema_declares_tool_access_optional_on_both_models() -> None:
     # @spec TOOL-ACCESS-1 TOOL-ACCESS-2: a new optional field is a patch.
     schema = build_schema()
-    assert schema["protocolVersion"] == PROTOCOL_VERSION == "0.5.15"
+    assert schema["protocolVersion"] == PROTOCOL_VERSION == "0.5.16"
 
     definitions = schema["$defs"]
     assert definitions["ToolAccess"]["enum"] == ["read-only"]

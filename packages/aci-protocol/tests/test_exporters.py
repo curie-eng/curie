@@ -10,7 +10,7 @@ the private helpers, because the rendered artifact is the real contract.
 
 import re
 
-from aci_protocol import BootEnv
+from aci_protocol import BootEnv, SessionConfig
 from aci_protocol.rust_export import render_rust
 from aci_protocol.schema_export import build_schema
 
@@ -30,6 +30,53 @@ def test_event_session_context_fields_are_optional_nullable_strings() -> None:
         prop = event["properties"][field]
         assert "anyOf" in prop
         assert {variant["type"] for variant in prop["anyOf"]} == {"string", "null"}
+
+
+def test_channel_read_export_pairs_required_children_under_an_optional_parent() -> None:
+    schema = build_schema()
+    assert schema["protocolVersion"] == "0.5.16"
+    definitions = schema["$defs"]
+    event = definitions["Event"]
+    assert "channel_read" not in event["required"]
+    prop = event["properties"]["channel_read"]
+    assert prop["default"] is None
+    assert {"$ref": "#/$defs/ChannelReadCapability"} in prop["anyOf"]
+    assert {"type": "null"} in prop["anyOf"]
+    capability = definitions["ChannelReadCapability"]
+    assert set(capability["required"]) == {"url", "token"}
+    assert set(capability["properties"]) == {"url", "token"}
+    for field in ("url", "token"):
+        assert capability["properties"][field]["type"] == "string"
+        assert capability["properties"][field]["minLength"] == 1
+
+
+def test_channel_read_is_absent_from_boot_session_and_queued_turn_contracts() -> None:
+    definitions = build_schema()["$defs"]
+    for model in ("BootEnv", "SessionConfig", "QueuedTurn"):
+        assert "channel_read" not in definitions[model]["properties"]
+    assert "channel_read" not in BootEnv.model_fields
+    assert "channel_read" not in SessionConfig.model_fields
+    assert not any("CHANNEL_READ" in key for key in BootEnv.env_keys())
+
+
+def test_generated_rust_uses_the_typed_optional_channel_read_pair() -> None:
+    rust = render_rust()
+    capability = re.search(r"pub struct ChannelReadCapability \{\n(.*?)\n\}", rust, re.DOTALL)
+    assert capability, "generated Rust omits the channel read capability"
+    assert "pub url: String," in capability.group(1)
+    assert "pub token: String," in capability.group(1)
+    assert "Option<String>" not in capability.group(1)
+    assert "channel_read: Option<ChannelReadCapability>," in rust
+
+
+def test_generated_rust_channel_read_debug_uses_a_redacted_formatter() -> None:
+    rust = render_rust()
+    capability = re.search(
+        r"#\[derive\(([^\n]*)\)\]\npub struct ChannelReadCapability", rust
+    )
+    assert capability, "generated Rust omits the channel read derive declaration"
+    assert "Debug" not in capability.group(1).split(", ")
+    assert "impl std::fmt::Debug for ChannelReadCapability" in rust
 
 
 def test_generated_rust_guards_the_version() -> None:
