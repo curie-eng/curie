@@ -3,7 +3,7 @@
 import inspect
 
 import pytest
-from redis.exceptions import RedisError
+from redis.exceptions import NoPermissionError, RedisError, ResponseError
 
 from . import admission_broker as broker_helpers
 from .admission_broker import (
@@ -234,3 +234,45 @@ def test_constructor_invalid_bounds_before_broker_io(admission_broker, field, ba
         assert b.command("ACL", "LOG") == []
     finally:
         c.close()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("SET", "curie:runs", "forged"),
+        ("DEL", "curie:runs"),
+        ("SET", "protected:admission:quota", "forged"),
+        ("DEL", "protected:admission:quota"),
+        ("ZADD", "protected:admission:intent:cross-product", 1, "forged"),
+        ("XADD", "protected:admission:intent:cross-product", "1-0", "payload", "forged"),
+    ],
+)
+@pytest.mark.parametrize("inside_script", [False, True])
+def test_enqueue_command_authority_does_not_cross_owned_key_families(
+    admission_broker, command, inside_script
+):
+    """@spec PROTECTED-HOOK-ADMISSION-6/7 PROTECTED-HOOK-LANE-3."""
+    b = admission_broker
+    acl = module("admission_acl")
+    install(b, acl)
+    # Absent keys make SET/ZADD/XADD valid writes and DEL a valid zero result;
+    # a wrong-type or missing-key error cannot masquerade as an ACL refusal.
+    assert b.command("EXISTS", command[1]) == 0
+    before = snapshot(b)
+    c = client(b)
+    try:
+        if inside_script:
+            with pytest.raises(ResponseError, match="(?i)(permission|noperm)"):
+                c.eval(
+                    "return redis.call(ARGV[1],KEYS[1],unpack(ARGV,2))",
+                    1,
+                    command[1],
+                    command[0],
+                    *command[2:],
+                )
+        else:
+            with pytest.raises(NoPermissionError):
+                c.execute_command(*command)
+    finally:
+        c.close()
+    assert snapshot(b) == before
