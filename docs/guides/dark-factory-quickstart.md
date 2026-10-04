@@ -86,9 +86,17 @@ created again, `cluster up` keeps the recorded model credential, and the App
 setup, deploy, surface, deadline, publication policy, and budget are applied
 again to the same result.
 
-The second run prints what it inferred:
+By default, each run prints the Kubernetes context once and one line for each
+step it performs. Cluster installation inference notices remain visible. The
+first run ends with the App link and registration steps; the second ends with
+three lines summarizing readiness, intake and the deployed image. Pass
+`--debug` to see the chained commands and their detailed output. The printed
+rerun command omits namespace, release and model flags when they match the
+defaults.
 
-| Inferred value | Source |
+The second run configures these values:
+
+| Value | Source |
 |---|---|
 | Mention | The App slug, so a revision comment can mention `@<slug>`. |
 | Allowlist | The repository you passed, checked against the App installation. |
