@@ -35,12 +35,14 @@ The approval policy gate at `runner/src/curie_runner/approval.py` contains no
 SDK imports. Its Claude permission callback and hook adapter live at
 `runner/src/curie_runner/harness/claude/approval.py`.
 
-17 runner modules import `claude_agent_sdk` today (`check.py`, `session.py`,
+18 runner modules import `claude_agent_sdk` today (`check.py`, `session.py`,
 `hooks.py`, `adapter.py`, `mcp_argv.py`, `fake.py`, `preflight_blocked.py`,
 `approval.py`, `translate.py`,
 `plugin.py`, `state.py`, `progress.py`, `turn_progress.py`, `issue_read.py`,
-`usage_report.py`, `tool_access.py`, `__main__.py`). In that inventory,
-`approval.py` means `runner/src/curie_runner/harness/claude/approval.py`;
+`usage_report.py`, `tool_access.py`, `__main__.py`, `platform_slack.py`). In that
+inventory, `approval.py` means `runner/src/curie_runner/harness/claude/approval.py`
+and `platform_slack.py` means
+`runner/src/curie_runner/harness/claude/platform_slack.py`;
 the core `runner/src/curie_runner/approval.py` has no SDK import.
 `preflight_blocked.py` also lives inside the Claude harness package. The import
 rules in `pyproject.toml` forbid SDK dependencies in the gate and ratchet the

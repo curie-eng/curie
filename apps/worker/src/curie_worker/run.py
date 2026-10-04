@@ -58,6 +58,7 @@ from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
 from .hook_source_guard import CronHookSourceGuard
+from .kernel.channel_read import drain_pending_channel_read_closes
 from .kernel.core import Kernel
 from .kernel.memory import drain_pending_memory_closes
 from .killswitch import KillSwitch
@@ -407,6 +408,9 @@ def build(
     """@spec PROTECTED-HOOK-SOURCE-2."""
     owner = resources if resources is not None else WorkerResources()
     owner.register_close("memory-drain", drain_pending_memory_closes, order=0)
+    # Channel read revocations likewise (ADR 0100): one not finished leaves the
+    # capability to expire at its stream deadline.
+    owner.register_close("channel-read-drain", drain_pending_channel_read_closes, order=1)
     gate_engine = create_source_gate_engine(config)
     owner.register_close("source-gate", gate_engine.dispose, order=100)
     source_gate = SourceGate(gate_engine)
@@ -646,6 +650,9 @@ def build(
         # Deliberate progress (ADR 0130): the durable record a person's turn
         # reports on, the one the maintenance tick sweeps.
         progress=ProgressStore(async_redis, config),
+        # ADR 0100: the stored bundle is where a turn's channel read grant is
+        # read from, so the kernel knows it without asking the API.
+        bundles=BundleStore(config),
     )
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
     kernel.attach_killswitch(killswitch)

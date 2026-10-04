@@ -90,6 +90,25 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   App installation token and returns them verbatim. It stores nothing.
   State and other scoped credentials do not authorize it, and `wir`
   authorizes no other route.
+- **Channel read is a scoped credential exception (ADR 0100, #2877).**
+  `POST /channel-read` accepts only the API issued `chr` capability in
+  `X-Curie-Channel-Read`. Its sole audience is `channel.read`, and it names
+  one agent, deployment, grant digest, logical turn and generation. The worker
+  mints it through `POST /v1/internal/channel-read/context` using its internal
+  worker credential. The active ledger key is a 90 second lease that the worker
+  renews every 30 seconds with an owner checked refresh; the worker ends the
+  turn with an owner tombstone (a late committed open is refused) and an owner
+  checked revoke in the shared Valkey ledger
+  (`curie_internal.channel_read_ledger`), so revocation holds while the API is
+  down and a dead worker's capability lapses within one lease. Every read
+  repeats the generation, the grant (read locally from the agent's active
+  stored bundle manifest, cached by digest), the binding and Slack membership,
+  and Slack reads live only in `channel_read/slack_reads.py`. A turn may spend
+  8 pages, a window is at most 7 days, and `limit` defaults to 50 with a 100
+  maximum. Refusals are named `channel_read.*` codes; a 429 carries
+  `Retry-After`. It stores no message body. State, issue read
+  and other scoped credentials do not authorize it, and `chr` authorizes no
+  other route.
 - **Git-flow never calls the GitHub API.** `gitflow.py` builds the bundle by
   archiving the pushed sha directly from the repo over the git protocol (bare
   repos in tests, the real remote in production). This keeps the flow

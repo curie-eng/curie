@@ -69,7 +69,8 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Sequence
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal
 from urllib.parse import quote
 
 import aiohttp
@@ -201,6 +202,14 @@ _CLOSE_TURN_TIMEOUT = aiohttp.ClientTimeout(total=5)
 # #3823: the worker reports a sandbox claim's boot credential released.
 RELEASED_CREDENTIALS_PATH = "/v1/internal/state/released-credentials"
 _RELEASE_CREDENTIAL_TIMEOUT_S = 5
+# ADR 0100 (#2877): the API route that mints a turn's channel read capability,
+# and how long that call may take. Short: an open mint runs before the runner
+# call and a steer mint runs under the per-thread lock, and a failed mint only
+# runs the turn without the capability.
+CHANNEL_READ_CONTEXT_PATH = "/v1/internal/channel-read/context"
+_CHANNEL_READ_CONTEXT_TIMEOUT = aiohttp.ClientTimeout(total=3)
+_CHANNEL_READ_GRANT_ABSENT = "channel_read.grant_absent"
+_CHANNEL_READ_CODE = re.compile(r"^channel_read\.[a-z_]{1,64}$")
 # ADR-0188: the ``sender`` claim of a turn with no person behind it (a job, an
 # eval). The runner renders the same string as "no author"
 # (``memory_facts.NO_PERSON``); ``tests/test_memory_fact_key_parity.py`` pins
@@ -582,6 +591,28 @@ def _deployment_from_row(data: dict[str, Any]) -> ResolvedDeployment:
     if isinstance(runner_resources, str):
         data["runner_resources"] = json.loads(runner_resources)
     return ResolvedDeployment.model_validate(data)
+
+
+@dataclass(frozen=True)
+class ChannelReadMint:
+    """One minted channel read capability (ADR 0100, #2877).
+
+    ``turn_key`` is the logical turn digest the API resolved, approval chain
+    hops included, so the kernel addresses the shared Valkey ledger keys for
+    revocation without resolving the chain itself. The token never appears in
+    ``repr``."""
+
+    token: str = field(repr=False)
+    generation: int
+    expires_at: int
+    turn_key: str
+
+
+class ChannelReadGrantAbsent(Exception):
+    """The deployment's bundle does not grant channel read (409 ``grant_absent``).
+
+    Raised, not returned as None, so the kernel can remember the deployment
+    and stop asking; every other refusal or failure is None."""
 
 
 class BindingResolver:
@@ -1395,6 +1426,89 @@ class BindingResolver:
             return False
         return True
 
+    async def channel_read_context(
+        self,
+        *,
+        agent_id: uuid.UUID,
+        deployment_id: uuid.UUID,
+        event_id: str,
+        mode: Literal["open", "steer"],
+        owner: str | None = None,
+        default: tuple[str, str] | None,
+        ttl_s: int,
+    ) -> ChannelReadMint | None:
+        """Mint a turn's channel read capability on the API (ADR 0100, #2877).
+
+        ``mode="open"`` opens the logical turn under ``owner`` (the attempt's
+        id); ``mode="steer"`` renews the live one and sends no owner, since the
+        API keeps the opener's. Uses the worker token every other
+        ``/v1/internal`` call uses, never the platform key.
+
+        Raises ``ChannelReadGrantAbsent`` on 409 ``channel_read.grant_absent``.
+        Every other refusal, error, malformed body or unreachable API returns
+        None, so the turn runs without the capability (fail closed). An older
+        API without the route answers 404, logged once. Neither the token nor
+        any response text reaches a log line.
+        """
+
+        body: dict[str, Any] = {
+            "agent_id": str(agent_id),
+            "deployment_id": str(deployment_id),
+            "event_id": event_id,
+            "mode": mode,
+            "default_channel": (
+                None if default is None else {"kind": default[0], "address": default[1]}
+            ),
+            "ttl_s": ttl_s,
+        }
+        if owner is not None:
+            body["owner"] = owner
+        url = f"{self._config.api_base_url.rstrip('/')}{CHANNEL_READ_CONTEXT_PATH}"
+        try:
+            async with (
+                aiohttp.ClientSession(timeout=_CHANNEL_READ_CONTEXT_TIMEOUT) as session,
+                session.post(
+                    url,
+                    json=body,
+                    headers={"X-Curie-Worker-Token": self._config.internal_worker_token},
+                ) as response,
+            ):
+                status = response.status
+                try:
+                    payload: Any = await response.json(content_type=None)
+                except (ValueError, aiohttp.ClientError):
+                    payload = None
+        except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+            logger.warning(
+                "could not mint a channel read capability (%s): %s", mode, type(exc).__name__
+            )
+            return None
+        if status == 404:
+            if not getattr(self, "_channel_read_route_missing", False):
+                self._channel_read_route_missing = True
+                logger.info(
+                    "the API has no channel read context route (404); turns run "
+                    "without a channel read capability"
+                )
+            return None
+        if status == 409:
+            code = _refusal_code(payload)
+            if code == _CHANNEL_READ_GRANT_ABSENT:
+                raise ChannelReadGrantAbsent(code)
+            logger.info("the API refused a channel read %s mint: %s", mode, code)
+            return None
+        if status != 200:
+            logger.warning(
+                "the API refused a channel read %s mint: HTTP %s %s",
+                mode,
+                status,
+                _refusal_code(payload),
+            )
+            return None
+        mint = _channel_read_mint(payload)
+        if mint is None:
+            logger.warning("the API answered a channel read %s mint with a malformed body", mode)
+        return mint
 
 def boot_token_facts(token: str | None) -> tuple[str | None, str | None, int | None]:
     """``(agent, cred, exp)`` from a boot state token this worker minted.
@@ -1438,6 +1552,37 @@ def _boot_state_token_exp(token_ttl_s: float | None) -> int:
         lifetime = math.ceil(max(0.0, token_ttl_s))
     bounded = min(lifetime + BOOT_TOKEN_GRACE_SECONDS, SANDBOX_TOKEN_TTL_SECONDS)
     return int(time.time()) + bounded
+
+def _refusal_code(payload: object) -> str | None:
+    """The ``channel_read.*`` code of a refusal body, or None; never its message."""
+
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    code = detail.get("code") if isinstance(detail, dict) else None
+    return code if isinstance(code, str) and _CHANNEL_READ_CODE.fullmatch(code) else None
+
+
+def _channel_read_mint(payload: object) -> ChannelReadMint | None:
+    if not isinstance(payload, dict):
+        return None
+    token = payload.get("token")
+    generation = payload.get("generation")
+    expires_at = payload.get("expires_at")
+    turn_key = payload.get("turn_key")
+    if (
+        not isinstance(token, str)
+        or not token
+        or not isinstance(turn_key, str)
+        or not turn_key
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation <= 0
+        or isinstance(expires_at, bool)
+        or not isinstance(expires_at, int)
+    ):
+        return None
+    return ChannelReadMint(
+        token=token, generation=generation, expires_at=expires_at, turn_key=turn_key
+    )
 
 
 def _binding_claim(kind: str | None, address: str | None) -> str | None:

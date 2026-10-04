@@ -21,6 +21,7 @@ from aci_protocol import BootEnv
 from aiohttp import web
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from curie_telemetry import bootstrap_service_telemetry
+from plugin_format import CHANNEL_READ_SERVER_NAME
 
 from . import __version__
 from .adapter import (
@@ -61,6 +62,7 @@ from .harness.claude.approval import (
     build_memory_tools,
 )
 from .harness.claude.preflight_blocked import PreflightBlockedSession
+from .harness.claude.platform_slack import build_channel_read_server
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
     BUILTIN_HARNESS_CANONICAL_PATHS,
@@ -99,7 +101,13 @@ from .memory_facts import (
     resolve_facts_store,
 )
 from .otel import RunTracer, build_tracer_provider
-from .plugin import bundle_mcp_servers, bundle_skill_names, load_bundle_web_search_enabled
+from .platform_slack.capability import ChannelReadTurn, url_origin
+from .plugin import (
+    bundle_mcp_servers,
+    bundle_skill_names,
+    load_bundle_channel_read,
+    load_bundle_web_search_enabled,
+)
 from .progress import (
     PROGRESS_TOKEN_ENV,
     PROGRESS_URL_ENV,
@@ -120,7 +128,7 @@ from .state import (
 )
 from .subprocess_env import lock_process_environ
 from .tool_access import TurnToolAccess, front_can_use_tool, front_pre_tool_use_hooks
-from .tool_names import STATE_SERVER_NAME
+from .tool_names import CHANNEL_READ_TOOL_NAMES, STATE_SERVER_NAME
 from .turn_progress import (
     PROGRESS_PREAMBLE,
     TurnProgress,
@@ -551,6 +559,19 @@ def _readonly_tools(
     return harness.readonly_tools | observed
 
 
+def _with_channel_read_server(servers: set[str] | None, mounted: bool) -> set[str] | None:
+    """The gate's connector servers, plus ``curie-slack`` when it is mounted.
+
+    The mounted read tools are then canonicalized and governed by toolPolicy
+    like a connector's (ADR 0100), never exempt. ``None`` stays ``None``: an
+    unreadable declaration keeps the gate's fail-closed posture.
+    """
+
+    if not mounted or servers is None:
+        return servers
+    return set(servers) | {CHANNEL_READ_SERVER_NAME}
+
+
 def build_runner(
     config: RunnerConfig,
     *,
@@ -739,6 +760,10 @@ def build_runner(
     # build_approval_gate refuses a bundle gate that would redefine the route
     # of a tool the operator already gated. Either raises before the first
     # turn, so a misdeclared policy never boots ungated.
+    # Channel read (ADR 0100, #2877): a granted, real-model boot mounts the
+    # platform curie-slack server. The fake tier mounts no platform server and
+    # makes no network call, so it never mounts or advertises it.
+    channel_read_mounted = load_bundle_channel_read(config.session.plugin_dir) and not fake_model
     try:
         resolution = resolve_approval_policy(config.session.plugin_dir)
         approval_gate = build_approval_gate(
@@ -757,7 +782,9 @@ def build_runner(
             # (#1495).
             bundle_name=resolution.bundle_name,
             mcp_servers=resolution.mcp_servers,
-            connector_servers=resolution.connector_servers,
+            connector_servers=_with_channel_read_server(
+                resolution.connector_servers, channel_read_mounted
+            ),
             managed_workspace=mounted_workspace is not None,
             tool_policy=resolution.tool_policy,
         )
@@ -786,6 +813,14 @@ def build_runner(
     # bundle shipping its own server. Absent (fake/local, or an older worker), no
     # state server is mounted and the agent simply sees no state tools.
     state_client = resolve_state_client(os.environ)
+    # The per-turn channel read holder. Its capability URL must be on the same
+    # platform origin the worker gave this sandbox for state, which the kernel
+    # mints from the same runner-facing API base.
+    channel_read_turn = (
+        ChannelReadTurn(trusted_origin=url_origin(os.environ.get(BootEnv.env_key("state_url"))))
+        if channel_read_mounted
+        else None
+    )
     # The GitHub factory issue read (ADR 0187) is present only for an execution
     # with a WorkItem whose worker injected the route and capability.
     issue_read = resolve_issue_read(os.environ)
@@ -927,7 +962,13 @@ def build_runner(
             tool_access,
         )
         policy_hidden_tools = (
-            policy_disallowed_tools(approval_gate, capability.observed_tools)
+            policy_disallowed_tools(
+                approval_gate,
+                # The probe never sees an in-process server, so the mounted
+                # read tools join the projection by their published names.
+                capability.observed_tools
+                | (CHANNEL_READ_TOOL_NAMES if channel_read_turn is not None else frozenset()),
+            )
             if approval_gate is not None
             else ()
         )
@@ -984,6 +1025,11 @@ def build_runner(
             **(
                 {STATE_SERVER_NAME: build_state_server(state_client)}
                 if state_client is not None
+                else {}
+            ),
+            **(
+                {CHANNEL_READ_SERVER_NAME: build_channel_read_server(channel_read_turn)}
+                if channel_read_turn is not None
                 else {}
             ),
         }
@@ -1141,6 +1187,7 @@ def build_runner(
             connector_availability=connector_availability,
             history_capacity_exceeded=history_capacity_exceeded,
             memory_turn=memory_turn,
+            channel_read=channel_read_turn,
             tool_access=tool_access,
             attachment_notice=format_attachment_notice(attachment_paths),
             channel_kind=config.channel_kind,

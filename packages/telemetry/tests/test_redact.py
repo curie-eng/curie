@@ -18,6 +18,8 @@ FAKE_CHANNEL_TOKEN = "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "FAKEFAKEFAKESIG
 # Shapes from curie_internal.sandbox_token.mint and curie_worker.caller_token.mint.
 FAKE_SANDBOX_TOKEN = "sbx." + "ZXhhbXBsZXNhbmRib3hwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
 FAKE_CONNECTOR_CALLER_TOKEN = "cct." + "ZXhhbXBsZWNhbGxlcnBheWxvYWQ." + "FAKEFAKEFAKESIG0000"
+# Shape from curie_api.channel_read.token.mint (ADR 0100, #2877).
+FAKE_CHANNEL_READ_TOKEN = "chr." + "ZXhhbXBsZWNoYW5uZWxyZWFkcGF5bG9hZA." + "FAKEFAKEFAKESIG0000"
 # Provider docs: "API keys start with `am_`"
 # https://docs.agentmail.to/knowledge-base/getting-api-key.md
 FAKE_AGENTMAIL_API_KEY = "am_" + "FAKEFAKEFAKEFAKEFAKE0000"
@@ -102,6 +104,7 @@ REDACTED_CASES = [
         for rule, token in (
             ("sandbox_token", FAKE_SANDBOX_TOKEN),
             ("connector_caller_token", FAKE_CONNECTOR_CALLER_TOKEN),
+            ("channel_read_token", FAKE_CHANNEL_READ_TOKEN),
         )
     ),
     *(
@@ -113,6 +116,7 @@ REDACTED_CASES = [
         for rule, token in (
             ("sandbox_token", FAKE_SANDBOX_TOKEN),
             ("connector_caller_token", FAKE_CONNECTOR_CALLER_TOKEN),
+            ("channel_read_token", FAKE_CHANNEL_READ_TOKEN),
         )
     ),
     *(
@@ -124,6 +128,7 @@ REDACTED_CASES = [
         for rule, token in (
             ("sandbox_token", FAKE_SANDBOX_TOKEN),
             ("connector_caller_token", FAKE_CONNECTOR_CALLER_TOKEN),
+            ("channel_read_token", FAKE_CHANNEL_READ_TOKEN),
         )
     ),
     *(
@@ -135,6 +140,7 @@ REDACTED_CASES = [
         for rule, token in (
             ("sandbox_token", FAKE_SANDBOX_TOKEN),
             ("connector_caller_token", FAKE_CONNECTOR_CALLER_TOKEN),
+            ("channel_read_token", FAKE_CHANNEL_READ_TOKEN),
         )
         for prefix, retained, context_rule in (
             ("Authorization: Bearer ", "Authorization: ", "bearer_token"),
@@ -381,6 +387,11 @@ REDACTED_CASES = [
         "CURIE_CHANNEL_TOKEN=[REDACTED:channel_token]",
         id="channel_token_assignment_is_idempotent",
     ),
+    pytest.param(
+        f"read capability {FAKE_CHANNEL_READ_TOKEN}",
+        "read capability [REDACTED:channel_read_token]",
+        id="bare_channel_read_token_shape_is_redacted",
+    ),
 ]
 
 
@@ -398,6 +409,7 @@ PRESERVED_CASES = [
             (
                 "sbx.payload",
                 "cct.payload",
+                "chr.payload",
                 "sbx..signature",
                 "cct.payload.",
                 "sandbox=sbx-acme-example caller=cct-acme-example",
@@ -522,6 +534,7 @@ def test_preserved(line: str) -> None:
         pytest.param(
             FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT, id="discord_bot_redaction_is_idempotent-assignment"
         ),
+        pytest.param(FAKE_CHANNEL_READ_TOKEN, id="channel_read_redaction_is_idempotent"),
     ],
 )
 def test_redaction_is_idempotent(secret: str) -> None:

@@ -121,7 +121,7 @@ def test_healthz_status_and_event_round_trip() -> None:
     anyio.run(go)
 
 
-def test_current_runner_does_not_advertise_channel_read_enforcement() -> None:
+def test_an_ungranted_runner_does_not_advertise_channel_read() -> None:
     from aci_protocol import CHANNEL_READ_STATUS_FIELD
 
     runner, _ = _runner()

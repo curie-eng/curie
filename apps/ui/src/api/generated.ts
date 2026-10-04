@@ -1023,6 +1023,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/channel-read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Read Channel */
+        post: operations["read_channel_channel_read_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/channels/admission": {
         parameters: {
             query?: never;
@@ -1743,6 +1760,23 @@ export interface paths {
         get: operations["factory_status_card_v1_factory_cards__token__svg_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/channel-read/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Mint Channel Read Context */
+        post: operations["mint_channel_read_context_v1_internal_channel_read_context_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3636,6 +3670,13 @@ export interface components {
             /** Expected Version */
             expected_version: number;
         };
+        /** ChannelAddress */
+        ChannelAddress: {
+            /** Address */
+            address: string;
+            /** Kind */
+            kind: string;
+        };
         /**
          * ChannelBindingOut
          * @description The READ side of a binding: the stored pair, serialized as it is stored.
@@ -3764,6 +3805,112 @@ export interface components {
         ChannelCallersWrite: {
             /** Allowed Callers */
             allowed_callers: string[] | null;
+        };
+        /**
+         * ChannelReadContext
+         * @description The capability and the logical turn digest the worker revokes by.
+         */
+        ChannelReadContext: {
+            /** Expires At */
+            expires_at: number;
+            /** Generation */
+            generation: number;
+            /** Token */
+            token: string;
+            /** Turn Key */
+            turn_key: string;
+        };
+        /**
+         * ChannelReadContextMint
+         * @description The worker's request for one logical turn's capability.
+         */
+        ChannelReadContextMint: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            default_channel?: components["schemas"]["ChannelAddress"] | null;
+            /**
+             * Deployment Id
+             * Format: uuid
+             */
+            deployment_id: string;
+            /** Event Id */
+            event_id: string;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "open" | "steer";
+            /** Owner */
+            owner?: string | null;
+            /** Ttl S */
+            ttl_s: number;
+        };
+        /**
+         * ChannelReadMessage
+         * @description A channel neutral record. ``id`` is opaque: ``<ts>`` for a parent or an
+         *     unthreaded message, ``<thread_ts>:<ts>`` for a thread reply.
+         */
+        ChannelReadMessage: {
+            /** Author */
+            author: string;
+            /** Id */
+            id: string;
+            /** Provenance */
+            provenance: string;
+            /** Reply Count */
+            reply_count?: number | null;
+            /** Text */
+            text: string;
+            /** Thread Id */
+            thread_id?: string | null;
+            /** Timestamp */
+            timestamp: string;
+            /** Truncated */
+            truncated: boolean;
+        };
+        /** ChannelReadPage */
+        ChannelReadPage: {
+            /** Has More */
+            has_more: boolean;
+            /** Messages */
+            messages: components["schemas"]["ChannelReadMessage"][];
+            /** Next Cursor */
+            next_cursor?: string | null;
+        };
+        /**
+         * ChannelReadRequest
+         * @description One page of history, one thread, or one message of a bound channel.
+         */
+        ChannelReadRequest: {
+            channel?: components["schemas"]["ChannelSelector"] | null;
+            /** Cursor */
+            cursor?: string | null;
+            /** Latest */
+            latest?: string | null;
+            /** Limit */
+            limit?: number | null;
+            /** Message Id */
+            message_id?: string | null;
+            /** Oldest */
+            oldest?: string | null;
+            /** Operation */
+            operation?: ("history" | "thread" | "message") | null;
+            /** Thread Id */
+            thread_id?: string | null;
+        };
+        /**
+         * ChannelSelector
+         * @description A bound channel named by the agent. ``kind`` is required in practice and
+         *     refused by name when absent, so the agent learns what to send.
+         */
+        ChannelSelector: {
+            /** Address */
+            address: string;
+            /** Kind */
+            kind?: string | null;
         };
         /** ChannelTokenOut */
         ChannelTokenOut: {
@@ -8750,6 +8897,95 @@ export interface operations {
             };
         };
     };
+    read_channel_channel_read_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Channel-Read"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChannelReadRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelReadPage"];
+                };
+            };
+            /** @description No channel named and no default channel */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid channel read capability */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Channel not bound, or the Slack app is not a member */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Message or thread not found in the channel */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Turn inactive or expired, grant revoked, or kind unsupported */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid window, limit, identifier, cursor or body */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Page or attempt budget exhausted, or Slack rate limited */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Slack returned an error */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Ledger unavailable or no Slack credential */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     check_admission_channels_admission_post: {
         parameters: {
             query?: never;
@@ -9952,6 +10188,55 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
+            };
+        };
+    };
+    mint_channel_read_context_v1_internal_channel_read_context_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChannelReadContextMint"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelReadContext"];
+                };
+            };
+            /** @description No capability for this turn */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Ledger unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

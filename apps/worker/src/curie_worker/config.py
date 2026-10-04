@@ -1473,6 +1473,18 @@ class WorkerConfig(BaseSettings):
         # not close the steers that joined the next turn.
         return f"{self.key_prefix}:memory-steer-turns:{agent_id}:{live_turn}"
 
+    def channel_read_turn_key(self, thread_key: str) -> str:
+        # The live channel read logical turn on one thread (ADR 0100, #2877):
+        # who opened it and what it is bound to, so a steer on any worker can
+        # renew it. Never a token. Deleted by its opener's owner only.
+        return f"{self.key_prefix}:channel-read-turn:{thread_key}"
+
+    def channel_read_pin_key(self, thread_key: str) -> str:
+        # The deployment a thread's sandbox claim was booted for (ADR 0100),
+        # so a retained sandbox mints against its own bundle's grant after a
+        # redeploy. Keyed by thread, naming the claim it describes.
+        return f"{self.key_prefix}:channel-read-pin:{thread_key}"
+
     def progress_key(self, progress_id: str) -> str:
         # One logical turn chain's progress record (ADR 0130); see the worker
         # README's "Deliberate progress" section for its fields and expiry.

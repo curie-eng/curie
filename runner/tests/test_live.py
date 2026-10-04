@@ -1819,3 +1819,243 @@ def test_live_compound_request_saves_or_does_not_claim_to() -> None:
     assert channel_store.facts, (
         f"the reply claims a save but channel memory holds no fact: {reply!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# ADR 0100 channel read (#2877): the granted curie-slack tools on the real SDK
+# --------------------------------------------------------------------------- #
+
+_CHANNEL_READ_TOOL = "mcp__curie-slack__read_channel_history"
+_CHANNEL_READ_CAPABILITY_HEADER = "X-Curie-Channel-Read"
+
+
+def _require_live_channel_read_credential() -> None:
+    if not (_HAS_CRED or _OPENROUTER_KEY):
+        pytest.fail(
+            "CURIE_E2E_LIVE=1 channel read proof requires a model credential: "
+            "set CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY or OPENROUTER_API_KEY"
+        )
+
+
+class _ChannelReadStub:
+    """A local stand-in for the platform ``POST /channel-read`` route."""
+
+    def __init__(self, marker: str) -> None:
+        self.marker = marker
+        self.received: list[tuple[str | None, dict[str, Any]]] = []
+
+    def app(self) -> Any:
+        from aiohttp import web
+
+        app = web.Application()
+
+        async def read(request: web.Request) -> web.Response:
+            self.received.append(
+                (request.headers.get(_CHANNEL_READ_CAPABILITY_HEADER), await request.json())
+            )
+            return web.json_response(
+                {
+                    "messages": [
+                        {
+                            "id": "1759449600.000100",
+                            "timestamp": "2026-10-03T12:00:00Z",
+                            "author": "U0EXAMPLE1",
+                            "text": f"The deploy code word is {self.marker}.",
+                            "truncated": False,
+                            "provenance": (
+                                "https://example.slack.com/archives/C0EXAMPLE1/p1759449600000100"
+                            ),
+                        }
+                    ],
+                    "has_more": False,
+                }
+            )
+
+        app.router.add_post("/{tail:.*}", read)
+        return app
+
+
+def _channel_read_token(turn: str) -> str:
+    import base64
+    import time
+
+    now = int(time.time())
+    claims = {
+        "aud": "channel.read",
+        "agent": "00000000-0000-4000-8000-00000000a001",
+        "deployment": "00000000-0000-4000-8000-00000000d001",
+        "grant": "a" * 64,
+        "turn": turn,
+        "gen": 1,
+        "default": {"kind": "slack", "address": "C0EXAMPLE1"},
+        "iat": now,
+        "exp": now + 900,
+    }
+    payload = (
+        base64.urlsafe_b64encode(json.dumps(claims, sort_keys=True).encode())
+        .rstrip(b"=")
+        .decode()
+    )
+    return f"chr.{payload}.live-channel-read-signature"
+
+
+def _channel_read_bundle(
+    tmp_path: Path, *, grant: bool, policy: dict[str, list[str]] | None = None
+) -> Path:
+    bundle = tmp_path / "channel-read-bundle"
+    (bundle / ".claude-plugin").mkdir(parents=True)
+    manifest: dict[str, Any] = {
+        "name": "channel-reader",
+        "version": "0.1.0",
+        "description": "Reads its own channel",
+    }
+    if grant:
+        manifest["channelRead"] = True
+    if policy is not None:
+        manifest["toolPolicy"] = {"enforcement": TOOL_POLICY_ENFORCEMENT, **policy}
+    (bundle / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    return bundle
+
+
+_CHANNEL_READ_PROMPT = (
+    "Call the mcp__curie-slack__read_channel_history tool exactly once with "
+    "oldest `2026-10-03T00:00:00Z` and latest `2026-10-04T00:00:00Z` to read "
+    "yesterday's messages in this channel. Then reply with only the code word "
+    "the first message names. If the tool is unavailable or refused, reply "
+    "with only: unavailable"
+)
+
+
+def _drive_live_channel_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    grant: bool,
+    policy: dict[str, list[str]] | None,
+    marker: str,
+) -> tuple[Final, list[dict[str, Any]], _ChannelReadStub, str]:
+    from aiohttp.test_utils import TestServer
+    from curie_runner import __main__ as boot
+
+    init_messages = _install_init_observer(monkeypatch)
+    stub = _ChannelReadStub(marker)
+    session_id = f"channel-read-{uuid4()}"
+    token = _channel_read_token(session_id)
+    bundle = _channel_read_bundle(tmp_path, grant=grant, policy=policy)
+    # The OpenRouter key rides the SDK env exactly as production feeds it;
+    # with only an Anthropic credential the ambient one is used.
+    model, sdk_env = _live_model_and_env()
+    if model is not None:
+        monkeypatch.setenv("CURIE_MODEL", model)
+
+    async def go() -> Final:
+        async with TestServer(stub.app()) as server:
+            base = str(server.make_url("")).rstrip("/")
+            # The capability URL shares the boot's platform origin, which the
+            # runner pins it to.
+            monkeypatch.setenv("CURIE_STATE_URL", f"{base}/agents/a/state")
+            monkeypatch.setenv("CURIE_STATE_TOKEN", "live-state-placeholder")
+            config = _catalog_config(bundle, session_id)
+            runner = await anyio.to_thread.run_sync(
+                lambda: boot.build_runner(
+                    config, sdk_env=sdk_env, history_store=_LiveTranscriptStore()
+                )
+            )
+            await runner.start()
+            final: Final | None = None
+            try:
+                async for line in runner.run_turn(
+                    Event.model_validate(
+                        {
+                            "kind": "event",
+                            "type": "message",
+                            "text": _CHANNEL_READ_PROMPT,
+                            "user": "U0EXAMPLE1",
+                            "ts": "1",
+                            "channel_read": {"url": f"{base}/channel-read", "token": token},
+                        }
+                    )
+                ):
+                    parsed = parse_ndjson_line(line)
+                    if isinstance(parsed, Final):
+                        final = parsed
+            finally:
+                await runner.close()
+            assert final is not None, "real SDK turn emitted no terminal Final"
+            return final
+
+    return anyio.run(go), init_messages, stub, token
+
+
+def _init_tools(init_messages: list[dict[str, Any]]) -> set[str]:
+    assert init_messages, "real SDK boot emitted no init frame"
+    raw = init_messages[-1].get("tools")
+    assert isinstance(raw, list), "SDK init carried no concrete tools catalogue"
+    return {str(tool) for tool in raw}
+
+
+@pytest.mark.skipif(
+    not _LIVE_REQUESTED,
+    reason="set CURIE_E2E_LIVE=1 for real SDK channel read discovery and invocation",
+)
+def test_live_granted_read_tool_is_discoverable_and_returns_the_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_live_channel_read_credential()
+    marker = f"curie-2877-{uuid4().hex[:12]}"
+    final, init_messages, stub, token = _drive_live_channel_read(
+        tmp_path, monkeypatch, grant=True, policy=None, marker=marker
+    )
+
+    assert _CHANNEL_READ_TOOL in _init_tools(init_messages)
+    assert final.status is SessionStatus.DONE, final
+    assert len(stub.received) == 1, stub.received
+    header, body = stub.received[0]
+    assert header == token
+    assert body.get("operation") == "history"
+    assert "live-channel-read-signature" not in json.dumps(body)
+    assert marker in (final.text or ""), final.text
+
+
+@pytest.mark.skipif(
+    not _LIVE_REQUESTED,
+    reason="set CURIE_E2E_LIVE=1 for real SDK channel read catalogue control",
+)
+def test_live_ungranted_bundle_lists_no_channel_read_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_live_channel_read_credential()
+    marker = f"curie-2877-{uuid4().hex[:12]}"
+    final, init_messages, stub, _ = _drive_live_channel_read(
+        tmp_path, monkeypatch, grant=False, policy=None, marker=marker
+    )
+
+    # A provider error before any tool runs would pass a refusal vacuously.
+    assert not (final.text or "").startswith("API Error"), final.text
+    listed = _init_tools(init_messages)
+    assert not {name for name in listed if name.startswith("mcp__curie-slack__")}
+    assert stub.received == []
+    assert marker not in (final.text or "")
+
+
+@pytest.mark.skipif(
+    not _LIVE_REQUESTED,
+    reason="set CURIE_E2E_LIVE=1 for real SDK channel read policy control",
+)
+def test_live_policy_denied_read_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_live_channel_read_credential()
+    marker = f"curie-2877-{uuid4().hex[:12]}"
+    final, init_messages, stub, _ = _drive_live_channel_read(
+        tmp_path, monkeypatch, grant=True, policy={"deny": ["curie-slack/*"]}, marker=marker
+    )
+
+    # Either the catalogue hides it or the gate denies the call; both are
+    # refusals, and neither lets a request reach the platform route.
+    assert not (final.text or "").startswith("API Error"), final.text
+    assert init_messages, "real SDK boot emitted no init frame"
+    assert stub.received == []
+    assert marker not in (final.text or "")

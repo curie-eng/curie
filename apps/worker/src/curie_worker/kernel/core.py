@@ -15,6 +15,7 @@ from ..attachments import (
 from ..binding import (
     BindingResolver,
 )
+from ..bundle_store import BundleReader
 from ..config import WorkerConfig
 from ..hook_runs import HookRunRecorder
 from ..killswitch import KillSwitch
@@ -44,6 +45,7 @@ from . import (
     attachments,
     attempt,
     capacity,
+    channel_read,
     claim,
     completion,
     delivery,
@@ -91,6 +93,7 @@ class Kernel:
         work_items: WorkItemDispatchClient | None = None,
         sibling_limit: SiblingTurnLimit | None = None,
         progress: ProgressStore | None = None,
+        bundles: BundleReader | None = None,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -155,6 +158,12 @@ class Kernel:
         self._sibling_limit = sibling_limit
         # Deliberate progress (ADR 0130). None sends no capability to any turn.
         self._progress = progress
+        # ADR 0100: where a turn's channel read grant is read from (the stored
+        # bundle's manifest). None means the grant is never known locally.
+        self._bundles = bundles
+        # The grant each bundle declares, by bundle ref (a stored bundle is
+        # write once). Cleared past 4096 entries.
+        self._bundle_grants: dict[str, bool] = {}
         # Keyed by request id, never thread key: a steered follow-up shares the
         # thread and must not see or remove this run.
         self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
@@ -173,6 +182,12 @@ class Kernel:
         # is capped at it, because a steer ends when the live turn ends. Entries
         # past their deadline are dropped whenever one is recorded.
         self._turn_deadlines: dict[str, float] = {}
+        # ADR 0100: deployments whose bundle the API said grants no channel
+        # read, so their turns stop asking. Cleared past 4096 entries.
+        self._channel_read_absent: set[uuid.UUID] = set()
+        # And deployments a mint succeeded for: when a later mint fails, a
+        # runner that cannot enforce channel read is still refused.
+        self._channel_read_granted: set[uuid.UUID] = set()
         # In-process per-thread lock over the route/start critical section only.
         # asyncio.Lock is FIFO, so same-thread events from one worker open/steer
         # the runner in arrival order (ordering preserved under concurrent sends).
@@ -275,6 +290,11 @@ class Kernel:
     _record_turn_deadline = memory._record_turn_deadline
     _settle_memory_turns = memory._settle_memory_turns
     _close_memory_turns = memory._close_memory_turns
+    _with_channel_read = channel_read._with_channel_read
+    _steer_channel_read = channel_read._steer_channel_read
+    _settle_channel_read = channel_read._settle_channel_read
+    _close_channel_read = channel_read._close_channel_read
+    _require_channel_read = channel_read._require_channel_read
     _bind_publication_context = publication._bind_publication_context
     _continue_unpublished = publication._continue_unpublished
     _target_for = routing._kernel_target_for

@@ -60,7 +60,19 @@ from ..workitem_dispatch import (
 if TYPE_CHECKING:
     from .core import Kernel
 
-from . import claim, clock, constants, delivery, failures, hooks, log, memory, routing, workspace
+from . import (
+    channel_read,
+    claim,
+    clock,
+    constants,
+    delivery,
+    failures,
+    hooks,
+    log,
+    memory,
+    routing,
+    workspace,
+)
 from .log import logger
 
 
@@ -495,6 +507,10 @@ async def _process_event(
         # ADR-0188: a targetless turn names no binding, so it never gets a
         # memory write credential.
         memory_grant: memory.TurnMemoryGrant | None = None
+        # ADR 0100: the channel read grant. A targetless hook turn gets one
+        # too, with no default channel, so each read names its channel; an
+        # eval isolated turn never does.
+        channel_read_grant: channel_read.TurnChannelReadGrant | None = None
         if targetless:
             # Routed by the hook run's agent, never a channel binding (#2963).
             # The id is the one the hook row lookup parsed and matched, not
@@ -545,6 +561,14 @@ async def _process_event(
                 token_ttl_s=self._runner.turn_deadline_s(claim._remaining_budget(lease)),
             )
             workspace_deployment_id = resolved.deployment_id
+            if resolved.deployment_id is not None:
+                channel_read_grant = channel_read.TurnChannelReadGrant(
+                    agent_id=resolved.agent_id,
+                    deployment_id=resolved.deployment_id,
+                    default=None,
+                    thread_key=thread_key,
+                    bundle_ref=resolved.bundle_ref,
+                )
             packs = binding.packs_for(resolved)
             approval_routes = resolved.approval_routes
         elif self._binding is not None:
@@ -696,6 +720,15 @@ async def _process_event(
                     address=handle.channel,
                     thread_key=thread_key,
                 )
+                deployment_id = getattr(resolved, "deployment_id", None)
+                if isinstance(deployment_id, uuid.UUID):
+                    channel_read_grant = channel_read.TurnChannelReadGrant(
+                        agent_id=resolved.agent_id,
+                        deployment_id=deployment_id,
+                        default=(handle.kind, handle.channel),
+                        thread_key=thread_key,
+                        bundle_ref=getattr(resolved, "bundle_ref", None),
+                    )
             caller_for_boot = (
                 self._work_item_runs.get(owned_work_item_id)
                 if owned_work_item_id is not None
@@ -998,6 +1031,7 @@ async def _process_event(
                     pressure_retried=False,
                     workspace_inference=workspace_inference,
                     memory_grant=memory_grant,
+                    channel_read_grant=channel_read_grant,
                 )
             except failures._WorkItemDeferred:
                 return

@@ -3010,6 +3010,29 @@
         "title": "CancelBody",
         "type": "object"
       },
+      "ChannelAddress": {
+        "additionalProperties": false,
+        "properties": {
+          "address": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Address",
+            "type": "string"
+          },
+          "kind": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "ChannelAddress",
+        "type": "object"
+      },
       "ChannelBindingOut": {
         "additionalProperties": false,
         "description": "The READ side of a binding: the stored pair, serialized as it is stored.\n\nDeliberately NOT a subclass of `ChannelBinding`, and that is the whole point.\n`ChannelBinding` carries the address-shape rule three write paths inherit\n(`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be\nthe element type of `AgentOut.channels` as well -- so the rule that guards a\nBIND also ran when an existing row was READ, and one row it rejected failed\nthe whole response for every agent in it (#1914).\n\nAn install reaches that state by upgrading: migration 0021 backfills\n`agent_channels.address` from `agents.slack_channel` verbatim, and that column\nis exactly where a literal `#name` from before the validator lived. So an\ninstall that was merely mis-routed became one whose agent list was\nunavailable, reporting a Pydantic error instead of the bad value.\n\nSerializing a stored row must not re-litigate whether it should have been\nstored. Showing the bad address is also the more useful outcome: an operator\ncannot fix a value the API refuses to tell them.\n\nThe read shape becomes `{kind, address, adapter}` (ADR-0168 decision 3):\n`adapter` is part of the route's identity, not a credential, so it belongs\non the read side; `endpoint` stays write-only, unchanged from before.\n`ChannelBindingWrite`'s docstring still describes `endpoint`'s absence.\n\n`allowed_callers` (ADR 0175) is shown as stored: null for everyone, else the\nexact ids that may start a turn through this binding. It is written only by\n`PUT /agents/{agent_id}/channels/callers`, never by a binding write.",
@@ -3162,6 +3185,332 @@
           "allowed_callers"
         ],
         "title": "ChannelCallersWrite",
+        "type": "object"
+      },
+      "ChannelReadContext": {
+        "description": "The capability and the logical turn digest the worker revokes by.",
+        "properties": {
+          "expires_at": {
+            "title": "Expires At",
+            "type": "integer"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          },
+          "turn_key": {
+            "title": "Turn Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "generation",
+          "expires_at",
+          "turn_key"
+        ],
+        "title": "ChannelReadContext",
+        "type": "object"
+      },
+      "ChannelReadContextMint": {
+        "additionalProperties": false,
+        "description": "The worker's request for one logical turn's capability.",
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "default_channel": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChannelAddress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "deployment_id": {
+            "format": "uuid",
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "open",
+              "steer"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "owner": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 16,
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner"
+          },
+          "ttl_s": {
+            "maximum": 86400.0,
+            "minimum": 1.0,
+            "title": "Ttl S",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent_id",
+          "deployment_id",
+          "event_id",
+          "mode",
+          "ttl_s"
+        ],
+        "title": "ChannelReadContextMint",
+        "type": "object"
+      },
+      "ChannelReadMessage": {
+        "description": "A channel neutral record. ``id`` is opaque: ``<ts>`` for a parent or an\nunthreaded message, ``<thread_ts>:<ts>`` for a thread reply.",
+        "properties": {
+          "author": {
+            "title": "Author",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "provenance": {
+            "title": "Provenance",
+            "type": "string"
+          },
+          "reply_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Count"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "thread_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thread Id"
+          },
+          "timestamp": {
+            "title": "Timestamp",
+            "type": "string"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "timestamp",
+          "author",
+          "text",
+          "truncated",
+          "provenance"
+        ],
+        "title": "ChannelReadMessage",
+        "type": "object"
+      },
+      "ChannelReadPage": {
+        "properties": {
+          "has_more": {
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/ChannelReadMessage"
+            },
+            "title": "Messages",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "messages",
+          "has_more"
+        ],
+        "title": "ChannelReadPage",
+        "type": "object"
+      },
+      "ChannelReadRequest": {
+        "additionalProperties": false,
+        "description": "One page of history, one thread, or one message of a bound channel.",
+        "properties": {
+          "channel": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChannelSelector"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cursor"
+          },
+          "latest": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit"
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message Id"
+          },
+          "oldest": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest"
+          },
+          "operation": {
+            "anyOf": [
+              {
+                "enum": [
+                  "history",
+                  "thread",
+                  "message"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation"
+          },
+          "thread_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thread Id"
+          }
+        },
+        "title": "ChannelReadRequest",
+        "type": "object"
+      },
+      "ChannelSelector": {
+        "additionalProperties": false,
+        "description": "A bound channel named by the agent. ``kind`` is required in practice and\nrefused by name when absent, so the agent learns what to send.",
+        "properties": {
+          "address": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Address",
+            "type": "string"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          }
+        },
+        "required": [
+          "address"
+        ],
+        "title": "ChannelSelector",
         "type": "object"
       },
       "ChannelTokenOut": {
@@ -13647,6 +13996,82 @@
         ]
       }
     },
+    "/channel-read": {
+      "post": {
+        "operationId": "read_channel_channel_read_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Channel-Read",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Channel-Read"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelReadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelReadPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "No channel named and no default channel"
+          },
+          "401": {
+            "description": "Missing or invalid channel read capability"
+          },
+          "403": {
+            "description": "Channel not bound, or the Slack app is not a member"
+          },
+          "404": {
+            "description": "Message or thread not found in the channel"
+          },
+          "409": {
+            "description": "Turn inactive or expired, grant revoked, or kind unsupported"
+          },
+          "422": {
+            "description": "Invalid window, limit, identifier, cursor or body"
+          },
+          "429": {
+            "description": "Page or attempt budget exhausted, or Slack rate limited"
+          },
+          "502": {
+            "description": "Slack returned an error"
+          },
+          "503": {
+            "description": "Ledger unavailable or no Slack credential"
+          }
+        },
+        "summary": "Read Channel",
+        "tags": [
+          "channel-read"
+        ]
+      }
+    },
     "/channels/admission": {
       "post": {
         "description": "Answer whether a caller may start a turn on a route (platform key only).\n\nThe Slack dispatcher's half of ADR 0175 decision 2: it has no database, so\nit asks here, after its own filters and before it claims the event or posts\na placeholder. The answer comes from the same `admission.admit` the channel\nport runs, so the two channels cannot disagree about one list.\n\nPlatform key only, never a `chn` token or an adapter principal: an adapter\nalready gets its answer as the 403 on `POST /channels/turns`, and this\nroute would otherwise let a token scoped to one binding ask about every\nother binding's list.\n\nAn unbound route answers allowed and unrestricted: the list lives on the\nbinding, and what happens to a mention of an unbound channel is routing's\ncall, unchanged by this ADR.",
@@ -16044,6 +16469,71 @@
         "summary": "Factory Status Card",
         "tags": [
           "factory-status"
+        ]
+      }
+    },
+    "/v1/internal/channel-read/context": {
+      "post": {
+        "operationId": "mint_channel_read_context_v1_internal_channel_read_context_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelReadContextMint"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelReadContext"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "409": {
+            "description": "No capability for this turn"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "description": "Ledger unavailable"
+          }
+        },
+        "summary": "Mint Channel Read Context",
+        "tags": [
+          "internal-channel-read"
         ]
       }
     },

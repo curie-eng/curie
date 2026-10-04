@@ -55,6 +55,11 @@ from typing import Any, Literal
 
 from aci_protocol.service_config import STREAM_PAYLOAD_FIELD
 from channel_protocol.reply import TurnCompleted
+from curie_internal.channel_read_ledger import LEDGER_TTL_S as _CHANNEL_READ_PIN_TTL_S
+from curie_internal.channel_read_ledger import refresh_owner as _refresh_channel_read_owner
+from curie_internal.channel_read_ledger import revoke_by_owner as _revoke_channel_read_by_owner
+from curie_internal.channel_read_ledger import revoke_owner as _revoke_channel_read_owner
+from curie_internal.channel_read_ledger import tombstone_owner as _tombstone_channel_read_owner
 from pydantic import BaseModel
 from redis.asyncio import Redis
 
@@ -66,6 +71,82 @@ DoneMarkerValue = Literal["1", "history_capacity"]
 # The longest a per-turn memory credential lives: ``binding.SANDBOX_TOKEN_TTL_SECONDS``
 # (not imported: binding imports this package's config, and the value is tiny).
 _MEMORY_STEER_TURNS_TTL_S = 24 * 60 * 60
+
+# ADR 0100 (#2877): delete the live channel read record only when its owner
+# is the caller, so an earlier attempt's late settlement never deletes the
+# record a newer turn on the thread wrote. A value that is not JSON is left.
+_TAKE_CHANNEL_READ_TURN_LUA = """
+local value = redis.call('GET', KEYS[1])
+if not value then return 0 end
+local ok, record = pcall(cjson.decode, value)
+if ok and type(record) == 'table' and record['owner'] == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+return 0
+"""
+
+
+@dataclass(frozen=True)
+class LiveChannelReadTurn:
+    """The live channel read logical turn on one thread (ADR 0100, #2877).
+
+    Written by the attempt that opened it, read by a steer on any worker so it
+    can renew the same logical turn with the opener's event id and default
+    channel. Carries no token. ``default`` is None for a targetless turn.
+    """
+
+    agent_id: uuid.UUID
+    deployment_id: uuid.UUID
+    event_id: str
+    owner: str
+    default: tuple[str, str] | None
+
+    def to_json(self) -> str:
+        kind, address = self.default if self.default is not None else (None, None)
+        return json.dumps(
+            {
+                "agent_id": str(self.agent_id),
+                "deployment_id": str(self.deployment_id),
+                "event_id": self.event_id,
+                "owner": self.owner,
+                "kind": kind,
+                "address": address,
+            },
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_json(cls, raw: str) -> LiveChannelReadTurn | None:
+        try:
+            data = json.loads(raw)
+            kind, address = data.get("kind"), data.get("address")
+            default = (
+                (kind, address) if isinstance(kind, str) and isinstance(address, str) else None
+            )
+            event_id, owner = data["event_id"], data["owner"]
+            if not isinstance(event_id, str) or not isinstance(owner, str):
+                return None
+            return cls(
+                agent_id=uuid.UUID(data["agent_id"]),
+                deployment_id=uuid.UUID(data["deployment_id"]),
+                event_id=event_id,
+                owner=owner,
+                default=default,
+            )
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return None
+
+
+@dataclass(frozen=True)
+class ChannelReadPin:
+    """The deployment one sandbox claim on a thread was booted for (ADR 0100)."""
+
+    claim_name: str
+    agent_id: uuid.UUID
+    deployment_id: uuid.UUID
+    bundle_ref: str | None
+
 
 # Stored fields of the completion hash. The done flag is its OWN field rather
 # than a value inside the record JSON so it can be set in the same MULTI as the
@@ -290,6 +371,119 @@ class Markers:
             pipe.rpush(key, *values)
             pipe.expire(key, _MEMORY_STEER_TURNS_TTL_S)
             await pipe.execute()
+
+    async def record_channel_read_turn(
+        self, thread_key: str, record: LiveChannelReadTurn, ttl_s: int
+    ) -> None:
+        """Record the live channel read logical turn on a thread (ADR 0100).
+
+        Expires with the capability it describes, so a record whose owner
+        never settles leaves nothing behind once the token is dead anyway."""
+
+        await self._redis.set(
+            self._config.channel_read_turn_key(thread_key), record.to_json(), ex=max(1, ttl_s)
+        )
+
+    async def read_channel_read_turn(self, thread_key: str) -> LiveChannelReadTurn | None:
+        """The live channel read logical turn on a thread, or None."""
+
+        raw = _as_str(await self._redis.get(self._config.channel_read_turn_key(thread_key)))
+        return None if raw is None else LiveChannelReadTurn.from_json(raw)
+
+    async def take_channel_read_turn(self, thread_key: str, owner: str) -> bool:
+        """Delete the thread's live record only if ``owner`` wrote it."""
+
+        taken = await self._redis.eval(
+            _TAKE_CHANNEL_READ_TURN_LUA,
+            1,
+            self._config.channel_read_turn_key(thread_key),
+            owner,
+        )
+        return bool(taken)
+
+    async def read_channel_read_pin(self, thread_key: str) -> ChannelReadPin | None:
+        """The deployment the thread's current sandbox claim was booted for."""
+
+        raw = _as_str(await self._redis.get(self._config.channel_read_pin_key(thread_key)))
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw)
+            return ChannelReadPin(
+                claim_name=str(data["claim_name"]),
+                agent_id=uuid.UUID(data["agent_id"]),
+                deployment_id=uuid.UUID(data["deployment_id"]),
+                bundle_ref=data.get("bundle_ref")
+                if isinstance(data.get("bundle_ref"), str)
+                else None,
+            )
+        except (ValueError, TypeError, KeyError):
+            return None
+
+    async def pin_channel_read_deployment(
+        self,
+        thread_key: str,
+        claim_name: str,
+        agent_id: uuid.UUID,
+        deployment_id: uuid.UUID,
+        bundle_ref: str | None,
+    ) -> None:
+        """Record the deployment a freshly claimed sandbox was booted for."""
+
+        await self._redis.set(
+            self._config.channel_read_pin_key(thread_key),
+            json.dumps(
+                {
+                    "claim_name": claim_name,
+                    "agent_id": str(agent_id),
+                    "deployment_id": str(deployment_id),
+                    "bundle_ref": bundle_ref,
+                },
+                separators=(",", ":"),
+            ),
+            ex=_CHANNEL_READ_PIN_TTL_S,
+        )
+
+    async def refresh_channel_read_owner(
+        self, agent_id: uuid.UUID, turn_key: str, owner: str
+    ) -> bool:
+        """Renew the opener's lease on a live logical turn (owner checked)."""
+
+        return await _refresh_channel_read_owner(
+            self._redis, self._config.key_prefix, agent_id, turn_key, owner
+        )
+
+    async def tombstone_channel_read_owner(
+        self, agent_id: uuid.UUID, owner: str, ttl_s: int
+    ) -> None:
+        """Mark an attempt's owner settled, so a late open under it is refused."""
+
+        await _tombstone_channel_read_owner(
+            self._redis, self._config.key_prefix, agent_id, owner, ttl_s
+        )
+
+    async def revoke_channel_read_by_owner(self, agent_id: uuid.UUID, owner: str) -> bool:
+        """Revoke every logical turn ``owner`` opened, through the ledger's index.
+
+        For an attempt whose mint answer may have been lost. Owner checked per
+        turn, so a newer owner's capability is untouched."""
+
+        return await _revoke_channel_read_by_owner(
+            self._redis, self._config.key_prefix, agent_id, owner
+        )
+
+    async def revoke_channel_read_owner(
+        self, agent_id: uuid.UUID, turn_key: str, owner: str
+    ) -> bool:
+        """Revoke a logical turn's channel read capability as its opener.
+
+        The owner checked delete runs directly in the Valkey the API reads, so
+        revocation holds while the API is down. False when the active value
+        belongs to another owner (a resume opener) or is already gone."""
+
+        return await _revoke_channel_read_owner(
+            self._redis, self._config.key_prefix, agent_id, turn_key, owner
+        )
 
     async def drain_steer_memory_turns(
         self, agent_id: uuid.UUID, live_turn: str

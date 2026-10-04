@@ -129,6 +129,16 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         _placeholder("sandbox_token"),
     ),
     RedactionRule(
+        "channel_read_token",
+        # The API issued channel read capability (ADR 0100), the same two
+        # base64url segments behind the ``chr`` prefix.
+        re.compile(
+            r"(?<![A-Za-z0-9_-])chr\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+            r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])"
+        ),
+        _placeholder("channel_read_token"),
+    ),
+    RedactionRule(
         "connector_caller_token",
         # The connector caller minter uses the same base64url segment alphabet.
         re.compile(

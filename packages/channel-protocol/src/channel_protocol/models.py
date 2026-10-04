@@ -17,6 +17,7 @@ class ChannelCapability(StrEnum):
     RICH_CARDS = "rich-cards"
     THREADING = "threading"
     FILE_ATTACHMENTS = "file-attachments"
+    HISTORY_READ = "history-read"
 
 
 class ChannelCapabilities(BaseModel):

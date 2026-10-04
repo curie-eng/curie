@@ -18,7 +18,7 @@ from ..reply_sink import (
 from ..turn_progress import (
     TurnProgressPlan,
 )
-from . import hooks, memory
+from . import channel_read, hooks, memory
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +165,10 @@ RETRYABLE_CLASSIFICATIONS = frozenset(
 #: The class a restricted turn fails under when its runner cannot enforce it.
 TOOL_ACCESS_UNENFORCED_CLASSIFICATION = "tool-access-unenforced"
 
+#: The class a channel read granted turn fails under when its runner cannot
+#: enforce channel read (ADR 0100, #2877). Not retryable: the same boot refuses again.
+CHANNEL_READ_UNENFORCED_CLASSIFICATION = "channel-read-unenforced"
+
 # Platform ErrorEvent.classification vocabulary. Allowlist-constrain only: do
 # not synonym-map SDK ``rate_limit`` onto platform ``rate-limit``, which would
 # make a currently non-retryable token retryable.
@@ -197,7 +201,15 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 
 WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
-    {"runner-timeout-unconfirmed", "sandbox-capacity", "sandbox-terminated"}
+    {
+        "runner-timeout-unconfirmed",
+        "sandbox-capacity",
+        "sandbox-terminated",
+        # ADR 0100: the kernel's own refusal of a granted turn whose runner
+        # does not advertise channel read enforcement. Worker local, so a
+        # runner ErrorEvent naming it is not trusted. Not retryable.
+        CHANNEL_READ_UNENFORCED_CLASSIFICATION,
+    }
 )
 
 _ESCALATION_DETAIL_MAX = 300
@@ -525,3 +537,16 @@ _MEMORY_TURNS: ContextVar[memory._AttemptMemoryTurns | None] = ContextVar(
 # Strong references to in-flight closes, so a close scheduled in the background
 # is not garbage collected before it finishes.
 _PENDING_MEMORY_CLOSES: set[asyncio.Task[None]] = set()
+
+# ADR 0100 (#2877): the channel read grant this attempt mints from where the
+# turn opens, and the owner and opened logical turns it revokes when it ends.
+# Per attempt, set and reset by ``Kernel._attempt`` like the memory carries.
+_CHANNEL_READ_MINT: ContextVar[channel_read._ChannelReadMint | None] = ContextVar(
+    "curie_worker_channel_read_mint", default=None
+)
+_CHANNEL_READ_TURNS: ContextVar[channel_read._AttemptChannelRead | None] = ContextVar(
+    "curie_worker_channel_read_turns", default=None
+)
+
+# Strong references to in-flight channel read revocations, like the above.
+_PENDING_CHANNEL_READ_CLOSES: set[asyncio.Task[None]] = set()
