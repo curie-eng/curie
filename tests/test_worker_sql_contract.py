@@ -88,16 +88,26 @@ def test_every_worker_text_statement_plans_against_migrations(
             alias.asname or alias.name
             for node in ast.walk(tree)
             if isinstance(node, ast.ImportFrom)
-            and node.module in {"sqlalchemy", "sqlalchemy.sql"}
+            and node.module in {"sqlalchemy", "sqlalchemy.sql", "sqlalchemy.sql.expression"}
             for alias in node.names
             if alias.name == "text"
         }
+        module_aliases = {
+            alias.asname or alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+            if alias.name == "sqlalchemy" or alias.name.startswith("sqlalchemy.sql")
+        }
+        constructor_names = set(aliases)
+        constructor_names.update(f"{module}.text" for module in module_aliases)
+        if "sqlalchemy" in module_aliases:
+            constructor_names.add("sqlalchemy.sql.text")
         expected.update(
             f"{path.relative_to(ROOT).as_posix()}:{node.lineno}"
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id in aliases
+            and ast.unparse(node.func) in constructor_names
         )
     assert expected
     sites = {site for site, _ in statements}
@@ -211,6 +221,74 @@ def test_unrelated_scope_binding_preserves_a_static_sql_string(
     statements = discover_statements(tmp_path, "curie")
     assert len(statements) == 1
     assert statements[0][1] == "SELECT name FROM curie.agents"
+
+
+_BRANCHING_SQL = [
+    (
+        "    try:\n"
+        '        sql = "{first_sql}"\n'
+        "        perform_operation()\n"
+        "    except Exception:\n"
+        '        sql = "{second_sql}"\n'
+    ),
+    (
+        "    match flag:\n"
+        '        case "first":\n'
+        '            sql = "{first_sql}"\n'
+        "        case _:\n"
+        '            sql = "{second_sql}"\n'
+    ),
+    (
+        '    sql = "{first_sql}"\n'
+        "    while flag:\n"
+        '        sql = "{second_sql}"\n'
+        "        flag = False\n"
+    ),
+]
+
+
+@pytest.mark.parametrize("branch", _BRANCHING_SQL, ids=["try_except", "match", "while"])
+def test_sql_branch_discovery_cannot_hide_an_earlier_missing_column(
+    tmp_path: Path, branch: str
+) -> None:
+    relative = _write_worker(
+        tmp_path,
+        "from sqlalchemy import text\n"
+        "def statement(flag):\n"
+        + branch.format(
+            first_sql="SELECT missing_contract_column FROM curie.agents",
+            second_sql="SELECT name FROM curie.agents",
+        )
+        + "    return text(sql)\n",
+    )
+
+    try:
+        statements = discover_statements(tmp_path, "curie")
+    except ValueError as error:
+        assert relative in str(error)
+        return
+
+    assert any("missing_contract_column" in sql for _, sql in statements)
+
+
+@pytest.mark.parametrize("branch", _BRANCHING_SQL, ids=["try_except", "match", "while"])
+def test_sql_branch_discovery_accepts_valid_sql_in_every_branch(
+    tmp_path: Path, branch: str
+) -> None:
+    _write_worker(
+        tmp_path,
+        "from sqlalchemy import text\n"
+        "def statement(flag):\n"
+        + branch.format(
+            first_sql="SELECT name FROM curie.agents",
+            second_sql="SELECT name FROM curie.agents",
+        )
+        + "    return text(sql)\n",
+    )
+
+    statements = discover_statements(tmp_path, "curie")
+    assert statements
+    assert {sql for _, sql in statements} == {"SELECT name FROM curie.agents"}
 
 
 def test_new_worker_sql_using_a_missing_column_is_rejected(

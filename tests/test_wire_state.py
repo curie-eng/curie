@@ -46,8 +46,52 @@ def test_all_existing_wire_sites_are_declared() -> None:
             "cli/src/new_producer.rs",
             'fn publish() { redis::cmd("XADD").arg(stream).arg("*"); }\n',
         ),
+        (
+            "apps/api/src/curie_api/new_producer.py",
+            "from typing import Any\n"
+            "async def publish(client, stream, payload):\n"
+            "    append: Any = client.xadd\n"
+            '    await append(stream, {"payload": payload})\n',
+        ),
+        (
+            "apps/api/src/curie_api/new_producer.py",
+            "async def publish(client, stream, payload):\n"
+            '    await getattr(client, "xadd")(stream, {"payload": payload})\n',
+        ),
+        (
+            "apps/api/src/curie_api/new_producer.py",
+            "class Publisher:\n"
+            "    def __init__(self, client):\n"
+            "        self.publish = client.xadd\n"
+            "    async def enqueue(self, stream, payload):\n"
+            '        return await self.publish(stream, {"payload": payload})\n',
+        ),
+        (
+            "apps/worker/src/curie_worker/new_producer.py",
+            'SCRIPT = f"""return redis.call("XADD", KEYS[1], "*", "payload", ARGV[1])\n'
+            '-- {description}"""\n',
+        ),
+        (
+            "cli/src/new_producer.rs",
+            'fn publish() { let append = redis::cmd; append("XADD").arg(stream); }\n',
+        ),
+        (
+            "cli/src/new_producer.rs",
+            'const SCRIPT: &str = r#"return redis.call("XADD", KEYS[1], "*", '
+            '"payload", ARGV[1])"#;\n',
+        ),
     ],
-    ids=["python", "lua", "rust"],
+    ids=[
+        "python",
+        "lua",
+        "rust",
+        "python_annotated_alias",
+        "python_getattr",
+        "python_class_attribute_alias",
+        "lua_in_fstring",
+        "rust_bound_alias",
+        "lua_in_rust_raw_string",
+    ],
 )
 def test_undeclared_producer_is_rejected(tmp_path: Path, relative: str, source: str) -> None:
     _write(tmp_path, relative, source)
@@ -79,8 +123,19 @@ def test_duplicate_producer_in_an_inventoried_scope_is_rejected(tmp_path: Path) 
         'def key(identity):\n    return f"curie:undeclared:{identity}"\n',
         # Existing wire values do not authorize a new construction site.
         'KEY = "curie:runs"\n',
+        'KEY = "cu" + "rie:undeclared:key"\n',
+        'KEY = f"{\'curie\'}:undeclared:key"\n',
+        'KEY = f"cu{\'rie\'}:undeclared:key"\n',
     ],
-    ids=["double_quotes", "single_quotes", "formatted", "existing_value_new_site"],
+    ids=[
+        "double_quotes",
+        "single_quotes",
+        "formatted",
+        "existing_value_new_site",
+        "concatenated_prefix",
+        "formatted_static_prefix",
+        "formatted_split_prefix",
+    ],
 )
 def test_undeclared_key_literal_is_rejected(tmp_path: Path, source: str) -> None:
     relative = "apps/api/src/curie_api/new_key.py"
@@ -112,6 +167,13 @@ def test_undeclared_rust_key_literal_is_rejected(tmp_path: Path) -> None:
     assert any(relative in error for error in validate_inventory(tmp_path))
 
 
+def test_undeclared_rust_concatenated_key_literal_is_rejected(tmp_path: Path) -> None:
+    relative = "cli/src/new_key.rs"
+    _write(tmp_path, relative, 'pub const KEY: &str = concat!("curie", ":undeclared:key");\n')
+    assert any(relative in site for site in scan_key_literals(tmp_path))
+    assert any(relative in error for error in validate_inventory(tmp_path))
+
+
 def test_comments_and_nonwire_strings_do_not_create_sites(tmp_path: Path) -> None:
     _write(
         tmp_path,
@@ -124,9 +186,69 @@ def test_comments_and_nonwire_strings_do_not_create_sites(tmp_path: Path) -> Non
     assert scan_key_literals(tmp_path) == set()
 
 
+@pytest.mark.parametrize(
+    ("relative", "source"),
+    [
+        (
+            "apps/api/src/curie_api/nonproducer.py",
+            "from typing import Any\n"
+            "async def read(client, key):\n"
+            "    fetch: Any = client.get\n"
+            "    return await fetch(key)\n",
+        ),
+        (
+            "apps/api/src/curie_api/nonproducer.py",
+            "async def read(client, key):\n"
+            '    return await getattr(client, "get")(key)\n',
+        ),
+        (
+            "apps/api/src/curie_api/nonproducer.py",
+            "class Reader:\n"
+            "    def __init__(self, client):\n"
+            "        self.fetch = client.get\n"
+            "    async def read(self, key):\n"
+            "        return await self.fetch(key)\n",
+        ),
+        (
+            "apps/worker/src/curie_worker/nonproducer.py",
+            'SCRIPT = f"""-- redis.call("XADD", KEYS[1], "*", "payload", ARGV[1])\n'
+            'return redis.call("GET", KEYS[1]) -- {description}"""\n',
+        ),
+        (
+            "cli/src/nonproducer.rs",
+            'fn read() { let fetch = redis::cmd; fetch("GET").arg(key); }\n',
+        ),
+        (
+            "cli/src/nonproducer.rs",
+            'const SCRIPT: &str = r#"-- redis.call("XADD", KEYS[1], "*", "payload", ARGV[1])\n'
+            'return redis.call("GET", KEYS[1])"#;\n',
+        ),
+    ],
+    ids=[
+        "python_annotated_reader",
+        "python_getattr_reader",
+        "python_class_attribute_reader",
+        "lua_fstring_comment",
+        "rust_bound_reader",
+        "lua_rust_comment",
+    ],
+)
+def test_nonwriters_using_supported_syntax_do_not_create_producer_sites(
+    tmp_path: Path, relative: str, source: str
+) -> None:
+    _write(tmp_path, relative, source)
+    assert scan_producers(tmp_path) == set()
+
+
 def test_sandbox_token_has_one_shared_implementation() -> None:
-    modules = set(ROOT.glob("apps/*/src/*/sandbox_token.py"))
-    modules.update(ROOT.glob("packages/*/src/*/sandbox_token.py"))
+    source_roots = [ROOT / "runner/src"]
+    for parent in ("apps", "packages", "adapters", "tools"):
+        source_roots.extend(ROOT.glob(f"{parent}/*/src"))
+    modules = {
+        path
+        for source_root in source_roots
+        for path in source_root.rglob("sandbox_token.py")
+    }
     assert modules == {
         ROOT / "packages/curie-internal/src/curie_internal/sandbox_token.py"
     }
