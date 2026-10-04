@@ -337,9 +337,13 @@ CIDRs after.
 `curie cluster up` inspects the two PriorityClasses and the
 `agent-sandbox-controller` Deployment. When complete Helm ownership metadata
 names another release, Curie applies the matching creation or deployment value
-as false. Missing, malformed, unreadable, or incomplete ownership does not
-authorize reuse and blocks the install. An explicit true value that contradicts
-the detected owner is a usage error.
+as false. An unowned controller Deployment is reused the same way when its
+`agent-sandbox-controller` container image matches the vendored chart image
+and the Deployment is Available with enough ready replicas. Missing, malformed,
+or unreadable controller data does not authorize reuse. An unowned controller
+that is unhealthy or a different image blocks the install and names the kubectl
+commands that make it reusable. `curie cluster status` is not that repair.
+An explicit true value that contradicts a reusable controller is a usage error.
 
 Before Helm runs, Curie establishes ownership of the primary install namespace
 with both the release and install-namespace labels. An absent namespace is
