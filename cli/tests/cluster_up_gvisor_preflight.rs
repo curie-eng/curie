@@ -1875,8 +1875,10 @@ fn local_inference_with_absent_runtimeclass_applies_gvisor_off_before_install() 
 
 #[test]
 fn fake_model_default_does_not_lookup_or_infer_gvisor_off() {
+    // `--fake-model` is the hermetic chart-default fake install. A bare run
+    // can adopt a saved model credential and become a real install (#3848).
     let fixture = Fixture::new("nonmatching", "absent", "").with_runtimeclass_lookup("absent");
-    let (output, _) = fixture.run(&[]);
+    let (output, _) = fixture.run(&["--fake-model"]);
     let shown = stderr(&output);
 
     assert!(

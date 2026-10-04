@@ -254,6 +254,11 @@ if args and args[0] == "delete" and len(args) > 2 and args[1] in ("job", "jobs",
         else: kept.append(job)
     state["jobs"][namespace] = kept; save(); raise SystemExit(0)
 
+if args[:2] == ["get", "runtimeclass"]:
+    sys.stderr.write(
+        'Error from server (Forbidden): runtimeclasses.node.k8s.io "gvisor" is forbidden: User "system:serviceaccount:example:example" cannot get resource "runtimeclasses" in API group "node.k8s.io" at the cluster scope\n'
+    )
+    raise SystemExit(1)
 fail("unexpected kubectl invocation: " + " ".join(args), 64)
 "###;
 

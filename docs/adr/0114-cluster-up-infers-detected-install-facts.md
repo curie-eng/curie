@@ -4,6 +4,11 @@ Date: 2026-08-20
 
 Status: Accepted
 
+**Superseded in part by [ADR 0193](0193-cluster-up-reads-a-missing-runtimeclass-before-install.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+0193 supersedes Decision 3 and rejected Alternative 2 only when a direct GET
+returns NotFound before install.
+
 **Supersedes in part [ADR 0032](0032-explicit-provider-egress.md) and
 [ADR 0006](0006-security-rails-as-chart-defaults.md).** This ADR replaces
 exactly these clauses:
