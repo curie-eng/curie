@@ -3807,17 +3807,62 @@ fn images_compatible(live: &str, required: &str) -> bool {
     }
 }
 
+const VENDORED_CONTROLLER_MANIFEST: &str = "files/agent-sandbox/controller.yaml";
+
+fn chart_read_error(chart: &str, detail: impl std::fmt::Display) -> anyhow::Error {
+    let fix = "pass `--chart` as a local chart directory or packaged .tgz that contains files/agent-sandbox/controller.yaml";
+    crate::exit::CliError::failure(format!(
+        "could not read the vendored agent-sandbox controller image from `{chart}`: {detail}; {fix}"
+    ))
+    .with_fix(fix)
+    .into()
+}
+
+fn vendored_controller_manifest(chart: &str) -> Result<String> {
+    let path = std::path::Path::new(chart);
+    if path.is_dir() {
+        let manifest = path.join(VENDORED_CONTROLLER_MANIFEST);
+        return std::fs::read_to_string(&manifest).map_err(|error| chart_read_error(chart, error));
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if name.ends_with(".tgz") || name.ends_with(".tar.gz") {
+        let file = std::fs::File::open(path).map_err(|error| chart_read_error(chart, error))?;
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        let entries = archive
+            .entries()
+            .map_err(|error| chart_read_error(chart, error))?;
+        for entry in entries {
+            let mut entry = entry.map_err(|error| chart_read_error(chart, error))?;
+            let entry_path = entry
+                .path()
+                .map_err(|error| chart_read_error(chart, error))?
+                .to_path_buf();
+            if !entry_path.ends_with(VENDORED_CONTROLLER_MANIFEST) {
+                continue;
+            }
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut text)
+                .map_err(|error| chart_read_error(chart, error))?;
+            return Ok(text);
+        }
+        return Err(chart_read_error(
+            chart,
+            format!("the archive has no {VENDORED_CONTROLLER_MANIFEST}"),
+        ));
+    }
+    Err(chart_read_error(
+        chart,
+        "the chart is neither a directory nor a .tgz",
+    ))
+}
+
 fn vendored_controller_image(chart: &str) -> Result<String> {
-    let path = std::path::Path::new(chart).join("files/agent-sandbox/controller.yaml");
-    let text = std::fs::read_to_string(&path).map_err(|error| -> anyhow::Error {
-        let fix = "pass `--chart` as the local chart directory that contains files/agent-sandbox/controller.yaml";
-        crate::exit::CliError::failure(format!(
-            "could not read the vendored agent-sandbox controller image from `{}`: {error}; {fix}",
-            path.display()
-        ))
-        .with_fix(fix)
-        .into()
-    })?;
+    let text = vendored_controller_manifest(chart)?;
+    let path = std::path::Path::new(chart).join(VENDORED_CONTROLLER_MANIFEST);
     for document in text.split("\n---") {
         let document = document.trim();
         if document.is_empty() {

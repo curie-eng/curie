@@ -317,13 +317,30 @@ exit 0
         }
         let path = std::env::join_paths(paths).expect("join PATH");
 
+        let chart_override = extra
+            .windows(2)
+            .find(|pair| pair[0] == "--chart")
+            .map(|pair| pair[1]);
+        let mut extra_args = Vec::new();
+        let mut skip_chart_value = false;
+        for arg in extra {
+            if skip_chart_value {
+                skip_chart_value = false;
+                continue;
+            }
+            if *arg == "--chart" {
+                skip_chart_value = true;
+                continue;
+            }
+            extra_args.push(*arg);
+        }
         let mut args = vec![
             "--color",
             "never",
             "cluster",
             "up",
             "--chart",
-            chart(),
+            chart_override.unwrap_or(chart()),
             "--namespace",
             TARGET_NAMESPACE,
             "--release",
@@ -332,7 +349,7 @@ exit 0
             "--no-expose",
             "--fake-model",
         ];
-        args.extend_from_slice(extra);
+        args.extend(extra_args);
 
         Command::new(bin())
             .args(args)
@@ -670,6 +687,49 @@ fn unowned_compatible_controller_is_reused_with_one_disclosed_override() {
             .contains("agentSandbox.controller.deploy=false"),
         "the inferred controller reuse value must reach Helm"
     );
+}
+
+fn packaged_chart_archive(dir: &std::path::Path) -> std::path::PathBuf {
+    let root = dir.join("chart-src");
+    let manifest = root.join("curie/files/agent-sandbox");
+    fs::create_dir_all(&manifest).expect("create packaged chart tree");
+    fs::write(
+        manifest.join("controller.yaml"),
+        include_str!("../../charts/curie/files/agent-sandbox/controller.yaml"),
+    )
+    .expect("write vendored controller manifest");
+    let archive = dir.join("curie.tgz");
+    let status = std::process::Command::new("tar")
+        .args([
+            "-czf",
+            archive.to_str().expect("archive path"),
+            "-C",
+            root.to_str().expect("chart root"),
+            "curie",
+        ])
+        .status()
+        .expect("tar the chart");
+    assert!(status.success(), "tar must package the chart");
+    archive
+}
+
+#[test]
+fn unowned_compatible_controller_in_a_packaged_chart_is_reused() {
+    let fixture = Fixture::new();
+    let archive = packaged_chart_archive(fixture._temp.path());
+    let output = fixture.run(
+        DEFAULT_PLATFORM,
+        "absent",
+        DEFAULT_SANDBOX,
+        "absent",
+        "unowned-compatible",
+        &["--chart", archive.to_str().expect("chart archive path")],
+    );
+
+    assert_upgrade_ran_once(&fixture, &output);
+    let shown = stderr(&output);
+    assert_inference_once(&shown, "--set agentSandbox.controller.deploy=false");
+    assert!(shown.contains("without Helm ownership"), "{shown}");
 }
 
 #[test]
