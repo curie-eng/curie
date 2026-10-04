@@ -145,13 +145,11 @@ def _seed(function: ast.FunctionDef | ast.AsyncFunctionDef, schema: str) -> _Env
 
 def _constructors(tree: ast.Module) -> set[str]:
     names: set[str] = set()
-    canonical = {
-        "sqlalchemy.text", "sqlalchemy.sql.text", "sqlalchemy.sql.expression.text"
-    }
+    canonical = {"sqlalchemy.text", "sqlalchemy.sql.text", "sqlalchemy.sql.expression.text"}
 
     def qualified(module: str, alias: str) -> None:
         names.update(
-            f"{alias}{constructor[len(module):]}"
+            f"{alias}{constructor[len(module) :]}"
             for constructor in canonical
             if constructor.startswith(f"{module}.")
         )
@@ -184,6 +182,7 @@ class _SQLVisitor(ast.NodeVisitor):
         self.scopes: list[str] = []
         self.statements: list[tuple[str, str]] = []
         self.loop_breaks: list[list[_Environment]] = []
+        self.loop_continues: list[list[_Environment]] = []
 
     def visit_Module(self, node: ast.Module) -> None:
         # Module constants can be declared below a function that uses them.
@@ -272,13 +271,16 @@ class _SQLVisitor(ast.NodeVisitor):
 
     def _loop(self, body: list[ast.stmt], otherwise: list[ast.stmt], before: _Environment) -> None:
         breaks: list[_Environment] = []
+        continues: list[_Environment] = []
         self.loop_breaks.append(breaks)
+        self.loop_continues.append(continues)
         try:
             for statement in body:
                 self.visit(statement)
         finally:
             self.loop_breaks.pop()
-        self.environment = _merge([before, self.environment])
+            self.loop_continues.pop()
+        self.environment = _merge([before, self.environment, *continues])
         for statement in otherwise:
             self.visit(statement)
         # A break exits this loop before its else suite. Inner loop breaks are
@@ -288,6 +290,10 @@ class _SQLVisitor(ast.NodeVisitor):
     def visit_Break(self, node: ast.Break) -> None:
         if self.loop_breaks:
             self.loop_breaks[-1].append(self.environment.copy())
+
+    def visit_Continue(self, node: ast.Continue) -> None:
+        if self.loop_continues:
+            self.loop_continues[-1].append(self.environment.copy())
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
         self.visit(node.iter)
