@@ -163,6 +163,9 @@ BASE = {
     "compat_metadata": None,
     "drain_annotation": "auto",
     "drain_render_fails": False,
+    "upgrade_fails": False,
+    "history_after_upgrade": None,
+    "revision_versions": None,
 }
 
 SCENARIOS = {
@@ -228,6 +231,27 @@ SCENARIOS = {
     "drain-annotation-missing": {"drain_annotation": None},
     "drain-annotation-invalid": {"drain_annotation": "many"},
     "drain-render-fails": {"drain_render_fails": True},
+    # Helm exits 1 with the chart's nil digest refusal and creates no revision.
+    "helm-upgrade-fails": {"upgrade_fails": True},
+    # Helm exits 1 after recording a failed revision. The previous revision
+    # stays deployed, which is what the worker still runs.
+    "upgrade-fails-previous-deployed": {
+        "upgrade_fails": True,
+        "history_after_upgrade": [
+            {"revision": 1, "status": "deployed", "chart": "curie-0.8.6", "app_version": "0.8.6"},
+            {"revision": 2, "status": "failed", "chart": "curie-0.9.0", "app_version": "0.9.0"},
+        ],
+        "revision_versions": {"1": "0.8.6", "2": "0.9.0"},
+    },
+    # Helm exits 1 but the deployed revision is already the target.
+    "upgrade-fails-target-deployed": {
+        "upgrade_fails": True,
+        "history_after_upgrade": [
+            {"revision": 1, "status": "superseded", "chart": "curie-0.8.6", "app_version": "0.8.6"},
+            {"revision": 2, "status": "deployed", "chart": "curie-0.9.0", "app_version": "0.9.0"},
+        ],
+        "revision_versions": {"1": "0.8.6", "2": "0.9.0"},
+    },
     # Every checkpoint write fails, starting with the first one before any
     # mutation.
     "persist-fails": {"checkpoint_patch_fails": "always"},
@@ -605,6 +629,9 @@ if program == "helm":
     # numeric release revision at version:
     # https://github.com/helm/helm/blob/v3.20.0/cmd/helm/status.go
     if args[0] == "history":
+        if upgraded and scenario.get("history_after_upgrade"):
+            print(json.dumps(scenario["history_after_upgrade"]))
+            sys.exit(0)
         print("Error: release: not found", file=sys.stderr)
         sys.exit(1)
     if args[0] == "status":
@@ -629,6 +656,10 @@ if program == "helm":
             print('Error: release: not found', file=sys.stderr)
             sys.exit(1)
         shape = scenario["metadata_after_shape"] if upgraded else "valid"
+        revision = flag_value("--revision")
+        revision_versions = scenario.get("revision_versions") or {}
+        if revision and revision in revision_versions:
+            chart_version = revision_versions[revision]
         if shape == "malformed":
             print("{")
             sys.exit(0)
@@ -750,10 +781,20 @@ if program == "helm":
         values = flag_value("-f")
         if values:
             capture("values", ".yaml", values)
+        if scenario["upgrade_fails"]:
+            print(
+                "Error: execution error at (curie/templates/agent-sandbox.yaml:870:4): "
+                'agentSandbox.runnerImages.acme-bot must be a digest reference, got "<nil>"',
+                file=sys.stderr,
+            )
+            sys.exit(1)
         print("Release accepted")
         sys.exit(0)
 
 if program == "kubectl":
+    if args[:1] == ["-n"] and "delete" in args and "sandboxclaim" in args:
+        print("sandboxclaim deleted")
+        sys.exit(0)
     if scenario["workloads_fail"] and args[:3] == ["get", WORKLOADS, "-n"]:
         print("Error from server (Forbidden): workloads is forbidden", file=sys.stderr)
         sys.exit(1)
