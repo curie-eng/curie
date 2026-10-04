@@ -1063,7 +1063,9 @@ async def _escalate(
 
 
 def _backoff(self: Kernel, attempt: int) -> float:
-    raw: float = self._config.retry_backoff_base_s * (2 ** (attempt - 1))
+    # The exponent is clamped: a sweep continuation's busy wait counts
+    # attempts without bound, and 2.0 ** 1024 overflows a float (#2878).
+    raw: float = self._config.retry_backoff_base_s * (2 ** min(max(attempt - 1, 0), 64))
     return min(self._config.retry_backoff_max_s, raw)
 
 

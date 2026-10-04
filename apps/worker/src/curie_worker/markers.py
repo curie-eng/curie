@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from aci_protocol.service_config import STREAM_PAYLOAD_FIELD
 from channel_protocol.reply import TurnCompleted
 from pydantic import BaseModel
 from redis.asyncio import Redis
@@ -137,6 +138,29 @@ else
 end
 return 1
 """
+
+# The fenced settlement that also publishes the next slice of a long scheduled
+# sweep (ADR-0160, #2878): ``_SETTLE_FENCED_LUA`` exactly, plus five lines placed
+# right after both guards. Built from the shared text so the guards cannot
+# drift: a fenced-out owner writes nothing and publishes nothing.
+#
+# These run before the record writes. A replay (the production client retries
+# EVAL after a lost reply) finds the event's published marker (``KEYS[7]``)
+# holding THIS call's record generation and returns success without writing or
+# publishing again. The marker, not the completion record, is the evidence: an
+# outbox clear deletes the record but never the marker. Otherwise the successor
+# is XADDed FIRST, with the marker set beside it, before the record, the index
+# and the done marker, so a failing XADD aborts the script with nothing
+# written: the slice is never settled without its successor.
+_SETTLE_FENCED_AND_PUBLISH_LUA = _SETTLE_FENCED_LUA.replace(
+    "\nredis.call('HDEL', KEYS[2], ARGV[11])\n",
+    "\nif redis.call('GET', KEYS[7]) == ARGV[6] then"
+    "\n  return 1"
+    "\nend"
+    "\nredis.call('XADD', KEYS[6], '*', ARGV[13], ARGV[14])"
+    "\nredis.call('SET', KEYS[7], ARGV[6], 'EX', ARGV[1])"
+    "\nredis.call('HDEL', KEYS[2], ARGV[11])\n",
+)
 
 # The fenced MARKER-ONLY settlement (#2963): a targetless cron turn owes no
 # ``turn.completed`` (no adapter is waiting), so it writes no outbox record. The
@@ -333,9 +357,7 @@ class Markers:
         exceeded history capacity keeps its distinct marker without expiry
         until the API mirrors the refusal to SQL.
         """
-        ttl_s = max(
-            self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s)
-        )
+        ttl_s = max(self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s))
         await self._redis.eval(
             _MARK_DONE_LUA,
             2,
@@ -347,9 +369,7 @@ class Markers:
         )
 
     def _done_ttl_s(self) -> int:
-        return max(
-            self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s)
-        )
+        return max(self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s))
 
     async def mark_done_without_completion(self, event_id: str) -> None:
         """Leaseless marker-only done, for a targetless turn (#2963).
@@ -458,9 +478,7 @@ class Markers:
         lease_key = self._config.delivery_lease_key(stream, group, entry_id)
         state_key = self._config.delivery_state_key(stream, group, entry_id)
         record_generation = uuid.uuid4().hex
-        ttl_s = max(
-            self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s)
-        )
+        ttl_s = max(self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s))
         settled = await self._redis.eval(
             _SETTLE_FENCED_LUA,
             5,
@@ -484,6 +502,69 @@ class Markers:
         )
         return record_generation if int(settled) == 1 else None
 
+    async def settle_fenced_and_publish(
+        self,
+        event_id: str,
+        record: CompletionRecord,
+        *,
+        stream: str,
+        group: str,
+        entry_id: str,
+        owner: str,
+        generation: int,
+        marker_value: DoneMarkerValue,
+        successor_stream: str,
+        successor_payload: str,
+        record_generation: str,
+    ) -> str | None:
+        """``settle_fenced``, plus publishing a sweep's next slice in the same script.
+
+        The caller supplies ``record_generation`` so that, when the reply is
+        lost, it can read ``sweep_published_generation`` and tell a committed
+        script from one that never ran. Returns ``record_generation`` on success and
+        None when the fence refused, in which case nothing was written and
+        nothing was published.
+        """
+        lease_key = self._config.delivery_lease_key(stream, group, entry_id)
+        state_key = self._config.delivery_state_key(stream, group, entry_id)
+        ttl_s = max(self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s))
+        settled = await self._redis.eval(
+            _SETTLE_FENCED_AND_PUBLISH_LUA,
+            7,
+            self._config.done_key(event_id),
+            self._config.completion_key(event_id),
+            self._config.completions_pending_key(),
+            lease_key,
+            state_key,
+            successor_stream,
+            self._config.sweep_published_key(event_id),
+            str(ttl_s),
+            _DONE_FIELD,
+            _RECORD_FIELD,
+            _GENERATION_FIELD,
+            record.model_dump_json(),
+            record_generation,
+            owner,
+            _DELIVERY_GENERATION_FIELD,
+            str(generation),
+            event_id,
+            _CAUSE_FIELD,
+            marker_value,
+            STREAM_PAYLOAD_FIELD,
+            successor_payload,
+        )
+        return record_generation if int(settled) == 1 else None
+
+    async def sweep_published_generation(self, event_id: str) -> str | None:
+        """The record generation of the settle that published this slice's
+        successor, or None. Survives an outbox clear, unlike the record."""
+        value = await self._redis.get(self._config.sweep_published_key(event_id))
+        return _as_str(value)
+
+    async def publish_successor(self, stream: str, payload: str) -> None:
+        """Publish a sweep's next slice with no fence (the leaseless path only)."""
+        await self._redis.xadd(stream, {STREAM_PAYLOAD_FIELD: payload})
+
     async def note_provider_egress_refusal(self, event_id: str, *, generation: str) -> bool:
         """Retain the fixed refusal cause only on the observed outbox generation."""
         return await self._update_completion_cause(
@@ -494,9 +575,7 @@ class Markers:
         """Remove an earlier refusal when this generation fails for another cause."""
         return await self._update_completion_cause(event_id, generation=generation, cause="")
 
-    async def _update_completion_cause(
-        self, event_id: str, *, generation: str, cause: str
-    ) -> bool:
+    async def _update_completion_cause(self, event_id: str, *, generation: str, cause: str) -> bool:
         updated = await self._redis.eval(
             _UPDATE_COMPLETION_CAUSE_LUA,
             1,
@@ -517,9 +596,7 @@ class Markers:
         corruption, not an older shape to fall back for -- the outbox has no
         pre-upgrade records. The caller quarantines rather than guessing.
         """
-        stored: dict[Any, Any] = await self._redis.hgetall(
-            self._config.completion_key(event_id)
-        )
+        stored: dict[Any, Any] = await self._redis.hgetall(self._config.completion_key(event_id))
         return _parse_stored(event_id, stored)
 
     async def read_completions(
@@ -627,9 +704,7 @@ class Markers:
         """
         # With a count, SRANDMEMBER answers with a list; the client's signature
         # also covers the countless single-member form, hence the narrowing.
-        members: Any = await self._redis.srandmember(
-            self._config.completions_pending_key(), limit
-        )
+        members: Any = await self._redis.srandmember(self._config.completions_pending_key(), limit)
         if not members:
             return set()
         if not isinstance(members, list):

@@ -682,6 +682,32 @@ before writing the done marker. A prestart deferral leaves the row open for
 scheduler reconciliation. A cron failure is not retried within its fire.
 Slack and webhook turns perform no hook run writes.
 
+A long scheduled sweep is the one cron turn that continues past its delivery
+budget (ADR-0160, #2878). A targeted cron delivery cut by the budget
+(`runner-timeout` or `runner-timeout-unconfirmed` with no budget left) whose
+newest checkpoint fact still lists uncovered sources renews the hook lease and
+publishes a continuation `<base>:sweep:<n>:<covered>:<stalled>` on the runs
+stream inside the same fenced script that settles the slice
+(`Markers.settle_fenced_and_publish`), leaving the row open. `covered` is the
+count of distinct covered names, ignoring case, and `stalled` counts the
+slices in a row that added none: a source may span up to two cut slices, and
+the sweep stops after `sweep.MAX_STALLED_SLICES` (3) stalled slices in a row or
+past `sweep.MAX_SWEEP_SLICES` (48) slices. The script publishes before it
+writes the record and the done marker, so a failed publish settles nothing. It
+also sets a per-event published marker beside the publish, and a retried
+script that finds the marker holding its own generation writes nothing again,
+even after the outbox record was cleared.
+`curie_worker.sweep.SweepCoverage` reads the checkpoint from agent and channel
+memory with the platform key, keeping only facts the API stamped with the cron
+sender for this hook, sweep date and run. A continuation only adopts the live
+route and never claims, resumes or hands off a sandbox (`SweepClaimGone`). It
+waits out a winding-down turn inside its own budget and closes `blocked` on a
+paused hook. Every stop that closes `failed`, `skipped` or `blocked` with a
+checkpoint, or on a continuation, posts one coverage notice as a new message
+after the settle is won. The hook lease renewed at a cron delivery's start
+carries `sweep.HOOK_LEASE_START_MARGIN_S` on top, so the interrupt and the
+coverage read at a budget cut cannot let the next fire reclaim the run first.
+
 If persistence fails before durable closure, the delivery stays pending and
 may run again on redelivery. The close and the done marker use PostgreSQL and
 Valkey, so they are not atomic across both systems.

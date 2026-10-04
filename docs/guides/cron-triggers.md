@@ -93,6 +93,66 @@ channel to post an approval card to or resume in, so a gated tool call ends the
 run as `failed` and the tool never runs. Give a trigger a `target` if its work
 needs approval.
 
+## Long sweeps
+
+A turn ends at the worker's delivery budget (`worker.deliveryBudgetSeconds`).
+A sweep that needs longer, such as a daily plan built from several sources,
+continues on the same sandbox when the budget cuts it off, provided it saved a
+checkpoint that shows progress and still lists sources it has not covered. The
+worker then sends the same prompt again into the same live session
+(ADR-0160).
+
+A sweep can continue only when:
+
+1. The trigger has a `target`. A hook with no `target` never continues.
+2. Memory writes are on for the agent
+   (`curie cluster overrides <agent> --memory-writes on`).
+3. `worker.runnerTotalTimeoutSeconds` equals `worker.deliveryBudgetSeconds`,
+   which is the default. A turn cut by the per-request ceiling while budget is
+   left is not a budget cut, and the sweep stops.
+
+The prompt names the sources and tells the agent to keep one
+`sweep-checkpoint` fact per sweep, updating it in place with the `update`
+memory tool after each source. A memory holds at most 200 facts and a
+statement at most 500 characters, so a new fact per source does not scale. The
+checkpoint has one key per line:
+
+```
+sweep-checkpoint
+sweep: weekday-plan
+date: 2026-10-05
+hook: weekday-plan
+covered: slack
+uncovered: github, notes
+```
+
+`date` is the slot's local date in the trigger `timezone` (UTC when it is
+omitted), and `hook` is the trigger `name`. `covered` lists only finished
+sources. `none` or an empty value is an empty list, and a source may not appear
+in both lists. The prompt should also say that if today's checkpoint exists the
+agent continues from its uncovered list, and that it ends with a post whose
+last section lists every uncovered source, which is empty when the sweep
+finished.
+
+A source does not have to finish inside one turn: it may span up to two cut
+turns before it is saved as covered. Sources are counted by distinct name,
+ignoring case. A sweep stops after 3 turns in a row that save no new source,
+and after 48 turns in all. While a sweep continues its run has no outcome yet, so
+later fires of the same trigger record `skipped` or `deferred`. A sweep never
+moves to a new sandbox: if its sandbox is gone it stops.
+
+When a sweep stops short (a failed or refused turn, no progress, its sandbox
+gone, or the hook paused), the run records `failed` or `blocked` and the
+target gets one notice as a new message, for example:
+
+```
+Scheduled sweep "weekday-plan" for 2026-10-05 stopped before it finished (run outcome: failed). Not covered: github, notes.
+```
+
+With no checkpoint the notice says nothing was recorded as covered. A sweep
+that finishes posts only its own plan. A gated tool inside a sweep pauses the
+run as `ran`, and the sweep does not continue after the approval resumes it.
+
 ## Reading the record
 
 `curie local schedules` and `curie cluster schedules` list every cron hook on

@@ -287,6 +287,15 @@ class HookPaused(ThreadBusyError):
     """An operator paused the cron hook before the runner accepted its turn."""
 
 
+class SweepClaimGone(RuntimeError):
+    """A sweep continuation found its sandbox claim gone (ADR-0160, #2878).
+
+    Terminal, never "busy, retry later": the sweep stops and reports what it
+    did not cover. Not a ThreadBusyError on purpose, so no busy handler can
+    defer or redeliver it.
+    """
+
+
 class PendingPublicationError(ThreadBusyError):
     """A thread-owned publication must settle before another turn can start."""
 

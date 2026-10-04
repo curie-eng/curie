@@ -16,7 +16,7 @@ from aci_protocol import (
     TurnSource,
 )
 
-from .. import caller_token
+from .. import caller_token, sweep
 from ..approvals import (
     ApprovalBackendError,
     PublicationLineage,
@@ -366,6 +366,20 @@ async def _route_and_start(
             or existing_handle.publication_visible_outcome_revision
             != publication_visible_outcome_revision
         )
+    continuation = (
+        source is TurnSource.CRON and sweep.parse_continuation(queued_event_id) is not None
+    )
+    if continuation and (
+        existing_handle is None
+        or force_lineage_replacement
+        or (workspace_repo is not None and existing_handle.workspace_repo != workspace_repo)
+        or _boots_differently(existing_handle, boot_env, caller_run=caller_run)
+    ):
+        # ADR-0160: a sweep continues only on the claim it already holds.
+        # Any state that would claim, resume or hand off a sandbox stops it.
+        raise failures.SweepClaimGone(
+            f"thread {thread_key} sweep claim is gone or would be replaced"
+        )
     if (
         force_lineage_replacement
         and existing_handle is not None
@@ -447,35 +461,54 @@ async def _route_and_start(
     # all -- the runner's own per-turn logging starts only once its
     # process is already up, so it cannot see the wait that got it there.
     claim_started = clock.time.monotonic()
-    handle = await self._claim_or_resume(
-        thread_key,
-        boot_env,
-        workspace_deployment_id=(workspace_deployment_id if workspace_repo is not None else None),
-        workspace_repo=workspace_repo,
-        replace_handle=(
-            existing_handle
-            if existing_handle is not None
-            and (
-                turn_budget_replacement
-                or (
-                    workspace_repo is not None
-                    and (force_lineage_replacement or existing_handle.workspace_repo is None)
-                )
+    if continuation:
+        assert existing_handle is not None  # narrowed by the refusal above
+        # Refresh the route the way substrate.claim does for a live route, but
+        # only while it still names this claim: a continuation adopts, never
+        # claims (ADR-0160).
+        if not await asyncio.to_thread(
+            self._substrate.touch_live, thread_key, existing_handle.claim_name
+        ):
+            raise failures.SweepClaimGone(f"thread {thread_key} sweep claim moved")
+        if existing_handle.workspace_repo is not None and self._workspace is not None:
+            await asyncio.to_thread(
+                self._workspace.touch,
+                thread_key,
+                ttl_seconds=self._route_ttl_seconds,
             )
-            else None
-        ),
-        lineage_branch=lineage_branch,
-        lineage_head=lineage_head,
-        lineage_base_sha=lineage_base_sha,
-        publication_visible_outcome_revision=(publication_visible_outcome_revision or 0),
-        force_lineage_replacement=force_lineage_replacement,
-        pending_publication_approval=pending_publication_approval,
-        agent_name=agent_name,
-        runner_resources=runner_resources,
-        remaining_s=remaining_s,
-        attachment_fresh_only=attachment_fresh_only,
-        caller_run=caller_run,
-    )
+        handle = existing_handle
+    else:
+        handle = await self._claim_or_resume(
+            thread_key,
+            boot_env,
+            workspace_deployment_id=(
+                workspace_deployment_id if workspace_repo is not None else None
+            ),
+            workspace_repo=workspace_repo,
+            replace_handle=(
+                existing_handle
+                if existing_handle is not None
+                and (
+                    turn_budget_replacement
+                    or (
+                        workspace_repo is not None
+                        and (force_lineage_replacement or existing_handle.workspace_repo is None)
+                    )
+                )
+                else None
+            ),
+            lineage_branch=lineage_branch,
+            lineage_head=lineage_head,
+            lineage_base_sha=lineage_base_sha,
+            publication_visible_outcome_revision=(publication_visible_outcome_revision or 0),
+            force_lineage_replacement=force_lineage_replacement,
+            pending_publication_approval=pending_publication_approval,
+            agent_name=agent_name,
+            runner_resources=runner_resources,
+            remaining_s=remaining_s,
+            attachment_fresh_only=attachment_fresh_only,
+            caller_run=caller_run,
+        )
     wait = current_wait()
 
     async def check_capacity_before_request() -> float | None:
