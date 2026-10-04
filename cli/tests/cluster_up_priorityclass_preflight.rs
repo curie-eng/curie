@@ -183,11 +183,15 @@ case " $* " in
                 exit 0
                 ;;
             unowned-compatible)
-                printf '%s\n' '{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"agent-sandbox-controller","namespace":"agent-sandbox-system","generation":2},"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"agent-sandbox-controller","image":"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0"}]}}},"status":{"observedGeneration":2,"readyReplicas":1,"availableReplicas":1,"updatedReplicas":1,"conditions":[{"type":"Available","status":"True"}]}}'
+                printf '%s\n' '{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"agent-sandbox-controller","namespace":"agent-sandbox-system","generation":2},"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"agent-sandbox-controller","image":"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0"}]}}},"status":{"observedGeneration":2,"replicas":1,"readyReplicas":1,"availableReplicas":1,"updatedReplicas":1,"conditions":[{"type":"Available","status":"True"}]}}'
                 exit 0
                 ;;
             unowned-digest)
-                printf '%s\n' '{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"agent-sandbox-controller","namespace":"agent-sandbox-system","generation":2},"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"agent-sandbox-controller","image":"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}},"status":{"observedGeneration":2,"readyReplicas":1,"availableReplicas":1,"updatedReplicas":1,"conditions":[{"type":"Available","status":"True"}]}}'
+                printf '%s\n' '{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"agent-sandbox-controller","namespace":"agent-sandbox-system","generation":2},"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"agent-sandbox-controller","image":"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}},"status":{"observedGeneration":2,"replicas":1,"readyReplicas":1,"availableReplicas":1,"updatedReplicas":1,"conditions":[{"type":"Available","status":"True"}]}}'
+                exit 0
+                ;;
+            unowned-rollout)
+                printf '%s\n' '{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"agent-sandbox-controller","namespace":"agent-sandbox-system","generation":4},"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"agent-sandbox-controller","image":"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0"}]}}},"status":{"observedGeneration":4,"replicas":2,"readyReplicas":1,"availableReplicas":1,"updatedReplicas":1,"conditions":[{"type":"Available","status":"True"}]}}'
                 exit 0
                 ;;
             unowned-incompatible)
@@ -881,6 +885,33 @@ fn stale_unowned_controller_is_not_reused() {
     assert!(
         !error.contains("--set agentSandbox.controller.deploy=false"),
         "stale health must not authorize reuse: {payload}"
+    );
+}
+
+#[test]
+fn in_progress_unowned_rollout_is_not_reused() {
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        DEFAULT_PLATFORM,
+        "absent",
+        DEFAULT_SANDBOX,
+        "absent",
+        "unowned-rollout",
+        &["--json"],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(fixture.upgrade_count(), 0);
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("--json must emit the error payload: {error}"));
+    let error = payload["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("agent-sandbox-controller"),
+        "the in-progress rollout must name the controller: {payload}"
+    );
+    assert!(
+        !error.contains("--set agentSandbox.controller.deploy=false"),
+        "an old replica beside the new template must not authorize reuse: {payload}"
     );
 }
 

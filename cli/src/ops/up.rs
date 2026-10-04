@@ -3926,6 +3926,13 @@ fn controller_health(deployment: &serde_json::Value) -> ControllerHealth {
     let updated = deployment
         .pointer("/status/updatedReplicas")
         .and_then(|value| value.as_u64());
+    let total = deployment
+        .pointer("/status/replicas")
+        .and_then(|value| value.as_u64());
+    let unavailable = deployment
+        .pointer("/status/unavailableReplicas")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
     let generation = deployment
         .pointer("/metadata/generation")
         .and_then(|value| value.as_u64());
@@ -3944,12 +3951,12 @@ fn controller_health(deployment: &serde_json::Value) -> ControllerHealth {
         });
     let current = generation.is_some()
         && observed == generation
-        && updated.is_some_and(|count| count >= desired);
-    let healthy = desired >= 1
-        && ready.is_some_and(|count| count >= desired)
-        && available_replicas.is_some_and(|count| count >= desired)
-        && available == Some("True")
-        && current;
+        && updated == Some(desired)
+        && total == Some(desired)
+        && ready == Some(desired)
+        && available_replicas == Some(desired)
+        && unavailable == 0;
+    let healthy = desired >= 1 && available == Some("True") && current;
     let ready_text = ready
         .map(|count| count.to_string())
         .unwrap_or_else(|| "missing".to_string());
