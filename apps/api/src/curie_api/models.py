@@ -15,6 +15,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
+    CHAR,
     BigInteger,
     CheckConstraint,
     DateTime,
@@ -1878,6 +1879,37 @@ class HookSourcePolicy(Base):
     bundle_digest: Mapped[str | None] = mapped_column(String, nullable=True)
     legacy_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class HookSourceOperation(Base):
+    """@spec PROTECTED-HOOK-SOURCE-10."""
+
+    __tablename__ = "hook_source_operations"
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="hook_source_operations_generation_ck"),
+        CheckConstraint(
+            "status IN ('pending', 'committed')", name="hook_source_operations_status_ck"
+        ),
+        CheckConstraint(
+            "intent_sha256 ~ '^[0-9a-f]{64}$'", name="hook_source_operations_intent_ck"
+        ),
+        UniqueConstraint(
+            "agent_id", "hook", "generation", name="uq_hook_source_operation_generation"
+        ),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    hook: Mapped[str] = mapped_column(String(63), primary_key=True)
+    operation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    intent_sha256: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    attempted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 

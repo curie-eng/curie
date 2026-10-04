@@ -30,6 +30,7 @@ from aci_protocol import (
 from curie_api.config import Settings
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_dispatcher.queue import to_stream_fields
+from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import tracing as telemetry_tracing
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker import capacity_wait as capacity_wait_module
@@ -49,6 +50,7 @@ from curie_worker.consumer_liveness import (
 )
 from curie_worker.cron_loop import CronSchedulerLoop, _Target
 from curie_worker.delivery_lease import DeliveryLeaseStore
+from curie_worker.hook_source_guard import CronHookSourceGuard
 from curie_worker.runner_client import TurnStream
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.stream_consumer import ConsumerLivenessExpired
@@ -59,7 +61,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind
 from redis.asyncio import Redis as AsyncRedis
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 # importlib import mode does not add the test root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -93,6 +95,7 @@ def test_enqueue_producer_is_the_real_consumer_parent(
     producer_spans: tuple[TracerProvider, InMemorySpanExporter],
     producer: str,
 ) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
     provider, exporter = producer_spans
 
     async def go() -> None:
@@ -117,36 +120,47 @@ def test_enqueue_producer_is_the_real_consumer_parent(
                         )
                     )
                 else:
+
                     async def not_killed(_agent_id: uuid.UUID) -> bool:
                         return False
 
-                    loop = CronSchedulerLoop(
-                        engine=run.engine,
-                        redis=h.async_redis,
-                        source=SimpleNamespace(triggers=lambda _bundle: []),
-                        is_killed=not_killed,
-                        db_schema="curie",
-                        stream=h.config.stream,
-                        interval_seconds=1,
-                        claim_lease_s=300,
-                        default_max_usd_per_day=10,
-                        default_max_output_tokens_per_run=100_000,
+                    gate_engine = create_async_engine(
+                        run.engine.url, pool_size=4, max_overflow=0, pool_timeout=30
                     )
-                    await loop._enqueue(
-                        _Target(
-                            agent_id=run.agent_id,
-                            agent_name="acme-bot",
-                            version_id=run.version_id,
-                            bundle_ref=None,
-                            deployed_at=None,
-                            max_usd_per_day=None,
-                            max_output_tokens_per_run=None,
-                        ),
-                        {"name": run.ref.name, "prompt": "cron prompt"},
-                        _qevent("route").reply_handle,
-                        datetime.fromisoformat(run.ref.slot_utc),
-                        run.run_id,
-                    )
+                    guard = CronHookSourceGuard(SourceGate(gate_engine), run.engine)
+                    try:
+                        loop = CronSchedulerLoop(
+                            source_guard=guard,
+                            engine=run.engine,
+                            redis=h.async_redis,
+                            source=SimpleNamespace(triggers=lambda _bundle: []),
+                            is_killed=not_killed,
+                            db_schema="curie",
+                            stream=h.config.stream,
+                            interval_seconds=1,
+                            claim_lease_s=300,
+                            default_max_usd_per_day=10,
+                            default_max_output_tokens_per_run=100_000,
+                        )
+                        async with guard.locked_snapshot(run.agent_id, run.ref.name) as context:
+                            await loop._enqueue(
+                                _Target(
+                                    agent_id=run.agent_id,
+                                    agent_name="acme-bot",
+                                    version_id=run.version_id,
+                                    bundle_ref=None,
+                                    deployed_at=None,
+                                    max_usd_per_day=None,
+                                    max_output_tokens_per_run=None,
+                                ),
+                                {"name": run.ref.name, "prompt": "cron prompt"},
+                                _qevent("route").reply_handle,
+                                datetime.fromisoformat(run.ref.slot_utc),
+                                run.run_id,
+                                source_context=context,
+                            )
+                    finally:
+                        await gate_engine.dispose()
             rows = await h.async_redis.xreadgroup(
                 h.config.consumer_group,
                 h.config.consumer_name,
@@ -212,7 +226,8 @@ def test_carrierless_cli_entry_starts_a_real_root_consumer_span(
 @pytest.mark.parametrize("recover", [False, True], ids=["wake", "lost_wake"])
 @pytest.mark.parametrize("active", [False, True], ids=["stored", "active"])
 @pytest.mark.parametrize(
-    "stored", [None, "00-3123456789abcdef0123456789abcdef-3123456789abcdef-01"],
+    "stored",
+    [None, "00-3123456789abcdef0123456789abcdef-3123456789abcdef-01"],
     ids=["absent", "present"],
 )
 def test_capacity_publication_injects_active_context_and_preserves_stored_fields(
@@ -244,15 +259,20 @@ def test_capacity_publication_injects_active_context_and_preserves_stored_fields
             )
             assert rows[0][1][0][0] == entry_id
             lease = await leases.acquire(
-                h.config.stream, h.config.consumer_group, entry_id,
+                h.config.stream,
+                h.config.consumer_group,
+                entry_id,
                 consumer=h.config.consumer_name,
             )
             try:
                 parked = await store.park(entry_id, original, event.event_id, lease)
             finally:
                 await leases.release(
-                    h.config.stream, h.config.consumer_group, entry_id,
-                    owner=lease.owner, resume_event_id=None,
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry_id,
+                    owner=lease.owner,
+                    resume_event_id=None,
                 )
             await h.async_redis.zadd(store._due, {event.event_id: 0})
             if recover:
@@ -4412,7 +4432,7 @@ def _workspace_binding(deployment_id: uuid.UUID) -> object:
             *,
             kind: str | None = None,
             address: str | None = None,
-        **_: object,
+            **_: object,
         ) -> dict[str, str]:
             return {}
 

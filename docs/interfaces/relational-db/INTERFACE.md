@@ -44,10 +44,23 @@ PostgreSQL 16:
 - **Two engines, one DSN** (`apps/api/src/curie_api/db.py::create_engine`, `apps/worker/src/curie_worker/run.py::build`): the API and the worker each build their own `create_async_engine(...)` from their own `database_url` setting (`apps/api/src/curie_api/config.py::Settings`, `apps/worker/src/curie_worker/config.py::WorkerConfig`), both read from `DATABASE_URL`, so a swap repoints both services. The worker never imports the API's models: it reaches the schema through hand-written SQL, both reading (`apps/worker/src/curie_worker/binding.py::_RESOLVE_SQL`, `apps/worker/src/curie_worker/binding.py::_UNDEPLOYED_BINDING_SQL`, `apps/worker/src/curie_worker/connector_loop.py::_TARGETS_SQL`) and writing (`apps/worker/src/curie_worker/publication_store.py::PostgresPublicationStore` updates `publications` / `approvals` under `FOR UPDATE ... SKIP LOCKED`). Table and column names are a second, ORM-independent coupling a conforming DB must honor.
 - **Migrations**: the target DB must apply the **whole Alembic chain in `apps/api/alembic/versions/`**, in revision order, ending at `alembic heads`. The chain grows with the product, so it is deliberately not enumerated here: `ls apps/api/alembic/versions/` is the list, and `alembic heads` is the tip a conforming DB must reach. A single head is the invariant — a fork means two branches each added a migration (rebase and merge the heads before swapping anything). Two recent expand revisions make authenticated review feedback part of this schema contract: `0042_review_lineage_authority.py` adds immutable App-observed authority to publication lineages and the `publication_review_reservations` concurrency table; `0043_github_review_feedback.py` adds the `github_review_deliveries` audit table and the `github_review_feedback` durable feedback/outbox table. The latter stores normalized feedback and a credential-free queued turn, never a raw webhook body or GitHub credential.
 
-The application schema window keeps minimum `0070` and advances its head to
-`0075`, as recorded in `apps/api/src/curie_api/schema_compat.json`. Hook source
-policy migration `0075` follows polling cursor migration `0073`; the next
-migrations `0071` and `0072` remain in the chain.
+The candidate application serving window and ordered revision ancestry live in
+`packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
+validated against the actual API migration graph and CLI candidate catalog.
+`packages/protected-hooks/src/curie_protected_hooks/schema_serving.py::can_serve`
+owns the pure serving decision; API exports delegate to it. The API window
+resource and chart metadata are checked generated mirrors. Historical CLI
+release windows remain separate and unchanged. Polling
+cursor migration `0073` follows `0072`; both existing next migrations, `0071`
+and `0072`, remain in the chain.
+
+API startup calls
+`packages/protected-hooks/src/curie_protected_hooks/schema_serving.py::assert_servable`
+under its configured database identity. The read-only probe requires one live
+revision plus readable source policy and operation columns with compatible
+types, including when an unknown future revision is presumed compatible.
+Configured schema selection locates version metadata; source tables remain in
+`curie`. This proves readable structure, not runtime authority or qualification.
 
 ## Implementations today
 
