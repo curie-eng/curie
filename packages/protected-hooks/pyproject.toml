@@ -4,7 +4,7 @@ name = "curie-protected-hooks"
 version = "0.0.0"
 description = "Internal protected hook source authority primitives"
 requires-python = ">=3.13"
-dependencies = ["redis>=8.1.0", "sqlalchemy[asyncio]>=2.0.51"]
+dependencies = ["cryptography>=50.0.1", "redis>=8.1.0", "sqlalchemy[asyncio]>=2.0.51"]
 
 [build-system]
 requires = ["hatchling"]
