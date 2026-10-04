@@ -2,13 +2,17 @@
 
 Date: 2026-10-03
 
-Status: Draft
+Status: Accepted
+
+Accepted 2026-10-04 with maintainer approval from TheConnMan, recorded as an
+approving review on the publishing pull request
+([#3928](https://github.com/curie-eng/curie/pull/3928)).
 
 This ADR builds on
 [ADR 0166](0166-tenant-boundary-and-principal-identity-land-together.md) and
 [ADR 0168](0168-one-installation-hosts-several-bot-identities.md).
 
-When Accepted, it supersedes four clauses:
+It supersedes four clauses:
 
 - **ADR 0166 decision 2,** that `identity_links` bind a provider native id
   "inside one provider installation". A link is scoped to an identity namespace
@@ -28,8 +32,7 @@ it includes one connection per identity, the identity stamped from the
 connection, and routes keyed `(kind, adapter, address)`.
 
 Per [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md),
-both stay `Accepted` and gain back links naming exactly these clauses at
-acceptance.
+both stay `Accepted` and carry back links naming exactly these clauses.
 
 ## Context
 
@@ -432,6 +435,5 @@ already answered.
 
 ## Tracking
 
-Realized by #2909, #2910 and #2911, and by #3039 for attaching identities. The
-three pull requests hold until this ADR is Accepted. #2911 may proceed
-separately without its binding reference.
+Realized by #2909, #2910 and #2911, and by #3039 for attaching identities.
+#2911 may proceed separately without its binding reference.
