@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 import redis
 from curie_api.config import get_settings
-from curie_api.killswitch import KILL_CHANNEL, kill_key
+from curie_internal.keyspace import KILL_CHANNEL, kill_key
 
 
 @pytest.fixture

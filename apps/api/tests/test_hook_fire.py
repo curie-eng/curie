@@ -14,8 +14,8 @@ from typing import Any
 import redis.asyncio as redis
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api.config import get_settings
-from curie_api.killswitch import kill_key
 from curie_api.models import HookRun
+from curie_internal.keyspace import kill_key
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 

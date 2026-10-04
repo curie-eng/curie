@@ -15,6 +15,7 @@ from pathlib import Path
 from channel_protocol.progress import ProgressCommand
 from curie_api import turn_progress
 from curie_api.routers import turn_progress as turn_progress_router
+from curie_internal.keyspace import inbox_key, inbox_pending_key
 
 _VECTOR = (
     Path(__file__).resolve().parents[3] / "tests" / "vectors" / "turn-progress-capability.json"
@@ -58,10 +59,10 @@ def test_the_api_verifies_the_frozen_scope_on_the_frozen_route() -> None:
 def test_the_api_writes_the_frozen_inbox_key_and_entry() -> None:
     vector = _vector()
     progress_id = str(uuid.uuid4())
-    assert turn_progress.inbox_key("acme:worker", progress_id) == vector["inbox_key"].format(
+    assert inbox_key("acme:worker", progress_id) == vector["inbox_key"].format(
         key_prefix="acme:worker", progress_id=progress_id
     )
-    assert turn_progress.inbox_pending_key("acme:worker") == vector["inbox_pending_key"].format(
+    assert inbox_pending_key("acme:worker") == vector["inbox_pending_key"].format(
         key_prefix="acme:worker"
     )
     example = vector["inbox_entry_example"]

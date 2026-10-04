@@ -31,6 +31,7 @@ from aci_protocol import (
     SessionStatus,
     TurnSource,
 )
+from curie_internal.keyspace import kill_key
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
 from curie_worker.binding import (
     BUNDLE_REF_ENV,
@@ -41,7 +42,6 @@ from curie_worker.binding import (
     BindingResolver,
 )
 from curie_worker.delivery_lease import DeliveryLeaseStore
-from curie_worker.killswitch import kill_key
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.workitem_dispatch import WorkItemAcquireGrant, WorkItemRun
 from sqlalchemy import text
