@@ -10,7 +10,7 @@
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 
 use anyhow::Result;
 
@@ -198,17 +198,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
     fn render(&self, ui: &crate::ui::Ui) {
         match self {
             Self::DryRun(plan) => plan.render(ui),
-            Self::Registration {
-                context,
-                url,
-                steps,
-                kind_cluster,
-            } => {
-                if let Some(name) = kind_cluster {
-                    ui.payload(&format!("Kind cluster {name}, context {context}."));
-                } else {
-                    ui.payload(&format!("Using Kubernetes context {context}."));
-                }
+            Self::Registration { url, steps, .. } => {
                 ui.payload("No App id was passed. Register the factory App, then rerun:");
                 ui.payload_plain(url);
                 for (index, step) in steps.iter().enumerate() {
@@ -318,22 +308,28 @@ pub struct RerunTarget<'a> {
 }
 
 pub fn registration_steps(target: &RerunTarget<'_>) -> Vec<String> {
-    let org = target
-        .org
-        .map(|org| format!(" --org {org}"))
-        .unwrap_or_default();
+    let mut rerun = format!(
+        "Rerun: curie factory quickstart --repo {} --context {}",
+        target.repo, target.context
+    );
+    for (flag, value, default) in [
+        ("--namespace", target.namespace, "curie"),
+        ("--release", target.release, "curie"),
+        ("--model", target.model, DEFAULT_MODEL),
+    ] {
+        if value != default {
+            rerun.push_str(&format!(" {flag} {value}"));
+        }
+    }
+    if let Some(org) = target.org {
+        rerun.push_str(&format!(" --org {org}"));
+    }
+    rerun.push_str(" --app-id <APP_ID> --private-key-file <PATH.pem>");
     vec![
         "Open the link and click Create GitHub App. The name, permissions, and the disabled webhook are already filled in.".to_string(),
         "On the App settings page, note the App ID and click Generate a private key to download the .pem file.".to_string(),
         format!("Click Install App and install it on {}.", target.repo),
-        format!(
-            "Rerun: curie factory quickstart --repo {repo} --context {context} --namespace {namespace} --release {release} --model {model}{org} --app-id <APP_ID> --private-key-file <PATH.pem>",
-            repo = target.repo,
-            context = target.context,
-            namespace = target.namespace,
-            release = target.release,
-            model = target.model,
-        ),
+        rerun,
     ]
 }
 
@@ -876,6 +872,7 @@ async fn release_model_recorded(opts: &QuickstartOpts) -> Result<bool> {
 }
 
 async fn execute(planned: &Planned) -> Result<QuickstartOutput> {
+    crate::ui::ui().note(&format!("Kubernetes context: {}", planned.context));
     let mut prompted = false;
     let mut intake_json = serde_json::Value::Null;
     for action in &planned.actions {
@@ -884,8 +881,17 @@ async fn execute(planned: &Planned) -> Result<QuickstartOutput> {
             ensure_credential(&planned.credential)?;
         }
         match action {
-            Action::External { program, args } => run_program(program, args).await?,
-            Action::Cluster { args } => run_self(args).await?,
+            Action::External { program, args } => {
+                let step = if program == "kind" {
+                    "Creating kind cluster"
+                } else {
+                    "Scaling CoreDNS"
+                };
+                run_program(program, args, step).await?;
+            }
+            Action::Cluster { args } => {
+                run_self(args, "Installing Curie").await?;
+            }
             Action::Register {
                 org,
                 repo,
@@ -912,14 +918,45 @@ async fn execute(planned: &Planned) -> Result<QuickstartOutput> {
                 });
             }
             Action::Intake(intake) => {
-                crate::kube_context::pin_for_cluster_command(Some(&planned.context))?;
-                let output = crate::factory_intake::factory_intake((**intake).clone()).await?;
-                intake_json = output.to_json();
+                let mut args = vec![
+                    "cluster".into(),
+                    "factory".into(),
+                    "--context".into(),
+                    planned.context.clone(),
+                    "--namespace".into(),
+                    intake.common.namespace.clone(),
+                    "--release".into(),
+                    intake.common.release.clone(),
+                    "--chart".into(),
+                    intake.chart.clone(),
+                    "--repo".into(),
+                    intake.repos.join(","),
+                    "--intake".into(),
+                    POLL_INTAKE.into(),
+                    "--app-id".into(),
+                    intake.app_id.clone().unwrap_or_default(),
+                    "--private-key-file".into(),
+                    intake
+                        .private_key_file
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                ];
+                if let Some(org) = &intake.org {
+                    args.extend(["--org".into(), org.clone()]);
+                }
+                intake_json = run_self(&args, "Configuring factory intake").await?;
                 if intake_json.get("github_app").is_none() {
-                    return Err(CliError::failure(
-                        "factory intake did not record the App; nothing further was deployed",
-                    )
-                    .into());
+                    return Err(step_error(
+                        Path::new("curie"),
+                        &args,
+                        "Configuring factory intake",
+                        CliError::failure(
+                            "factory intake did not record the App; nothing further was deployed",
+                        )
+                        .into(),
+                        None,
+                    ));
                 }
             }
             Action::Deploy {
@@ -930,58 +967,85 @@ async fn execute(planned: &Planned) -> Result<QuickstartOutput> {
                 deadline_seconds,
                 budget_usd,
             } => {
-                let image = render_published_bundle(namespace, release).await?;
+                crate::ui::ui().note("Rendering factory bundle");
                 let dir = bundle_dir(namespace, release);
-                run_self(&[
-                    "cluster".into(),
-                    "deploy".into(),
-                    "--context".into(),
-                    context.clone(),
-                    "--namespace".into(),
-                    namespace.clone(),
-                    "--release".into(),
-                    release.clone(),
-                    "--plugin-dir".into(),
-                    dir.display().to_string(),
-                    "--agent".into(),
-                    AGENT_NAME.into(),
-                    "--env".into(),
-                    "prod".into(),
-                    "--repo".into(),
-                    repo.clone(),
-                ])
+                let image = render_published_bundle(namespace, release)
+                    .await
+                    .map_err(|error| {
+                        let (_, fix) = crate::exit::classify(&error);
+                        step_error(
+                            Path::new("curie"),
+                            &["--plugin-dir".into(), dir.display().to_string()],
+                            "Rendering factory bundle",
+                            error,
+                            fix.as_deref(),
+                        )
+                    })?;
+                run_self(
+                    &[
+                        "cluster".into(),
+                        "deploy".into(),
+                        "--context".into(),
+                        context.clone(),
+                        "--namespace".into(),
+                        namespace.clone(),
+                        "--release".into(),
+                        release.clone(),
+                        "--plugin-dir".into(),
+                        dir.display().to_string(),
+                        "--agent".into(),
+                        AGENT_NAME.into(),
+                        "--env".into(),
+                        "prod".into(),
+                        "--repo".into(),
+                        repo.clone(),
+                    ],
+                    "Deploying dark factory",
+                )
                 .await?;
-                run_self(&cluster_agent(
-                    "surfaces",
-                    context,
-                    namespace,
-                    release,
-                    &["--add".into(), format!("github={repo}")],
-                ))
+                run_self(
+                    &cluster_agent(
+                        "surfaces",
+                        context,
+                        namespace,
+                        release,
+                        &["--add".into(), format!("github={repo}")],
+                    ),
+                    "Binding GitHub repository",
+                )
                 .await?;
-                run_self(&cluster_agent(
-                    "overrides",
-                    context,
-                    namespace,
-                    release,
-                    &["--execution-deadline".into(), deadline_seconds.to_string()],
-                ))
+                run_self(
+                    &cluster_agent(
+                        "overrides",
+                        context,
+                        namespace,
+                        release,
+                        &["--execution-deadline".into(), deadline_seconds.to_string()],
+                    ),
+                    "Setting execution deadline",
+                )
                 .await?;
-                run_self(&cluster_agent(
-                    "publication-policy",
-                    context,
-                    namespace,
-                    release,
-                    &["--policy".into(), "auto".into()],
-                ))
+                run_self(
+                    &cluster_agent(
+                        "publication-policy",
+                        context,
+                        namespace,
+                        release,
+                        &["--policy".into(), "auto".into()],
+                    ),
+                    "Setting publication policy",
+                )
                 .await?;
-                run_self(&cluster_agent(
-                    "budget",
-                    context,
-                    namespace,
-                    release,
-                    &["--limit".into(), budget_display(*budget_usd)],
-                ))
+                run_self(
+                    &cluster_agent(
+                        "budget",
+                        context,
+                        namespace,
+                        release,
+                        &["--limit".into(), budget_display(*budget_usd)],
+                    ),
+                    "Setting factory budget",
+                )
                 .await?;
                 let app = intake_json
                     .get("github_app")
@@ -1161,63 +1225,161 @@ async fn render_published_bundle(namespace: &str, release: &str) -> Result<Strin
     }
 }
 
-async fn run_self(args: &[String]) -> Result<()> {
+async fn run_self(args: &[String], step: &str) -> Result<serde_json::Value> {
     let program = std::env::current_exe().map_err(|err| {
         CliError::failure(format!("cannot locate the curie binary to continue: {err}"))
     })?;
-    run_command(&program, args).await
+    // Structured child results let intake cross the same process boundary as
+    // the other steps. Plain captured diagnostics retain every inference while
+    // parent plumbing controls whether the full child detail is shown.
+    let mut args = args.to_vec();
+    args.extend([
+        "--json".into(),
+        "--debug".into(),
+        "--color".into(),
+        "never".into(),
+    ]);
+    let output = run_command(&program, &args, step).await?;
+    serde_json::from_slice(&output.stdout).map_err(|error| {
+        step_error(
+            &program,
+            &args,
+            step,
+            CliError::failure(format!("child result was not JSON: {error}")).into(),
+            None,
+        )
+    })
 }
 
-async fn run_program(program: &str, args: &[String]) -> Result<()> {
+async fn run_program(program: &str, args: &[String], step: &str) -> Result<()> {
     require_on_path(program)?;
-    run_command(Path::new(program), args).await
+    run_command(Path::new(program), args, step).await?;
+    Ok(())
 }
 
-async fn run_command(program: &Path, args: &[String]) -> Result<()> {
+fn step_error(
+    program: &Path,
+    args: &[String],
+    step: &str,
+    source: anyhow::Error,
+    fix: Option<&str>,
+) -> anyhow::Error {
+    let paths = regex::Regex::new(r#"(^|[\s\"'`(])(?:/|~/)[^\s\"'`<>),;]+"#)
+        .expect("static quickstart path redaction pattern");
+    let redact = |text: &str| {
+        let mut text = text.to_string();
+        if program.is_absolute() {
+            text = text.replace(&program.display().to_string(), "curie");
+        }
+        for pair in args.windows(2) {
+            if pair[0] == "--chart" || pair[0] == "--plugin-dir" {
+                text = text.replace(
+                    &pair[1],
+                    if pair[0] == "--chart" {
+                        "<chart>"
+                    } else {
+                        "<bundle>"
+                    },
+                );
+            }
+        }
+        paths
+            .replace_all(&text, "$1<path>")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let fix = redact(&fix.map(str::to_string).unwrap_or_else(|| {
+        format!("rerun curie factory quickstart with --debug to inspect {step}; address the reported cause and rerun; completed steps are safe to repeat")
+    }));
+    let cause = redact(&source.to_string().replace("Error:", ""));
+    let message = format!("{step} failed: {cause}");
+    let source = crate::exit::with_json_payload(
+        source.context(format!("{} {}", program.display(), args.join(" "))),
+        serde_json::json!({ "error": message, "fix": fix }),
+    );
+    crate::exit::operator_context(source, message, Some(fix))
+}
+
+async fn run_command(program: &Path, args: &[String], step: &str) -> Result<Output> {
     let ui = crate::ui::ui();
+    ui.note(step);
     ui.plumbing(&format!("+ {} {}", program.display(), args.join(" ")));
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args);
-    if ui.json() {
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let output = cmd.output().await.map_err(|err| {
-            CliError::failure(format!("{} failed to start: {err}", program.display()))
-        })?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(CliError::failure(format!(
-                "{} {} failed: {}{}",
-                program.display(),
-                args.join(" "),
-                stderr.trim(),
-                if stdout.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" {}", stdout.trim())
-                }
-            ))
-            .into());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if args.first().map(String::as_str) == Some("cluster")
+        && args.get(1).map(String::as_str) == Some("factory")
+    {
+        // Poll quickstart has no webhook secret, just as its in-process plan.
+        cmd.env_remove(crate::factory_intake::WEBHOOK_SECRET_ENV);
+    }
+    let output = cmd.output().await.map_err(|error| {
+        step_error(
+            program,
+            args,
+            step,
+            CliError::failure(format!("failed to start: {error}")).into(),
+            None,
+        )
+    })?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stderr.lines() {
+        if line.starts_with("Kubernetes context:") {
+            continue;
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            eprint!("{stderr}");
-        }
-        Ok(())
-    } else {
-        let status = cmd.status().await.map_err(|err| {
-            CliError::failure(format!("{} failed to start: {err}", program.display()))
-        })?;
-        if status.success() {
-            Ok(())
+        // ADR 0114 Decision 4 requires each detected inference to stay visible,
+        // even when the wrapper hides the child's other successful output.
+        if line.starts_with("inferred ") {
+            ui.note(line);
         } else {
-            Err(
-                CliError::failure(format!("{} {} failed", program.display(), args.join(" ")))
-                    .with_fix("fix the reported step and rerun; completed steps are safe to repeat")
-                    .into(),
-            )
+            ui.plumbing(line);
         }
     }
+    for line in stdout.lines() {
+        ui.plumbing(line);
+    }
+    if !output.status.success() {
+        let json: Option<serde_json::Value> = serde_json::from_slice(&output.stdout).ok();
+        let message = json
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(|value| value.as_str());
+        // Some children report only the process status in JSON. Their final
+        // captured failure diagnostic carries the actual tool rejection.
+        let diagnostic = stderr.lines().rev().find_map(|line| {
+            line.split_once(" failed: ")
+                .or_else(|| line.split_once("Error: "))
+                .map(|(_, cause)| cause)
+        });
+        let message = match message {
+            Some(message) if message.contains("exited nonzero") => {
+                diagnostic.unwrap_or(message).to_string()
+            }
+            Some(message) => message.to_string(),
+            None => diagnostic
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{}{}", stderr.trim(), stdout.trim())),
+        };
+        let class = match output.status.code() {
+            Some(2) => crate::exit::ExitClass::Usage,
+            Some(3) => crate::exit::ExitClass::Transient,
+            Some(4) => crate::exit::ExitClass::Unsupported,
+            _ => crate::exit::ExitClass::Failure,
+        };
+        let fix = json
+            .as_ref()
+            .and_then(|value| value.get("fix"))
+            .and_then(|value| value.as_str());
+        let source = CliError {
+            message,
+            fix: fix.map(str::to_string),
+            class,
+        }
+        .into();
+        return Err(step_error(program, args, step, source, fix));
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -1448,8 +1610,9 @@ mod tests {
         });
         let text = steps.join("\n");
         assert!(text.contains(
-            "curie factory quickstart --repo acme/widgets --context kind-curie-factory --namespace factory-ns --release factory --model z-ai/glm-5.3-flash --app-id <APP_ID> --private-key-file <PATH.pem>"
+            "curie factory quickstart --repo acme/widgets --context kind-curie-factory --namespace factory-ns --release factory --app-id <APP_ID> --private-key-file <PATH.pem>"
         ));
+        assert!(!text.contains("--model"));
         assert!(!text.to_ascii_lowercase().contains("gh "));
         assert!(!text.contains("webhook secret"));
         let url = crate::factory_app::registration_url(None, "curie-factory-abcdef12");
@@ -1464,8 +1627,13 @@ mod tests {
         input.release = "trial".into();
         let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
         assert!(text.contains(
-            "--repo acme/widgets --context remote-cluster --namespace acme --release trial --model z-ai/glm-5.3-flash"
+            "--repo acme/widgets --context remote-cluster --namespace acme --release trial --app-id"
         ), "{text}");
+        let rerun = text
+            .lines()
+            .find(|line| line.starts_with("Rerun:"))
+            .unwrap();
+        assert!(!rerun.contains("--model"), "{rerun}");
         assert!(!text.contains("kind create"), "{text}");
     }
 
