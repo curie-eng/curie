@@ -20,6 +20,50 @@ pnpm exec playwright test   # E2E, headless; builds + previews automatically
 `pnpm dev` serves the app on http://localhost:5173. `pnpm preview` serves the
 production build on http://localhost:4173 (what Playwright drives).
 
+### Console credential proof
+
+Choose an unused loopback `PW_PORT` and leave `PW_BASE_URL` unset so Playwright
+builds and serves the candidate's production assets. From `apps/ui`, run:
+
+```bash
+CI=1 pnpm exec playwright test e2e/console-assets.spec.ts --project=chromium
+```
+
+The spec reads every built file under `dist/`, including deferred chunks and any
+source maps. It rejects platform key values and the removed browser key resolver
+signatures. The generated browser command manifest omits credential argument
+defaults; command IDs, flags, environment names, help text, secret references,
+and ordinary defaults remain available for CLI hints. The host CLI manifest is
+unchanged.
+
+For the wired proof, start a task-owned full backing stack and the candidate API
+with its schema applied. Follow the repository's
+[concurrent verification instructions](../../AGENTS.md#concurrent-local-verification)
+for isolated ports, endpoints, and cleanup. Export `CURIE_API_TARGET` for that API,
+an unused loopback `PW_PORT`, and `CURIE_API_KEY` matching the API's `API_KEY`
+setting. The platform key is used only by the Node harness to mint a login code;
+the browser signs in through the login screen with that code.
+
+```bash
+PW_INTEGRATION=1 pnpm exec playwright test e2e/integration/console-secret-proof.spec.ts --project=integration
+```
+
+This proof records real traffic while signing in, navigating, and traversing
+browser history. It checks browser URLs, request URLs, and Referer headers for
+credential parameters and tested credential values, rejects a platform-key
+request header, and checks request bodies and completed API response bodies for
+platform key values. It verifies the session cookie and requires successful
+protected API calls. The login exchange must post only the code and return only
+identity and expiry fields. An unauthenticated request from the fresh Playwright
+context through the preview's `/api/agents` proxy must receive 401. It uses the
+real API without route interception and does not need the existing wiring spec's
+OTLP trace seed.
+
+Verify the assertions with a local negative control: temporarily reintroduce a
+platform-key query path, rebuild, and run the same proof. The run must fail on a
+credential assertion. Restore the candidate source, rebuild, and confirm both
+proof specs pass before retaining the change.
+
 ## Container build inputs
 
 Build from the repository root with `docker build -f apps/ui/Dockerfile .`.
@@ -148,7 +192,7 @@ and the cost calls `getCost`/`getBudget`/`putBudget`/`getKillState`/`killAgent`/
 `resumeAgent`/`getAgents`, and the behavior-packs calls
 `getBehaviorPacks`/`putBehaviorPacks`), `bundle.ts` (jszip packaging + the testable
 `bundleFileTree`), `hooks.ts` (`useTraces`/`useTrace`/`useMetricsSummary`/
-`useMetricSeries`/`useAgents`/`useCost`), `config.ts` (API key + prefix). Deploy
+`useMetricSeries`/`useAgents`/`useCost`), `config.ts` (same-origin API prefix). Deploy
 failures flow through the store reducer actions `deployFailedValidation` /
 `deployFailed`. Observability lives in `src/views/obs/Real*.tsx`
 (`RealTraces`, `RealMetrics`, `RealLogs`, `RealCost`, `RealApprovals`),

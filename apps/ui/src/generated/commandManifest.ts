@@ -1298,9 +1298,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                ""
-              ],
               "env": "SLACK_APP_TOKEN",
               "global": false,
               "help": "Slack app token. Defaults from SLACK_APP_TOKEN",
@@ -1310,9 +1307,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                ""
-              ],
               "env": "SLACK_BOT_TOKEN",
               "global": false,
               "help": "Slack bot token. Defaults from SLACK_BOT_TOKEN",
@@ -1402,9 +1396,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "valkeypass"
-              ],
               "env": "CURIE_VALKEY_PASSWORD",
               "global": false,
               "help": "Valkey password (compose default `valkeypass`). Prefer the CURIE_VALKEY_PASSWORD env var over passing a real secret on the command line, where it leaks via `ps` and shell history",
@@ -1422,9 +1413,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "help": "Platform API key for the default-channel lookup",
@@ -1516,9 +1504,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "valkeypass"
-              ],
               "env": "CURIE_VALKEY_PASSWORD",
               "global": false,
               "help": "Valkey password (compose default `valkeypass`). Prefer the CURIE_VALKEY_PASSWORD env var over passing a real secret on the command line, where it leaks via `ps` and shell history",
@@ -1536,9 +1521,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "help": "Platform API key for the default-channel lookup",
@@ -1699,9 +1681,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "help": "Platform API key",
@@ -1812,9 +1791,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -1864,9 +1840,6 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "default_values": [
-                    "curie-dev-key"
-                  ],
                   "env": "CURIE_API_KEY",
                   "global": false,
                   "id": "api_key",
@@ -1911,9 +1884,6 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "default_values": [
-                    "curie-dev-key"
-                  ],
                   "env": "CURIE_API_KEY",
                   "global": false,
                   "id": "api_key",
@@ -1965,9 +1935,6 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "default_values": [
-                    "curie-dev-key"
-                  ],
                   "env": "CURIE_API_KEY",
                   "global": false,
                   "id": "api_key",
@@ -2014,9 +1981,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -2101,9 +2065,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -2340,9 +2301,6 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "default_values": [
-                    "curie-dev-key"
-                  ],
                   "env": "CURIE_API_KEY",
                   "global": false,
                   "help": "Platform API key",
@@ -2378,9 +2336,6 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "default_values": [
-                    "curie-dev-key"
-                  ],
                   "env": "CURIE_API_KEY",
                   "global": false,
                   "help": "Platform API key",
@@ -2469,9 +2424,6 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "default_values": [
-                    "curie-dev-key"
-                  ],
                   "env": "CURIE_API_KEY",
                   "global": false,
                   "help": "Platform API key",
@@ -2600,9 +2552,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -2704,9 +2653,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -2752,9 +2698,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -2832,9 +2775,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -2932,9 +2872,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -2979,9 +2916,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -3038,9 +2972,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -3093,9 +3024,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -3160,9 +3088,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -3225,9 +3150,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -3296,9 +3218,6 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "default_values": [
-                    "curie-dev-key"
-                  ],
                   "env": "CURIE_API_KEY",
                   "global": false,
                   "id": "api_key",
@@ -3346,9 +3265,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -4286,9 +4202,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                ""
-              ],
               "env": "SLACK_APP_TOKEN",
               "global": false,
               "help": "Slack app token. Defaults from SLACK_APP_TOKEN",
@@ -4298,9 +4211,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                ""
-              ],
               "env": "SLACK_BOT_TOKEN",
               "global": false,
               "help": "Slack bot token. Defaults from SLACK_BOT_TOKEN",
@@ -4371,9 +4281,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                ""
-              ],
               "global": false,
               "help": "Path to the App's PEM private key file. The path is passed to helm with --set-file, so the key's contents never enter argv",
               "id": "private_key",
@@ -7525,9 +7432,6 @@ export const commandManifest = {
           "required": false
         },
         {
-          "default_values": [
-            "curie-dev-key"
-          ],
           "env": "CURIE_API_KEY",
           "global": false,
           "help": "Platform API key",
