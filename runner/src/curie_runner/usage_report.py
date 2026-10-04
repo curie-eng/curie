@@ -172,9 +172,9 @@ def build_usage_body(
         for model, raw in model_usage.items():
             if isinstance(model, str) and model and isinstance(raw, dict):
                 represented.add(model)
-                models.extend(
-                    _split(model, _entry(model, raw, _MODEL_USAGE_KEYS), seen, primary_model)
-                )
+                split = _split(model, _entry(model, raw, _MODEL_USAGE_KEYS), seen, primary_model)
+                # A zero cumulative entry means the model gained nothing this turn.
+                models.extend(e for e in split if any(e[key] for key in _WIRE_KEYS))
     else:
         usage = getattr(message, "usage", None)
         if isinstance(usage, dict) and usage and primary_model:
@@ -184,7 +184,6 @@ def build_usage_body(
                     primary_model, _entry(primary_model, usage, _USAGE_KEYS), seen, primary_model
                 )
             )
-    models = [entry for entry in models if any(entry[key] for key in _WIRE_KEYS)]
     for (role, model), counts in seen.items():
         if role == REVIEWER and model and model not in represented:
             entry: dict[str, Any] = {"model": model, "role": REVIEWER}
@@ -338,7 +337,8 @@ class UsageReporter:
                 # A newer snapshot may only have caught up observed usage and
                 # produced no body. Do not rewind it when an older replay lands.
                 self._cumulative_session, self._cumulative = self._speculative or (
-                    session_id, baseline
+                    session_id,
+                    baseline,
                 )
                 self._speculative = (self._cumulative_session, self._cumulative)
 

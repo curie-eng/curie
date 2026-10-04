@@ -361,6 +361,38 @@ def test_a_model_seen_only_on_subagent_messages_is_wholly_reviewer() -> None:
     assert got[("reviewer", REVIEWER)]["output_tokens"] == 45
 
 
+def test_a_zero_model_usage_entry_beside_a_nonzero_one_posts_no_zero_row() -> None:
+    """A cumulative entry at zero means the model gained nothing this turn."""
+    message = _result(
+        model_usage={PRIMARY: _model_usage(100, 10), REVIEWER: _model_usage(0, 0)},
+        uuid="t-zero-beside",
+    )
+    observed = {("implementer", PRIMARY): _wire(100, 10)}
+    body = build_usage_body(message, PRIMARY, observed=observed)
+    assert body is not None
+    assert [(e["role"], e["model"]) for e in body["models"]] == [("implementer", PRIMARY)]
+
+
+def test_model_usage_with_only_zero_entries_builds_nothing() -> None:
+    """All-zero cumulative entries are no observation, so there is no body."""
+    message = _result(
+        model_usage={PRIMARY: _model_usage(0, 0), REVIEWER: _model_usage(0, 0)},
+        uuid="t-all-zero",
+    )
+    assert build_usage_body(message, PRIMARY, observed={}) is None
+
+
+def test_an_explicit_zero_per_turn_usage_posts_one_zero_implementer_row() -> None:
+    """A blocked-preflight turn ran and spent nothing; that zero is a real row (#3977)."""
+    message = _result(
+        usage={"input_tokens": 0, "output_tokens": 0}, model_usage={}, uuid="t-zero-usage"
+    )
+    observed = {("implementer", PRIMARY): _wire(0, 0)}
+    body = build_usage_body(message, PRIMARY, observed=observed)
+    assert body is not None
+    assert body["models"] == [{"model": PRIMARY, "role": "implementer", **_wire(0, 0)}]
+
+
 def test_a_model_never_observed_is_implementer_whatever_the_primary() -> None:
     message = _result(model_usage={REVIEWER: _model_usage(9, 9)}, uuid="t-unseen")
     body = build_usage_body(message, PRIMARY, observed={})
@@ -417,7 +449,8 @@ def test_session_posts_observed_reviewer_missing_from_result_totals_once(
             await runner.start()
             try:
                 lines = [
-                    line async for line in runner.run_turn(
+                    line
+                    async for line in runner.run_turn(
                         Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
                     )
                 ]
@@ -478,7 +511,9 @@ def test_zero_cumulative_delta_keeps_fresh_reviewer_usage_without_recounting() -
 
     anyio.run(go)
     assert [body["turn_id"] for body, _ in recorder.received] == [
-        "turn_initial", "turn_fresh", "turn_followup"
+        "turn_initial",
+        "turn_fresh",
+        "turn_followup",
     ]
     fresh_body = _by_role_model(recorder.received[1][0])
     assert set(fresh_body) == {("reviewer", REVIEWER)}
