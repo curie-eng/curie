@@ -168,15 +168,13 @@ curie local message --continue "what's 2 + 2?"
 This is the same path a real Slack `@mention`
 takes - see [`docs/slack-local-runbook.md`](docs/slack-local-runbook.md) when you're ready to try it live.
 
-Visit the console at 
+Mint a login code, then open the console at `http://localhost:28080/?api=1` and paste the code:
 
 ```bash
-http://localhost:28080/?api=1&api_key=<key>
+curie local console login --subject you@example.com
 ```
 
-where `<key>` is this install's API key: the `api_key` field of
-`~/.config/curie/local/curie.json` (or `$CURIE_CONFIG_DIR/local/curie.json`), which
-`curie local up` generates on first run. There you can see the whole conversation, its traces, metrics, and cost. The same console also surfaces logs,
+There you can see the whole conversation, its traces, metrics, and cost. The same console also surfaces logs,
 approvals, and memory, which get more relevant once this plugin is deployed on Kubernetes in production.
 
 When done run the following command

@@ -1,8 +1,8 @@
 """Console session exchange and authenticated current-session inspection.
 
-ADR-0083, first slice (#1044) of #630. The console holds the shared platform
-administrator key in browser code today -- resolved from `?api_key=`, a build
-variable, or a published dev default -- which puts a credential that authorizes
+ADR-0083, first slice (#1044) of #630. Before this change the console held the shared platform
+administrator key in browser code -- resolved from `?api_key=`, a build
+variable, or a published dev default -- which put a credential that authorizes
 deployments, approvals, budgets and the kill switch into browser history, request
 logs and referrers, revocable only by rotating the Secret and restarting the API.
 

@@ -2,10 +2,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StoreProvider } from "../../state/store";
+import { ConsoleSessionGate } from "../../state/session";
 import { RealApprovals } from "./RealApprovals";
 import {
   ApiError,
-  exchangeConsoleLoginCode,
   getApprovalAudit,
   getConsoleSession,
   listApprovals,
@@ -22,12 +22,13 @@ vi.mock("../../api/client", async (importOriginal) => {
     ...actual,
     listApprovals: vi.fn(),
     getApprovalAudit: vi.fn(),
+    // The global gate (#1047) probes the session; the view no longer does.
     getConsoleSession: vi.fn(),
-    exchangeConsoleLoginCode: vi.fn(),
     resolveApproval: vi.fn(),
   };
 });
 
+// Mirrors ConsoleSessionOut (apps/api/src/curie_api/schemas.py).
 function consoleSession(subject = "U0AUTHENTICATED") {
   return {
     subject,
@@ -66,10 +67,13 @@ function approval(overrides: Partial<ApprovalOut> = {}): ApprovalOut {
   };
 }
 
+// Mounted the way main.tsx mounts the console: behind the global session gate.
 function renderView() {
   return render(
     <StoreProvider>
-      <RealApprovals />
+      <ConsoleSessionGate>
+        <RealApprovals />
+      </ConsoleSessionGate>
     </StoreProvider>,
   );
 }
@@ -188,34 +192,42 @@ describe("RealApprovals (#867)", () => {
     await waitFor(() => expect(listApprovals).toHaveBeenCalledTimes(2));
   });
 
-  it("shows the login-code exchange when there is no console session and renders its immutable subject after exchange", async () => {
+  it("shows the principal from the global console session and never probes the session itself", async () => {
+    vi.mocked(getConsoleSession).mockResolvedValue(consoleSession("U0GATESUBJECT"));
     vi.mocked(listApprovals).mockResolvedValue([approval()]);
-    vi.mocked(getConsoleSession).mockRejectedValue(new ApiError(401, "missing, invalid, or expired console session"));
-    vi.mocked(exchangeConsoleLoginCode).mockResolvedValue(consoleSession("U0EXCHANGED"));
     renderView();
 
-    expect(await screen.findByLabelText("login code")).toBeInTheDocument();
-    expect(screen.queryByTestId("approve-btn")).not.toBeInTheDocument();
-    await userEvent.type(screen.getByLabelText("login code"), "one-time-example-code");
-    await userEvent.click(screen.getByTestId("approval-login-submit"));
-
-    await waitFor(() => expect(exchangeConsoleLoginCode).toHaveBeenCalledWith("one-time-example-code"));
-    expect(await screen.findByTestId("approval-principal")).toHaveTextContent("U0EXCHANGED");
-    expect(screen.queryByLabelText("resolved by")).not.toBeInTheDocument();
-    expect(screen.queryByLabelText("actor channel")).not.toBeInTheDocument();
+    await userEvent.click(await screen.findByText("Refund $4,200 to ACME Corp"));
+    const detail = await screen.findByTestId("approval-detail");
+    expect(within(detail).getByTestId("approval-principal")).toHaveTextContent("U0GATESUBJECT");
+    expect(within(detail).getByTestId("approve-btn")).toBeEnabled();
+    expect(within(detail).getByTestId("reject-btn")).toBeEnabled();
+    // One session request for the whole console: the gate's.
+    expect(getConsoleSession).toHaveBeenCalledTimes(1);
+    expect(screen.queryByLabelText("login code")).not.toBeInTheDocument();
   });
 
-  it("returns to the login-code state when an otherwise-live session is revoked or expires", async () => {
+  // A resolve 401 is routed by the global 401 policy (the client's
+  // unauthorized listener re-probes the session; see session.test.tsx). The
+  // view itself only reports the failure; it owns no login form any more.
+  it("reports a resolve 401 as an error and owns no login-code form", async () => {
     vi.mocked(listApprovals).mockResolvedValue([approval()]);
-    vi.mocked(resolveApproval).mockRejectedValue(new ApiError(401, "missing, invalid, or expired console session"));
+    // POST /approvals/{id}/resolve 401 detail, from _unauthorized() in
+    // apps/api/src/curie_api/approval_auth.py (require_approval_principal).
+    vi.mocked(resolveApproval).mockRejectedValue(new ApiError(401, "missing or invalid approval principal"));
     renderView();
 
     await userEvent.click(await screen.findByText("Refund $4,200 to ACME Corp"));
     await screen.findByTestId("approval-detail");
     await userEvent.click(screen.getByTestId("reject-btn"));
 
-    expect(await screen.findByLabelText("login code")).toBeInTheDocument();
-    expect(screen.queryByTestId("approve-btn")).not.toBeInTheDocument();
+    expect(await screen.findByTestId("resolve-error")).toHaveTextContent(
+      "401: missing or invalid approval principal",
+    );
+    expect(screen.queryByLabelText("login code")).not.toBeInTheDocument();
+    expect(screen.queryByText(/login code/i)).not.toBeInTheDocument();
+    // Still in the view with the controls available for a retry.
+    expect(screen.getByTestId("approve-btn")).toBeInTheDocument();
   });
 
   it.each(RESOLVE_ERROR_CASES)("preserves the designed resolve message for HTTP %i", async (status, detail, message) => {

@@ -86,6 +86,7 @@ Reach the UI (port-forward):
 When exposed as NodePort (`curie up` does this by default), the UI is reachable at:
   http://<any-node-ip>:{{ .Values.ui.service.nodePort }}
 The nodePort is pinned in values (ui.service.nodePort) so it survives a down/up cycle.
+The console session cookie is Secure, so sign-in works only over HTTPS or from http://localhost; over plain HTTP from another host it cannot sign in. Use the port-forward above, or serve the UI over HTTPS (https://github.com/curie-eng/curie/issues/3968).
 {{- end }}
 {{- end }}
 
