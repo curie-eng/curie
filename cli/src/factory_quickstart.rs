@@ -642,7 +642,16 @@ fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIntakeOpts {
 }
 
 pub fn describe(planned: &Planned) -> Vec<String> {
-    let mut lines = vec![planned.context_reason.clone()];
+    let toolchain = if planned
+        .actions
+        .iter()
+        .any(|action| matches!(action, Action::Intake(_)))
+    {
+        crate::factory_toolchain::PLAN_NOTE
+    } else {
+        crate::factory_toolchain::SKIPPED_NOTE
+    };
+    let mut lines = vec![toolchain.into(), planned.context_reason.clone()];
     match &planned.credential {
         CredentialDecision::UseEnv => {
             lines.push("model credential: use CURIE_CREDENTIALS (no prompt)".to_string());
@@ -908,6 +917,24 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
         current.as_deref(),
         crate::ops::on_path,
     )?;
+    // The finishing pass discovers repository needs before pinning a kube
+    // context or reading Helm. Dry-run describes these reads without making
+    // them, and the first pass has no installation credential yet.
+    if !opts.dry_run {
+        match (&opts.app_id, &opts.private_key_file) {
+            (Some(id), Some(file)) if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) => {
+                crate::factory_toolchain::preflight(id, file, std::slice::from_ref(&opts.repo))
+                    .await?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(CliError::usage(
+                    "pass a numeric --app-id and --private-key-file together",
+                )
+                .into())
+            }
+        }
+    }
     // Confirm before pin or helm. A non-terminal refusal here never reads the
     // release, and a declined prompt never installs.
     let real_interactive = std::io::stdin().is_terminal();

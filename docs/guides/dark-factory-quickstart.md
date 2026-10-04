@@ -95,6 +95,21 @@ and the deployed image. Pass
 rerun command omits namespace, release and model flags when they match the
 defaults.
 
+Before any Helm call, the second run authenticates with the GitHub App and reads
+the selected repository's workflows and standard manifests at one default-branch
+commit. It announces inferred toolchains and warns when a required tool or
+version is absent from the fixed factory runner. The runner includes Python
+3.13, Node 22.23, and Rust 1.95. Matching minor versions are supported regardless
+of patch; a bare Node 22 declaration also matches. A warning reports the tool,
+version, and declaring file without changing the runner image or installing
+tools. If a workflow names a version file that is missing, the version is
+reported as unknown with a warning naming the file, and setup continues.
+Authentication failures and malformed GitHub responses remain errors.
+A repository with no declarations gets a `no toolchain signals` note.
+`curie cluster factory` performs the same check for its allowlisted repositories.
+Without `--app-id`, it prints `toolchain inference skipped: no --app-id`.
+Dry-run describes the inference without reading GitHub.
+
 Before deploying, the second run reads the key's remaining credit from
 OpenRouter (the smaller of the key's limit and the account balance). It warns
 when that is below 5 USD, the credit one factory run needs. When it cannot read
