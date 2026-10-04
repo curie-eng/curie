@@ -711,6 +711,7 @@ class ResponseDropRelay:
 
         try:
             server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server.minimum_version = ssl.TLSVersion.TLSv1_2
             server.load_cert_chain(
                 str(self.broker.private / "server.crt"), str(self.broker.private / "server.key")
             )
@@ -718,6 +719,7 @@ class ResponseDropRelay:
             peer.settimeout(5)
             self.downstream = server.wrap_socket(peer, server_side=True)
             trusted = ssl.create_default_context(cafile=str(self.broker.private / "ca.crt"))
+            trusted.minimum_version = ssl.TLSVersion.TLSv1_2
             self.upstream = trusted.wrap_socket(
                 socket.create_connection(("127.0.0.1", self.broker.port), timeout=5),
                 server_hostname="127.0.0.1",
