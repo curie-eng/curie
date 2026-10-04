@@ -599,6 +599,9 @@ Each test/implementation unit cites its corresponding ID above. Required cases:
   serialized; no-row race and reload after lock wait; invalid signatures never
   acquire the advisory lock; valid preliminary authentication followed by key
   rotation while waiting fails authoritative reauthentication; cron/fire cannot bypass.
+* SOURCE-2/10: standalone worker schema and cron campaigns resolve their configured
+  database through the existing settings owner and pass without a preceding API
+  test setting `DATABASE_URL`. Templates and clones remain real, isolated and owned.
 * SOURCE-3/4: administrative auth only; consumer/evidence secrets absent from
   every response; scoped derivation differs across hook/agent/generation;
   exact existing signature bytes; missing requested read-only still effective
