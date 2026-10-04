@@ -93,7 +93,7 @@ def test_every_worker_text_statement_plans_against_migrations(
             if alias.name == "text"
         }
         module_aliases = {
-            alias.asname or alias.name
+            alias.asname or alias.name: alias.name
             for node in ast.walk(tree)
             if isinstance(node, ast.Import)
             for alias in node.names
@@ -101,8 +101,13 @@ def test_every_worker_text_statement_plans_against_migrations(
         }
         constructor_names = set(aliases)
         constructor_names.update(f"{module}.text" for module in module_aliases)
-        if "sqlalchemy" in module_aliases:
-            constructor_names.add("sqlalchemy.sql.text")
+        for module, imported in module_aliases.items():
+            if imported == "sqlalchemy":
+                constructor_names.update(
+                    {f"{module}.sql.text", f"{module}.sql.expression.text"}
+                )
+            elif imported == "sqlalchemy.sql":
+                constructor_names.add(f"{module}.expression.text")
         expected.update(
             f"{path.relative_to(ROOT).as_posix()}:{node.lineno}"
             for node in ast.walk(tree)
@@ -142,6 +147,8 @@ def test_publication_result_sql_discovers_filtered_and_unfiltered_branches() -> 
         ("from sqlalchemy import text as sql_text", "sql_text"),
         ("from sqlalchemy.sql import text", "text"),
         ("import sqlalchemy as sa", "sa.text"),
+        ("import sqlalchemy as sa", "sa.sql.text"),
+        ("import sqlalchemy", "sqlalchemy.sql.expression.text"),
     ],
 )
 def test_sql_discovery_accepts_sqlalchemy_constructor_spellings(
@@ -241,10 +248,28 @@ _BRANCHING_SQL = [
         '        sql = "{second_sql}"\n'
         "        flag = False\n"
     ),
+    (
+        '    sql = "{second_sql}"\n'
+        "    while flag:\n"
+        '        sql = "{first_sql}"\n'
+        "        break\n"
+        "    else:\n"
+        '        sql = "{second_sql}"\n'
+    ),
+    (
+        '    sql = "{second_sql}"\n'
+        "    for item in flag:\n"
+        '        sql = "{first_sql}"\n'
+        "        break\n"
+        "    else:\n"
+        '        sql = "{second_sql}"\n'
+    ),
 ]
 
 
-@pytest.mark.parametrize("branch", _BRANCHING_SQL, ids=["try_except", "match", "while"])
+@pytest.mark.parametrize(
+    "branch", _BRANCHING_SQL, ids=["try_except", "match", "while", "while_else", "for_else"]
+)
 def test_sql_branch_discovery_cannot_hide_an_earlier_missing_column(
     tmp_path: Path, branch: str
 ) -> None:
@@ -268,7 +293,9 @@ def test_sql_branch_discovery_cannot_hide_an_earlier_missing_column(
     assert any("missing_contract_column" in sql for _, sql in statements)
 
 
-@pytest.mark.parametrize("branch", _BRANCHING_SQL, ids=["try_except", "match", "while"])
+@pytest.mark.parametrize(
+    "branch", _BRANCHING_SQL, ids=["try_except", "match", "while", "while_else", "for_else"]
+)
 def test_sql_branch_discovery_accepts_valid_sql_in_every_branch(
     tmp_path: Path, branch: str
 ) -> None:
@@ -288,25 +315,48 @@ def test_sql_branch_discovery_accepts_valid_sql_in_every_branch(
     assert {sql for _, sql in statements} == {"SELECT name FROM curie.agents"}
 
 
+@pytest.mark.parametrize(
+    ("import_source", "constructor"),
+    [
+        ("from sqlalchemy import text", "text"),
+        ("import sqlalchemy as sa", "sa.sql.text"),
+        ("import sqlalchemy", "sqlalchemy.sql.expression.text"),
+    ],
+    ids=["direct", "aliased_sql_module", "qualified_expression_module"],
+)
 def test_new_worker_sql_using_a_missing_column_is_rejected(
-    tmp_path: Path, migrated_database_url: str
+    tmp_path: Path, migrated_database_url: str, import_source: str, constructor: str
 ) -> None:
     _write_worker(
         tmp_path,
-        "from sqlalchemy import text\n"
-        'statement = text("SELECT missing_contract_column FROM curie.agents")\n',
+        f"{import_source}\n"
+        f'statement = {constructor}("SELECT missing_contract_column FROM curie.agents")\n',
     )
     statements = discover_statements(tmp_path, "curie")
+    assert len(statements) == 1
+    assert statements[0][1] == "SELECT missing_contract_column FROM curie.agents"
     with pytest.raises(DBAPIError, match="missing_contract_column"):
         _explain(migrated_database_url, statements)
 
 
+@pytest.mark.parametrize(
+    ("import_source", "constructor"),
+    [
+        ("from sqlalchemy import text", "text"),
+        ("import sqlalchemy as sa", "sa.sql.text"),
+        ("import sqlalchemy", "sqlalchemy.sql.expression.text"),
+    ],
+    ids=["direct", "aliased_sql_module", "qualified_expression_module"],
+)
 def test_valid_parameterized_worker_sql_is_accepted(
-    tmp_path: Path, migrated_database_url: str
+    tmp_path: Path, migrated_database_url: str, import_source: str, constructor: str
 ) -> None:
     _write_worker(
         tmp_path,
-        "from sqlalchemy import text\n"
-        'statement = text("SELECT name FROM curie.agents WHERE id = CAST(:id AS uuid)")\n',
+        f"{import_source}\n"
+        f"statement = {constructor}("
+        '"SELECT name FROM curie.agents WHERE id = CAST(:id AS uuid)")\n',
     )
-    _explain(migrated_database_url, discover_statements(tmp_path, "curie"))
+    statements = discover_statements(tmp_path, "curie")
+    assert len(statements) == 1
+    _explain(migrated_database_url, statements)
