@@ -19,11 +19,11 @@ import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
+from curie_internal import sandbox_token
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
-from .. import sandbox_token
 from ..config import get_settings
 from ..deps import SessionDep
 from ..factory_card import CardInput, render_card

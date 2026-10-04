@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
+from curie_internal.streams import ensure_group
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
 from redis.exceptions import (
@@ -256,11 +257,7 @@ class StreamConsumer:
         each subclass's ``ensure_group`` for why it picks ``$`` vs ``0``). An
         existing group is left untouched.
         """
-        try:
-            await self._redis.xgroup_create(stream, group, id=start_id, mkstream=True)
-        except ResponseError as exc:
-            if "BUSYGROUP" not in str(exc):
-                raise
+        await ensure_group(self._redis, stream, group, start_id=start_id)
 
     async def _consume(self, spec: ReadLoopSpec, handler: EntryHandler) -> None:
         """Blocking-read loop: read the group, dispatch each entry to ``handler``,

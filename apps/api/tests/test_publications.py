@@ -32,7 +32,7 @@ import httpx
 import pytest
 import redis
 import redis.asyncio as aioredis
-from curie_api import approval_principal, sandbox_token
+from curie_api import approval_principal
 from curie_api.config import get_settings
 from curie_api.crud import (
     approvals as crud_approvals,
@@ -52,6 +52,7 @@ from curie_api.resumequeue import ResumeQueue
 from curie_api.schemas.channels import ChannelBindingWrite
 from curie_api.schemas.publications import PublicationCreate
 from curie_api.sweeper import sweep_expired_approvals
+from curie_internal import sandbox_token
 from curie_telemetry import record_metric
 from curie_test_support.valkey import connect_or_skip
 from fastapi import Response

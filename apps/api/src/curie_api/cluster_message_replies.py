@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import redis.asyncio as redis
+from curie_internal.keyspace import cluster_reply_keys
 
 
 class ReplyBucketFullError(RuntimeError):
@@ -105,13 +106,7 @@ class ClusterMessageReplyStore:
     def _keys(reply_ref: str) -> tuple[str, str, str, str]:
         # Curly braces keep one bucket in one Redis Cluster hash slot while the
         # fixed UUID-only suffix prevents key injection.
-        base = f"curie:cluster-message-replies:{{{reply_ref}}}"
-        return (
-            f"{base}:events",
-            f"{base}:digests",
-            f"{base}:bytes",
-            f"{base}:terminal",
-        )
+        return cluster_reply_keys(reply_ref)
 
     async def append(
         self,

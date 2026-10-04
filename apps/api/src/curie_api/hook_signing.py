@@ -51,7 +51,7 @@ import hmac
 import json
 import time
 
-from curie_api.sandbox_token import signature
+from curie_internal.sandbox_token import signature
 
 # The header an upstream presents its signature in. Named for this platform
 # rather than borrowing GitHub's ``X-Hub-Signature-256``: a hook source is any

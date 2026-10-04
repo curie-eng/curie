@@ -15,6 +15,7 @@ from typing import Any
 
 import curie_worker.binding as binding_module
 from aci_protocol import Final, SessionStatus, TextDelta, ToolAccess
+from curie_internal.keyspace import kill_key
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import (
     BUDGET_ENV,
@@ -24,7 +25,6 @@ from curie_worker.binding import (
     ResolvedDeployment,
 )
 from curie_worker.config import WorkerConfig
-from curie_worker.killswitch import kill_key
 from curie_worker.reply_sink import TargetRoute
 
 # importlib import mode does not add the test root to sys.path.

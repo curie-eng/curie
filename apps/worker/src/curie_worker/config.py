@@ -38,6 +38,7 @@ from aci_protocol.service_config import (
     warn_if_deprecated_api_url_env,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_internal import keyspace
 from pydantic import AliasChoices, BeforeValidator, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
@@ -1366,7 +1367,7 @@ class WorkerConfig(BaseSettings):
         default=300.0, ge=0, validation_alias="CURIE_WORKER_SUPERVISE_FAILURE_RESET_S"
     )
 
-    key_prefix: str = "curie:worker"
+    key_prefix: str = keyspace.WORKER_KEY_PREFIX_DEFAULT
 
     @property
     def runner_facing_api_base_url(self) -> str:
@@ -1419,7 +1420,7 @@ class WorkerConfig(BaseSettings):
         return self.read_block_ms / 1000 + 5.0
 
     def done_key(self, event_id: str) -> str:
-        return f"{self.key_prefix}:done:{event_id}"
+        return keyspace.done_key(self.key_prefix, event_id)
 
     def side_effect_key(self, event_id: str) -> str:
         return f"{self.key_prefix}:sidefx:{event_id}"
@@ -1450,7 +1451,7 @@ class WorkerConfig(BaseSettings):
         # The durable outbox record for this event's ``turn.completed``. NO TTL:
         # a payload that expires under a longer-lived set membership is a
         # completion lost silently (EB-B6(f)).
-        return f"{self.key_prefix}:completion:{event_id}"
+        return keyspace.completion_key(self.key_prefix, event_id)
 
     def completions_pending_key(self) -> str:
         # The sweep index. A SET, not a SCAN over the keyspace: the maintenance
@@ -1469,7 +1470,7 @@ class WorkerConfig(BaseSettings):
     def progress_key(self, progress_id: str) -> str:
         # One logical turn chain's progress record (ADR 0130); see the worker
         # README's "Deliberate progress" section for its fields and expiry.
-        return f"{self.key_prefix}:progress:{progress_id}"
+        return keyspace.progress_key(self.key_prefix, progress_id)
 
     def progress_delivery_key(self, delivery_id: str) -> str:
         # One pending progress delivery, keyed by its derived reply-wire id.
@@ -1488,12 +1489,12 @@ class WorkerConfig(BaseSettings):
         # The chain's inbox stream. The API appends to it under the same
         # KEY_PREFIX (its worker_key_prefix); the shape is frozen in
         # tests/vectors/turn-progress-capability.json.
-        return f"{self.key_prefix}:progress:inbox:{progress_id}"
+        return keyspace.inbox_key(self.key_prefix, progress_id)
 
     def progress_inbox_pending_key(self) -> str:
         # Durable discovery for commands accepted after a live pump stops or
         # while every worker is restarting.
-        return f"{self.key_prefix}:progress:inbox:pending"
+        return keyspace.inbox_pending_key(self.key_prefix)
 
     def upgrade_quiesce_key(self) -> str:
         # One authoritative "stop taking new work" marker per Helm installation

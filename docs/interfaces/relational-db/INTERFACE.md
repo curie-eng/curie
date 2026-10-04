@@ -49,6 +49,36 @@ The application schema window keeps minimum `0070` and advances its head to
 cursor migration `0073` follows `0072`; both existing next migrations, `0071`
 and `0072`, remain in the chain.
 
+## Worker reads and writes
+
+The worker's SQLAlchemy `text(...)` statements are a schema contract alongside
+the API models. The current modules and table ownership are:
+
+| Worker module | Reads | Writes |
+|---|---|---|
+| `apps/worker/src/curie_worker/binding.py` | `agents`, `agent_channels`, `deployments`, `agent_versions`, `approvals` | None |
+| `apps/worker/src/curie_worker/connector_loop.py` | `agents`, `deployments`, `agent_versions` | None |
+| `apps/worker/src/curie_worker/cron_loop.py` | `agents`, `deployments`, `agent_versions`, `agent_channels`, `hook_runs`, `schedule_controls` | `hook_runs`, `schedule_controls` |
+| `apps/worker/src/curie_worker/hook_runs.py` | `hook_runs`, `schedule_controls` | `hook_runs` |
+| `apps/worker/src/curie_worker/publication_store.py` | `publications`, `approvals`, `thread_publication_lineages`, `execution_requests`, `work_items` | `publications`, `approvals`, `thread_publication_lineages` |
+
+`tests/test_worker_sql_contract.py` creates an isolated database, applies the
+actual API Alembic chain to head, and checks every discovered worker text
+statement against it through
+`packages/curie-internal/src/curie_internal/worker_sql.py::discover_statements` and
+`packages/curie-internal/src/curie_internal/worker_sql.py::explain_statements`.
+Discovery resolves schema formatting, table attributes assigned by class
+initializers, and each constant branch of local SQL fragments, including filtered
+and unfiltered publication result queries. An unresolved expression is a failure
+with its source location, never a skipped statement. `EXPLAIN` validates table and
+column references without executing writes; the gate also proves that a missing
+column is rejected and a valid parameterized statement is accepted.
+
+The worker continues to own a separate engine and does not import API models at
+runtime. Alembic migrations remain the source of table and column authority; a
+test fixture that fabricates those tables cannot substitute for this contract
+check.
+
 ## Implementations today
 
 One: the compose/dev Postgres. Two SQLAlchemy async engines reach it, the API's

@@ -12,6 +12,7 @@ from __future__ import annotations
 import time
 
 import redis
+from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT
 from redis.asyncio import Redis as AsyncRedis
 
 from .types import PressureCandidate, PressureScanResult, RouteRecord, RouteState
@@ -84,7 +85,7 @@ class AffinityStore:
         client: redis.Redis,
         *,
         pressure_client: AsyncRedis,
-        key_prefix: str = "curie:sandbox",
+        key_prefix: str = SANDBOX_KEY_PREFIX_DEFAULT,
     ) -> None:
         self._redis = client
         self._pressure_redis = pressure_client

@@ -24,6 +24,7 @@ from aci_protocol import HookRunRef, QueuedTurn, ReplyHandle
 from aci_protocol.turn import TurnSource
 from channel_protocol import hook_conversation_id, scoped_conversation_id
 from curie_api import threadkeys
+from curie_internal.sandbox_token import decode
 from curie_worker.binding import (
     HISTORY_REF_ENV,
     HISTORY_TOKEN_ENV,
@@ -32,7 +33,6 @@ from curie_worker.binding import (
 )
 from curie_worker.config import WorkerConfig
 from curie_worker.kernel.routing import _thread_key_for
-from curie_worker.sandbox_token import decode
 
 _AGENT = uuid.UUID("33333333-3333-4333-8333-333333333333")
 _OTHER_AGENT = uuid.UUID("44444444-4444-4444-8444-444444444444")

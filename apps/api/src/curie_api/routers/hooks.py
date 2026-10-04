@@ -61,6 +61,7 @@ from aci_protocol import (
 )
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from channel_protocol import hook_conversation_id
+from curie_internal.keyspace import HOOK_KEY_PREFIX
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     inject_trace_context,
@@ -107,7 +108,6 @@ router = APIRouter(prefix="/hooks", tags=["hooks"])
 # prefix: that one is keyed by binding row id and this one by agent id, and two
 # different id spaces under one prefix could collide and swallow each other's
 # turns.
-_CLAIM_PREFIX = "curie:hook"
 
 # The one detail string every hook auth failure returns. Identical for "no
 # signature", "bad signature" and "no such agent", so a caller cannot use the
@@ -542,12 +542,12 @@ async def ingest_hook(
     # partition it names. Folding the partition in would let a retry that derived
     # a different value run the agent a second time for the same delivery.
     event_id = f"hook-{agent.id}-{hook}-{digest}"
-    key = f"{_CLAIM_PREFIX}:delivery:{agent.id}:{hook}:{digest}"
+    key = f"{HOOK_KEY_PREFIX}:delivery:{agent.id}:{hook}:{digest}"
     owner = f"pending:{pysecrets.token_hex(16)}"
     client: redis.Redis = request.app.state.valkey
 
     reservation = backlog_reservation(
-        key_prefix=f"{_CLAIM_PREFIX}:backlog:{agent.id}",
+        key_prefix=f"{HOOK_KEY_PREFIX}:backlog:{agent.id}",
         window_s=settings.hook_backlog_window_s,
     )
     preserve_quota = False

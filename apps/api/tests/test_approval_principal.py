@@ -8,8 +8,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from curie_api import approval_principal, sandbox_token
+from curie_api import approval_principal
 from curie_api.config import get_settings
+from curie_internal import sandbox_token
 
 SUBJECT = "U0EXAMPLE1"
 CHANNEL = "C0EXAMPLE1"

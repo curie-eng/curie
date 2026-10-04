@@ -3,8 +3,7 @@
 The API, not the sandbox, decides what a ``state`` credential may do on the
 ``memory`` namespace. Each check below runs against the real state router and
 the disposable Postgres the conftest provisions; nothing is mocked. Tokens are
-minted with the api copy of ``sandbox_token``, which is byte-identical to the
-worker's minting copy.
+minted with the shared ``sandbox_token`` module used by the worker and API.
 
 The two credential shapes (plan section 2):
 
@@ -21,7 +20,7 @@ from typing import Any
 
 import pytest
 from curie_api.config import get_settings
-from curie_api.sandbox_token import mint
+from curie_internal.sandbox_token import mint
 
 _FAR_FUTURE = 4102444800  # 2100-01-01, valid at test time
 

@@ -6,10 +6,14 @@ import asyncio
 import importlib
 import logging
 import os
+import subprocess
+import sys
 import threading
 import uuid
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,7 +22,6 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol import scoped_conversation_id
 from channel_protocol.reply import ReplyAck, ReplyTarget
-from curie_test_support.postgres import pg_connect_or_skip
 from curie_worker.approval_cards import ApprovalCardRef
 from curie_worker.config import WorkerConfig
 from curie_worker.publication_loop import (
@@ -33,8 +36,9 @@ from curie_worker.publication_store import (
 )
 from curie_worker.reply_sink import CLUSTER_MESSAGE_ADAPTER, TargetRoute, build_reply_sink
 from curie_worker.slack_sink import UnconfiguredSlackIdentityError
-from sqlalchemy import text
+from sqlalchemy import make_url, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import NullPool
 
 PUBLICATION_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
 APPROVAL_ID = uuid.UUID("33333333-3333-4333-8333-333333333333")
@@ -71,6 +75,38 @@ def anyio_backend() -> str:
 @pytest.fixture
 def publication() -> Any:
     return importlib.import_module("curie_worker.publication_loop")
+
+
+@pytest.fixture
+def migrated_publication_database_url() -> Iterator[str]:
+    """Replay the real API migrations in this test's disposable database."""
+    base = make_url(_DB_URL)
+    name = f"curie_publication_{uuid.uuid4().hex}"
+    url = base.set(database=name).render_as_string(hide_password=False)
+
+    async def admin(statement: str) -> None:
+        engine = create_async_engine(
+            base.set(database="postgres"), isolation_level="AUTOCOMMIT", poolclass=NullPool
+        )
+        try:
+            async with engine.connect() as connection:
+                await connection.exec_driver_sql(statement)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(admin(f'CREATE DATABASE "{name}"'))
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=Path(__file__).resolve().parents[3] / "apps/api",
+            env={**os.environ, "DATABASE_URL": url},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        yield url
+    finally:
+        asyncio.run(admin(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
 
 
 class _Store:
@@ -1682,35 +1718,56 @@ async def test_terminal_job_state_without_exact_facts_cannot_close_lineage(
 
 async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
     publication: Any,
+    migrated_publication_database_url: str,
 ) -> None:
-    engine: AsyncEngine = create_async_engine(_DB_URL)
-    schema: str | None = None
+    engine: AsyncEngine = create_async_engine(migrated_publication_database_url)
+    schema = "curie"
+    version_id = uuid.uuid4()
+    deployment_id = uuid.uuid4()
     try:
-        await pg_connect_or_skip(engine)
-
-        schema = f"test_publication_{uuid.uuid4().hex}"
         durable = PostgresPublicationStore(
             engine,
             schema=schema,
             lease_owner="terminal-replay-test",
         )
         async with engine.begin() as connection:
-            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            await connection.execute(
+                text("INSERT INTO curie.agents (id, name) VALUES (:id, :name)"),
+                {"id": AGENT_ID, "name": "acme-publication-test"},
+            )
             await connection.execute(
                 text(
-                    f'CREATE TABLE "{schema}".thread_publication_lineages ('
-                    "id uuid PRIMARY KEY, pr_number integer, pr_url text, "
-                    "head_sha text, status text NOT NULL, version integer NOT NULL, "
-                    "updated_at timestamp NOT NULL DEFAULT now())"
-                )
+                    "INSERT INTO curie.agent_versions "
+                    "(id, agent_id, version_label, created_by) "
+                    "VALUES (:id, :agent_id, 'v1', 'publication-test')"
+                ),
+                {"id": version_id, "agent_id": AGENT_ID},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO curie.deployments (id, agent_id, version_id, environment) "
+                    "VALUES (:id, :agent_id, :version_id, 'dev')"
+                ),
+                {"id": deployment_id, "agent_id": AGENT_ID, "version_id": version_id},
             )
             await connection.execute(
                 text(
                     f'INSERT INTO "{schema}".thread_publication_lineages '
-                    "(id, pr_number, pr_url, head_sha, status, version) "
-                    "VALUES (:id, 123, :pr_url, :head_sha, 'open', 2)"
+                    "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
+                    "base_sha, branch, pr_number, pr_url, head_sha, status, version) "
+                    "VALUES (:id, :agent_id, :deployment_id, :conversation_id, "
+                    "'acme-corp/acme-bot', :base_sha, :branch, 123, :pr_url, :head_sha, 'open', 2)"
                 ),
-                {"id": LINEAGE_ID, "pr_url": PR_URL, "head_sha": PRIOR_HEAD},
+                {
+                    "id": LINEAGE_ID,
+                    "agent_id": AGENT_ID,
+                    "deployment_id": deployment_id,
+                    "conversation_id": CONVERSATION_ID,
+                    "base_sha": PRIOR_HEAD,
+                    "branch": LINEAGE_BRANCH,
+                    "pr_url": PR_URL,
+                    "head_sha": PRIOR_HEAD,
+                },
             )
 
         class RealTerminalStore(_Store):
@@ -1802,10 +1859,21 @@ async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
             await connection.execute(
                 text(
                     f'INSERT INTO "{schema}".thread_publication_lineages '
-                    "(id, pr_number, pr_url, head_sha, status, version) "
-                    "VALUES (:id, 123, :pr_url, :head_sha, 'open', 2)"
+                    "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
+                    "base_sha, branch, pr_number, pr_url, head_sha, status, version) "
+                    "VALUES (:id, :agent_id, :deployment_id, :conversation_id, "
+                    "'acme-corp/acme-bot', :base_sha, :branch, 123, :pr_url, :head_sha, 'open', 2)"
                 ),
-                {"id": concurrent_id, "pr_url": PR_URL, "head_sha": foreign_head},
+                {
+                    "id": concurrent_id,
+                    "agent_id": AGENT_ID,
+                    "deployment_id": deployment_id,
+                    "conversation_id": f"{CONVERSATION_ID}-concurrent",
+                    "base_sha": PRIOR_HEAD,
+                    "branch": f"{LINEAGE_BRANCH}-concurrent",
+                    "pr_url": PR_URL,
+                    "head_sha": foreign_head,
+                },
             )
         with pytest.raises(PublicationStoreError, match="terminal CAS was lost"):
             await durable.mark_lineage_terminal(
@@ -1833,9 +1901,6 @@ async def test_terminal_job_reconcile_replay_is_idempotent_in_real_store(
             "version": 2,
         }
     finally:
-        if schema is not None:
-            async with engine.begin() as connection:
-                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         await engine.dispose()
 
 

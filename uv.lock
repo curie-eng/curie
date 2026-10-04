@@ -16,6 +16,7 @@ members = [
     "curie-dispatcher",
     "curie-doclint",
     "curie-e2e-connector",
+    "curie-internal",
     "curie-mail-adapter",
     "curie-runner",
     "curie-telemetry",
@@ -708,6 +709,7 @@ dependencies = [
     { name = "boto3" },
     { name = "boto3-stubs", extra = ["s3"] },
     { name = "curie-channel-protocol" },
+    { name = "curie-internal" },
     { name = "curie-telemetry" },
     { name = "curie-telemetry-schema" },
     { name = "fastapi" },
@@ -731,6 +733,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.43.55" },
     { name = "boto3-stubs", extras = ["s3"], specifier = ">=1.43.57" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
+    { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-telemetry-schema", editable = "packages/telemetry-schema" },
     { name = "fastapi", specifier = ">=0.139.2" },
@@ -788,6 +791,7 @@ version = "0.0.0"
 source = { editable = "apps/dispatcher" }
 dependencies = [
     { name = "aci-protocol" },
+    { name = "curie-internal" },
     { name = "curie-telemetry" },
     { name = "httpx" },
     { name = "pydantic" },
@@ -799,6 +803,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
+    { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "pydantic", specifier = ">=2.10" },
@@ -837,6 +842,21 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "mcp", specifier = ">=1.28.1" },
     { name = "pyyaml", specifier = ">=6" },
+]
+
+[[package]]
+name = "curie-internal"
+version = "0.0.0"
+source = { editable = "packages/curie-internal" }
+dependencies = [
+    { name = "redis" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "redis", specifier = ">=5.2" },
+    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
 ]
 
 [[package]]
@@ -950,6 +970,7 @@ dependencies = [
     { name = "curie-channel-protocol" },
     { name = "curie-dispatcher" },
     { name = "curie-e2e-connector" },
+    { name = "curie-internal" },
     { name = "curie-telemetry" },
     { name = "httpx" },
     { name = "kubernetes" },
@@ -971,6 +992,7 @@ requires-dist = [
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-dispatcher", editable = "apps/dispatcher" },
     { name = "curie-e2e-connector", editable = "apps/e2e-connector" },
+    { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "kubernetes", specifier = ">=36.0.3" },
@@ -993,6 +1015,7 @@ dependencies = [
     { name = "curie-discord-adapter" },
     { name = "curie-dispatcher" },
     { name = "curie-e2e-connector" },
+    { name = "curie-internal" },
     { name = "curie-mail-adapter" },
     { name = "curie-runner" },
     { name = "curie-telemetry" },
@@ -1026,6 +1049,7 @@ requires-dist = [
     { name = "curie-discord-adapter", editable = "adapters/discord" },
     { name = "curie-dispatcher", editable = "apps/dispatcher" },
     { name = "curie-e2e-connector", editable = "apps/e2e-connector" },
+    { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-mail-adapter", editable = "apps/mail-adapter" },
     { name = "curie-runner", editable = "runner" },
     { name = "curie-telemetry", editable = "packages/telemetry" },

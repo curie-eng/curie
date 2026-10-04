@@ -80,7 +80,7 @@ FAKE_COLON_FIELD_SECRET = "0000FAKECOLONFIELDSECRET"
 FAKE_HOME_PATH = "/home/theconnman/.config/curie/settings.json"
 FAKE_CHANNEL_TOKEN = "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
 # The local token minters use base64url payload and signature segments.
-# See curie_api.sandbox_token.mint and curie_worker.caller_token.mint.
+# See curie_internal.sandbox_token.mint and curie_worker.caller_token.mint.
 FAKE_SANDBOX_TOKEN = "sbx." + "ZXhhbXBsZXNhbmRib3hwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
 FAKE_CONNECTOR_CALLER_TOKEN = "cct." + "ZXhhbXBsZWNhbGxlcnBheWxvYWQ." + "FAKEFAKEFAKESIG0000"
 FAKE_X_API_KEY_HEADER = "X-API-Key: " + "FAKEFAKEFAKEHEADERVALUE0000"

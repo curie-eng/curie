@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 from aci_protocol import Final, SessionStatus, TextDelta, TurnSource
-from curie_worker import sandbox_token
+from curie_internal import sandbox_token
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
 from curie_worker.config import WorkerConfig
 from curie_worker.kernel.claim import _boots_differently

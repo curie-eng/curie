@@ -43,6 +43,7 @@ from channel_protocol.work_item_events import (
     ci_event_id,
     ci_round_key,
 )
+from curie_internal.keyspace import WORK_ITEM_CI_RERUN_PREFIX
 from curie_telemetry.redact import redact_text
 from sqlalchemy import TIMESTAMP, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -107,7 +108,7 @@ def rerun_refused_note(reason: str) -> str:
 def ci_rerun_key(request_id: uuid.UUID, head_sha: str) -> str:
     """One flake rerun per request head. A later head gets its own key."""
 
-    return f"curie:work-item:ci-rerun:{request_id}:{head_sha}"
+    return f"{WORK_ITEM_CI_RERUN_PREFIX}:{request_id}:{head_sha}"
 
 
 def failing_actions_jobs(detail: CiDetail) -> list[dict[str, Any]]:

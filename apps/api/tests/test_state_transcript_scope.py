@@ -34,7 +34,7 @@ from urllib.parse import quote
 import pytest
 from channel_protocol import hook_conversation_id, scoped_conversation_id
 from curie_api.config import get_settings
-from curie_api.sandbox_token import mint
+from curie_internal.sandbox_token import mint
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 

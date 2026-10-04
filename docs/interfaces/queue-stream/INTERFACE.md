@@ -142,9 +142,57 @@ onto the runs stream with a raw client: the worker's cron scheduler
 (`apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop._enqueue`), and the
 API's WorkItem reconciler
 (`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._xadd`), which
-creates the consumer group with `XGROUP CREATE ... MKSTREAM`, retries once after a
-`NOGROUP`, and for a marked round sets a `SET NX EX` marker and appends in one EVAL
-Lua script (`_MARK_AND_XADD`).
+uses the shared group creation implementation before publishing, retries once after
+a `NOGROUP`, and for a marked round sets a `SET NX EX` marker and appends in one
+EVAL Lua script (`_MARK_AND_XADD`).
+
+## Declared producers and keyspace
+
+Every production append site is declared in the inventory read by
+`packages/curie-internal/src/curie_internal/wire_inventory.py::validate_inventory`.
+The collected `tests/test_wire_state.py` gate scans Python calls, embedded Lua
+commands, and Rust commands. Site identity includes source path, enclosing scope,
+and ordinal, so a second identical append in an already declared scope still
+requires a declaration.
+
+The complete runs capable producer set is:
+
+| Producer | Append sites | Purpose |
+|---|---|---|
+| `apps/dispatcher/src/curie_dispatcher/queue.py::enqueue` | Python `xadd` | Dispatcher intake after the event claim and placeholder |
+| `apps/api/src/curie_api/delivery.py` | Both `XADD` branches in `_ENQUEUE_SCRIPT` | Owner checked channel, hook, and review intake, with optional metadata |
+| `apps/api/src/curie_api/resumequeue.py::ResumeQueue.enqueue` | Python `xadd` | Approval resume |
+| `apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._xadd` | Direct Python append, retry append, and Lua `_MARK_AND_XADD` | WorkItem execute, terminate, and reconciliation wakes |
+| `apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop._enqueue` | Python `xadd` | Scheduled turns |
+| `apps/worker/src/curie_worker/capacity_wait.py` | Lua `_WAKE_LUA` and `_RECONCILE_LUA` | Capacity wake and terminal reconciliation |
+| `cli/src/queue.rs` | Rust `queue::xadd` | Generic stream append used by runs and eval callers; the runtime stream argument makes this site runs capable |
+
+Sibling append sites are declared separately: API `EvalQueue.enqueue` in
+`apps/api/src/curie_api/evalqueue.py`, deploy notice `_PUBLISH_ONCE` in
+`apps/api/src/curie_api/deploy_notice.py`, and progress `_APPEND_LUA` in
+`apps/api/src/curie_api/turn_progress.py`; worker `StreamConsumer._dead_letter` in
+`apps/worker/src/curie_worker/stream_consumer.py`, completion
+`_DEAD_LETTER_COMPLETION_LUA` in `apps/worker/src/curie_worker/markers.py`, and progress
+`_DEAD_LETTER_LUA` in `apps/worker/src/curie_worker/progress.py`. Their eval, notice,
+progress, and graveyard destinations retain their own payload and retention rules.
+
+Consumer group creation has one implementation,
+`packages/curie-internal/src/curie_internal/streams.py::ensure_group`.
+`StreamConsumer._ensure_group` passes its lane's explicit start position, while
+`WorkItemReconciler._ensure_group` passes `$` before either direct or marked
+publishing. The helper uses `MKSTREAM`, leaves an existing group unchanged by
+accepting only `BUSYGROUP`, and propagates other faults. Creating the group before
+API publishing preserves wakes when the worker starts afterward; consolidating
+the implementation does not change caller start positions.
+
+Cross service key names and builders live in
+`packages/curie-internal/src/curie_internal/keyspace.py`. The same wire gate scans
+Python and Rust key literal occurrences and rejects undeclared `curie:` strings,
+including duplicates of an existing value. Protected worker literals and producer
+sites remain individually declared where present rather than being migrated or
+exempted from scanning. The internal package also owns the single scoped token
+implementation in `packages/curie-internal/src/curie_internal/sandbox_token.py`;
+API and worker import it directly without application copies.
 
 ## The port (as of #284 / ADR-0027)
 
@@ -255,8 +303,9 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   raw `xadd` and, when it fails, marks the scheduled run failed in Postgres. The
   WorkItem reconciler
   (`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._xadd`) issues
-  its own `xgroup_create` with `mkstream`, a raw `xadd` with one `NOGROUP` retry, and
-  the `_MARK_AND_XADD` EVAL script. Neither uses `StreamPublisher`. A second broker
+  group creation through the shared `ensure_group` implementation, a raw `xadd`
+  with one `NOGROUP` retry, and the `_MARK_AND_XADD` EVAL script. Neither uses
+  `StreamPublisher`. A second broker
   would have to supply, for these two alone: append of a one-field `payload` entry to
   an ordered stream; idempotent creation of the stream and its consumer group, with an
   error it can recognize as a missing group; and an atomic "set a TTL marker only if

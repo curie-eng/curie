@@ -15,7 +15,7 @@ from curie_telemetry.redact import RedactingLogFilter, redact_text
 # (``apps/api/src/curie_api/channel_token.py``, prefix ``chn``). The issue's
 # ``chn-{channel_id}-{digest}`` shape is ``_event_id``, not a credential.
 FAKE_CHANNEL_TOKEN = "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
-# Shapes from curie_api.sandbox_token.mint and curie_worker.caller_token.mint.
+# Shapes from curie_internal.sandbox_token.mint and curie_worker.caller_token.mint.
 FAKE_SANDBOX_TOKEN = "sbx." + "ZXhhbXBsZXNhbmRib3hwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
 FAKE_CONNECTOR_CALLER_TOKEN = "cct." + "ZXhhbXBsZWNhbGxlcnBheWxvYWQ." + "FAKEFAKEFAKESIG0000"
 # Provider docs: "API keys start with `am_`"

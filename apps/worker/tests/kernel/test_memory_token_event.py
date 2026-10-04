@@ -25,11 +25,11 @@ from typing import Any
 
 import pytest
 from aci_protocol import Final, OutboundEvent, QueuedTurn, SessionStatus, TextDelta, ToolNote
+from curie_internal.sandbox_token import verify
 from curie_worker import binding as binding_module
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import BindingResolver, ResolvedDeployment
 from curie_worker.config import WorkerConfig
-from curie_worker.sandbox_token import verify
 
 # importlib import mode does not add the test root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))

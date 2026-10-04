@@ -46,10 +46,10 @@ from curie_runner.usage_report import UsageReporter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from curie_api import sandbox_token
 from curie_api.config import get_settings
 from curie_api.factory_notices import FINAL_MARKER
 from curie_api.factory_usage import Price, get_price_book
+from curie_internal import sandbox_token
 from test_factory_status_comment import _admit, _execute, _finish_failed, _marked
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     _reconcile,

@@ -40,6 +40,7 @@ from typing import Any
 
 import curie_worker.binding as binding_module
 import pytest
+from curie_internal.sandbox_token import verify
 from curie_test_support.postgres import pg_connect_or_skip
 from curie_worker.binding import (
     APPROVAL_REQUIRED_ENV,
@@ -54,7 +55,6 @@ from curie_worker.binding import (
     warn_if_multiple_agents_bound,
 )
 from curie_worker.config import WorkerConfig
-from curie_worker.sandbox_token import verify
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine

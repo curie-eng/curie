@@ -4,6 +4,7 @@ version = "0.0.0"
 description = "Curie dispatcher (Slack Bolt for Python, Socket Mode): ack + enqueue to Valkey Streams"
 requires-python = ">=3.13"
 dependencies = [
+    "curie-internal",
     "aci-protocol",
     "curie-telemetry",
     "slack-bolt>=1.30.0",

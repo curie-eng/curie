@@ -79,12 +79,13 @@ from aci_protocol.turn import (
     ReplyHandle,
     matching_routes,
 )
+from curie_internal import sandbox_token
 from plugin_format import is_reserved_boot_env_name
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from . import caller_token, sandbox_token
+from . import caller_token
 from .behaviorpacks import BehaviorPacks
 from .config import WorkerConfig
 

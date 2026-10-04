@@ -21,10 +21,11 @@ from typing import Any
 
 import pytest
 import redis
-from curie_api import adapter_principal, approval_principal, channel_token, sandbox_token
+from curie_api import adapter_principal, approval_principal, channel_token
 from curie_api.config import get_settings
 from curie_api.main import create_app
-from curie_api.sandbox_token import b64url, signature
+from curie_internal import sandbox_token
+from curie_internal.sandbox_token import b64url, signature
 from fastapi.testclient import TestClient
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import create_async_engine

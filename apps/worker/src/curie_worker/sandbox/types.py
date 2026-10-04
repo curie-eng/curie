@@ -20,6 +20,7 @@ from typing import Literal, Protocol
 from aci_protocol import BootEnv
 from aci_protocol.service_config import API_KEY_ENV
 from aci_protocol.slack_identities import SLACK_CREDENTIAL_ENV_PREFIXES
+from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT
 from plugin_format import is_reserved_boot_env_name
 
 # Substrate-neutral labels: every backend tags its managed objects with these
@@ -296,7 +297,7 @@ class SubstrateConfig:
     # Growth factor once the fast window is spent. Doubling reaches the cap in
     # four steps, so the tail costs tens of calls instead of hundreds.
     poll_backoff_factor: float = 2.0
-    key_prefix: str = "curie:sandbox"
+    key_prefix: str = SANDBOX_KEY_PREFIX_DEFAULT
     claim_prefix: str = "curie-thread"
     # How long ``release(..., wait_gone=True)`` waits for the deleted claim AND
     # its sandbox/pod to disappear. Kubernetes delete of a SandboxClaim returns

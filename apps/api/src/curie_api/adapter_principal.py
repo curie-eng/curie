@@ -24,7 +24,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from curie_api.sandbox_token import b64url, b64url_decode, signature
+from curie_internal.sandbox_token import b64url, b64url_decode, signature
 
 _PREFIX = "adp"
 _KIND = "adapter"

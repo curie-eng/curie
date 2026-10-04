@@ -1,0 +1,254 @@
+{
+  "producers": {
+    "apps/api/src/curie_api/delivery.py:module:1": {
+      "language": "lua",
+      "purpose": "Runs enqueue with transport identity under an ownership checked Lua claim"
+    },
+    "apps/api/src/curie_api/delivery.py:module:2": {
+      "language": "lua",
+      "purpose": "Runs enqueue without transport identity under an ownership checked Lua claim"
+    },
+    "apps/api/src/curie_api/deploy_notice.py:module:1": {
+      "language": "lua",
+      "purpose": "Deployment notice stream publication"
+    },
+    "apps/api/src/curie_api/evalqueue.py:EvalQueue.enqueue:1": {
+      "language": "python",
+      "purpose": "Eval job stream publication"
+    },
+    "apps/api/src/curie_api/resumequeue.py:ResumeQueue.enqueue:1": {
+      "language": "python",
+      "purpose": "Runs enqueue resuming an approved turn"
+    },
+    "apps/api/src/curie_api/turn_progress.py:module:1": {
+      "language": "lua",
+      "purpose": "Turn progress stream publication"
+    },
+    "apps/api/src/curie_api/workitem_reconciler.py:WorkItemReconciler._xadd:1": {
+      "language": "python",
+      "purpose": "Runs enqueue with transport identity"
+    },
+    "apps/api/src/curie_api/workitem_reconciler.py:WorkItemReconciler._xadd:2": {
+      "language": "python",
+      "purpose": "Runs enqueue without transport identity"
+    },
+    "apps/api/src/curie_api/workitem_reconciler.py:module:1": {
+      "language": "lua",
+      "purpose": "Runs enqueue with a durable wake marker"
+    },
+    "apps/dispatcher/src/curie_dispatcher/queue.py:enqueue:1": {
+      "language": "python",
+      "purpose": "Runs enqueue after dispatcher placeholder publication"
+    },
+    "apps/worker/src/curie_worker/capacity_wait.py:module:1": {
+      "language": "lua",
+      "purpose": "Runs enqueue waking a capacity waiting turn"
+    },
+    "apps/worker/src/curie_worker/capacity_wait.py:module:2": {
+      "language": "lua",
+      "purpose": "Runs enqueue completing an exhausted capacity waiting turn"
+    },
+    "apps/worker/src/curie_worker/cron_loop.py:CronSchedulerLoop._enqueue:1": {
+      "language": "python",
+      "purpose": "Runs enqueue firing an admitted scheduled hook"
+    },
+    "apps/worker/src/curie_worker/markers.py:module:1": {
+      "language": "lua",
+      "purpose": "Ownership protected worker completion outbox stream publication"
+    },
+    "apps/worker/src/curie_worker/progress.py:module:1": {
+      "language": "lua",
+      "purpose": "Worker progress stream publication"
+    },
+    "apps/worker/src/curie_worker/stream_consumer.py:StreamConsumer._dead_letter:1": {
+      "language": "python",
+      "purpose": "Bounded stream graveyard publication before acknowledgement"
+    },
+    "cli/src/queue.rs:xadd:1": {
+      "language": "rust",
+      "purpose": "Runs capable generic CLI publisher also used for eval streams"
+    }
+  },
+  "key_literals": {
+    "apps/api/src/curie_api/deploy_notice.py:DeployNoticeQueue.publish:1": {
+      "value": "curie:deploy-notice",
+      "reason": "Deployment notice deterministic identity namespace, not a Valkey key"
+    },
+    "apps/api/src/curie_api/factory_notices.py:module:1": {
+      "value": "curie:queued",
+      "reason": "Accepted legacy factory state label, not a Valkey key"
+    },
+    "apps/api/src/curie_api/factory_notices.py:module:2": {
+      "value": "curie:running",
+      "reason": "Accepted legacy factory state label, not a Valkey key"
+    },
+    "apps/api/src/curie_api/factory_notices.py:module:3": {
+      "value": "curie:pr-open",
+      "reason": "Accepted legacy factory state label, not a Valkey key"
+    },
+    "apps/api/src/curie_api/factory_notices.py:module:4": {
+      "value": "curie:needs-human",
+      "reason": "Accepted legacy factory state label, not a Valkey key"
+    },
+    "apps/worker/src/curie_worker/consumer.py:module:1": {
+      "value": "curie:thread-reset-requests",
+      "reason": "Ownership protected reset reader retains its exact existing wire key"
+    },
+    "apps/worker/src/curie_worker/consumer.py:module:2": {
+      "value": "curie:thread-reset-inflight",
+      "reason": "Ownership protected reset reader retains its exact existing wire key"
+    },
+    "apps/worker/src/curie_worker/consumer.py:module:3": {
+      "value": "curie:thread-reset-result:",
+      "reason": "Ownership protected reset reader retains its exact existing wire key"
+    },
+    "apps/worker/src/curie_worker/deploy_notice.py:DeployNoticeConsumer._handle:1": {
+      "value": "f'curie:deploy-notice:{notice.notice_key}'",
+      "reason": "Worker deployment notice synthetic thread identity namespace"
+    },
+    "apps/worker/src/curie_worker/deploy_notice.py:DeployNoticeConsumer._handle:2": {
+      "value": "f'curie:deploy-notice:{self._stream}:{entry_id}'",
+      "reason": "Worker deployment notice synthetic thread identity namespace"
+    },
+    "apps/worker/src/curie_worker/publication_k8s.py:build_publication_resources:1": {
+      "value": "f'curie:{settings.namespace}:{settings.owner_name}'",
+      "reason": "Publication Kubernetes resource UUID namespace, not a Valkey key"
+    },
+    "cli/src/completion_outbox.rs:tests.completion_outbox_health_matches_the_frozen_vector:1": {
+      "value": "curie:worker",
+      "reason": "Existing inline Rust test assertion or fixture for a wire value"
+    },
+    "cli/src/message.rs:tests.a_published_stack_leaves_the_image_to_compose:1": {
+      "value": "curie:runs",
+      "reason": "Existing inline Rust test assertion or fixture for a wire value"
+    },
+    "cli/src/message.rs:tests.message_dry_run_json_carries_the_planned_action:1": {
+      "value": "curie:turns",
+      "reason": "Existing inline Rust test assertion or fixture for a wire value"
+    },
+    "cli/src/message.rs:tests.message_dry_run_json_carries_the_planned_action:2": {
+      "value": "curie:turns",
+      "reason": "Existing inline Rust test assertion or fixture for a wire value"
+    },
+    "cli/src/message.rs:tests.the_one_shot_producer_runs_the_stacks_dispatcher_image:1": {
+      "value": "curie:runs",
+      "reason": "Existing inline Rust test assertion or fixture for a wire value"
+    },
+    "cli/src/queue.rs:module:1": {
+      "value": "curie:thread-reset-requests",
+      "reason": "Rust reset wire value and existing frozen vector assertions"
+    },
+    "cli/src/queue.rs:tests.thread_reset_set_matches_the_frozen_vector:1": {
+      "value": "curie:thread-reset-inflight",
+      "reason": "Rust reset wire value and existing frozen vector assertions"
+    },
+    "cli/src/queue.rs:tests.thread_reset_set_matches_the_frozen_vector:2": {
+      "value": "curie:thread-reset-result:",
+      "reason": "Rust reset wire value and existing frozen vector assertions"
+    },
+    "cli/src/secrets.rs:legacy_entry:1": {
+      "value": "curie:global:{name}",
+      "reason": "Operating system credential vault namespace, not a Valkey key"
+    },
+    "cli/src/secrets.rs:module:1": {
+      "value": "curie:global:vault",
+      "reason": "Operating system credential vault namespace, not a Valkey key"
+    },
+    "cli/src/secrets.rs:tests.vault_round_trips_multiple_credentials_in_one_payload:1": {
+      "value": "curie:global:vault",
+      "reason": "Operating system credential vault namespace, not a Valkey key"
+    },
+    "packages/aci-protocol/generated/rust/src/lib.rs:module:1": {
+      "value": "curie:runs",
+      "reason": "Frozen protocol default stream declaration"
+    },
+    "packages/aci-protocol/generated/rust/src/lib.rs:module:2": {
+      "value": "curie:evals",
+      "reason": "Frozen protocol default stream declaration"
+    },
+    "packages/aci-protocol/src/aci_protocol/service_config.py:module:1": {
+      "value": "curie:runs",
+      "reason": "Frozen protocol default stream declaration"
+    },
+    "packages/aci-protocol/src/aci_protocol/service_config.py:module:2": {
+      "value": "curie:evals",
+      "reason": "Frozen protocol default stream declaration"
+    },
+    "packages/channel-protocol/src/channel_protocol/work_item_events.py:module:1": {
+      "value": "curie:work-item:ci:",
+      "reason": "Shared channel protocol CI round key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:1": {
+      "value": "curie:kill:",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:10": {
+      "value": "curie:thread-reset-result:",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:11": {
+      "value": "curie:channel",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:12": {
+      "value": "curie:hook",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:13": {
+      "value": "curie:github-review",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:14": {
+      "value": "curie:github-review:held",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:15": {
+      "value": "curie:deploy-notice:dedupe:",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:16": {
+      "value": "curie:cluster-message-replies",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:17": {
+      "value": "curie:work-item:ci-rerun",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:2": {
+      "value": "curie:kill-events",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:3": {
+      "value": "curie:worker",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:4": {
+      "value": "curie:sandbox",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:5": {
+      "value": "curie:dedupe:",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:6": {
+      "value": "curie:admission:",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:7": {
+      "value": "curie:slack-root-context:",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:8": {
+      "value": "curie:thread-reset-requests",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/keyspace.py:module:9": {
+      "value": "curie:thread-reset-inflight",
+      "reason": "Canonical shared internal wire key declaration"
+    },
+    "packages/curie-internal/src/curie_internal/wire_inventory.py:module:1": {
+      "value": "curie:",
+      "reason": "Literal matching prefix for the inventory scanner, not a Valkey key"
+    }
+  }
+}
