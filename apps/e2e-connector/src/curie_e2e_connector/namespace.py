@@ -19,6 +19,7 @@ from curie_e2e_connector.contract import (
     OWNER_LABEL,
     POD_SECURITY_LABEL,
     REFUSAL_BUILD_IN_PROGRESS,
+    REFUSAL_ENVIRONMENT_REQUIRED,
     REFUSAL_MISCONFIGURED,
     REFUSAL_NO_RUN,
     REFUSAL_NOT_OWNED,
@@ -132,6 +133,33 @@ def owned_by(install: Install, caller: Caller, metadata: dict[str, Any]) -> bool
         and labels.get(RUN_LABEL) == caller.run
         and labels.get(WORK_ITEM_LABEL) == caller.work_item
     )
+
+
+def require_environment(
+    cluster: ClusterApi, install: Install, caller: Caller, tool: str
+) -> dict[str, Any]:
+    """The live namespace's metadata, refusing one this run does not own.
+
+    Every tool that acts inside the run's namespace calls this first, so a
+    missing, Terminating, or foreign namespace answers the same two refusals.
+    """
+
+    namespace = namespace_name(install, caller)
+    code, payload = checked_request(cluster, "GET", f"/api/v1/namespaces/{namespace}")
+    status = payload.get("status")
+    phase = status.get("phase") if isinstance(status, dict) else None
+    if code == 404 or (code == 200 and phase == "Terminating"):
+        raise ClusterError(
+            f"{REFUSAL_ENVIRONMENT_REQUIRED}: call env_create first; this run has no live namespace"
+        )
+    if code != 200:
+        raise ClusterError(f"the test cluster did not answer a namespace read ({code})")
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict) or not owned_by(install, caller, metadata):
+        raise ClusterError(
+            f"{REFUSAL_NOT_OWNED}: {tool} acts only in the namespace this run created"
+        )
+    return metadata
 
 
 def _refuse_not_owned() -> None:
