@@ -28,6 +28,8 @@ Closes #
 <!-- Required for a patch release PR. Name a run URL that re-verified each
      trigger on a live surface, or an explicit waiver of the form:
      waiver: <reason>
+     The pull request's own CI run URL counts as proof for any ladder rung
+     CI ran on the same tree; do not rerun that rung locally.
      Other pull requests may leave this comment in place. -->
 
 ## Fix pin verification

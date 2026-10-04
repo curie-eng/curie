@@ -32,6 +32,20 @@ pipeline, and it fails closed on either of two questions:
             it is itself an in-progress check-run on the tagged SHA and
             would otherwise wait on itself forever.
 
+            One exception (ADR-0195, issue #3858): a release-preparation
+            commit that changes only version identity may borrow an
+            ancestor's green CI. When the tagged commit's own required checks
+            are absent or still running, and none of them concluded
+            non-passing, the gate walks the commit's first-parent ancestors,
+            nearest first and at most VERSION_ONLY_PROOF_DEPTH deep. Each
+            candidate is considered only if the whole diff from it to the
+            tagged commit stays inside `release/atlas.py`'s
+            `version_only_paths` for this tag; the first path outside that set
+            ends the walk. The first candidate whose own required checks are
+            all green is the proof commit. Any contrary evidence on the tagged
+            commit itself, any other path in the delta, or no green candidate
+            within the depth refuses exactly as before.
+
 Both live as separately-testable functions so the negative case -- an
 unreviewed or check-less commit is refused -- is an ordinary pytest assertion
 against a constructed fixture, not a manual demonstration against the real
@@ -48,23 +62,36 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from types import ModuleType
 
 
-def _load_nightly():
-    path = Path(__file__).resolve().parent / "nightly.py"
-    spec = importlib.util.spec_from_file_location("release_nightly", path)
+def _load_sibling(filename: str, module_name: str) -> ModuleType:
+    """Load a module that sits next to this file, by path.
+
+    The release workflows run this script as `python3 release/authorize.py`
+    with no package on the import path, so siblings are loaded by file.
+    """
+    path = Path(__file__).resolve().parent / filename
+    spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules["release_nightly"] = module
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
 
-_nightly = _load_nightly()
+_nightly = _load_sibling("nightly.py", "release_nightly")
+_atlas = _load_sibling("atlas.py", "release_atlas")
 
 PASSING_CONCLUSIONS = {"success", "neutral"}
+
+# How many first-parent ancestors the version-only proof walk may consult
+# (ADR-0195, issue #3858). A release preparation is normally one commit, or a
+# merge of one, on top of green CI; ten leaves room for a few stacked bumps
+# without letting the walk wander arbitrarily far back.
+VERSION_ONLY_PROOF_DEPTH = 10
 
 # The check-run names that must be present and green before a tag may
 # publish (issue #733). These are the job `name:` fields from
@@ -269,6 +296,86 @@ def exclude_current_workflow_run(
     ]
 
 
+def _git_output(args: Sequence[str], *, cwd: Path | None, purpose: str) -> str:
+    """Run a read-only git command for the proof walk; any failure refuses."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise AuthorizationError(f"could not {purpose}: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip()
+        suffix = f": {detail}" if detail else ""
+        raise AuthorizationError(
+            f"could not {purpose}; git returned {result.returncode}{suffix}"
+        )
+    return result.stdout
+
+
+def _has_contrary_required_evidence(
+    check_runs: list[dict[str, object]], required_names: frozenset[str]
+) -> bool:
+    """Did any required check-run on the commit itself conclude non-passing?
+
+    A null conclusion (still running) is not evidence either way. `skipped`
+    counts as contrary, matching `missing_required_checks` (issue #1470).
+    """
+    return any(
+        run.get("name") in required_names
+        and run.get("conclusion") is not None
+        and run.get("conclusion") not in PASSING_CONCLUSIONS
+        for run in check_runs
+    )
+
+
+def find_version_only_proof(
+    sha: str,
+    tag: str,
+    fetch_check_runs: Callable[[str], list[dict[str, object]]],
+    *,
+    cwd: Path | None = None,
+    exclude_run_id: str | None = None,
+    required_names: frozenset[str] | None = None,
+) -> str | None:
+    """The nearest first-parent ancestor whose green CI also proves `sha`.
+
+    Walks at most VERSION_ONLY_PROOF_DEPTH first-parent ancestors, nearest
+    first. The diff from each candidate to `sha` is checked against
+    `version_only_paths` for `tag` before that candidate's check-runs are
+    fetched; the first candidate outside the set ends the walk. Returns None
+    when no candidate qualifies. Git failures raise AuthorizationError.
+    """
+    version = tag.strip().removeprefix("refs/tags/")
+    allowed = _atlas.version_only_paths(version)
+    ancestors = _git_output(
+        [
+            "rev-list",
+            "--first-parent",
+            f"--max-count={VERSION_ONLY_PROOF_DEPTH + 1}",
+            sha,
+        ],
+        cwd=cwd,
+        purpose=f"list the first-parent ancestors of {sha}",
+    ).split()
+    for candidate in ancestors[1:]:
+        changed = _git_output(
+            ["diff", "--no-renames", "--name-only", candidate, sha],
+            cwd=cwd,
+            purpose=f"diff {candidate} against {sha}",
+        ).splitlines()
+        if not {path for path in changed if path} <= allowed:
+            return None
+        runs = exclude_current_workflow_run(fetch_check_runs(candidate), exclude_run_id)
+        if not missing_required_checks(runs, required_names):
+            return candidate
+    return None
+
+
 def authorize(
     sha: str,
     check_runs: list[dict[str, object]],
@@ -281,8 +388,14 @@ def authorize(
     allow_red_nightly: bool = False,
     require_nightly: bool = False,
     tag: str | None = None,
-) -> None:
+    fetch_proof_check_runs: Callable[[str], list[dict[str, object]]] | None = None,
+) -> str | None:
     """Raise AuthorizationError unless `sha` may publish a release.
+
+    Returns the proof commit whose checks stood in for `sha`'s own (see the
+    version-only exception in the module docstring, ADR-0195), or None when
+    `sha`'s own required checks were green. The exception needs both `tag`
+    and `fetch_proof_check_runs`; without either the gate is unchanged.
 
     `tag` is the pushed tag name (`v0.7.0`, `v0.7.0-rc.1`). A missing tag
     is treated as final (fail closed) so omitting the class cannot widen
@@ -316,9 +429,26 @@ def authorize(
                 f"merge the reviewed branch into {primary_ref}, then tag. "
                 "Refusing to authorize this tag"
             )
+    if required_names is None:
+        required_names = REQUIRED_CHECK_NAMES
     other_runs = exclude_current_workflow_run(check_runs, exclude_run_id)
     missing = missing_required_checks(other_runs, required_names)
-    if missing:
+    proof: str | None = None
+    if (
+        missing
+        and tag is not None
+        and fetch_proof_check_runs is not None
+        and not _has_contrary_required_evidence(other_runs, required_names)
+    ):
+        proof = find_version_only_proof(
+            sha,
+            tag,
+            fetch_proof_check_runs,
+            cwd=cwd,
+            exclude_run_id=exclude_run_id,
+            required_names=required_names,
+        )
+    if missing and proof is None:
         raise AuthorizationError(
             f"commit {sha} is missing {len(missing)} required check-run(s) "
             f"({len(other_runs)} check-runs found for the commit, excluding "
@@ -332,6 +462,7 @@ def authorize(
         )
         if reason:
             raise AuthorizationError(reason)
+    return proof
 
 
 def fetch_check_runs(
@@ -416,6 +547,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     branch = "main"
     nightly_conclusion: str | None = None
+    proof: str | None = None
+    proof_runs: dict[str, list[dict[str, object]]] = {}
+
+    def fetch_proof_check_runs(candidate: str) -> list[dict[str, object]]:
+        # Both authorize() calls below walk the same ancestors; fetch each once.
+        if candidate not in proof_runs:
+            proof_runs[candidate] = fetch_check_runs(candidate, args.repo)
+        return proof_runs[candidate]
 
     try:
         check_runs = fetch_check_runs(args.sha, args.repo)
@@ -428,6 +567,7 @@ def main(argv: list[str] | None = None) -> int:
             args.reviewed_ref,
             exclude_run_id=args.run_id,
             tag=args.tag,
+            fetch_proof_check_runs=fetch_proof_check_runs,
         )
         matching = [
             ref
@@ -452,12 +592,13 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        authorize(
+        proof = authorize(
             args.sha,
             check_runs,
             args.reviewed_ref,
             exclude_run_id=args.run_id,
             tag=args.tag,
+            fetch_proof_check_runs=fetch_proof_check_runs,
             nightly_conclusion=nightly_conclusion,
             allow_red_nightly=_nightly.allow_red_nightly_from_bodies(bodies),
             require_nightly=True,
@@ -487,9 +628,16 @@ def main(argv: list[str] | None = None) -> int:
             f"the latest nightly on {branch} concluded {nightly_conclusion!r} "
             "with --allow-red-nightly recorded in an associated pull request body"
         )
+    if proof is None:
+        checked_note = "checked"
+    else:
+        checked_note = (
+            f"checked via version-only ancestor {proof} "
+            "(its required checks stand in for this commit's, ADR-0195)"
+        )
     print(
         f"OK: {args.sha} is reachable from a reviewed ref "
-        f"({checked_refs}), checked, and {nightly_note}; authorized"
+        f"({checked_refs}), {checked_note}, and {nightly_note}; authorized"
     )
     return 0
 

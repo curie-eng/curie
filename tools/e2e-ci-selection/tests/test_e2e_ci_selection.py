@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
@@ -142,6 +143,7 @@ def _expected_output(
     images_needed: bool = False,
     cli_release_needed: bool = False,
     released_upgrade_full: bool = False,
+    version_only: bool = False,
 ) -> str:
     selected_tiers = set(selected)
     lines = [
@@ -156,6 +158,7 @@ def _expected_output(
     lines.append(
         f"released_upgrade_full={'true' if released_upgrade_full else 'false'}"
     )
+    lines.append(f"version_only={'true' if version_only else 'false'}")
     return "\n".join(lines) + "\n"
 
 
@@ -1048,6 +1051,167 @@ def test_revisions_select_changed_paths_and_unknown_fallback(tmp_path: Path) -> 
     assert unknown_output == _expected_output(*BASE_TIERS)
 
 
+
+# The exact five files of the real v0.11.2 preparation PR #3845, with the
+# snapshot renamed for whatever release this checkout is (#3858).
+def _repo_version() -> str:
+    cargo = tomllib.loads((REPO_ROOT / "cli" / "Cargo.toml").read_text())
+    return f"v{cargo['package']['version']}"
+
+
+def _version_only_paths(version: str) -> tuple[str, ...]:
+    return (
+        "charts/curie/Chart.yaml",
+        "cli/Cargo.toml",
+        "cli/Cargo.lock",
+        "docs/architecture-atlas/versions.json",
+        f"docs/architecture-atlas/snapshots/{version}.json",
+    )
+
+
+# What #3858 runs for a version-only diff: the local-release rung, which
+# exercises version identity on the new commit, and nothing heavier.
+VERSION_ONLY_SELECTION = _expected_output(
+    "local-release",
+    pytest_needed=False,
+    cli_release_needed=True,
+    version_only=True,
+)
+# What the same five paths selected before #3858, and still select whenever
+# the delta is not version-only.
+FULL_PREP_SELECTION = _expected_output(*TIERS, cli_release_needed=True)
+
+
+@pytest.mark.parametrize("omit_kind", [False, True])
+def test_version_only_release_prep_selects_only_the_local_release_rung(
+    tmp_path: Path, omit_kind: bool
+) -> None:
+    """#3858: a release bump reuses the proof it already has."""
+    completed, output = _invoke_selector(
+        tmp_path, *_version_only_paths(_repo_version()), omit_kind=omit_kind
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert output == VERSION_ONLY_SELECTION
+
+
+def test_another_releases_snapshot_is_not_version_only(tmp_path: Path) -> None:
+    """#3858: only this checkout's own snapshot is version-only."""
+    assert _repo_version() != "v9.9.9"
+    completed, output = _invoke_selector(tmp_path, *_version_only_paths("v9.9.9"))
+    assert completed.returncode == 0, completed.stderr
+    assert output == FULL_PREP_SELECTION
+
+
+@pytest.mark.parametrize("extra", ["cli/src/main.rs", "README.md"])
+def test_any_other_path_makes_the_prep_diff_not_version_only(
+    tmp_path: Path, extra: str
+) -> None:
+    """#3858: one path outside the set restores today's selection."""
+    completed, output = _invoke_selector(
+        tmp_path, *_version_only_paths(_repo_version()), extra
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert output == FULL_PREP_SELECTION
+
+
+def test_push_is_never_version_only(tmp_path: Path) -> None:
+    """#3858: pushes and dispatches run everything."""
+    completed, output = _invoke_selector(tmp_path, push=True)
+    assert completed.returncode == 0, completed.stderr
+    assert _outputs_of(output)["version_only"] == "false"
+
+
+def _outputs_of(output: str) -> dict[str, str]:
+    return dict(line.split("=", maxsplit=1) for line in output.splitlines())
+
+
+def _git(repository: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def _commit_files(repository: Path, files: dict[str, str], message: str) -> str:
+    for path, content in files.items():
+        target = repository / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    _git(repository, "add", "--", *files)
+    _git(repository, "commit", "-q", "-m", message)
+    return _git(repository, "rev-parse", "HEAD")
+
+
+def _new_repository(tmp_path: Path) -> Path:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "-q", "--initial-branch", "main")
+    _git(repository, "config", "user.email", "test@example.com")
+    _git(repository, "config", "user.name", "Test User")
+    return repository
+
+
+def _cargo_toml(version: str) -> str:
+    return f'[package]\nname = "curie"\nversion = "{version}"\n'
+
+
+def test_revision_mode_reads_the_version_from_the_head_commit(tmp_path: Path) -> None:
+    """#3858: revision mode names the snapshot from head's cli/Cargo.toml."""
+    repository = _new_repository(tmp_path)
+    base = _commit_files(
+        repository,
+        {
+            "cli/Cargo.toml": _cargo_toml("1.2.2"),
+            "cli/src/main.rs": "fn main() {}\n",
+            "README.md": "readme\n",
+        },
+        "base",
+    )
+    version_files = {path: f"{path} bumped\n" for path in _version_only_paths("v1.2.3")}
+    version_files["cli/Cargo.toml"] = _cargo_toml("1.2.3")
+    head = _commit_files(repository, version_files, "prepare v1.2.3")
+
+    completed, output = _invoke_selector(tmp_path, base=base, head=head, cwd=repository)
+    assert completed.returncode == 0, completed.stderr
+    assert output == VERSION_ONLY_SELECTION
+
+    # Negative control: a snapshot named for a version head does not declare
+    # is not version-only.
+    wrong = {path: f"{path} again\n" for path in _version_only_paths("v1.2.4")}
+    wrong["cli/Cargo.toml"] = _cargo_toml("1.2.3")
+    wrong_head = _commit_files(repository, wrong, "snapshot for another version")
+    completed, output = _invoke_selector(
+        tmp_path, base=head, head=wrong_head, cwd=repository
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert _outputs_of(output)["version_only"] == "false"
+    assert _outputs_of(output)["local"] == "true"
+
+
+def test_revision_mode_without_a_cargo_manifest_is_not_version_only(
+    tmp_path: Path,
+) -> None:
+    """#3858: an unreadable version fails closed to today's selection."""
+    repository = _new_repository(tmp_path)
+    base = _commit_files(repository, {"README.md": "readme\n"}, "base")
+    paths = [
+        path for path in _version_only_paths("v1.2.3") if not path.startswith("cli/")
+    ]
+    head = _commit_files(
+        repository, {path: f"{path} bumped\n" for path in paths}, "no manifest"
+    )
+
+    completed, output = _invoke_selector(tmp_path, base=base, head=head, cwd=repository)
+    assert completed.returncode == 0, completed.stderr
+    path_mode, path_output = _invoke_selector(tmp_path, *paths)
+    assert path_mode.returncode == 0, path_mode.stderr
+    assert _outputs_of(output)["version_only"] == "false"
+    assert output == path_output
+
+
 VALID_REGISTRY = """
 version: 1
 fallback: [skill, local, local-release, cluster]
@@ -1224,6 +1388,9 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "skill_local_tiers": "${{ steps.filter.outputs.skill_local_tiers }}",
         "images": "${{ steps.filter.outputs.images }}",
         "cli_release": "${{ steps.filter.outputs.cli_release }}",
+        # #3858: python-pytest and rust-select read these two.
+        "pytest": "${{ steps.filter.outputs.pytest }}",
+        "version_only": "${{ steps.filter.outputs.version_only }}",
         "runtime_assertions": "${{ steps.runtime.outputs.runtime_assertions }}",
     }
 
@@ -1894,6 +2061,30 @@ def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
         skill_local_result="success",
     )
     assert unexpected_result.returncode != 0
+
+
+
+def test_e2e_required_accepts_a_version_only_selection(tmp_path: Path) -> None:
+    """#3858: the required E2E gate passes on the local-release rung alone."""
+    selected, output = _invoke_selector(tmp_path, *_version_only_paths(_repo_version()))
+    assert selected.returncode == 0, selected.stderr
+    outputs = _outputs_of(output)
+    assert outputs["version_only"] == "true"
+    selection = {
+        "event_name": "pull_request",
+        "skill_selected": outputs["skill"],
+        "local_selected": outputs["local"],
+        "local_release_selected": outputs["local_release"],
+        "cluster_selected": outputs["cluster"],
+        "released_upgrade_selected": outputs["released_upgrade"],
+        "released_upgrade_full": outputs["released_upgrade_full"],
+    }
+
+    ran = _run_aggregate(**selection, local_release_result="success")
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+
+    missing = _run_aggregate(**selection)
+    assert missing.returncode != 0
 
 
 @pytest.mark.parametrize(

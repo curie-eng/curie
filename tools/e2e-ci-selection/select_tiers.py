@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import re
 import subprocess
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any, cast
 
 import yaml
@@ -33,6 +36,11 @@ UPGRADE_WORKFLOW_JOBS = frozenset(
     }
 )
 WORKFLOW_PATH = ".github/workflows/ci.yaml"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CARGO_MANIFEST = "cli/Cargo.toml"
+# A version-only diff (#3858) still runs this rung: it proves the new version
+# identity end to end on the new commit.
+VERSION_ONLY_TIERS = frozenset({"local-release"})
 HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -321,7 +329,7 @@ def _workflow_job_spans(content: str) -> dict[str, tuple[int, int]]:
         alias_lines = (
             event.start_mark.line + 1
             for event in yaml.parse(content)
-            if isinstance(event, yaml.events.AliasEvent)
+            if isinstance(event, yaml.events.AliasEvent) and event.start_mark is not None
         )
         if any(
             beginning <= line < end
@@ -384,12 +392,64 @@ def _changes_upgrade_workflow_jobs(base: str, head: str) -> bool:
     return False
 
 
+def _load_atlas() -> ModuleType:
+    """Load release/atlas.py by path; it owns the version-only path set."""
+    path = REPO_ROOT / "release" / "atlas.py"
+    spec = importlib.util.spec_from_file_location("release_atlas", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_atlas = _load_atlas()
+
+
+def _head_version(head: str | None) -> str | None:
+    """The CLI version at `head` (revision mode) or in this checkout (path mode).
+
+    None when the manifest cannot be read, which keeps today's selection.
+    """
+    if head is None:
+        try:
+            manifest = (REPO_ROOT / CARGO_MANIFEST).read_text(encoding="utf-8")
+        except OSError:
+            return None
+    else:
+        completed = subprocess.run(
+            ["git", "show", f"{head}:{CARGO_MANIFEST}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return None
+        manifest = completed.stdout
+    try:
+        version = tomllib.loads(manifest)["package"]["version"]
+    except (tomllib.TOMLDecodeError, KeyError, TypeError):
+        return None
+    return version if isinstance(version, str) and version else None
+
+
+def _is_version_only(paths: list[str], head: str | None) -> bool:
+    """Does the diff change only version identity for the head's release (#3858)?"""
+    if not paths:
+        return False
+    version = _head_version(head)
+    if version is None:
+        return False
+    allowed: frozenset[str] = _atlas.version_only_paths(f"v{version}")
+    return set(paths) <= allowed
+
+
 def _render(
     selected: set[str],
     pytest_needed: bool,
     images_needed: bool,
     cli_release_needed: bool,
     released_upgrade_full: bool,
+    version_only: bool,
 ) -> str:
     lines = [f"{OUTPUT_KEYS[tier]}={'true' if tier in selected else 'false'}" for tier in TIERS]
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected)
@@ -400,6 +460,7 @@ def _render(
     lines.append(
         f"released_upgrade_full={'true' if released_upgrade_full else 'false'}"
     )
+    lines.append(f"version_only={'true' if version_only else 'false'}")
     return "\n".join(lines) + "\n"
 
 
@@ -424,6 +485,7 @@ def _run() -> None:
 
     paths: list[str] = []
     workflow_upgrade_changed = False
+    version_only = False
     if args.push:
         if args.path or args.base or args.head:
             raise RegistryError("push cannot be combined with paths or revisions")
@@ -448,6 +510,7 @@ def _run() -> None:
         pytest_needed = _needs_pytest(registry, paths)
         images_needed = _needs_images(paths)
         cli_release_needed = _needs_cli_release(paths)
+        version_only = _is_version_only(paths, args.head if not args.path else None)
 
     if args.omit_kind:
         selected.difference_update(KIND_TIERS)
@@ -458,6 +521,12 @@ def _run() -> None:
             selected.add("cluster")
     if workflow_upgrade_changed:
         selected.add("released-upgrade")
+    if version_only:
+        # A release bump changes only version identity, so the proof the base
+        # already has still holds (#3858). Run the rung that exercises the new
+        # version, and leave pytest to the required job's release tests.
+        selected = set(VERSION_ONLY_TIERS)
+        pytest_needed = False
 
     # Ordinary pull requests run one upgrade matrix smoke shard. A change to
     # the upgrade jobs themselves runs the full matrix and released chart jobs
@@ -477,6 +546,7 @@ def _run() -> None:
                 images_needed,
                 cli_release_needed,
                 released_upgrade_full,
+                version_only,
             )
         )
 
