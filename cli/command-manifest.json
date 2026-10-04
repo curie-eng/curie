@@ -6986,7 +6986,7 @@
             },
             {
               "global": false,
-              "help": "Kubernetes context. When omitted, the current kubeconfig context is used. When neither exists, a kind cluster is created",
+              "help": "Kubernetes context. An explicit name is used with no prompt. When omitted, a current kind context proceeds with no prompt, and no current context creates a kind cluster. Any other current context requires confirmation in a terminal and is refused without one. Pass this flag to proceed without a prompt",
               "id": "context",
               "long": "context",
               "positional": false,

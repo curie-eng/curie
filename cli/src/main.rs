@@ -1066,8 +1066,11 @@ enum FactoryAction {
         /// the key contents never enter argv.
         #[arg(long, value_name = "PATH", requires = "app_id")]
         private_key_file: Option<PathBuf>,
-        /// Kubernetes context. When omitted, the current kubeconfig context is
-        /// used. When neither exists, a kind cluster is created.
+        /// Kubernetes context. An explicit name is used with no prompt. When
+        /// omitted, a current kind context proceeds with no prompt, and no
+        /// current context creates a kind cluster. Any other current context
+        /// requires confirmation in a terminal and is refused without one.
+        /// Pass this flag to proceed without a prompt.
         #[arg(long, value_name = "NAME")]
         context: Option<String>,
         /// Kubernetes namespace. Default: curie.
