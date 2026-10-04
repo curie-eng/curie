@@ -120,3 +120,10 @@ merges, forward main to next following repository release-train rules.
 Do not close #3603 or claim safe intake installation until task 7 and every
 required acceptance item pass on the final artifacts. No downstream import or
 production deployment is part of this upstream implementation plan.
+
+The next atomic admission foundation is decomposed in the
+[admission plan](2026-10-03-protected-hook-admission.md), derived from its
+[closed internal admission contract](../specs/2026-10-03-protected-hook-admission.md).
+It supplies the real broker transaction and bounded recovery primitive without
+HTTP wiring, periodic reconciliation or worker activation. Those remain tasks
+3/4 above; protected source publication and installation remain closed.
