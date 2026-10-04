@@ -187,6 +187,59 @@ implementation. The dependency observations identified in ADR 0191 establish
 the measured ACL/Lua primitives, not the complete product role inventory or
 runtime qualification.
 
+## Metadata role realization
+
+<!-- @spec PROTECTED-HOOK-LANE-3 -->
+The first broker realization exports two closed metadata permission subsets,
+`source_writer` and `control_reader`, through
+`metadata_acl_rules(role) -> tuple[str, ...]` in the internal protected hooks
+package. Unknown roles refuse. Each recipe resets prior permissions and
+selectors before granting its named subset. Permission reset preserves the
+principal's existing password and enabled state. It contains no username,
+password, credential reference, enabled user flag or broker configuration.
+Only the out of band provisioner installs these rules, enables its distinct
+principals and supplies their independently issued credentials. Recipes do
+not disable another service's default user or modify a running broker.
+
+The source writer grants GET, SET and the script operations used by the
+existing SourceFence only on `protected:source:*`, plus connection handshake
+commands. It has no control, admission, execution stream, consumption, INFO,
+TIME or broker administration authority. Existing reservation and ordinary
+publication retain their SOURCE-6/7 semantics. Protected publication remains
+unavailable.
+
+The control reader grants GET on `protected:source:*` and
+`protected:control:*`, INFO server and TIME, plus connection handshake and
+read only EVAL. Its separate declared key selector admits EVAL on those
+families without granting any inner write command. It grants no SET, DEL,
+stream, consume, administration or unrestricted key permission. Its operation
+facade, `AuthorityMetadataReader`, receives an explicitly supplied scoped
+Redis client. It never constructs a connection or reads environment
+credentials. `read_source(agent_id, hook)` preserves SourceFence's validated
+read result. `read_control(key)` accepts only ASCII keys matching
+`protected:control:[A-Za-z0-9:_-]{1,256}` and returns bytes or absence.
+`observe()` calls INFO with exactly the server section and TIME with no
+caller supplied arguments. Its immutable `BrokerObservation` contains only
+the canonical forty lowercase hexadecimal character `run_id` and
+`now_ms`, bounded by the LANE-2 millisecond range. Invalid observations or
+broker errors refuse through a safe unavailable error without connection
+details. These separate reads are not atomic admission or readiness proof.
+
+Measure the exact emitted command and key selectors against the pinned
+dependency before claiming this realization. The INFO subcommand permission
+checks the first section argument; neither a recipe nor this facade claims
+general isolation of arbitrary INFO argument combinations. Tests use a
+separate disposable broker with its default user disabled and distinct
+credentials. They exercise positive CAS and metadata reads and negative
+authentication, cross role direct and Lua writes, consume and administration
+operations. Do not change a shared backing service's ACLs to run them.
+
+These subsets are not the complete enqueue, worker or verifier inventories.
+They issue no authority, authenticate no TLS or provisioning boundary and
+do not enable source administration, runtime qualification or protected
+delivery. The default resolver remains unavailable until the separate
+authority, admission, provisioning and execution requirements pass.
+
 ## Atomic admission, duplicate receipt and activation
 
 <!-- @spec PROTECTED-HOOK-LANE-4 -->
