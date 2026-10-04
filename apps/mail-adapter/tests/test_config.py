@@ -50,6 +50,7 @@ _OVERRIDES: dict[str, tuple[str, str, object]] = {
     "CURIE_MAIL_MAX_BODY_BYTES": ("max_body_bytes", "4096", 4096),
     "CURIE_MAIL_MAX_REPLY_BYTES": ("max_reply_bytes", "8192", 8192),
     "CURIE_MAIL_MAX_STATE_BYTES": ("max_state_bytes", "1048576", 1048576),
+    "CURIE_MAIL_ALLOW_ALL_SENDERS": ("allow_all_senders", "true", True),
     "CURIE_MAIL_ALLOWED_SENDERS": (
         "allowed_senders",
         "alice@example.com,example.org",
@@ -76,6 +77,7 @@ _DEFAULTS: dict[str, object] = {
     "max_reply_bytes": 1048576,
     "max_state_bytes": 268435456,
     "allowed_senders": (),
+    "allow_all_senders": False,
     "agentmail_egress_cidrs": (),
     "discovery_unready_after_seconds": 120.0,
 }

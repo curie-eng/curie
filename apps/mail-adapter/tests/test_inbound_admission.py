@@ -21,8 +21,9 @@ def test_rejected_listings_persist_only_a_minimal_receipt_without_spending_capac
 
     Rejected receipts remain durable so the same provider id is not reconsidered
     forever, but their sender/subject listing PII must be discarded before the
-    active-item and byte budgets are charged.  A legitimate message therefore
-    remains admissible after a burst of large rejected listings.
+    active item and byte budgets are charged. An allowlisted message remains
+    unauthenticated after that burst, and its identifier only receipt can still be
+    recorded without allocating a body or turn.
     """
     adapter = make_adapter(
         max_pending_deliveries=1,
@@ -61,8 +62,9 @@ def test_rejected_listings_persist_only_a_minimal_receipt_without_spending_capac
     mail.add_inbound("msg-legitimate", "thr-legitimate", sender=ALLOWED_SENDER)
     adapter.poll_once()
 
-    assert ingress.delivery_ids() == ["msg-legitimate"]
-    assert mail.body_calls == {"msg-legitimate": 1}
+    assert ingress.delivery_ids() == []
+    assert mail.body_calls == {}
+    assert adapter.state.delivery("msg-legitimate") == {"state": "rejected", "turn": None}
 
 
 def test_sent_listing_is_discarded_before_any_durable_claim_or_body_fetch(
@@ -95,15 +97,12 @@ def test_sqlite_admission_failure_refuses_without_crashing_or_burning_mail(
     """A local disk fault is back-pressure, not message acknowledgement.
 
     The fault is induced through SQLite itself.  Once storage is writable again,
-    the untouched provider delivery must traverse the ordinary body and ingress
-    path exactly once.
+    the untouched provider delivery must receive a durable rejection receipt
+    without fetching its body or starting a turn.
     """
     adapter = make_adapter()
-    mail.add_inbound(
-        "msg-disk-pressure",
-        "thr-disk-pressure",
-        subject="large-enough-to-require-new-pages-" + ("x" * (128 * 1024)),
-    )
+    message_id = "msg-disk-pressure-" + ("x" * (128 * 1024))
+    mail.add_inbound(message_id, "thr-disk-pressure")
     connection = adapter.state.connection
     page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
     page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
@@ -117,8 +116,8 @@ def test_sqlite_admission_failure_refuses_without_crashing_or_burning_mail(
         connection.execute("PRAGMA query_only=ON")
 
     assert adapter.poll_once() == 200
-    assert "msg-disk-pressure" not in adapter.seen
-    assert adapter.state.delivery("msg-disk-pressure") is None
+    assert message_id not in adapter.seen
+    assert adapter.state.delivery(message_id) is None
     assert mail.body_calls == {}
     assert ingress.attempts == 0
 
@@ -130,8 +129,9 @@ def test_sqlite_admission_failure_refuses_without_crashing_or_burning_mail(
 
     adapter.poll_once()
 
-    assert ingress.delivery_ids() == ["msg-disk-pressure"]
-    assert mail.body_calls == {"msg-disk-pressure": 1}
+    assert ingress.delivery_ids() == []
+    assert mail.body_calls == {}
+    assert adapter.state.delivery(message_id) == {"state": "rejected", "turn": None}
 
 
 def test_prime_ignores_a_malformed_listing_without_crashing_startup(
@@ -155,12 +155,12 @@ def test_prime_ignores_a_malformed_listing_without_crashing_startup(
     assert adapter.ready.is_set()
     assert adapter.state.is_primed()
     assert adapter.state.known_message_ids() == ["msg-existing"]
-    assert adapter.state.delivery("msg-existing") == {"state": "primed", "turn": None}
+    assert adapter.state.delivery("msg-existing") == {"state": "rejected", "turn": None}
     assert mail.body_calls == {}
     assert ingress.attempts == 0
 
 
-def test_primed_receipts_survive_the_terminal_cap_and_reopen(
+def test_historical_primed_receipts_survive_the_terminal_cap_and_reopen(
     mail: MailState,
     ingress: IngressState,
     make_adapter: Callable[..., MailAdapter],
@@ -178,6 +178,7 @@ def test_primed_receipts_survive_the_terminal_cap_and_reopen(
         preexisting_ids = [f"msg-preexisting-{index}" for index in range(receipt_cap + 1)]
         for message_id in preexisting_ids:
             mail.add_inbound(message_id, f"thr-{message_id}", sender=ALLOWED_SENDER)
+            assert first.state.record_terminal(message_id, "primed") == "admitted"
 
         first.startup()
         first.poll_once()

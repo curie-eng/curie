@@ -299,7 +299,7 @@ def test_repeated_list_transport_failures_back_off_then_reset_on_recovery(
         mail.drop_next_lists = 4
         mail.add_inbound("msg-drop", "thr-drop", subject="Held", text="delivered after the outage")
 
-        assert wait_until(lambda: ingress.delivery_ids() == ["msg-drop"], timeout=20), (
+        assert wait_until(lambda: adapter.state.delivery("msg-drop") is not None, timeout=20), (
             f"the held message never survived the outage: {ingress.delivery_ids()}"
         )
         # Keep polling past the recovered pass, so a post-recovery gap exists to
@@ -343,8 +343,7 @@ def test_repeated_list_transport_failures_back_off_then_reset_on_recovery(
     # above already guarantees both indexes exist. Do not relax it back into a broad
     # tolerance: a tolerance cannot distinguish saturation from continued growth.
     assert abs(waits_before_failures[-1] - waits_before_failures[-2]) < 0.15, (
-        "the backoff kept doubling instead of saturating at its ceiling: "
-        f"{waits_before_failures}"
+        f"the backoff kept doubling instead of saturating at its ceiling: {waits_before_failures}"
     )
     # The recovery pass is the first list call after the last dropped one, so the
     # final interval of the run is fully post-recovery and needs no guessing.
@@ -355,7 +354,8 @@ def test_repeated_list_transport_failures_back_off_then_reset_on_recovery(
     assert times[-1] - times[-2] < 0.15, (
         f"the normal cadence never resumed after recovery: {times[-1] - times[-2]}"
     )
-    assert ingress.delivery_ids() == ["msg-drop"], (
+    assert ingress.delivery_ids() == []
+    assert adapter.state.delivery("msg-drop") == {"state": "rejected", "turn": None}, (
         f"the held message was skipped or duplicated across the outage: {ingress.delivery_ids()}"
     )
 
@@ -399,7 +399,7 @@ def test_an_unrelated_failure_does_not_clear_an_armed_backoff(
             "msg-mixed", "thr-mixed", subject="Mixed", text="delivered after the outage"
         )
 
-        assert wait_until(lambda: ingress.delivery_ids() == ["msg-mixed"], timeout=20), (
+        assert wait_until(lambda: adapter.state.delivery("msg-mixed") is not None, timeout=20), (
             f"the held message never survived the mixed outage: {ingress.delivery_ids()}"
         )
         # Keep polling past recovery, so the interval after the 500 is a settled
@@ -432,6 +432,7 @@ def test_an_unrelated_failure_does_not_clear_an_armed_backoff(
     assert wait_before_recovery > 0.3, (
         f"an unrelated 5xx cleared the armed transport backoff: {wait_before_recovery}"
     )
-    assert ingress.delivery_ids() == ["msg-mixed"], (
+    assert ingress.delivery_ids() == []
+    assert adapter.state.delivery("msg-mixed") == {"state": "rejected", "turn": None}, (
         f"the held message was skipped or duplicated across the outage: {ingress.delivery_ids()}"
     )

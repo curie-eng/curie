@@ -1,23 +1,7 @@
-"""The inbound gate: the provider's filtering, the label check, the allow-list.
+"""Sender matching is only a filter; all AgentMail authentication fails closed.
 
-Two independent controls in one file because they are two halves of one gate,
-and the plan is explicit that they are layered rather than equivalent:
-
-1. Provider-side filtering is the primary control and it is not ours. AgentMail
-   drops mail whose authentication headers are present and explicitly fail
-   before it reaches the API, and excludes the `spam`, `blocked` and
-   `unauthenticated` categories from list results by default.
-2. The adapter states that exclusion in the request rather than inheriting it,
-   so a changed provider default cannot widen an install silently.
-3. The `labels` check is defense in depth that should never fire in a correct
-   install.
-
-The allow-list is a fourth thing and is NOT part of that chain: it is a filter
-on an attacker-controlled `From` header and it authenticates nobody.
-
-The two mutations are independent on purpose: dropping the `include_*`
-parameters reddens only the request-shape case, and dropping the label check
-reddens only the two label cases.
+Provider list exclusions and rejection labels remain useful mailbox controls.
+Neither a matching From address nor absent labels establishes authentication.
 """
 
 from __future__ import annotations
@@ -46,15 +30,14 @@ def _adapter_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [
         record.getMessage()
         for record in caplog.records
-        if record.levelno >= logging.WARNING
-        and record.name.startswith("curie_mail_adapter")
+        if record.levelno >= logging.WARNING and record.name.startswith("curie_mail_adapter")
     ]
 
 
 # --- the allow-list -----------------------------------------------------------
 
 
-def test_an_exact_address_entry_admits_that_sender(
+def test_an_exact_address_match_still_cannot_authenticate_that_sender(
     mail: MailState, ingress: IngressState, make_adapter: Callable[..., MailAdapter]
 ) -> None:
     adapter = make_adapter(allowed_senders=("alice@example.com",))
@@ -62,7 +45,8 @@ def test_an_exact_address_entry_admits_that_sender(
 
     adapter.poll_once()
 
-    assert ingress.delivery_ids() == ["msg-1"]
+    assert ingress.delivery_ids() == []
+    assert adapter.sender_allowed("alice@example.com")
 
 
 @pytest.mark.parametrize(
@@ -85,7 +69,8 @@ def test_a_bare_domain_entry_matches_only_that_domain(
 
     adapter.poll_once()
 
-    assert ingress.delivery_ids() == (["msg-1"] if admitted else [])
+    assert ingress.delivery_ids() == []
+    assert adapter.sender_allowed(sender) is admitted
 
 
 def test_matching_is_case_insensitive_and_tolerates_whitespace(
@@ -98,7 +83,9 @@ def test_matching_is_case_insensitive_and_tolerates_whitespace(
 
     adapter.poll_once()
 
-    assert ingress.delivery_ids() == ["msg-1", "msg-2"]
+    assert ingress.delivery_ids() == []
+    assert adapter.sender_allowed("ALICE@example.com")
+    assert adapter.sender_allowed("Bob@Other-Domain.com")
 
 
 def test_a_display_name_from_header_is_matched_on_the_bare_address(
@@ -111,7 +98,9 @@ def test_a_display_name_from_header_is_matched_on_the_bare_address(
 
     adapter.poll_once()
 
-    assert ingress.delivery_ids() == ["msg-1"]
+    assert ingress.delivery_ids() == []
+    assert adapter.sender_allowed("Alice Example <alice@example.com>")
+    assert not adapter.sender_allowed("Alice Example <mallory@evil.example>")
 
 
 def test_a_rejected_sender_posts_nothing_and_is_marked_seen(
@@ -138,7 +127,7 @@ def test_a_rejected_sender_posts_nothing_and_is_marked_seen(
     assert len(warnings) == 1, warnings
     warning = warnings[0]
     assert "rejected" in warning
-    assert "sender is not on CURIE_MAIL_ALLOWED_SENDERS" in warning
+    assert "authentication_unverifiable" in warning
     assert re.search(r"\bcorrelation=[0-9a-f]{16}\b", warning)
     assert "msg-junk" not in warning
     assert STRANGER not in warning
@@ -183,16 +172,17 @@ def test_a_rejected_sender_gets_no_reply_and_has_no_conversation_record(
     assert mail.replies == []
 
 
-def test_allow_all_is_reachable_only_by_writing_the_star(
+def test_a_wildcard_filter_does_not_authenticate_any_sender(
     mail: MailState, ingress: IngressState, make_adapter: Callable[..., MailAdapter]
 ) -> None:
     """The dangerous state must be named explicitly, never produced by omission."""
-    adapter = make_adapter(allowed_senders=("*",))
+    adapter = make_adapter(allowed_senders=("*",), allow_all_senders=True)
     mail.add_inbound("msg-1", "thr-1", sender="whoever@wherever.example")
 
     adapter.poll_once()
 
-    assert ingress.delivery_ids() == ["msg-1"]
+    assert ingress.delivery_ids() == []
+    assert adapter.sender_allowed("whoever@wherever.example")
 
 
 def test_ingress_disabled_does_not_authorize_an_unadmitted_egress_ref(
@@ -215,35 +205,32 @@ def test_ingress_disabled_does_not_authorize_an_unadmitted_egress_ref(
 
 
 @pytest.mark.parametrize("label", LEAKED_LABELS)
-def test_the_label_check_catches_what_a_widened_provider_would_deliver(
+def test_labeled_mail_is_rejected_even_when_provider_filtering_widens(
     mail: MailState,
     ingress: IngressState,
     adapter: MailAdapter,
     label: str,
 ) -> None:
-    """Defense in depth against a provider default change or a key with label-read
-    permissions. In a correct install this path never executes, and it is not what
-    makes the install safe: see the module docstring for the real ordering.
-    """
+    """Mail remains unverified when the provider serves normally withheld labels."""
     mail.leak_labeled = True  # the provider is serving what it normally withholds
     mail.add_inbound("msg-bad", "thr-bad", sender=ALLOWED_SENDER, labels=[label])
 
     adapter.poll_once()
 
     assert ingress.attempts == 0
-    assert mail.body_calls == {}, "provider verdict labels must run before the body GET"
+    assert mail.body_calls == {}, "authentication must be checked before the body GET"
     assert mail.replies == []
     assert adapter.state.reply_text("thr-bad", "msg-bad") == (False, None)
     assert "msg-bad" in adapter.seen  # rejected once, not re-evaluated forever
 
 
-def test_the_label_check_runs_before_the_allow_list(
+def test_unverifiable_authentication_is_named_before_the_sender_filter(
     mail: MailState,
     ingress: IngressState,
     adapter: MailAdapter,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A labeled message from a stranger is rejected once, naming the label."""
+    """A labeled message from a stranger is rejected once, naming authentication."""
     mail.leak_labeled = True
     mail.add_inbound("msg-bad", "thr-bad", sender=STRANGER, labels=["unauthenticated"])
 
@@ -251,27 +238,28 @@ def test_the_label_check_runs_before_the_allow_list(
         adapter.poll_once()
 
     assert ingress.attempts == 0
-    assert mail.body_calls == {}, "provider labels and allow-list must precede body GET"
+    assert mail.body_calls == {}, "authentication must precede body GET"
     assert "msg-bad" in adapter.seen  # permanent rejection, not re-evaluated forever
     warnings = _adapter_warnings(caplog)
     assert len(warnings) == 1, warnings
     warning = warnings[0]
     assert "rejected" in warning
-    assert "provider labels unauthenticated" in warning
+    assert "authentication_unverifiable" in warning
     assert re.search(r"\bcorrelation=[0-9a-f]{16}\b", warning)
     assert "msg-bad" not in warning
     assert STRANGER not in warning
 
 
-def test_an_empty_labels_array_is_admitted(
+def test_an_empty_labels_array_still_has_no_authentication_verdict(
     mail: MailState, ingress: IngressState, adapter: MailAdapter
 ) -> None:
-    """The common case is no labels at all; absence must not read as a rejection."""
+    """Absence of provider rejection labels cannot establish authentication."""
     mail.add_inbound("msg-1", "thr-1", labels=[])
 
     adapter.poll_once()
 
-    assert ingress.delivery_ids() == ["msg-1"]
+    assert ingress.delivery_ids() == []
+    assert adapter.sender_allowed(ALLOWED_SENDER)
 
 
 def test_a_sent_label_keeps_its_self_echo_meaning(
@@ -283,14 +271,16 @@ def test_a_sent_label_keeps_its_self_echo_meaning(
 
     adapter.poll_once()
 
-    assert ingress.delivery_ids() == ["msg-theirs"]
+    assert ingress.delivery_ids() == []
+    assert adapter.state.delivery("msg-ours") is None
+    assert adapter.state.delivery("msg-theirs") == {"state": "rejected", "turn": None}
     assert mail.body_calls.get("msg-ours", 0) == 0
 
 
 def test_the_list_request_states_the_exclusions_explicitly(
     mail: MailState, adapter: MailAdapter
 ) -> None:
-    """Layer 2: the adapter says no rather than inheriting a default that can move.
+    """The adapter states provider exclusions rather than inheriting defaults.
 
     Parameter names and semantics ("Include <category> in results") are from
     https://docs.agentmail.to/api-reference/inboxes/messages/list ; the documented
@@ -316,17 +306,18 @@ def test_the_list_request_states_the_exclusions_explicitly(
 def test_the_providers_default_filtering_is_what_keeps_labeled_mail_out(
     mail: MailState, ingress: IngressState, adapter: MailAdapter
 ) -> None:
-    """Layer 1, and it is where the protection actually comes from today.
+    """Provider filtering reduces listings without granting sender identity.
 
     With the fake behaving as the provider documents, a spam-labeled message from
     an allow-listed sender is never served at all, so the adapter never sees it:
     zero ingress attempts and no entry in `seen`, which is a different outcome
-    from the label check's (which marks the message seen).
+    from the shared authentication gate (which records a rejection receipt).
     """
     mail.add_inbound("msg-spam", "thr-spam", sender=ALLOWED_SENDER, labels=["spam"])
     mail.add_inbound("msg-ok", "thr-ok", sender=ALLOWED_SENDER)
 
     adapter.poll_once()
 
-    assert ingress.delivery_ids() == ["msg-ok"]
+    assert ingress.delivery_ids() == []
+    assert adapter.state.delivery("msg-ok") == {"state": "rejected", "turn": None}
     assert "msg-spam" not in adapter.seen
