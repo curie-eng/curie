@@ -868,6 +868,7 @@ name = "curie-protected-hooks"
 version = "0.0.0"
 source = { editable = "packages/protected-hooks" }
 dependencies = [
+    { name = "aci-protocol" },
     { name = "cryptography" },
     { name = "redis" },
     { name = "sqlalchemy", extra = ["asyncio"] },
@@ -875,6 +876,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aci-protocol", editable = "packages/aci-protocol" },
     { name = "cryptography", specifier = ">=50.0.1" },
     { name = "redis", specifier = ">=8.1.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.51" },

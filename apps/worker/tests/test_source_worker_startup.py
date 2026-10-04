@@ -37,7 +37,7 @@ def migration_support() -> Any:
 def worker_templates() -> Iterator[Any]:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
     support = migration_support()
-    base = make_url(os.environ["DATABASE_URL"])
+    base = make_url(support.get_settings().database_url)
     templates = support.MigrationTemplates(base)
     try:
         yield support, base, templates
