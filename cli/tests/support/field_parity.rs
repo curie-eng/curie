@@ -23,14 +23,18 @@
 //!   bare `Deserialize` and qualified `serde::Deserialize` derive spellings (last
 //!   path segment == `Deserialize`), and deliberately does NOT match `Serialize`.
 //! * Wire name governs coverage, not the Rust ident: `#[serde(rename="x")]`,
-//!   container `#[serde(rename_all=...)]` are applied; `#[serde(skip)]` drops the
-//!   field from the wire; `#[serde(alias=...)]` is an ADDITIONAL accepted name so
+//!   container `#[serde(rename_all=...)]` are applied; skips are directional:
+//!   response mirrors drop a field on `skip` or `skip_deserializing`, request
+//!   mirrors on `skip` or `skip_serializing`, and the other directional skip keeps
+//!   the field on the wire; `#[serde(alias=...)]` is an ADDITIONAL accepted name so
 //!   it never counts as coverage. `#[serde(default)]` and `skip_serializing_if`
 //!   are irrelevant to coverage; they matter only to optionality (below).
 //! * Fail-closed shapes: a `#[serde(flatten)]` field or an object-level
 //!   `allOf`/`anyOf`/`oneOf` schema cannot be decomposed field-by-field, so the
 //!   struct yields `UnsupportedShape` and is NOT read as zero-required (which
-//!   would silently pass).
+//!   would silently pass). On request mirrors the same holds for a kept field
+//!   whose `skip_serializing_if` is anything but exactly `"Option::is_none"` on an
+//!   `Option<..>` field: the gate cannot know when such a key is omitted.
 //! * An omission entry always suppresses `MissingField` for its field; a
 //!   dishonest omission (blank/missing `why`, or a field the struct actually
 //!   carries, or a field the schema no longer defines) additionally yields
@@ -204,6 +208,10 @@ pub(crate) struct CollectedStruct {
     pub(crate) wire_fields: BTreeSet<String>,
     pub(crate) fields: Vec<WireField>,
     pub(crate) has_flatten: bool,
+    /// Request side only: a `skip_serializing_if` on a kept field that is not
+    /// exactly `Option::is_none` on an `Option<..>` field, so the gate cannot
+    /// tell when the key is omitted.
+    pub(crate) has_unsupported_skip_if: bool,
 }
 
 /// serde attributes distilled from a field's (or container's) `#[serde(...)]`
@@ -214,9 +222,26 @@ struct SerdeAttrs {
     rename: Option<String>,
     rename_all: Option<String>,
     skip: bool,
+    skip_serializing: bool,
+    skip_deserializing: bool,
     flatten: bool,
     default: bool,
-    skip_serializing_if: bool,
+    /// The predicate string literal of `skip_serializing_if`, when present
+    /// (empty when the value is not a string literal).
+    skip_serializing_if: Option<String>,
+}
+
+impl SerdeAttrs {
+    /// Does this field vanish from the wire in `direction`? `skip` drops both;
+    /// `skip_serializing` only the request side; `skip_deserializing` only the
+    /// response side.
+    fn dropped_in(&self, direction: Direction) -> bool {
+        self.skip
+            || match direction {
+                Direction::Serialize => self.skip_serializing,
+                Direction::Deserialize => self.skip_deserializing,
+            }
+    }
 }
 
 fn parse_serde_attrs(attrs: &[syn::Attribute]) -> SerdeAttrs {
@@ -230,12 +255,12 @@ fn parse_serde_attrs(attrs: &[syn::Attribute]) -> SerdeAttrs {
         // rename / rename_all / skip / flatten / default / skip_serializing_if /
         // alias / deny_unknown_fields / untagged, all handled below.
         let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("skip") || meta.path.is_ident("skip_deserializing") {
-                // `skip` drops the field from BOTH directions; `skip_deserializing`
-                // drops it from the wire (the decoder populates from Default), so it
-                // does NOT cover its schema property either. `skip_serializing`
-                // (below, ignored) is still deserialized and DOES cover.
+            if meta.path.is_ident("skip") {
                 out.skip = true;
+            } else if meta.path.is_ident("skip_serializing") {
+                out.skip_serializing = true;
+            } else if meta.path.is_ident("skip_deserializing") {
+                out.skip_deserializing = true;
             } else if meta.path.is_ident("flatten") {
                 out.flatten = true;
             } else if meta.path.is_ident("rename") {
@@ -251,8 +276,14 @@ fn parse_serde_attrs(attrs: &[syn::Attribute]) -> SerdeAttrs {
                     let _: syn::Expr = meta.value()?.parse()?;
                 }
             } else if meta.path.is_ident("skip_serializing_if") {
-                out.skip_serializing_if = true;
-                let _: syn::Expr = meta.value()?.parse()?;
+                let expr: syn::Expr = meta.value()?.parse()?;
+                out.skip_serializing_if = Some(match expr {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(lit),
+                        ..
+                    }) => lit.value(),
+                    _ => String::new(),
+                });
             } else if meta.input.peek(syn::Token![=]) {
                 // Any other value-bearing key (alias = "..") — consume and
                 // ignore. `alias` deliberately does NOT count as coverage.
@@ -382,6 +413,7 @@ impl<'ast> Visit<'ast> for StructCollector {
             let mut wire_fields = BTreeSet::new();
             let mut fields = Vec::new();
             let mut has_flatten = false;
+            let mut has_unsupported_skip_if = false;
             if let syn::Fields::Named(named) = &node.fields {
                 for field in &named.named {
                     let fs = parse_serde_attrs(&field.attrs);
@@ -389,8 +421,16 @@ impl<'ast> Visit<'ast> for StructCollector {
                         has_flatten = true;
                         continue;
                     }
-                    if fs.skip {
+                    if fs.dropped_in(self.direction) {
                         continue;
+                    }
+                    let depth = option_depth(&field.ty);
+                    if self.direction == Direction::Serialize {
+                        if let Some(predicate) = &fs.skip_serializing_if {
+                            if predicate != "Option::is_none" || depth == 0 {
+                                has_unsupported_skip_if = true;
+                            }
+                        }
                     }
                     let Some(ident) = field.ident.as_ref() else {
                         continue;
@@ -406,10 +446,10 @@ impl<'ast> Visit<'ast> for StructCollector {
                     wire_fields.insert(wire.clone());
                     fields.push(WireField {
                         wire,
-                        option_depth: option_depth(&field.ty),
+                        option_depth: depth,
                         json_value: is_json_value(&field.ty),
                         has_default: fs.default || container.default,
-                        skip_serializing_if: fs.skip_serializing_if,
+                        skip_serializing_if: fs.skip_serializing_if.is_some(),
                     });
                 }
             }
@@ -418,6 +458,7 @@ impl<'ast> Visit<'ast> for StructCollector {
                 wire_fields,
                 fields,
                 has_flatten,
+                has_unsupported_skip_if,
             });
         }
         // Continue the default traversal so structs nested inside THIS struct's
@@ -576,7 +617,7 @@ fn compare_mirror(
         return;
     };
 
-    if s.has_flatten || is_composed_schema(schema) {
+    if s.has_flatten || s.has_unsupported_skip_if || is_composed_schema(schema) {
         out.push(Violation::UnsupportedShape {
             struct_name: struct_name.to_string(),
             schema: schema_name.to_string(),
