@@ -17,6 +17,7 @@ from aci_protocol import (
     TurnSource,
 )
 from channel_protocol.work_item_events import execute_event_id, terminate_event_id
+from curie_internal.streams import ensure_group
 from curie_telemetry import record_metric
 from redis.exceptions import ResponseError
 from sqlalchemy import exists, func, select
@@ -78,13 +79,7 @@ class WorkItemReconciler:
         return self._settings.runs_consumer_group or WORKER_GROUP_DEFAULT
 
     async def _ensure_group(self) -> None:
-        try:
-            await self._valkey.xgroup_create(
-                self._stream(), self._group(), id="$", mkstream=True
-            )
-        except ResponseError as exc:
-            if "BUSYGROUP" not in str(exc):
-                raise
+        await ensure_group(self._valkey, self._stream(), self._group(), start_id="$")
 
     async def _xadd(self, turn: QueuedTurn, *, marker: tuple[str, int] | None = None) -> None:
         if marker is not None:

@@ -15,6 +15,7 @@ import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from curie_internal.keyspace import DEPLOY_NOTICE_DEDUPE_PREFIX
 from curie_telemetry import record_metric
 from redis.asyncio import Redis
 from sqlalchemy import delete, func, select, tuple_
@@ -305,7 +306,7 @@ class DeployNoticeQueue:
                     stream_id = await self._redis.eval(
                         _PUBLISH_ONCE,
                         2,
-                        f"curie:deploy-notice:dedupe:{row.key}",
+                        f"{DEPLOY_NOTICE_DEDUPE_PREFIX}{row.key}",
                         row.stream,
                         _DEDUP_TTL_SECONDS,
                         row.payload,

@@ -58,6 +58,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 import httpx
 import redis
+from curie_internal.keyspace import ADMISSION_KEY_PREFIX_DEFAULT
 from curie_telemetry import inject_trace_context
 
 from .config import DispatcherConfig
@@ -247,7 +248,7 @@ class AdmissionGate:
         ttl_s: float,
         stale_s: float,
         redis_client: Redis | None,
-        key_prefix: str = "curie:admission:",
+        key_prefix: str = ADMISSION_KEY_PREFIX_DEFAULT,
         clock: Clock = time.time,
         max_entries: int = _MAX_ENTRIES,
     ) -> None:

@@ -11,12 +11,11 @@ milestone budget are the worker store's (``curie_worker.progress``).
 
 The scope, the route, the inbox key and its entry fields are frozen with the
 worker and the runner in ``tests/vectors/turn-progress-capability.json``: the
-three ship in different images and share no module.
+three ship in different images; the API and worker use shared key builders.
 """
 
 from __future__ import annotations
 
-import hashlib
 from typing import Annotated, Any, Final
 
 from channel_protocol.progress import ProgressCommand
@@ -58,31 +57,6 @@ class TurnProgressBody(ProgressCommand):
 
     generation: Position
     seq: Position
-
-
-def inbox_key(key_prefix: str, progress_id: str) -> str:
-    """The chain's inbox stream, under the worker's key prefix."""
-
-    return f"{key_prefix}:progress:inbox:{progress_id}"
-
-
-def inbox_pending_key(key_prefix: str) -> str:
-    """The durable index maintenance workers use to find non-empty inboxes."""
-
-    return f"{key_prefix}:progress:inbox:pending"
-
-
-def progress_key(key_prefix: str, progress_id: str) -> str:
-    """The worker-owned chain record whose active generation fences ingress."""
-
-    return f"{key_prefix}:progress:{progress_id}"
-
-
-def rate_key(key_prefix: str, token: str) -> str:
-    """The token's rate bucket, named by a digest so the token is never stored."""
-
-    digest = hashlib.sha256(token.encode()).hexdigest()[:32]
-    return f"{key_prefix}:progress:rate:{digest}"
 
 
 def inbox_fields(body: TurnProgressBody) -> dict[str, str]:

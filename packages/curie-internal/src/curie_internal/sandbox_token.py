@@ -13,9 +13,8 @@ extra claims (ADR-0188: ``binding``, ``memory``, ``sender``, ``turn``) that narr
 what the api lets it do. ``verify`` checks only the core claims; ``decode``
 returns the whole verified payload so the api can read the rest.
 
-This module is duplicated byte-identically in ``apps/api`` and ``apps/worker``
-(they share no internal library and the contract packages are frozen); a
-committed byte-identical-source test keeps the two copies from drifting.
+API verification and worker minting import this single implementation from
+the shared internal package. The frozen protocol packages remain independent.
 """
 
 from __future__ import annotations

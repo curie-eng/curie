@@ -13,13 +13,7 @@ import uuid
 from datetime import UTC, datetime
 
 import redis.asyncio as redis
-
-KILL_KEY_PREFIX = "curie:kill:"
-KILL_CHANNEL = "curie:kill-events"
-
-
-def kill_key(agent_id: uuid.UUID) -> str:
-    return f"{KILL_KEY_PREFIX}{agent_id}"
+from curie_internal.keyspace import KILL_CHANNEL, kill_key
 
 
 class KillSwitch:

@@ -5,6 +5,7 @@ description = "Relay (Curie) monorepo workspace root"
 requires-python = ">=3.13"
 dependencies = [
     "aci-protocol",
+    "curie-internal",
     "curie-channel-protocol",
     "curie-telemetry-schema",
     "plugin-format",
@@ -24,6 +25,7 @@ package = false
 [tool.uv.workspace]
 members = [
     "packages/aci-protocol",
+    "packages/curie-internal",
     "packages/channel-protocol",
     "packages/plugin-format",
     "packages/telemetry-schema",
@@ -42,6 +44,7 @@ members = [
 
 [tool.uv.sources]
 aci-protocol = { workspace = true }
+curie-internal = { workspace = true }
 curie-channel-protocol = { workspace = true }
 curie-telemetry-schema = { workspace = true }
 plugin-format = { workspace = true }
@@ -80,6 +83,7 @@ dev = [
 # The platform, frozen contracts, harness port and approval gate stay SDK free.
 root_packages = [
     "curie_api",
+    "curie_internal",
     "curie_worker",
     "curie_connector_proxy",
     "curie_dispatcher",
@@ -289,6 +293,7 @@ namespace_packages = true
 explicit_package_bases = true
 mypy_path = [
     "packages/aci-protocol/src",
+    "packages/curie-internal/src",
     "packages/channel-protocol/src",
     "packages/plugin-format/src",
     "packages/telemetry-schema/src",
@@ -306,6 +311,7 @@ mypy_path = [
 ]
 files = [
     "packages/aci-protocol/src",
+    "packages/curie-internal/src",
     "packages/channel-protocol/src",
     "packages/plugin-format/src",
     "packages/telemetry-schema/src",

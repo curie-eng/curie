@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 import redis.asyncio as redis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
+from curie_internal.keyspace import GITHUB_REVIEW_HELD_INDEX, GITHUB_REVIEW_KEY_PREFIX, done_key
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
 from sqlalchemy import func, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
@@ -323,7 +324,7 @@ async def validate_stored_context(
 # Held feedback lives in Valkey, not SQL, so the stable train needs no
 # migration (#2962). Losing Valkey loses held reviews, which degrades to the
 # pre-#2962 behavior: that review is never admitted and must be re-posted.
-_HELD_INDEX = "curie:github-review:held"
+_HELD_INDEX = GITHUB_REVIEW_HELD_INDEX
 
 
 def _held_key(event_id: str) -> str:
@@ -593,7 +594,7 @@ class GitHubReviewReconciler:
                             if not await take_backlog_slot(
                                 self._valkey,
                                 reservation=backlog_reservation(
-                                    key_prefix=f"curie:github-review:backlog:{row.binding_id}",
+                                    key_prefix=f"{GITHUB_REVIEW_KEY_PREFIX}:backlog:{row.binding_id}",
                                     window_s=self._settings.channel_binding_backlog_window_s,
                                 ),
                                 limit=self._settings.channel_binding_backlog_limit,
@@ -604,7 +605,7 @@ class GitHubReviewReconciler:
                             row.quota_taken = True
                         _, receipt = await enqueue_owned(
                             self._valkey,
-                            key=f"curie:github-review:{row.event_id}",
+                            key=f"{GITHUB_REVIEW_KEY_PREFIX}:{row.event_id}",
                             stream=self._settings.runs_stream,
                             # Lua preserves its preceding SET if XADD fails.
                             # Reuse this row's owner so a retry can finish that
@@ -720,7 +721,7 @@ class GitHubReviewReconciler:
                 # The worker retains this marker without expiry until SQL has
                 # committed the failure, so a slow observer cannot lose it.
                 await self._valkey.expire(
-                    f"{self._settings.worker_key_prefix}:done:{candidate}",
+                    done_key(self._settings.worker_key_prefix, candidate),
                     _WORKER_DONE_RETENTION_S,
                 )
         await self._retry_history_capacity_notices(event_id)
@@ -752,7 +753,7 @@ class GitHubReviewReconciler:
                 (candidates[-1][1], candidates[-1][0]) if len(candidates) == 100 else None
             )
         for candidate, _created_at, error_code in candidates:
-            key = f"{self._settings.worker_key_prefix}:done:{candidate}"
+            key = done_key(self._settings.worker_key_prefix, candidate)
             async with self._valkey.pipeline(transaction=False) as pipe:
                 pipe.get(key)
                 pipe.ttl(key)

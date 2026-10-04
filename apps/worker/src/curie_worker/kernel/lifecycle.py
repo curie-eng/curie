@@ -14,9 +14,9 @@ from aci_protocol import (
 from channel_protocol.reply import (
     NavAffordance,
 )
+from curie_internal import sandbox_token
 from opentelemetry.trace import SpanKind, StatusCode
 
-from .. import sandbox_token
 from ..behaviorpacks import (
     BehaviorPacks,
 )

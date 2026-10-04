@@ -24,6 +24,7 @@ from aci_protocol import (
     derive_dead_letter_stream_name,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_internal.keyspace import WORKER_KEY_PREFIX_DEFAULT
 from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -322,7 +323,7 @@ class Settings(BaseSettings):
     # Terminal review reconciliation reads the worker's completion/dead-letter
     # keyspace. Match WorkerConfig's actual legacy environment contract:
     # KEY_PREFIX overrides it; CURIE_KEY_PREFIX deliberately does not.
-    worker_key_prefix: str = Field(default="curie:worker", validation_alias="KEY_PREFIX")
+    worker_key_prefix: str = Field(default=WORKER_KEY_PREFIX_DEFAULT, validation_alias="KEY_PREFIX")
     # The Helm installation the worker's upgrade quiesce marker is scoped to
     # (#2374, mirrored from WorkerConfig.installation_id). Blank is standalone
     # or Compose, which use the legacy release-wide key.

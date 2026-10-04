@@ -4,6 +4,7 @@ import json
 from typing import Any, Literal
 
 import redis.asyncio as redis
+from curie_internal.keyspace import completion_key, done_key
 
 from .config import Settings
 
@@ -19,8 +20,8 @@ async def worker_event_terminal_outcome(
     fence, and the independently retained completion-outbox flag.
     """
     async with valkey.pipeline(transaction=False) as pipe:
-        pipe.get(f"{settings.worker_key_prefix}:done:{event_id}")
-        pipe.hget(f"{settings.worker_key_prefix}:completion:{event_id}", "done")
+        pipe.get(done_key(settings.worker_key_prefix, event_id))
+        pipe.hget(completion_key(settings.worker_key_prefix, event_id), "done")
         marker, flag = await pipe.execute()
     if marker in ("history_capacity", b"history_capacity"):
         return "history_capacity"

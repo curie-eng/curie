@@ -52,6 +52,11 @@ from aci_protocol.service_config import (
     warn_if_deprecated_api_url_env,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_internal.keyspace import (
+    ADMISSION_KEY_PREFIX_DEFAULT,
+    DEDUPE_KEY_PREFIX_DEFAULT,
+    THREAD_CONTEXT_KEY_PREFIX_DEFAULT,
+)
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
@@ -127,7 +132,7 @@ class DispatcherConfig(BaseSettings):
 
     stream: str = Field(default=RUNS_STREAM_DEFAULT, validation_alias=STREAM_ENV)
     dedupe_prefix: str = Field(
-        default="curie:dedupe:", validation_alias="CURIE_DEDUPE_PREFIX"
+        default=DEDUPE_KEY_PREFIX_DEFAULT, validation_alias="CURIE_DEDUPE_PREFIX"
     )
     dedupe_ttl_seconds: int = Field(
         default=3600, validation_alias="CURIE_DEDUPE_TTL_SECONDS"
@@ -184,7 +189,7 @@ class DispatcherConfig(BaseSettings):
     # same reason `dedupe_prefix` is one: two installs sharing a Valkey must not
     # read each other's answers.
     admission_cache_prefix: str = Field(
-        default="curie:admission:", validation_alias="CURIE_ADMISSION_CACHE_PREFIX"
+        default=ADMISSION_KEY_PREFIX_DEFAULT, validation_alias="CURIE_ADMISSION_CACHE_PREFIX"
     )
 
     # @spec slack-alert-followup-context: Context cache and restart behavior.
@@ -192,7 +197,7 @@ class DispatcherConfig(BaseSettings):
     # context a later reply needs; a prefix so two installs sharing a Valkey
     # never read each other's. The retention matches the idle transcript window.
     thread_context_cache_prefix: str = Field(
-        default="curie:slack-root-context:",
+        default=THREAD_CONTEXT_KEY_PREFIX_DEFAULT,
         validation_alias="CURIE_THREAD_CONTEXT_CACHE_PREFIX",
     )
     thread_context_ttl_seconds: int = Field(

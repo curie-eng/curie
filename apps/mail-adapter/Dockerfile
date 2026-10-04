@@ -24,6 +24,7 @@ ENV UV_COMPILE_BYTECODE=1 \
 # dependencies without building any workspace member.
 COPY pyproject.toml uv.lock ./
 COPY packages/aci-protocol/pyproject.toml packages/aci-protocol/
+COPY packages/curie-internal/pyproject.toml packages/curie-internal/
 COPY packages/channel-protocol/pyproject.toml packages/channel-protocol/
 COPY packages/plugin-format/pyproject.toml packages/plugin-format/
 COPY packages/telemetry-schema/pyproject.toml packages/telemetry-schema/

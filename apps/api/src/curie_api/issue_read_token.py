@@ -13,10 +13,9 @@ import time
 import uuid
 from typing import Literal
 
+from curie_internal import sandbox_token
+from curie_internal.sandbox_token import b64url, b64url_decode
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-
-from curie_api import sandbox_token
-from curie_api.sandbox_token import b64url, b64url_decode
 
 _PREFIX = "wir"
 

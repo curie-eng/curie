@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass
 from typing import Literal
 
-from curie_api.sandbox_token import b64url, b64url_decode, signature
+from curie_internal.sandbox_token import b64url, b64url_decode, signature
 
 _PREFIX = "apr"
 APPROVE_SCOPE = "approval.resolve"

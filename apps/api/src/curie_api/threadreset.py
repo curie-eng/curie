@@ -12,12 +12,9 @@ This is a lightweight signal, not a pub/sub channel like the kill switch
 (``killswitch.py``): a thread-reset request is a one-shot administrative
 action with no live "is this still requested" state to gate a running turn on,
 so a Valkey SET the worker's existing maintenance tick drains is enough -- no
-new subscriber process, no new lifecycle to manage. ``THREAD_RESET_SET`` is
-duplicated verbatim in ``apps/worker/src/curie_worker/consumer.py`` (the
-worker's own copy), the same cross-service-constant pattern the kill switch
-already uses (`apps/worker/src/curie_worker/killswitch.py`'s
-``KILL_KEY_PREFIX``/``KILL_CHANNEL`` mirror this module's) since neither
-service imports the other's package.
+new subscriber process, no new lifecycle to manage. Key names come from the
+shared internal keyspace. The ownership protected worker consumer retains its
+existing declarations, checked against that canonical keyspace by the vectors.
 
 Completion is observed across TWO sets, not one (#812). ``is_pending`` -- which
 the CLI's ``reset-thread`` poll gates its "sandbox released" report on -- must
@@ -33,29 +30,11 @@ leaving a wrong key indistinguishable from a working reset.
 """
 
 import redis.asyncio as redis
-
-# Frozen with the worker and CLI copies in tests/vectors/thread-reset-set.json.
-THREAD_RESET_SET = "curie:thread-reset-requests"
-
-# Claimed-but-not-yet-released requests (#812). The worker SPOPs a request off
-# ``THREAD_RESET_SET`` (the atomic claim) and moves it here for the duration of
-# ``release_thread``, clearing it only once the release actually lands. This
-# module reads the UNION of both sets in ``is_pending`` so the observable "reset
-# outstanding" signal the CLI polls on flips to done only when the sandbox is
-# truly released -- not at claim time, and not at all if the release fails or
-# times out (the worker leaves the key here). Duplicated verbatim in
-# ``apps/worker/src/curie_worker/consumer.py`` (the worker's own copy), the
-# same cross-service-constant pattern as ``THREAD_RESET_SET``.
-THREAD_RESET_INFLIGHT_SET = "curie:thread-reset-inflight"
-
-# Outcome of a drained reset (#3699): this prefix plus the thread key holds
-# ``released`` when the worker found a route to release and ``no-route`` when the
-# key matched none, so nothing was released. The worker writes it before it clears
-# the in-progress marker and lets it expire after an hour; ``request`` deletes it
-# so a fresh request never reads an earlier reset's outcome. Frozen with the
-# worker copy (``apps/worker/src/curie_worker/consumer.py``) in
-# tests/vectors/thread-reset-set.json.
-THREAD_RESET_RESULT_PREFIX = "curie:thread-reset-result:"
+from curie_internal.keyspace import (
+    THREAD_RESET_INFLIGHT_SET,
+    THREAD_RESET_RESULT_PREFIX,
+    THREAD_RESET_SET,
+)
 
 
 class ThreadResetRequests:

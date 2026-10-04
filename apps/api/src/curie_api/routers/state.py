@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, NoReturn
 
 import redis.asyncio as redis
+from curie_internal import sandbox_token
 from curie_telemetry import record_metric
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from sqlalchemy import Text, cast, delete, func, select, text
@@ -41,7 +42,7 @@ from curie_api.schemas.state import (
     StateNamespaceOut,
 )
 
-from .. import sandbox_token, state_mutation, threadkeys, transcripts
+from .. import state_mutation, threadkeys, transcripts
 from ..auth import require_internal_worker_token, verify_platform_key
 from ..config import get_settings
 from ..deps import SessionDep

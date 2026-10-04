@@ -47,6 +47,7 @@ from aci_protocol import (
     ReplyHandle,
     TurnSource,
 )
+from curie_internal.keyspace import CHANNEL_KEY_PREFIX
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     inject_trace_context,
@@ -114,7 +115,6 @@ _AUTH_DETAIL = "missing or invalid credential"
 # `(channel_id, delivery_id)` and never `delivery_id` alone, so two adapters
 # sharing an upstream id space -- two AgentMail inboxes, two webhook sources --
 # cannot swallow each other's turns (E16).
-_CLAIM_PREFIX = "curie:channel"
 
 # The 403 a refused caller earns at the channel port (ADR 0175 decision 2). The
 # adapter has already proved it speaks for this binding, so saying "refused"
@@ -441,7 +441,7 @@ def _event_id(channel_id: uuid.UUID, digest: str) -> str:
 
 
 def _claim_key(channel_id: uuid.UUID, digest: str) -> str:
-    return f"{_CLAIM_PREFIX}:delivery:{channel_id}:{digest}"
+    return f"{CHANNEL_KEY_PREFIX}:delivery:{channel_id}:{digest}"
 
 
 def _verify_credential(x_api_key: str | None) -> channel_token.ChannelClaims | None:
@@ -697,7 +697,7 @@ async def ingest_turn(
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
 
     reservation = backlog_reservation(
-        key_prefix=f"{_CLAIM_PREFIX}:backlog:{row.id}",
+        key_prefix=f"{CHANNEL_KEY_PREFIX}:backlog:{row.id}",
         window_s=settings.channel_binding_backlog_window_s,
     )
     preserve_quota = False
