@@ -43,10 +43,6 @@
     "schema_head": "0073",
     "schema_min": "0070"
   },
-  "0.12.1": {
-    "schema_head": "0075",
-    "schema_min": "0070"
-  },
   "0.8.0": {
     "schema_head": "0036",
     "schema_min": "0001"
