@@ -38,8 +38,8 @@ from typing import Annotated
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
 
 from .. import crud
-from ..approval_auth import CONSOLE_SESSION_COOKIE, set_console_session_cookie
-from ..auth import require_platform_key
+from ..approval_auth import set_console_session_cookie
+from ..auth import CONSOLE_SESSION_COOKIE, require_platform_key
 from ..deps import SessionDep
 from ..rate_limit import require_rate_limit
 from ..schemas import (
