@@ -3665,6 +3665,7 @@ enum ControllerOwnership {
 
 struct ControllerHealth {
     healthy: bool,
+    desired: u64,
     detail: String,
 }
 
@@ -3922,6 +3923,15 @@ fn controller_health(deployment: &serde_json::Value) -> ControllerHealth {
     let available_replicas = deployment
         .pointer("/status/availableReplicas")
         .and_then(|value| value.as_u64());
+    let updated = deployment
+        .pointer("/status/updatedReplicas")
+        .and_then(|value| value.as_u64());
+    let generation = deployment
+        .pointer("/metadata/generation")
+        .and_then(|value| value.as_u64());
+    let observed = deployment
+        .pointer("/status/observedGeneration")
+        .and_then(|value| value.as_u64());
     let available = deployment
         .pointer("/status/conditions")
         .and_then(|value| value.as_array())
@@ -3932,42 +3942,82 @@ fn controller_health(deployment: &serde_json::Value) -> ControllerHealth {
                     .flatten()
             })
         });
+    let current = generation.is_some()
+        && observed == generation
+        && updated.is_some_and(|count| count >= desired);
     let healthy = desired >= 1
         && ready.is_some_and(|count| count >= desired)
         && available_replicas.is_some_and(|count| count >= desired)
-        && available == Some("True");
+        && available == Some("True")
+        && current;
     let ready_text = ready
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "missing".to_string());
+    let observed_text = observed
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "missing".to_string());
+    let generation_text = generation
         .map(|count| count.to_string())
         .unwrap_or_else(|| "missing".to_string());
     ControllerHealth {
         healthy,
+        desired,
         detail: format!(
-            "Available is {} and readyReplicas is {ready_text} of {desired}",
+            "Available is {} and readyReplicas is {ready_text} of {desired}; observedGeneration is {observed_text} of generation {generation_text}",
             available.unwrap_or("missing")
         ),
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '@')
+    }) {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn kubectl_repair_prefix() -> String {
+    match std::env::var("HELM_KUBECONTEXT") {
+        Ok(context) if !context.is_empty() => format!(
+            "kubectl --context {} -n {CONTROLLER_DEPLOYMENT_NAMESPACE}",
+            shell_quote(&context)
+        ),
+        _ => format!("kubectl -n {CONTROLLER_DEPLOYMENT_NAMESPACE}"),
     }
 }
 
 fn unowned_controller_conflict(
     observed_image: Option<&str>,
     required: &str,
-    health: &str,
+    health: &ControllerHealth,
 ) -> anyhow::Error {
     let observed = observed_image.unwrap_or("missing");
     let image_matches = observed_image.is_some_and(|image| images_compatible(image, required));
-    let set_image = format!(
-        "kubectl -n {CONTROLLER_DEPLOYMENT_NAMESPACE} set image deployment/{CONTROLLER_DEPLOYMENT_NAME} {CONTROLLER_DEPLOYMENT_NAME}={required}"
+    let kubectl = kubectl_repair_prefix();
+    let mut steps = Vec::new();
+    if !image_matches {
+        steps.push(format!(
+            "{kubectl} set image deployment/{CONTROLLER_DEPLOYMENT_NAME} {CONTROLLER_DEPLOYMENT_NAME}={required}"
+        ));
+    }
+    if health.desired < 1 {
+        steps.push(format!(
+            "{kubectl} scale deployment/{CONTROLLER_DEPLOYMENT_NAME} --replicas=1"
+        ));
+    }
+    steps.push(format!(
+        "{kubectl} rollout status deployment/{CONTROLLER_DEPLOYMENT_NAME}"
+    ));
+    let fix = format!(
+        "{}, then rerun `curie factory quickstart`",
+        steps.join(" && ")
     );
-    let rollout = format!(
-        "kubectl -n {CONTROLLER_DEPLOYMENT_NAMESPACE} rollout status deployment/{CONTROLLER_DEPLOYMENT_NAME}"
-    );
-    let fix = if image_matches {
-        format!("{rollout}, then rerun `curie factory quickstart`")
-    } else {
-        format!("{set_image} && {rollout}, then rerun `curie factory quickstart`")
-    };
     let message = format!(
-        "Deployment `{CONTROLLER_DEPLOYMENT_NAME}` in namespace `{CONTROLLER_DEPLOYMENT_NAMESPACE}` cannot be reused: image is `{observed}` and this chart requires `{required}`; {health}. {fix}"
+        "Deployment `{CONTROLLER_DEPLOYMENT_NAME}` in namespace `{CONTROLLER_DEPLOYMENT_NAMESPACE}` cannot be reused: image is `{observed}` and this chart requires `{required}`; {}. {fix}",
+        health.detail
     );
     crate::exit::CliError::failure(message).with_fix(fix).into()
 }
@@ -4042,7 +4092,7 @@ async fn reconcile_controller_ownership(
                 Err(unowned_controller_conflict(
                     observed.as_deref(),
                     &required,
-                    &health.detail,
+                    &health,
                 ))
             }
         }
