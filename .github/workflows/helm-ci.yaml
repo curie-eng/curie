@@ -5,60 +5,14 @@ name: Helm CI
 # job gives the chart the CI it otherwise lacks -- lint, render every shipped
 # values overlay, and schema-validate the rendered manifests.
 on:
-  # Push runs for every releasable commit because release authorization
-  # requires this check. Pull requests remain filtered to chart changes.
+  # Pull requests to main and next always start this workflow so the chart
+  # aggregator can report. chart-changes decides whether the shards run,
+  # using the historical path list in tools/helm-ci-gate/decide.py. Pushes
+  # stay unfiltered in effect because select treats push as chart-relevant.
   push:
     branches: [main, next]
   pull_request:
     branches: [main, next]
-    paths:
-      - "charts/curie/**"
-      - "examples/sre-bot/**"
-      - ".github/workflows/helm-ci.yaml"
-      - ".github/workflows/ci.yaml"
-      - ".github/workflows/release.yaml"
-      # The Chart job below is the only CI run of the chart assertion
-      # scripts, and several read or EXECUTE repository code outside charts/: the object-store web-identity and threaded bot allowlist gates
-      # import the real api, worker, and dispatcher config through `uv run`;
-      # upgrade-retained-scalar builds and runs the CLI with cargo against a
-      # Python driver under cli/tests/data; observability-stack and
-      # worker-ttl-bounds cross-check cli/src and cli/scripts; render reads the
-      # generated aci-protocol bindings; security-probe runs scripts/; and the
-      # image-pin gates read the compose files; and mail-adapter-wiring reads
-      # the ci.yaml and release.yaml image build matrices. A PR that breaks one of those
-      # without touching charts/ must still run this workflow, or the gate
-      # that exists to catch it is skipped. Whole trees are listed rather than
-      # single files so a new script reading a new file cannot silently fall
-      # outside the filter.
-      - "cli/**"
-      - "apps/api/**"
-      - "apps/worker/**"
-      - "apps/dispatcher/**"
-      - "packages/**"
-      - "scripts/**"
-      - "uv.lock"
-      - "pyproject.toml"
-      - "compose.yaml"
-      - "compose.dev.yaml"
-      # Third obligation, and the one this gate exists for (#2741): the
-      # retained-values scalar gate below BUILDS AND EXECUTES the real CLI
-      # against the recorded upgrade boundary, so its subject is Rust and its
-      # driver is a Python stub -- neither of them under charts/. Without these
-      # entries, a PR that reverts the JSON re-serializer and puts the YAML 1.2
-      # emitter back matches nothing in this filter, the helm job is skipped,
-      # and the gate that exists to catch exactly that revert never runs.
-      - "cli/src/ops/upgrade.rs"
-      - "cli/tests/data/upgrade-driver.py"
-      # Fourth obligation, the first gate's shape: the Slack identities gate
-      # (ADR-0168 decision 1) feeds the rendered declaration through this
-      # parser, which the API, worker and dispatcher config all import, and
-      # the worker's env through the sandbox filter. The parser reads the
-      # default identity's name and the reserved delivery selector from
-      # turn.py. A PR that loosens any of them must still run it.
-      - "packages/aci-protocol/src/aci_protocol/slack_identities.py"
-      - "packages/aci-protocol/src/aci_protocol/turn.py"
-      - "apps/worker/src/curie_worker/sandbox/types.py"
-      - "compose/**"
 
 permissions:
   contents: read
@@ -71,6 +25,22 @@ env:
   KUBECONFORM_VERSION: v0.6.7
 
 jobs:
+  chart-changes:
+    name: Detect chart-relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      chart: ${{ steps.filter.outputs.chart }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: python3 tools/helm-ci-gate/decide.py select
+
   # The chart gate runs as parallel shards. The render assertions used to be
   # one serial job of roughly nine minutes, dominated by the retained-values
   # step that builds the CLI; each shard now repeats the cheap tool setup and
@@ -79,6 +49,8 @@ jobs:
   chart-lint-and-assertions-1:
     name: Chart lint, kubeconform, and render assertions (1 of 3)
     runs-on: ubuntu-latest
+    needs: [chart-changes]
+    if: ${{ needs.chart-changes.outputs.chart == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -443,6 +415,8 @@ jobs:
   chart-assertions-2:
     name: Chart render assertions (2 of 3)
     runs-on: ubuntu-latest
+    needs: [chart-changes]
+    if: ${{ needs.chart-changes.outputs.chart == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1002,6 +976,8 @@ jobs:
   chart-assertions-retained-values:
     name: Chart render assertions (3 of 3, retained values through the real CLI)
     runs-on: ubuntu-latest
+    needs: [chart-changes]
+    if: ${{ needs.chart-changes.outputs.chart == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1054,26 +1030,32 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/upgrade-retained-scalar-assertions.sh
 
-  # The required check name the release gate reads (release/authorize.py).
-  # It carries no job-level `if:` (#1470): when any shard fails this job is
-  # skipped, and the release gate refuses a skipped required check, so a
-  # failing shard still blocks a release exactly as a failing step did when
-  # the shards were one job.
   helm:
     name: Chart (lint + template + kubeconform)
     runs-on: ubuntu-latest
-    needs: [chart-lint-and-assertions-1, chart-assertions-2, chart-assertions-retained-values]
+    needs: [chart-changes, chart-lint-and-assertions-1, chart-assertions-2, chart-assertions-retained-values]
+    # A completed run must record this check as success or failure. A
+    # condition that can be false would mark it skipped and block release
+    # authorization (#1470). Cancellation is the only skip.
+    if: ${{ !cancelled() }}
     steps:
-      - name: Every chart shard passed
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Require shard outcomes
         env:
-          NEEDS: ${{ toJSON(needs) }}
-        run: |
-          set -euo pipefail
-          echo "$NEEDS" | jq -e '[.[].result] | all(. == "success")'
+          CHANGES_RESULT: ${{ needs.chart-changes.result }}
+          CHART: ${{ needs.chart-changes.outputs.chart }}
+          SHARD_LINT: ${{ needs.chart-lint-and-assertions-1.result }}
+          SHARD_RENDER: ${{ needs.chart-assertions-2.result }}
+          SHARD_RETAINED: ${{ needs.chart-assertions-retained-values.result }}
+        run: python3 tools/helm-ci-gate/decide.py aggregate
 
   reserved-env-upgrade:
     name: Reject legacy extraEnv before upgrade mutation
     runs-on: ubuntu-latest
+    needs: [chart-changes]
+    if: ${{ needs.chart-changes.outputs.chart == 'true' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7

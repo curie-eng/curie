@@ -1304,16 +1304,12 @@ class TestHelmCiWorkflowTriggers:
         assert "paths" not in triggers["push"]
         assert "paths-ignore" not in triggers["push"]
         assert triggers["pull_request"]["branches"] == ["main", "next"]
-        # The non-chart trees are not strays to tidy up: helm-ci's Chart job
-        # is the only CI run of charts/curie/ci/, and those scripts read or
-        # execute code in each of these trees (the api, worker, and
-        # dispatcher config through `uv run`, the CLI through cargo, the
-        # aci-protocol bindings, scripts/, the compose files, the ci.yaml and
-        # release.yaml image matrices). A PR touching
-        # only one of them must still match this filter or the gate that
-        # exists to catch it never runs. The explicit files below are also
-        # executed by gates that live outside their owning trees.
-        assert triggers["pull_request"]["paths"] == [
+        assert "paths" not in triggers["pull_request"]
+        assert "paths-ignore" not in triggers["pull_request"]
+        # Those trees are executed by the chart scripts. The list now lives
+        # in CHART_PATHS, and a pull request that touches one must still
+        # select the chart run.
+        assert _load_helm_decide().CHART_PATHS == (
             "charts/curie/**",
             "examples/sre-bot/**",
             ".github/workflows/helm-ci.yaml",
@@ -1335,13 +1331,13 @@ class TestHelmCiWorkflowTriggers:
             "packages/aci-protocol/src/aci_protocol/turn.py",
             "apps/worker/src/curie_worker/sandbox/types.py",
             "compose/**",
-        ]
+        )
 
     def test_a_cli_only_change_runs_the_chart_scripts(self):
         # The Rust job no longer runs the chart scripts, so a CLI-only PR
         # that breaks upgrade-retained-scalar or observability-stack is
         # caught only if helm-ci's filter matches it.
-        paths = yaml.safe_load(HELM_CI_YAML.read_text())[True]["pull_request"]["paths"]
+        paths = _load_helm_decide().CHART_PATHS
         for changed in (
             "cli/src/ops/upgrade.rs",
             "cli/src/examples.rs",
@@ -1567,29 +1563,47 @@ class TestLegitimateSkips:
 
 
 class TestHelmCiJobsCarryNoJobLevelIf:
-    """No helm-ci.yaml job may carry a job-level `if:` (#1470).
+    """A conditional if on helm skips the required check name on a releasable push.
 
-    A job-level `if:` on the `helm` job makes GitHub record
-    `Chart (lint + template + kubeconform)` -- a required check name -- with
-    `conclusion: skipped` on every releasable push. The gate now refuses a
-    skipped required check, so every release would be blocked with the chart
-    never rendered; before that change it silently AUTHORIZED instead, which is
-    strictly worse. Either way the job must simply run on push.
-
-    `TestHelmCiWorkflowTriggers` pins the trigger-level route into the same
-    hole (a filtered `push:` trigger produces no check-run at all); this pins
-    the job-level route. Asserted over every job in the workflow, not just
-    `helm`, so a future job added there is covered without editing this test.
+    After #1470 the gate refuses a skipped required check, so that skip blocks
+    every release. helm's if must be exactly `${{ !cancelled() }}` so a
+    completed run cannot record the required check as skipped. chart-changes
+    has no if. The four gated jobs use exactly
+    `${{ needs.chart-changes.outputs.chart == 'true' }}`. Any other job-level
+    if fails the test.
     """
 
-    def test_no_helm_ci_job_declares_a_job_level_if(self):
-        doc = yaml.safe_load(HELM_CI_YAML.read_text())
-        conditional = sorted(
-            job_id for job_id, job in doc["jobs"].items() if "if" in job
+    GATED = (
+        "chart-lint-and-assertions-1",
+        "chart-assertions-2",
+        "chart-assertions-retained-values",
+        "reserved-env-upgrade",
+    )
+    GATED_IF = "${{ needs.chart-changes.outputs.chart == 'true' }}"
+
+    def test_only_the_chart_gate_ifs_are_allowed(self):
+        jobs = yaml.safe_load(HELM_CI_YAML.read_text())["jobs"]
+
+        assert "if" not in jobs["chart-changes"]
+        assert jobs["helm"]["if"] == "${{ !cancelled() }}"
+        for job_id in self.GATED:
+            assert jobs[job_id]["if"] == self.GATED_IF
+        extra = sorted(
+            job_id
+            for job_id, job in jobs.items()
+            if "if" in job and job_id not in {"helm", *self.GATED}
+        )
+        assert not extra, (
+            "helm-ci.yaml job(s) carry an unexpected job-level if, which can "
+            f"skip the required chart check and block every release: {extra}"
         )
 
-        assert not conditional, (
-            "helm-ci.yaml job(s) carry a job-level `if:`, which makes their "
-            "check-run `skipped` on releasable pushes and blocks every release "
-            f"with the chart never rendered: {conditional}"
-        )
+
+def _load_helm_decide():
+    """Import the chart gate by path. Do not name the module `select`."""
+    path = REPO_ROOT / "tools" / "helm-ci-gate" / "decide.py"
+    spec = importlib.util.spec_from_file_location("helm_ci_gate_decide", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module

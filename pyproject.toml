@@ -222,6 +222,7 @@ testpaths = [
     "tools/ci-retry-gate/tests",
     "tools/ci-workflow-paths/tests",
     "tools/e2e-ci-selection/tests",
+    "tools/helm-ci-gate/tests",
     "tools/fix-pin-ci/tests",
     "tools/sdk-lock-gate/tests",
     "tools/close-on-next/tests",
