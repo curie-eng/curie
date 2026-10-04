@@ -19,9 +19,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.util
+import io
 import json
 import re
+import socket
+import ssl
+import subprocess
 import sys
+import tarfile
+import time
 import uuid
 from collections.abc import Iterator
 from datetime import datetime, timedelta
@@ -31,6 +38,8 @@ from typing import Any
 import httpx
 import pytest
 import redis
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -1882,3 +1891,434 @@ def test_a_dropped_rerun_response_is_not_posted_again(admitted: Any) -> None:
 
     assert sink.reruns == [job_id]
     assert _ci_turns(published["id"]) == []
+
+
+@pytest.fixture
+def recorded_github(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_db: None
+) -> Iterator[tuple[Any, Any, dict[str, Any]]]:
+    """Keep every factory component real, substituting only GitHub's HTTPS API."""
+
+    from curie_api.main import create_app
+    from fastapi.testclient import TestClient
+    from test_factory_terminus import _clear_ci_keys
+
+    stub_root = Path(__file__).resolve().parents[3] / "tools" / "github-stub"
+    recording = json.loads((stub_root / "recordings" / "curie-pr-3400.json").read_text())
+    spec = importlib.util.spec_from_file_location(
+        "factory_replay_github_stub", stub_root / "github_stub.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    stub = module.GithubStub(tmp_path, recording)
+    stream = f"test:curie:github-replay:{uuid.uuid4().hex}"
+    app_key = (
+        rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode()
+    )
+    try:
+        stub.start()
+        environment = {
+            "GITHUB_API_URL": stub.base_url,
+            "SSL_CERT_FILE": str(stub.ca_file),
+            "GITHUB_APP_ID": "51",
+            "GITHUB_APP_PRIVATE_KEY": app_key,
+            "GITHUB_WEBHOOK_SECRET": "example-factory-hmac-secret",
+            "GITHUB_REPO_ALLOWLIST": '["acme-corp/*"]',
+            "GITHUB_TOKEN": "",
+            "GITHUB_FACTORY_INGRESS_ENABLED": "true",
+            "GITHUB_FACTORY_INTAKE": "webhook",
+            "GITHUB_FACTORY_LABEL": LABEL,
+            "GITHUB_FACTORY_MENTION": "curie",
+            "GITHUB_REVIEW_INGRESS_ENABLED": "false",
+            "GITHUB_FACTORY_CI_WAIT_S": "3600",
+            "CURIE_WORK_ITEM_RECONCILER_ENABLED": "false",
+            "RESUME_RECONCILER_ENABLED": "false",
+            "APPROVAL_SWEEP_INTERVAL_S": "0",
+            "DEAD_LETTER_WATCH_INTERVAL_S": "0",
+            "RUNS_STREAM": stream,
+            "INTERNAL_WORKER_TOKEN": "factory-terminus-worker",
+            "GITHUB_FACTORY_PYTHON_CI": json.dumps(
+                {
+                    REPO: {
+                        "check": "Python (ruff + mypy + pytest)",
+                        "paths": ["apps/api"],
+                        "pendingCheckPrefix": "Python pytest (shard ",
+                    }
+                }
+            ),
+        }
+        for key, value in environment.items():
+            monkeypatch.setenv(key, value)
+        get_settings.cache_clear()
+        with TestClient(create_app()) as client:
+            created = client.post(
+                "/agents",
+                headers={"X-API-Key": get_settings().api_key},
+                json={
+                    "name": f"acme-replay-{uuid.uuid4().hex[:8]}",
+                    "repo_full_name": REPO,
+                    "channel": {"kind": "github", "address": REPO},
+                },
+            )
+            assert created.status_code == 201, created.text
+            yield client, stub, recording
+    finally:
+        try:
+            _clear_ci_keys()
+            valkey = redis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
+            try:
+                valkey.delete(stream)
+            finally:
+                valkey.close()
+        finally:
+            stub.close()
+            get_settings.cache_clear()
+
+
+def _published_stub_pull(stub: Any, tmp_path: Path) -> dict[str, Any]:
+    """Publish an actual Git branch before attaching its provider pull request."""
+
+    import os
+
+    from curie_api.github_app import credentials_for
+
+    token = credentials_for(get_settings()).token_for_verified_installation(REPO, 5501)
+    env = {**os.environ, "GIT_SSL_CAINFO": str(stub.ca_file), "GIT_TERMINAL_PROMPT": "0"}
+    checkout = tmp_path / "publication"
+
+    def git(*args: str, cwd: Path = tmp_path) -> None:
+        completed = subprocess.run(
+            ["git", "-c", f"http.extraHeader=Authorization: Bearer {token}", *args],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert completed.returncode == 0, "owned publication Git command failed"
+
+    git("clone", stub.clone_url, str(checkout))
+    git("checkout", "-b", "factory/replay", cwd=checkout)
+    changed = checkout / "apps" / "api" / "src" / "example.py"
+    changed.parent.mkdir(parents=True)
+    changed.write_text("EXAMPLE = 1\n")
+    git("add", "apps/api/src/example.py", cwd=checkout)
+    git(
+        "-c",
+        "user.name=Example Author",
+        "-c",
+        "user.email=author@example.com",
+        "commit",
+        "-m",
+        "Add example API change",
+        cwd=checkout,
+    )
+    git("push", "origin", "HEAD:refs/heads/factory/replay", cwd=checkout)
+    with httpx.Client(
+        verify=ssl.create_default_context(cafile=str(stub.ca_file)),
+        headers={"Authorization": f"Bearer {token}"},
+        trust_env=False,
+    ) as github:
+        response = github.post(
+            f"{stub.base_url}/repos/{REPO}/pulls",
+            json={
+                "title": "Example publication",
+                "body": "An example change.",
+                "head": "factory/replay",
+                "base": "main",
+            },
+        )
+    assert response.status_code == 201, response.text
+    return dict(response.json())
+
+
+def test_recorded_github_timeline_waits_for_python_aggregate_through_the_factory_gate(
+    recorded_github: tuple[Any, Any, dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    """Replay #3400's observed lifecycle through HTTP, SQL and the real Valkey.
+
+    The recording contains completed-run timestamps returned by GitHub, rather
+    than polling snapshots. The stub derives visibility and in-progress state
+    from those timestamps. Source: the recording's public repository and PR.
+    https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
+    """
+
+    from test_factory_progress import verification
+
+    client, stub, recording = recorded_github
+    number = 3815
+    response = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "factory_admitted", response.text
+    published = _request(number)
+    _start_running(published["id"])
+    pull = _published_stub_pull(stub, tmp_path)
+    head_sha = pull["head"]["sha"]
+    _attach_publication(
+        published["work_item_id"], status="succeeded", pr=pull["number"], head_sha=head_sha
+    )
+
+    async def python_publication() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE curie.publications SET changed_paths = CAST(:paths AS jsonb) "
+                        "WHERE execution_request_id = :id"
+                    ),
+                    {"paths": '["apps/api/src/example.py"]', "id": published["id"]},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(python_publication())
+    observation = verification(
+        client,
+        published["id"],
+        {
+            "check": "unit_tests",
+            "command": "uv run pytest apps/api/tests -q",
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+    )
+    assert observation.status_code == 201, observation.text
+
+    stub.advance(180)
+    _reconcile_later(180)
+
+    assert _terminal(number) == ("running", None)
+    assert _terminal_notices(published["id"]) == []
+    assert _ci_turns(published["id"]) == []
+    from curie_api.github_app import credentials_for
+
+    token = credentials_for(get_settings()).token_for_verified_installation(REPO, 5501)
+    with httpx.Client(
+        verify=ssl.create_default_context(cafile=str(stub.ca_file)),
+        headers={"Authorization": f"Bearer {token}"},
+        trust_env=False,
+    ) as github:
+        observed = github.get(f"{stub.base_url}/repos/{REPO}/commits/{head_sha}/check-runs")
+        assert observed.status_code == 200, observed.text
+        checks = observed.json()["check_runs"]
+        assert not any(run["name"] == "Python (ruff + mypy + pytest)" for run in checks)
+        shards = [run for run in checks if run["name"].startswith("Python pytest (shard ")]
+        assert len(shards) == 3
+        assert all(run["status"] == "in_progress" for run in shards)
+
+    epoch = datetime.fromisoformat(recording["epoch"].replace("Z", "+00:00"))
+    final_seconds = (
+        max(
+            (
+                datetime.fromisoformat(run["completed_at"].replace("Z", "+00:00")) - epoch
+            ).total_seconds()
+            for run in recording["check_runs"]
+        )
+        + 1
+    )
+    stub.advance(final_seconds - 180)
+    _reconcile_later(int(final_seconds))
+
+    assert _terminal(number) == ("completed", "completed")
+    assert _ci_turns(published["id"]) == []
+    assert len(_terminal_notices(published["id"])) == 1
+    assert stub.unknown_requests == []
+
+
+@pytest.fixture
+def workspace_api(
+    recorded_github: tuple[Any, Any, dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[str]:
+    """Run the production API on an owned socket for the worker's HTTP client."""
+
+    _client, stub, _recording = recorded_github
+    monkeypatch.setenv("GITHUB_CLONE_BASE", stub.base_url)
+    monkeypatch.setenv("GIT_SSL_CAINFO", str(stub.ca_file))
+    get_settings.cache_clear()
+    listener = socket.socket()
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(128)
+        port = listener.getsockname()[1]
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import asyncio,socket,sys,uvicorn; "
+                "listener=socket.socket(fileno=int(sys.argv[1])); "
+                "server=uvicorn.Server(uvicorn.Config('curie_api.main:create_app', "
+                "factory=True,log_level='critical',access_log=False)); "
+                "asyncio.run(server.serve(sockets=[listener]))",
+                str(listener.fileno()),
+            ],
+            pass_fds=(listener.fileno(),),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        api_url = f"http://127.0.0.1:{port}"
+        deadline = time.monotonic() + 15
+        with httpx.Client(timeout=1, trust_env=False) as probe:
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise RuntimeError("owned API process exited before startup")
+                try:
+                    if probe.get(f"{api_url}/health").status_code == 200:
+                        break
+                except httpx.HTTPError:
+                    pass
+                time.sleep(0.05)
+            else:
+                raise RuntimeError("owned API did not become healthy")
+        yield api_url
+    finally:
+        try:
+            if process is not None:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                assert process.poll() is not None
+        finally:
+            listener.close()
+            get_settings.cache_clear()
+
+
+@pytest.fixture
+def workspace_objects(recorded_github: tuple[Any, Any, dict[str, Any]]) -> Iterator[Any]:
+    """Use a unique bucket on the real backing object store and verify teardown."""
+
+    import boto3
+    from botocore.config import Config
+    from botocore.exceptions import ClientError
+    from curie_worker.workspace import WorkspaceObjectStore
+
+    settings = get_settings()
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=settings.s3_endpoint_url,
+        aws_access_key_id=settings.s3_access_key,
+        aws_secret_access_key=settings.s3_secret_key,
+        region_name=settings.s3_region,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+    bucket = f"test-curie-workspace-{uuid.uuid4().hex}"
+    objects = WorkspaceObjectStore(client=s3, bucket=bucket)
+    created = False
+    try:
+        s3.create_bucket(Bucket=bucket)
+        created = True
+        yield objects
+    finally:
+        try:
+            if created:
+                for key in objects.list_keys(""):
+                    objects.delete(key)
+                assert list(objects.list_keys("")) == []
+                s3.delete_bucket(Bucket=bucket)
+                with pytest.raises(ClientError) as absent:
+                    s3.head_bucket(Bucket=bucket)
+                assert absent.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+        finally:
+            s3.close()
+
+
+def test_managed_workspace_clones_the_tls_github_origin_through_real_api_and_storage(
+    recorded_github: tuple[Any, Any, dict[str, Any]],
+    workspace_api: str,
+    workspace_objects: Any,
+    tmp_path: Path,
+) -> None:
+    """Redeem, clone, archive, store and download without replacing an internal port."""
+
+    from curie_api.github_app import credentials_for
+    from curie_worker.workspace import (
+        SubprocessCommands,
+        WorkspaceCredentialClient,
+        WorkspaceLimits,
+        WorkspacePreparer,
+    )
+
+    client, stub, _recording = recorded_github
+    token = credentials_for(get_settings()).token_for_verified_installation(REPO, 5501)
+    with httpx.Client(
+        verify=ssl.create_default_context(cafile=str(stub.ca_file)),
+        headers={"Authorization": f"Bearer {token}"},
+        trust_env=False,
+    ) as github:
+        branch = github.get(f"{stub.base_url}/repos/{REPO}/branches/main")
+        assert branch.status_code == 200, branch.text
+        head_sha = branch.json()["commit"]["sha"]
+    admitted = _post(client, "issues", _issue_event("labeled", 3815, label={"name": LABEL}))
+    assert admitted.status_code == 200, admitted.text
+    assert admitted.json()["status"] == "factory_admitted", admitted.text
+    request = _request(3815)
+    _start_running(request["id"])
+    pull = _published_stub_pull(stub, tmp_path)
+    _attach_publication(
+        request["work_item_id"], status="succeeded", pr=pull["number"], head_sha=pull["head"]["sha"]
+    )
+    lineage = _rows(
+        "SELECT l.deployment_id, l.conversation_id "
+        "FROM curie.thread_publication_lineages l JOIN curie.work_items w "
+        "ON w.publication_lineage_id = l.id WHERE w.id = :id",
+        {"id": request["work_item_id"]},
+    )[0]
+    credentials = WorkspaceCredentialClient(
+        api_url=workspace_api,
+        github_api_url=stub.base_url,
+        worker_token="factory-terminus-worker",
+    )
+    assert (
+        credentials.select(lineage["deployment_id"], lineage["conversation_id"], "octocat", REPO)
+        == REPO
+    )
+    redeemed = credentials.redeem(lineage["deployment_id"], lineage["conversation_id"])
+    assert redeemed.clone_url == stub.clone_url
+    preparer = WorkspacePreparer(
+        credentials=credentials,
+        commands=SubprocessCommands(),
+        objects=workspace_objects,
+        scratch_root=tmp_path / "managed-clone",
+        limits=WorkspaceLimits(),
+    )
+    prepared = preparer.prepare(
+        deployment_id=lineage["deployment_id"],
+        thread_key=lineage["conversation_id"],
+        generation=uuid.uuid4().hex,
+    )
+    try:
+        preparer.verify(prepared)
+        assert prepared.clean_clone_url == stub.clone_url
+        assert prepared.base_sha == head_sha
+        with httpx.Client(trust_env=False) as download:
+            archive = download.get(prepared.reference.url)
+        assert archive.status_code == 200, archive.text
+        with tarfile.open(fileobj=io.BytesIO(archive.content), mode="r:gz") as tar:
+            config = tar.extractfile(".git/config")
+            assert config is not None
+            git_config = config.read()
+            assert git_config.count(stub.clone_url.encode()) == 1
+            assert redeemed.authorization_header.encode() not in git_config
+            assert b"extraheader" not in git_config.lower()
+            assert tar.getmember("example.py").isfile()
+        assert not any((tmp_path / "managed-clone").iterdir())
+        assert stub.unknown_requests == []
+    finally:
+        preparer.delete(prepared)
+        assert list(workspace_objects.list_keys("")) == []

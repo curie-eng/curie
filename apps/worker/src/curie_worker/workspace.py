@@ -252,20 +252,43 @@ class WorkspaceCredential:
     repo_full_name: str
     clone_url: str
     authorization_header: str
+    github_html_base: str
     revision: str | None = None
     base_branch: str | None = None
     base_commit: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.repo_full_name or not self.clone_url or not self.authorization_header:
+        if (
+            not self.repo_full_name
+            or not self.clone_url
+            or not self.authorization_header
+            or not self.github_html_base
+        ):
             raise ValueError("workspace credential response is incomplete")
-        if not self.clone_url.startswith("https://github.com/"):
+        base = urlsplit(self.github_html_base)
+        clone = urlsplit(self.clone_url)
+        # Accessing port also refuses malformed ports before Git receives auth.
+        _ = base.port, clone.port
+        if (
+            base.scheme != "https"
+            or not base.hostname
+            or base.username is not None
+            or base.password is not None
+            or base.query
+            or base.fragment
+            or self.github_html_base.endswith("/")
+            or clone.scheme != "https"
+            or clone.username is not None
+            or clone.password is not None
+            or clone.query
+            or clone.fragment
+        ):
             raise ValueError("workspace clone URL must be a clean GitHub HTTPS URL")
-        if self.clone_url != f"https://github.com/{self.repo_full_name}.git":
+        if (
+            not _REPO_FULL_NAME.fullmatch(self.repo_full_name)
+            or self.clone_url != f"{self.github_html_base}/{self.repo_full_name}.git"
+        ):
             raise ValueError("workspace clone URL does not match the server-derived repository")
-        authority = self.clone_url.removeprefix("https://").split("/", 1)[0]
-        if "@" in authority:
-            raise ValueError("workspace clone URL must not contain userinfo")
         if any(character in self.authorization_header for character in ("\r", "\n", "\0")):
             raise ValueError("workspace authorization header contains control characters")
 
@@ -431,12 +454,17 @@ class WorkspaceCredentialClient:
         self,
         *,
         api_url: str,
+        github_api_url: str,
         worker_token: str,
         transport: Callable[..., Any] = _url_transport,
     ) -> None:
         if not worker_token:
             raise ValueError("workspace delivery requires CURIE_INTERNAL_WORKER_TOKEN")
+        # config imports publication_validation, which imports this module.
+        from .config import github_html_base
+
         self._api_url = api_url.rstrip("/")
+        self._github_html_base = github_html_base(github_api_url)
         self._worker_token = worker_token
         self._transport = transport
 
@@ -557,6 +585,7 @@ class WorkspaceCredentialClient:
                 repo_full_name=str(payload["repo_full_name"]),
                 clone_url=str(payload["clone_url"]),
                 authorization_header=str(payload["authorization_header"]),
+                github_html_base=self._github_html_base,
                 revision=revision,
                 base_branch=base_branch,
                 base_commit=base_commit,
@@ -1129,7 +1158,9 @@ class WorkspacePreparer:
                     "GIT_CONFIG_COUNT": "2",
                     "GIT_CONFIG_KEY_0": "http.followRedirects",
                     "GIT_CONFIG_VALUE_0": "false",
-                    "GIT_CONFIG_KEY_1": "http.https://github.com/.extraHeader",
+                    "GIT_CONFIG_KEY_1": (
+                        f"http.https://{urlsplit(credential.github_html_base).netloc}/.extraHeader"
+                    ),
                     "GIT_CONFIG_VALUE_1": f"Authorization: {credential.authorization_header}",
                 }
                 try:
@@ -1367,7 +1398,10 @@ class WorkspacePreparer:
             raise WorkspacePreparationError(
                 "origin-sanitization", ".git/config could not be inspected"
             ) from exc
-        forbidden = (credential.authorization_header, "@github.com")
+        forbidden = (
+            credential.authorization_header,
+            f"@{urlsplit(credential.github_html_base).netloc}",
+        )
         if any(value and value in config for value in forbidden):
             raise WorkspacePreparationError(
                 "origin-sanitization", ".git/config still contains credential material"

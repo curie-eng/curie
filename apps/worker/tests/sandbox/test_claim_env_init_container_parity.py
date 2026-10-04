@@ -73,12 +73,10 @@ _TARGETED: dict[str, frozenset[str]] = {
 }
 
 # CURIE_ env an init container reads that is deliberately NOT claim-settable
-# (chart-wired from values or a Secret). Empty today: every CURIE_ key the
-# staging init containers read is claim-settable, and the endpoint, bucket and
-# credential env they also read are S3_*/AWS_*-prefixed and out of a claim's
-# reach by construction. It exists so a new key has to be classified on purpose
-# -- targeted by the worker, or declared worker-side here with its reason.
-_CHART_WIRED_ONLY: frozenset[str] = frozenset()
+# (chart-wired from values or a Secret). CURIE_GITHUB_API_URL comes from the
+# operator's api.githubApiUrl value and defines the trusted checkout origin.
+# Allowing a claim to replace it would let that claim authorize another host.
+_CHART_WIRED_ONLY: frozenset[str] = frozenset({"CURIE_GITHUB_API_URL"})
 
 
 class TemplateScanError(AssertionError):

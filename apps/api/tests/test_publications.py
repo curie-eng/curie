@@ -2554,6 +2554,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                 )
                 credentials = WorkspaceCredentialClient(
                     api_url="https://api.example.test",
+                    github_api_url=get_settings().github_api_url,
                     worker_token=WORKER_TOKEN,
                     transport=_testclient_transport(client),
                 )
@@ -2945,6 +2946,7 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
                 )
                 credentials = WorkspaceCredentialClient(
                     api_url="https://api.example.test",
+                    github_api_url=get_settings().github_api_url,
                     worker_token=WORKER_TOKEN,
                     transport=_testclient_transport(client),
                 )

@@ -664,11 +664,18 @@ import sys
 
 import yaml
 
-# Env names in these namespaces are boot-env contract keys and must be declared.
+# Env names in these namespaces must be declared boot-env keys unless explicitly
+# classified as install-owned configuration below.
 # Anything else the runner container carries (HOME, and operator free-form
 # extraEnv on a non-default render) is out of scope by design: extraEnv is
 # operator-supplied and the contract does not govern it (issue #488, edge case 6).
 CONTRACT_PREFIXES = ("CURIE_", "OTEL_EXPORTER_OTLP_", "ANTHROPIC_")
+
+# Non-secret GitHub origin policy from api.githubApiUrl, read by workspace-init
+# and runner workspace_snapshot.py, not an ACI session payload. The chart
+# reserves it against agent extraEnv, and the worker declaration gate classifies
+# the same exact name as install-owned configuration outside frozen BootEnv.
+INSTALL_OWNED_ENV = {"CURIE_GITHUB_API_URL"}
 
 rendered, key_src = sys.argv[1], sys.argv[2]
 
@@ -712,7 +719,10 @@ if not found:
 
 # Non-vacuity floor: the render must actually carry boot env. Without this a
 # template that dropped its whole env block would sail through the subset check.
-contract_names = {n for n in found if n.startswith(CONTRACT_PREFIXES)}
+contract_names = {
+    n for n in found
+    if n.startswith(CONTRACT_PREFIXES) and n not in INSTALL_OWNED_ENV
+}
 if "CURIE_SESSION_ID" not in contract_names or len(contract_names) < 4:
     sys.stderr.write(
         "runner env does not carry a plausible boot env (expected CURIE_SESSION_ID "

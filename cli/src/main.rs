@@ -1281,6 +1281,12 @@ enum DevAction {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Serve a TLS GitHub fixture or capture public check lifecycle recordings.
+    GithubStub {
+        /// `serve` or `capture`, followed by fixture flags.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Select the end to end tiers CI would run for paths or revisions.
     E2eCiSelection {
         /// Changed path. Repeat for every path in the candidate change.
@@ -4786,6 +4792,10 @@ async fn run(command: Option<Command>) -> Result<()> {
             DevAction::FactoryE2e { args } => {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 commands::dev_script("cli/scripts/factory-e2e.sh", &args).await
+            }
+            DevAction::GithubStub { args } => {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                commands::dev_script("cli/scripts/github-stub.sh", &args).await
             }
             DevAction::E2eCiSelection {
                 path,
