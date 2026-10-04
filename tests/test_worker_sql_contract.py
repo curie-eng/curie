@@ -81,7 +81,7 @@ def test_every_worker_text_statement_plans_against_migrations(
     migrated_database_url: str,
 ) -> None:
     statements = discover_statements(ROOT, "curie")
-    expected = 0
+    expected: set[str] = set()
     for path in (ROOT / "apps/worker/src/curie_worker").rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         aliases = {
@@ -92,16 +92,40 @@ def test_every_worker_text_statement_plans_against_migrations(
             for alias in node.names
             if alias.name == "text"
         }
-        expected += sum(
-            isinstance(node, ast.Call)
+        expected.update(
+            f"{path.relative_to(ROOT).as_posix()}:{node.lineno}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id in aliases
-            for node in ast.walk(tree)
         )
-    assert expected > 0
-    assert len(statements) == expected
-    assert len({site for site, _ in statements}) == expected
+    assert expected
+    sites = {site for site, _ in statements}
+    assert len(statements) >= len(expected)
+    assert len(sites) == len(statements)
+    assert all(
+        any(site == coordinate or site.startswith(f"{coordinate}:") for site in sites)
+        for coordinate in expected
+    ), expected - sites
     _explain(migrated_database_url, statements)
+
+
+def test_publication_result_sql_discovers_filtered_and_unfiltered_branches() -> None:
+    statements = [
+        sql
+        for site, sql in discover_statements(ROOT, "curie")
+        if "curie_worker/publication_store.py" in site
+    ]
+    select_variants = [
+        sql for sql in statements if "p.result_reported_at IS NULL" in sql
+    ]
+    update_variants = [
+        sql for sql in statements if "approval resolved before card delivery began" in sql
+    ]
+    assert any("AND p.id = :requested_id" in sql for sql in select_variants)
+    assert any("AND p.id = :requested_id" not in sql for sql in select_variants)
+    assert any("AND id = :requested_id" in sql for sql in update_variants)
+    assert any("AND id = :requested_id" not in sql for sql in update_variants)
 
 
 @pytest.mark.parametrize(
