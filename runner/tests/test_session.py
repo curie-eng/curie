@@ -2,6 +2,7 @@
 
 import asyncio
 import functools
+import json
 import logging
 
 import anyio
@@ -14,7 +15,10 @@ from claude_agent_sdk import (
     RateLimitEvent,
     ResultMessage,
     TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 from claude_agent_sdk.types import RateLimitInfo
 from curie_runner import RunTracer, SideEffectClassifier, build_options, create_app
@@ -31,6 +35,7 @@ from curie_runner.mcp_tool_capability import (
     ConnectorAvailability,
     ConnectorCapabilityFailure,
 )
+from curie_runner.progress import ProgressActivity
 from curie_runner.session import SessionRunner
 from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
@@ -243,6 +248,118 @@ def test_happy_turn_stream_shape() -> None:
     assert events[-1].status == SessionStatus.DONE
     assert fake.queries == ["go"]  # the event text was pushed into the session
     assert runner.status == SessionStatus.DONE
+
+
+def test_reviewer_text_stays_out_of_reply_and_durable_parent_conversation() -> None:
+    """Forwarded reviewer prose is usage evidence, with nested tools preserved.
+
+    Installed claude_agent_sdk/types.py:2183 documents forward_subagent_text
+    and parent_tool_use_id on forwarded text, thinking and tool blocks.
+    https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/types.py
+    """
+    appended: list[dict] = []
+    activity = ProgressActivity()
+    app = web.Application()
+
+    async def get_history(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {"detail": "not found"},
+            status=404,
+            headers={"X-Curie-Transcript-Max-Bytes": "65536"},
+        )
+
+    async def append_history(request: web.Request) -> web.Response:
+        appended.append((await request.json())["item"])
+        return web.json_response({"recorded": True}, status=201)
+
+    app.router.add_get("/agents/A/state/transcript/t1", get_history)
+    app.router.add_post("/agents/A/state/transcript/t1/append", append_history)
+    messages = [
+        AssistantMessage(
+            content=[
+                ThinkingBlock(thinking="Implementer thought", signature="primary_signature"),
+                TextBlock(text="Working. "),
+            ],
+            model="primary_model",
+        ),
+        AssistantMessage(
+            content=[TextBlock(text="Reviewer text only")],
+            model="reviewer_model",
+            parent_tool_use_id="parent_review",
+        ),
+        AssistantMessage(
+            content=[
+                TextBlock(text="Reviewer tool commentary"),
+                ThinkingBlock(thinking="Reviewer thinking", signature="reviewer_signature"),
+                ToolUseBlock(id="review_read", name="Read", input={"path": "example.py"}),
+            ],
+            model="reviewer_model",
+            parent_tool_use_id="parent_review",
+        ),
+        UserMessage(
+            content=[ToolResultBlock(tool_use_id="review_read", content="Review tool result")],
+            parent_tool_use_id="parent_review",
+        ),
+        AssistantMessage(content=[TextBlock(text="Done.")], model="primary_model"),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="example_session", result="",
+        ),
+    ]
+
+    async def go() -> list:
+        async with TestServer(app) as server:
+            store = StateApiTranscriptStore(
+                str(server.make_url("/agents/A/state/transcript/t1")), token=None
+            )
+            assert await store.load() == []
+            fake = FakeModelSession(lambda: messages)
+            runner = SessionRunner(
+                max_usd_per_day=None,
+                held_secrets=frozenset(),
+                session_factory=lambda: fake,
+                ceiling=0,
+                tracer=RunTracer(None),
+                classifier=SideEffectClassifier(),
+                trace_name="reviewer_text",
+                history_store=store,
+                progress_activity=activity,
+            )
+            await runner.start()
+            try:
+                lines = [
+                    line async for line in runner.run_turn(
+                        Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
+                    )
+                ]
+                return parse_ndjson("".join(lines))
+            finally:
+                await runner.close()
+
+    events = anyio.run(go)
+    assert [event.text for event in events if event.type == "text_delta"] == [
+        "Working. ", "Done."
+    ]
+    assert events[-1].status is SessionStatus.DONE
+    assert events[-1].text == "Working. Done."
+    assert [event.tool for event in events if event.type == "tool_note"] == ["Read"]
+    assert activity.tool_calls == 1
+    assert activity.last_tool == "Read"
+    assert len(appended) == 1
+    assert appended[0]["assistant"] == "Working. Done."
+    durable = json.dumps(appended[0]["messages"])
+    for reviewer_content in (
+        "Reviewer text only", "Reviewer tool commentary", "Reviewer thinking"
+    ):
+        assert reviewer_content not in durable
+    assert "Implementer thought" in durable
+    assert "primary_signature" in durable
+    assert "Review tool result" in durable
+    assert '"tool_use"' in durable and '"Read"' in durable
+    assistant_messages = [
+        message for message in appended[0]["messages"] if message["role"] == "assistant"
+    ]
+    assert all(message["content"] for message in assistant_messages)
 
 
 def test_transcript_capacity_failure_precedes_terminal_final(
@@ -2192,6 +2309,17 @@ def test_build_options_requests_payload_stripped_partial_boundaries() -> None:
         resume=None,
     )
     assert options.include_partial_messages is True
+
+
+def test_build_options_forwards_text_only_subagent_usage() -> None:
+    # The installed SDK types.py:2183 documents that the default forwards only
+    # nested tool blocks. True also forwards text and thinking AssistantMessages.
+    # https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/types.py
+    options = build_options(
+        plugins=[], model=None, system_prompt=None, max_turns=20,
+        max_budget_usd=1.0, resume=None,
+    )
+    assert options.forward_subagent_text is True
 
 
 def test_build_options_carries_task_budget_hint() -> None:

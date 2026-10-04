@@ -166,21 +166,31 @@ def build_usage_body(
 
     seen: Observed = observed if observed is not None else {}
     models: list[dict[str, Any]] = []
+    represented: set[str] = set()
     model_usage = getattr(message, "model_usage", None)
     if isinstance(model_usage, dict) and model_usage:
         for model, raw in model_usage.items():
             if isinstance(model, str) and model and isinstance(raw, dict):
+                represented.add(model)
                 models.extend(
                     _split(model, _entry(model, raw, _MODEL_USAGE_KEYS), seen, primary_model)
                 )
     else:
         usage = getattr(message, "usage", None)
         if isinstance(usage, dict) and usage and primary_model:
+            represented.add(primary_model)
             models.extend(
                 _split(
                     primary_model, _entry(primary_model, usage, _USAGE_KEYS), seen, primary_model
                 )
             )
+    models = [entry for entry in models if any(entry[key] for key in _WIRE_KEYS)]
+    for (role, model), counts in seen.items():
+        if role == REVIEWER and model and model not in represented:
+            entry: dict[str, Any] = {"model": model, "role": REVIEWER}
+            entry.update({key: _count(counts.get(key)) for key in _WIRE_KEYS})
+            if any(entry[key] for key in _WIRE_KEYS):
+                models.append(entry)
     if not models:
         return None
     if observed is None:
@@ -205,6 +215,9 @@ class UsageReporter:
         # A new session id, or a drop in any count, means the SDK restarted the total.
         self._cumulative: dict[str, dict[str, int]] = {}
         self._cumulative_session: str | None = None
+        # Reviewer observations reported before they appear in cumulative totals.
+        # Queued bodies count too: their replay must retain the same usage.
+        self._unmatched_reviewer: dict[str, dict[str, int]] = {}
         # Bodies whose POST has not been accepted, each with the baseline that
         # becomes current once that body is accepted. Replay keeps the original
         # turn id and roles. record_usage treats a replayed turn as a no-op.
@@ -259,14 +272,27 @@ class UsageReporter:
         session_id = session_id if isinstance(session_id, str) else None
         restarted = session_id != previous_session or _cumulative_decreased(previous, parsed)
         if restarted:
+            self._unmatched_reviewer.clear()
             turn = {model: dict(counts) for model, counts in parsed.items()}
             baseline = {model: dict(counts) for model, counts in parsed.items()}
         else:
             turn = _turn_counts(previous, parsed)
             baseline = {model: dict(counts) for model, counts in {**previous, **parsed}.items()}
-        if not any(any(counts.values()) for counts in turn.values()):
+        for model, counts in list(turn.items()):
+            unmatched = self._unmatched_reviewer.get(model)
+            if unmatched is None:
+                continue
+            for key in _WIRE_KEYS:
+                caught_up = min(counts[key], unmatched[key])
+                counts[key] -= caught_up
+                unmatched[key] -= caught_up
+            if not any(counts.values()):
+                del turn[model]
+            if not any(unmatched.values()):
+                del self._unmatched_reviewer[model]
+        if not turn:
             return None, session_id, baseline
-        isolated = replace(message, model_usage=cast(Any, _wire_to_model_usage(turn)))
+        isolated = replace(message, model_usage=cast(Any, _wire_to_model_usage(turn)), usage={})
         return isolated, session_id, baseline
 
     def _remember(self, session_id: str | None, baseline: dict[str, dict[str, int]]) -> None:
@@ -309,7 +335,12 @@ class UsageReporter:
             self._cumulative_session = session_id
             self._cumulative = baseline
             if not self._queue:
-                self._speculative = (session_id, baseline)
+                # A newer snapshot may only have caught up observed usage and
+                # produced no body. Do not rewind it when an older replay lands.
+                self._cumulative_session, self._cumulative = self._speculative or (
+                    session_id, baseline
+                )
+                self._speculative = (self._cumulative_session, self._cumulative)
 
     async def report(self, message: ResultMessage, primary_model: str | None) -> None:
         observed, self._observed = self._observed, {}
@@ -327,12 +358,19 @@ class UsageReporter:
                 isolated, session_id, baseline = self._isolate_turn(
                     message, parsed, previous, previous_session
                 )
-                body = (
-                    None
-                    if isolated is None
-                    else build_usage_body(isolated, primary_model, observed=observed)
-                )
+                if isolated is None:
+                    isolated = replace(message, model_usage={}, usage={})
+                body = build_usage_body(isolated, primary_model, observed=observed)
                 if body is not None:
+                    included = _parse_model_usage(isolated.model_usage or {})
+                    for entry in body["models"]:
+                        model = entry["model"]
+                        if entry["role"] == REVIEWER and model not in included:
+                            unmatched = self._unmatched_reviewer.setdefault(
+                                model, dict.fromkeys(_WIRE_KEYS, 0)
+                            )
+                            for key in _WIRE_KEYS:
+                                unmatched[key] += entry[key]
                     self._queue.append((body, session_id, baseline))
                 self._remember(session_id, baseline)
             else:

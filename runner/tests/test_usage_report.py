@@ -21,11 +21,13 @@ from __future__ import annotations
 from typing import Any
 
 import anyio
+import pytest
 from aci_protocol import Event, parse_ndjson
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from claude_agent_sdk import ResultMessage
 from curie_runner import RunTracer, SideEffectClassifier
+from curie_runner.fake import FakeModelSession
 from curie_runner.session import SessionRunner
 from curie_runner.usage_report import UsageReporter, build_usage_body
 
@@ -364,6 +366,206 @@ def test_a_model_never_observed_is_implementer_whatever_the_primary() -> None:
     body = build_usage_body(message, PRIMARY, observed={})
     assert body is not None
     assert [(e["role"], e["model"]) for e in body["models"]] == [("implementer", REVIEWER)]
+
+
+@pytest.mark.parametrize("result_shape", ["model_usage", "usage"])
+def test_session_posts_observed_reviewer_missing_from_result_totals_once(
+    result_shape: str,
+) -> None:
+    """Text only nested messages carry usage even without terminal model totals.
+
+    Provider shapes are defined by installed claude_agent_sdk/types.py,
+    AssistantMessage and ClaudeAgentOptions.forward_subagent_text.
+    Repeated message IDs carry the same API response usage:
+    https://code.claude.com/docs/en/agent-sdk/cost-tracking
+    """
+    recorder = _Recorder()
+    terminal = (
+        {"model_usage": {PRIMARY: _model_usage(100, 40, cached=20, write=5)}}
+        if result_shape == "model_usage"
+        else {"usage": _sdk_usage(100, 40, cached=20, write=5)}
+    )
+    reviewer = _assistant(
+        REVIEWER,
+        _sdk_usage(30, 12, cached=7, write=3),
+        parent="toolu_example",
+        message_id="msg_reviewer_example",
+    )
+    messages = [
+        _assistant(PRIMARY, _sdk_usage(100, 40, cached=20, write=5)),
+        reviewer,
+        reviewer,
+        _result(**terminal, uuid="turn_missing_reviewer"),
+    ]
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            fake = FakeModelSession(lambda: messages)
+            runner = SessionRunner(
+                max_usd_per_day=None,
+                held_secrets=frozenset(),
+                session_factory=lambda: fake,
+                ceiling=0,
+                tracer=RunTracer(None),
+                classifier=SideEffectClassifier(),
+                trace_name="usage",
+                usage_reporter=UsageReporter(
+                    str(server.make_url("/v1/work-item-progress/example-request/usage")), TOKEN
+                ),
+                primary_model=PRIMARY,
+            )
+            await runner.start()
+            try:
+                lines = [
+                    line async for line in runner.run_turn(
+                        Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
+                    )
+                ]
+                assert parse_ndjson("".join(lines))[-1].type == "final"
+                assert len(recorder.received) == 1
+            finally:
+                await runner.close()
+
+    anyio.run(go)
+    body, token = recorder.received[0]
+    assert token == TOKEN
+    assert body["turn_id"] == "turn_missing_reviewer"
+    models = _by_role_model(body)
+    assert set(models) == {("implementer", PRIMARY), ("reviewer", REVIEWER)}
+    assert {key: models[("implementer", PRIMARY)][key] for key in _wire(0, 0)} == _wire(
+        100, 40, cached=20, write=5
+    )
+    assert {key: models[("reviewer", REVIEWER)][key] for key in _wire(0, 0)} == _wire(
+        30, 12, cached=7, write=3
+    )
+
+
+def test_zero_cumulative_delta_keeps_fresh_reviewer_usage_without_recounting() -> None:
+    """A repeated cumulative snapshot must still retain fresh observed usage.
+
+    Cumulative snapshots and response ID deduplication follow the SDK guide:
+    https://code.claude.com/docs/en/agent-sdk/cost-tracking
+    """
+    recorder = _Recorder()
+    totals = {PRIMARY: _model_usage(100, 10), REVIEWER: _model_usage(40, 4)}
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            reporter = UsageReporter(
+                str(server.make_url("/v1/work-item-progress/example-request/usage")), TOKEN
+            )
+            reporter.observe(_assistant(PRIMARY, _sdk_usage(100, 10)))
+            reporter.observe(_assistant(REVIEWER, _sdk_usage(40, 4), parent="toolu_example"))
+            await reporter.report(_result(model_usage=totals, uuid="turn_initial"), PRIMARY)
+            fresh = _assistant(
+                REVIEWER,
+                _sdk_usage(20, 2, cached=5, write=1),
+                parent="toolu_example",
+                message_id="msg_fresh_reviewer",
+            )
+            reporter.observe(fresh)
+            reporter.observe(fresh)
+            await reporter.report(_result(model_usage=totals, uuid="turn_fresh"), PRIMARY)
+            await reporter.report(_result(model_usage=totals, uuid="turn_empty"), PRIMARY)
+            reporter.observe(_assistant(PRIMARY, _sdk_usage(25, 3)))
+            await reporter.report(
+                _result(
+                    model_usage={**totals, PRIMARY: _model_usage(125, 13)},
+                    uuid="turn_followup",
+                ),
+                PRIMARY,
+            )
+
+    anyio.run(go)
+    assert [body["turn_id"] for body, _ in recorder.received] == [
+        "turn_initial", "turn_fresh", "turn_followup"
+    ]
+    fresh_body = _by_role_model(recorder.received[1][0])
+    assert set(fresh_body) == {("reviewer", REVIEWER)}
+    assert {key: fresh_body[("reviewer", REVIEWER)][key] for key in _wire(0, 0)} == _wire(
+        20, 2, cached=5, write=1
+    )
+    followup = _by_role_model(recorder.received[2][0])
+    assert set(followup) == {("implementer", PRIMARY)}
+    assert {key: followup[("implementer", PRIMARY)][key] for key in _wire(0, 0)} == _wire(25, 3)
+
+
+@pytest.mark.parametrize(
+    ("initial_report_fails", "fresh_usage"), [(False, True), (True, True), (True, False)]
+)
+def test_delayed_reviewer_totals_count_previously_observed_usage_once(
+    initial_report_fails: bool,
+    fresh_usage: bool,
+) -> None:
+    """A later cumulative snapshot includes reviewer usage already reported.
+
+    The SDK cost guide defines model_usage as cumulative within a session:
+    https://code.claude.com/docs/en/agent-sdk/cost-tracking
+    """
+    recorder = _Recorder(statuses=[503, 503, 201, 201] if initial_report_fails else None)
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            reporter = UsageReporter(
+                str(server.make_url("/v1/work-item-progress/example-request/usage")), TOKEN
+            )
+            reporter.observe(_assistant(PRIMARY, _sdk_usage(100, 10)))
+            reporter.observe(
+                _assistant(
+                    REVIEWER,
+                    _sdk_usage(30, 12, cached=9, write=6),
+                    parent="toolu_example",
+                    message_id="msg_reviewer_initial",
+                )
+            )
+            await reporter.report(
+                _result(model_usage={PRIMARY: _model_usage(100, 10)}, uuid="turn_observed"),
+                PRIMARY,
+            )
+            if fresh_usage:
+                reporter.observe(_assistant(PRIMARY, _sdk_usage(25, 3)))
+                reporter.observe(
+                    _assistant(
+                        REVIEWER,
+                        _sdk_usage(20, 8, cached=3, write=2),
+                        parent="toolu_example",
+                        message_id="msg_reviewer_fresh",
+                    )
+                )
+            totals = {
+                PRIMARY: _model_usage(125, 13) if fresh_usage else _model_usage(100, 10),
+                REVIEWER: (
+                    _model_usage(50, 20, cached=12, write=8)
+                    if fresh_usage
+                    else _model_usage(30, 12, cached=9, write=6)
+                ),
+            }
+            await reporter.report(_result(model_usage=totals, uuid="turn_catchup"), PRIMARY)
+            await reporter.report(_result(model_usage=totals, uuid="turn_empty"), PRIMARY)
+
+    anyio.run(go)
+    expected_turns = ["turn_observed"] * (3 if initial_report_fails else 1)
+    if fresh_usage:
+        expected_turns.append("turn_catchup")
+    assert [body["turn_id"] for body, _ in recorder.received] == expected_turns
+    if initial_report_fails:
+        assert recorder.received[0] == recorder.received[1] == recorder.received[2]
+    first = _by_role_model(recorder.received[0][0])
+    assert set(first) == {("implementer", PRIMARY), ("reviewer", REVIEWER)}
+    assert {key: first[("reviewer", REVIEWER)][key] for key in _wire(0, 0)} == _wire(
+        30, 12, cached=9, write=6
+    )
+    if not fresh_usage:
+        return
+    catchup = _by_role_model(recorder.received[-1][0])
+    assert set(catchup) == {("implementer", PRIMARY), ("reviewer", REVIEWER)}
+    assert {key: catchup[("reviewer", REVIEWER)][key] for key in _wire(0, 0)} == _wire(
+        20, 8, cached=3, write=2
+    )
+    assert {
+        key: sum(body[("reviewer", REVIEWER)][key] for body in (first, catchup))
+        for key in _wire(0, 0)
+    } == _wire(50, 20, cached=12, write=8)
 
 
 def test_observe_keys_role_on_parent_tool_use_id_and_report_resets() -> None:

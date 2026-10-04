@@ -580,8 +580,21 @@ def phase_view(
     }
     ordered = sorted(reports, key=lambda report: report.id or 0)
     completed = status == "completed"
-    latest = ordered[-1].phase if ordered else None
-    current = None if completed or latest not in ids else latest
+    current: str | None = None
+    if not completed:
+        for report in ordered:
+            if report.phase not in ids:
+                continue
+            loop_return = any(
+                report.phase == str(loop["start"])
+                and (
+                    current == str(loop["review"])
+                    or (current == WAIT_CI_PHASE and str(loop["review"]) == "review_diff")
+                )
+                for loop in declaration.get("loops", [])
+            )
+            if current is None or ids.index(report.phase) >= ids.index(current) or loop_return:
+                current = report.phase
     reported = {report.phase for report in ordered}
     latest_ci = max(
         (index for index, report in enumerate(ordered) if report.phase == WAIT_CI_PHASE),

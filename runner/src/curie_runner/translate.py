@@ -311,6 +311,7 @@ def _translate_assistant(
     activity: ProgressActivity | None = None,
 ) -> list[OutboundEvent]:
     events: list[OutboundEvent] = []
+    nested = message.parent_tool_use_id is not None
 
     # Assistant usage is per-message. ResultMessage usage is a turn total and
     # must never be copied onto the last generation, where it would double-count
@@ -342,13 +343,13 @@ def _translate_assistant(
         # below closes the generation, so a later block in a parallel tool
         # response would otherwise be dropped. Tool names only, never arguments.
         for block in message.content:
-            if isinstance(block, TextBlock) and block.text:
+            if isinstance(block, TextBlock) and block.text and not nested:
                 gen.observe_output(block.text)
             elif isinstance(block, ToolUseBlock):
                 gen.observe_output(f"[tool_use {block.name}]")
     for block in message.content:
         if isinstance(block, TextBlock):
-            if block.text:
+            if block.text and not nested:
                 state.assistant_text += block.text
                 events.append(TextDelta(text=block.text))
         elif isinstance(block, ToolUseBlock):
