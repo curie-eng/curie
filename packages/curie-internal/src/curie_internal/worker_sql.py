@@ -145,19 +145,32 @@ def _seed(function: ast.FunctionDef | ast.AsyncFunctionDef, schema: str) -> _Env
 
 def _constructors(tree: ast.Module) -> set[str]:
     names: set[str] = set()
+    canonical = {
+        "sqlalchemy.text", "sqlalchemy.sql.text", "sqlalchemy.sql.expression.text"
+    }
+
+    def qualified(module: str, alias: str) -> None:
+        names.update(
+            f"{alias}{constructor[len(module):]}"
+            for constructor in canonical
+            if constructor.startswith(f"{module}.")
+        )
+
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             if node.module in {"sqlalchemy", "sqlalchemy.sql", "sqlalchemy.sql.expression"}:
-                names.update(
-                    alias.asname or alias.name for alias in node.names if alias.name == "text"
-                )
+                for alias in node.names:
+                    if alias.name == "text":
+                        names.add(alias.asname or alias.name)
+                    else:
+                        qualified(f"{node.module}.{alias.name}", alias.asname or alias.name)
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name == "sqlalchemy" or alias.name.startswith("sqlalchemy.sql"):
-                    prefix = alias.asname or alias.name
-                    names.add(f"{prefix}.text")
-                    if alias.name == "sqlalchemy" and alias.asname is None:
-                        names.add("sqlalchemy.sql.text")
+                    if alias.asname is None:
+                        names.update(canonical)
+                    else:
+                        qualified(alias.name, alias.asname)
     return names
 
 
@@ -170,6 +183,7 @@ class _SQLVisitor(ast.NodeVisitor):
         self.class_environment: _Environment = {}
         self.scopes: list[str] = []
         self.statements: list[tuple[str, str]] = []
+        self.loop_breaks: list[list[_Environment]] = []
 
     def visit_Module(self, node: ast.Module) -> None:
         # Module constants can be declared below a function that uses them.
@@ -257,11 +271,23 @@ class _SQLVisitor(ast.NodeVisitor):
         self._loop(node.body, node.orelse, before)
 
     def _loop(self, body: list[ast.stmt], otherwise: list[ast.stmt], before: _Environment) -> None:
-        for statement in body:
-            self.visit(statement)
+        breaks: list[_Environment] = []
+        self.loop_breaks.append(breaks)
+        try:
+            for statement in body:
+                self.visit(statement)
+        finally:
+            self.loop_breaks.pop()
         self.environment = _merge([before, self.environment])
         for statement in otherwise:
             self.visit(statement)
+        # A break exits this loop before its else suite. Inner loop breaks are
+        # captured by their own frame and do not skip this loop's else suite.
+        self.environment = _merge([self.environment, *breaks])
+
+    def visit_Break(self, node: ast.Break) -> None:
+        if self.loop_breaks:
+            self.loop_breaks[-1].append(self.environment.copy())
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
         self.visit(node.iter)
