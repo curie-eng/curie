@@ -5,6 +5,7 @@
 //! the platform API's committed OpenAPI surface. Task I1.
 
 pub mod api;
+pub mod api_requests;
 pub mod approval_wording;
 pub mod artifacts;
 pub mod bundle;

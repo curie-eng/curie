@@ -15,6 +15,7 @@ const dep = (
   commit_sha: null,
   status,
   deployed_at: "2026-07-08T00:00:00Z",
+  workspace_enabled: false,
 });
 
 describe("agentIdsForEnv (client-side env scoping)", () => {

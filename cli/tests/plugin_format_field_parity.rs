@@ -26,6 +26,7 @@
 mod field_parity;
 
 use field_parity::{violations, Violation};
+use quote::ToTokens;
 use serde_json::Value;
 
 // ─── Loaders ─────────────────────────────────────────────────────────────────
@@ -123,8 +124,9 @@ fn mentions_struct(vs: &[Violation], struct_name: &str) -> bool {
         | Violation::StaleOmission { struct_name: s, .. }
         | Violation::SchemaNotFound { struct_name: s, .. }
         | Violation::DuplicateStruct { struct_name: s }
-        | Violation::UnsupportedShape { struct_name: s, .. } => s == struct_name,
-        Violation::MalformedManifestEntry { .. } => false,
+        | Violation::UnsupportedShape { struct_name: s, .. }
+        | Violation::OptionalityMismatch { struct_name: s, .. } => s == struct_name,
+        _ => false,
     })
 }
 
@@ -189,6 +191,65 @@ fn spec_rs_has_no_plugin_format_field_parity_violations() {
         "cli/src/spec.rs has drifted from packages/plugin-format/schema/plugin-format.schema.json. \
          Each entry below is fixed by either adding the field to the struct or declaring the \
          omission (with a justification) in cli/plugin-format-mirrors.json:\n{vs:#?}"
+    );
+}
+
+#[test]
+fn spec_gate_rejects_an_existing_schema_field_removed_from_the_real_source() {
+    let src = repo_text("cli/src/spec.rs");
+    let mut parsed = syn::parse_file(&src).expect("the real spec source parses");
+    let gate = parsed
+        .items
+        .iter_mut()
+        .find_map(|item| match item {
+            syn::Item::Struct(item) if item.ident == "ApprovalGateSpec" => Some(item),
+            _ => None,
+        })
+        .expect("the real source defines ApprovalGateSpec");
+    let syn::Fields::Named(fields) = &mut gate.fields else {
+        panic!("ApprovalGateSpec has named fields");
+    };
+    let original_count = fields.named.len();
+    fields.named = std::mem::take(&mut fields.named)
+        .into_iter()
+        .filter(|field| field.ident.as_ref().is_none_or(|name| name != "summary"))
+        .collect();
+    assert_eq!(
+        fields.named.len() + 1,
+        original_count,
+        "the mutation must remove exactly ApprovalGateSpec.summary"
+    );
+    let drifted = parsed.to_token_stream().to_string();
+    syn::parse_file(&drifted).expect("the field mutation preserves valid Rust syntax");
+    let schema = plugin_format_schema_as_components();
+    let manifest = repo_json("cli/plugin-format-mirrors.json");
+    let scoped = manifest_for_file(&manifest, "cli/src/spec.rs");
+
+    let vs = violations(&drifted, &schema, &scoped);
+    assert!(
+        has_missing_field(&vs, "ApprovalGateSpec", "summary"),
+        "the real spec gate must reject a missing frozen schema field:\n{vs:#?}"
+    );
+}
+
+#[test]
+fn spec_gate_rejects_a_schema_field_added_without_updating_the_real_source() {
+    let src = repo_text("cli/src/spec.rs");
+    let mut schema = plugin_format_schema_as_components();
+    schema["components"]["schemas"]["ApprovalPolicy"]["properties"]
+        .as_object_mut()
+        .expect("the real ApprovalPolicy schema has properties")
+        .insert(
+            "newPolicyField".into(),
+            serde_json::json!({ "type": "string" }),
+        );
+    let manifest = repo_json("cli/plugin-format-mirrors.json");
+    let scoped = manifest_for_file(&manifest, "cli/src/spec.rs");
+
+    let vs = violations(&src, &schema, &scoped);
+    assert!(
+        has_missing_field(&vs, "ApprovalPolicySpec", "newPolicyField"),
+        "the real spec gate must reject a schema field absent from the Rust mirror:\n{vs:#?}"
     );
 }
 

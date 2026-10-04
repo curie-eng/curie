@@ -29,9 +29,11 @@ runtimes on Kubernetes or Docker, `runner/` serves the ACI protocol inside the
 sandbox, `apps/api` owns agents/versions/deployments and the git-flow deploy
 engine, and `apps/ui` and `cli/` are the operator surfaces. The core's own
 internal seams are already contracts: `packages/aci-protocol` and
-`packages/plugin-format` are frozen, tri-language (Pydantic source of truth,
-committed JSON Schema, generated TypeScript and Rust), and guarded by a
-schema-compat CI test.
+`packages/plugin-format` are frozen and guarded by schema-compat CI tests.
+`aci-protocol` is tri-language (Pydantic source of truth, committed JSON
+Schema, generated TypeScript and Rust). `plugin-format` is a frozen JSON
+Schema plus a CLI field-parity gate; its Rust is hand-written and not
+generated ([ADR 0194](adr/0194-plugin-format-contract-is-the-frozen-schema-plus-a-parity-gate.md)).
 
 ## The six swappable jobs
 

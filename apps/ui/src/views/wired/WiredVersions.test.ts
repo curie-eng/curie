@@ -8,6 +8,7 @@ const v = (id: string, created_at: string): VersionOut => ({
   version_label: id,
   bundle_ref: "r",
   bundle_sha256: "s",
+  commit_sha: null,
   created_by: "ui",
   created_at,
 });
@@ -20,6 +21,7 @@ const d = (version_id: string, environment: "prod" | "dev", deployed_at: string,
   commit_sha: null,
   status,
   deployed_at,
+  workspace_enabled: false,
 });
 
 describe("buildRows (versions joined with deployments)", () => {

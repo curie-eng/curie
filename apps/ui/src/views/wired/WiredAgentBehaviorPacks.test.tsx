@@ -45,6 +45,27 @@ beforeEach(() => {
 });
 
 describe("WiredAgentBehaviorPacks (#870)", () => {
+  it("renders and edits a config with omitted optional defaults", async () => {
+    // apps/api/openapi.json declares every BehaviorPacksConfig property optional.
+    vi.mocked(getBehaviorPacks).mockResolvedValue({} as BehaviorPacksConfig);
+    vi.mocked(putBehaviorPacks).mockImplementation(async (_id, cfg) => cfg);
+    renderPanel();
+
+    expect(await screen.findByTestId("load-lines")).toHaveValue("");
+    expect(screen.getByTestId("pack-toggle-load")).not.toBeChecked();
+    expect(screen.getByText("No settings declared.")).toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("pack-toggle-load"));
+    await userEvent.type(screen.getByTestId("load-lines"), "thinking");
+    await userEvent.click(screen.getByTestId("behavior-packs-save"));
+
+    await waitFor(() => expect(putBehaviorPacks).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(putBehaviorPacks).mock.calls[0][1].load).toEqual({
+      enabled: true,
+      lines: ["thinking"],
+    });
+    expect(await screen.findByTestId("behavior-packs-saved")).toHaveTextContent("Saved");
+  });
+
   it("renders every pack with its enabled state from the GET", async () => {
     vi.mocked(getBehaviorPacks).mockResolvedValue(
       makeConfig({ load: { enabled: true, lines: ["thinking…"] } }),
@@ -86,9 +107,11 @@ describe("WiredAgentBehaviorPacks (#870)", () => {
     await waitFor(() => expect(putBehaviorPacks).toHaveBeenCalledTimes(1));
     const [id, sent] = vi.mocked(putBehaviorPacks).mock.calls[0];
     expect(id).toBe("a1");
-    expect(sent.greeting.enabled).toBe(true);
+    expect(sent.greeting).toBeDefined();
+    expect(sent.load).toBeDefined();
+    expect(sent.greeting?.enabled).toBe(true);
     // The rest of the config is round-tripped untouched.
-    expect(sent.load.enabled).toBe(false);
+    expect(sent.load?.enabled).toBe(false);
     expect(await screen.findByTestId("behavior-packs-saved")).toHaveTextContent("Saved");
   });
 
@@ -105,7 +128,8 @@ describe("WiredAgentBehaviorPacks (#870)", () => {
 
     await waitFor(() => expect(putBehaviorPacks).toHaveBeenCalledTimes(1));
     const [, sent] = vi.mocked(putBehaviorPacks).mock.calls[0];
-    expect(sent.load.lines).toEqual(["one", "two"]);
+    expect(sent.load).toBeDefined();
+    expect(sent.load?.lines).toEqual(["one", "two"]);
   });
 
   it("round-trips the read-only settings pack unchanged", async () => {

@@ -7,7 +7,13 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+
+use crate::api_requests::{
+    AgentCreate, AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve,
+    ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
+    DeploymentCreate, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
+    ResolveTargetRequest, RoutingCheckRequest, VersionCreate,
+};
 
 pub struct ApiClient {
     base_url: String,
@@ -97,6 +103,12 @@ pub(crate) struct ClusterMessageProgress {
 /// so this is a valid Slack channel-ID shape, not a `#name`.
 pub const DEFAULT_SLACK_CHANNEL: &str = "C0LOCALDEV";
 
+/// What an absent target `env` means: `ResolvedTarget.env` and
+/// `NamedTarget.env` default to `"dev"` in the committed OpenAPI schema.
+fn default_target_env() -> String {
+    "dev".to_string()
+}
+
 /// @spec ADR-0168 d8. What an absent `identity` means on a target the API
 /// resolved: the API predates this decision, and every target it knows is on
 /// the default.
@@ -113,6 +125,8 @@ fn default_identity() -> String {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResolvedTarget {
     pub agent: Option<String>,
+    /// Optional on the wire; an omitted env is the API's own default.
+    #[serde(default = "default_target_env")]
     pub env: String,
     pub slack_channel: Option<String>,
     /// @spec ADR-0168 d8. The identity the binding speaks through.
@@ -169,6 +183,8 @@ fn yes() -> bool {
 pub struct NamedTarget {
     pub name: String,
     pub agent: Option<String>,
+    /// Optional on the wire; an omitted env is the API's own default.
+    #[serde(default = "default_target_env")]
     pub env: String,
     pub slack_channel: Option<String>,
     /// @spec ADR-0168 d8. The identity the binding speaks through.
@@ -202,7 +218,9 @@ pub struct ConnectorManifests {
     pub mcp_entries: std::collections::BTreeMap<String, serde_json::Value>,
     /// The version whose bundle was read. Required on the wire.
     pub version_id: String,
-    /// plugin.json triggers as stored. Required on the wire, even when empty.
+    /// plugin.json triggers as stored. Optional on the wire, where an omitted
+    /// list means no triggers (the schema's empty default).
+    #[serde(default)]
     pub triggers: Vec<serde_json::Value>,
 }
 
@@ -333,12 +351,12 @@ pub struct Agent {
 /// An operator authored hook configuration file. Absent maps are omitted from
 /// PATCH so changing one map leaves the other untouched. An empty map clears
 /// that map. The API remains the authority for pointer and name validation.
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookConfigInput {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     hook_partitions: Option<std::collections::BTreeMap<String, HookPartitionInput>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     source_bindings: Option<std::collections::BTreeMap<String, SourceBindingInput>>,
 }
 
@@ -346,24 +364,37 @@ impl HookConfigInput {
     pub fn is_empty(&self) -> bool {
         self.hook_partitions.is_none() && self.source_bindings.is_none()
     }
+
+    /// The `PATCH /agents/{id}` body carrying exactly the maps the file names.
+    pub fn into_update(self) -> AgentUpdate {
+        AgentUpdate {
+            hook_partitions: self.hook_partitions,
+            source_bindings: self.source_bindings,
+            ..AgentUpdate::default()
+        }
+    }
 }
 
-#[derive(Deserialize, Serialize)]
+/// One hook's conversation partition pointer, as an operator file writes it
+/// and as `AgentUpdate.hook_partitions` sends it (`HookPartitionConfig`).
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct HookPartitionInput {
+pub struct HookPartitionInput {
     pointer: String,
 }
 
-#[derive(Deserialize, Serialize)]
+/// One hook's allowlisted workload mapping (`SourceBindingConfig`).
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SourceBindingInput {
+pub struct SourceBindingInput {
     workload_pointer: String,
     map: std::collections::BTreeMap<String, SourceBindingEntryInput>,
 }
 
-#[derive(Deserialize, Serialize)]
+/// One allowlisted repository and revision (`SourceBindingEntry`).
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SourceBindingEntryInput {
+pub struct SourceBindingEntryInput {
     repository: String,
     revision: String,
 }
@@ -1151,8 +1182,17 @@ pub struct WorkItemPublication {
 /// `WorkItemCorrectnessOut`: the platform never asserts correctness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItemCorrectness {
+    /// Optional on the wire with the schema's constant default `false`.
+    #[serde(default)]
     pub asserted: bool,
+    /// Optional on the wire with the schema's constant default `"bundle"`.
+    #[serde(default = "default_correctness_owner")]
     pub owner: String,
+}
+
+/// `WorkItemCorrectnessOut.owner`'s schema default and only value.
+fn default_correctness_owner() -> String {
+    "bundle".to_string()
 }
 
 /// `WorkItemCiOut`: live CI for the published head (detail only).
@@ -1750,18 +1790,19 @@ fn agent_create_body(
     slack_channel: &str,
     repo_full_name: Option<&str>,
     identity: Option<&str>,
-) -> serde_json::Value {
-    let mut channel = json!({"kind": "slack", "address": slack_channel});
-    // @spec ADR-0168 d8: only a named identity travels; the default is omitted,
-    // exactly as every create sent it before the identity existed.
-    if let Some(identity) = named_identity("slack", identity) {
-        channel["adapter"] = json!(identity);
+) -> AgentCreate {
+    AgentCreate {
+        channel: ChannelBindingWrite {
+            // @spec ADR-0168 d8: only a named identity travels; the default is
+            // omitted, exactly as every create sent it before the identity existed.
+            adapter: named_identity("slack", identity).map(str::to_string),
+            address: slack_channel.to_string(),
+            endpoint: None,
+            kind: "slack".to_string(),
+        },
+        name: name.to_string(),
+        repo_full_name: repo_full_name.map(str::to_string),
     }
-    let mut body = json!({"name": name, "channel": channel});
-    if let Some(repo) = repo_full_name {
-        body["repo_full_name"] = json!(repo);
-    }
-    body
 }
 
 /// `adapter` as a request names it, with the default Slack identity dropped,
@@ -1810,12 +1851,11 @@ fn identity_refusal(kind: &str, address: &str, identity: &str, body: &str) -> an
 /// and Pydantic decodes a `null` and an absent key to the same `None`, so a
 /// `null` would read as "omitted" while looking on the wire like an intent to
 /// clear (#1071, the same trap documented on [`ApiClient::set_approval_routes`]).
-fn agent_update_body(repo_full_name: Option<&str>) -> serde_json::Value {
-    let mut body = json!({});
-    if let Some(repo) = repo_full_name {
-        body["repo_full_name"] = json!(repo);
+fn agent_update_body(repo_full_name: Option<&str>) -> AgentUpdate {
+    AgentUpdate {
+        repo_full_name: repo_full_name.map(str::to_string),
+        ..AgentUpdate::default()
     }
-    body
 }
 
 /// The `POST /agents/{id}/channels` body: the binding PAIR, plus the identity
@@ -1832,15 +1872,13 @@ fn add_channel_body(
     address: &str,
     endpoint: Option<&str>,
     adapter: Option<&str>,
-) -> serde_json::Value {
-    let mut body = json!({"kind": kind, "address": address});
-    if let Some(endpoint) = endpoint {
-        body["endpoint"] = json!(endpoint);
+) -> ChannelBindingWrite {
+    ChannelBindingWrite {
+        adapter: adapter.map(str::to_string),
+        address: address.to_string(),
+        endpoint: endpoint.map(str::to_string),
+        kind: kind.to_string(),
     }
-    if let Some(adapter) = adapter {
-        body["adapter"] = json!(adapter);
-    }
-    body
 }
 
 /// The `POST /channels/token` body. Pure so the shape is testable without a
@@ -1852,13 +1890,13 @@ fn mint_channel_token_body(
     address: &str,
     adapter: Option<&str>,
     ttl_s: i64,
-) -> serde_json::Value {
-    let mut body = json!({"kind": kind, "address": address});
-    if let Some(adapter) = adapter {
-        body["adapter"] = json!(adapter);
+) -> ChannelTokenRequest {
+    ChannelTokenRequest {
+        adapter: adapter.map(str::to_string),
+        address: address.to_string(),
+        kind: kind.to_string(),
+        ttl_s: Some(ttl_s),
     }
-    body["ttl_s"] = json!(ttl_s);
-    body
 }
 
 /// Is this 404 a MISSING ENDPOINT rather than a missing resource?
@@ -2335,7 +2373,7 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/agents", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&body),
+                    .json::<AgentCreate>(&body),
                 "POST /agents",
             )
             .await?;
@@ -2364,16 +2402,17 @@ impl ApiClient {
         self.create_agent(name, slack_channel, None, None).await
     }
 
-    /// `PATCH /agents/{id}` with a body the caller already built (see
-    /// [`agent_update_body`]). The returned `Agent` is the row as the API
-    /// stored it, so callers report what took rather than what they intended.
-    pub async fn update_agent(&self, agent_id: &str, body: &serde_json::Value) -> Result<Agent> {
+    /// `PATCH /agents/{id}` with a typed body the caller already built (see
+    /// [`AgentUpdate`]: an omitted key is unchanged, an explicit clear sends
+    /// `null`). The returned `Agent` is the row as the API stored it, so
+    /// callers report what took rather than what they intended.
+    pub async fn update_agent(&self, agent_id: &str, body: &AgentUpdate) -> Result<Agent> {
         let resp = self
             .send_request(
                 self.http
                     .patch(format!("{}/agents/{agent_id}", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(body),
+                    .json::<AgentUpdate>(body),
                 "PATCH /agents/{id}",
             )
             .await?;
@@ -2424,7 +2463,7 @@ impl ApiClient {
             .http
             .post(format!("{}/agents/{agent_id}/channels", self.base_url))
             .header("X-API-Key", &self.api_key)
-            .json(&add_channel_body(kind, address, endpoint, adapter))
+            .json::<ChannelBindingWrite>(&add_channel_body(kind, address, endpoint, adapter))
             .send()
             .await
             .context("POST /agents/{id}/channels")?;
@@ -2517,7 +2556,9 @@ impl ApiClient {
             ))
             .query(&query)
             .header("X-API-Key", &self.api_key)
-            .json(&serde_json::json!({ "allowed_callers": callers }))
+            .json::<ChannelCallersWrite>(&ChannelCallersWrite {
+                allowed_callers: callers.map(<[String]>::to_vec),
+            })
             .send()
             .await
             .context("PUT /agents/{id}/channels/callers")?;
@@ -2548,7 +2589,7 @@ impl ApiClient {
             .http
             .post(format!("{}/channels/token", self.base_url))
             .header("X-API-Key", &self.api_key)
-            .json(&mint_channel_token_body(kind, address, adapter, ttl_s))
+            .json::<ChannelTokenRequest>(&mint_channel_token_body(kind, address, adapter, ttl_s))
             .send()
             .await
             .context("POST /channels/token")?;
@@ -2578,7 +2619,10 @@ impl ApiClient {
                 self.http
                     .patch(format!("{}/agents/{agent_id}", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({ "secrets": secrets })),
+                    .json::<AgentUpdate>(&AgentUpdate {
+                        secrets: Some(secrets.clone()),
+                        ..AgentUpdate::default()
+                    }),
                 "PATCH /agents/{id}",
             )
             .await?;
@@ -2742,11 +2786,11 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/agents/{agent_id}/versions", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({
-                        "version_label": version_label,
-                        "created_by": created_by,
-                        "commit_sha": commit_sha,
-                    })),
+                    .json::<VersionCreate>(&VersionCreate {
+                        commit_sha: commit_sha.map(str::to_string),
+                        created_by: created_by.to_string(),
+                        version_label: version_label.to_string(),
+                    }),
                 "POST /agents/{id}/versions",
             )
             .await?;
@@ -2795,21 +2839,19 @@ impl ApiClient {
         commit_sha: Option<&str>,
         workspace_enabled: Option<bool>,
     ) -> Result<Deployment> {
-        let mut body = json!({
-            "agent_id": agent_id,
-            "version_id": version_id,
-            "environment": environment,
-            "commit_sha": commit_sha,
-        });
-        if let Some(enabled) = workspace_enabled {
-            body["workspace_enabled"] = json!(enabled);
-        }
+        let body = DeploymentCreate {
+            agent_id: agent_id.to_string(),
+            commit_sha: commit_sha.map(str::to_string),
+            environment: environment.to_string(),
+            version_id: version_id.to_string(),
+            workspace_enabled,
+        };
         let resp = self
             .send_request(
                 self.http
                     .post(format!("{}/deployments", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&body),
+                    .json::<DeploymentCreate>(&body),
                 "POST /deployments",
             )
             .await?;
@@ -3090,7 +3132,7 @@ impl ApiClient {
                 self.http
                     .put(format!("{}/agents/{agent_id}/budget", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(budget),
+                    .json::<BudgetConfig>(budget),
                 "PUT /agents/{id}/budget",
             )
             .await?;
@@ -3125,7 +3167,10 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/deploy-targets/resolve", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&serde_json::json!({"content": content, "target": target})),
+                    .json::<ResolveTargetRequest>(&ResolveTargetRequest {
+                        content: content.to_string(),
+                        target: target.to_string(),
+                    }),
                 "resolving the deploy target",
             )
             .await?;
@@ -3178,7 +3223,10 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/deploy-targets/list", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&serde_json::json!({"content": content, "target": ""})),
+                    .json::<ResolveTargetRequest>(&ResolveTargetRequest {
+                        content: content.to_string(),
+                        target: String::new(),
+                    }),
                 "listing the deploy targets",
             )
             .await?;
@@ -3240,10 +3288,10 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/git-flow/routing-check", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&serde_json::json!({
-                        "repo_full_name": repo_full_name,
-                        "content": content,
-                    }))
+                    .json::<RoutingCheckRequest>(&RoutingCheckRequest {
+                        content: content.map(str::to_string),
+                        repo_full_name: repo_full_name.to_string(),
+                    })
                     .timeout(std::time::Duration::from_secs(10)),
                 "checking git-flow routing",
             )
@@ -3485,7 +3533,9 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/agents/{agent_id}/memory", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({ "content": content })),
+                    .json::<MemoryEntryCreate>(&MemoryEntryCreate {
+                        content: content.to_string(),
+                    }),
                 "POST /agents/{id}/memory",
             )
             .await?;
@@ -3527,7 +3577,9 @@ impl ApiClient {
                         self.base_url
                     ))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({ "text": text })),
+                    .json::<MemoryGuidanceIn>(&MemoryGuidanceIn {
+                        text: text.to_string(),
+                    }),
                 "PUT /agents/{id}/memory/guidance",
             )
             .await?;
@@ -3725,17 +3777,17 @@ impl ApiClient {
         principal_token: &str,
         note: Option<&str>,
     ) -> Result<ApprovalRecord> {
-        let mut body = json!({ "decision": decision });
-        if let Some(note) = note {
-            body["note"] = json!(note);
-        }
+        let body = ApprovalResolve {
+            decision: decision.to_string(),
+            note: note.map(str::to_string),
+        };
         let resp = self
             .send_request(
                 self.http
                     .post(format!("{}/approvals/{approval_id}/resolve", self.base_url))
                     .header("X-API-Key", &self.api_key)
                     .header("X-Curie-Approval-Principal", principal_token)
-                    .json(&body),
+                    .json::<ApprovalResolve>(&body),
                 "POST /approvals/{id}/resolve",
             )
             .await?;
@@ -3792,11 +3844,11 @@ impl ApiClient {
                     .post(format!("{}/approvals/{approval_id}/recover", self.base_url))
                     .header("X-API-Key", &self.api_key)
                     .header("X-Curie-Approval-Principal", principal_token)
-                    .json(&json!({
-                        "disposition": "rejected",
-                        "reason": reason,
-                        "recovery_key": recovery_key,
-                    })),
+                    .json::<ApprovalRecover>(&ApprovalRecover {
+                        disposition: "rejected".to_string(),
+                        reason: reason.to_string(),
+                        recovery_key: recovery_key.to_string(),
+                    }),
                 "POST /approvals/{id}/recover",
             )
             .await?;
@@ -3818,7 +3870,9 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/approvals/principals/operator", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({ "subject": subject })),
+                    .json::<ApprovalPrincipalMint>(&ApprovalPrincipalMint {
+                        subject: subject.to_string(),
+                    }),
                 "POST /approvals/principals/operator",
             )
             .await?;
@@ -3846,7 +3900,9 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/console/login-codes", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({ "subject": subject })),
+                    .json::<ConsoleLoginCodeMint>(&ConsoleLoginCodeMint {
+                        subject: subject.to_string(),
+                    }),
                 "POST /console/login-codes",
             )
             .await?;
@@ -3875,7 +3931,10 @@ impl ApiClient {
                 self.http
                     .patch(format!("{}/agents/{agent_id}", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({ "approval_required_tools": tools })),
+                    .json::<AgentUpdate>(&AgentUpdate {
+                        approval_required_tools: Some(tools.to_vec()),
+                        ..AgentUpdate::default()
+                    }),
                 "PATCH /agents/{id} (approval gates)",
             )
             .await?;
@@ -3906,7 +3965,10 @@ impl ApiClient {
                 self.http
                     .patch(format!("{}/agents/{agent_id}", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({ "approval_routes": routes })),
+                    .json::<AgentUpdate>(&AgentUpdate {
+                        approval_routes: Some(routes.clone()),
+                        ..AgentUpdate::default()
+                    }),
                 "PATCH /agents/{id} (approval routes)",
             )
             .await?;
@@ -3927,19 +3989,17 @@ impl ApiClient {
         suite: Option<&str>,
         model: Option<&str>,
     ) -> Result<EvalTriggerResult> {
-        let mut body = json!({ "agent_id": agent_id });
-        if let Some(suite) = suite {
-            body["suite"] = json!(suite);
-        }
-        if let Some(model) = model {
-            body["model"] = json!(model);
-        }
+        let body = EvalTriggerRequest {
+            agent_id: agent_id.to_string(),
+            model: model.map(str::to_string),
+            suite: suite.map(str::to_string),
+        };
         let resp = self
             .send_request(
                 self.http
                     .post(format!("{}/evals/trigger", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&body),
+                    .json::<EvalTriggerRequest>(&body),
                 "POST /evals/trigger",
             )
             .await?;
@@ -4064,6 +4124,11 @@ mod tests {
         validate_allowlist_entry, ChannelBinding, ListedTargets, ResolvedTarget,
         DEFAULT_SLACK_IDENTITY,
     };
+
+    /// A typed request body as it goes on the wire.
+    fn wire<T: serde::Serialize>(body: &T) -> serde_json::Value {
+        serde_json::to_value(body).expect("request bodies serialize")
+    }
 
     /// The pre-dispatch span guard allows exactly the cap (#1948): 1,000 hour
     /// buckets from 1970-01-01T00:00:00Z is legal, one more is not.
@@ -4218,7 +4283,7 @@ mod tests {
         // A value the caller did not pass is not a binding the caller intended.
         // The column is no longer unique (ADR-0091, migration 0018), so an
         // unsolicited value would silently bind rather than 409.
-        let body = agent_create_body("bot", "C123", None, None);
+        let body = wire(&agent_create_body("bot", "C123", None, None));
         assert_eq!(body["name"], "bot");
         assert_eq!(body["channel"]["kind"], "slack");
         assert_eq!(body["channel"]["address"], "C123");
@@ -4229,7 +4294,7 @@ mod tests {
     fn create_agent_body_binds_the_repo_when_asked() {
         // Creation is the first chance to bind, and the only one that needs no
         // second request: AgentUpdate carries repo_full_name too (#1194).
-        let body = agent_create_body("bot", "C123", Some("acme/bundle"), None);
+        let body = wire(&agent_create_body("bot", "C123", Some("acme/bundle"), None));
         assert_eq!(body["repo_full_name"], "acme/bundle");
     }
 
@@ -4237,7 +4302,7 @@ mod tests {
     fn agent_update_body_omits_both_when_neither_is_asked() {
         // Omission is how the wire says "leave this alone", so a PATCH with
         // nothing to change carries nothing at all.
-        let body = agent_update_body(None);
+        let body = wire(&agent_update_body(None));
         assert!(
             body.as_object().expect("an object").is_empty(),
             "was {body}"
@@ -4250,7 +4315,7 @@ mod tests {
         // guards both fields behind `is not None`, and Pydantic decodes a null
         // and an omitted key identically, so a null would read as "omitted"
         // while looking on the wire like an intent to clear (#1071).
-        let repo = agent_update_body(Some("acme/bundle"));
+        let repo = wire(&agent_update_body(Some("acme/bundle")));
         assert_eq!(repo["repo_full_name"], "acme/bundle");
     }
 
@@ -4261,8 +4326,8 @@ mod tests {
         // not merely send something unnecessary, it 422s the whole PATCH --
         // taking the repo bind travelling beside it down with it.
         for body in [
-            agent_update_body(None),
-            agent_update_body(Some("acme/bundle")),
+            wire(&agent_update_body(None)),
+            wire(&agent_update_body(Some("acme/bundle"))),
         ] {
             assert!(
                 body.get("channel").is_none() && body.get("channels").is_none(),
@@ -4270,7 +4335,7 @@ mod tests {
             );
         }
         assert_eq!(
-            agent_update_body(Some("acme/bundle")),
+            wire(&agent_update_body(Some("acme/bundle"))),
             serde_json::json!({"repo_full_name": "acme/bundle"}),
             "the repo bind is the only thing left in this body"
         );
@@ -4282,13 +4347,13 @@ mod tests {
         // the assertion, so a stray `agent_id` echoed back into the body, or a
         // bare address string standing in for the pair, both fail.
         assert_eq!(
-            add_channel_body("slack", "C0EXAMPLE1", None, None),
+            wire(&add_channel_body("slack", "C0EXAMPLE1", None, None)),
             serde_json::json!({"kind": "slack", "address": "C0EXAMPLE1"})
         );
         // The kind is never inferred: a non-Slack ingress passes through
         // verbatim, which is the whole point of a channel-neutral binding.
         assert_eq!(
-            add_channel_body("email", "ops@example.com", None, None),
+            wire(&add_channel_body("email", "ops@example.com", None, None)),
             serde_json::json!({"kind": "email", "address": "ops@example.com"})
         );
     }
@@ -4299,7 +4364,12 @@ mod tests {
         // endpoint -- Slack is an in-process ingress, so it has nothing to
         // configure a transport for.
         assert_eq!(
-            add_channel_body("slack", "C0EXAMPLE1", None, Some("default")),
+            wire(&add_channel_body(
+                "slack",
+                "C0EXAMPLE1",
+                None,
+                Some("default")
+            )),
             serde_json::json!({"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default"})
         );
     }
@@ -4308,12 +4378,12 @@ mod tests {
     fn add_channel_body_sends_a_non_slack_route_whole() {
         // A non-Slack route's endpoint and adapter travel together.
         assert_eq!(
-            add_channel_body(
+            wire(&add_channel_body(
                 "discord",
                 "111111111111111111",
                 Some("https://discord-adapter.example.com/replies"),
                 Some("discord-main"),
-            ),
+            )),
             serde_json::json!({
                 "kind": "discord",
                 "address": "111111111111111111",
@@ -4336,7 +4406,12 @@ mod tests {
     #[test]
     fn mint_token_body_carries_the_adapter_when_known() {
         assert_eq!(
-            mint_channel_token_body("slack", "C0EXAMPLE1", Some("second"), 3600),
+            wire(&mint_channel_token_body(
+                "slack",
+                "C0EXAMPLE1",
+                Some("second"),
+                3600
+            )),
             serde_json::json!({
                 "kind": "slack",
                 "address": "C0EXAMPLE1",
@@ -4372,7 +4447,12 @@ mod tests {
         // Omission resolves the way the platform did before the identity
         // existed (ADR-0168 decision 3).
         assert_eq!(
-            mint_channel_token_body("email", "ops@example.com", None, 3600),
+            wire(&mint_channel_token_body(
+                "email",
+                "ops@example.com",
+                None,
+                3600
+            )),
             serde_json::json!({"kind": "email", "address": "ops@example.com", "ttl_s": 3600})
         );
     }

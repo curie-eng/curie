@@ -857,6 +857,12 @@ jobs:
           pnpm gen:manifest
           git diff --exit-code src/generated/commandManifest.ts \
             || (echo "commandManifest.ts is stale; run 'pnpm gen:manifest' in apps/ui and commit." && exit 1)
+      - name: API types are current
+        # The committed src/api/generated.ts must match what apps/api/openapi.json
+        # generates, so a changed API response field cannot land without the UI
+        # types (and the consumers typecheck reaches through them) following it.
+        # Generation never runs inside the UI Docker build.
+        run: pnpm gen:api-types --check
       - name: Lint
         run: pnpm lint
       - name: Unit tests (vitest)
