@@ -1281,6 +1281,14 @@ enum DevAction {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Serve or record a scripted Anthropic Messages endpoint (#3814).
+    /// `serve` replays a transcript and fails on an unexpected request.
+    /// `record` proxies to a provider and writes the transcript.
+    ModelScript {
+        /// `serve` or `record`, followed by endpoint flags.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Serve a TLS GitHub fixture or capture public check lifecycle recordings.
     GithubStub {
         /// `serve` or `capture`, followed by fixture flags.
@@ -4792,6 +4800,10 @@ async fn run(command: Option<Command>) -> Result<()> {
             DevAction::FactoryE2e { args } => {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 commands::dev_script("cli/scripts/factory-e2e.sh", &args).await
+            }
+            DevAction::ModelScript { args } => {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                commands::dev_script("cli/scripts/model-script.sh", &args).await
             }
             DevAction::GithubStub { args } => {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -8448,6 +8460,22 @@ mod tests {
             _ => panic!("dev factory-e2e parsed as another command"),
         }
         assert!(try_parse_from(["curie", "dev", "factory-e2e"]).is_err());
+        let cli = try_parse_from([
+            "curie",
+            "dev",
+            "model-script",
+            "serve",
+            "--transcript",
+            "transcript.json",
+        ])
+        .expect("dev model-script should pass its flags through");
+        match cli.command {
+            Some(Command::Dev {
+                action: DevAction::ModelScript { args },
+            }) => assert_eq!(args, ["serve", "--transcript", "transcript.json"]),
+            _ => panic!("dev model-script parsed as another command"),
+        }
+        assert!(try_parse_from(["curie", "dev", "model-script"]).is_err());
         let cli = try_parse_from(["curie", "dev", "chart-runtime-e2e"])
             .expect("dev chart-runtime-e2e should parse");
         assert!(matches!(

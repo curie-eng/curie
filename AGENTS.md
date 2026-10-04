@@ -811,15 +811,16 @@ required and proved, not carried on the original classification.
 | cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
 | live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow; also the MCP/workspace/coding-tool path set below | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
 | external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape; Slack is required on the MCP/workspace/coding-tool path set below | drive the real integration; a replayed fixture or a fake does not close this tier |
-| factory | API factory runtime, CI, progress, or publication behavior; runner verification preflight or factory progress; the dark factory example; worker work item execution | `curie dev factory-e2e run --scenario issue-to-pr` until the scenario in #3814 ships |
+| factory | API factory runtime, CI, progress, or publication behavior; runner verification preflight or factory progress; the dark factory example; worker work item execution | `curie dev factory-e2e scripted` on the kind rung when factory paths change |
 
 The factory path set includes `apps/api/src/curie_api/factory_runtime*`,
 `factory_ci*`, `factory_progress*`, and `routers/publications*`;
 runner verification preflight and progress; `examples/dark-factory/`; and
 worker work item execution. Factory evidence must run the production factory
 scenario through the changed components. A canned fixture or fake scenario
-does not close this tier. Until #3814 ships its scenario, use the command in
-the factory row.
+does not close this tier. The factory row names `curie dev factory-e2e scripted`,
+the kind-rung scenario that replays a recorded model transcript against the
+GitHub stub and a fixture whose layout is not this repository.
 
 The PR body guard derives minimum required tiers from changed files. A row
 required by those paths cannot be omitted or marked not applicable through
