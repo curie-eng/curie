@@ -237,6 +237,10 @@ fn guide_documents_cluster_up_gvisor_inference_and_fail_closed_contradictions() 
             ),
             "{label} primer missing the explicit mode contradiction error\n{text}"
         );
+        assert!(
+            text.contains("before the first install") && text.contains("NotFound"),
+            "{label} primer missing the pre-install NotFound RuntimeClass lookup\n{text}"
+        );
     }
 }
 
