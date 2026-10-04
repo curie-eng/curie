@@ -102,6 +102,7 @@ ed25519-dalek = { version = "3.0", default-features = false, features = ["fast",
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 # The frozen ACI types are a normal dependency of the lib, but integration test
 # crates need them by name to build a SessionStatus for the status_json contract.
 curie-aci-protocol = { path = "../packages/aci-protocol/generated/rust" }
