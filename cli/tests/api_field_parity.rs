@@ -40,7 +40,25 @@
 //       /// A manifest entry lacks a required key (`struct`/`schema`), so its
 //       /// struct would silently escape field comparison.
 //       MalformedManifestEntry { detail: String },
+//       // ── Issue #3834 additions ──
+//       /// Required Rust field for an API field that is optional or nullable.
+//       OptionalityMismatch { struct_name: String, schema: String, field: String },
+//       /// A platform send with an untyped or `json!` body, or not in `requests`.
+//       UnclassifiedRequest { function: String },
+//       /// The declared operation's requestBody schema is not the mirror's schema.
+//       RequestSchemaMismatch { function: String, .. },
+//       /// Source-derived method or normalized path differs from the declaration.
+//       RequestRouteMismatch { function: String, .. },
+//       /// Method, `format!` URL literal, or turbofish body cannot be extracted.
+//       UnverifiableRequest { function: String },
 //   }
+//
+//   pub fn request_violations(
+//       api_src: &str,                   // cli/src/api.rs (the sends)
+//       requests_src: &str,              // cli/src/api_requests.rs (the bodies)
+//       openapi: &serde_json::Value,
+//       manifest: &serde_json::Value,    // `request_mirrors` + `requests`
+//   ) -> Vec<Violation>;
 //
 // Precedence rules Stream A MUST honor so each fixture triggers one variant:
 //  - A struct with any `#[serde(flatten)]` field => emit `UnsupportedShape` for
@@ -163,8 +181,10 @@ fn mentions_struct(vs: &[Violation], struct_name: &str) -> bool {
         | Violation::StaleOmission { struct_name: s, .. }
         | Violation::SchemaNotFound { struct_name: s, .. }
         | Violation::DuplicateStruct { struct_name: s }
-        | Violation::UnsupportedShape { struct_name: s, .. } => s == struct_name,
-        Violation::MalformedManifestEntry { .. } => false,
+        | Violation::UnsupportedShape { struct_name: s, .. }
+        | Violation::OptionalityMismatch { struct_name: s, .. } => s == struct_name,
+        // Request-binding variants are keyed by function, not struct.
+        _ => false,
     })
 }
 
@@ -233,8 +253,9 @@ fn version_struct_carries_the_full_version_out() {
             | Violation::StaleOmission { struct_name, .. }
             | Violation::SchemaNotFound { struct_name, .. }
             | Violation::DuplicateStruct { struct_name }
-            | Violation::UnsupportedShape { struct_name, .. } => struct_name == "Version",
-            Violation::MalformedManifestEntry { .. } => false,
+            | Violation::UnsupportedShape { struct_name, .. }
+            | Violation::OptionalityMismatch { struct_name, .. } => struct_name == "Version",
+            _ => false,
         })
         .collect();
     assert!(
@@ -461,38 +482,262 @@ fn real_tree_request_bodies_match_openapi_operations() {
     assert!(vs.is_empty(), "CLI request bodies drifted from OpenAPI: {vs:#?}");
 }
 
+// ─── Request-gate fixtures (Revision 2: binding sends to HTTP operations) ────
+//
+// `request_violations(api_src, requests_src, openapi, manifest)` reads every
+// platform send in `api_src` in the production shape
+// `self.http.<method>(format!("{}<path>", self.base_url, ..)).header(..).json::<T>(&body)`
+// and binds it to the manifest's `requests` entry for the enclosing fn. The
+// source-derived method and path (placeholders normalized to `{}` on both
+// sides) must equal the declared method and path, and that OpenAPI operation's
+// requestBody schema must equal the `request_mirrors` schema for the struct.
+
+/// An OpenAPI document with one operation (`method` on `path`) whose JSON
+/// requestBody references `components.schemas.<body_schema>`.
+fn request_openapi(path: &str, method: &str, body_schema: &str, schemas: Value) -> Value {
+    let mut operation = serde_json::Map::new();
+    operation.insert(
+        method.to_string(),
+        serde_json::json!({"requestBody":{"content":{"application/json":{
+            "schema":{"$ref": format!("#/components/schemas/{body_schema}")}
+        }}}}),
+    );
+    let mut paths = serde_json::Map::new();
+    paths.insert(path.to_string(), Value::Object(operation));
+    serde_json::json!({"paths": Value::Object(paths), "components": {"schemas": schemas}})
+}
+
+fn request_manifest(function: &str, method: &str, path: &str, schema: &str) -> Value {
+    serde_json::json!({
+        "request_mirrors": [{"struct": "Body", "schema": schema}],
+        "requests": [{"function": function, "struct": "Body", "method": method, "path": path}]
+    })
+}
+
+fn create_schema() -> Value {
+    serde_json::json!({"Create":{"type":"object",
+        "properties":{"name":{"type":"string"}},"required":["name"]}})
+}
+
+fn has_route_mismatch(vs: &[Violation], function_name: &str) -> bool {
+    vs.iter().any(|v| {
+        matches!(v, Violation::RequestRouteMismatch { function, .. } if function == function_name)
+    })
+}
+
+fn has_unverifiable_request(vs: &[Violation], function_name: &str) -> bool {
+    vs.iter().any(|v| {
+        matches!(v, Violation::UnverifiableRequest { function } if function == function_name)
+    })
+}
+
+fn has_unclassified_request(vs: &[Violation], function_name: &str) -> bool {
+    vs.iter().any(|v| {
+        matches!(v, Violation::UnclassifiedRequest { function } if function == function_name)
+    })
+}
+
 #[test]
 fn request_gate_rejects_missing_required_fields_and_unclassified_sends() {
     let requests = "#[derive(Serialize, Deserialize)] struct Body { typo: String }";
-    let src = "impl Client { fn create(&self) { self.http.post(url).json::<Body>(&body); } fn new_send(&self) { self.http.post(url).json(&body); } }";
-    let openapi = serde_json::json!({"paths":{"/items":{"post":{"requestBody":{
-        "content":{"application/json":{"schema":{"$ref":"#/components/schemas/Create"}}}
-    }}}},"components":{"schemas":{"Create":{"type":"object",
-        "properties":{"name":{"type":"string"}},"required":["name"]}}}});
-    let manifest = serde_json::json!({"request_mirrors":[{"struct":"Body","schema":"Create"}],
-        "requests":[{"function":"create","struct":"Body","method":"post","path":"/items"}]});
+    let src = r#"impl Client {
+        fn create(&self) {
+            self.http
+                .post(format!("{}/items", self.base_url))
+                .header("X-API-Key", &self.api_key)
+                .json::<Body>(&body);
+        }
+        fn new_send(&self) {
+            self.http
+                .post(format!("{}/items", self.base_url))
+                .header("X-API-Key", &self.api_key)
+                .json(&body);
+        }
+    }"#;
+    let openapi = request_openapi("/items", "post", "Create", create_schema());
+    let manifest = request_manifest("create", "post", "/items", "Create");
     let vs = field_parity::request_violations(src, requests, &openapi, &manifest);
     assert!(has_missing_field(&vs, "Body", "name"), "{vs:#?}");
     assert!(has_unknown_field(&vs, "Body", "typo"), "{vs:#?}");
-    assert!(vs.iter().any(|v| matches!(v, Violation::UnclassifiedRequest { function }
-        if function == "new_send")), "{vs:#?}");
+    assert!(has_unclassified_request(&vs, "new_send"), "{vs:#?}");
+    // The declared, real-shape send is bound correctly; only its body drifted.
+    assert!(!has_route_mismatch(&vs, "create"), "{vs:#?}");
+    assert!(!has_unverifiable_request(&vs, "create"), "{vs:#?}");
 }
 
 #[test]
 fn request_gate_rejects_wrong_operation_schema_and_dynamic_json() {
     let requests = "#[derive(Serialize, Deserialize)] struct Body { name: String }";
-    let openapi = serde_json::json!({"paths":{"/items":{"post":{"requestBody":{
-        "content":{"application/json":{"schema":{"$ref":"#/components/schemas/Create"}}}
-    }}}},"components":{"schemas":{
-        "Create":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]},
-        "Other":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
-    }}});
-    let manifest = serde_json::json!({"request_mirrors":[{"struct":"Body","schema":"Other"}],
-        "requests":[{"function":"create","struct":"Body","method":"post","path":"/items"}]});
-    let src = "impl Client { fn create(&self) { self.http.post(url).json::<Body>(&body); } }";
-    assert!(field_parity::request_violations(src, requests, &openapi, &manifest).iter().any(|v|
-        matches!(v, Violation::RequestSchemaMismatch { function, .. } if function == "create")));
-    let src = "impl Client { fn create(&self) { self.http.post(url).json(&json!({\"name\": name})); } }";
-    assert!(field_parity::request_violations(src, requests, &openapi, &manifest).iter().any(|v|
-        matches!(v, Violation::UnclassifiedRequest { function } if function == "create")));
+    let mut schemas = create_schema();
+    schemas["Other"] = serde_json::json!({"type":"object",
+        "properties":{"name":{"type":"string"}},"required":["name"]});
+    let openapi = request_openapi("/items", "post", "Create", schemas);
+    // Declared mirror schema `Other` is not the operation's requestBody `Create`.
+    let manifest = request_manifest("create", "post", "/items", "Other");
+    let src = r#"impl Client {
+        fn create(&self) {
+            self.http
+                .post(format!("{}/items", self.base_url))
+                .header("X-API-Key", &self.api_key)
+                .json::<Body>(&body);
+        }
+    }"#;
+    let vs = field_parity::request_violations(src, requests, &openapi, &manifest);
+    assert!(
+        vs.iter().any(|v| matches!(v, Violation::RequestSchemaMismatch { function, .. }
+            if function == "create")),
+        "{vs:#?}"
+    );
+
+    // A `json!` body on a declared platform send is rejected even with the
+    // manifest pointing at the correct schema.
+    let manifest = request_manifest("create", "post", "/items", "Create");
+    let src = r#"impl Client {
+        fn create(&self) {
+            self.http
+                .post(format!("{}/items", self.base_url))
+                .header("X-API-Key", &self.api_key)
+                .json(&json!({"name": name}));
+        }
+    }"#;
+    let vs = field_parity::request_violations(src, requests, &openapi, &manifest);
+    assert!(has_unclassified_request(&vs, "create"), "{vs:#?}");
+}
+
+#[test]
+fn request_gate_rejects_a_send_whose_method_differs_from_the_declaration() {
+    // Production mutated post -> put; manifest and OpenAPI still say post.
+    let requests = "#[derive(Serialize, Deserialize)] struct Body { name: String }";
+    let src = r#"impl Client {
+        fn create(&self) {
+            self.http
+                .put(format!("{}/items", self.base_url))
+                .header("X-API-Key", &self.api_key)
+                .json::<Body>(&body);
+        }
+    }"#;
+    let openapi = request_openapi("/items", "post", "Create", create_schema());
+    let manifest = request_manifest("create", "post", "/items", "Create");
+    let vs = field_parity::request_violations(src, requests, &openapi, &manifest);
+    assert!(has_route_mismatch(&vs, "create"), "{vs:#?}");
+}
+
+#[test]
+fn request_gate_rejects_a_send_whose_path_differs_from_the_declaration() {
+    // Production mutated the URL literal; manifest and OpenAPI still say /items.
+    let requests = "#[derive(Serialize, Deserialize)] struct Body { name: String }";
+    let src = r#"impl Client {
+        fn create(&self) {
+            self.http
+                .post(format!("{}/things", self.base_url))
+                .header("X-API-Key", &self.api_key)
+                .json::<Body>(&body);
+        }
+    }"#;
+    let openapi = request_openapi("/items", "post", "Create", create_schema());
+    let manifest = request_manifest("create", "post", "/items", "Create");
+    let vs = field_parity::request_violations(src, requests, &openapi, &manifest);
+    assert!(has_route_mismatch(&vs, "create"), "{vs:#?}");
+}
+
+#[test]
+fn request_gate_normalizes_path_placeholders_and_passes_a_correct_send() {
+    // Liveness: `{item}` in the source and `{item_id}` in OpenAPI are the same
+    // segment once both normalize to `{}`; a correct typed body is clean.
+    let requests = "#[derive(Serialize, Deserialize)] struct Body { name: String }";
+    let src = r#"impl Client {
+        fn update(&self, item: &str, body: &Body) {
+            self.http
+                .patch(format!("{}/items/{item}", self.base_url))
+                .header("X-API-Key", &self.api_key)
+                .json::<Body>(body);
+        }
+    }"#;
+    let openapi = request_openapi("/items/{item_id}", "patch", "Create", create_schema());
+    let manifest = request_manifest("update", "patch", "/items/{item_id}", "Create");
+    let vs = field_parity::request_violations(src, requests, &openapi, &manifest);
+    assert!(vs.is_empty(), "a correct real-shape send must pass: {vs:#?}");
+}
+
+#[test]
+fn request_gate_rejects_an_opaque_url_as_unverifiable() {
+    // The URL is not a `format!` literal, so method+path cannot be bound to the
+    // declaration. Unknown shapes are rejected, never trusted.
+    let requests = "#[derive(Serialize, Deserialize)] struct Body { name: String }";
+    let src = r#"impl Client {
+        fn create(&self, url: String, body: &Body) {
+            self.http
+                .post(url)
+                .header("X-API-Key", &self.api_key)
+                .json::<Body>(body);
+        }
+    }"#;
+    let openapi = request_openapi("/items", "post", "Create", create_schema());
+    let manifest = request_manifest("create", "post", "/items", "Create");
+    let vs = field_parity::request_violations(src, requests, &openapi, &manifest);
+    assert!(has_unverifiable_request(&vs, "create"), "{vs:#?}");
+}
+
+#[test]
+fn request_gate_rejects_a_required_cli_field_for_an_optional_api_field() {
+    // A required (non-Option) Rust request field always sends the key, so it
+    // cannot honestly mirror an API field the request may omit.
+    let requests = "#[derive(Debug, Default, Serialize)] struct Body { name: String, note: String }";
+    let src = r#"impl Client {
+        fn create(&self, body: &Body) {
+            self.http
+                .post(format!("{}/items", self.base_url))
+                .header("X-API-Key", &self.api_key)
+                .json::<Body>(body);
+        }
+    }"#;
+    let schemas = serde_json::json!({"Create":{"type":"object","properties":{
+        "name":{"type":"string"},
+        "note":{"type":"string"}
+    },"required":["name"]}});
+    let openapi = request_openapi("/items", "post", "Create", schemas);
+    let manifest = request_manifest("create", "post", "/items", "Create");
+    let vs = field_parity::request_violations(src, requests, &openapi, &manifest);
+    assert!(
+        vs.iter().any(|v| matches!(v, Violation::OptionalityMismatch { struct_name, field, .. }
+            if struct_name == "Body" && field == "note")),
+        "{vs:#?}"
+    );
+    // The required-on-both-sides field is not flagged.
+    assert!(
+        !vs.iter().any(|v| matches!(v, Violation::OptionalityMismatch { field, .. }
+            if field == "name")),
+        "{vs:#?}"
+    );
+}
+
+#[test]
+fn request_gate_accepts_skipped_option_and_three_state_nullable_fields() {
+    // Liveness: `Option<T>` + skip_serializing_if mirrors an optional field;
+    // `Option<Option<T>>` + skip_serializing_if mirrors an optional NULLABLE
+    // field (absent = unchanged, null = clear, value = set).
+    let requests = r#"#[derive(Debug, Default, Serialize)] struct Body {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<Option<String>>,
+    }"#;
+    let src = r#"impl Client {
+        fn create(&self, body: &Body) {
+            self.http
+                .post(format!("{}/items", self.base_url))
+                .header("X-API-Key", &self.api_key)
+                .json::<Body>(body);
+        }
+    }"#;
+    let schemas = serde_json::json!({"Create":{"type":"object","properties":{
+        "name":{"type":"string"},
+        "note":{"type":"string"},
+        "model":{"anyOf":[{"type":"string"},{"type":"null"}]}
+    },"required":["name"]}});
+    let openapi = request_openapi("/items", "post", "Create", schemas);
+    let manifest = request_manifest("create", "post", "/items", "Create");
+    let vs = field_parity::request_violations(src, requests, &openapi, &manifest);
+    assert!(vs.is_empty(), "optional and nullable request fields must pass: {vs:#?}");
 }

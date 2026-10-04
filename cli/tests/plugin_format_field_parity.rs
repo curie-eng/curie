@@ -124,8 +124,9 @@ fn mentions_struct(vs: &[Violation], struct_name: &str) -> bool {
         | Violation::StaleOmission { struct_name: s, .. }
         | Violation::SchemaNotFound { struct_name: s, .. }
         | Violation::DuplicateStruct { struct_name: s }
-        | Violation::UnsupportedShape { struct_name: s, .. } => s == struct_name,
-        Violation::MalformedManifestEntry { .. } => false,
+        | Violation::UnsupportedShape { struct_name: s, .. }
+        | Violation::OptionalityMismatch { struct_name: s, .. } => s == struct_name,
+        _ => false,
     })
 }
 
