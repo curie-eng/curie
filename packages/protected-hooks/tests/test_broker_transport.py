@@ -11,6 +11,7 @@ import json
 import os
 import secrets
 import shutil
+import socket
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -115,7 +116,7 @@ class TLSBroker:
         """@spec PROTECTED-HOOK-LANE-3."""
         return "<owned-tls-broker>"
 
-    def docker(self, *args):
+    def docker(self, *args, allow_port_collision=False):
         """Anonymous owned daemon operations, @spec PROTECTED-HOOK-LANE-3."""
         try:
             result = subprocess.run(
@@ -124,8 +125,30 @@ class TLSBroker:
         except (OSError, subprocess.TimeoutExpired):
             fail_safely("owned TLS Docker operation failed")
         if result.returncode:
+            if (
+                allow_port_collision
+                and args[0] == "run"
+                and any(
+                    marker in result.stderr.lower()
+                    for marker in ("address already in use", "port is already allocated")
+                )
+            ):
+                return None
             fail_safely("owned TLS Docker operation refused")
         return result.stdout
+
+    def remove_owned(self, owner, cidfile):
+        """Validate each failed or finished resource, @spec PROTECTED-HOOK-LANE-3."""
+        owned = cidfile.read_text().strip() if cidfile.exists() else self.cid
+        if owned:
+            assert len(owned) == 64 and all(char in "0123456789abcdef" for char in owned)
+            identity = json.loads(self.docker("inspect", owned))[0]
+            assert identity["Id"] == owned
+            assert identity["Config"]["Labels"]["curie.test.owner"] == owner
+            self.docker("rm", "-f", owned)
+            assert owned not in self.docker("ps", "-aq", "--no-trunc").splitlines()
+        cidfile.unlink(missing_ok=True)
+        self.cid = None
 
     def command(self, *args):
         """Sanitize provisioning failures, @spec PROTECTED-HOOK-LANE-3."""
@@ -149,6 +172,8 @@ class TLSBroker:
     def restart(self):
         """Owned epoch or certificate replacement, @spec PROTECTED-HOOK-LANE-2/3."""
         self.docker("restart", self.cid)
+        binding = FixtureSecret(self.docker("port", self.cid, "6379/tcp").strip())
+        assert binding == FixtureSecret(f"127.0.0.1:{self.port}")
         self.ready()
 
     def replace_leaf(self):
@@ -281,46 +306,55 @@ def tls_broker(tmp_path_factory):
             + " ".join(metadata_acl_rules("control_reader"))
             + "\n",
         )
-        fixture.docker(
-            "run",
-            "-d",
-            "--name",
-            owner,
-            "--cidfile",
-            str(cidfile),
-            "--label",
-            "curie.test.owner=" + owner,
-            "--user",
-            f"{os.getuid()}:{os.getgid()}",
-            "-p",
-            "127.0.0.1::6379",
-            "-v",
-            str(fixture.private) + ":/tls:ro",
-            "valkey/valkey:8.1.10-alpine",
-            "valkey-server",
-            "--port",
-            "0",
-            "--tls-port",
-            "6379",
-            "--tls-cert-file",
-            "/tls/server.crt",
-            "--tls-key-file",
-            "/tls/server.key",
-            "--tls-ca-cert-file",
-            "/tls/ca.crt",
-            "--tls-auth-clients",
-            "no",
-            "--aclfile",
-            "/tls/users.acl",
-            "--save",
-            "",
-            "--appendonly",
-            "no",
-        )
+        for _attempt in range(5):
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                fixture.port = probe.getsockname()[1]
+            started = fixture.docker(
+                "run",
+                "-d",
+                "--name",
+                owner,
+                "--cidfile",
+                str(cidfile),
+                "--label",
+                "curie.test.owner=" + owner,
+                "--user",
+                f"{os.getuid()}:{os.getgid()}",
+                "-p",
+                f"127.0.0.1:{fixture.port}:6379",
+                "-v",
+                str(fixture.private) + ":/tls:ro",
+                "valkey/valkey:8.1.10-alpine",
+                "valkey-server",
+                "--port",
+                "0",
+                "--tls-port",
+                "6379",
+                "--tls-cert-file",
+                "/tls/server.crt",
+                "--tls-key-file",
+                "/tls/server.key",
+                "--tls-ca-cert-file",
+                "/tls/ca.crt",
+                "--tls-auth-clients",
+                "no",
+                "--aclfile",
+                "/tls/users.acl",
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+                allow_port_collision=True,
+            )
+            if started is not None:
+                break
+            fixture.remove_owned(owner, cidfile)
+        else:
+            fail_safely("owned TLS fixture could not reserve a stable loopback port")
         fixture.cid = cidfile.read_text().strip()
-        binding = fixture.docker("port", fixture.cid, "6379/tcp").strip()
-        assert binding.startswith("127.0.0.1:")
-        fixture.port = int(binding.rsplit(":", 1)[1])
+        binding = FixtureSecret(fixture.docker("port", fixture.cid, "6379/tcp").strip())
+        assert binding == FixtureSecret(f"127.0.0.1:{fixture.port}")
         fixture.admin = Redis(
             host="127.0.0.1",
             port=fixture.port,
@@ -344,14 +378,7 @@ def tls_broker(tmp_path_factory):
                 fixture.admin.close()
         finally:
             try:
-                owned = cidfile.read_text().strip() if cidfile.exists() else fixture.cid
-                if owned:
-                    assert len(owned) == 64 and all(char in "0123456789abcdef" for char in owned)
-                    identity = json.loads(fixture.docker("inspect", owned))[0]
-                    assert identity["Id"] == owned
-                    assert identity["Config"]["Labels"]["curie.test.owner"] == owner
-                    fixture.docker("rm", "-f", owned)
-                    assert owned not in fixture.docker("ps", "-aq", "--no-trunc").splitlines()
+                fixture.remove_owned(owner, cidfile)
             finally:
                 for path in fixture.private.iterdir():
                     if path.is_file():
@@ -625,8 +652,6 @@ def test_factory_invalid_inputs_precede_network(broker, monkeypatch, kind):
         ca = FixtureSecret(broker.ca_pem + (broker.private / "server.key").read_text())
     else:
         manifest = broker.manifest(tls_server_name="localhost")
-    import socket
-
     attempts = []
 
     def forbidden(*args, **kwargs):
