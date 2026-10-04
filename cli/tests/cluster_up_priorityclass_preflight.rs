@@ -181,6 +181,22 @@ case " $* " in
                 printf '%s\n' '{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"agent-sandbox-controller","labels":{"app.kubernetes.io/managed-by":"Helm"}}}'
                 exit 0
                 ;;
+            unowned-compatible)
+                printf '%s\n' '{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"agent-sandbox-controller","namespace":"agent-sandbox-system"},"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"agent-sandbox-controller","image":"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0"}]}}},"status":{"readyReplicas":1,"availableReplicas":1,"conditions":[{"type":"Available","status":"True"}]}}'
+                exit 0
+                ;;
+            unowned-digest)
+                printf '%s\n' '{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"agent-sandbox-controller","namespace":"agent-sandbox-system"},"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"agent-sandbox-controller","image":"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}},"status":{"readyReplicas":1,"availableReplicas":1,"conditions":[{"type":"Available","status":"True"}]}}'
+                exit 0
+                ;;
+            unowned-incompatible)
+                printf '%s\n' '{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"agent-sandbox-controller","namespace":"agent-sandbox-system"},"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"agent-sandbox-controller","image":"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.4.0"}]}}},"status":{"readyReplicas":1,"availableReplicas":1,"conditions":[{"type":"Available","status":"True"}]}}'
+                exit 0
+                ;;
+            unowned-unhealthy)
+                printf '%s\n' '{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"agent-sandbox-controller","namespace":"agent-sandbox-system"},"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"agent-sandbox-controller","image":"registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0"}]}}},"status":{"readyReplicas":0,"availableReplicas":0,"conditions":[{"type":"Available","status":"False"}]}}'
+                exit 0
+                ;;
             failure)
                 printf '%s\n' 'Error from server (Forbidden): deployments.apps "agent-sandbox-controller" is forbidden' >&2
                 exit 1
@@ -595,8 +611,8 @@ fn absent_and_target_owned_controller_do_not_infer_reuse() {
 }
 
 #[test]
-fn unreadable_or_incomplete_controller_ownership_fails_closed() {
-    for mode in ["malformed", "incomplete", "failure"] {
+fn unreadable_controller_ownership_fails_closed() {
+    for mode in ["malformed", "failure"] {
         let fixture = Fixture::new();
         let output = fixture.run(
             DEFAULT_PLATFORM,
@@ -621,6 +637,175 @@ fn unreadable_or_incomplete_controller_ownership_fails_closed() {
             "mode {mode} must not infer from uncertain ownership: {shown}"
         );
     }
+}
+
+#[test]
+fn unowned_compatible_controller_is_reused_with_one_disclosed_override() {
+    // The image matches charts/curie/files/agent-sandbox/controller.yaml.
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        DEFAULT_PLATFORM,
+        "absent",
+        DEFAULT_SANDBOX,
+        "absent",
+        "unowned-compatible",
+        &[],
+    );
+
+    assert_upgrade_ran_once(&fixture, &output);
+    assert_eq!(fixture.controller_query_count(), 1);
+    let shown = stderr(&output);
+    assert_inference_once(&shown, "--set agentSandbox.controller.deploy=false");
+    assert!(
+        shown.contains("without Helm ownership"),
+        "the inference must name the unowned controller: {shown}"
+    );
+    assert!(
+        shown.contains("registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0"),
+        "the inference must name the reused image: {shown}"
+    );
+    assert!(
+        fixture
+            .upgrade_log()
+            .contains("agentSandbox.controller.deploy=false"),
+        "the inferred controller reuse value must reach Helm"
+    );
+}
+
+#[test]
+fn unowned_digest_pinned_compatible_controller_is_reused() {
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        DEFAULT_PLATFORM,
+        "absent",
+        DEFAULT_SANDBOX,
+        "absent",
+        "unowned-digest",
+        &[],
+    );
+
+    assert_upgrade_ran_once(&fixture, &output);
+    let shown = stderr(&output);
+    assert_inference_once(&shown, "--set agentSandbox.controller.deploy=false");
+    assert!(shown.contains("without Helm ownership"), "{shown}");
+}
+
+#[test]
+fn unowned_incompatible_controller_names_the_kubectl_repair() {
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        DEFAULT_PLATFORM,
+        "absent",
+        DEFAULT_SANDBOX,
+        "absent",
+        "unowned-incompatible",
+        &["--json"],
+    );
+    let shown = stderr(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(fixture.upgrade_count(), 0);
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("--json must emit the error payload: {error}"));
+    let error = payload["error"].as_str().unwrap_or("");
+    let fix = payload["fix"].as_str().unwrap_or("");
+    for expected in [
+        "agent-sandbox-controller",
+        "agent-sandbox-system",
+        "v0.4.0",
+        "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0",
+        "kubectl -n agent-sandbox-system set image deployment/agent-sandbox-controller agent-sandbox-controller=registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0",
+        "kubectl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller",
+        "curie factory quickstart",
+    ] {
+        assert!(
+            error.contains(expected) || fix.contains(expected),
+            "the incompatible controller error must contain `{expected}`:\n{payload}"
+        );
+    }
+    assert!(
+        !error.to_ascii_lowercase().contains("cluster status")
+            && !fix.to_ascii_lowercase().contains("cluster status"),
+        "the repair must not be cluster status: {payload}"
+    );
+    assert!(
+        !error.contains("--set agentSandbox.controller.deploy=false"),
+        "an incompatible controller must not be reused: {payload}"
+    );
+}
+
+#[test]
+fn unowned_unhealthy_controller_names_rollout_status() {
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        DEFAULT_PLATFORM,
+        "absent",
+        DEFAULT_SANDBOX,
+        "absent",
+        "unowned-unhealthy",
+        &["--json"],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(fixture.upgrade_count(), 0);
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("--json must emit the error payload: {error}"));
+    let error = payload["error"].as_str().unwrap_or("");
+    let fix = payload["fix"].as_str().unwrap_or("");
+    assert!(
+        error.contains("Available is False"),
+        "the unhealthy controller must name its health: {payload}"
+    );
+    assert!(
+        fix.contains(
+            "kubectl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller"
+        ),
+        "the repair must be rollout status: {payload}"
+    );
+    assert!(
+        !fix.contains("set image"),
+        "a matching image must not be rewritten: {payload}"
+    );
+    assert!(
+        !error.to_ascii_lowercase().contains("cluster status")
+            && !fix.to_ascii_lowercase().contains("cluster status"),
+        "the repair must not be cluster status: {payload}"
+    );
+}
+
+#[test]
+fn incomplete_controller_ownership_names_the_kubectl_repair() {
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        DEFAULT_PLATFORM,
+        "absent",
+        DEFAULT_SANDBOX,
+        "absent",
+        "incomplete",
+        &["--json"],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(fixture.upgrade_count(), 0);
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("--json must emit the error payload: {error}"));
+    let error = payload["error"].as_str().unwrap_or("");
+    let fix = payload["fix"].as_str().unwrap_or("");
+    assert!(
+        error.contains("image is `missing`"),
+        "incomplete ownership without an image must name that gap: {payload}"
+    );
+    assert!(fix.contains("set image"), "{payload}");
+    assert!(
+        !error.to_ascii_lowercase().contains("cluster status")
+            && !fix.to_ascii_lowercase().contains("cluster status"),
+        "the repair must not be cluster status: {payload}"
+    );
 }
 
 #[test]

@@ -2663,8 +2663,10 @@ enum ClusterAction {
     /// recorded model configuration. Use --fake-model to explicitly downgrade
     /// to fake mode. An sk-ant- or sk-or- credential infers its provider egress
     /// when --allow-egress-host is absent. Other credential shapes remain sealed
-    /// until their provider or a raw range is explicit. Existing singleton
-    /// resources are reused only from complete Helm ownership metadata. An exact
+    /// until their provider or a raw range is explicit. A controller owned by
+    /// another Helm release is reused. A healthy unowned controller whose image
+    /// matches the chart is reused. An unhealthy or different unowned controller
+    /// stops the install and names the kubectl repair. An exact
     /// admission result that the gvisor RuntimeClass is absent applies
     /// security.gvisor.mode=off and retries once. Every inferred value is printed.
     Up {

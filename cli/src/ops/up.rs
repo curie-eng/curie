@@ -3220,7 +3220,8 @@ enum ClusterUpInference {
         owner_release: String,
     },
     ControllerReuse {
-        owner_release: String,
+        owner_release: Option<String>,
+        image: Option<String>,
     },
     GvisorOff,
 }
@@ -3239,9 +3240,18 @@ impl ClusterUpInference {
                 "inferred reuse of PriorityClass `{name}` from Helm release `{owner_release}`; applying `--set priorityClasses.{}.create=false`",
                 role.key()
             )),
-            Self::ControllerReuse { owner_release } => ui.note(&format!(
-                "inferred reuse of `{CONTROLLER_DEPLOYMENT_NAME}` from Helm release `{owner_release}`; applying `--set {CONTROLLER_DEPLOY_KEY}=false`"
-            )),
+            Self::ControllerReuse {
+                owner_release,
+                image,
+            } => match owner_release {
+                Some(owner_release) => ui.note(&format!(
+                    "inferred reuse of `{CONTROLLER_DEPLOYMENT_NAME}` from Helm release `{owner_release}`; applying `--set {CONTROLLER_DEPLOY_KEY}=false`"
+                )),
+                None => ui.note(&format!(
+                    "inferred reuse of `{CONTROLLER_DEPLOYMENT_NAME}` at `{}` without Helm ownership; applying `--set {CONTROLLER_DEPLOY_KEY}=false`",
+                    image.as_deref().unwrap_or("unknown")
+                )),
+            },
             Self::GvisorOff => ui.note(&format!(
                 "inferred that the cluster has no `gvisor` RuntimeClass from admission; applying `--set {GVISOR_MODE_KEY}=off`"
             )),
@@ -3646,10 +3656,16 @@ async fn reconcile_priority_class_ownership(
     Ok(inferred)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 enum ControllerOwnership {
     Absent,
-    Existing(Option<PriorityClassOwner>),
+    Owned(PriorityClassOwner),
+    Unowned(serde_json::Value),
+}
+
+struct ControllerHealth {
+    healthy: bool,
+    detail: String,
 }
 
 fn controller_read_error(detail: impl std::fmt::Display, transient: bool) -> anyhow::Error {
@@ -3751,20 +3767,180 @@ async fn controller_owner() -> Result<ControllerOwnership> {
     }
     let labels = controller_metadata_map(metadata, "labels")?;
     if controller_metadata_value(labels, "app.kubernetes.io/managed-by")? != Some("Helm") {
-        return Ok(ControllerOwnership::Existing(None));
+        return Ok(ControllerOwnership::Unowned(value));
     }
     let annotations = controller_metadata_map(metadata, "annotations")?;
     let Some(release) = controller_metadata_value(annotations, "meta.helm.sh/release-name")? else {
-        return Ok(ControllerOwnership::Existing(None));
+        return Ok(ControllerOwnership::Unowned(value));
     };
     let Some(namespace) = controller_metadata_value(annotations, "meta.helm.sh/release-namespace")?
     else {
-        return Ok(ControllerOwnership::Existing(None));
+        return Ok(ControllerOwnership::Unowned(value));
     };
-    Ok(ControllerOwnership::Existing(Some(PriorityClassOwner {
+    Ok(ControllerOwnership::Owned(PriorityClassOwner {
         release: release.to_string(),
         namespace: namespace.to_string(),
-    })))
+    }))
+}
+
+fn image_name_and_tag(image: &str) -> Option<(&str, &str)> {
+    let without_digest = image.split_once('@').map(|(name, _)| name).unwrap_or(image);
+    let tag_at = match without_digest.rfind('/') {
+        Some(slash) => without_digest[slash + 1..]
+            .rfind(':')
+            .map(|offset| slash + 1 + offset),
+        None => without_digest.rfind(':'),
+    }?;
+    let repo = &without_digest[..tag_at];
+    let tag = &without_digest[tag_at + 1..];
+    if repo.is_empty() || tag.is_empty() {
+        None
+    } else {
+        Some((repo, tag))
+    }
+}
+
+fn images_compatible(live: &str, required: &str) -> bool {
+    match (image_name_and_tag(live), image_name_and_tag(required)) {
+        (Some(live_image), Some(required_image)) => live_image == required_image,
+        _ => live == required,
+    }
+}
+
+fn vendored_controller_image(chart: &str) -> Result<String> {
+    let path = std::path::Path::new(chart).join("files/agent-sandbox/controller.yaml");
+    let text = std::fs::read_to_string(&path).map_err(|error| -> anyhow::Error {
+        let fix = "pass `--chart` as the local chart directory that contains files/agent-sandbox/controller.yaml";
+        crate::exit::CliError::failure(format!(
+            "could not read the vendored agent-sandbox controller image from `{}`: {error}; {fix}",
+            path.display()
+        ))
+        .with_fix(fix)
+        .into()
+    })?;
+    for document in text.split("\n---") {
+        let document = document.trim();
+        if document.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_norway::from_str::<serde_json::Value>(document) else {
+            continue;
+        };
+        if value.get("kind").and_then(|kind| kind.as_str()) != Some("Deployment") {
+            continue;
+        }
+        let name = value
+            .pointer("/metadata/name")
+            .and_then(|name| name.as_str());
+        if name != Some(CONTROLLER_DEPLOYMENT_NAME) {
+            continue;
+        }
+        let Some(image) = controller_container_image(&value) else {
+            break;
+        };
+        return Ok(image);
+    }
+    let fix = "restore files/agent-sandbox/controller.yaml in the chart directory";
+    Err(crate::exit::CliError::failure(format!(
+        "the chart at `{}` does not name an image for Deployment `{CONTROLLER_DEPLOYMENT_NAME}`; {fix}",
+        path.display()
+    ))
+    .with_fix(fix)
+    .into())
+}
+
+fn controller_container_image(deployment: &serde_json::Value) -> Option<String> {
+    let containers = deployment
+        .pointer("/spec/template/spec/containers")?
+        .as_array()?;
+    containers.iter().find_map(|container| {
+        let name = container.get("name").and_then(|value| value.as_str());
+        if name != Some(CONTROLLER_DEPLOYMENT_NAME) {
+            return None;
+        }
+        container
+            .get("image")
+            .and_then(|value| value.as_str())
+            .filter(|image| !image.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn controller_health(deployment: &serde_json::Value) -> ControllerHealth {
+    let desired = deployment
+        .pointer("/spec/replicas")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(1);
+    let ready = deployment
+        .pointer("/status/readyReplicas")
+        .and_then(|value| value.as_u64());
+    let available_replicas = deployment
+        .pointer("/status/availableReplicas")
+        .and_then(|value| value.as_u64());
+    let available = deployment
+        .pointer("/status/conditions")
+        .and_then(|value| value.as_array())
+        .and_then(|conditions| {
+            conditions.iter().find_map(|condition| {
+                (condition.get("type").and_then(|value| value.as_str()) == Some("Available"))
+                    .then(|| condition.get("status").and_then(|value| value.as_str()))
+                    .flatten()
+            })
+        });
+    let healthy = desired >= 1
+        && ready.is_some_and(|count| count >= desired)
+        && available_replicas.is_some_and(|count| count >= desired)
+        && available == Some("True");
+    let ready_text = ready
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "missing".to_string());
+    ControllerHealth {
+        healthy,
+        detail: format!(
+            "Available is {} and readyReplicas is {ready_text} of {desired}",
+            available.unwrap_or("missing")
+        ),
+    }
+}
+
+fn unowned_controller_conflict(
+    observed_image: Option<&str>,
+    required: &str,
+    health: &str,
+) -> anyhow::Error {
+    let observed = observed_image.unwrap_or("missing");
+    let image_matches = observed_image.is_some_and(|image| images_compatible(image, required));
+    let set_image = format!(
+        "kubectl -n {CONTROLLER_DEPLOYMENT_NAMESPACE} set image deployment/{CONTROLLER_DEPLOYMENT_NAME} {CONTROLLER_DEPLOYMENT_NAME}={required}"
+    );
+    let rollout = format!(
+        "kubectl -n {CONTROLLER_DEPLOYMENT_NAMESPACE} rollout status deployment/{CONTROLLER_DEPLOYMENT_NAME}"
+    );
+    let fix = if image_matches {
+        format!("{rollout}, then rerun `curie factory quickstart`")
+    } else {
+        format!("{set_image} && {rollout}, then rerun `curie factory quickstart`")
+    };
+    let message = format!(
+        "Deployment `{CONTROLLER_DEPLOYMENT_NAME}` in namespace `{CONTROLLER_DEPLOYMENT_NAMESPACE}` cannot be reused: image is `{observed}` and this chart requires `{required}`; {health}. {fix}"
+    );
+    crate::exit::CliError::failure(message).with_fix(fix).into()
+}
+
+fn explicit_controller_creation_error(detail: &str) -> anyhow::Error {
+    let assignment = format!("{CONTROLLER_DEPLOY_KEY}=true");
+    let fix = format!("remove `--set {assignment}`, or pass `--set {CONTROLLER_DEPLOY_KEY}=false`");
+    crate::exit::CliError::usage(format!("{detail}; {fix}"))
+        .with_fix(fix)
+        .into()
+}
+
+fn reuse_unowned_controller(plan: &mut UpValuePlan, image: String) -> Option<ClusterUpInference> {
+    plan.set(CONTROLLER_DEPLOY_KEY, "false");
+    Some(ClusterUpInference::ControllerReuse {
+        owner_release: None,
+        image: Some(image),
+    })
 }
 
 async fn reconcile_controller_ownership(
@@ -3775,37 +3951,57 @@ async fn reconcile_controller_ownership(
     if explicit == Some("false") {
         return Ok(None);
     }
-    let owner = match controller_owner().await? {
-        ControllerOwnership::Absent => return Ok(None),
-        ControllerOwnership::Existing(Some(owner)) => owner,
-        ControllerOwnership::Existing(None) => {
-            return Err(controller_read_error(
-                "the Deployment exists without complete Helm ownership metadata",
-                false,
-            ));
+    match controller_owner().await? {
+        ControllerOwnership::Absent => Ok(None),
+        ControllerOwnership::Owned(owner)
+            if owner.release == opts.common.release && owner.namespace == opts.common.namespace =>
+        {
+            Ok(None)
         }
-    };
-    if owner.release == opts.common.release && owner.namespace == opts.common.namespace {
-        return Ok(None);
+        ControllerOwnership::Owned(owner) => {
+            if explicit == Some("true") {
+                return Err(explicit_controller_creation_error(&format!(
+                    "Deployment `{CONTROLLER_DEPLOYMENT_NAME}` is owned by Helm release `{}` in namespace `{}`, which contradicts explicit `{CONTROLLER_DEPLOY_KEY}=true`",
+                    owner.release, owner.namespace
+                )));
+            }
+            if explicit.is_some() {
+                return Ok(None);
+            }
+            plan.set(CONTROLLER_DEPLOY_KEY, "false");
+            Ok(Some(ClusterUpInference::ControllerReuse {
+                owner_release: Some(owner.release),
+                image: None,
+            }))
+        }
+        ControllerOwnership::Unowned(deployment) => {
+            let required = vendored_controller_image(&opts.chart)?;
+            let observed = controller_container_image(&deployment);
+            let health = controller_health(&deployment);
+            let compatible = observed
+                .as_deref()
+                .is_some_and(|image| images_compatible(image, &required));
+            if compatible && health.healthy {
+                if explicit == Some("true") {
+                    return Err(explicit_controller_creation_error(&format!(
+                        "Deployment `{CONTROLLER_DEPLOYMENT_NAME}` in namespace `{CONTROLLER_DEPLOYMENT_NAMESPACE}` is a healthy `{}` without Helm ownership, which contradicts explicit `{CONTROLLER_DEPLOY_KEY}=true`",
+                        observed.as_deref().unwrap_or("missing")
+                    )));
+                }
+                if explicit.is_some() {
+                    return Ok(None);
+                }
+                let image = observed.unwrap_or(required);
+                Ok(reuse_unowned_controller(plan, image))
+            } else {
+                Err(unowned_controller_conflict(
+                    observed.as_deref(),
+                    &required,
+                    &health.detail,
+                ))
+            }
+        }
     }
-    if explicit == Some("true") {
-        let assignment = format!("{CONTROLLER_DEPLOY_KEY}=true");
-        let fix =
-            format!("remove `--set {assignment}`, or pass `--set {CONTROLLER_DEPLOY_KEY}=false`");
-        return Err(crate::exit::CliError::usage(format!(
-            "Deployment `{CONTROLLER_DEPLOYMENT_NAME}` is owned by Helm release `{}` in namespace `{}`, which contradicts explicit `{assignment}`; {fix}",
-            owner.release, owner.namespace
-        ))
-        .with_fix(fix)
-        .into());
-    }
-    if explicit.is_some() {
-        return Ok(None);
-    }
-    plan.set(CONTROLLER_DEPLOY_KEY, "false");
-    Ok(Some(ClusterUpInference::ControllerReuse {
-        owner_release: owner.release,
-    }))
 }
 
 fn up_commands_with_plan(o: &UpOpts, plan: &UpValuePlan) -> Vec<OpsCommand> {
