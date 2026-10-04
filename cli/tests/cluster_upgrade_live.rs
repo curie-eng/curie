@@ -3358,6 +3358,48 @@ fn helm_upgrade_failure_is_a_terminal_checkpoint_and_releases_ownership() {
     );
 }
 
+/// #3849: after a failed apply, previous_serving follows the revision Helm
+/// still marks deployed, not the version cached before Helm ran.
+#[test]
+fn failed_apply_reports_the_revision_helm_still_has_deployed() {
+    let previous = Fixture::new(None);
+    let output = previous.local("upgrade-fails-previous-deployed");
+    assert!(!output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], true, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    assert!(
+        body["fail_forward"]["command"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cluster rollback"),
+        "{body}"
+    );
+
+    let moved = Fixture::new(None);
+    let output = moved.local("upgrade-fails-target-deployed");
+    assert!(!output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["previous_serving"], false, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    assert!(
+        body["fail_forward"]["command"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cluster upgrade"),
+        "{body}"
+    );
+    assert!(
+        !body["fail_forward"]["command"]
+            .as_str()
+            .unwrap_or("")
+            .contains("rollback"),
+        "{body}"
+    );
+}
+
 /// #2588 -- the same pending contract proceeds once `--forward-only` is set.
 /// Clap does not accept the flag on `cluster upgrade` yet, so this fails today.
 #[test]

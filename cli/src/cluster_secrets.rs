@@ -764,7 +764,12 @@ pub fn runner_base_verdict(
     ))
 }
 
-fn helm_get_json(common: &CommonOpts, what: &str, all: bool, revision: u32) -> OpsCommand {
+pub(crate) fn helm_get_json(
+    common: &CommonOpts,
+    what: &str,
+    all: bool,
+    revision: u32,
+) -> OpsCommand {
     let mut args = vec![
         plain("get"),
         plain(what),
@@ -787,7 +792,7 @@ fn helm_get_json(common: &CommonOpts, what: &str, all: bool, revision: u32) -> O
 /// revision deployed, and that one is what the worker runs. With no deployed
 /// revision at all, the reason names the newest record so the operator knows
 /// which revision to roll back from.
-fn serving_revision(
+pub(crate) fn serving_revision(
     history: &serde_json::Value,
     release: &str,
 ) -> std::result::Result<u32, String> {

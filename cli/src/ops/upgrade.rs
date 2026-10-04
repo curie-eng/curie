@@ -2337,6 +2337,39 @@ impl LiveHost {
         Ok(Some((helm_values_document(&outcome.values)?, schema_plan)))
     }
 
+    /// The chart version of the revision Helm still marks deployed.
+    /// A failed upgrade often leaves the previous revision deployed (#3421).
+    fn observe_deployed_version(&mut self) {
+        let history_cmd = super::verbs::helm_history_cmd(&self.opts.common);
+        let Ok((true, history_out, _)) = self.run(&history_cmd) else {
+            return;
+        };
+        let Ok(history) = serde_json::from_str::<serde_json::Value>(&history_out) else {
+            return;
+        };
+        let Ok(revision) =
+            crate::cluster_secrets::serving_revision(&history, &self.opts.common.release)
+        else {
+            return;
+        };
+        let metadata =
+            crate::cluster_secrets::helm_get_json(&self.opts.common, "metadata", false, revision);
+        let Ok((true, metadata_out, _)) = self.run(&metadata) else {
+            return;
+        };
+        let Ok(document) = serde_json::from_str::<serde_json::Value>(&metadata_out) else {
+            return;
+        };
+        let Some(version) = document
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .filter(|version| !version.is_empty())
+        else {
+            return;
+        };
+        self.set_current(Some(version.to_string()));
+    }
+
     /// The chart version the release reports. `scripts/check-version-consistency.sh`
     /// is required on every PR and release and asserts Chart.yaml `version` ==
     /// `appVersion` == the CLI version, so this one field is the whole answer
@@ -2649,7 +2682,12 @@ impl UpgradeDriver for LiveHost {
         self.live_drain_preflight()
     }
     fn apply_target(&mut self, to: &str) -> Result<()> {
-        self.helm_upgrade(to)?;
+        if let Err(error) = self.helm_upgrade(to) {
+            // Helm can fail after it has already moved the deployed revision.
+            // Re-read that revision so previous_serving is not the pre-apply cache.
+            self.observe_deployed_version();
+            return Err(error);
+        }
         // R2: what the release reports, not what was requested, is what was
         // installed. Helm can exit 0 on a revision that never moved.
         let observed = self.inspect_version();

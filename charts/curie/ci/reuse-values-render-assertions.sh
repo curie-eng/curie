@@ -180,6 +180,65 @@ fi
 assert_source "$LATEST_VERSION"
 [[ "$LATEST_VERSION" == "$REGRESSION_VERSION" ]] || assert_source "$REGRESSION_VERSION"
 
+# A valid layered runner binding from a previous release must render on that
+# release and on the candidate. Removing the key is the clear. The string
+# "null" stays a refused nonempty digest (#3849).
+LAYER_DIGEST="ghcr.io/acme/acme-bot-runner@sha256:$(printf 'a%.0s' $(seq 1 64))"
+OTHER_DIGEST="ghcr.io/acme/acme-other-runner@sha256:$(printf 'b%.0s' $(seq 1 64))"
+cat > "$TMP/layered-binding.json" <<EOF
+{"agentSandbox":{"runnerImages":{"acme-bot":"$LAYER_DIGEST","acme-other":"$OTHER_DIGEST"},"connectorSecrets":{"acme-bot":{"API_TOKEN":"acme-secret"}}}}
+EOF
+if ! helm template acme "$TMP/released-$LATEST_VERSION/curie" -f "$TMP/layered-binding.json" >"$TMP/layered-released.yaml" 2>"$TMP/layered-released.err"; then
+  echo "FAIL: v$LATEST_VERSION refuses a valid layered runner binding:" >&2
+  sed 's/^/    /' "$TMP/layered-released.err" >&2
+  exit 1
+fi
+grep -q "$LAYER_DIGEST" "$TMP/layered-released.yaml" || fail "v$LATEST_VERSION did not render the layered digest"
+if ! helm template acme "$CHART" --is-upgrade -f "$TMP/layered-binding.json" >"$TMP/layered-candidate.yaml" 2>"$TMP/layered-candidate.err"; then
+  echo "FAIL: candidate refuses a valid layered binding carried from v$LATEST_VERSION:" >&2
+  sed 's/^/    /' "$TMP/layered-candidate.err" >&2
+  exit 1
+fi
+python3 - "$TMP/layered-binding.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+doc = json.load(open(path))
+del doc["agentSandbox"]["runnerImages"]["acme-bot"]
+json.dump(doc, open(path, "w"))
+PY
+if ! helm template acme "$CHART" --is-upgrade -f "$TMP/layered-binding.json" >"$TMP/layered-omitted.yaml" 2>"$TMP/layered-omitted.err"; then
+  echo "FAIL: candidate refuses retained values once the stale layer key is removed:" >&2
+  sed 's/^/    /' "$TMP/layered-omitted.err" >&2
+  exit 1
+fi
+if grep -q "$LAYER_DIGEST" "$TMP/layered-omitted.yaml"; then
+  fail "omitted acme-bot digest is still rendered"
+fi
+grep -q "$OTHER_DIGEST" "$TMP/layered-omitted.yaml" || fail "sibling layer was dropped with the stale key"
+grep -q "acme-secret" "$TMP/layered-omitted.yaml" || fail "connector secret was dropped with the stale layer"
+NEW_DIGEST="ghcr.io/acme/acme-bot-runner@sha256:$(printf 'c%.0s' $(seq 1 64))"
+python3 - "$TMP/layered-binding.json" "$NEW_DIGEST" <<'PY'
+import json, sys
+path, digest = sys.argv[1], sys.argv[2]
+doc = json.load(open(path))
+doc["agentSandbox"]["runnerImages"]["acme-bot"] = digest
+json.dump(doc, open(path, "w"))
+PY
+if ! helm template acme "$CHART" --is-upgrade -f "$TMP/layered-binding.json" >"$TMP/layered-redeploy.yaml" 2>"$TMP/layered-redeploy.err"; then
+  echo "FAIL: candidate refuses a rebuilt layer digest on the upgraded chart:" >&2
+  sed 's/^/    /' "$TMP/layered-redeploy.err" >&2
+  exit 1
+fi
+grep -q "$NEW_DIGEST" "$TMP/layered-redeploy.yaml" || fail "rebuilt layer digest was not rendered"
+if grep -q "$LAYER_DIGEST" "$TMP/layered-redeploy.yaml"; then
+  fail "the stale layer digest survived the rebuild"
+fi
+if helm template acme "$CHART" --is-upgrade --set-string "agentSandbox.runnerImages.acme-bot=null" >"$TMP/layered-null.yaml" 2>"$TMP/layered-null.err"; then
+  fail "the string null was accepted as a runner digest"
+fi
+grep -q "agentSandbox.runnerImages.acme-bot" "$TMP/layered-null.err" || fail "null digest refusal does not name the binding"
+echo "OK: v$LATEST_VERSION layered binding upgrades when the stale key is removed"
+
 # --- negative control: revert #3544's connectorCaller guard ------------------
 # #3544 turned `.Values.connectorCaller.<field>` into
 # `(get (.Values.connectorCaller | default dict) "<field>")`. Put the direct
