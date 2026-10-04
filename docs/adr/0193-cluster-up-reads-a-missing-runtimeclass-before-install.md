@@ -29,8 +29,8 @@ closed.
 
 ## Decision
 
-When `curie cluster up` would render the gVisor preflight, it GETs the
-configured RuntimeClass first. NotFound applies `security.gvisor.mode=off`
+When `curie cluster up` renders the gVisor preflight, it reads that render's
+`runtimeClassName` and GETs that class before Helm. NotFound applies `security.gvisor.mode=off`
 before Helm and prints the existing inference line. Forbidden leaves the chart
 default and keeps the one admission retry. Present does not infer off, and a
 later not-found admission fails closed. Explicit auto or require plus NotFound

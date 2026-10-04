@@ -3105,16 +3105,27 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
     plan
 }
 
-fn gvisor_preflight_job_name_from_render(rendered: &str) -> Result<Option<String>> {
+struct RenderedGvisorPreflight {
+    job_name: String,
+    runtime_class_name: String,
+    creates_runtime_class: bool,
+}
+
+fn gvisor_preflight_from_render(rendered: &str) -> Result<Option<RenderedGvisorPreflight>> {
     let mut found = None;
+    let mut creates_runtime_class = false;
     for document in rendered.split("\n---") {
         let document = document.trim();
         if document.is_empty() {
             continue;
         }
         let value: serde_json::Value = serde_norway::from_str(document)
-            .context("could not parse the rendered gVisor preflight Job")?;
+            .context("could not parse the rendered gVisor preflight")?;
         if value.is_null() {
+            continue;
+        }
+        if value.get("kind").and_then(|kind| kind.as_str()) == Some("RuntimeClass") {
+            creates_runtime_class = true;
             continue;
         }
         if value.get("kind").and_then(|kind| kind.as_str()) != Some("Job") {
@@ -3126,18 +3137,32 @@ fn gvisor_preflight_job_name_from_render(rendered: &str) -> Result<Option<String
             .and_then(|name| name.as_str())
             .filter(|name| !name.is_empty())
             .context("the rendered gVisor preflight Job has no name")?;
-        if found.replace(name.to_string()).is_some() {
+        let runtime_class_name = value
+            .pointer("/spec/template/spec/runtimeClassName")
+            .and_then(|name| name.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .context("the rendered gVisor preflight Job has no runtimeClassName")?
+            .to_string();
+        if found.is_some() {
             bail!("the gVisor preflight template rendered more than one Job");
         }
+        found = Some((name.to_string(), runtime_class_name));
     }
-    Ok(found)
+    Ok(
+        found.map(|(job_name, runtime_class_name)| RenderedGvisorPreflight {
+            job_name,
+            runtime_class_name,
+            creates_runtime_class,
+        }),
+    )
 }
 
 async fn rendered_gvisor_preflight_job(
     chart: &str,
     common: &CommonOpts,
     plan: &UpValuePlan,
-) -> Result<Option<String>> {
+) -> Result<Option<RenderedGvisorPreflight>> {
     let mut args = vec![
         plain("template"),
         plain(&common.release),
@@ -3164,7 +3189,7 @@ async fn rendered_gvisor_preflight_job(
             failure_reason(&err)
         );
     }
-    gvisor_preflight_job_name_from_render(&out)
+    gvisor_preflight_from_render(&out)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3259,67 +3284,11 @@ impl ClusterUpInference {
     }
 }
 
-/// Helm `--set key=false` is boolean false. [`crate::doctor::helm_truthy`]
-/// treats every non-empty string as true, so effective values cannot use it.
-fn helm_set_bool(value: Option<&str>, default: bool) -> bool {
-    match value.map(str::trim) {
-        None => default,
-        Some("true" | "True" | "TRUE") => true,
-        Some("false" | "False" | "FALSE") => false,
-        Some("") => false,
-        Some(_) => true,
-    }
-}
-
-const GVISOR_RUNTIME_CLASS_KEY: &str = "security.gvisor.runtimeClassName";
-const GVISOR_INSTALL_RUNTIME_CLASS_KEY: &str = "security.gvisor.installRuntimeClass";
-const GVISOR_PREFLIGHT_ENABLED_KEY: &str = "security.gvisorPreflight.enabled";
-const AGENT_SANDBOX_DEPLOY_KEY: &str = "agentSandbox.deploy";
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RuntimeClassLookup {
     Present,
     Absent,
     Forbidden,
-}
-
-/// Mirrors `curie.gvisor.preflightRequired`. `None` means the chart would not
-/// render the blocking Job, so `cluster up` must not GET.
-fn gvisor_preflight_runtime_class_name(values: &BTreeMap<String, String>) -> Option<String> {
-    let mode = values
-        .get(GVISOR_MODE_KEY)
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("auto");
-    if mode == "off" {
-        return None;
-    }
-    let deploy = helm_set_bool(
-        values.get(AGENT_SANDBOX_DEPLOY_KEY).map(String::as_str),
-        true,
-    );
-    let preflight = helm_set_bool(
-        values.get(GVISOR_PREFLIGHT_ENABLED_KEY).map(String::as_str),
-        true,
-    );
-    if !deploy || !preflight {
-        return None;
-    }
-    let fake = helm_set_bool(values.get(FAKE_MODEL_KEY).map(String::as_str), true);
-    let inference_deploy =
-        helm_set_bool(values.get(INFERENCE_DEPLOY_KEY).map(String::as_str), false);
-    let real = !fake || inference_deploy;
-    if !(mode == "require" || (mode == "auto" && real)) {
-        return None;
-    }
-    Some(
-        values
-            .get(GVISOR_RUNTIME_CLASS_KEY)
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .unwrap_or("gvisor")
-            .to_string(),
-    )
 }
 
 fn runtime_class_read_error(
@@ -5566,41 +5535,6 @@ async fn run_prepared_up(
         if let Some(inference) = reconcile_controller_ownership(&opts, &mut value_plan).await? {
             inference.render(ui);
         }
-        if let Some(name) = gvisor_preflight_runtime_class_name(&value_plan.effective_values()) {
-            match lookup_runtime_class(&name).await? {
-                RuntimeClassLookup::Present => {}
-                RuntimeClassLookup::Forbidden => {
-                    runtime_class_lookup_forbidden = true;
-                }
-                RuntimeClassLookup::Absent => {
-                    let install_runtime_class = helm_set_bool(
-                        value_plan
-                            .effective_values()
-                            .get(GVISOR_INSTALL_RUNTIME_CLASS_KEY)
-                            .map(String::as_str),
-                        false,
-                    );
-                    // installRuntimeClass true means the chart will create the class.
-                    if !install_runtime_class {
-                        if let Some(mode @ ("auto" | "require")) =
-                            final_operator_value(&opts, GVISOR_MODE_KEY)
-                        {
-                            let assignment = format!("{GVISOR_MODE_KEY}={mode}");
-                            let fix = format!(
-                            "remove the explicit `{assignment}` setting and rerun to accept the inferred gVisor posture"
-                        );
-                            return Err(crate::exit::CliError::usage(format!(
-                            "explicit `{assignment}` contradicts the detected RuntimeClass lookup `runtimeclasses.node.k8s.io \"{name}\" not found`; {fix}"
-                        ))
-                        .with_fix(fix)
-                        .into());
-                        }
-                        value_plan.set(GVISOR_MODE_KEY, "off");
-                        ClusterUpInference::GvisorOff.render(ui);
-                    }
-                }
-            }
-        }
     } else {
         preflight_priority_class_ownership(&opts, &value_plan).await?;
     }
@@ -5618,8 +5552,49 @@ async fn run_prepared_up(
         .cloned()
         .collect();
     cmds = up_commands_with_plan(&opts, &value_plan);
-    let gvisor_preflight_job =
+    // The rendered preflight is the chart's decision: it already applied Helm's
+    // typed values, string truthiness, and this chart's defaults. A copied
+    // predicate would disagree with `--set-string` and with a chart whose
+    // runtimeClassName default is not `gvisor`.
+    let mut gvisor_preflight =
         rendered_gvisor_preflight_job(&opts.chart, &opts.common, &value_plan).await?;
+    if detect_facts {
+        if let Some(preflight) = gvisor_preflight.as_ref() {
+            let name = preflight.runtime_class_name.clone();
+            let creates_runtime_class = preflight.creates_runtime_class;
+            match lookup_runtime_class(&name).await? {
+                RuntimeClassLookup::Present => {}
+                RuntimeClassLookup::Forbidden => {
+                    runtime_class_lookup_forbidden = true;
+                }
+                RuntimeClassLookup::Absent if creates_runtime_class => {}
+                RuntimeClassLookup::Absent => {
+                    if let Some(mode @ ("auto" | "require")) =
+                        final_operator_value(&opts, GVISOR_MODE_KEY)
+                    {
+                        let assignment = format!("{GVISOR_MODE_KEY}={mode}");
+                        let fix = format!(
+                            "remove the explicit `{assignment}` setting and rerun to accept the inferred gVisor posture"
+                        );
+                        return Err(crate::exit::CliError::usage(format!(
+                            "explicit `{assignment}` contradicts the detected RuntimeClass lookup `runtimeclasses.node.k8s.io \"{name}\" not found`; {fix}"
+                        ))
+                        .with_fix(fix)
+                        .into());
+                    }
+                    value_plan.set(GVISOR_MODE_KEY, "off");
+                    ClusterUpInference::GvisorOff.render(ui);
+                    cmds = up_commands_with_plan(&opts, &value_plan);
+                    gvisor_preflight =
+                        rendered_gvisor_preflight_job(&opts.chart, &opts.common, &value_plan)
+                            .await?;
+                }
+            }
+        }
+    }
+    let gvisor_preflight_job = gvisor_preflight
+        .as_ref()
+        .map(|preflight| preflight.job_name.clone());
     let cl = ui.checklist();
     let label = format!("installing release {}", opts.common.release);
     // A failed-only history is not an upgrade target: `helm upgrade --install`

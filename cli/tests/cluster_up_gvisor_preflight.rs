@@ -102,10 +102,12 @@ if [ "$1" = "template" ]; then
     fake_model="true"
     inference_deploy="false"
     install_runtimeclass="false"
+    preflight_enabled="true"
+    runtime_class="gvisor"
     show_only=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --set|--set-string)
+            --set)
                 shift
                 case "$1" in
                     fullnameOverride=*) fullname=${1#*=} ;;
@@ -113,6 +115,30 @@ if [ "$1" = "template" ]; then
                     priorityClasses.sandbox.create=*) sandbox_create=${1#*=} ;;
                     security.gvisor.mode=*) gvisor_mode=${1#*=} ;;
                     security.gvisor.installRuntimeClass=*) install_runtimeclass=${1#*=} ;;
+                    security.gvisor.runtimeClassName=*) runtime_class=${1#*=} ;;
+                    security.gvisorPreflight.enabled=false) preflight_enabled="false" ;;
+                    security.gvisorPreflight.enabled=true) preflight_enabled="true" ;;
+                    agentSandbox.runner.fakeModel=*) fake_model=${1#*=} ;;
+                    inference.deploy=*) inference_deploy=${1#*=} ;;
+                esac
+                ;;
+            --set-string)
+                shift
+                case "$1" in
+                    fullnameOverride=*) fullname=${1#*=} ;;
+                    priorityClasses.platform.create=*) platform_create=${1#*=} ;;
+                    priorityClasses.sandbox.create=*) sandbox_create=${1#*=} ;;
+                    security.gvisor.mode=*) gvisor_mode=${1#*=} ;;
+                    security.gvisor.installRuntimeClass=*) install_runtimeclass=${1#*=} ;;
+                    security.gvisor.runtimeClassName=*) runtime_class=${1#*=} ;;
+                    security.gvisorPreflight.enabled=*)
+                        # A nonempty Helm string is truthy, including the string false.
+                        if [ -n "${1#*=}" ]; then
+                            preflight_enabled="true"
+                        else
+                            preflight_enabled="false"
+                        fi
+                        ;;
                     agentSandbox.runner.fakeModel=*) fake_model=${1#*=} ;;
                     inference.deploy=*) inference_deploy=${1#*=} ;;
                 esac
@@ -131,7 +157,7 @@ if [ "$1" = "template" ]; then
     if [ "$show_only" = "templates/preflight-gvisor.yaml" ]; then
         # Real execution matches curie.gvisor.preflightRequired: fakeModel is not
         # true, or inference.deploy is true. Mode off still omits the template.
-        if [ "$gvisor_mode" = "off" ] || { [ "$gvisor_mode" = "auto" ] && [ "$fake_model" = "true" ] && [ "$inference_deploy" != "true" ]; }; then
+        if [ "$preflight_enabled" = "false" ] || [ "$gvisor_mode" = "off" ] || { [ "$gvisor_mode" = "auto" ] && [ "$fake_model" = "true" ] && [ "$inference_deploy" != "true" ]; }; then
             printf '%s\n' 'Error: could not find template "templates/preflight-gvisor.yaml" in chart' >&2
             exit 1
         fi
@@ -150,7 +176,9 @@ if [ "$1" = "template" ]; then
             'metadata:' \
             "  name: $fullname-preflight-gvisor" \
             'spec:' \
-            '  backoffLimit: 0'
+            '  template:' \
+            '    spec:' \
+            "      runtimeClassName: $runtime_class"
         exit 0
     fi
 
@@ -1899,5 +1927,57 @@ fn fake_model_default_does_not_lookup_or_infer_gvisor_off() {
     assert!(
         !shown.contains(GVISOR_INFERENCE),
         "the fake model default must not announce the inference:\n{shown}"
+    );
+}
+
+#[test]
+fn typed_false_preflight_does_not_lookup_a_runtimeclass() {
+    let fixture = Fixture::new("nonmatching", "absent", OPENROUTER_CREDENTIAL)
+        .with_runtimeclass_lookup("absent");
+    let (output, _) = fixture.run(&["--set", "security.gvisorPreflight.enabled=false"]);
+    let shown = stderr(&output);
+
+    assert!(
+        output.status.success(),
+        "a typed false preflight must install without a lookup\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        fixture.runtimeclass_gets().is_empty(),
+        "an omitted preflight must not GET a RuntimeClass:\n{}",
+        fixture.runtimeclass_gets()
+    );
+    let upgrades = fs::read_to_string(&fixture.upgrade_log).unwrap_or_default();
+    assert!(
+        !upgrades.contains("security.gvisor.mode=off"),
+        "an omitted preflight must not infer mode off:\n{upgrades}"
+    );
+}
+
+#[test]
+fn rendered_runtime_class_name_is_the_lookup_name() {
+    let fixture = Fixture::new("nonmatching", "absent", OPENROUTER_CREDENTIAL)
+        .with_runtimeclass_lookup("present");
+    let (output, _) = fixture.run(&["--set", "security.gvisor.runtimeClassName=example-class"]);
+    let shown = stderr(&output);
+
+    assert!(
+        output.status.success(),
+        "a chart class name must be looked up as rendered\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        fixture
+            .runtimeclass_gets()
+            .contains("get runtimeclass example-class"),
+        "the lookup must use the rendered class name:\n{}",
+        fixture.runtimeclass_gets()
+    );
+    assert!(
+        !fixture
+            .runtimeclass_gets()
+            .contains("get runtimeclass gvisor"),
+        "the lookup must not substitute the chart's usual default:\n{}",
+        fixture.runtimeclass_gets()
     );
 }
