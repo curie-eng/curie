@@ -28,6 +28,7 @@ from typing import Literal
 
 from aci_protocol import PROTOCOL_VERSION, Event, ReplyHandle, is_compatible, parse_inbound
 from aci_protocol.events import READER_CONTEXT, PublicationContext, ToolAccess, _AciModel
+from pydantic import Field
 
 _FIXTURE = Path(__file__).resolve().parent / "fixtures" / "reply_handle_0_2_9.json"
 
@@ -172,9 +173,12 @@ def _event_0_5_11() -> dict[str, object]:
 
 
 def test_the_pinned_0_5_11_event_matches_the_live_model_minus_memory_token() -> None:
-    """The re-declaration is faithful: the live model is 0.5.11 plus one field."""
+    """The pinned reader predates the two optional credential fields."""
 
-    assert set(Event.model_fields) - set(_Event_0_5_11.model_fields) == {"memory_token"}
+    assert set(Event.model_fields) - set(_Event_0_5_11.model_fields) == {
+        "memory_token",
+        "channel_read",
+    }
     assert set(_Event_0_5_11.model_fields) <= set(Event.model_fields)
 
 
@@ -214,3 +218,47 @@ def test_an_event_carrying_memory_token_decodes_under_the_0_5_gate() -> None:
     old = _Event_0_5_11.model_validate(new_payload, context=READER_CONTEXT)
     assert old.text == new_payload["text"]
     assert "memory_token" not in old.model_dump()
+
+
+class _Event_0_5_15(_Event_0_5_11):  # noqa: N801
+    """The previous event shape contains memory credentials but no channel read."""
+
+    memory_token: str | None = Field(default=None, repr=False)
+
+
+def test_pinned_0_5_15_event_has_exactly_the_previous_patch_fields() -> None:
+    assert set(Event.model_fields) - set(_Event_0_5_15.model_fields) == {"channel_read"}
+    assert set(_Event_0_5_15.model_fields) <= set(Event.model_fields)
+    assert is_compatible("0.5.15", PROTOCOL_VERSION)
+    assert is_compatible(PROTOCOL_VERSION, "0.5.15")
+
+
+def test_previous_patch_event_without_channel_read_decodes_without_capability() -> None:
+    previous = _Event_0_5_15.model_validate(_event_0_5_11())
+    payload = previous.model_dump_json()
+    assert "channel_read" not in previous.model_dump()
+    current = parse_inbound(payload)
+    assert isinstance(current, Event)
+    assert current.channel_read is None
+    assert current.text == previous.text
+    assert current.user == previous.user
+
+
+def test_previous_patch_reader_accepts_and_drops_optional_channel_read_object() -> None:
+    current = Event.model_validate(
+        {
+            **_event_0_5_11(),
+            "memory_token": "memory.example.signature",
+            "channel_read": {
+                "url": "https://api.example.com/channel-read",
+                "token": "channel.read.example.signature",
+            },
+        }
+    )
+    payload = json.loads(current.model_dump_json())
+    assert payload["channel_read"]["token"] == "channel.read.example.signature"
+    previous = _Event_0_5_15.model_validate(payload, context=READER_CONTEXT)
+    assert previous.text == current.text
+    assert previous.memory_token == "memory.example.signature"
+    assert "channel_read" not in previous.model_dump()
+    assert not hasattr(previous, "channel_read")
