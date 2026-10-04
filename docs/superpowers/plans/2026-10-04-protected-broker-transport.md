@@ -105,7 +105,12 @@ protected hooks regression suite, Ruff, mypy, import and documentation checks.
 Classify all seven tiers in the execution record and PR body. Other tiers are
 not applicable to this unwired library transport: no service wiring, installed
 schema, release path, chart/substrate, runner, provider, external delivery,
-factory or bundle behavior changes. Required repository CI checks still apply.
+factory or bundle behavior changes. The publication guard conservatively maps
+any root lock change to local release verification. This change only declares
+the already resolved cryptography 50.0.1 as a direct dependency and changes no
+resolved version. Record that mapped tier as required with an explicit
+discovery waiver linked to open #3603; full protected artifact qualification
+remains required before activation. Required repository CI checks still apply.
 
 Source activation, atomic admission/receipts, complete role inventories,
 preventive provisioning, guarded worker execution and actual provider/connector
