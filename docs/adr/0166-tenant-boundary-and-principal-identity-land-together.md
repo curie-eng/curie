@@ -4,6 +4,12 @@ Date: 2026-09-20
 
 Status: Accepted
 
+**Superseded in part by [ADR 0193](0193-identity-links-live-in-provider-identity-namespaces.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+in decision 2, `identity_links` no longer bind a native id "inside one provider
+installation"; they bind it inside one identity namespace. Everything else in
+this ADR stands.
+
 The acceptance condition, the bounded SET LOCAL probe on the pooled connection factory, is still to be run.
 
 Accepted 2026-09-21 with explicit maintainer approval from Brian Conn, recorded
