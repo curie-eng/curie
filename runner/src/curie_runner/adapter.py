@@ -417,13 +417,18 @@ def model_message_to_conversation(message: object) -> ConversationMessage | None
             ]
         return ConversationMessage(role="user", content=content)
     if isinstance(message, AssistantMessage):
+        nested = message.parent_tool_use_id is not None
+        content = [
+            projected
+            for block in message.content
+            if not (nested and isinstance(block, TextBlock | ThinkingBlock))
+            and (projected := _content_block_to_dict(block)) is not None
+        ]
+        if nested and not content:
+            return None
         return ConversationMessage(
             role="assistant",
-            content=[
-                projected
-                for block in message.content
-                if (projected := _content_block_to_dict(block)) is not None
-            ],
+            content=content,
         )
     return None
 
@@ -616,6 +621,8 @@ def build_options(
         # pass the bundle's servers in ``mcp_servers`` themselves.
         strict_mcp_config=True,
         include_partial_messages=True,
+        # Observe usage on subagents whose replies contain no tool blocks.
+        forward_subagent_text=True,
         # Commit/PR attribution off for every session this runner builds
         # (#3193); see _SDK_ATTRIBUTION_OFF_SETTINGS above.
         settings=_SDK_ATTRIBUTION_OFF_SETTINGS,

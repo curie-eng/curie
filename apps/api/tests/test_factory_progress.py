@@ -1095,7 +1095,7 @@ def test_a_failed_request_keeps_its_current_phase_and_adds_no_ticks() -> None:
     assert [states[p] for p in ("review_diff", "publish", "wait_ci")] == ["pending"] * 3
 
 
-def test_an_out_of_order_report_takes_the_latest_as_current() -> None:
+def test_an_out_of_order_report_keeps_the_furthest_phase_current() -> None:
     view = phase_view(
         DECLARATION,
         _reports_of(("implement", 1), ("plan", 1)),
@@ -1103,8 +1103,75 @@ def test_an_out_of_order_report_takes_the_latest_as_current() -> None:
         None,
     )
     states = _states(view)
-    assert states["plan"] == "current"
-    assert states["implement"] == "pending"
+    assert view.current == "implement"
+    assert states["plan"] == "done"
+    assert states["implement"] == "current"
+
+
+@pytest.mark.parametrize("declaration", [DECLARATION, STAGED_DECLARATION])
+@pytest.mark.parametrize("status", ["running", "failed"])
+def test_renewed_plan_review_preserves_completed_plan_and_diff_review_progress(
+    declaration: dict[str, Any], status: str
+) -> None:
+    view = phase_view(
+        declaration,
+        _reports_of(
+            ("plan", 1),
+            ("plan_review", 1),
+            ("failing_test", None),
+            ("implement", 1),
+            ("review_diff", 1),
+            ("plan_review", 2),
+        ),
+        status,
+        "runner_escalated" if status == "failed" else None,
+    )
+
+    assert view.current == "review_diff"
+    states = _states(view)
+    assert all(
+        states[phase] == "done"
+        for phase in (
+            "read_issue", "pin_criteria", "plan", "plan_review", "failing_test", "implement"
+        )
+    )
+    assert states["review_diff"] == "current"
+    assert states["publish"] == states["wait_ci"] == "pending"
+    assert _loop(view, "plan").approved
+    assert not _loop(view, "plan").active
+    stages = _stage_states(view)
+    assert stages["plan"] == stages["plan_review"] == stages["implement"] == "done"
+    assert stages["review_diff"] == ("blocked" if status == "failed" else "current")
+
+
+@pytest.mark.parametrize("status", ["failed", "expired", "cancelled"])
+@pytest.mark.parametrize(
+    ("entries", "returned_phase"),
+    [
+        ((("plan", 1), ("plan_review", 1), ("plan", 2)), "plan"),
+        ((("implement", 1), ("review_diff", 1), ("implement", 2)), "implement"),
+        (
+            (
+                ("implement", 1),
+                ("review_diff", 1),
+                ("publish", None),
+                ("wait_ci", None),
+                ("implement", 2),
+            ),
+            "implement",
+        ),
+    ],
+)
+def test_terminal_loop_return_keeps_the_returned_phase_selected(
+    status: str, entries: tuple[tuple[str, int | None], ...], returned_phase: str
+) -> None:
+    view = phase_view(STAGED_DECLARATION, _reports_of(*entries), status, None)
+
+    assert view.current == returned_phase
+    assert _states(view)[returned_phase] == "current"
+    assert _stage_states(view)[returned_phase] == (
+        "blocked" if status in {"failed", "expired"} else "current"
+    )
 
 
 @pytest.mark.parametrize(
