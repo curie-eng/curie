@@ -8155,6 +8155,32 @@ fn approvals_summary_line(agent: &str, gated_tools: &[String], unreadable: Optio
     }
 }
 
+/// Mint a Console login code bound to the supplied subject.
+pub async fn console_login(
+    api_url: &str,
+    resolved_api_key: &str,
+    subject: &str,
+    dry_run: bool,
+) -> Result<ApprovalsOutput> {
+    if subject.trim().is_empty() {
+        return Err(crate::exit::usage(
+            "the principal subject must not be blank",
+        ));
+    }
+    if dry_run {
+        return Ok(ApprovalsOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!(
+                "POST {}/console/login-codes subject={subject:?} (the code is returned only by a real run)",
+                api_url.trim_end_matches('/')
+            )],
+        }));
+    }
+    let client = ApiClient::with_resolved_key(api_url, resolved_api_key)?;
+    Ok(ApprovalsOutput::ConsoleLoginCode {
+        delivery: client.mint_console_login_code(subject).await?,
+    })
+}
+
 /// `<tier> approvals <agent> [--gate TOOL]... [--clear]`: view or set the tool
 /// names whose calls pause for human approval. No flags => show current gates.
 pub async fn approvals(

@@ -489,6 +489,40 @@ flag, or `CURIE_NAMESPACE` for namespace, still overrides the saved field.
 | `curie cluster reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Waits for the worker to drain the request. When the key matched no route (a named bot's key carries its identity as its own segment, `kind:identity:channel:conversation`), nothing was released: the command says so and exits 2 instead of reporting `released`; `--json` adds `route_existed` when the API reported the outcome.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
 | `curie cluster delete <agent> --yes` | End every active deployment, then delete the agent through the platform API. Destructive and irreversible: refuses without `--yes`.<br>• If the final agent deletion fails, the agent remains present but any deployments already ended stay ended. |
 
+##### Console login
+
+Administrators can mint a Console login code without selecting an agent:
+
+```bash
+curie local console login --subject operator@example.com
+curie cluster --context <context> console login --subject operator@example.com
+```
+
+`--subject` is required and must not be blank. The administrator selects the
+identity; the code exchanges once for a Console session bound to that subject.
+Both commands use the existing platform API login code endpoint.
+
+Local login uses the stored installation credential for the selected Compose
+project (`COMPOSE_PROJECT_NAME`, default `curie`) when reaching a loopback API.
+Cluster login discovers the selected release credential and defaults to a
+loopback tunnel to its API. Select that release with `--namespace` and `--release`, using
+the cluster targeting rules above. Either tier accepts `--api-url` or
+`CURIE_API_URL`; a direct cluster endpoint must use HTTPS unless it is loopback.
+Neither command accepts `--api-key`, and both ignore `CURIE_API_KEY`.
+
+Human stdout contains only the code followed by a newline; the subject and
+expiry note goes to stderr. With `--json`, stdout is one object containing
+`console_login_code` with `code`, `subject`, and `expires_at` fields.
+
+Add `--dry-run` to print an offline request plan without reading credentials,
+opening a tunnel, or making an API request. With `--json --dry-run`, the output
+uses the existing `{"dry_run": true, "plan": ["..."]}` shape:
+
+```bash
+curie --json local console login --subject operator@example.com --dry-run
+curie --json cluster --context <context> console login --subject operator@example.com --dry-run
+```
+
 ##### `curie local|cluster observability`: API-backed queries
 
 The bare commands above remain URL/surface reports. Queries are read-only and

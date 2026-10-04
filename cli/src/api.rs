@@ -1449,6 +1449,11 @@ fn stored_local_api_key() -> Option<String> {
     crate::local_stack_keys::stored_api_key(&resources.project)
 }
 
+/// Resolve a local API credential through the existing stored project key rule.
+pub fn resolve_local_api_key(base_url: &str, api_key: &str) -> String {
+    api_key_for_destination(base_url, api_key, stored_local_api_key)
+}
+
 /// Build the one kind of HTTP client this CLI makes requests with.
 ///
 /// The loopback `no_proxy` rule is a SECURITY property, not a convenience: a
@@ -1929,13 +1934,19 @@ impl ApiClient {
     pub const APPROVALS_LIST_LIMIT: usize = 200;
 
     pub fn new(base_url: &str, api_key: &str) -> Result<Self> {
+        let api_key = resolve_local_api_key(base_url, api_key);
+        Self::with_resolved_key(base_url, &api_key)
+    }
+
+    /// Construct with the exact credential resolved for the selected installation.
+    /// A cluster tunnel is loopback too, so it must not trigger local key discovery.
+    pub fn with_resolved_key(base_url: &str, api_key: &str) -> Result<Self> {
         warn_if_insecure(base_url);
         let http = http_client(base_url, Some(std::time::Duration::from_secs(5)))
             .context("building HTTP client")?;
-        let api_key = api_key_for_destination(base_url, api_key, stored_local_api_key);
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key,
+            api_key: api_key.to_string(),
             http,
         })
     }
