@@ -1913,7 +1913,8 @@ mailAdapter:
 | `mailAdapter.pollIntervalSeconds` | Seconds between polls of that inbox (default `5`). Zero or negative fails the boot gate rather than tight-looping a third-party API. |
 | `mailAdapter.maxPendingDeliveries` | Maximum unresolved inbound rows (default `1000`). At capacity new mail stays unclaimed at AgentMail rather than evicting accepted work. |
 | `mailAdapter.maxBodyBytes` / `maxReplyBytes` / `maxStateBytes` | Allocation and SQLite page bounds. Size the PVC above `maxStateBytes` for the WAL and filesystem overhead. |
-| `mailAdapter.allowedSenders` | Who may start a turn. Empty denies everyone, and with ingress on the pod refuses to boot rather than run an inbox that answers nobody; `*` is the explicit allow-all. |
+| `mailAdapter.allowedSenders` | Claimed sender allowlist. Empty fails boot with ingress enabled. Every AgentMail message currently fails sender authentication with `authentication_unverifiable`, including allowlisted senders. |
+| `mailAdapter.allowAllSenders` | Default `false`. Explicit opt in permitting a `*` entry at boot. Never bypasses sender authentication or permits an AgentMail approval answer. |
 | `mailAdapter.ingressEnabled` | `false` serves egress while sending nothing inbound. That is the staged-cutover position while the platform side of a new binding is being wired. |
 | `mailAdapter.egressSecret` | The shared secret the worker presents on `X-Curie-Adapter-Secret` and the adapter checks before any side effect. |
 | `mailAdapter.channelTokenExistingSecret` / `channelTokenExistingSecretKey` | Source the scoped channel token from an operator-managed Secret instead of the chart Secret (default key `mailChannelToken`). |
@@ -1981,11 +1982,16 @@ owned or deleted by the chart. Erasure means stopping the adapter and deleting
 the PVC plus every retained PV, snapshot, and backup. Starting on a fresh claim
 performs first-boot priming and intentionally does not backfill the inbox.
 
-The remaining operator-relevant sender boundary is documented once in the
-adapter's README rather than here: Curie authenticates no sender, so
-`mailAdapter.allowedSenders` filters an attacker-controlled `From` header and
-buys nothing unless every domain on it enforces DMARC. That section, the
-AgentMail-specific parameter names, the full config surface and the boot gates all live in
+The inbound sender gate fails closed for turns and approval answers. AgentMail
+supplies no trusted positive aligned authentication verdict that Curie can
+verify, guarantees neither header provenance nor stripping, and permits DMARC
+failure under `p=none`. Every message is refused with
+`authentication_unverifiable`; allowlisted senders, labels, missing rejection
+labels and provider supplied headers cannot bypass the gate. Any
+`mailAdapter.allowedSenders` list containing `*` also fails boot unless
+`mailAdapter.allowAllSenders=true` is explicitly set, and that opt in never
+bypasses authentication. Provider evidence, parameter names, the full config
+surface and boot gates live in
 [`apps/mail-adapter/README.md`](../apps/mail-adapter/README.md); to build an adapter for a
 different channel, see [Building a channel adapter](guides/building-a-channel-adapter.md).
 

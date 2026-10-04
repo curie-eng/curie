@@ -382,16 +382,20 @@ From [`apps/mail-adapter`](../../apps/mail-adapter):
   same thread before the first turn completes, and the first answer then lands on the
   wrong message or clear the second turn's text. Persist ownership at the same
   granularity as the target.
-- **Filtering inbound senders is not authenticating them.** Find out what your
-  provider already drops or withholds by default, ask for that filtering explicitly in
-  every request rather than inheriting it, so a changed provider default cannot widen
-  your install silently, and keep a cheap check on the provider's own verdict behind
-  that as defense in depth. An allow-list on a sender identifier the sender controls
-  (an email `From` header, a display name, a caller ID) sits on top of all three and
-  authenticates nobody: it is meaningful only where that identifier is independently
-  enforced, which for email means the sending domain publishing an enforcing DMARC
-  policy. [`apps/mail-adapter/README.md`](../../apps/mail-adapter/README.md) is the
-  worked version, with AgentMail's parameter names and the key permissions it needs.
+
+**Verify sender authentication before accepting a turn or approval answer.**
+An allowlist filters a claimed sender identifier and never authenticates it.
+Require a positive authentication verdict that your own code verifies. A
+provider label, the absence of a rejection label, or a provider supplied header
+cannot supply that verdict. If no verifiable verdict is available, refuse the
+message with a named reason before either platform endpoint is called. Keep
+provider result exclusions explicit as an additional filter. For email,
+AgentMail supplies no trusted positive aligned verdict, guarantees neither
+header provenance nor stripping, and permits DMARC failure under `p=none`;
+Curie refuses every message with `authentication_unverifiable`, including
+allowlisted senders and approval answers. A wildcard needs a separate boot opt
+in and never bypasses authentication. The provider evidence and complete gate
+contract are in [`apps/mail-adapter/README.md`](../../apps/mail-adapter/README.md).
 
 ## 7. Conformance floor
 

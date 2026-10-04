@@ -30,6 +30,7 @@ Env mapping:
     CURIE_MAIL_MAX_REPLY_BYTES              -> max_reply_bytes
     CURIE_MAIL_MAX_STATE_BYTES              -> max_state_bytes
     CURIE_MAIL_ALLOWED_SENDERS              -> allowed_senders
+    CURIE_MAIL_ALLOW_ALL_SENDERS            -> allow_all_senders
     CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS       -> agentmail_egress_cidrs
     CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS -> discovery_unready_after_seconds
 
@@ -133,6 +134,10 @@ class MailAdapterConfig(BaseSettings):
     # validator below owns the whole parse.
     allowed_senders: Annotated[tuple[str, ...], NoDecode] = Field(
         default=(), validation_alias="CURIE_MAIL_ALLOWED_SENDERS"
+    )
+    # Explicit consent to a wildcard sender filter never supplies authentication.
+    allow_all_senders: bool = Field(
+        default=False, validation_alias="CURIE_MAIL_ALLOW_ALL_SENDERS"
     )
 
     @field_validator("allowed_senders", mode="before")

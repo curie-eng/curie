@@ -66,11 +66,11 @@ def test_platform_rejection_degrades_probe_and_success_recovers(
     try:
         adapter.startup()
         url = serve_egress(adapter)
-        mail.add_inbound("msg-rejected", "thr-rejected")
+        turn = {"delivery_id": "msg-rejected", "conversation_id": "thr-rejected"}
         ingress.response = (401, {"detail": "invalid token"})
         with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
-            adapter.poll_once()
-            adapter.poll_once()
+            adapter.post_turn(turn)
+            adapter.post_turn(turn)
         assert get(url + "/readyz") == (503, {"status": "starting"})
         body = get(url + "/statusz")[1]
         assert body["channel_token"]["state"] == "rejected"
@@ -82,12 +82,12 @@ def test_platform_rejection_degrades_probe_and_success_recovers(
         assert "re-mint" in lines[0] and "/channels/token" in lines[0]
         assert secret not in "\n".join(lines)
         ingress.response = (503, {"detail": "temporarily unavailable"})
-        adapter.poll_once()
+        adapter.post_turn(turn)
         assert get(url + "/readyz") == (503, {"status": "starting"})
         assert get(url + "/statusz")[1]["channel_token"]["state"] == "rejected"
         assert get(url + "/statusz")[1]["last_ingress_status"] == 503
         ingress.response = (200, {"queued": True})
-        adapter.poll_once()
+        adapter.post_turn(turn)
         assert get(url + "/readyz") == (200, {"status": "ready"})
         assert get(url + "/statusz")[1]["channel_token"]["state"] == "ok"
         assert get(url + "/statusz")[1]["last_ingress_status"] == 200

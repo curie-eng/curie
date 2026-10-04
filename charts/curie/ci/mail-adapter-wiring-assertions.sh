@@ -490,6 +490,8 @@ actual="$(field "$on_dir" Deployment "$DEPLOY_NAME" spec.template.spec.priorityC
 #    VALUE rather than being omitted, so the adapter's boot gate fires instead of
 #    the variable silently defaulting.
 # ---------------------------------------------------------------------------
+assert_env_value "$on_dir" CURIE_MAIL_ALLOW_ALL_SENDERS "false" \
+  "The wildcard sender filter must require explicit opt in by default."
 assert_env_value "$on_dir" CURIE_MAIL_ALLOWED_SENDERS "" \
   "An empty mailAdapter.allowedSenders must render the variable with an empty value, not omit it."
 senders_dir="$(render senders "${ON[@]}" "${CREDS[@]}" --set 'mailAdapter.allowedSenders={ops@example.com,dev@example.com}')"
@@ -509,11 +511,14 @@ knobs_dir="$(render knobs "${ON[@]}" "${CREDS[@]}" \
   --set mailAdapter.maxReplyBytes=8192 \
   --set mailAdapter.maxStateBytes=1048576 \
   --set mailAdapter.ingressEnabled=false \
+  --set mailAdapter.allowAllSenders=true \
   --set mailAdapter.discoveryUnreadyAfterSeconds=45)"
 assert_env_value "$knobs_dir" AGENTMAIL_INBOX "assert-inbox@example.com" \
   "mailAdapter.inbox must reach the process; a name typo renders green and is ignored at runtime."
 assert_env_value "$knobs_dir" CURIE_MAIL_POLL_INTERVAL_SECONDS "37" \
   "mailAdapter.pollIntervalSeconds must reach the process as a quoted string."
+assert_env_value "$knobs_dir" CURIE_MAIL_ALLOW_ALL_SENDERS "true" \
+  "mailAdapter.allowAllSenders must explicitly reach the boot gate without bypassing authentication."
 assert_env_value "$knobs_dir" ADAPTER_INGRESS_ENABLED "false" \
   "mailAdapter.ingressEnabled must reach the process as a quoted string; an unquoted YAML bool is rejected by the API server."
 assert_env_value "$knobs_dir" CURIE_MAIL_MAX_PENDING_DELIVERIES "17" \
