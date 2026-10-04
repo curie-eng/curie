@@ -762,3 +762,106 @@ fn request_gate_accepts_skipped_option_and_three_state_nullable_fields() {
         "optional and nullable request fields must pass: {vs:#?}"
     );
 }
+
+// ─── Request-gate fixtures: directional serde skips and skip_serializing_if ──
+
+/// Run the request gate over one `Serialize` request mirror `Body` bound to an
+/// API schema `Create` with the given `properties` and `required` names.
+fn body_violations(body_struct: &str, properties: Value, required: &[&str]) -> Vec<Violation> {
+    let src = r#"impl Client {
+        fn create(&self, body: &Body) {
+            self.http
+                .post(format!("{}/items", self.base_url))
+                .header("X-API-Key", &self.api_key)
+                .json::<Body>(body);
+        }
+    }"#;
+    let schemas = serde_json::json!({"Create":{"type":"object",
+        "properties": properties, "required": required}});
+    let openapi = request_openapi("/items", "post", "Create", schemas);
+    let manifest = request_manifest("create", "post", "/items", "Create");
+    field_parity::request_violations(src, body_struct, &openapi, &manifest)
+}
+
+#[test]
+fn request_gate_rejects_a_skip_serializing_required_field() {
+    // `skip_serializing` means the body never sends `name`, so the mirror does
+    // not cover the required API field -> MissingField.
+    let requests = r#"#[derive(Debug, Serialize)] struct Body {
+        #[serde(skip_serializing)]
+        name: String,
+    }"#;
+    let vs = body_violations(
+        requests,
+        serde_json::json!({"name":{"type":"string"}}),
+        &["name"],
+    );
+    assert!(has_missing_field(&vs, "Body", "name"), "{vs:#?}");
+}
+
+#[test]
+fn request_gate_rejects_a_bare_skip_required_field() {
+    // `skip` drops the field from both directions -> MissingField on a request.
+    let requests = r#"#[derive(Debug, Serialize)] struct Body {
+        #[serde(skip)]
+        name: String,
+    }"#;
+    let vs = body_violations(
+        requests,
+        serde_json::json!({"name":{"type":"string"}}),
+        &["name"],
+    );
+    assert!(has_missing_field(&vs, "Body", "name"), "{vs:#?}");
+}
+
+#[test]
+fn request_gate_accepts_a_skip_deserializing_required_field() {
+    // Liveness: `skip_deserializing` only affects decoding; the field is still
+    // serialized, so it covers the required API field. No violation at all.
+    let requests = r#"#[derive(Debug, Serialize)] struct Body {
+        #[serde(skip_deserializing)]
+        name: String,
+    }"#;
+    let vs = body_violations(
+        requests,
+        serde_json::json!({"name":{"type":"string"}}),
+        &["name"],
+    );
+    assert!(vs.is_empty(), "{vs:#?}");
+}
+
+#[test]
+fn request_gate_rejects_a_skip_serializing_if_other_than_option_is_none() {
+    // `Option::is_some` omits exactly when a value is present, so the omission
+    // semantics are not "None omits"; the comparator must not read it as an
+    // optional-field mirror -> UnsupportedShape for the struct.
+    let requests = r#"#[derive(Debug, Serialize)] struct Body {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_some")]
+        ttl_s: Option<i64>,
+    }"#;
+    let vs = body_violations(
+        requests,
+        serde_json::json!({"name":{"type":"string"},"ttl_s":{"type":"integer"}}),
+        &["name"],
+    );
+    assert!(has_unsupported_shape(&vs, "Body"), "{vs:#?}");
+}
+
+#[test]
+fn request_gate_rejects_a_custom_skip_serializing_if_predicate() {
+    // A custom predicate cannot be verified as "None omits" -> UnsupportedShape.
+    let requests = r#"#[derive(Debug, Serialize)] struct Body {
+        name: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        ttl_s: Option<i64>,
+    }"#;
+    let vs = body_violations(
+        requests,
+        serde_json::json!({"name":{"type":"string"},"ttl_s":{"type":"integer"}}),
+        &["name"],
+    );
+    assert!(has_unsupported_shape(&vs, "Body"), "{vs:#?}");
+}
+// Liveness for `Option::is_none` on `Option<T>` and `Option<Option<T>>` is
+// already covered by `request_gate_accepts_skipped_option_and_three_state_nullable_fields`.
