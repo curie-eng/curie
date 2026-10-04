@@ -234,21 +234,17 @@ TURN_PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TURN_PROGRESS_TOOL}"
 # server only when the worker injected the issue read route and capability.
 ISSUE_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__get_issue"
 
-# Curie's own platform-owned MCP servers are ``curie`` and ``curie-state``
-# (#2286). The runner mounts both itself and a bundle cannot declare either:
-# plugin_format's ``connectors.RESERVED_CONNECTOR_NAMES`` refuses the names at
-# deploy, so a bundle can never express a toolPolicy over them. ADR-0139 settles
-# what that means -- bundle configuration may add restrictions but may not
-# hollow out operator or platform controls -- so the tools these servers publish
-# are outside toolPolicy scope entirely rather than classified against a policy
-# they cannot appear in.
+# The existing platform MCP servers ``curie`` and ``curie-state`` retain their
+# exemption under #2286 and ADR 0139. Only their exact published platform tool
+# names bypass toolPolicy. A bundle may plugin mount either name with the
+# plugin infix; those tools remain governed by policy. Connectors may use neither
+# name. The reserved identity set also includes the channel read capability,
+# which receives no exemption and is not mounted by this prerequisite.
 #
-# There is deliberately NO server-set constant here. RESERVED_CONNECTOR_NAMES is
-# the one list of these names (runner depends on plugin_format and never the
-# reverse), and a mirror of it in this module would be a second copy that only a
-# test ever read. The runtime exemption is decided on exact live TOOL names, not
-# on a server set: see ``is_platform_owned_tool``, which is where the first
-# #2286 fix went wrong by matching the server prefix instead.
+# Reservation does not imply mounting, publication or policy exemption. The
+# runtime exemption is decided on exact live tool names, not a reserved server
+# set: see ``is_platform_owned_tool``, where the first #2286 fix went wrong by
+# matching the server prefix instead.
 
 # The live tool names the ``curie`` server publishes, enumerated from the two
 # constants that already own them rather than respelled: ``APPROVAL_TOOL_NAME``

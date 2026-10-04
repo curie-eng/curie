@@ -88,6 +88,9 @@ class PluginManifest(BaseModel):
     # validator error rather than an opaque manifest-level pydantic failure that
     # would reject the whole bundle.
     toolPolicy: dict[str, Any] | None = None
+    # Permission for a platform owned channel read capability under ADR 0100.
+    # Only literal true grants it; the value carries no selectors or credentials.
+    channelRead: bool = Field(default=False, strict=True)
 
 
 # Trigger types the manifest may declare beyond inbound chat (epic #29).

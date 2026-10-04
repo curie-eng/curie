@@ -631,6 +631,11 @@
           "default": null,
           "title": "Author"
         },
+        "channelRead": {
+          "default": false,
+          "title": "Channelread",
+          "type": "boolean"
+        },
         "commands": {
           "anyOf": [
             {

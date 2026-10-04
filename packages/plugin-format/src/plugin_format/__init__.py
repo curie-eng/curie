@@ -24,6 +24,7 @@ from .archive import (
     check_archive_bounds,
     safe_extract,
 )
+from .connectors import CHANNEL_READ_SERVER_NAME
 from .gate_summary import (
     RESERVED_PERMISSION_PREFIX,
     check_gate_summary_template,
@@ -69,6 +70,7 @@ __version__ = "0.0.0"
 __all__ = [
     "__version__",
     "PLATFORM_PUBLISH_TOOL_NAME",
+    "CHANNEL_READ_SERVER_NAME",
     "RESERVED_BOOT_ENV",
     "is_reserved_boot_env_name",
     "MANIFEST_LOCATIONS",

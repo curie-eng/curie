@@ -125,7 +125,7 @@ def test_unmatched_tool_is_denied() -> None:
         ),
         (
             {
-                "allow": ["curie-slack/history"],
+                "allow": ["curie-slack/hist*"],
                 "approvalRequired": ["curie-slack/*"],
                 "deny": ["curie-slack/history"],
             },

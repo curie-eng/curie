@@ -27,6 +27,14 @@ Pydantic models mirroring the Claude Code shapes:
   `version`, `description`, `author` (string or `{name, email?, url?}`),
   `homepage`, `repository`, `license`, `keywords`, `commands`, `agents`,
   `hooks`, `mcpServers`. Unknown keys are accepted and preserved.
+
+  The optional Curie grant `channelRead` is a strict JSON boolean, defaulting
+  to `false`. Only literal `true` grants the bounded platform channel read
+  capability under ADR 0100. Null, strings, numbers, arrays and selector objects
+  are invalid. The grant contains no channel, workspace, address or credential;
+  the platform must check current agent bindings and adapter membership on each
+  read. This prerequisite defines and validates the grant but implements no
+  read operation, server mounting or credential issuance.
 - `SkillFrontmatter` (`skills/**/SKILL.md` YAML frontmatter): `name` and
   `description` required; `allowed-tools` optional, accepted as either the
   space- or comma-separated string the Agent Skills specification calls
@@ -131,14 +139,22 @@ Pydantic models mirroring the Claude Code shapes:
     a malformed pattern, a pattern repeated within one collection, the identical
     pattern string in two collections, and a literal server segment naming a
     server the bundle declares in neither `mcpServers` nor `connectors.yaml`
-    (`tool_policy.unknown_server`). When that undeclared segment names one of
-    Curie's own platform owned servers (`connectors.RESERVED_CONNECTOR_NAMES`,
-    today `curie` and `curie-state`) the code is `tool_policy.platform_server`
-    instead: those servers are outside `toolPolicy` scope, so the pattern is
-    inert and the generic advice to declare it is a dead end, because a
-    connector may not take a reserved name. A bundle that DOES declare its own
-    plugin-mounted `mcpServers` entry by one of those names is unaffected and
-    keeps full policy scope over it.
+    (`tool_policy.unknown_server`). The existing platform servers `curie` and
+    `curie-state` retain their policy exemption: an undeclared literal segment
+    naming either gets `tool_policy.platform_server`. Their exact published
+    platform tools remain outside policy scope. Bundle plugin mounted
+    `mcpServers` entries using either name retain their accepted namespaced
+    behavior and remain fully governed by policy. Neither name is legal in
+    `connectors.yaml`.
+
+    The canonical `CHANNEL_READ_SERVER_NAME` is `curie-slack`, reserved against
+    `connectors.yaml`, inline manifest `mcpServers` and `.mcp.json`. With a
+    `channelRead: true` grant it is recognized for policy validation and fully
+    governed by `toolPolicy`, with no platform exemption. Deny, approval and
+    unmatched deny retain their usual precedence. Without the grant a literal
+    pattern gets `channel_read.grant_required`, and wildcard policy cannot
+    enable the absent capability. Reservation does not imply mounting,
+    publication or exemption; this prerequisite mounts no channel read server.
     Overlapping but *different* globs are legal and resolve by precedence. A
     policy with all three collections empty warns (`tool_policy.denies_everything`)
     but still validates: it denies everything, which is coherent.
@@ -172,7 +188,7 @@ Error codes include `bundle.missing`, `manifest.missing`,
 `manifest.invalid_json`, `manifest.invalid`, `manifest.name_invalid`,
 `skill.frontmatter_missing`, `skill.frontmatter_invalid`,
 `skill.tools_confusable`, `mcp.invalid_json`, `mcp.server_incomplete`,
-`mcp.declared_pointer`, `hooks.declared_missing`, `hooks.invalid_json`,
+`mcp.declared_pointer`, `mcp.reserved_name`, `hooks.declared_missing`, `hooks.invalid_json`,
 `hooks.invalid`, `hooks.command_missing`, `triggers.invalid`,
 `triggers.unknown_type`, `triggers.cron_missing_schedule`,
 `triggers.cron_missing_name`, `triggers.cron_missing_prompt`,
@@ -185,6 +201,7 @@ Error codes include `bundle.missing`, `manifest.missing`,
 `tool_policy.enforcement_unsupported`, `tool_policy.pattern_invalid`,
 `tool_policy.pattern_duplicate`, `tool_policy.pattern_conflict`,
 `tool_policy.unknown_server`, `tool_policy.platform_server`,
+`channel_read.grant_required`,
 `scripts.not_a_directory`.
 
 `tool_policy.denies_everything` is the one **warning** code in this list, not an
