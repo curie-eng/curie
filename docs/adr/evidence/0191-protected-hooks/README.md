@@ -167,6 +167,47 @@ distribution or prevented image changes.
 The fixture restored its original roles with ACL LOAD and deleted its probe
 keys afterward. No broker credential or probe payload is published here.
 
+## Metadata permission subset realization
+
+The metadata realization uses Valkey 8.1.10 and redis client 8.1.0. A new
+independently owned disposable broker disables only its own default user and
+starts distinct source writer, control reader and fixture provisioner
+principals. No shared service ACL or production identity is changed.
+
+The permission reset tokens `-@all resetkeys resetchannels clearselectors`
+removed prior command, key, channel and selector grants while preserving the
+principal's enabled state and password. The source writer's emitted rules
+allowed the existing SourceFence reservation, idempotent retry and matching
+ordinary publication. A newer reservation closed active authority; stale
+publication and conflicting CAS could not replace it.
+
+The reader's main read selectors on `protected:source:*` and
+`protected:control:*`, combined with a separate
+`(+eval %RW~protected:source:* %RW~protected:control:*)` declared key selector,
+allowed EVAL containing GET. Inner SET remained refused with ResponseError;
+declaring an admission key refused with NoPermissionError. Direct writes,
+payload reads, stream consumption, pubsub and administration also refused.
+
+`+info|server` allowed INFO server and refused INFO clients, memory, all and
+the no section form. INFO server clients and INFO server memory returned
+only the server section on this version; this is not a general assertion
+that arbitrary extra INFO arguments are refused. The operation facade
+requests exactly INFO server and TIME. Broker identity and time are separate
+observations, not an atomic admission proof.
+
+The actual command `uv run --frozen pytest packages/protected-hooks/tests -q`
+passed 830 tests in 2.37 seconds with exit 0 after the separate failing test
+commit. Its real broker tests include prior overprivilege removal, ordinary
+and default authentication refusal, fixed observation and retained session
+revocation: password replacement alone preserved an authenticated connection;
+CLIENT KILL USER terminated it and old password reconnect refused. The fixture
+removed its exact owned container and credential file afterward.
+
+This measures the two metadata permission subsets. It does not establish the
+complete enqueue, worker or verifier ACL inventory, TLS/network isolation,
+runtime qualification, source activation, restart recovery or end to end
+protected delivery support.
+
 ## Reported PostgreSQL transaction-lock observation
 
 The separately reported PostgreSQL 16.15 measurement used this exact statement:
