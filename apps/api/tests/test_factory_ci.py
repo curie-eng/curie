@@ -1342,3 +1342,120 @@ def test_tried_summary_clips_a_long_title() -> None:
     summary = factory_ci.tried_summary(publications, verdict, PR_URL)
     assert "t" * 100 in summary
     assert "t" * 101 not in summary
+
+
+# --- decide: delegated required CI (#3873) ---------------------------------------------
+#
+# A declared check that could not run in the sandbox may delegate its proof to a
+# named required pull request check. ``delegated_checks`` names those checks; the
+# request must not complete until each one actually ran and passed.
+
+DELEGATED = "integration-tests"
+
+
+def _delegated_run(conclusion: str | None = "success", status: str = "completed") -> dict[str, Any]:
+    # Any app may own the delegated check; match is by name alone.
+    run = _run(DELEGATED, status=status, conclusion=conclusion, run_id=50)
+    run["app"] = {"slug": "buildkite"}
+    return run
+
+
+def test_a_missing_delegated_check_waits_before_the_ci_deadline() -> None:
+    detail = _detail(_run("lint"), _run("unit", run_id=2))
+    for seconds in (30, 130, 1199):
+        verdict = _decide(detail, seconds, delegated_checks=(DELEGATED,))
+        assert verdict.kind == "pending"
+        assert verdict.reason == "delegated_ci_missing"
+
+
+def test_a_missing_delegated_check_is_unverified_at_the_ci_deadline() -> None:
+    detail = _detail(_run("lint"), _run("unit", run_id=2))
+    verdict = _decide(detail, 1200, delegated_checks=(DELEGATED,))
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "delegated_ci_missing"
+    # The execution deadline caps the CI wait the same way.
+    early = PUBLISHED + timedelta(seconds=600)
+    verdict = _decide(detail, 600, execution_deadline=early, delegated_checks=(DELEGATED,))
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "delegated_ci_missing"
+
+
+def test_no_checks_at_all_is_never_no_ci_when_a_check_is_delegated() -> None:
+    empty = _detail()
+    assert _decide(empty, 130).kind == "no_ci"  # control: today's verdict without delegation
+
+    after_grace = _decide(empty, 130, delegated_checks=(DELEGATED,))
+    assert after_grace.kind == "pending"
+    assert after_grace.reason == "delegated_ci_missing"
+
+    expired = _decide(empty, 1200, delegated_checks=(DELEGATED,))
+    assert expired.kind == "unverified"
+    assert expired.reason == "delegated_ci_missing"
+
+
+@pytest.mark.parametrize("conclusion", ["skipped", "neutral"])
+def test_a_skipped_or_neutral_delegated_check_is_unverified(conclusion: str) -> None:
+    detail = _detail(_run("lint"), _delegated_run(conclusion))
+    # Without delegation the same conclusions read as passing.
+    assert _decide(detail, 30).kind == "green"
+
+    verdict = _decide(detail, 30, delegated_checks=(DELEGATED,))
+    assert verdict.kind == "unverified"
+    assert verdict.reason == f"delegated_ci_{conclusion}"
+
+
+def test_a_failing_delegated_check_goes_to_the_failing_path() -> None:
+    detail = _detail(_run("lint"), _delegated_run("failure"))
+    verdict = _decide(detail, 30, delegated_checks=(DELEGATED,))
+    assert verdict.kind == "failing"
+    assert DELEGATED in _names(verdict.failing)
+
+
+def test_a_pending_delegated_check_keeps_waiting() -> None:
+    detail = _detail(_run("lint"), _delegated_run(status="in_progress", conclusion=None))
+    verdict = _decide(detail, 30, delegated_checks=(DELEGATED,))
+    assert verdict.kind == "pending"
+
+
+def test_a_delegated_commit_status_context_satisfies_the_delegation() -> None:
+    detail = _detail(_run("lint"), statuses=(_status(DELEGATED, "success"),))
+    verdict = _decide(detail, 30, delegated_checks=(DELEGATED,))
+    assert verdict.kind == "green"
+
+
+def test_a_passing_delegated_check_with_unrelated_green_checks_is_green() -> None:
+    detail = _detail(
+        _run("lint"),
+        _run("docs", conclusion="skipped", run_id=2),
+        _delegated_run(),
+        statuses=(_status("ci/jenkins", "success"),),
+    )
+    verdict = _decide(detail, 30, delegated_checks=(DELEGATED,))
+    assert verdict.kind == "green"
+
+
+def test_every_delegated_check_must_be_present() -> None:
+    detail = _detail(_run("lint"), _delegated_run())
+    verdict = _decide(detail, 1200, delegated_checks=(DELEGATED, "e2e"))
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "delegated_ci_missing"
+
+
+@pytest.mark.parametrize(
+    ("detail", "seconds"),
+    [
+        (_detail(_run("build")), 30),
+        (_detail(_run("docs", conclusion="skipped")), 30),
+        (_detail(), 30),
+        (_detail(), 130),
+        (_detail(), 1200),
+        (_detail(_run("build", status="in_progress")), 30),
+        (_detail(_run("build", status="in_progress")), 1200),
+        (_detail(_run("lint", conclusion="failure")), 30),
+        (_detail(statuses=(_status("ci/jenkins", "pending"),)), 30),
+        (_detail(reason="timeout"), 30),
+        (_detail(reason="github_forbidden"), 30),
+    ],
+)
+def test_no_delegated_checks_keeps_todays_verdicts(detail: CiDetail, seconds: float) -> None:
+    assert _decide(detail, seconds, delegated_checks=()) == _decide(detail, seconds)
