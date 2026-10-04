@@ -53,8 +53,11 @@ What it does:
 
 1. When no kubeconfig context is targeted, it creates kind cluster
    `curie-factory` (context `kind-curie-factory`) and scales CoreDNS to one
-   replica. An existing context, including a remote cluster, skips kind. Pass
-   `--context <name>` to choose one.
+   replica. A current kind context skips creating a cluster and does not ask.
+   A current context that is not kind, including a remote cluster, is not
+   used until you confirm it in a terminal. Without a terminal the command
+   stops and names `--context <name>` as the way to proceed. An explicit
+   `--context <name>` never prompts.
 2. It installs Curie with `cluster up`. On the kind path it sets
    `security.gvisor.mode=off` before the first install. It asks for the
    OpenRouter key once when `CURIE_CREDENTIALS` is unset and the release is

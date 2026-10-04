@@ -4,7 +4,9 @@
 //! The command chains kind (only when no kube context is targeted), `cluster
 //! up` with gVisor off on that kind path, the printed App registration link,
 //! and on the second run the App setup, polling intake, and the published
-//! dark factory deploy. It never opens a browser and never runs `gh`.
+//! dark factory deploy. A current context that is not a kind context (`kind-`
+//! prefix) is confirmed in a terminal and refused without one. An explicit
+//! `--context` is not asked. It never opens a browser and never runs `gh`.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -106,6 +108,8 @@ pub enum Action {
 #[derive(Debug, Clone)]
 pub struct Planned {
     pub context: String,
+    /// Why `context` was selected. `--dry-run` prints this before any step.
+    pub context_reason: String,
     pub kind_cluster: Option<String>,
     pub credential: CredentialDecision,
     pub actions: Vec<Action>,
@@ -337,6 +341,83 @@ pub fn kind_context_name(kind_name: &str) -> String {
     format!("kind-{kind_name}")
 }
 
+/// Kind writes kubeconfig contexts as `kind-<cluster>`. The same prefix selects
+/// the gVisor-off path, so confirmation uses it too.
+fn is_kind_context(name: &str) -> bool {
+    name.starts_with("kind-")
+}
+
+fn unconfirmed_remote_context<'a>(
+    explicit: Option<&'a str>,
+    current: Option<&'a str>,
+) -> Option<&'a str> {
+    match (explicit, current) {
+        (None, Some(name)) if !is_kind_context(name) => Some(name),
+        _ => None,
+    }
+}
+
+fn unconfirmed_context_error(name: &str) -> anyhow::Error {
+    CliError::usage(format!(
+        "refusing to install into Kubernetes context {name} because it is not a kind context and stdin is not a terminal. Pass --context {name} to proceed"
+    ))
+    .with_fix(format!("rerun with --context {name}"))
+    .into()
+}
+
+fn context_confirmation_line(name: &str, line: &str) -> Result<()> {
+    if matches!(line.trim(), "y" | "Y" | "yes" | "Yes") {
+        return Ok(());
+    }
+    Err(CliError::usage(format!(
+        "refusing to install into Kubernetes context {name} without confirmation. Pass --context {name} to proceed"
+    ))
+    .with_fix(format!("rerun with --context {name}"))
+    .into())
+}
+
+fn confirm_remote_context(name: &str, interactive: bool) -> Result<()> {
+    if !interactive {
+        return Err(unconfirmed_context_error(name));
+    }
+    eprint!("Kubernetes context {name} is not a kind context. Install Curie into it? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|err| CliError::failure(format!("reading confirmation from stdin: {err}")))?;
+    context_confirmation_line(name, &line)
+}
+
+fn context_reason(
+    explicit: Option<&str>,
+    current: Option<&str>,
+    context: &str,
+    create_kind: bool,
+    kind_cluster: Option<&str>,
+) -> String {
+    if explicit.is_some() {
+        format!("Kubernetes context: {context} because --context was passed")
+    } else if let Some(name) = current {
+        if is_kind_context(name) {
+            format!("Kubernetes context: {context} because the current context is a kind context")
+        } else {
+            format!(
+                "Kubernetes context: {context} because it is the current context and it is not a kind context; a terminal must confirm before install, and a non-terminal run stops until --context {context} is passed"
+            )
+        }
+    } else if create_kind {
+        format!(
+            "Kubernetes context: {context} because no current context is set, so a kind cluster is created"
+        )
+    } else {
+        let name = kind_cluster.unwrap_or(context);
+        format!(
+            "Kubernetes context: {context} because no current context is set and kind cluster {name} already exists"
+        )
+    }
+}
+
 pub fn bundle_dir(namespace: &str, release: &str) -> PathBuf {
     std::env::temp_dir()
         .join(format!("curie-factory-quickstart-{namespace}-{release}"))
@@ -386,6 +467,14 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         .with_fix("pass a name of letters, digits, and hyphens, or omit --kind-name")
         .into());
     }
+    if !input.interactive {
+        if let Some(name) = unconfirmed_remote_context(
+            input.explicit_context.as_deref(),
+            input.current_context.as_deref(),
+        ) {
+            return Err(unconfirmed_context_error(name));
+        }
+    }
 
     let owned_kind = kind_context_name(&input.kind_name);
     let context = input
@@ -397,9 +486,9 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
     // the one this command created on a previous run, still gets gVisor off
     // and the CoreDNS scale. A remote context does not.
     let kind_target = input.explicit_context.is_none() && input.current_context.is_none()
-        || context.starts_with("kind-");
+        || is_kind_context(&context);
     let kind_cluster = kind_target.then(|| {
-        if context.starts_with("kind-") {
+        if is_kind_context(&context) {
             context.trim_start_matches("kind-").to_string()
         } else {
             input.kind_name.clone()
@@ -481,8 +570,16 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         });
     }
 
+    let context_reason = context_reason(
+        input.explicit_context.as_deref(),
+        input.current_context.as_deref(),
+        &context,
+        create_kind,
+        kind_cluster.as_deref(),
+    );
     Ok(Planned {
         context,
+        context_reason,
         kind_cluster,
         credential: credential_decision(
             input.credential_in_env,
@@ -517,7 +614,7 @@ fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIntakeOpts {
 }
 
 pub fn describe(planned: &Planned) -> Vec<String> {
-    let mut lines = Vec::new();
+    let mut lines = vec![planned.context_reason.clone()];
     match &planned.credential {
         CredentialDecision::UseEnv => {
             lines.push("model credential: use CURIE_CREDENTIALS (no prompt)".to_string());
@@ -686,6 +783,15 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
         current.as_deref(),
         crate::ops::on_path,
     )?;
+    // Confirm before pin or helm. A non-terminal refusal here never reads the
+    // release, and a declined prompt never installs.
+    let real_interactive = std::io::stdin().is_terminal();
+    if !opts.dry_run {
+        if let Some(name) = unconfirmed_remote_context(opts.context.as_deref(), current.as_deref())
+        {
+            confirm_remote_context(name, real_interactive)?;
+        }
+    }
     let existing = if opts.context.is_none() && current.is_none() {
         match kind_clusters().await {
             Ok(clusters) => clusters,
@@ -698,7 +804,6 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     } else {
         Vec::new()
     };
-    let interactive = std::io::stdin().is_terminal();
     let credential_in_env = crate::ops::model_credential_env()?.is_some();
     let targeted = opts.context.clone().or_else(|| current.clone());
     if let Some(context) = &targeted {
@@ -733,9 +838,13 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
         chart: opts.chart.clone(),
         credential_in_env,
         release_has_real_model,
-        interactive,
+        // Dry-run reports a non-kind current context instead of refusing it.
+        interactive: opts.dry_run || real_interactive,
     })?;
     if opts.dry_run {
+        let mut planned = planned;
+        planned.credential =
+            credential_decision(credential_in_env, release_has_real_model, real_interactive);
         return Ok(QuickstartOutput::DryRun(DryRunPlan {
             lines: describe(&planned),
         }));
@@ -1252,6 +1361,8 @@ mod tests {
         input.existing_kind_clusters = vec!["curie-factory".into()];
         let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
         assert!(!text.contains("kind create"), "{text}");
+        assert!(text.contains("already exists"), "{text}");
+        assert!(!text.contains("is created"), "{text}");
         assert!(
             text.contains("scale deployment/coredns --replicas=1"),
             "{text}"
@@ -1275,9 +1386,20 @@ mod tests {
         let mut input = base();
         input.current_context = Some("k8".into());
         let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
-        assert!(!text.contains("kind "), "{text}");
+        assert!(!text.contains("kind create"), "{text}");
         assert!(text.contains("--context k8"), "{text}");
+        assert!(text.contains("must confirm"), "{text}");
         assert!(!text.contains("security.gvisor.mode=off"), "{text}");
+    }
+
+    #[test]
+    fn a_declined_context_confirmation_names_the_context_flag() {
+        let err = context_confirmation_line("work-cluster", "n").unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(shown.contains("--context work-cluster"), "{shown}");
+        assert!(context_confirmation_line("work-cluster", "y").is_ok());
+        assert!(context_confirmation_line("work-cluster", "yes").is_ok());
+        assert!(context_confirmation_line("work-cluster", "").is_err());
     }
 
     #[test]
