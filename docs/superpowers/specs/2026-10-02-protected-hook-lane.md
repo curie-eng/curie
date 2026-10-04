@@ -240,6 +240,81 @@ do not enable source administration, runtime qualification or protected
 delivery. The default resolver remains unavailable until the separate
 authority, admission, provisioning and execution requirements pass.
 
+## Authenticated metadata reader transport
+
+<!-- @spec PROTECTED-HOOK-LANE-2/3 -->
+The next metadata realization adds `AuthenticatedMetadataReader` in the
+internal protected hooks package. The exported credential is
+`MetadataReaderCredential(username: str, password: str)`, a frozen, slotted
+dataclass whose representation redacts both fields. Both values must be
+nonempty strings and username must differ from `default`. The exported
+classmethod `AuthenticatedMetadataReader.connect(manifest: Manifest,
+credential: MetadataReaderCredential, ca_pem: str) -> AuthenticatedMetadataReader`
+accepts only a trusted parsed Manifest, that explicit credential and CA PEM
+data from provisioning. It eagerly completes TLS, pin, named authentication
+and live run_id verification before returning a reader. No unverified public
+constructor is provided. Credential arguments cannot override transport settings. No
+connection is derived from environment variables, URLs, WorkerConfig, source
+input, worker output or evidence. The manifest remains the existing closed v1
+shape. This reader does not prove the credential issuance or role separation;
+provisioning must supply the actual control reader principal.
+
+The factory refuses malformed inputs and tuples whose broker endpoint host
+is different from `tls_server_name` before network operations. That tuple is
+unsupported by this first transport realization. It cannot weaken hostname
+validation to support it. CA PEM data is a nonempty string containing only PEM certificates, with no
+private key or other PEM block; it is validated before network operations.
+No caller selected file paths or broad connection keyword arguments are
+accepted. The connection uses database zero, certificate validation required,
+standard hostname validation and the manifest endpoint. After normal TLS
+chain and hostname validation, a narrow SSLConnection subclass obtains the
+server leaf certificate in DER, extracts its DER SubjectPublicKeyInfo and
+matches its SHA256 against the trusted manifest pin before transmitting
+credentials or application commands. Missing certificate, malformed
+certificate or pin mismatch closes the socket and refuses. Every new socket,
+including reconnects, repeats this validation.
+
+Named authentication uses explicit RESP3 HELLO AUTH. No password only AUTH,
+default user fallback, alternative endpoint, plaintext or weaker verification
+retry is permitted. Connect and socket timeouts are each two seconds; retries
+are disabled. Maintenance notifications, client tracking and caller supplied
+connection callbacks are disabled. After authentication on every connection
+or reconnect, INFO with exactly the server section must yield the canonical
+live run_id bound by the manifest before an application command is sent.
+Changed, missing or unreadable run_id closes that connection and refuses.
+These checks do not issue readiness or authorize a restored broker epoch.
+
+The reader exports only `read_source(agent_id, hook)`, `read_control(key)`,
+`observe()` and `close()`, retaining the existing metadata reader argument and
+result shapes. Source coordinates and control keys are validated before
+identity checks or other I/O. The authenticated transport translates all public
+input validation failures, including SourceFenceInvalid, into the existing
+BrokerMetadataUnavailable error; AuthorityMetadataReader retains its existing
+validation and exception behavior. No raw client, generic command, write, provisioning or
+credential issuance interface is exported. Its operations are serialized on
+one privately owned connection so the authentication and identity check apply
+to the connection executing the read. Each public read checks live INFO server
+identity before reading metadata; observe returns validated identity and TIME
+from that connection. Separate commands remain separate observations, not
+atomic admission. A reconnect cannot silently substitute another broker.
+Close releases owned connections and permanently refuses later operations;
+close is idempotent. Public credential and reader representations, exceptions
+and transport log output exclude credentials, certificate bytes, endpoints,
+raw broker responses and underlying exception details. This is not a claim
+that debugger inspection or third party traceback-local capture cannot inspect
+private objects; test fixtures must redact their own diagnostic output. Expected validation, TLS, authentication and broker failures
+surface only the existing safe metadata unavailable error.
+
+Real disposable TLS broker tests must prove successful source/control reads
+and observation, and refusal with wrong CA, hostname, leaf SPKI pin, named
+credential and live run_id. Wrong CA/name/pin must transmit no authentication.
+A failed named principal must never attempt default authentication. Retained
+connection and forced reconnect cases must verify pin and run_id enforcement,
+and close must prevent reuse. Validated wrong tuple/input refusals precede
+connection attempts. The reader remains unwired: no source administration,
+activation, admission, runtime evidence issuance, protected worker startup or
+qualification is enabled by these tests.
+
 ## Atomic admission, duplicate receipt and activation
 
 <!-- @spec PROTECTED-HOOK-LANE-4 -->
