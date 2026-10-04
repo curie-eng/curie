@@ -114,6 +114,8 @@ def broker(tmp_path_factory):
             name,
             "--cidfile",
             str(cidfile),
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
             "--label",
             "curie.test.owner=" + name,
             "-p",
