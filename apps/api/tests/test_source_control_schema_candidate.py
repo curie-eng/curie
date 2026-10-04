@@ -36,14 +36,14 @@ def test_candidate_requires_exact_ledger_schema(resource: str) -> None:
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
-def test_new_candidate_release_fields_are_0122(field: str) -> None:
+def test_new_candidate_release_fields_are_0120(field: str) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
     if field == "cargo":
         value = tomllib.loads((ROOT / "cli/Cargo.toml").read_text())["package"]["version"]
     else:
         chart = yaml.safe_load((ROOT / "charts/curie/Chart.yaml").read_text())
         value = chart["version" if field == "chart" else "appVersion"]
-    assert value == "0.12.2"
+    assert value == "0.12.0"
 
 
 def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
