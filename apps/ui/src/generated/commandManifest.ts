@@ -7784,6 +7784,24 @@ export const commandManifest = {
           "name": "factory-e2e"
         },
         {
+          "about": "Serve a TLS GitHub fixture or capture public check lifecycle recordings",
+          "args": [
+            {
+              "global": false,
+              "help": "`serve` or `capture`, followed by fixture flags",
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709552000,
+                "min": 1
+              },
+              "positional": true,
+              "required": true
+            }
+          ],
+          "hidden": false,
+          "name": "github-stub"
+        },
+        {
           "about": "Select the end to end tiers CI would run for paths or revisions",
           "args": [
             {

@@ -252,6 +252,7 @@ class GithubStub:
 
         server = Server((self.bind, self.port), Handler)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(self.root / "server.pem", self.root / "server.key")
         server.socket = context.wrap_socket(server.socket, server_side=True)
         self.port = server.server_port
