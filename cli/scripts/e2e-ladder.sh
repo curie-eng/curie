@@ -3743,7 +3743,9 @@ def documents(name):
     if not path.exists():
         return []
     result = []
-    for line in path.read_text(errors="replace").splitlines():
+    # The fileexporter writes JSON and its newline separately. Only the newline
+    # commits a record; leave any trailing export fragment for the next query.
+    for line in path.read_text(errors="replace").split("\n")[:-1]:
         if line.strip():
             result.append(json.loads(line))
     return result
