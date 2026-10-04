@@ -28,8 +28,16 @@ Closes #
 <!-- Required for a patch release PR. Name a run URL that re-verified each
      trigger on a live surface, or an explicit waiver of the form:
      waiver: <reason>
-     The pull request's own CI run URL counts as proof for any ladder rung
-     CI ran on the same tree; do not rerun that rung locally.
+
+     To defer proof to this pull request's own CI, replace this comment with
+     the exact marker below on its own visible line:
+this-pr-ci
+
+     Wait for the CI checks on this pull request's current head to pass before
+     merging. A passing run proves only the ladder rungs CI executes on that
+     head. Include separate live proof or a waiver for any broader surface.
+     This pull request's own CI run URL also counts for those same rungs;
+     do not rerun a rung locally after CI has proved it on the same tree.
      Other pull requests may leave this comment in place. -->
 
 ## Fix pin verification
