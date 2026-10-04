@@ -3105,16 +3105,27 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
     plan
 }
 
-fn gvisor_preflight_job_name_from_render(rendered: &str) -> Result<Option<String>> {
+struct RenderedGvisorPreflight {
+    job_name: String,
+    runtime_class_name: String,
+    creates_runtime_class: bool,
+}
+
+fn gvisor_preflight_from_render(rendered: &str) -> Result<Option<RenderedGvisorPreflight>> {
     let mut found = None;
+    let mut creates_runtime_class = false;
     for document in rendered.split("\n---") {
         let document = document.trim();
         if document.is_empty() {
             continue;
         }
         let value: serde_json::Value = serde_norway::from_str(document)
-            .context("could not parse the rendered gVisor preflight Job")?;
+            .context("could not parse the rendered gVisor preflight")?;
         if value.is_null() {
+            continue;
+        }
+        if value.get("kind").and_then(|kind| kind.as_str()) == Some("RuntimeClass") {
+            creates_runtime_class = true;
             continue;
         }
         if value.get("kind").and_then(|kind| kind.as_str()) != Some("Job") {
@@ -3126,18 +3137,32 @@ fn gvisor_preflight_job_name_from_render(rendered: &str) -> Result<Option<String
             .and_then(|name| name.as_str())
             .filter(|name| !name.is_empty())
             .context("the rendered gVisor preflight Job has no name")?;
-        if found.replace(name.to_string()).is_some() {
+        let runtime_class_name = value
+            .pointer("/spec/template/spec/runtimeClassName")
+            .and_then(|name| name.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .context("the rendered gVisor preflight Job has no runtimeClassName")?
+            .to_string();
+        if found.is_some() {
             bail!("the gVisor preflight template rendered more than one Job");
         }
+        found = Some((name.to_string(), runtime_class_name));
     }
-    Ok(found)
+    Ok(
+        found.map(|(job_name, runtime_class_name)| RenderedGvisorPreflight {
+            job_name,
+            runtime_class_name,
+            creates_runtime_class,
+        }),
+    )
 }
 
 async fn rendered_gvisor_preflight_job(
     chart: &str,
     common: &CommonOpts,
     plan: &UpValuePlan,
-) -> Result<Option<String>> {
+) -> Result<Option<RenderedGvisorPreflight>> {
     let mut args = vec![
         plain("template"),
         plain(&common.release),
@@ -3164,7 +3189,7 @@ async fn rendered_gvisor_preflight_job(
             failure_reason(&err)
         );
     }
-    gvisor_preflight_job_name_from_render(&out)
+    gvisor_preflight_from_render(&out)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3257,6 +3282,72 @@ impl ClusterUpInference {
             )),
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeClassLookup {
+    Present,
+    Absent,
+    Forbidden,
+}
+
+fn runtime_class_read_error(
+    name: &str,
+    detail: impl std::fmt::Display,
+    transient: bool,
+) -> anyhow::Error {
+    let fix = "run `curie cluster status`".to_string();
+    let message = format!("could not inspect RuntimeClass `{name}`: {detail}; {fix}");
+    let error = if transient {
+        crate::exit::CliError::transient(message)
+    } else {
+        crate::exit::CliError::failure(message)
+    };
+    error.with_fix(fix).into()
+}
+
+async fn lookup_runtime_class(name: &str) -> Result<RuntimeClassLookup> {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("runtimeclass"),
+            plain(name),
+            plain("-o"),
+            plain("json"),
+        ],
+    );
+    let (ok, out, err) = run_capture(&cmd).await?;
+    if ok {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(out.trim()) {
+            let found = value
+                .as_object()
+                .and_then(|object| object.get("metadata"))
+                .and_then(|metadata| metadata.as_object())
+                .and_then(|metadata| metadata.get("name"))
+                .and_then(|found| found.as_str());
+            if found == Some(name) {
+                return Ok(RuntimeClassLookup::Present);
+            }
+        }
+    }
+    let text = format!("{err}\n{out}");
+    if text.contains("(NotFound)") {
+        return Ok(RuntimeClassLookup::Absent);
+    }
+    if text.contains("(Forbidden)") {
+        return Ok(RuntimeClassLookup::Forbidden);
+    }
+    let detail = if ok {
+        "kubectl returned invalid JSON"
+    } else {
+        failure_reason(&err)
+    };
+    Err(runtime_class_read_error(
+        name,
+        detail,
+        is_connectivity_failure(&text),
+    ))
 }
 
 fn final_operator_value<'a>(opts: &'a UpOpts, key: &str) -> Option<&'a str> {
@@ -5435,6 +5526,8 @@ async fn run_prepared_up(
         return Ok(ClusterUpOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
     require_on_path("helm")?;
+    // Skipped lookups are not Forbidden: only a refused GET keeps the admission retry.
+    let mut runtime_class_lookup_forbidden = false;
     if detect_facts {
         for inference in reconcile_priority_class_ownership(&opts, &mut value_plan).await? {
             inference.render(ui);
@@ -5459,8 +5552,49 @@ async fn run_prepared_up(
         .cloned()
         .collect();
     cmds = up_commands_with_plan(&opts, &value_plan);
-    let gvisor_preflight_job =
+    // The rendered preflight is the chart's decision: it already applied Helm's
+    // typed values, string truthiness, and this chart's defaults. A copied
+    // predicate would disagree with `--set-string` and with a chart whose
+    // runtimeClassName default is not `gvisor`.
+    let mut gvisor_preflight =
         rendered_gvisor_preflight_job(&opts.chart, &opts.common, &value_plan).await?;
+    if detect_facts {
+        if let Some(preflight) = gvisor_preflight.as_ref() {
+            let name = preflight.runtime_class_name.clone();
+            let creates_runtime_class = preflight.creates_runtime_class;
+            match lookup_runtime_class(&name).await? {
+                RuntimeClassLookup::Present => {}
+                RuntimeClassLookup::Forbidden => {
+                    runtime_class_lookup_forbidden = true;
+                }
+                RuntimeClassLookup::Absent if creates_runtime_class => {}
+                RuntimeClassLookup::Absent => {
+                    if let Some(mode @ ("auto" | "require")) =
+                        final_operator_value(&opts, GVISOR_MODE_KEY)
+                    {
+                        let assignment = format!("{GVISOR_MODE_KEY}={mode}");
+                        let fix = format!(
+                            "remove the explicit `{assignment}` setting and rerun to accept the inferred gVisor posture"
+                        );
+                        return Err(crate::exit::CliError::usage(format!(
+                            "explicit `{assignment}` contradicts the detected RuntimeClass lookup `runtimeclasses.node.k8s.io \"{name}\" not found`; {fix}"
+                        ))
+                        .with_fix(fix)
+                        .into());
+                    }
+                    value_plan.set(GVISOR_MODE_KEY, "off");
+                    ClusterUpInference::GvisorOff.render(ui);
+                    cmds = up_commands_with_plan(&opts, &value_plan);
+                    gvisor_preflight =
+                        rendered_gvisor_preflight_job(&opts.chart, &opts.common, &value_plan)
+                            .await?;
+                }
+            }
+        }
+    }
+    let gvisor_preflight_job = gvisor_preflight
+        .as_ref()
+        .map(|preflight| preflight.job_name.clone());
     let cl = ui.checklist();
     let label = format!("installing release {}", opts.common.release);
     // A failed-only history is not an upgrade target: `helm upgrade --install`
@@ -5496,7 +5630,9 @@ async fn run_prepared_up(
             InstallOutcome::AdmissionRejected(rejection) => {
                 return Err(admission_install_error(rejection, invocation));
             }
-            InstallOutcome::RuntimeClassRejected { rejection, step } if detect_facts => {
+            InstallOutcome::RuntimeClassRejected { rejection, step }
+                if detect_facts && runtime_class_lookup_forbidden =>
+            {
                 if let Some(mode @ ("auto" | "require")) =
                     final_operator_value(&opts, GVISOR_MODE_KEY)
                 {

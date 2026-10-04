@@ -234,6 +234,11 @@ case " $* " in
 esac
 
 if [ "$1" != "get" ] || [ "$2" != "priorityclass" ] || [ -z "$3" ]; then
+    if [ "$1" = "get" ] && [ "$2" = "runtimeclass" ]; then
+        printf '%s\n' 'Error from server (Forbidden): runtimeclasses.node.k8s.io "gvisor" is forbidden: User "system:serviceaccount:example:example" cannot get resource "runtimeclasses" in API group "node.k8s.io" at the cluster scope' >&2
+        exit 1
+    fi
+
     printf 'unexpected kubectl invocation: %s\n' "$*" >&2
     exit 64
 fi

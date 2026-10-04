@@ -433,6 +433,12 @@ case "$verb $object" in
     # Empty stdout with exit 0 is kubectl --ignore-not-found for an absent class.
     :
     ;;
+'get runtimeclass')
+    # A real-model install now GETs the RuntimeClass. Forbidden keeps these
+    # tests on the install path they already assert.
+    printf '%s\n' 'Error from server (Forbidden): runtimeclasses.node.k8s.io "gvisor" is forbidden: User "system:serviceaccount:example:example" cannot get resource "runtimeclasses" in API group "node.k8s.io" at the cluster scope' >&2
+    exit 1
+    ;;
 'get namespace')
     case "$all" in
         *'get namespace parity '*)

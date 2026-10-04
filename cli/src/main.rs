@@ -2669,9 +2669,11 @@ enum ClusterAction {
     /// until their provider or a raw range is explicit. A controller owned by
     /// another Helm release is reused. A healthy unowned controller whose image
     /// matches the chart is reused. An unhealthy or different unowned controller
-    /// stops the install and names the kubectl repair. An exact
-    /// admission result that the gvisor RuntimeClass is absent applies
-    /// security.gvisor.mode=off and retries once. Every inferred value is printed.
+    /// stops the install and names the kubectl repair. A direct GET that
+    /// returns NotFound applies security.gvisor.mode=off before the first
+    /// install and prints the inference. A forbidden lookup still applies that
+    /// override from the exact admission result and retries once. Every
+    /// inferred value is printed.
     Up {
         /// Kubernetes namespace.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]

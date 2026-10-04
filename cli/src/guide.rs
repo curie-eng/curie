@@ -354,8 +354,8 @@ pub fn primer() -> Primer {
                 detail: "When you are asked to get a bundle running, do the plumbing yourself -- source the bundle's dotenv, run `curie local up`, `curie local deploy`, and `curie local comms --slack`, then tear down -- rather than handing the human a shell checklist to copy-paste. Two parts are irreducibly manual and stay with the human: supplying the actual secret VALUES (never type a credential or API key yourself) and creating an external app in a browser to mint its tokens (e.g. the Slack app). Automate everything between. If a credential already lives in the environment or the bundle's own `.env`, use it instead of asking for it to be exported.",
             },
             Landmine {
-                title: "Missing gVisor is inferred only from admission",
-                detail: "A real model install first keeps the gVisor chart default. When admission reports exactly that RuntimeClass gvisor is not found, direct `curie cluster up` shows that attempt as retrying, applies security.gvisor.mode=off, prints the override, and retries once. Other failures remain closed. Explicit auto or require modes contradict the detected result and are errors.",
+                title: "Missing gVisor is inferred from a NotFound lookup, or from admission when that lookup is forbidden",
+                detail: "Direct `curie cluster up` looks up the configured RuntimeClass before the first install. A GET that returns NotFound applies security.gvisor.mode=off before the first install and prints the same inference. When that lookup is Forbidden, the chart default stays, `curie-preflight-gvisor` may report that RuntimeClass gvisor is not found, the attempt shows as retrying, the override is applied, and direct `curie cluster up` retries once. Other failures remain closed. Explicit auto or require modes contradict the detected result and are errors.",
             },
         ],
         recovery: vec![
@@ -365,11 +365,11 @@ pub fn primer() -> Primer {
             },
             Recovery {
                 symptom: "`curie cluster up` fails immediately when `curie-preflight-gvisor` reports `FailedCreate`: `RuntimeClass \"gvisor\" not found`",
-                fix: "Plain `curie cluster up` now infers security.gvisor.mode=off from this exact admission result and retries once. If you explicitly set auto or require, remove that setting to accept the detected posture, or install runsc on the nodes.",
+                fix: "A NotFound lookup already applied security.gvisor.mode=off before the first install. A forbidden lookup still retries once from this exact admission result. If you explicitly set auto or require, remove that setting to accept the detected posture, or install runsc on the nodes.",
             },
             Recovery {
                 symptom: "`curie cluster up` hangs ~2 min then dies with `job curie-preflight-gvisor failed: DeadlineExceeded`",
-                fix: "The Kubernetes Event watch was unavailable, so Helm reported the later deadline. A real-model install on a cluster with no `runsc` RuntimeClass still fails closed. Opt out with `curie cluster up --set security.gvisor.mode=off`, or use `--fake-model`, or install runsc on the nodes.",
+                fix: "The Kubernetes Event watch was unavailable, so Helm reported the later deadline. That case stays fail closed: Curie did not read a RuntimeClass lookup or an admission result from the deadline itself. Opt out with `curie cluster up --set security.gvisor.mode=off`, or use `--fake-model`, or install runsc on the nodes.",
             },
             Recovery {
                 symptom: "\"(no response)\" or an empty reply",
