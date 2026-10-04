@@ -39,6 +39,9 @@ async def require_api_key(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing or invalid API key",
         )
+    from .approval_auth import enforce_console_cookie_origin
+
+    enforce_console_cookie_origin(request)
     from . import crud
 
     async with request.app.state.sessionmaker() as session:

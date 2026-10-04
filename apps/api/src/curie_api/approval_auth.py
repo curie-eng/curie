@@ -168,6 +168,20 @@ def _console_origin_rejected() -> HTTPException:
     )
 
 
+def enforce_console_cookie_origin(request: Request) -> None:
+    """Reject an unsafe cookie-authenticated method whose origin host does not match.
+
+    SameSite=Strict does not stop a same-site sibling form. Safe methods are
+    not checked. The platform-key path must not call this.
+    """
+    if request.method.upper() in _SAFE_ORIGIN_METHODS:
+        return
+    if not _same_console_host(
+        _claimed_console_origin(request), _expected_console_origin(request)
+    ):
+        raise _console_origin_rejected()
+
+
 async def require_approval_principal(
     approval_id: uuid.UUID,
     request: Request,
@@ -202,11 +216,8 @@ async def require_approval_principal(
     if presented == 0:
         raise _unauthorized()
 
-    if has_cookie and request.method.upper() not in _SAFE_ORIGIN_METHODS:
-        if not _same_console_host(
-            _claimed_console_origin(request), _expected_console_origin(request)
-        ):
-            raise _console_origin_rejected()
+    if has_cookie:
+        enforce_console_cookie_origin(request)
 
     if has_adapter:
         assert x_curie_adapter_principal is not None
@@ -296,7 +307,7 @@ def platform_key_or_adapter(
         if x_curie_adapter_principal is None:
             await require_api_key(request, x_api_key)
             return None
-        if x_api_key is not None or request.cookies.get(CONSOLE_SESSION_COOKIE):
+        if x_api_key is not None or CONSOLE_SESSION_COOKIE in request.cookies:
             raise _unauthorized("ambiguous credentials")
         claims = adapter_principal.verify(
             x_curie_adapter_principal, get_settings().api_key, scope=scope

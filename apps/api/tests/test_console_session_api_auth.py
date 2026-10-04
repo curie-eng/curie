@@ -294,3 +294,65 @@ def test_platform_key_wins_over_an_expired_session_without_a_lookup(
         response = client.get("/agents", headers={**auth_headers, **_cookie(token)})
     assert response.status_code == 200, response.text
     assert "console_sessions" not in "\n".join(statements)
+
+
+def test_a_foreign_origin_rejects_a_console_session_mutation(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    headers = _cookie(_exchange(client, auth_headers))
+    headers["Origin"] = "https://evil.example"
+    with _sql(client) as statements:
+        response = client.post(f"/agents/{uuid.uuid4()}/kill", headers=headers)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "console session origin rejected"
+    assert "console_sessions" not in "\n".join(statements)
+
+
+def test_a_matching_origin_lets_a_console_session_reach_kill(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    headers = _cookie(_exchange(client, auth_headers))
+    headers["Origin"] = "https://testserver"
+    response = client.post(f"/agents/{uuid.uuid4()}/kill", headers=headers)
+    assert response.status_code not in (401, 403), response.text
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"] == "agent not found"
+
+
+def test_a_safe_method_skips_the_console_session_origin_check(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    headers = _cookie(_exchange(client, auth_headers))
+    headers["Origin"] = "https://evil.example"
+    response = client.get("/agents", headers=headers)
+    assert response.status_code == 200, response.text
+
+
+def test_the_platform_key_skips_the_console_session_origin_check(
+    client: Any, auth_headers: dict[str, str]
+) -> None:
+    response = client.post(
+        f"/agents/{uuid.uuid4()}/kill",
+        headers={**auth_headers, "Origin": "https://evil.example"},
+    )
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"] == "agent not found"
+
+
+def test_an_empty_session_cookie_plus_an_adapter_header_is_ambiguous(client: Any) -> None:
+    response = client.get(
+        "/approvals",
+        headers={
+            "X-Curie-Adapter-Principal": "not-a-token",
+            **_cookie(""),
+        },
+    )
+    assert response.status_code == 401, response.text
+    assert response.json()["detail"] == "ambiguous credentials"
+
+
+def test_an_empty_session_cookie_is_not_a_session(client: Any) -> None:
+    with _sql(client) as statements:
+        response = client.get("/agents", headers=_cookie(""))
+    _assert_api_key_refusal(response)
+    assert "console_sessions" not in "\n".join(statements)
