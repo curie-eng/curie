@@ -926,6 +926,26 @@ release train branch.
 Bug fixes, security fixes, and anything shared by both lines land on the stable
 `main` line first. Features for the next feature release land on `next`.
 
+For a patch cut whose fixes are still under preparation, use one short-lived
+preparation PR to `main` carrying those fixes, the version bump, and the atlas
+snapshot. Commit all non-version changes first and pin the atlas to that final
+non-version commit. Follow it with the version/snapshot commit, whose paths must
+stay inside `release/atlas.py::version_only_paths` for the release tag. Keep the
+head up to date with `main`; if the base or a non-version change advances,
+regenerate the pin and snapshot and rerun the required checks on the final head.
+Do not require a separate candidate PR or candidate CI round.
+
+The atlas may accept the merge commit across that version-only delta. Current
+tag authorization under
+[ADR 0195](docs/adr/0195-a-version-only-delta-reuses-its-parents-checks.md) still
+excludes the second-parent PR head as inherited CI proof. A combined preparation
+merge therefore needs its own complete required checks on `main` before direct
+tagging. [Draft ADR 0196](docs/adr/0196-combined-preparation-pr-checks.md) proposes
+reusing full green PR-head checks for an up-to-date merge with a version-only or
+empty delta; that path remains blocked until explicit ADR acceptance and
+implementation. The complete procedure is in
+[release verification](docs/release-verification.md#one-preparation-pr-carries-the-fixes-and-version).
+
 To cut a feature release candidate, merge `main` into `next` through a PR, tag
 the release candidate on `next`, and test that candidate extensively. The
 forward merge from `main` into `next` happens at release candidate prep, not
@@ -970,14 +990,19 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
   keyword in a PR that targets `next` never fires on its own. Issues referenced
   by a `next` targeted PR are closed at the `next` into `main` merge, where the
   magic words fire once on the default branch.
-- PR bodies must contain real line breaks. The PR body guard rejects escaped
-  newline sequences because GitHub treats them as text, making closing keywords
-  inert. A patch release PR (title `Prepare the vX.Y.Z release` with Z not 0)
-  must also fill Trigger (issue numbers) and Live proof (a run URL or
-  `waiver: <reason>`); the same guard rejects either section left empty. Run
-  `scripts/check-pr-body.sh <body-file> --changed-files-file <changed-files-json> --open-issues-file <open-issues-json>` before opening or editing a PR
-  (`--title-file` for a release PR). See
-  [`docs/release-verification.md`](docs/release-verification.md#patch-releases-name-their-trigger-and-live-proof).
+
+PR bodies must contain real line breaks. The PR body guard rejects escaped
+newline sequences because GitHub treats them as text, making closing keywords
+inert. A patch release PR (title `Prepare the vX.Y.Z release` with Z not 0)
+must also fill Trigger (issue numbers) and Live proof (a run URL, the exact
+standalone `this-pr-ci` line inside that section, or `waiver: <reason>`);
+the same guard rejects either section left empty. The marker references the
+preparation PR's own CI and proves only the rungs that CI actually ran; a
+required live surface outside that run still needs a run URL or waiver. Run
+`scripts/check-pr-body.sh <body-file> --changed-files-file <changed-files-json> --open-issues-file <open-issues-json>` before opening or editing a PR
+(`--title-file` for a release PR). See
+[`docs/release-verification.md`](docs/release-verification.md#patch-releases-name-their-trigger-and-live-proof).
+
 - **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
   commit messages OR pull request bodies, and never add `Co-Authored-By` lines
   referencing AI.** This applies to the PR body as much as to the commits: many

@@ -216,4 +216,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0191 | [Protected hooks use a separately authorized delivery lane](0191-protected-hook-delivery-authority.md) | Accepted |
 | 0193 | [Cluster up reads a missing RuntimeClass before install](0193-cluster-up-reads-a-missing-runtimeclass-before-install.md) | Accepted |
 | 0195 | [A version-only delta reuses its parent's checks](0195-a-version-only-delta-reuses-its-parents-checks.md) | Accepted |
+| 0196 | [Combined preparation PR checks can prove an unchanged release merge](0196-combined-preparation-pr-checks.md) | Draft |
 <!-- END GENERATED: adr-index -->
