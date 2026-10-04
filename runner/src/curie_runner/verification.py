@@ -12,6 +12,12 @@ Each check is an argv list run without a shell in the mounted checkout, with
 package managers forced offline. A lockfile-pinned install may run first, but
 only when the bundle sets ``lockfile_installs``. Every record must be accepted
 by the api or boot fails before model start.
+
+After the probes each declared check takes one route (#3873). A passed or
+failed check is executable. An unavailable check that declares
+``delegated_to`` is delegated to that required pull request CI check. An
+unavailable check without it is blocked, and any blocked check stops the run
+before the model starts. A ``not_declared`` record takes no route.
 """
 
 from __future__ import annotations
@@ -25,7 +31,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 
@@ -50,6 +56,7 @@ _MAX_PATH_CHARS = 64
 _MAX_ARGV = 16
 _MAX_ARG_CHARS = 128
 _MAX_COMMAND_CHARS = 120
+_MAX_DELEGATED_CHARS = 64
 # The api stores each observation as canonical compact JSON and rejects a note
 # over this many UTF-8 bytes.
 MAX_STORED_OBSERVATION_BYTES = 280
@@ -148,6 +155,7 @@ class VerificationCheck:
     paths: tuple[str, ...]
     command: tuple[str, ...]
     install: tuple[str, ...] | None = None
+    delegated_to: str | None = None
 
 
 @dataclass(frozen=True)
@@ -203,7 +211,10 @@ def _install(raw: object) -> tuple[str, ...]:
 
 
 def stored_observation_bytes(record: dict[str, Any]) -> int:
-    """UTF-8 size of the api's canonical stored note for one observation."""
+    """UTF-8 size of the api's canonical stored note for one observation.
+
+    The api's canonical note omits ``delegated_to`` when it is None.
+    """
 
     stored = {
         key: record.get(key)
@@ -216,17 +227,22 @@ def stored_observation_bytes(record: dict[str, Any]) -> int:
             "blocked_services",
         )
     }
+    if record.get("delegated_to") is not None:
+        stored["delegated_to"] = record["delegated_to"]
     return len(json.dumps(stored, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
 
 def _worst_case_fits(
-    check_id: str, command: tuple[str, ...], install: tuple[str, ...] | None
+    check_id: str,
+    command: tuple[str, ...],
+    install: tuple[str, ...] | None,
+    delegated_to: str | None,
 ) -> bool:
     """Whether an unavailable record with the longest single blocker fits the api."""
 
     blockers = list(KNOWN_BLOCKER_NAMES)
     blockers.extend(_binary_name(argv[0]) for argv in (command, install) if argv is not None)
-    record = {
+    record: dict[str, Any] = {
         "check": check_id,
         "command": shlex.join(command),
         "outcome": "unavailable",
@@ -234,16 +250,36 @@ def _worst_case_fits(
         "missing_binaries": [max(blockers, key=len)],
         "blocked_services": [],
     }
+    if delegated_to is not None:
+        record["delegated_to"] = delegated_to
     return stored_observation_bytes(record) <= MAX_STORED_OBSERVATION_BYTES
+
+
+def _delegated_to(raw: object) -> str:
+    """The required pull request CI check a check delegates to; never echoed."""
+
+    if (
+        not isinstance(raw, str)
+        or not 1 <= len(raw) <= _MAX_DELEGATED_CHARS
+        or raw != raw.strip()
+        or _UNPRINTABLE.search(raw)
+    ):
+        raise ValueError(
+            f"delegated_to must be 1 to {_MAX_DELEGATED_CHARS} printable characters "
+            "without backticks or surrounding spaces"
+        )
+    return raw
 
 
 def _check(raw: object) -> VerificationCheck:
     if (
         not isinstance(raw, dict)
         or not {"id", "paths", "command"} <= set(raw)
-        or set(raw) - {"id", "paths", "command", "install"}
+        or set(raw) - {"id", "paths", "command", "install", "delegated_to"}
     ):
-        raise ValueError("each check needs id, paths and command, and optional install")
+        raise ValueError(
+            "each check needs id, paths and command, and optional install and delegated_to"
+        )
     check_id = raw["id"]
     if not isinstance(check_id, str) or not _CHECK_ID.fullmatch(check_id):
         raise ValueError("check id must match ^[a-z][a-z0-9_]{0,31}$")
@@ -266,12 +302,21 @@ def _check(raw: object) -> VerificationCheck:
     install: tuple[str, ...] | None = None
     if "install" in raw:
         install = _install(raw["install"])
-    if not _worst_case_fits(check_id, command, install):
+    delegated_to: str | None = None
+    if "delegated_to" in raw:
+        delegated_to = _delegated_to(raw["delegated_to"])
+    if not _worst_case_fits(check_id, command, install, delegated_to):
         raise ValueError(
             "check id and command are too long for an unavailable report of "
             f"{MAX_STORED_OBSERVATION_BYTES} bytes"
         )
-    return VerificationCheck(id=check_id, paths=tuple(paths), command=command, install=install)
+    return VerificationCheck(
+        id=check_id,
+        paths=tuple(paths),
+        command=command,
+        install=install,
+        delegated_to=delegated_to,
+    )
 
 
 def _read(path: Path) -> object:
@@ -562,16 +607,18 @@ async def preflight_workspace_verification(
     for check in declaration.checks:
         result, installed = await _verify(check, workspace, declaration.lockfile_installs)
         passed = result.outcome == "passed"
-        record: dict[str, Any] = _fit_stored_size(
-            {
-                "check": check.id,
-                "command": shlex.join(check.command),
-                "outcome": result.outcome,
-                "exit_status": result.exit_status,
-                "missing_binaries": [] if passed else list(result.missing),
-                "blocked_services": [] if passed else list(result.blocked),
-            }
-        )
+        observed: dict[str, Any] = {
+            "check": check.id,
+            "command": shlex.join(check.command),
+            "outcome": result.outcome,
+            "exit_status": result.exit_status,
+            "missing_binaries": [] if passed else list(result.missing),
+            "blocked_services": [] if passed else list(result.blocked),
+        }
+        # Sent only when declared, so an undelegated body is unchanged.
+        if check.delegated_to is not None:
+            observed["delegated_to"] = check.delegated_to
+        record = _fit_stored_size(observed)
         status = await _post(client, record)
         entry: dict[str, Any] = {
             "id": check.id,
@@ -584,8 +631,30 @@ async def preflight_workspace_verification(
             "missing_binaries": record["missing_binaries"],
             "blocked_services": record["blocked_services"],
             "report_status": status,
+            "delegated_to": check.delegated_to,
         }
         if result.failure_reason is not None:
             entry["failure_reason"] = result.failure_reason
         summary["checks"].append(entry)
     return summary
+
+
+def preflight_route(
+    entry: dict[str, Any],
+) -> Literal["executable", "delegated", "blocked"] | None:
+    """The route of one summary entry: run here, delegated to CI, or blocked."""
+
+    outcome = entry.get("outcome")
+    if outcome in ("passed", "failed"):
+        return "executable"
+    if outcome == "unavailable":
+        return "delegated" if entry.get("delegated_to") is not None else "blocked"
+    return None
+
+
+def blocked_checks(summary: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The blocked entries of a preflight summary, in declaration order."""
+
+    if summary is None:
+        return []
+    return [entry for entry in summary["checks"] if preflight_route(entry) == "blocked"]

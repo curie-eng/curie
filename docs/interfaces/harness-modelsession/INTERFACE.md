@@ -23,9 +23,9 @@ epic_note: folds into
 Inside the runner the model harness is reached through one in-process port: the
 `ModelSession` Protocol. Everything above it (ACI translation, budget, side-effect
 flagging, NDJSON, the HTTP layer) is written against the Protocol. The port itself is
-CLEAN, but the SDK is not yet confined to one module: sixteen runner modules still import
+CLEAN, but the SDK is not yet confined to one module: seventeen runner modules still import
 `claude_agent_sdk` today (`check.py`, `session.py`, `hooks.py`, `adapter.py`, `mcp_argv.py`, `fake.py`,
-`approval.py`, `translate.py`, `plugin.py`, `state.py`, `progress.py`, `turn_progress.py`, `issue_read.py`, `usage_report.py`, `tool_access.py`, `__main__.py`, whose boot path
+`preflight_blocked.py`, `approval.py`, `translate.py`, `plugin.py`, `state.py`, `progress.py`, `turn_progress.py`, `issue_read.py`, `usage_report.py`, `tool_access.py`, `__main__.py`, whose boot path
 assembles the approval gate's `PreToolUse` hook matcher alongside the bundle's), and the
 value that crosses the port is currently the raw SDK message union rather than a
 runner-owned neutral type. The
@@ -120,6 +120,10 @@ Two, both in `runner/src/curie_runner/`:
   harness: `conformance_producer` (`runner/src/curie_runner/conformance.py::conformance_producer`) drives
   a real `SessionRunner` over the fake (`runner/src/curie_runner/conformance.py::_build_runner`), so the ACI conformance gate
   validates the actual translation/final plumbing, not a canned stream.
+- **Blocked preflight:** `PreflightBlockedSession`
+  (`runner/src/curie_runner/preflight_blocked.py::PreflightBlockedSession`) stands in for
+  the model session when a declared verification check is blocked (#3873). It answers
+  every turn offline with one `Could not complete:` message and a zero-token result.
 
 At the package layer there is exactly one registered contribution, the built-in Claude
 harness (`runner/src/curie_runner/harness/claude.py::CLAUDE_CONTRIBUTION`), which
@@ -133,7 +137,7 @@ The port is CLEAN as a code interface but leaks harness shape where the SDK is n
 walled off, called out in vision-doc Job 1:
 
 - **SDK-shaped message payload.** The value crossing the port is the concrete
-  `claude_agent_sdk` message union, and `claude_agent_sdk` is imported across sixteen
+  `claude_agent_sdk` message union, and `claude_agent_sdk` is imported across seventeen
   runner modules rather than one harness package. The runner-owned `TurnEvent` model that
   was to draw the neutral line is withdrawn (issue #307 closed as superseded, its PR #315
   closed unmerged and kept only as mining material for the package-shaped redesign);

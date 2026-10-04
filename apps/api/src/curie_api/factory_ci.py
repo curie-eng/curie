@@ -10,6 +10,11 @@ decides with the pure ``decide``:
 - Python changes require valid preflight evidence; when the repository has a
   required Python CI policy (``GITHUB_FACTORY_PYTHON_CI``, #3617), they must
   also fall under its paths and pass its GitHub Actions check;
+- a declared check that could not run in the sandbox and delegates its proof
+  to a named required check (``delegated_to``, #3873) holds the request until
+  that check run or commit status has run and passed. Missing waits until the
+  CI deadline and is then unverified; skipped or neutral is unverified; a
+  failure takes the failing path below. It is never green or no CI;
 - a failure of GitHub Actions jobs is rerun once at that same head before
   anyone is asked to fix it (#3741). The rerun does not consume a round. Only
   a failure that is still present after the rerun, or a rerun GitHub refuses,
@@ -341,13 +346,16 @@ def _metadata_revision_detail(
     fresh_contexts = {item.get("context") for item in fresh.statuses}
     return replace(
         detail,
-        check_runs=fresh.check_runs + [
-            run for run in detail.check_runs
-            if run.get("name") not in fresh_names
-            and run.get("name") not in metadata_ci.checks
+        check_runs=fresh.check_runs
+        + [
+            run
+            for run in detail.check_runs
+            if run.get("name") not in fresh_names and run.get("name") not in metadata_ci.checks
         ],
-        statuses=fresh.statuses + [
-            item for item in detail.statuses
+        statuses=fresh.statuses
+        + [
+            item
+            for item in detail.statuses
             if item.get("context") not in fresh_contexts
             and item.get("context") not in metadata_ci.statuses
         ],
@@ -366,12 +374,16 @@ def decide(
     metadata_ci: MetadataCiPolicy | None,
     prior_round_had_checks: bool = False,
     fresh_after: datetime | None = None,
+    delegated_checks: Sequence[str] = (),
 ) -> Verdict:
     """The CI verdict for one observation. Pure: time is an argument.
 
     ``python_ci`` is the repository's required Python CI; ``None`` judges a
     Python change on the repository's own checks like any other change.
     ``metadata_ci`` declares which checks a metadata revision must refresh.
+    ``delegated_checks`` names required checks that unavailable sandbox
+    verification delegated to; each must appear as a check run ``name`` (any
+    app) or a commit status ``context`` and pass.
     """
 
     unselected_path = _unselected_python_path(changed_paths, python_ci)
@@ -407,8 +419,7 @@ def decide(
         )
         effective = _metadata_revision_detail(detail, fresh_after, metadata_ci)
         fresh_failure = any(
-            run.get("status") == "completed"
-            and run.get("conclusion") in _FAILING_CONCLUSIONS
+            run.get("status") == "completed" and run.get("conclusion") in _FAILING_CONCLUSIONS
             for run in fresh_runs
         ) or any(item.get("state") in _FAILING_STATES for item in fresh_statuses)
         unchanged_failure = any(
@@ -417,8 +428,7 @@ def decide(
             and run.get("conclusion") in _FAILING_CONCLUSIONS
             for run in effective.check_runs
         ) or any(
-            item.get("context") not in metadata_ci.statuses
-            and item.get("state") in _FAILING_STATES
+            item.get("context") not in metadata_ci.statuses and item.get("state") in _FAILING_STATES
             for item in effective.statuses
         )
         if (
@@ -443,20 +453,30 @@ def decide(
         and run["app"].get("slug") == "github-actions"
     ]
     if requires_python_ci and any(
-        run.get("status") == "completed"
-        and run.get("conclusion") in {"skipped", "neutral"}
+        run.get("status") == "completed" and run.get("conclusion") in {"skipped", "neutral"}
         for run in required_python_runs
     ):
         conclusion = next(
             run.get("conclusion")
             for run in required_python_runs
-            if run.get("status") == "completed"
-            and run.get("conclusion") in {"skipped", "neutral"}
+            if run.get("status") == "completed" and run.get("conclusion") in {"skipped", "neutral"}
         )
         return Verdict(
             kind="unverified",
             reason=f"required_python_ci_{conclusion}",
         )
+
+    delegated_runs = [run for run in check_runs if run.get("name") in delegated_checks]
+    delegated_unproven = next(
+        (
+            run.get("conclusion")
+            for run in delegated_runs
+            if run.get("status") == "completed" and run.get("conclusion") in {"skipped", "neutral"}
+        ),
+        None,
+    )
+    if delegated_unproven is not None:
+        return Verdict(kind="unverified", reason=f"delegated_ci_{delegated_unproven}")
 
     failing: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
@@ -478,8 +498,7 @@ def decide(
     if failing:
         # Fail fast: the whole budget is what remains of the execution deadline.
         required_python_failed = requires_python_ci and any(
-            run.get("status") == "completed"
-            and run.get("conclusion") in _FAILING_CONCLUSIONS
+            run.get("status") == "completed" and run.get("conclusion") in _FAILING_CONCLUSIONS
             for run in required_python_runs
         )
         return Verdict(
@@ -511,6 +530,16 @@ def decide(
             "required_python_ci_unrelated" if has_unrelated_checks else "required_python_ci_missing"
         )
         return Verdict(kind="unverified", reason=reason, pending=pending)
+
+    observed_names = {run.get("name") for run in delegated_runs} | {
+        item.get("context") for item in statuses
+    }
+    if any(check not in observed_names for check in delegated_checks):
+        return Verdict(
+            kind="unverified" if expired else "pending",
+            pending=pending,
+            reason="delegated_ci_missing",
+        )
 
     if not check_runs and not statuses:
         in_grace = now < published_at + timedelta(seconds=CI_GRACE_SECONDS)
@@ -552,8 +581,8 @@ def _clean(value: Any, limit: int) -> str | None:
 
 def _job_log_tail(value: str) -> str:
     redacted = redact_text(value)
-    lines = redacted.splitlines()[-workitem_outcomes.CI_JOB_LOG_MAX_LINES:]
-    return "\n".join(lines)[-workitem_outcomes.CI_JOB_LOG_MAX_CHARS:]
+    lines = redacted.splitlines()[-workitem_outcomes.CI_JOB_LOG_MAX_LINES :]
+    return "\n".join(lines)[-workitem_outcomes.CI_JOB_LOG_MAX_CHARS :]
 
 
 def continuation_text(
@@ -835,17 +864,16 @@ async def gate(
     changed_paths = _publication_changed_paths(facts.publications)
     changed_python_paths = _python_paths(changed_paths)
     python_ci = python_ci_policy(settings, lineage.repo_full_name or work_item.repo_full_name)
-    metadata_ci = metadata_ci_policy(
-        settings, lineage.repo_full_name or work_item.repo_full_name
-    )
+    metadata_ci = metadata_ci_policy(settings, lineage.repo_full_name or work_item.repo_full_name)
     unselected_path = _unselected_python_path(changed_paths, python_ci)
     preflight_verdict: Verdict | None = None
+    delegated_checks: tuple[str, ...] = ()
     if unselected_path is not None:
         preflight_verdict = Verdict(
             kind="unverified",
             reason=f"required_python_ci_unselected: {unselected_path}",
         )
-    elif changed_python_paths:
+    else:
         verifications: list[factory_progress.VerificationObservation]
         try:
             async with sessionmaker() as session:
@@ -854,22 +882,31 @@ async def gate(
                 )
                 await session.rollback()
         except ValueError:
+            # Unreadable evidence could hide a delegated check: fail closed.
             preflight_verdict = Verdict(
-                kind="unverified", reason="python_preflight_unreadable"
+                kind="unverified",
+                reason=(
+                    "python_preflight_unreadable"
+                    if changed_python_paths
+                    else "preflight_unreadable"
+                ),
             )
         else:
-            failed = factory_progress.failed_verification(verifications)
-            if not verifications:
-                preflight_verdict = Verdict(
-                    kind="unverified", reason="python_preflight_missing"
+            delegated_checks = tuple(
+                dict.fromkeys(
+                    observation.delegated_to
+                    for observation in verifications
+                    if observation.delegated_to is not None
+                    and factory_progress.verification_route(observation) == "required_ci"
                 )
-            elif failed is not None:
+            )
+            failed = factory_progress.failed_verification(verifications)
+            if changed_python_paths and not verifications:
+                preflight_verdict = Verdict(kind="unverified", reason="python_preflight_missing")
+            elif changed_python_paths and failed is not None:
                 preflight_verdict = Verdict(
                     kind="unverified",
-                    reason=(
-                        "python_preflight_failed_exit_status_"
-                        f"{failed.exit_status}"
-                    ),
+                    reason=(f"python_preflight_failed_exit_status_{failed.exit_status}"),
                 )
 
     detail: CiDetail | None = None
@@ -901,16 +938,12 @@ async def gate(
                 metadata_ci=metadata_ci,
                 prior_round_had_checks=round_ > 1,
                 fresh_after=fresh_after,
+                delegated_checks=delegated_checks,
             )
     if verdict.kind == "pending":
         next_poll[request.id] = now + timedelta(seconds=CI_POLL_SECONDS)
         return "waiting"
-    if (
-        verdict.kind == "failing"
-        and detail is not None
-        and detail.state == "observed"
-        and head_sha
-    ):
+    if verdict.kind == "failing" and detail is not None and detail.state == "observed" and head_sha:
         decision = await _consider_flake_rerun(
             sessionmaker,
             valkey,
@@ -1021,9 +1054,7 @@ return 0
 """
 
 
-def _ci_deadline(
-    published_at: datetime, request: ExecutionRequest, settings: Settings
-) -> datetime:
+def _ci_deadline(published_at: datetime, request: ExecutionRequest, settings: Settings) -> datetime:
     assert request.execution_deadline is not None
     return min(
         published_at + timedelta(seconds=settings.github_factory_ci_wait_s),
@@ -1186,9 +1217,7 @@ async def _lookup_run_id(
     https://docs.github.com/en/rest/actions/workflow-jobs#get-a-job-for-a-workflow-run
     """
 
-    sent = await _github_send(
-        client, "GET", f"{base}/actions/jobs/{job_id}", headers, timeout
-    )
+    sent = await _github_send(client, "GET", f"{base}/actions/jobs/{job_id}", headers, timeout)
     if isinstance(sent, _ActionsRerun):
         return sent
     refused = _status_rerun(sent.status_code, ok=200)
@@ -1256,9 +1285,7 @@ async def _post_missing_runs(
     head_sha = lineage.head_sha
     if not isinstance(head_sha, str) or not workitem_outcomes._SHA_RE.fullmatch(head_sha):
         return _ActionsRerun("refused", "no_head_sha")
-    minted, refused = await workitem_outcomes._mint_ci_token(
-        lineage, work_item, settings, head_sha
-    )
+    minted, refused = await workitem_outcomes._mint_ci_token(lineage, work_item, settings, head_sha)
     if refused is not None:
         reason = refused.reason or "github_error"
         if reason in {"timeout", "observation_busy", "github_rate_limited", "github_error"}:

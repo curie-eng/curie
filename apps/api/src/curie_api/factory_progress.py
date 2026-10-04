@@ -9,6 +9,7 @@ the pure phase view the status comment and the SVG card render from.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ VERIFICATION_PREFLIGHT_PHASE = "verification_preflight"
 VERIFICATION_CHECK_PATTERN = r"^[a-z][a-z0-9_]{0,31}$"
 VERIFICATION_CHECK_LIMIT = 4
 PYTHON_CHECK_ID = "python"
+_DELEGATED_FORBIDDEN = re.compile(r"[\x00-\x1f\x7f`]")
 
 
 class _Strict(BaseModel):
@@ -144,7 +146,9 @@ class VerificationObservation(_Strict):
     ``check`` is the declared check id and ``command`` the exact command the
     runner ran for it. ``not_declared`` records that neither the bundle nor the
     repository declared a check, so no command ran: its check, command and
-    exit_status are null and it carries no blockers.
+    exit_status are null and it carries no blockers. ``delegated_to`` optionally
+    names the required CI check that stands in for a declared check; it is
+    never valid on ``not_declared``.
     """
 
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -155,6 +159,18 @@ class VerificationObservation(_Strict):
     exit_status: int | None = Field(ge=-255, le=255)
     missing_binaries: list[str] = Field(max_length=8)
     blocked_services: list[str] = Field(max_length=8)
+    delegated_to: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("delegated_to")
+    @classmethod
+    def _delegated_to_printable(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value != value.strip() or _DELEGATED_FORBIDDEN.search(value):
+            raise ValueError(
+                "delegated_to must be printable characters without backticks or surrounding spaces"
+            )
+        return value
 
     @field_validator("command")
     @classmethod
@@ -165,16 +181,12 @@ class VerificationObservation(_Strict):
 
     @field_validator("missing_binaries", "blocked_services")
     @classmethod
-    def _unique_nonblank_names(
-        cls, values: list[str], info: ValidationInfo
-    ) -> list[str]:
+    def _unique_nonblank_names(cls, values: list[str], info: ValidationInfo) -> list[str]:
         normalized: list[str] = []
         for value in values:
             name = value.strip()
             if not name or len(name) > 64:
-                raise ValueError(
-                    f"{info.field_name} entries must be 1 to 64 characters"
-                )
+                raise ValueError(f"{info.field_name} entries must be 1 to 64 characters")
             normalized.append(name)
         if len(set(normalized)) != len(normalized):
             raise ValueError(f"{info.field_name} entries must be unique")
@@ -189,9 +201,11 @@ class VerificationObservation(_Strict):
                 or self.command is not None
                 or self.exit_status is not None
                 or has_blocker
+                or self.delegated_to is not None
             ):
                 raise ValueError(
-                    "not_declared requires a null check, command and exit_status and no blockers"
+                    "not_declared requires a null check, command and exit_status, "
+                    "no blockers and no delegated_to"
                 )
         elif self.check is None or self.command is None:
             raise ValueError(f"{self.outcome} requires a declared check and its command")
@@ -203,16 +217,35 @@ class VerificationObservation(_Strict):
                 raise ValueError("passed requires exit_status 0 and no blockers")
         elif self.exit_status in (None, 0):
             raise ValueError("failed requires a nonzero exit_status")
-        note = json.dumps(self.model_dump(), sort_keys=True, separators=(",", ":"))
-        if len(note.encode("utf-8")) > 280:
+        if len(verification_observation_note(self).encode("utf-8")) > 280:
             raise ValueError("verification observation exceeds the 280-byte storage limit")
         return self
 
 
 def verification_observation_note(observation: VerificationObservation) -> str:
-    """Serialize a validated observation into its compact, deterministic note."""
+    """Serialize a validated observation into its compact, deterministic note.
 
-    return json.dumps(observation.model_dump(), sort_keys=True, separators=(",", ":"))
+    A ``None`` ``delegated_to`` is omitted: that is the canonical form, so every
+    note stored before the field existed stays canonical.
+    """
+
+    record = observation.model_dump()
+    if record["delegated_to"] is None:
+        del record["delegated_to"]
+    return json.dumps(record, sort_keys=True, separators=(",", ":"))
+
+
+def verification_route(
+    observation: VerificationObservation,
+) -> Literal["sandbox", "required_ci", "blocked"] | None:
+    """Where an observed check is proven: the sandbox, the required CI check it
+    delegates to, or nowhere yet. ``None`` when no check was declared."""
+
+    if observation.outcome in ("passed", "failed"):
+        return "sandbox"
+    if observation.outcome == "unavailable":
+        return "required_ci" if observation.delegated_to is not None else "blocked"
+    return None
 
 
 @dataclass(frozen=True)
@@ -574,9 +607,7 @@ def phase_view(
         else [(phase_id, label, (phase_id,)) for phase_id, label in phases]
     )
     stage_by_phase = {
-        phase_id: stage_id
-        for stage_id, _label, phase_ids in stage_specs
-        for phase_id in phase_ids
+        phase_id: stage_id for stage_id, _label, phase_ids in stage_specs for phase_id in phase_ids
     }
     ordered = sorted(reports, key=lambda report: report.id or 0)
     completed = status == "completed"
@@ -649,8 +680,7 @@ def phase_view(
             active = active and latest_ci <= latest_diff_review
         if staged and review == WAIT_CI_PHASE:
             active = status == "running" and (
-                current == review
-                or (current == start and latest_ci > latest_diff_review)
+                current == review or (current == start and latest_ci > latest_diff_review)
             )
         if active:
             round_label = f"round {loop_round} of {cap}"

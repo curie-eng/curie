@@ -905,6 +905,170 @@ def test_model_progress_cannot_spoof_the_reserved_verification_phase(
     assert _reports(request_id) == []
 
 
+# --- 5b: delegated_to and the verification route (#3873) -----------------------------------
+
+DELEGATED: dict[str, Any] = {
+    "check": "integration",
+    "command": "make integration",
+    "outcome": "unavailable",
+    "exit_status": None,
+    "missing_binaries": [],
+    "blocked_services": ["postgres"],
+    "delegated_to": "integration-tests",
+}
+UNDELEGATED: dict[str, Any] = {k: v for k, v in DELEGATED.items() if k != "delegated_to"}
+
+
+def _read_observations(request_id: uuid.UUID) -> Any:
+    """Run the real reader in a fresh session; returns its list or raises its error."""
+
+    import asyncio
+
+    from curie_api.factory_progress import read_verification_observations
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+    async def go() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                return await read_verification_observations(session, request_id)
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(go())
+
+
+def test_a_delegated_unavailable_check_is_stored_canonically_and_routes_to_required_ci(
+    admitted: Any,  # noqa: F811
+) -> None:
+    from curie_api.factory_progress import verification_route
+
+    client, github, _sink = admitted
+    number = 9731
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+
+    response = verification(client, request_id, DELEGATED)
+
+    assert response.status_code == 201, response.text
+    expected_note = json.dumps(DELEGATED, sort_keys=True, separators=(",", ":"))
+    assert '"delegated_to":"integration-tests"' in expected_note
+    assert len(expected_note.encode("utf-8")) <= 280
+    assert _reports(request_id) == [
+        {"phase": "verification_preflight", "note": expected_note, "loop_round": None}
+    ]
+    (observation,) = _read_observations(request_id)
+    assert observation.delegated_to == "integration-tests"
+    assert verification_route(observation) == "required_ci"
+
+
+def test_an_undelegated_note_omits_the_key_and_a_null_key_is_not_canonical(
+    admitted: Any,  # noqa: F811
+) -> None:
+    from curie_api.factory_progress import verification_route
+
+    client, github, _sink = admitted
+    number = 9732
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+
+    response = verification(client, request_id, UNDELEGATED)
+
+    assert response.status_code == 201, response.text
+    (stored,) = _reports(request_id)
+    assert stored["note"] == json.dumps(UNDELEGATED, sort_keys=True, separators=(",", ":"))
+    assert "delegated_to" not in stored["note"]
+    (observation,) = _read_observations(request_id)
+    assert observation.delegated_to is None
+    assert verification_route(observation) == "blocked"
+
+    # A local import: test_factory_status_comment imports this module at load time.
+    from test_factory_status_comment import _execute
+
+    noncanonical = json.dumps(
+        {**UNDELEGATED, "delegated_to": None}, sort_keys=True, separators=(",", ":")
+    )
+    _execute(
+        "DELETE FROM curie.execution_request_phase_reports WHERE execution_request_id = :id",
+        {"id": request_id},
+    )
+    _execute(
+        "INSERT INTO curie.execution_request_phase_reports "
+        "(execution_request_id, phase, note) VALUES (:id, 'verification_preflight', :note)",
+        {"id": request_id, "note": noncanonical},
+    )
+    with pytest.raises(ValueError, match="not canonical"):
+        _read_observations(request_id)
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        {**NOT_DECLARED, "delegated_to": "integration-tests"},
+        {**DELEGATED, "delegated_to": "x" * 65},
+        {**DELEGATED, "delegated_to": "integration`tests"},
+        {**DELEGATED, "delegated_to": " integration-tests"},
+        {**DELEGATED, "delegated_to": "integration-tests "},
+        {**DELEGATED, "delegated_to": ""},
+        {**DELEGATED, "delegated_to": "integration\ntests"},
+    ],
+    ids=[
+        "not-declared",
+        "65-characters",
+        "backtick",
+        "leading-space",
+        "trailing-space",
+        "empty",
+        "control-character",
+    ],
+)
+def test_a_bad_delegated_to_is_422_and_stores_nothing(
+    admitted: Any, observation: dict[str, Any]  # noqa: F811
+) -> None:
+    client, github, _sink = admitted
+    number = 9734
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+
+    response = verification(client, request_id, observation)
+
+    assert response.status_code == 422, response.text
+    assert _reports(request_id) == []
+
+
+def test_a_64_character_delegated_to_is_accepted(admitted: Any) -> None:  # noqa: F811
+    client, github, _sink = admitted
+    number = 9735
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+
+    response = verification(client, request_id, {**DELEGATED, "delegated_to": "x" * 64})
+
+    assert response.status_code == 201, response.text
+    (observation,) = _read_observations(request_id)
+    assert observation.delegated_to == "x" * 64
+
+
+@pytest.mark.parametrize(
+    ("observation", "route"),
+    [
+        (_declared("python", PYTHON_COMMAND), "sandbox"),
+        (
+            {**_declared("python", PYTHON_COMMAND), "outcome": "failed", "exit_status": 1},
+            "sandbox",
+        ),
+        (DELEGATED, "required_ci"),
+        (UNDELEGATED, "blocked"),
+        (NOT_DECLARED, None),
+    ],
+    ids=["passed", "failed", "unavailable-delegated", "unavailable-undelegated", "not-declared"],
+)
+def test_verification_route_table(observation: dict[str, Any], route: str | None) -> None:
+    from curie_api.factory_progress import VerificationObservation, verification_route
+
+    assert verification_route(VerificationObservation.model_validate(observation)) == route
+
+
 # --- 6 and 7: declaration pinning and the report limit -----------------------------------
 
 
