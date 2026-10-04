@@ -139,16 +139,86 @@ def _tokens(source: str, *, lua: bool = False) -> list[_Token]:
 
 def _lua_producers(source: str) -> list[int]:
     tokens = _tokens(source, lua=True)
-    return [
-        token.offset
-        for index, token in enumerate(tokens[:-4])
-        if token.value == "redis"
-        and tokens[index + 1].value == "."
-        and tokens[index + 2].value in {"call", "pcall"}
-        and tokens[index + 3].value == "("
-        and tokens[index + 4].kind == "string"
-        and tokens[index + 4].value.upper() == "XADD"
-    ]
+    producers: list[int] = []
+    for index, token in enumerate(tokens[:-3]):
+        if (
+            token.value != "redis"
+            or tokens[index + 1].value != "."
+            or tokens[index + 2].value not in {"call", "pcall"}
+        ):
+            continue
+        argument = index + 3
+        if tokens[argument].value == "(":
+            argument += 1
+        if (
+            argument < len(tokens)
+            and tokens[argument].kind == "string"
+            and tokens[argument].value.upper() == "XADD"
+        ):
+            producers.append(token.offset)
+    return producers
+
+
+def _expression_path(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _expression_path(node.value)
+        if parent is not None:
+            return f"{parent}.{node.attr}"
+    return None
+
+
+def _writer_reference(node: ast.expr, aliases: set[str]) -> bool:
+    if isinstance(node, ast.Attribute) and node.attr.lower() == "xadd":
+        return True
+    if _expression_path(node) in aliases:
+        return True
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+        and isinstance(node.args[1].value, str)
+        and node.args[1].value.lower() == "xadd"
+    )
+
+
+def _assembled_string(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _assembled_string(node.left), _assembled_string(node.right)
+        if left is not None and right is not None:
+            return left + right
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                parts.append(part.value)
+            elif isinstance(part, ast.FormattedValue):
+                value = _assembled_string(part.value)
+                if value is None:
+                    value = "__wire_dynamic__"
+                elif part.conversion == ord("r"):
+                    value = repr(value)
+                elif part.conversion == ord("a"):
+                    value = ascii(value)
+                if part.format_spec is not None:
+                    specification = _assembled_string(part.format_spec)
+                    if specification is None:
+                        value = "__wire_dynamic__"
+                    else:
+                        try:
+                            value = format(value, specification)
+                        except ValueError:
+                            value = "__wire_dynamic__"
+                parts.append(value)
+            else:
+                return None
+        return "".join(parts)
+    return None
 
 
 class _PythonSites(ast.NodeVisitor):
@@ -178,6 +248,34 @@ class _PythonSites(ast.NodeVisitor):
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.scopes.append(node.name)
         self.aliases.append(set(self.aliases[-1]))
+        # A bound writer assigned on self can be called by another method.
+        # Gather these class attributes before visiting either method's calls.
+        for method in node.body:
+            if isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef):
+                method_aliases = set(self.aliases[-1])
+                assignments = sorted(
+                    (
+                        child
+                        for child in ast.walk(method)
+                        if isinstance(child, ast.Assign | ast.AnnAssign)
+                    ),
+                    key=lambda child: (child.lineno, child.col_offset),
+                )
+                for assignment in assignments:
+                    if assignment.value is None:
+                        continue
+                    targets = (
+                        assignment.targets
+                        if isinstance(assignment, ast.Assign)
+                        else [assignment.target]
+                    )
+                    if _writer_reference(assignment.value, method_aliases):
+                        for target in targets:
+                            name = _expression_path(target)
+                            if name is not None:
+                                method_aliases.add(name)
+                                if name.startswith("self."):
+                                    self.aliases[-1].add(name)
         self._body(node)
         self.aliases.pop()
         self.scopes.pop()
@@ -197,50 +295,99 @@ class _PythonSites(ast.NodeVisitor):
         self.scopes.pop()
 
     def visit_Call(self, node: ast.Call) -> None:
-        if (
-            isinstance(node.func, ast.Attribute) and node.func.attr.lower() == "xadd"
-        ) or (isinstance(node.func, ast.Name) and node.func.id in self.aliases[-1]):
+        if _writer_reference(node.func, self.aliases[-1]):
             self.producers.append(((node.lineno, node.col_offset, 0), self.scope, "python"))
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.generic_visit(node)
-        writer = (
-            isinstance(node.value, ast.Attribute) and node.value.attr.lower() == "xadd"
-        ) or (isinstance(node.value, ast.Name) and node.value.id in self.aliases[-1])
+        writer = _writer_reference(node.value, self.aliases[-1])
         for target in node.targets:
-            if isinstance(target, ast.Name):
+            name = _expression_path(target)
+            if name is not None:
                 if writer:
-                    self.aliases[-1].add(target.id)
+                    self.aliases[-1].add(name)
                 else:
-                    self.aliases[-1].discard(target.id)
+                    self.aliases[-1].discard(name)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is None:
+            return
+        self.visit(node.value)
+        name = _expression_path(node.target)
+        if name is not None:
+            if _writer_reference(node.value, self.aliases[-1]):
+                self.aliases[-1].add(name)
+            else:
+                self.aliases[-1].discard(name)
+
+    def _string(self, node: ast.expr, value: str, evidence: str) -> None:
+        if value.startswith(_KEY_PREFIX):
+            self.literals.append(((node.lineno, node.col_offset, 0), self.scope, evidence))
+        if "redis" in value and "XADD" in value.upper():
+            for offset in _lua_producers(value):
+                self.producers.append(((node.lineno, node.col_offset, offset), self.scope, "lua"))
 
     def visit_Constant(self, node: ast.Constant) -> None:
         if not isinstance(node.value, str) or id(node) in self.docstrings:
             return
-        if node.value.startswith(_KEY_PREFIX):
-            self.literals.append(((node.lineno, node.col_offset, 0), self.scope, node.value))
-        # Lua calls inside a Python string are writers, but comments and quoted Lua
-        # examples are not executable call sites.
-        if "redis" in node.value and "XADD" in node.value.upper():
-            for offset in _lua_producers(node.value):
-                self.producers.append(((node.lineno, node.col_offset, offset), self.scope, "lua"))
+        self._string(node, node.value, node.value)
+
+    def _dynamic_parts(self, node: ast.expr) -> None:
+        if isinstance(node, ast.JoinedStr):
+            for part in node.values:
+                if isinstance(part, ast.FormattedValue):
+                    self.visit(part.value)
+        elif isinstance(node, ast.BinOp):
+            self._dynamic_parts(node.left)
+            self._dynamic_parts(node.right)
+        elif not isinstance(node, ast.Constant):
+            self.visit(node)
+
+    def visit_BinOp(self, node: ast.BinOp) -> None:
+        assembled = _assembled_string(node)
+        if assembled is None:
+            self.generic_visit(node)
+        else:
+            self._string(node, assembled, ast.unparse(node))
+            self._dynamic_parts(node)
 
     def visit_JoinedStr(self, node: ast.JoinedStr) -> None:
-        first = node.values[0] if node.values else None
-        if isinstance(first, ast.Constant) and isinstance(first.value, str):
-            if first.value.startswith(_KEY_PREFIX):
-                self.literals.append(
-                    ((node.lineno, node.col_offset, 0), self.scope, ast.unparse(node))
-                )
-        # Literal portions belong to this one fstring. Only interpolation
-        # expressions can contain independent literal or producer occurrences.
-        for value in node.values:
-            if isinstance(value, ast.FormattedValue):
-                self.visit(value.value)
+        assembled = _assembled_string(node)
+        if assembled is not None:
+            self._string(node, assembled, ast.unparse(node))
+        self._dynamic_parts(node)
 
 
-def _rust_sites(source: str) -> tuple[
+def _rust_literal(tokens: list[_Token], index: int) -> tuple[str, int] | None:
+    if tokens[index].kind == "string":
+        return tokens[index].value, index + 1
+    if (
+        tokens[index].value != "concat"
+        or index + 2 >= len(tokens)
+        or [token.value for token in tokens[index + 1 : index + 3]] != ["!", "("]
+    ):
+        return None
+    index += 3
+    parts: list[str] = []
+    while index < len(tokens):
+        if tokens[index].value == ")":
+            return "".join(parts), index + 1
+        part = _rust_literal(tokens, index)
+        if part is None:
+            return None
+        value, index = part
+        parts.append(value)
+        if index < len(tokens) and tokens[index].value == ",":
+            index += 1
+        elif index >= len(tokens) or tokens[index].value != ")":
+            return None
+    return None
+
+
+def _rust_sites(
+    source: str,
+) -> tuple[
     list[tuple[tuple[int, int, int], str, str]],
     list[tuple[tuple[int, int, int], str, str]],
 ]:
@@ -249,10 +396,34 @@ def _rust_sites(source: str) -> tuple[
     for index, token in enumerate(tokens[:-2]):
         if token.value == "cmd" and tokens[index + 1].value == "as":
             command_names.add(tokens[index + 2].value)
+        if token.kind == "name" and token.value == "let":
+            target = index + 1
+            if tokens[target].value == "mut":
+                target += 1
+            end = next(
+                (
+                    position
+                    for position in range(target, len(tokens))
+                    if tokens[position].value == ";"
+                ),
+                len(tokens),
+            )
+            equals = next(
+                (position for position in range(target, end) if tokens[position].value == "="), None
+            )
+            if equals is not None:
+                reference = tokens[equals + 1 : end]
+                if (
+                    reference
+                    and reference[-1].value in command_names
+                    and all(part.kind == "name" or part.value == "::" for part in reference)
+                ):
+                    command_names.add(tokens[target].value)
     scopes: list[str | None] = []
     pending: str | None = None
     producers: list[tuple[tuple[int, int, int], str, str]] = []
     literals: list[tuple[tuple[int, int, int], str, str]] = []
+    grouped_until = 0
     for index, token in enumerate(tokens):
         if token.kind == "name" and token.value in {"fn", "impl", "mod", "trait"}:
             following = tokens[index + 1] if index + 1 < len(tokens) else None
@@ -267,8 +438,14 @@ def _rust_sites(source: str) -> tuple[
             pending = None
         scope = ".".join(value for value in scopes if value is not None) or "module"
         position = (token.offset, 0, 0)
-        if token.kind == "string" and token.value.startswith(_KEY_PREFIX):
-            literals.append((position, scope, token.value))
+        literal = _rust_literal(tokens, index) if index >= grouped_until else None
+        if literal is not None:
+            value, grouped_until = literal
+            if value.startswith(_KEY_PREFIX):
+                literals.append((position, scope, value))
+            if "redis" in value and "XADD" in value.upper():
+                for offset in _lua_producers(value):
+                    producers.append(((token.offset, offset, 0), scope, "lua"))
         if (
             token.kind == "name"
             and token.value in command_names

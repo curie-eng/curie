@@ -28,6 +28,18 @@ def _unique(values: list[str]) -> _Values:
     return tuple(dict.fromkeys(values))
 
 
+def _merge(environments: list[_Environment]) -> _Environment:
+    """Retain every alternative known in every possible control flow arm."""
+
+    if not environments:
+        return {}
+    known = set(environments[0]).intersection(*(set(item) for item in environments[1:]))
+    return {
+        key: _unique([value for environment in environments for value in environment[key]])
+        for key in known
+    }
+
+
 def _strings(node: ast.expr, environment: _Environment) -> _Values:
     """Resolve only strings and their explicitly supported static constructions."""
 
@@ -40,9 +52,12 @@ def _strings(node: ast.expr, environment: _Environment) -> _Values:
         return _unique([*_strings(node.body, environment), *_strings(node.orelse, environment)])
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         return _unique(
-            [left + right for left, right in itertools.product(
-                _strings(node.left, environment), _strings(node.right, environment)
-            )]
+            [
+                left + right
+                for left, right in itertools.product(
+                    _strings(node.left, environment), _strings(node.right, environment)
+                )
+            ]
         )
     if isinstance(node, ast.JoinedStr):
         parts: list[_Values] = []
@@ -84,9 +99,11 @@ def _strings(node: ast.expr, environment: _Environment) -> _Values:
         for template in templates:
             for arguments_variant in itertools.product(*arguments):
                 for keywords_variant in itertools.product(*(keywords[name] for name in names)):
-                    values.append(template.format(
-                        *arguments_variant, **dict(zip(names, keywords_variant, strict=True))
-                    ))
+                    values.append(
+                        template.format(
+                            *arguments_variant, **dict(zip(names, keywords_variant, strict=True))
+                        )
+                    )
         return _unique(values)
     raise ValueError(f"unresolved SQL expression {ast.unparse(node)}")
 
@@ -99,7 +116,7 @@ def _assign(target: ast.expr, value: ast.expr, environment: _Environment) -> Non
     # object preserves those attributes without instantiating application code.
     source = _path(value)
     aliases = {
-        f"{name}{key[len(source):]}": values
+        f"{name}{key[len(source) :]}": values
         for key, values in environment.items()
         if source is not None and key.startswith(f"{source}.")
     }
@@ -168,8 +185,12 @@ class _SQLVisitor(ast.NodeVisitor):
         previous_class = self.class_environment
         attributes: _Environment = {}
         initializer = next(
-            (method for method in node.body if isinstance(method, ast.FunctionDef)
-             and method.name == "__init__"), None
+            (
+                method
+                for method in node.body
+                if isinstance(method, ast.FunctionDef) and method.name == "__init__"
+            ),
+            None,
         )
         if initializer is not None:
             attributes = {**self.environment, **_seed(initializer, self.schema)}
@@ -231,15 +252,26 @@ class _SQLVisitor(ast.NodeVisitor):
 
     def visit_For(self, node: ast.For) -> None:
         self.visit(node.iter)
+        before = self.environment.copy()
         self._forget(node.target)
-        for statement in [*node.body, *node.orelse]:
+        self._loop(node.body, node.orelse, before)
+
+    def _loop(self, body: list[ast.stmt], otherwise: list[ast.stmt], before: _Environment) -> None:
+        for statement in body:
+            self.visit(statement)
+        self.environment = _merge([before, self.environment])
+        for statement in otherwise:
             self.visit(statement)
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
         self.visit(node.iter)
+        before = self.environment.copy()
         self._forget(node.target)
-        for statement in [*node.body, *node.orelse]:
-            self.visit(statement)
+        self._loop(node.body, node.orelse, before)
+
+    def visit_While(self, node: ast.While) -> None:
+        self.visit(node.test)
+        self._loop(node.body, node.orelse, self.environment.copy())
 
     def visit_With(self, node: ast.With) -> None:
         for item in node.items:
@@ -267,10 +299,64 @@ class _SQLVisitor(ast.NodeVisitor):
         for statement in node.orelse:
             self.visit(statement)
         otherwise = self.environment
-        self.environment = {
-            key: _unique([*body[key], *otherwise[key]])
-            for key in body.keys() & otherwise.keys()
-        }
+        self.environment = _merge([body, otherwise])
+
+    def _try(self, node: ast.Try | ast.TryStar) -> None:
+        before = self.environment.copy()
+        prefixes = [before]
+        for statement in node.body:
+            self.visit(statement)
+            prefixes.append(self.environment.copy())
+        for statement in node.orelse:
+            self.visit(statement)
+        outcomes = [self.environment.copy()]
+        # An exception can occur before any later assignment in the try body.
+        # Unknown values on one such path must not be replaced by another arm.
+        handler_input = _merge(prefixes)
+        for handler in node.handlers:
+            self.environment = handler_input.copy()
+            if handler.type is not None:
+                self.visit(handler.type)
+            if handler.name is not None:
+                self._forget(ast.Name(id=handler.name, ctx=ast.Store()))
+            for statement in handler.body:
+                self.visit(statement)
+            outcomes.append(self.environment.copy())
+        self.environment = _merge(outcomes)
+        for statement in node.finalbody:
+            self.visit(statement)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        self._try(node)
+
+    def visit_TryStar(self, node: ast.TryStar) -> None:
+        self._try(node)
+
+    def visit_Match(self, node: ast.Match) -> None:
+        self.visit(node.subject)
+        before = self.environment.copy()
+        outcomes: list[_Environment] = []
+        exhaustive = False
+        for case in node.cases:
+            self.environment = before.copy()
+            for pattern in ast.walk(case.pattern):
+                if isinstance(pattern, ast.MatchAs | ast.MatchStar) and pattern.name is not None:
+                    self._forget(ast.Name(id=pattern.name, ctx=ast.Store()))
+                elif isinstance(pattern, ast.MatchMapping) and pattern.rest is not None:
+                    self._forget(ast.Name(id=pattern.rest, ctx=ast.Store()))
+            if case.guard is not None:
+                self.visit(case.guard)
+            for statement in case.body:
+                self.visit(statement)
+            outcomes.append(self.environment.copy())
+            exhaustive |= (
+                case.guard is None
+                and isinstance(case.pattern, ast.MatchAs)
+                and case.pattern.pattern is None
+            )
+        if not exhaustive:
+            outcomes.append(before)
+        self.environment = _merge(outcomes)
 
     def visit_Call(self, node: ast.Call) -> None:
         if _path(node.func) in self.constructors:

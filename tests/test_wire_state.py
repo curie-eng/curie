@@ -35,7 +35,7 @@ def test_all_existing_wire_sites_are_declared() -> None:
     [
         (
             "apps/api/src/curie_api/new_producer.py",
-            'async def publish(client, stream, payload):\n'
+            "async def publish(client, stream, payload):\n"
             '    await client.xadd(stream, {"payload": payload})\n',
         ),
         (
@@ -124,8 +124,8 @@ def test_duplicate_producer_in_an_inventoried_scope_is_rejected(tmp_path: Path) 
         # Existing wire values do not authorize a new construction site.
         'KEY = "curie:runs"\n',
         'KEY = "cu" + "rie:undeclared:key"\n',
-        'KEY = f"{\'curie\'}:undeclared:key"\n',
-        'KEY = f"cu{\'rie\'}:undeclared:key"\n',
+        "KEY = f\"{'curie'}:undeclared:key\"\n",
+        "KEY = f\"cu{'rie'}:undeclared:key\"\n",
     ],
     ids=[
         "double_quotes",
@@ -198,8 +198,7 @@ def test_comments_and_nonwire_strings_do_not_create_sites(tmp_path: Path) -> Non
         ),
         (
             "apps/api/src/curie_api/nonproducer.py",
-            "async def read(client, key):\n"
-            '    return await getattr(client, "get")(key)\n',
+            'async def read(client, key):\n    return await getattr(client, "get")(key)\n',
         ),
         (
             "apps/api/src/curie_api/nonproducer.py",
@@ -245,10 +244,6 @@ def test_sandbox_token_has_one_shared_implementation() -> None:
     for parent in ("apps", "packages", "adapters", "tools"):
         source_roots.extend(ROOT.glob(f"{parent}/*/src"))
     modules = {
-        path
-        for source_root in source_roots
-        for path in source_root.rglob("sandbox_token.py")
+        path for source_root in source_roots for path in source_root.rglob("sandbox_token.py")
     }
-    assert modules == {
-        ROOT / "packages/curie-internal/src/curie_internal/sandbox_token.py"
-    }
+    assert modules == {ROOT / "packages/curie-internal/src/curie_internal/sandbox_token.py"}

@@ -106,8 +106,7 @@ def test_every_worker_text_statement_plans_against_migrations(
         expected.update(
             f"{path.relative_to(ROOT).as_posix()}:{node.lineno}"
             for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and ast.unparse(node.func) in constructor_names
+            if isinstance(node, ast.Call) and ast.unparse(node.func) in constructor_names
         )
     assert expected
     sites = {site for site, _ in statements}
@@ -126,9 +125,7 @@ def test_publication_result_sql_discovers_filtered_and_unfiltered_branches() -> 
         for site, sql in discover_statements(ROOT, "curie")
         if "curie_worker/publication_store.py" in site
     ]
-    select_variants = [
-        sql for sql in statements if "p.result_reported_at IS NULL" in sql
-    ]
+    select_variants = [sql for sql in statements if "p.result_reported_at IS NULL" in sql]
     update_variants = [
         sql for sql in statements if "approval resolved before card delivery began" in sql
     ]
