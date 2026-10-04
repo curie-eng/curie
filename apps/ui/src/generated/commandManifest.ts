@@ -895,6 +895,52 @@ export const commandManifest = {
       "name": "local",
       "subcommands": [
         {
+          "about": "Bootstrap access to the Curie Console",
+          "hidden": false,
+          "name": "console",
+          "subcommands": [
+            {
+              "about": "Mint a Console login code using the stored local installation credential",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Subject bound to the Console session created from this code",
+                  "id": "subject",
+                  "long": "subject",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Print the request plan without minting a code",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "login"
+            }
+          ]
+        },
+        {
           "about": "Bring the dev stack up (`core` with `--minimal`, else `full`) and print URLs. Add `--slack` for the optional dispatcher",
           "args": [
             {
@@ -3355,6 +3401,72 @@ export const commandManifest = {
       "hidden": false,
       "name": "cluster",
       "subcommands": [
+        {
+          "about": "Bootstrap access to the Curie Console",
+          "hidden": false,
+          "name": "console",
+          "subcommands": [
+            {
+              "about": "Mint a Console login code using the selected release credential",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Subject bound to the Console session created from this code",
+                  "id": "subject",
+                  "long": "subject",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to reach the release API over loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Print the request plan without minting a code",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "login"
+            }
+          ]
+        },
         {
           "about": "Report value paths that differ between a release and pending Helm files. A nonempty report is advisory and exits successfully",
           "args": [

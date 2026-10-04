@@ -645,6 +645,13 @@ fn parse_model_ref(raw: &str) -> Result<String, String> {
     Ok(raw.to_string())
 }
 
+fn parse_console_subject(raw: &str) -> Result<String, String> {
+    if raw.trim().is_empty() {
+        return Err("the principal subject must not be blank".to_string());
+    }
+    Ok(raw.to_string())
+}
+
 #[derive(Parser)]
 #[command(
     name = "curie",
@@ -1870,9 +1877,30 @@ enum ClusterHookAction {
     },
 }
 
+#[derive(Subcommand)]
+enum LocalConsoleAction {
+    /// Mint a Console login code using the stored local installation credential.
+    Login {
+        /// Subject bound to the Console session created from this code.
+        #[arg(long, value_name = "SUBJECT", value_parser = parse_console_subject)]
+        subject: String,
+        /// Platform API base URL.
+        #[arg(long, default_value = message::DEFAULT_LOCAL_API_URL, env = "CURIE_API_URL")]
+        api_url: String,
+        /// Print the request plan without minting a code.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 /// Subcommands of `curie local`.
 #[derive(Subcommand)]
 enum LocalAction {
+    /// Bootstrap access to the Curie Console.
+    Console {
+        #[command(subcommand)]
+        action: LocalConsoleAction,
+    },
     /// Bring the dev stack up (`core` with `--minimal`, else `full`) and print URLs. Add `--slack` for the optional dispatcher.
     ///
     /// Model parity with `curie skill up`: `local up` runs the real model when a
@@ -2643,7 +2671,34 @@ enum LocalAction {
 }
 
 #[derive(Subcommand)]
+enum ClusterConsoleAction {
+    /// Mint a Console login code using the selected release credential.
+    Login {
+        /// Subject bound to the Console session created from this code.
+        #[arg(long, value_name = "SUBJECT", value_parser = parse_console_subject)]
+        subject: String,
+        /// Platform API base URL. Omit to reach the release API over loopback.
+        #[arg(long, env = "CURIE_API_URL")]
+        api_url: Option<String>,
+        /// Kubernetes namespace of the release. Default: curie.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name. Default: curie.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Print the request plan without minting a code.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ClusterAction {
+    /// Bootstrap access to the Curie Console.
+    Console {
+        #[command(subcommand)]
+        action: ClusterConsoleAction,
+    },
     /// Report value paths that differ between a release and pending Helm files.
     /// A nonempty report is advisory and exits successfully.
     LintValues {
@@ -3778,11 +3833,11 @@ impl ClusterTargetSources {
         let Some((action_name, action_matches)) = cluster_matches.subcommand() else {
             return Self::default();
         };
-        let action_matches = if action_name == "hooks" {
-            let Some((_, hook_matches)) = action_matches.subcommand() else {
+        let action_matches = if matches!(action_name, "hooks" | "console") {
+            let Some((_, leaf_matches)) = action_matches.subcommand() else {
                 return Self::default();
             };
-            hook_matches
+            leaf_matches
         } else {
             // `cluster hook fire` carries namespace on the leaf, not on `hook`.
             match action_matches.subcommand() {
@@ -3822,7 +3877,13 @@ const E2E_CONNECTOR_IDENTITY_SET: &str = "e2eConnectorIdentity.enabled=true";
 
 fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>) {
     match action {
-        ClusterAction::LintValues {
+        ClusterAction::Console {
+            action:
+                ClusterConsoleAction::Login {
+                    namespace, release, ..
+                },
+        }
+        | ClusterAction::LintValues {
             namespace, release, ..
         }
         | ClusterAction::Up {
@@ -3912,7 +3973,15 @@ fn retarget_cluster_action(
         }
     };
     match action {
-        ClusterAction::LintValues {
+        ClusterAction::Console {
+            action:
+                ClusterConsoleAction::Login {
+                    namespace: current_namespace,
+                    release: current_release,
+                    ..
+                },
+        }
+        | ClusterAction::LintValues {
             namespace: current_namespace,
             release: current_release,
             ..
@@ -5285,6 +5354,21 @@ async fn run(command: Option<Command>) -> Result<()> {
                 })
                 .await;
                 emit(local::with_deploy_unreachable_hint(result, &local_api_url).await?)
+            }
+            LocalAction::Console {
+                action:
+                    LocalConsoleAction::Login {
+                        subject,
+                        api_url,
+                        dry_run,
+                    },
+            } => {
+                let api_key = if dry_run {
+                    String::new()
+                } else {
+                    api::resolve_local_api_key(&api_url, message::DEFAULT_API_KEY)
+                };
+                emit(commands::console_login(&api_url, &api_key, &subject, dry_run).await?)
             }
             LocalAction::Versions { target } => emit(commands::versions(target.into()).await?),
             LocalAction::Hooks { action } => match action {
@@ -6690,6 +6774,28 @@ async fn run(command: Option<Command>) -> Result<()> {
                     )
                     .await?,
                 )
+            }
+            ClusterAction::Console {
+                action:
+                    ClusterConsoleAction::Login {
+                        subject,
+                        api_url,
+                        namespace,
+                        release,
+                        dry_run,
+                    },
+            } => {
+                let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(
+                    ClusterConn {
+                        api_url,
+                        api_key: None,
+                        namespace,
+                        release,
+                    },
+                    dry_run,
+                )
+                .await?;
+                emit(commands::console_login(&api_url, &api_key, &subject, dry_run).await?)
             }
             ClusterAction::Resume {
                 agent,
