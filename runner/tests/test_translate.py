@@ -92,8 +92,13 @@ def test_tool_search_notes_without_flag() -> None:
 
 def test_result_success_is_final_done() -> None:
     msg = ResultMessage(
-        subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
-        num_turns=1, session_id="s", result="answer",
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="s",
+        result="answer",
     )
     events = _translate(msg)
     assert [e.type for e in events] == ["final"]
@@ -105,8 +110,13 @@ def test_success_final_carries_token_usage() -> None:
     # #390: usage from the SDK result rides the successful final so a consumer
     # can attribute a dollar cost to the turn.
     msg = ResultMessage(
-        subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
-        num_turns=1, session_id="s", result="answer",
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="s",
+        result="answer",
         usage={"input_tokens": 1200, "output_tokens": 88},
     )
     events = _translate(msg)
@@ -118,8 +128,14 @@ def test_success_final_has_no_usage_when_result_reports_none() -> None:
     # A result with no usage block leaves the wire counts None (never a
     # fabricated zero), so a consumer reads "cost unknown".
     msg = ResultMessage(
-        subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
-        num_turns=1, session_id="s", result="answer", usage=None,
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="s",
+        result="answer",
+        usage=None,
     )
     events = _translate(msg)
     assert events[0].input_tokens is None
@@ -129,8 +145,13 @@ def test_success_final_has_no_usage_when_result_reports_none() -> None:
 def test_failure_final_carries_no_usage() -> None:
     # A classified-failure final is never graded, so it carries no cost signal.
     msg = ResultMessage(
-        subtype="error", duration_ms=1, duration_api_ms=1, is_error=True,
-        num_turns=1, session_id="s", result="boom",
+        subtype="error",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=1,
+        session_id="s",
+        result="boom",
         usage={"input_tokens": 10, "output_tokens": 2},
     )
     events = _translate(msg)
@@ -154,8 +175,13 @@ def test_reasoning_model_empty_result_falls_back_to_assistant_text() -> None:
     )
     _translate(assistant, state)  # accumulates text into state
     result = ResultMessage(
-        subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
-        num_turns=1, session_id="s", result="",
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="s",
+        result="",
     )
     events = _translate(result, state)
     assert [e.type for e in events] == ["final"]
@@ -169,8 +195,13 @@ def test_result_with_own_text_ignores_accumulated_fallback() -> None:
     state = TurnState()
     _translate(AssistantMessage(content=[TextBlock(text="streamed")], model="m"), state)
     result = ResultMessage(
-        subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
-        num_turns=1, session_id="s", result="authoritative",
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="s",
+        result="authoritative",
     )
     events = _translate(result, state)
     assert [e.type for e in events] == ["final"]
@@ -179,8 +210,13 @@ def test_result_with_own_text_ignores_accumulated_fallback() -> None:
 
 def test_result_error_is_error_then_classified_final() -> None:
     msg = ResultMessage(
-        subtype="error_during_execution", duration_ms=1, duration_api_ms=1, is_error=True,
-        num_turns=1, session_id="s", result="boom",
+        subtype="error_during_execution",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=1,
+        session_id="s",
+        result="boom",
     )
     events = _translate(msg)
     assert [e.type for e in events] == ["error", "final"]
@@ -342,9 +378,7 @@ def _tool_result(
     is_error: bool | None = None,
 ) -> UserMessage:
     return UserMessage(
-        content=[
-            ToolResultBlock(tool_use_id=tool_use_id, content=content, is_error=is_error)
-        ]
+        content=[ToolResultBlock(tool_use_id=tool_use_id, content=content, is_error=is_error)]
     )
 
 
@@ -525,3 +559,368 @@ def test_unknown_error_without_credit_text_stays_unclassified() -> None:
     errors = [e for e in _translate(msg) if isinstance(e, ErrorEvent)]
     assert errors[0].classification == "unclassified"
     assert "upstream exploded" in errors[0].message
+
+
+# --- A reviewer subagent's credit refusal ends the turn (#3935) ---------------
+
+# Measured 2026-10-04 on bundled CLI 2.1.281: a subagent request answered HTTP
+# 402 with OpenRouter's body is not retried, and the parent turn recovers and
+# ends with a successful ResultMessage. With the runner's options
+# (forward_subagent_text left False) the runner sees only the Agent call's
+# is_error tool result below; with forward_subagent_text=True it also sees the
+# subagent's errored assistant message (parent_tool_use_id set, error unknown).
+_SUBAGENT_402 = (
+    "API Error: 402 This request requires more credits, or fewer max_tokens. You "
+    "requested up to 64000 tokens, but can only afford 61300. To increase, visit "
+    "https://openrouter.ai/settings/credits and upgrade to a paid account"
+)
+
+
+def _subagent_error_then_success(text: str) -> list:
+    state = TurnState()
+    errored = AssistantMessage(
+        content=[TextBlock(text=text)],
+        model="<synthetic>",
+        parent_tool_use_id="toolu_rev1",
+        error="unknown",
+    )
+    success = ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=2,
+        session_id="s",
+        result="The reviewer could not run.",
+    )
+    return _translate(errored, state) + _translate(success, state)
+
+
+def test_a_subagent_credit_refusal_ends_the_turn_classified_failure() -> None:
+    """#3935 AC4: a reviewer's 402 is terminal even when the parent recovers.
+
+    The forwarded shape, which the SDK only emits with
+    ``forward_subagent_text=True``. Red today: the ErrorEvent is already
+    emitted, but ``_translate_result`` returns Final DONE for the parent's
+    successful result, so the worker delivers the turn instead of ending the
+    run as out of credits.
+    """
+
+    events = _subagent_error_then_success(_SUBAGENT_402)
+
+    errors = [e for e in events if isinstance(e, ErrorEvent)]
+    assert len(errors) == 1
+    assert errors[0].classification == "model-credit-exhausted"
+    finals = [e for e in events if isinstance(e, Final)]
+    assert len(finals) == 1
+    assert events[-1] is finals[0]
+    assert finals[0].status is SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_a_subagent_non_credit_error_then_success_stays_done() -> None:
+    """Liveness for #3935: only a credit refusal turns a recovered turn terminal.
+
+    Green today and must stay green: an overloaded subagent the parent recovered
+    from is not out of credits, so the turn still delivers.
+    """
+
+    events = _subagent_error_then_success("API Error: 529 Overloaded")
+
+    errors = [e for e in events if isinstance(e, ErrorEvent)]
+    assert [e.classification for e in errors] == ["unclassified"]
+    finals = [e for e in events if isinstance(e, Final)]
+    assert len(finals) == 1
+    assert finals[0].status is SessionStatus.DONE
+
+
+_AGENT_402_RESULT = (
+    "Agent terminated early due to an API error: "
+    + _SUBAGENT_402
+    + " (error type unknown, HTTP 402, model sent to the API: acme-reviewer-model)"
+)
+
+
+def _tool_call_then_success(
+    result_text: str, *, tool: str = "Agent", is_error: bool | None = True
+) -> list:
+    """One tool call, its result, then the parent's successful result."""
+
+    state = TurnState()
+    tool_input = (
+        {"description": "Diff review round 1", "subagent_type": "reviewer"}
+        if tool == "Agent"
+        else {"command": "uv run pytest tests/test_billing.py -q"}
+    )
+    call = AssistantMessage(
+        content=[ToolUseBlock(id="toolu_rev1", name=tool, input=tool_input)],
+        model="m",
+    )
+    success = ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=2,
+        session_id="s",
+        result="The reviewer could not run.",
+    )
+    return (
+        _translate(call, state)
+        + _translate(_tool_result("toolu_rev1", result_text, is_error=is_error), state)
+        + _translate(success, state)
+    )
+
+
+def _credit_errors(events: list) -> list:
+    return [
+        e
+        for e in events
+        if isinstance(e, ErrorEvent) and e.classification == "model-credit-exhausted"
+    ]
+
+
+def test_a_reviewer_402_seen_only_as_the_agent_result_ends_the_turn() -> None:
+    """#3935 AC4, the shape the runner actually receives by default.
+
+    Red today on the ErrorEvent: the subagent's own errored message is not
+    forwarded, and the translator does not classify the Agent call's is_error
+    result text, so no model-credit-exhausted event exists. Red on the Final
+    too: the parent's success result maps to DONE.
+    """
+
+    events = _tool_call_then_success(_AGENT_402_RESULT)
+
+    errors = [e for e in events if isinstance(e, ErrorEvent)]
+    assert [e.classification for e in errors] == ["model-credit-exhausted"]
+    finals = [e for e in events if isinstance(e, Final)]
+    assert len(finals) == 1
+    assert events[-1] is finals[0]
+    assert finals[0].status is SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_a_reviewer_non_credit_failure_seen_as_the_agent_result_stays_done() -> None:
+    """Liveness for the default shape: a non-credit subagent failure stays DONE.
+
+    Green today and must stay green.
+    """
+
+    events = _tool_call_then_success(
+        "Agent terminated early due to an API error: API Error: 529 Overloaded"
+    )
+
+    finals = [e for e in events if isinstance(e, Final)]
+    assert len(finals) == 1
+    assert finals[0].status is SessionStatus.DONE
+    assert not [
+        e
+        for e in events
+        if isinstance(e, ErrorEvent) and e.classification == "model-credit-exhausted"
+    ]
+
+
+def test_a_failing_bash_test_mentioning_402_stays_done() -> None:
+    """Liveness for #3935: credit text in a non-Agent tool result is not a refusal.
+
+    The factory works on code that handles HTTP 402, so a failing test's output
+    names 402 and Payment Required (and here even OpenRouter's own sentence).
+    Green today and must stay green: only the Agent/Task call's failed result
+    carries a subagent's provider refusal; a Bash failure is the workload's own.
+    """
+
+    events = _tool_call_then_success(
+        "FAILED tests/test_billing.py::test_low_balance - "
+        "pytest: assert response.status == 402, 402 Payment Required: "
+        "This request requires more credits, or fewer max_tokens.",
+        tool="Bash",
+        is_error=True,
+    )
+
+    finals = [e for e in events if isinstance(e, Final)]
+    assert len(finals) == 1
+    assert finals[0].status is SessionStatus.DONE
+    assert _credit_errors(events) == []
+
+
+def test_a_successful_agent_result_mentioning_402_stays_done() -> None:
+    """Liveness for #3935: a reviewer that answered may quote 402 in its verdict.
+
+    Green today and must stay green: a successful (is_error None) Agent result
+    is the subagent's answer, not a provider refusal, whatever its text says.
+    """
+
+    events = _tool_call_then_success(
+        "REVIEWER: x\nVERDICT: REQUEST-CHANGES\nThe client treats HTTP 402 Payment "
+        'Required ("This request requires more credits") as retryable.',
+        is_error=None,
+    )
+
+    finals = [e for e in events if isinstance(e, Final)]
+    assert len(finals) == 1
+    assert finals[0].status is SessionStatus.DONE
+    assert _credit_errors(events) == []
+
+
+def _prior_error_then_agent_402_then_success(prior: object) -> list:
+    """An earlier recoverable error, then a reviewer's 402, then the parent's success."""
+
+    state = TurnState()
+    call = AssistantMessage(
+        content=[
+            ToolUseBlock(
+                id="toolu_rev1",
+                name="Agent",
+                input={"description": "Diff review round 1", "subagent_type": "reviewer"},
+            )
+        ],
+        model="m",
+    )
+    success = ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=3,
+        session_id="s",
+        result="The reviewer could not run.",
+    )
+    return (
+        _translate(prior, state)
+        + _translate(call, state)
+        + _translate(_tool_result("toolu_rev1", _AGENT_402_RESULT, is_error=True), state)
+        + _translate(success, state)
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "text"),
+    [("unknown", "API Error: 529 Overloaded"), ("server_error", "API Error: 500 upstream")],
+)
+def test_a_reviewer_402_after_an_earlier_main_thread_error_still_ends_the_turn(
+    error: str, text: str
+) -> None:
+    """#3935: an earlier recovered error must not mask a later credit refusal.
+
+    Red today: the Agent result's credit classification is applied only when
+    ``state.error_classification is None``. The main thread's earlier 529 (or
+    server error) already set it, so the 402 is swallowed, no
+    model-credit-exhausted event is emitted, and the parent's success maps to
+    Final DONE.
+    """
+
+    prior = AssistantMessage(content=[TextBlock(text=text)], model="m", error=error)
+    events = _prior_error_then_agent_402_then_success(prior)
+
+    errors = [e for e in events if isinstance(e, ErrorEvent)]
+    assert errors, "expected at least the earlier error"
+    assert errors[-1].classification == "model-credit-exhausted"
+    finals = [e for e in events if isinstance(e, Final)]
+    assert len(finals) == 1
+    assert events[-1] is finals[0]
+    assert finals[0].status is SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_a_reviewer_402_after_a_rejected_rate_limit_still_ends_the_turn() -> None:
+    """#3935: a rejected rate limit the turn recovered from must not mask a 402.
+
+    Red today for the same reason: the rate limit set
+    ``state.error_classification`` to rate-limit first.
+    """
+
+    prior = RateLimitEvent(
+        rate_limit_info=RateLimitInfo(status="rejected"), uuid="u", session_id="s"
+    )
+    events = _prior_error_then_agent_402_then_success(prior)
+
+    errors = [e for e in events if isinstance(e, ErrorEvent)]
+    assert [e.classification for e in errors] == ["rate-limit", "model-credit-exhausted"]
+    finals = [e for e in events if isinstance(e, Final)]
+    assert len(finals) == 1
+    assert events[-1] is finals[0]
+    assert finals[0].status is SessionStatus.CLASSIFIED_FAILURE
+
+
+def _credit_refusal_then_later_errors_then_result(later: list, result: ResultMessage) -> list:
+    """A reviewer's 402, then later recoverable errors, then the parent's result."""
+
+    state = TurnState()
+    call = AssistantMessage(
+        content=[
+            ToolUseBlock(
+                id="toolu_rev1",
+                name="Agent",
+                input={"description": "Diff review round 1", "subagent_type": "reviewer"},
+            )
+        ],
+        model="m",
+    )
+    events = _translate(call, state)
+    events += _translate(_tool_result("toolu_rev1", _AGENT_402_RESULT, is_error=True), state)
+    for message in later:
+        events += _translate(message, state)
+    return events + _translate(result, state)
+
+
+def _later_rate_limit() -> RateLimitEvent:
+    return RateLimitEvent(
+        rate_limit_info=RateLimitInfo(status="rejected"), uuid="u2", session_id="s"
+    )
+
+
+def _later_overloaded() -> AssistantMessage:
+    return AssistantMessage(
+        content=[TextBlock(text="API Error: 529 Overloaded")], model="m", error="unknown"
+    )
+
+
+def _success_result() -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=4,
+        session_id="s",
+        result="The reviewer could not run.",
+    )
+
+
+def _error_result() -> ResultMessage:
+    return ResultMessage(
+        subtype="error_during_execution",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=4,
+        session_id="s",
+        result="execution failed",
+    )
+
+
+@pytest.mark.parametrize(
+    ("later", "result"),
+    [
+        pytest.param(_later_rate_limit, _success_result, id="later-rate-limit"),
+        pytest.param(_later_overloaded, _success_result, id="later-overloaded-assistant-error"),
+        pytest.param(_later_rate_limit, _error_result, id="later-rate-limit-then-error-result"),
+    ],
+)
+def test_a_later_recoverable_error_does_not_mask_an_earlier_reviewer_402(
+    later: object, result: object
+) -> None:
+    """#3935: the worker keeps the classification of the LAST ErrorEvent it sees.
+
+    After a reviewer credit refusal, a later rejected rate limit or main-thread
+    529 must not become the last classification the worker records, and an
+    error result as the turn's end must not either.
+    """
+
+    events = _credit_refusal_then_later_errors_then_result([later()], result())
+
+    errors = [e for e in events if isinstance(e, ErrorEvent)]
+    assert errors, "expected at least the credit refusal"
+    assert errors[-1].classification == "model-credit-exhausted"
+    finals = [e for e in events if isinstance(e, Final)]
+    assert len(finals) == 1
+    assert events[-1] is finals[0]
+    assert finals[0].status is SessionStatus.CLASSIFIED_FAILURE
+    assert events.index(errors[-1]) < events.index(finals[0])

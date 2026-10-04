@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/factory-quickstart/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/factory-quickstart/v1.1.json",
   "title": "curie factory quickstart --json",
   "description": "The agent-facing payload of `curie factory quickstart`: the dry-run plan, the GitHub App registration link when no App id is passed, or the inferred App settings and published runner image after deploy. Never carries the OpenRouter key or the App private key.",
   "$defs": {
@@ -129,6 +129,18 @@
         },
         "budget_usd": {
           "type": "number"
+        },
+        "reviewer_model": {
+          "type": "string"
+        },
+        "run_credit_usd": {
+          "type": "number"
+        },
+        "credit_remaining_usd": {
+          "type": [
+            "number",
+            "null"
+          ]
         }
       },
       "required": [
