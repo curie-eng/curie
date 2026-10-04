@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 from curie_protected_hooks.source_policy_sql import SourceGate
+from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker import run
 from curie_worker.config import WorkerConfig
 from curie_worker.sandbox.k8s import k8s_config
@@ -45,6 +46,9 @@ def config(url: str) -> WorkerConfig:
     token = uuid.uuid4().hex
     return WorkerConfig(
         database_url=url,
+        valkey_host=VALKEY_HOST,
+        valkey_port=VALKEY_PORT,
+        valkey_password=VALKEY_PW,
         internal_worker_token="",
         workspace_enabled=False,
         publication_enabled=False,
