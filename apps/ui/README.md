@@ -99,7 +99,7 @@ honest `ComingSoon` stub (Usage, Settings).
   and an optional note. Resolver identity is the immutable subject of a live,
   HttpOnly same-origin Console session: the UI has no free-text identity or
   actor-channel field. A CLI-minted, single-use login code is exchanged for that
-  session; missing, revoked, or expired sessions return to the login-code prompt.
+  session; missing, revoked, or expired sessions return to the console login screen.
   Console principals carry no Slack channel evidence. They can resolve an
   explicit-user route containing their subject or a Slack user-group route when
   the server verifies that subject's membership; they cannot satisfy the default
@@ -124,12 +124,19 @@ filter, not exact matching.
 render a `ComingSoon` placeholder (`src/views/wired/WiredStubs.tsx`). These state
 plainly what is not wired yet rather than showing fictional data.
 
-**API access.** `src/api/config.ts` resolves the API key and prefix:
-- The API key is `?api_key=` else `VITE_API_KEY` else the dev default; sent as
-  `X-API-Key` for administrative/read surfaces. Approval resolution is the
-  exception: it sends the same-origin Console cookie, no platform key, and a body
-  containing only `decision` plus optional `note`. A platform key alone cannot
-  resolve an approval.
+**API access.** The console never holds the platform key (ADR-0083).
+- A login screen exchanges a code from `curie local console login` or
+  `curie cluster console login` for an HttpOnly `__Host-curie_console_session`
+  cookie, and every call sends only that cookie. Approval resolution sends a body
+  of `decision` plus optional `note`.
+- A 401 re-checks the session and returns to the login screen only if the session
+  is gone.
+- Limitation: the cookie is `__Host-` prefixed and `Secure`, so the browser stores
+  it only over HTTPS or from `http://localhost` / a loopback host. A plain-HTTP
+  console reached by a non-loopback address accepts the code and then fails every
+  call. Reach a cluster console at `http://localhost` through
+  `kubectl port-forward` or a kind `extraPortMappings` entry, or serve it over
+  HTTPS. Tracked in https://github.com/curie-eng/curie/issues/3968.
 - All calls go to the same-origin `/api` prefix. `vite.config.ts` proxies `/api`
   to `CURIE_API_TARGET` (default `http://localhost:8000`), stripping the
   prefix. This avoids CORS (Cross-Origin Resource Sharing) issues: apps/api

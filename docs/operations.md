@@ -404,7 +404,14 @@ Reports whether the release is healthy, which pods are ready, and the URLs
 to reach it -- including the web console, where you can see your agents,
 their deployed versions, and their run history. That console URL includes a
 `?api=1` parameter; leave it as-is when you open it, it's just what points
-the console at this release's Curie API. `--json` also reports the current
+the console at this release's Curie API. The console opens on a login screen:
+run `curie cluster console login --subject <you>` and paste the code it prints.
+The session cookie is `__Host-` prefixed and `Secure`, so browsers store it only
+over HTTPS or from `http://localhost` / a loopback host. A sealed cluster console
+reached over plain HTTP from a non-loopback host cannot sign in; reach it through
+`kubectl port-forward` (or a kind `extraPortMappings` entry) on localhost, or
+serve it over HTTPS ([#3968](https://github.com/curie-eng/curie/issues/3968)).
+`--json` also reports the current
 upgrade phase and the last known-good version.
 
 ### `curie cluster upgrade`

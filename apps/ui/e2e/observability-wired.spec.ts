@@ -1,9 +1,15 @@
 import { test, expect, type Page } from "@playwright/test";
 import { cliCommand } from "../src/primitives/cliCommand";
+import { stubConsoleSession } from "./support/consoleSession";
 
 // Wired Observability (OB1) in the stackless suite: the app runs in ?api=1 mode
 // but the observability API is stubbed with real-shaped responses via route
 // interception, so these run headless with no backend.
+
+// The console sits behind the login gate (#1047): sign this spec in.
+test.beforeEach(async ({ page }) => {
+  await stubConsoleSession(page);
+});
 
 const SUMMARY = {
   start: "2026-06-28T00:00:00Z",
