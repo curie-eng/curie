@@ -16,7 +16,7 @@ mod support;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const RELEASE: &str = "acme-platform";
@@ -124,6 +124,7 @@ const TOOL_SHIM: &str = r#"#!/usr/bin/env python3
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -210,6 +211,13 @@ def sandbox_list():
 if tool == "helm":
     verb = args[0] if args else ""
     if verb == "history":
+        if scenario == "helm-upgrade-hang" and (root / "hung-helm.pid").exists() and not (root / "helm-death-observed").exists():
+            pid = (root / "hung-helm.pid").read_text().strip()
+            status = subprocess.run(["ps", "-p", pid, "-o", "stat="], capture_output=True, text=True)
+            state = status.stdout.strip()
+            alive = status.returncode == 0 and state and state[0] not in ("Z", "X")
+            event("helm:child-alive" if alive else "helm:child-exited")
+            (root / "helm-death-observed").touch()
         event("helm:history")
         if scenario == "history-failure":
             print("history unavailable", file=sys.stderr)
@@ -338,8 +346,9 @@ if tool == "helm":
             (root / "hung-helm.pid").write_text(str(os.getpid()))
             print("helm-hang-stdout-placeholder", flush=True)
             print("helm-hang-stderr-placeholder", file=sys.stderr, flush=True)
-            time.sleep(3)
-            raise SystemExit(124)
+            event("helm:waiting")
+            while True:
+                time.sleep(60)
         if scenario == "helm-sensitive-stderr":
             print(os.environ["FAKE_SENSITIVE_SENTINEL"], file=sys.stderr)
             raise SystemExit(1)
@@ -568,7 +577,29 @@ impl FakeCluster {
             .env("FAKE_SENSITIVE_SENTINEL", sensitive_stderr_sentinel())
             .env("CURIE_GITHUB_API_URL", &self.github.base_url);
         if scenario == "helm-upgrade-hang" {
-            command.env("CURIE_TEST_GITHUB_APP_HELM_TIMEOUT_MS", "1000");
+            // Leave ample time for the real shim process to start under load.
+            // Correctness is asserted by events, rather than elapsed wall time.
+            command.env("CURIE_TEST_GITHUB_APP_HELM_TIMEOUT_MS", "10000");
+            let mut child = command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("run curie with a hung Helm child");
+            let watchdog = Instant::now() + Duration::from_secs(60);
+            loop {
+                if child.try_wait().expect("observe curie process").is_some() {
+                    return child.wait_with_output().expect("collect curie output");
+                }
+                if Instant::now() >= watchdog {
+                    child
+                        .kill()
+                        .expect("stop curie after fixture watchdog expiry");
+                    kill_recorded_process(&self.state().join("hung-helm.pid"));
+                    child.wait().expect("reap the fixture's curie process");
+                    panic!("the hung Helm fixture exceeded its broad safety watchdog");
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
         }
         command
             .output()
@@ -605,6 +636,17 @@ fn combined(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn kill_recorded_process(path: &Path) {
+    if let Some(pid) = fs::read_to_string(path)
+        .ok()
+        .and_then(|recorded| recorded.trim().parse::<libc::pid_t>().ok())
+        .filter(|pid| *pid > 0)
+    {
+        // Only the private shim's recorded child can receive this cleanup signal.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
 }
 
 fn process_exited(pid: u32) -> bool {
@@ -2037,21 +2079,20 @@ fn helm_failure_output_cannot_echo_sensitive_stderr_into_the_json_error() {
 
 #[test]
 fn a_hung_helm_upgrade_times_out_restores_live_pairs_and_returns_recovery() {
+    struct HungHelmCleanup(Option<PathBuf>);
+
+    impl Drop for HungHelmCleanup {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                kill_recorded_process(path);
+            }
+        }
+    }
+
     let cluster = FakeCluster::new("helm-upgrade-hang");
-    let started = Instant::now();
+    let mut cleanup = HungHelmCleanup(Some(cluster.state().join("hung-helm.pid")));
     let output = cluster.run("helm-upgrade-hang", false);
-    let elapsed = started.elapsed();
     let events = cluster.events();
-    // The one second child deadline includes delayed Python shim startup and is
-    // followed by several recovery subprocesses.
-    // Under nextest's partition-wide load those process launches can take a
-    // couple of seconds even though the hung Helm child was killed on time.
-    // Keep the wall bound far below the production Helm timeout without
-    // coupling the assertion to an otherwise idle runner.
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "debug timeout override must bound the hanging Helm child well below the production timeout; elapsed={elapsed:?}"
-    );
     assert!(
         !output.status.success(),
         "a timed-out Helm upgrade must return nonzero"
@@ -2065,6 +2106,7 @@ fn a_hung_helm_upgrade_times_out_restores_live_pairs_and_returns_recovery() {
         process_exited(pid),
         "timed-out Helm child {pid} remained alive after the CLI returned"
     );
+    cleanup.0 = None;
     assert!(
         events
             .iter()
@@ -2086,9 +2128,22 @@ fn a_hung_helm_upgrade_times_out_restores_live_pairs_and_returns_recovery() {
         .iter()
         .rposition(|event| event == "kubectl:get-sandboxes:post")
         .unwrap_or_else(|| panic!("missing post-timeout live verification: {events:?}"));
+    let waiting = position(&events, "helm:waiting");
+    let exited = position(&events, "helm:child-exited");
+    let recovery_history = events
+        .iter()
+        .enumerate()
+        .find_map(|(index, event)| (index > exited && event == "helm:history").then_some(index))
+        .unwrap_or_else(|| panic!("missing history read after child death: {events:?}"));
     assert!(
-        position(&events, "helm:upgrade") < template && template < pool && pool < verified,
-        "timeout recovery must restore template-before-pool and verify: {events:?}"
+        position(&events, "helm:upgrade") < waiting
+            && waiting < exited
+            && exited < recovery_history
+            && recovery_history < template
+            && template < pool
+            && pool < verified
+            && !events.iter().any(|event| event == "helm:child-alive"),
+        "the hung child must die before recovery history, template-before-pool restore, and verification: {events:?}"
     );
     assert_recreated_as_helm_owned(
         &cluster,
@@ -2104,6 +2159,13 @@ fn a_hung_helm_upgrade_times_out_restores_live_pairs_and_returns_recovery() {
         "the CLI must not automatically roll back an uncertain Helm attempt: {events:?}"
     );
     let value = stdout_json(&output);
+    assert!(
+        value
+            .get("error")
+            .and_then(|error| error.as_str())
+            .is_some_and(|error| error.contains("Helm mutation failed") && error.contains("sandbox")),
+        "the indefinitely waiting child must return the typed mutation and recovery failure: {value}"
+    );
     let recovery =
         format!("helm rollback {RELEASE} {REVISION} -n {NAMESPACE} --wait --timeout 180s");
     assert!(
