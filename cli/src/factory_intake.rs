@@ -544,11 +544,9 @@ async fn plan_app(
     opts: &mut FactoryIntakeOpts,
     recorded: &serde_json::Value,
     app_id: &str,
-    key_file: &Path,
+    preflight: crate::factory_toolchain::AppPreflight,
 ) -> Result<AppPlan> {
-    let pem = crate::factory_app::read_private_key(key_file)?;
-    let api = crate::factory_app::GithubApi::new()?;
-    let app = crate::factory_app::inspect_app(&api, app_id, &pem).await?;
+    let crate::factory_toolchain::AppPreflight { pem, api, app } = preflight;
     let repos_inferred = opts.repos.is_empty();
     let repos = crate::factory_app::resolve_allowlist(&opts.repos, &app)?;
     opts.repos = repos.clone();
@@ -682,6 +680,9 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
         let mut lines = Vec::new();
         if let Some((_, file)) = &app_args {
             lines.extend(app_dry_run_lines(&opts, file));
+            lines.insert(0, crate::factory_toolchain::PLAN_NOTE.into());
+        } else if !opts.disable {
+            lines.push(crate::factory_toolchain::SKIPPED_NOTE.into());
         }
         if !opts.disable && !opts.github_api_egress.is_empty() {
             let api = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
@@ -702,6 +703,14 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
     }
     let mut app_plan = None;
     if !opts.disable {
+        // Repository auth and inference are a preflight, before any Helm read
+        // or context-dependent setup. Reuse its tokens for the setup plan.
+        let preflight = if let Some((id, file)) = &app_args {
+            Some(crate::factory_toolchain::preflight(id, file, &opts.repos).await?)
+        } else {
+            crate::ui::ui().note(crate::factory_toolchain::SKIPPED_NOTE);
+            None
+        };
         let recorded = fetch_release_values(&opts.common)
             .await?
             .unwrap_or(serde_json::Value::Null);
@@ -716,8 +725,16 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
                 }));
             }
             None => {}
-            Some((id, file)) => {
-                app_plan = Some(plan_app(&mut opts, &recorded, id, file).await?);
+            Some((id, _)) => {
+                app_plan = Some(
+                    plan_app(
+                        &mut opts,
+                        &recorded,
+                        id,
+                        preflight.expect("App arguments have a completed preflight"),
+                    )
+                    .await?,
+                );
             }
         }
         let mut planned = intake_values(&opts, &[]);

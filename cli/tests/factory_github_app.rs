@@ -9,6 +9,8 @@
 //! https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
 //! https://docs.github.com/en/rest/apps/installations#list-repositories-accessible-to-the-app-installation
 //! https://docs.github.com/en/rest/issues/labels
+//! https://docs.github.com/en/rest/repos/contents#get-repository-content
+//! https://docs.github.com/en/rest/commits/commits#get-a-commit
 //!
 //! No live GitHub and no cluster. PEMs are generated at runtime with openssl
 //! so this file never carries key material.
@@ -17,6 +19,7 @@
 
 mod support;
 
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -154,6 +157,23 @@ struct GithubConfig {
     installed: bool,
 }
 
+#[derive(Clone, Copy)]
+enum ToolchainFixture {
+    None,
+    Python,
+    Go,
+    WorkflowPython,
+    WorkflowGo,
+    Java,
+    VersionFile,
+    MissingVersionFile,
+    DeniedVersionFile,
+    MalformedVersionFile,
+    MissingDiscoveredManifest,
+    Denied,
+    Malformed,
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     github: MockServer,
@@ -178,6 +198,10 @@ fn query_page(req: &Request) -> u32 {
 
 impl Fixture {
     fn new(config: GithubConfig) -> Self {
+        Self::with_toolchain(config, ToolchainFixture::None)
+    }
+
+    fn with_toolchain(config: GithubConfig, toolchain: ToolchainFixture) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let shim_dir = dir.path().join("bin");
         std::fs::create_dir(&shim_dir).expect("create shim dir");
@@ -202,9 +226,25 @@ impl Fixture {
         // order in which the CLI probes the supplied and the stored key.
         let public_key = Arc::new(dir.path().join("app.pub.pem"));
         let scratch = Arc::new(dir.path().join("scratch"));
+        let log = dir.path().join("invocations.log");
         let github = serve(move |req: &Request| {
             let auth = req.header("authorization").unwrap_or("").to_string();
             let path = path_only(req);
+            if path.starts_with("/repos/acme/")
+                && (path.contains("/contents") || path.contains("/commits/"))
+            {
+                writeln!(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log)
+                        .unwrap(),
+                    "github {}",
+                    req.path
+                )
+                .unwrap();
+                assert_eq!(auth, format!("Bearer {INSTALL_TOKEN}"));
+            }
             match (req.method.as_str(), path) {
                 ("GET", "/app") => {
                     if jwt_signed_by(&auth, &public_key, &scratch) {
@@ -242,6 +282,40 @@ impl Fixture {
                         Response::json(200, r#"{"total_count":2,"repositories":[]}"#)
                     }
                 }
+                ("GET", "/repos/acme/bot") | ("GET", "/repos/acme/web") => Response::json(200, r#"{"default_branch":"main"}"#),
+                ("GET", "/repos/acme/bot/commits/main") | ("GET", "/repos/acme/web/commits/main") => Response::json(200, r#"{"sha":"1111111111111111111111111111111111111111"}"#),
+                ("GET", p) if p.starts_with("/repos/acme/") && p.ends_with("/contents") => {
+                    match toolchain {
+                        ToolchainFixture::Denied => Response::json(403, r#"{"message":"Resource not accessible by integration"}"#),
+                        ToolchainFixture::Malformed => Response::json(200, r#"{"unexpected":true}"#),
+                        ToolchainFixture::None | ToolchainFixture::WorkflowPython | ToolchainFixture::WorkflowGo | ToolchainFixture::VersionFile | ToolchainFixture::MissingVersionFile | ToolchainFixture::DeniedVersionFile | ToolchainFixture::MalformedVersionFile => Response::json(200, "[]"),
+                        ToolchainFixture::Python | ToolchainFixture::MissingDiscoveredManifest => Response::json(200, r#"[{"type":"file","name":"pyproject.toml","path":"pyproject.toml"}]"#),
+                        ToolchainFixture::Go => Response::json(200, r#"[{"type":"file","name":"go.mod","path":"go.mod"}]"#),
+                        ToolchainFixture::Java => Response::json(200, r#"[{"type":"file","name":"pom.xml","path":"pom.xml"}]"#),
+                    }
+                }
+                ("GET", p) if p.ends_with("/contents/pyproject.toml") => {
+                    if matches!(toolchain, ToolchainFixture::MissingDiscoveredManifest) { Response::json(404, r#"{"message":"Not Found"}"#) }
+                    else { Response::json(200, &serde_json::json!({"type":"file","encoding":"base64","content":b64(b"[project]\nrequires-python = \"==3.13.2\"\n")}).to_string()) }
+                },
+                ("GET", p) if p.ends_with("/contents/go.mod") => Response::json(200, &serde_json::json!({"type":"file","encoding":"base64","content":b64(b"module example.com/acme\ngo 1.24.1\n")}).to_string()),
+                ("GET", p) if p.ends_with("/contents/pom.xml") => Response::json(200, &serde_json::json!({"type":"file","encoding":"base64","content":b64(b"<project><properties><maven.compiler.release>21</maven.compiler.release></properties></project>")}).to_string()),
+                ("GET", p) if p.ends_with("/contents/.github/workflows") && matches!(toolchain, ToolchainFixture::WorkflowPython | ToolchainFixture::WorkflowGo | ToolchainFixture::VersionFile | ToolchainFixture::MissingVersionFile | ToolchainFixture::DeniedVersionFile | ToolchainFixture::MalformedVersionFile) => Response::json(200, r#"[{"type":"file","path":".github/workflows/checks.yml"}]"#),
+                ("GET", p) if p.ends_with("/contents/.github/workflows/checks.yml") => {
+                    let setup = match toolchain {
+                        ToolchainFixture::WorkflowPython => "      - uses: actions/setup-python@v5\n        with:\n          python-version: '3.13'\n",
+                        ToolchainFixture::WorkflowGo => "      - uses: actions/setup-go@v5\n        with:\n          go-version: '1.24'\n",
+                        _ => "      - uses: actions/setup-python@v5\n        with:\n          python-version-file: config/runtime.python\n",
+                    };
+                    let workflow = format!("jobs:\n  tests:\n    runs-on: ubuntu-latest\n    steps:\n{setup}");
+                    Response::json(200, &serde_json::json!({"type":"file","encoding":"base64","content":b64(workflow.as_bytes())}).to_string())
+                }
+                ("GET", p) if p.ends_with("/contents/config/runtime.python") => match toolchain {
+                    ToolchainFixture::MissingVersionFile => Response::json(404, r#"{"message":"Not Found"}"#),
+                    ToolchainFixture::DeniedVersionFile => Response::json(403, r#"{"message":"Resource not accessible by integration"}"#),
+                    ToolchainFixture::MalformedVersionFile => Response::json(200, r#"{"unexpected":true}"#),
+                    _ => Response::json(200, &serde_json::json!({"type":"file","encoding":"base64","content":b64(b"3.13\n")}).to_string()),
+                },
                 ("GET", p) if p.starts_with("/repos/acme/") && p.contains("/labels/") => {
                     Response::json(404, r#"{"message":"Not Found"}"#)
                 }
@@ -295,6 +369,11 @@ impl Fixture {
         let path = std::env::join_paths(dirs).expect("join PATH");
         Command::new(bin())
             .args(argv)
+            .current_dir(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap(),
+            )
             .env("PATH", path)
             .env("HOME", self.dir.path().join("home"))
             .env("KUBECONFIG", self.dir.path().join("kubeconfig"))
@@ -452,6 +531,231 @@ fn without_an_app_the_registration_link_is_printed_and_nothing_applied() {
     );
     assert_registration_params(url);
     fx.assert_no_mutation();
+}
+
+#[test]
+fn factory_toolchain_preflight_reads_the_app_repository_before_any_helm_call() {
+    for (signal, expected) in [
+        (ToolchainFixture::Python, "Python 3.13.2"),
+        (ToolchainFixture::Go, "Go 1.24.1"),
+        (ToolchainFixture::None, "no toolchain signals"),
+    ] {
+        let fx = Fixture::with_toolchain(GithubConfig { installed: true }, signal);
+        let argv = happy_argv(&fx);
+        let output = fx.run(&strs(&argv));
+        assert!(output.status.success(), "{}", combined(&output));
+        assert!(
+            combined(&output).contains(expected),
+            "{}",
+            combined(&output)
+        );
+        let log = fx.log();
+        let contents = log
+            .find("github /repos/acme/bot/contents")
+            .expect("contents read");
+        let helm = log.find("helm ").expect("helm read");
+        assert!(
+            contents < helm,
+            "repository inference must precede Helm: {log}"
+        );
+        assert!(
+            fx.github
+                .recorded()
+                .iter()
+                .filter(|r| r.path.contains("/contents"))
+                .all(|r| r
+                    .path
+                    .contains("ref=1111111111111111111111111111111111111111")),
+            "contents must share the default branch commit"
+        );
+    }
+}
+
+#[test]
+fn factory_toolchain_auth_and_malformed_reads_fail_before_helm_and_never_claim_no_signals() {
+    for signal in [
+        ToolchainFixture::Denied,
+        ToolchainFixture::Malformed,
+        ToolchainFixture::DeniedVersionFile,
+        ToolchainFixture::MalformedVersionFile,
+        ToolchainFixture::MissingDiscoveredManifest,
+    ] {
+        let fx = Fixture::with_toolchain(GithubConfig { installed: true }, signal);
+        let argv = happy_argv(&fx);
+        let output = fx.run(&strs(&argv));
+        assert!(!output.status.success(), "{}", combined(&output));
+        assert!(!combined(&output).contains("no toolchain signals"));
+        assert!(!fx.log().contains("helm "), "{}", fx.log());
+        fx.assert_no_mutation();
+    }
+}
+
+#[test]
+fn factory_toolchain_contents_api_reads_workflows_java_and_declared_version_files() {
+    for (signal, expected, source, warning) in [
+        (
+            ToolchainFixture::WorkflowPython,
+            "Python 3.13",
+            ".github/workflows/checks.yml",
+            false,
+        ),
+        (
+            ToolchainFixture::WorkflowGo,
+            "Go 1.24",
+            ".github/workflows/checks.yml",
+            true,
+        ),
+        (ToolchainFixture::Java, "Java 21", "pom.xml", true),
+        (
+            ToolchainFixture::VersionFile,
+            "Python 3.13",
+            "config/runtime.python",
+            false,
+        ),
+    ] {
+        let fx = Fixture::with_toolchain(GithubConfig { installed: true }, signal);
+        let argv = happy_argv(&fx);
+        let output = fx.run(&strs(&argv));
+        assert!(output.status.success(), "{}", combined(&output));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(expected) && stderr.contains(source),
+            "{stderr}"
+        );
+        assert_eq!(
+            stderr.contains("fixed factory runner lacks"),
+            warning,
+            "{stderr}"
+        );
+        let log = fx.log();
+        let read = log
+            .find(&format!("contents/{source}"))
+            .expect("declaring file read through Contents API");
+        let helm = log.find("helm ").expect("Helm read after preflight");
+        assert!(read < helm, "inference must precede Helm: {log}");
+        assert!(fx
+            .github
+            .recorded()
+            .iter()
+            .filter(|request| request.path.contains("/contents"))
+            .all(|request| request
+                .path
+                .contains("ref=1111111111111111111111111111111111111111")));
+    }
+}
+
+#[test]
+fn missing_declared_version_file_warns_with_tool_and_path_then_continues() {
+    let fx = Fixture::with_toolchain(
+        GithubConfig { installed: true },
+        ToolchainFixture::MissingVersionFile,
+    );
+    let argv = happy_argv(&fx);
+    let output = fx.run(&strs(&argv));
+    assert!(output.status.success(), "{}", combined(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Python unknown (version file config/runtime.python)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(".github/workflows/checks.yml")
+            && stderr.contains("fixed factory runner lacks"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no toolchain signals"), "{stderr}");
+    let log = fx.log();
+    let missing_read = log
+        .find("contents/config/runtime.python")
+        .expect("declared file lookup");
+    let helm = log
+        .find("helm ")
+        .expect("missing version file must still allow Helm");
+    assert!(missing_read < helm, "{log}");
+}
+
+#[test]
+fn quickstart_second_pass_infers_before_context_pin_or_any_helm_call() {
+    let fx = Fixture::with_toolchain(GithubConfig { installed: true }, ToolchainFixture::Python);
+    // The named context is intentionally unavailable. Inference must still
+    // run first; the context failure must prevent all subsequent Helm calls.
+    let output = fx.run(&[
+        "factory",
+        "quickstart",
+        "--repo",
+        "acme/bot",
+        "--context",
+        "missing-context",
+        "--app-id",
+        APP_ID,
+        "--private-key-file",
+        &fx.path("app.pem"),
+        "--chart",
+        "charts/curie",
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Python 3.13.2"),
+        "{}",
+        combined(&output)
+    );
+    assert!(
+        stdout_json(&output).to_string().contains("missing-context"),
+        "{}",
+        combined(&output)
+    );
+    assert!(!fx.log().contains("helm "), "{}", fx.log());
+    fx.assert_no_mutation();
+}
+
+#[test]
+fn quickstart_second_pass_contents_failure_never_reaches_helm() {
+    let fx = Fixture::with_toolchain(GithubConfig { installed: true }, ToolchainFixture::Denied);
+    let output = fx.run(&[
+        "factory",
+        "quickstart",
+        "--repo",
+        "acme/bot",
+        "--context",
+        "missing-context",
+        "--app-id",
+        APP_ID,
+        "--private-key-file",
+        &fx.path("app.pem"),
+        "--chart",
+        "charts/curie",
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        stdout_json(&output).to_string().contains("HTTP 403"),
+        "{}",
+        combined(&output)
+    );
+    assert!(!combined(&output).contains("no toolchain signals"));
+    assert!(!fx.log().contains("helm "), "{}", fx.log());
+    fx.assert_no_mutation();
+}
+
+#[test]
+fn factory_without_app_notes_skip_and_dry_run_never_calls_github() {
+    let fx = Fixture::installed();
+    let output = fx.run(&["cluster", "factory", "--dry-run", "--json"]);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(stdout_json(&output)
+        .to_string()
+        .contains("toolchain inference skipped: no --app-id"));
+    assert!(fx.github.recorded().is_empty());
+    let argv = happy_argv(&fx);
+    let mut args = strs(&argv);
+    args.extend(["--dry-run", "--json"]);
+    let output = fx.run(&args);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(stdout_json(&output)
+        .to_string()
+        .contains("infer repository toolchains before Helm"));
+    assert!(fx.github.recorded().is_empty());
 }
 
 #[test]

@@ -101,7 +101,10 @@ if tool == 'kind':
         config.write_text(config.read_text().replace('current-context: ""','current-context: kind-curie-factory'))
         print('Created fixture kind cluster'); sys.exit(0)
 if tool == 'helm':
-    if args[:2] == ['get','values']: print((root / 'values').read_text()); sys.exit(0)
+    if args[:2] == ['get','values']:
+        if os.environ.get('QUICKSTART_REMOVE_KEY_AFTER_PREFLIGHT') == '1':
+            (root / 'app.pem').unlink(missing_ok=True)
+        print((root / 'values').read_text()); sys.exit(0)
     if args[:2] == ['get','hooks']: sys.exit(0)
     if args[:2] == ['get','metadata']: emit({'appVersion':os.environ['QUICKSTART_VERSION'],'version':os.environ['QUICKSTART_VERSION'],'chart':'curie-'+os.environ['QUICKSTART_VERSION']})
     if args[:2] == ['get','manifest']: emit(deployment)
@@ -318,6 +321,13 @@ impl Fixture {
                     200,
                     r#"{"total_count":1,"repositories":[{"full_name":"acme/widgets"}]}"#,
                 ),
+                ("GET", "/repos/acme/widgets") => {
+                    Response::json(200, r#"{"default_branch":"main"}"#)
+                }
+                ("GET", "/repos/acme/widgets/commits/main") => {
+                    Response::json(200, r#"{"sha":"1111111111111111111111111111111111111111"}"#)
+                }
+                ("GET", "/repos/acme/widgets/contents") => Response::json(200, "[]"),
                 ("GET", "/repos/acme/widgets/labels/curie-factory") => {
                     Response::json(200, r#"{"name":"curie-factory"}"#)
                 }
@@ -890,8 +900,21 @@ fn debug_reveals_chained_detail_and_default_failure_reports_one_pathless_error()
 #[test]
 fn a_chained_usage_failure_keeps_its_exit_class_and_one_error() {
     let fixture = Fixture::new();
-    fs::remove_file(fixture.dir.path().join("app.pem")).unwrap();
-    let (code, shown) = fixture.run(true, &["--color", "never"]);
+    // The parent now validates the key before any Helm read. Simulate a key
+    // removed after that valid preflight so the child still exercises the
+    // chained usage-error boundary, rather than bypassing it with an earlier
+    // parent validation error.
+    let output = fixture
+        .command(true, &["--color", "never"])
+        .env("QUICKSTART_REMOVE_KEY_AFTER_PREFLIGHT", "1")
+        .output()
+        .unwrap();
+    let code = output.status.code().unwrap_or(1);
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(code, 2, "{shown}");
     assert_eq!(shown.matches("Error:").count(), 1, "{shown}");
     assert!(
