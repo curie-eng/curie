@@ -334,6 +334,7 @@ def _sandbox_client(
         client = DockerSandboxClient(
             image=env.get("CURIE_RUNNER_IMAGE", "curie-runner"),
             bundle_store=bundle_store,
+            github_api_url=config.publication_github_api_url,
             network=env.get("CURIE_DOCKER_NETWORK") or None,
             otel_endpoint=runner_otel_endpoint or None,
             default_plugin_dir=config.bundle_plugin_dir,
@@ -432,6 +433,7 @@ def build(
             preparer=WorkspacePreparer(
                 credentials=WorkspaceCredentialClient(
                     api_url=config.api_base_url,
+                    github_api_url=config.publication_github_api_url,
                     worker_token=config.internal_worker_token,
                 ),
                 commands=SubprocessCommands(),

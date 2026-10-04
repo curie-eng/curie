@@ -66,6 +66,7 @@ class _BaseCredentialClient:
             repo_full_name=REPO,
             clone_url=CLEAN_URL,
             authorization_header=GIT_CREDENTIAL,
+            github_html_base="https://github.com",
             **self._fields,
         )
 
@@ -107,7 +108,10 @@ def test_credential_redemption_parses_the_recorded_base() -> None:
         )
 
     client = workspace.WorkspaceCredentialClient(
-        api_url="https://api.example.com", worker_token=WORKER_AUTH, transport=transport
+        api_url="https://api.example.com",
+        github_api_url="https://api.github.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
     )
     redeemed = client.redeem(DEPLOYMENT_ID, THREAD)
 
@@ -118,7 +122,10 @@ def test_credential_redemption_parses_the_recorded_base() -> None:
 def test_credential_without_a_base_defaults_to_none() -> None:
     workspace = importlib.import_module("curie_worker.workspace")
     credential = workspace.WorkspaceCredential(
-        repo_full_name=REPO, clone_url=CLEAN_URL, authorization_header=GIT_CREDENTIAL
+        repo_full_name=REPO,
+        clone_url=CLEAN_URL,
+        authorization_header=GIT_CREDENTIAL,
+        github_html_base="https://github.com",
     )
 
     assert credential.base_branch is None

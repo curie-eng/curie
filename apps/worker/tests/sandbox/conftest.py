@@ -62,8 +62,8 @@ class _FakeBundleStore:
 class _RecordingDocker(DockerSandboxClient):
     """Captures every docker argv and returns canned stdout per subcommand."""
 
-    def __init__(self, **kwargs: object) -> None:
-        super().__init__(**kwargs)  # type: ignore[arg-type]
+    def __init__(self, *, github_api_url: str = "https://api.github.com", **kwargs: object) -> None:
+        super().__init__(github_api_url=github_api_url, **kwargs)  # type: ignore[arg-type]
         self.calls: list[list[str]] = []
         self.timeouts: list[float] = []
         self.outputs: dict[str, str] = {}

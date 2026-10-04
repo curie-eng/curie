@@ -189,6 +189,7 @@ agentSandbox.runner:
   CURIE_BUDGET: agentSandbox.runner.budget.maxOutputTokensPerRun
   CURIE_CREDENTIALS: agentSandbox.runner.credentialsExistingSecret
   CURIE_FAKE_MODEL: agentSandbox.runner.fakeModel
+  CURIE_GITHUB_API_URL: api.githubApiUrl
   CURIE_MODEL: agentSandbox.runner.model
   CURIE_PLUGIN_DIR: agentSandbox.runner.pluginDir
   CURIE_RUNNER_ALLOW_TOKENLESS: nothing; a cluster runner always serves a bearer (remove this override)

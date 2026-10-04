@@ -12,6 +12,7 @@ import importlib.util
 import json
 import logging
 import socket
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -407,6 +408,74 @@ def test_docker_runner_uses_its_network_specific_otlp_endpoint(
     assert endpoint_args == (
         [f"OTEL_EXPORTER_OTLP_ENDPOINT={expected_endpoint}"] if expected_endpoint else []
     )
+
+
+@pytest.mark.parametrize("prefix", ["", "/forge"])
+def test_docker_runner_snapshot_uses_the_workers_configured_github_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, prefix: str
+) -> None:
+    from curie_runner.workspace_snapshot import capture_workspace_snapshot
+
+    calls: list[list[str]] = []
+
+    def capture_docker(
+        _self: DockerSandboxClient,
+        args: list[str],
+        *,
+        request_timeout_seconds: float,
+    ) -> str:
+        assert request_timeout_seconds > 0
+        calls.append(args)
+        return ""
+
+    html_base = f"https://github.example.com{prefix}"
+    github_api_url = f"{html_base}/api/v3"
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
+    monkeypatch.setattr(DockerSandboxClient, "_docker", capture_docker)
+    client = _sandbox_client(
+        WorkerConfig(fake_model=True, publication_github_api_url=github_api_url),
+        {
+            "CURIE_SANDBOX_SUBSTRATE": "docker",
+            "CURIE_GITHUB_API_URL": "https://other.example.com/api/v3",
+        },
+        _SUB,
+    )
+    assert isinstance(client, DockerSandboxClient)
+    client.create_claim(
+        "acme-sandbox",
+        pool="pool",
+        env={
+            "CURIE_FAKE_MODEL": "1",
+            "CURIE_GITHUB_API_URL": "https://other.example.com/api/v3",
+        },
+    )
+    assignments = [arg for arg in calls[0] if arg.startswith("CURIE_GITHUB_API_URL=")]
+    assert assignments == [f"CURIE_GITHUB_API_URL={github_api_url}"]
+    # Feed the emitted container setting into the actual runner snapshot
+    # boundary, proving a managed GHES checkout remains publishable locally.
+    monkeypatch.setenv("CURIE_GITHUB_API_URL", assignments[0].partition("=")[2])
+    repo_name = "acme-corp/acme-bot"
+    for args in (
+        ("init", "--quiet"),
+        ("remote", "add", "origin", f"{html_base}/{repo_name}.git"),
+    ):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git", "-c", "user.name=Curie Test", "-c", "user.email=curie@example.com",
+            "commit", "--quiet", "-m", "Initial fixture",
+        ],
+        cwd=tmp_path, check=True, capture_output=True,
+    )
+    (tmp_path / "README.md").write_text("GHES change\n")
+
+    captured = capture_workspace_snapshot(tmp_path, expected_repo=repo_name)
+
+    assert captured.repo_full_name == repo_name
+    assert captured.changed_paths == ("README.md",)
+    assert b"GHES change" in captured.patch
 
 
 def test_sandbox_client_docker_prepulls_image(monkeypatch) -> None:

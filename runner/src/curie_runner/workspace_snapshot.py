@@ -16,13 +16,17 @@ import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from .subprocess_env import shell_and_hook_env
 
 MAX_PATCH_BYTES = 900_000
 _GIT_TIMEOUT_SECONDS = 30
 _SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
+_REPO_FULL_NAME = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
+    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?$"
+)
 
 
 class WorkspaceSnapshotError(RuntimeError):
@@ -170,26 +174,30 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
 
 
 def _canonical_repo(origin: str) -> str:
-    parsed = urlsplit(origin.strip())
+    try:
+        api = urlsplit(os.environ.get("CURIE_GITHUB_API_URL", "https://api.github.com").rstrip("/"))
+        authority = "github.com" if api.netloc == "api.github.com" else api.netloc
+        html_base = urlunsplit((api.scheme, authority, api.path.removesuffix("/api/v3"), "", ""))
+        parsed = urlsplit(origin)
+        _ = parsed.port
+    except ValueError as exc:
+        raise WorkspaceSnapshotError("workspace repository origin is invalid") from exc
     if (
         parsed.scheme != "https"
-        or parsed.hostname != "github.com"
+        or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
+        or not origin.startswith(f"{html_base}/")
     ):
         raise WorkspaceSnapshotError(
             "workspace repository origin is not credential-free GitHub HTTPS"
         )
-    parts = [part for part in parsed.path.strip("/").split("/") if part]
-    if len(parts) != 2:
+    repo = origin[len(html_base) + 1 :].removesuffix(".git")
+    if not _REPO_FULL_NAME.fullmatch(repo) or origin != f"{html_base}/{repo}.git":
         raise WorkspaceSnapshotError("workspace repository origin is not an owner/repository URL")
-    owner, name = parts
-    name = name.removesuffix(".git")
-    if not owner or not name:
-        raise WorkspaceSnapshotError("workspace repository origin is incomplete")
-    return f"{owner}/{name}"
+    return repo
 
 
 def _changed_paths(repo: Path) -> tuple[str, ...]:
