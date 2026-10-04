@@ -407,6 +407,303 @@
       "reason": "GET /langfuse/traces returns list[dict[str, object]] with no named OpenAPI component schema. The CLI requires id and timestamp, preserves the API's nullable name, and flattens every other anonymous field so the response is retained wholesale."
     }
   ],
+  "_requests_comment": "Typed request bodies (#3834). Every platform JSON send in cli/src/api.rs is a .json::<T>(..) call on self.http.<method>(format!(\"{}<path>\", self.base_url, ..)). request_mirrors maps each body struct (cli/src/api_requests.rs, or a shared Serialize DTO in cli/src/api.rs) to its OpenAPI request schema, with justified omissions just like mirrors. requests binds each sending fn to the struct, method and OpenAPI path it sends; the gate checks the method and path against the source and the operation's requestBody schema against the mirror. Check with: curie dev field-parity",
+  "request_mirrors": [
+    {
+      "struct": "AgentCreate",
+      "schema": "AgentCreate",
+      "omissions": [
+        {
+          "field": "approval_required_tools",
+          "why": "Deploy creates an agent with its channel and optional repository only; approval gates are written afterwards by the approvals verb through PATCH (set_approval_tools)."
+        },
+        {
+          "field": "approval_routes",
+          "why": "Route bindings are written by the approvals verb through PATCH (set_approval_routes) after the agent exists, never at creation."
+        },
+        {
+          "field": "behavior_packs",
+          "why": "No CLI path composes behavior packs; deploy uploads a bundle instead, so creation never sends a pack list."
+        },
+        {
+          "field": "deploy_notifications",
+          "why": "Deploy notices are opt-in through the agent API; no CLI verb sets them, so creation leaves the server default."
+        },
+        {
+          "field": "hook_partitions",
+          "why": "Hook configuration is written by the hooks verb through PATCH (hooks_configure), not at creation."
+        },
+        {
+          "field": "memory",
+          "why": "No CLI verb sets the shared-memory toggle; creation leaves the server default (separate per-binding state)."
+        },
+        {
+          "field": "model",
+          "why": "The model override is written by the overrides verb through PATCH, so a created agent starts on the platform default."
+        },
+        {
+          "field": "publication_branch_prefix",
+          "why": "Publication policy is written by the publication-policy verb through PATCH, not at creation."
+        },
+        {
+          "field": "publication_draft",
+          "why": "Publication policy is written by the publication-policy verb through PATCH, not at creation."
+        },
+        {
+          "field": "publication_policy",
+          "why": "Publication policy is written by the publication-policy verb through PATCH, not at creation."
+        },
+        {
+          "field": "secrets",
+          "why": "Connector secrets are bound after resolution by update_agent_secrets (PATCH), so a fresh agent and a redeploy share one write path."
+        },
+        {
+          "field": "source_bindings",
+          "why": "Hook configuration is written by the hooks verb through PATCH (hooks_configure), not at creation."
+        },
+        {
+          "field": "thinking",
+          "why": "The thinking override is written by the overrides verb through PATCH, so a created agent starts on the platform default."
+        }
+      ]
+    },
+    {
+      "struct": "ChannelBindingWrite",
+      "schema": "ChannelBindingWrite",
+      "omissions": []
+    },
+    {
+      "struct": "AgentUpdate",
+      "schema": "AgentUpdate",
+      "omissions": [
+        {
+          "field": "deploy_notifications",
+          "why": "No CLI verb toggles deploy notices; the opt-in is set through the agent API directly, so a CLI PATCH never carries it."
+        },
+        {
+          "field": "memory",
+          "why": "The shared-memory toggle has no CLI surface yet (see the OverridesOutput emit omission), so no CLI PATCH sends it."
+        }
+      ]
+    },
+    {
+      "struct": "ChannelCallersWrite",
+      "schema": "ChannelCallersWrite",
+      "omissions": []
+    },
+    {
+      "struct": "ChannelTokenRequest",
+      "schema": "ChannelTokenRequest",
+      "omissions": []
+    },
+    {
+      "struct": "VersionCreate",
+      "schema": "VersionCreate",
+      "omissions": [
+        {
+          "field": "bundle_ref",
+          "why": "The bundle is uploaded after the version exists (upload_bundle), which sets the artifact pointer server-side; the create request never names one."
+        }
+      ]
+    },
+    {
+      "struct": "DeploymentCreate",
+      "schema": "DeploymentCreate",
+      "omissions": [
+        {
+          "field": "status",
+          "why": "A CLI deploy always creates an active deployment, which is the server default; ending one is DELETE /deployments/{id}, not a status write."
+        }
+      ]
+    },
+    {
+      "struct": "BudgetConfig",
+      "schema": "BudgetConfig",
+      "omissions": []
+    },
+    {
+      "struct": "ResolveTargetRequest",
+      "schema": "ResolveTargetRequest",
+      "omissions": []
+    },
+    {
+      "struct": "RoutingCheckRequest",
+      "schema": "RoutingCheckRequest",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryEntryCreate",
+      "schema": "MemoryEntryCreate",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryGuidanceIn",
+      "schema": "MemoryGuidanceIn",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalResolve",
+      "schema": "ApprovalResolve",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalRecover",
+      "schema": "ApprovalRecover",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalPrincipalMint",
+      "schema": "ApprovalPrincipalMint",
+      "omissions": []
+    },
+    {
+      "struct": "ConsoleLoginCodeMint",
+      "schema": "ConsoleLoginCodeMint",
+      "omissions": []
+    },
+    {
+      "struct": "EvalTriggerRequest",
+      "schema": "EvalTriggerRequest",
+      "omissions": [
+        {
+          "field": "target_url",
+          "why": "The CLI evaluates a deployed agent through the platform worker; it never points an eval at an external target URL."
+        },
+        {
+          "field": "version_id",
+          "why": "The CLI triggers the agent's active dev deployment and scopes results by the returned sha; it never pins a version id."
+        }
+      ]
+    }
+  ],
+  "requests": [
+    {
+      "function": "create_agent",
+      "struct": "AgentCreate",
+      "method": "post",
+      "path": "/agents"
+    },
+    {
+      "function": "update_agent",
+      "struct": "AgentUpdate",
+      "method": "patch",
+      "path": "/agents/{agent_id}"
+    },
+    {
+      "function": "add_agent_channel",
+      "struct": "ChannelBindingWrite",
+      "method": "post",
+      "path": "/agents/{agent_id}/channels"
+    },
+    {
+      "function": "set_channel_callers",
+      "struct": "ChannelCallersWrite",
+      "method": "put",
+      "path": "/agents/{agent_id}/channels/callers"
+    },
+    {
+      "function": "mint_channel_token",
+      "struct": "ChannelTokenRequest",
+      "method": "post",
+      "path": "/channels/token"
+    },
+    {
+      "function": "update_agent_secrets",
+      "struct": "AgentUpdate",
+      "method": "patch",
+      "path": "/agents/{agent_id}"
+    },
+    {
+      "function": "create_version",
+      "struct": "VersionCreate",
+      "method": "post",
+      "path": "/agents/{agent_id}/versions"
+    },
+    {
+      "function": "create_deployment",
+      "struct": "DeploymentCreate",
+      "method": "post",
+      "path": "/deployments"
+    },
+    {
+      "function": "set_budget",
+      "struct": "BudgetConfig",
+      "method": "put",
+      "path": "/agents/{agent_id}/budget"
+    },
+    {
+      "function": "resolve_deploy_target",
+      "struct": "ResolveTargetRequest",
+      "method": "post",
+      "path": "/deploy-targets/resolve"
+    },
+    {
+      "function": "list_deploy_targets",
+      "struct": "ResolveTargetRequest",
+      "method": "post",
+      "path": "/deploy-targets/list"
+    },
+    {
+      "function": "check_git_flow_routing",
+      "struct": "RoutingCheckRequest",
+      "method": "post",
+      "path": "/git-flow/routing-check"
+    },
+    {
+      "function": "create_memory",
+      "struct": "MemoryEntryCreate",
+      "method": "post",
+      "path": "/agents/{agent_id}/memory"
+    },
+    {
+      "function": "put_memory_guidance",
+      "struct": "MemoryGuidanceIn",
+      "method": "put",
+      "path": "/agents/{agent_id}/memory/guidance"
+    },
+    {
+      "function": "resolve_approval",
+      "struct": "ApprovalResolve",
+      "method": "post",
+      "path": "/approvals/{approval_id}/resolve"
+    },
+    {
+      "function": "recover_approval",
+      "struct": "ApprovalRecover",
+      "method": "post",
+      "path": "/approvals/{approval_id}/recover"
+    },
+    {
+      "function": "mint_operator_principal",
+      "struct": "ApprovalPrincipalMint",
+      "method": "post",
+      "path": "/approvals/principals/operator"
+    },
+    {
+      "function": "mint_console_login_code",
+      "struct": "ConsoleLoginCodeMint",
+      "method": "post",
+      "path": "/console/login-codes"
+    },
+    {
+      "function": "set_approval_tools",
+      "struct": "AgentUpdate",
+      "method": "patch",
+      "path": "/agents/{agent_id}"
+    },
+    {
+      "function": "set_approval_routes",
+      "struct": "AgentUpdate",
+      "method": "patch",
+      "path": "/agents/{agent_id}"
+    },
+    {
+      "function": "trigger_eval",
+      "struct": "EvalTriggerRequest",
+      "method": "post",
+      "path": "/evals/trigger"
+    }
+  ],
   "_emits_comment": "The second, emit-hop gate (#699): a CliOutput::to_json can hand-project one of the mirror structs above into a serde_json::json! literal and drop a field the struct-level gate already proved it carries (the named drift was VersionsOutput dropping Version.id, fixed in #691). Each entry below declares that a specific `output` type's to_json projects a specific mirror `struct`, and every allowlisted omission needs a consumer-derived justification just like the mirrors list above. Check with: curie dev emit-parity. This is a narrower gate than the struct-level one: it verifies every DECLARED (output, struct) pair stays honest, but (unlike mirrors' UndeclaredStruct check) it cannot discover a NEW projection on its own -- see cli/tests/support/emit_parity.rs's module doc for why that reach is out of scope for a syntax-only check.",
   "emits": [
     {

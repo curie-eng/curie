@@ -63,7 +63,8 @@
         "type": "object",
         "properties": {
           "fooBar": { "type": "string" }
-        }
+        },
+        "required": ["fooBar"]
       },
       "RenameNegativeSchema": {
         "type": "object",

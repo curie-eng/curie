@@ -435,9 +435,13 @@ fn rejects_required_cli_fields_for_optional_or_nullable_api_fields() {
     let manifest = serde_json::json!({"mirrors":[{"struct":"Mirror","schema":"Model"}]});
     let vs = violations(src, &openapi, &manifest);
     for field in ["omitted", "nullable"] {
-        assert!(vs.iter().any(|v| matches!(v, Violation::OptionalityMismatch {
+        assert!(
+            vs.iter()
+                .any(|v| matches!(v, Violation::OptionalityMismatch {
             struct_name, field: found, ..
-        } if struct_name == "Mirror" && found == field)), "{vs:#?}");
+        } if struct_name == "Mirror" && found == field)),
+            "{vs:#?}"
+        );
     }
 }
 
@@ -467,7 +471,9 @@ fn serde_default_does_not_accept_api_null() {
         "required":["value"]
     }}}});
     let manifest = serde_json::json!({"mirrors":[{"struct":"Mirror","schema":"Model"}]});
-    assert!(violations(src, &openapi, &manifest).iter().any(|v| matches!(v,
+    assert!(violations(src, &openapi, &manifest)
+        .iter()
+        .any(|v| matches!(v,
         Violation::OptionalityMismatch { field, .. } if field == "value")));
 }
 
@@ -479,7 +485,10 @@ fn real_tree_request_bodies_match_openapi_operations() {
         &repo_json("apps/api/openapi.json"),
         &repo_json("cli/api-mirrors.json"),
     );
-    assert!(vs.is_empty(), "CLI request bodies drifted from OpenAPI: {vs:#?}");
+    assert!(
+        vs.is_empty(),
+        "CLI request bodies drifted from OpenAPI: {vs:#?}"
+    );
 }
 
 // ─── Request-gate fixtures (Revision 2: binding sends to HTTP operations) ────
@@ -526,15 +535,15 @@ fn has_route_mismatch(vs: &[Violation], function_name: &str) -> bool {
 }
 
 fn has_unverifiable_request(vs: &[Violation], function_name: &str) -> bool {
-    vs.iter().any(|v| {
-        matches!(v, Violation::UnverifiableRequest { function } if function == function_name)
-    })
+    vs.iter().any(
+        |v| matches!(v, Violation::UnverifiableRequest { function } if function == function_name),
+    )
 }
 
 fn has_unclassified_request(vs: &[Violation], function_name: &str) -> bool {
-    vs.iter().any(|v| {
-        matches!(v, Violation::UnclassifiedRequest { function } if function == function_name)
-    })
+    vs.iter().any(
+        |v| matches!(v, Violation::UnclassifiedRequest { function } if function == function_name),
+    )
 }
 
 #[test]
@@ -584,8 +593,10 @@ fn request_gate_rejects_wrong_operation_schema_and_dynamic_json() {
     }"#;
     let vs = field_parity::request_violations(src, requests, &openapi, &manifest);
     assert!(
-        vs.iter().any(|v| matches!(v, Violation::RequestSchemaMismatch { function, .. }
-            if function == "create")),
+        vs.iter().any(
+            |v| matches!(v, Violation::RequestSchemaMismatch { function, .. }
+            if function == "create")
+        ),
         "{vs:#?}"
     );
 
@@ -656,7 +667,10 @@ fn request_gate_normalizes_path_placeholders_and_passes_a_correct_send() {
     let openapi = request_openapi("/items/{item_id}", "patch", "Create", create_schema());
     let manifest = request_manifest("update", "patch", "/items/{item_id}", "Create");
     let vs = field_parity::request_violations(src, requests, &openapi, &manifest);
-    assert!(vs.is_empty(), "a correct real-shape send must pass: {vs:#?}");
+    assert!(
+        vs.is_empty(),
+        "a correct real-shape send must pass: {vs:#?}"
+    );
 }
 
 #[test]
@@ -682,7 +696,8 @@ fn request_gate_rejects_an_opaque_url_as_unverifiable() {
 fn request_gate_rejects_a_required_cli_field_for_an_optional_api_field() {
     // A required (non-Option) Rust request field always sends the key, so it
     // cannot honestly mirror an API field the request may omit.
-    let requests = "#[derive(Debug, Default, Serialize)] struct Body { name: String, note: String }";
+    let requests =
+        "#[derive(Debug, Default, Serialize)] struct Body { name: String, note: String }";
     let src = r#"impl Client {
         fn create(&self, body: &Body) {
             self.http
@@ -699,13 +714,16 @@ fn request_gate_rejects_a_required_cli_field_for_an_optional_api_field() {
     let manifest = request_manifest("create", "post", "/items", "Create");
     let vs = field_parity::request_violations(src, requests, &openapi, &manifest);
     assert!(
-        vs.iter().any(|v| matches!(v, Violation::OptionalityMismatch { struct_name, field, .. }
-            if struct_name == "Body" && field == "note")),
+        vs.iter().any(
+            |v| matches!(v, Violation::OptionalityMismatch { struct_name, field, .. }
+            if struct_name == "Body" && field == "note")
+        ),
         "{vs:#?}"
     );
     // The required-on-both-sides field is not flagged.
     assert!(
-        !vs.iter().any(|v| matches!(v, Violation::OptionalityMismatch { field, .. }
+        !vs.iter()
+            .any(|v| matches!(v, Violation::OptionalityMismatch { field, .. }
             if field == "name")),
         "{vs:#?}"
     );
@@ -739,5 +757,8 @@ fn request_gate_accepts_skipped_option_and_three_state_nullable_fields() {
     let openapi = request_openapi("/items", "post", "Create", schemas);
     let manifest = request_manifest("create", "post", "/items", "Create");
     let vs = field_parity::request_violations(src, requests, &openapi, &manifest);
-    assert!(vs.is_empty(), "optional and nullable request fields must pass: {vs:#?}");
+    assert!(
+        vs.is_empty(),
+        "optional and nullable request fields must pass: {vs:#?}"
+    );
 }

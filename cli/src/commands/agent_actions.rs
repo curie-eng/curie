@@ -89,7 +89,7 @@ pub async fn hooks_configure(opts: AgentActionOpts, file: &Path) -> Result<HookO
     if config.is_empty() {
         bail!("hook configuration must contain hook_partitions or source_bindings");
     }
-    let body = serde_json::to_value(config).context("encoding hook configuration")?;
+    let body = config.into_update();
     if opts.dry_run {
         return Ok(HookOutput::DryRun(crate::ui::DryRunPlan {
             lines: vec![format!(

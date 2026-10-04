@@ -239,7 +239,10 @@ fn spec_gate_rejects_a_schema_field_added_without_updating_the_real_source() {
     schema["components"]["schemas"]["ApprovalPolicy"]["properties"]
         .as_object_mut()
         .expect("the real ApprovalPolicy schema has properties")
-        .insert("newPolicyField".into(), serde_json::json!({ "type": "string" }));
+        .insert(
+            "newPolicyField".into(),
+            serde_json::json!({ "type": "string" }),
+        );
     let manifest = repo_json("cli/plugin-format-mirrors.json");
     let scoped = manifest_for_file(&manifest, "cli/src/spec.rs");
 

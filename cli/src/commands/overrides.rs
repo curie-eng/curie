@@ -1,6 +1,7 @@
 //! `<tier> overrides` and `<tier> publication-policy`: per-agent operator settings.
 
 use super::*;
+use crate::api_requests::AgentUpdate;
 
 /// Which nullable override a `<tier> overrides` invocation intends to change.
 ///
@@ -57,36 +58,35 @@ impl OverrideChange {
         }
     }
 
-    /// The JSON value this intent contributes to a `PATCH /agents/{id}` body,
-    /// or `None` when the field must be OMITTED from the body entirely.
+    /// The three-state [`AgentUpdate`] value this intent contributes to a
+    /// `PATCH /agents/{id}` body.
     ///
     /// Returns:
-    ///   `Some(Value::Null)` to clear, `Some(Value::String)` to pin, `None` to
-    ///   leave the field out so the API's `model_fields_set` check reads it as
-    ///   unchanged.
-    fn patch_value(&self) -> Option<serde_json::Value> {
+    ///   `Some(None)` to clear (the wire carries `null`), `Some(Some(v))` to
+    ///   pin, `None` to leave the key out so the API's `model_fields_set` check
+    ///   reads it as unchanged.
+    fn patch_value(&self) -> Option<Option<String>> {
         match self {
             OverrideChange::Unchanged => None,
-            OverrideChange::Clear => Some(serde_json::Value::Null),
-            OverrideChange::Set(v) => Some(serde_json::Value::String(v.clone())),
+            OverrideChange::Clear => Some(None),
+            OverrideChange::Set(v) => Some(Some(v.clone())),
         }
     }
 
     /// Same as [`patch_value`](Self::patch_value), but for `Set` the stored
-    /// string is parsed and emitted as a JSON NUMBER rather than a string.
+    /// string is parsed into the integer the wire carries.
     ///
     /// `execution_deadline_seconds` is an int on the wire, unlike `model`/
     /// `thinking`, which are always strings. The value has already been range
     /// checked by [`resolve_execution_deadline`](Self::resolve_execution_deadline),
     /// so the parse here cannot fail for a `Set` this function is meant to see.
-    fn patch_value_as_number(&self) -> Option<serde_json::Value> {
+    fn patch_value_as_seconds(&self) -> Option<Option<u32>> {
         match self {
             OverrideChange::Unchanged => None,
-            OverrideChange::Clear => Some(serde_json::Value::Null),
-            OverrideChange::Set(v) => Some(serde_json::Value::Number(
-                v.parse::<i64>()
-                    .expect("execution deadline Set must already be a validated integer")
-                    .into(),
+            OverrideChange::Clear => Some(None),
+            OverrideChange::Set(v) => Some(Some(
+                v.parse::<u32>()
+                    .expect("execution deadline Set must already be a validated integer"),
             )),
         }
     }
@@ -169,16 +169,16 @@ impl OverrideChange {
         }
     }
 
-    /// Same as [`patch_value`](Self::patch_value), but `Set` is a JSON value
+    /// Same as [`patch_value`](Self::patch_value), but `Set` is a JSON object
     /// rather than a JSON string. Used for `runner_resources`.
-    fn patch_value_as_json(&self) -> Option<serde_json::Value> {
+    fn patch_value_as_object(&self) -> Option<Option<serde_json::Map<String, serde_json::Value>>> {
         match self {
             OverrideChange::Unchanged => None,
-            OverrideChange::Clear => Some(serde_json::Value::Null),
-            OverrideChange::Set(v) => Some(
+            OverrideChange::Clear => Some(None),
+            OverrideChange::Set(v) => Some(Some(
                 serde_json::from_str(v)
                     .expect("runner resources Set must already be a JSON object"),
-            ),
+            )),
         }
     }
 }
@@ -202,24 +202,26 @@ pub fn overrides_patch_body(
     thinking: &OverrideChange,
     execution_deadline: &OverrideChange,
     runner_resources: &OverrideChange,
-) -> Option<serde_json::Value> {
-    let mut body = serde_json::Map::new();
-    if let Some(v) = model.patch_value() {
-        body.insert("model".to_string(), v);
-    }
-    if let Some(v) = thinking.patch_value() {
-        body.insert("thinking".to_string(), v);
-    }
-    if let Some(v) = execution_deadline.patch_value_as_number() {
-        body.insert("execution_deadline_seconds".to_string(), v);
-    }
-    if let Some(v) = runner_resources.patch_value_as_json() {
-        body.insert("runner_resources".to_string(), v);
-    }
-    if body.is_empty() {
+) -> Option<AgentUpdate> {
+    let all_unchanged = [model, thinking, execution_deadline, runner_resources]
+        .iter()
+        .all(|change| **change == OverrideChange::Unchanged);
+    if all_unchanged {
         return None;
     }
-    Some(serde_json::Value::Object(body))
+    Some(AgentUpdate {
+        model: model.patch_value(),
+        thinking: thinking.patch_value(),
+        execution_deadline_seconds: execution_deadline.patch_value_as_seconds(),
+        runner_resources: runner_resources.patch_value_as_object(),
+        ..AgentUpdate::default()
+    })
+}
+
+/// The `PATCH /agents/{id}` body exactly as it goes on the wire, for a
+/// `--dry-run` plan.
+fn patch_body_json(body: &AgentUpdate) -> Result<serde_json::Value> {
+    serde_json::to_value(body).context("encoding the PATCH body")
 }
 
 /// The one-line human summary of an `overrides` result.
@@ -420,16 +422,15 @@ pub async fn overrides_with_memory_writes(
     let ui = crate::ui::ui();
     let mut body = overrides_patch_body(&model, &thinking, &execution_deadline, &runner_resources);
     if let Some(on) = memory_writes {
-        let map = body.get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        if let Some(obj) = map.as_object_mut() {
-            obj.insert("memory_writes".to_string(), serde_json::Value::Bool(on));
-        }
+        body.get_or_insert_with(AgentUpdate::default).memory_writes = Some(on);
     }
     if opts.dry_run {
         let plan = match &body {
             Some(b) => format!(
-                "PATCH {}/agents/<id>  {b}  (would resolve agent {:?} first)",
-                opts.api_url, opts.agent
+                "PATCH {}/agents/<id>  {}  (would resolve agent {:?} first)",
+                opts.api_url,
+                patch_body_json(b)?,
+                opts.agent
             ),
             None => format!(
                 "GET {}/agents  (read-only: would resolve agent {:?} and print its overrides)",
@@ -544,41 +545,28 @@ pub fn publication_policy_patch_body(
     no_draft: bool,
     branch_prefix: &Option<String>,
     clear_branch_prefix: bool,
-) -> Option<serde_json::Value> {
-    let mut body = serde_json::Map::new();
-    if let Some(policy) = policy {
-        body.insert(
-            "publication_policy".to_string(),
-            serde_json::Value::String(policy.clone()),
-        );
-    }
-    if draft {
-        body.insert(
-            "publication_draft".to_string(),
-            serde_json::Value::Bool(true),
-        );
+) -> Option<AgentUpdate> {
+    let publication_draft = if draft {
+        Some(true)
     } else if no_draft {
-        body.insert(
-            "publication_draft".to_string(),
-            serde_json::Value::Bool(false),
-        );
-    }
-    if clear_branch_prefix {
-        body.insert(
-            "publication_branch_prefix".to_string(),
-            serde_json::Value::Null,
-        );
-    } else if let Some(prefix) = branch_prefix {
-        body.insert(
-            "publication_branch_prefix".to_string(),
-            serde_json::Value::String(prefix.clone()),
-        );
-    }
-    if body.is_empty() {
-        None
+        Some(false)
     } else {
-        Some(serde_json::Value::Object(body))
+        None
+    };
+    let publication_branch_prefix = if clear_branch_prefix {
+        Some(None)
+    } else {
+        branch_prefix.clone().map(Some)
+    };
+    if policy.is_none() && publication_draft.is_none() && publication_branch_prefix.is_none() {
+        return None;
     }
+    Some(AgentUpdate {
+        publication_policy: policy.clone(),
+        publication_draft,
+        publication_branch_prefix,
+        ..AgentUpdate::default()
+    })
 }
 
 pub async fn publication_policy(
@@ -600,8 +588,10 @@ pub async fn publication_policy(
     if opts.dry_run {
         let plan = match &body {
             Some(b) => format!(
-                "PATCH {}/agents/<id>  {b}  (would resolve agent {:?} first)",
-                opts.api_url, opts.agent
+                "PATCH {}/agents/<id>  {}  (would resolve agent {:?} first)",
+                opts.api_url,
+                patch_body_json(b)?,
+                opts.agent
             ),
             None => format!(
                 "GET {}/agents  (read-only: would resolve agent {:?} and print its publication policy)",
@@ -634,7 +624,7 @@ pub async fn publication_policy(
 
 #[cfg(test)]
 mod publication_policy_tests {
-    use super::publication_policy_patch_body;
+    use super::{patch_body_json, publication_policy_patch_body};
 
     #[test]
     fn an_inspect_sends_no_patch_body() {
@@ -643,9 +633,11 @@ mod publication_policy_tests {
 
     #[test]
     fn auto_draft_and_a_cleared_prefix_are_one_patch() {
-        let body =
-            publication_policy_patch_body(&Some("auto".to_string()), true, false, &None, true)
-                .expect("a write");
+        let body = patch_body_json(
+            &publication_policy_patch_body(&Some("auto".to_string()), true, false, &None, true)
+                .expect("a write"),
+        )
+        .expect("encodes");
         assert_eq!(body["publication_policy"], "auto");
         assert_eq!(body["publication_draft"], true);
         assert!(body["publication_branch_prefix"].is_null());
@@ -668,13 +660,24 @@ pub(super) fn done_policy(agent: &crate::api::Agent, changed: bool) -> Publicati
 mod overrides_tests {
     use super::{overrides_patch_body, OverrideChange};
 
+    /// The PATCH body as it goes on the wire, or `None` for the inspect path.
+    fn wire(
+        model: &OverrideChange,
+        thinking: &OverrideChange,
+        execution_deadline: &OverrideChange,
+        runner_resources: &OverrideChange,
+    ) -> Option<serde_json::Value> {
+        overrides_patch_body(model, thinking, execution_deadline, runner_resources)
+            .map(|body| super::patch_body_json(&body).expect("encodes"))
+    }
+
     // The property the whole verb rests on (#1310, #1311): an UNCHANGED field is
     // absent from the body, a CLEARED field is present and null. The API tells
     // those apart with `model_fields_set`, so collapsing them means "leave this
     // alone" silently becomes "reset this to the platform default".
     #[test]
     fn an_unchanged_field_is_absent_and_a_cleared_field_is_present_and_null() {
-        let body = overrides_patch_body(
+        let body = wire(
             &OverrideChange::Unchanged,
             &OverrideChange::Clear,
             &OverrideChange::Unchanged,
@@ -691,7 +694,7 @@ mod overrides_tests {
 
     #[test]
     fn both_unchanged_is_no_body_at_all_which_is_the_inspect_path() {
-        assert!(overrides_patch_body(
+        assert!(wire(
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
@@ -702,7 +705,7 @@ mod overrides_tests {
 
     #[test]
     fn a_set_field_carries_its_value() {
-        let body = overrides_patch_body(
+        let body = wire(
             &OverrideChange::Set("kimi-k2".into()),
             &OverrideChange::Set("adaptive".into()),
             &OverrideChange::Unchanged,
@@ -795,7 +798,7 @@ mod overrides_tests {
     // show the body that will actually be sent, not the argv they typed.
     #[test]
     fn the_dry_run_body_carries_the_trimmed_value() {
-        let body = overrides_patch_body(
+        let body = wire(
             &OverrideChange::resolve("model", Some(" kimi-k2 ".into()), false).unwrap(),
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
@@ -830,7 +833,7 @@ mod overrides_tests {
 
     #[test]
     fn a_set_execution_deadline_carries_a_json_number_not_a_string() {
-        let body = overrides_patch_body(
+        let body = wire(
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::resolve_execution_deadline(Some("120".into()), false).unwrap(),
@@ -844,7 +847,7 @@ mod overrides_tests {
 
     #[test]
     fn a_cleared_execution_deadline_is_present_and_null() {
-        let body = overrides_patch_body(
+        let body = wire(
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::Clear,
@@ -856,7 +859,7 @@ mod overrides_tests {
 
     #[test]
     fn an_unchanged_execution_deadline_is_absent_when_model_and_thinking_are_set() {
-        let body = overrides_patch_body(
+        let body = wire(
             &OverrideChange::Set("kimi-k2".into()),
             &OverrideChange::Set("adaptive".into()),
             &OverrideChange::Unchanged,
