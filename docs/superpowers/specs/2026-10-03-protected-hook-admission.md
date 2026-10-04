@@ -84,7 +84,8 @@ Closed broker keys are:
 | `protected:control:qualification:{qualification_id}:{qualification_generation}` | Immutable qualification string, provisioner. |
 | `protected:control:readiness:{runtime_id}:{runtime_generation}` | Readiness string, verifier. |
 | `protected:admission:intent:{d}` | Immutable original preparation string. |
-| `protected:admission:state:{d}` | Monotonic preparation/commit/failure string. |
+| `protected:admission:state:{d}` | Monotonic preparation/failure string and attempt count. |
+| `protected:admission:commit:{d}` | Immutable committed State with original accepted Receipt. |
 | `protected:admission:recovery:{d}` | Exact payload bytes while preparation needs them. |
 | `protected:admission:binding:{event_id}` | Immutable envelope bytes. |
 | `protected:admission:quota` | Global protected backlog ZSET; member `d`, score created broker ms. |
@@ -135,15 +136,19 @@ computed over their exact bytes before broker writes.
 `reason` in `null|deadline|attempts_exhausted|stream_id_unappendable`, and
 `receipt: null | Receipt`. Preparing has null reason/receipt. Committed has
 null reason and a receipt; failed has a nonnull reason and null receipt.
+The mutable state key accepts only preparing or failed State. The separate
+commit key accepts only committed State and is written NX as the final write.
+A valid commit overrides preparing state; commit together with failed state
+is contradictory and unavailable. No state write follows a committed outcome.
 An intent without State is an interrupted preparing intent with zero attempts,
-never accepted. An orphan state/binding/recovery without matching intent
+never accepted. An orphan state/commit/binding/recovery without matching intent
 refuses and requires repair; it is not authorization to overwrite anything.
 
 `Receipt` contains exactly the Intent fields except `created_at_ms`,
 `deadline_ms`, `reserved_stream_id`, `envelope_sha256`, plus
 `stream_id`, `acceptance_status: "accepted"` and
 `tool_access: "read-only"` (the effective compatibility alias).
-Receipt is created only inside the final committed State write and is immutable
+Receipt is created only inside the final commit key SET NX write and is immutable
 thereafter. Matching retries return this exact original receipt. A new runtime
 selection cannot relabel it. Metadata has no TTL, matching existing delivery
 receipt retention. Committed/failed state retains original digest/identity
@@ -181,8 +186,12 @@ and readiness matches existing validate_authority comparisons and broker time.
 Admission must be open. Every expected refusal, source/control shape, bound,
 key type and event-binding collision is checked before the first write.
 
-Before new readiness/open/quota checks, inspect original Intent and State.
-An existing committed receipt with current matching source authority and the
+Before new readiness/open/quota checks, inspect original Intent, mutable State
+and commit key. A commit authorizes acceptance only after validating its exact
+original receipt against immutable Intent, binding and reserved stream identity.
+An orphan/malformed commit, missing binding or commit alongside failed State
+returns unavailable. A retained valid commit does not require a trimmed stream
+entry still to exist. An existing committed receipt with current matching source authority and the
 same requested/effective policies, body digest, source generation/operation and
 fingerprint returns duplicate without writes, even if readiness expired,
 admission closed, manifest rotated or stream trimmed. Changed duplicate identity
@@ -193,7 +202,7 @@ or missing original evidence closes, rather than inferring success from stream.
 HTTP current authentication and cross-store ordinary receipt exclusion remain
 mandatory caller responsibilities in the parent SOURCE-8 integration.
 
-Use TYPE to require none/string for new intent/state/recovery/binding,
+Use TYPE to require none/string for new intent/state/commit/recovery/binding,
 none/zset for quota and none/stream for runs. Existing unmatched records refuse.
 Read XINFO STREAM last-generated-id when present. Reserve an explicit ID
 strictly greater than that ID using broker TIME milliseconds: if time is above
@@ -204,7 +213,8 @@ IDs. Check overflow before writes. Check ZCARD below trusted backlog_limit.
 
 Writes, in order, are SET intent NX; SET preparing State; ZADD quota NX;
 SET binding NX; SET recovery payload NX; XADD curie:runs reserved ID with
-exactly `payload` and `protected_envelope`; DEL recovery; SET committed State.
+exactly `payload` and `protected_envelope`; DEL recovery; SET commit key NX
+with committed State and original Receipt. Confirm that final NX succeeded.
 The last write alone establishes acceptance. Every NX must be confirmed and
 all writes follow preflight comparison. Lua isolation is not rollback. Any
 unexpected command failure is unavailable, even after XADD; partial Intent
@@ -217,8 +227,10 @@ uses ACL administration or ACL DRYRUN to manufacture authority.
 <!-- @spec PROTECTED-HOOK-ADMISSION-5 -->
 Recovery selects the original Intent; it never allocates a replacement identity
 or stream ID. It checks broker identity and all applicable types/immutable
-bindings before writing. Existing committed/failed states return their original
-outcome without writes. Preparation has at most ten recovery attempts. A
+bindings before writing. Existing validated commit or failed State returns its original
+outcome without writes. A commit and failed State cannot legitimately coexist;
+their coexistence refuses. Commit validation compares original Intent, binding
+and exact receipt fields before a duplicate may attest acceptance. Preparation has at most ten recovery attempts. A
 reachable recovery increments attempts once; broker communication failure does
 not assume an increment or capacity release. Deadline uses broker TIME.
 At now >= deadline or exhausted attempts, DEL recovery, ZREM quota member and
@@ -252,12 +264,12 @@ If entry exists after recovery bytes were deleted, the facade reads that exact
 XRANGE entry, validates its payload/envelope SHA256 in Python against Intent
 and immutable binding, then supplies the exact raw two-field snapshot to EVAL.
 EVAL compares the current XRANGE fields byte for byte to that validated
-snapshot before final commit; the preliminary read alone authorizes nothing.
+snapshot before final commit key SET NX; the preliminary read alone authorizes nothing.
 Do not assume Lua offers SHA256 or replace it with redis.sha1hex. Recovery
 never uses XADD *, trusts caller time, or removes another intent's quota member.
 
 A successful append followed by failed commit does not permit model dispatch.
-The future worker parks that private entry under LANE-4 until exact committed
+The future worker parks that private entry under LANE-4 until exact immutable commit key
 State agrees; it cannot XACK, charge a delivery retry or start a model while
 preparing. A failed transition permits terminal acknowledgement without model
 execution. This foundation includes no worker consumer or reconciliation loop.
@@ -312,7 +324,10 @@ each write, including missing initial State, quota/binding/recovery persistence,
 append success/commit failure, lost response, exact-ID recovery, stream advance,
 wrong existing entry, closed recovery, tenth attempt and 300 second deadline.
 Use actual broker errors, not a fake success model or a production fault hook.
-Use role permission denial to stop writes at each boundary and restore only
-the fixture's original scoped role; investigate SET ordinal boundaries with
-exact-key fixture selectors. No product ACL administration is introduced.
+Use literal exact-key ACL selectors to deny each next write while permitting
+all earlier writes. In particular, allow mutable state SET and deny SET on
+protected:admission:commit:{d}; the actual Lua append and recovery-byte deletion
+then precede an actual final commit permission error. Restore only the fixture's
+original scoped role. Seeded partial state does not prove this final-write
+error; execute the real script and inspect its retained earlier writes. No product ACL administration is introduced.
 Retain parent worker/provisioning/HTTP/reconciliation acceptance as open.
