@@ -222,4 +222,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0197 | [The factory reaches code hosts and trackers through two ports](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md) | Accepted |
 | 0198 | [Identity links live in provider identity namespaces](0198-identity-links-live-in-provider-identity-namespaces.md) | Accepted |
 | 0199 | [The factory admits only tickets it can start and finish](0199-the-factory-admits-only-tickets-it-can-start-and-finish.md) | Accepted |
+| 0201 | [Provider field mappings live with their realization](0201-provider-field-mappings-live-with-their-realization.md) | Draft |
 <!-- END GENERATED: adr-index -->
