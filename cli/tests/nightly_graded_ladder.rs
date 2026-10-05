@@ -40,15 +40,18 @@ use std::thread;
 
 use sha2::{Digest, Sha256};
 
-/// Read a workflow file's raw text, or an empty string when it does not exist
-/// yet. Assertions on an empty string fail with their own readable messages
-/// rather than panicking on a missing file, so a missing nightly workflow
-/// surfaces as a normal test failure naming the violated contract.
+/// Read a repository file these text contracts inspect. A missing or
+/// unreadable file panics naming its path: an empty-string fallback would let
+/// every negative assertion on it pass vacuously (#3826).
+fn repo_text(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
 fn workflow_text(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../.github/workflows")
         .join(name);
-    fs::read_to_string(path).unwrap_or_default()
+    repo_text(&path)
 }
 
 fn nightly() -> String {
@@ -59,9 +62,24 @@ fn ci() -> String {
     workflow_text("ci.yaml")
 }
 
+#[test]
+fn repo_text_panics_naming_a_missing_file() {
+    let missing = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../.github/workflows/renamed-away-3826.yaml");
+    let panic = std::panic::catch_unwind(|| repo_text(&missing))
+        .expect_err("a missing repository file must not read as empty text");
+    let message = panic
+        .downcast_ref::<String>()
+        .expect("the read panic must carry a formatted message");
+    assert!(
+        message.contains(&missing.display().to_string()),
+        "the read panic must name the missing path: {message}"
+    );
+}
+
 fn ladder() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/e2e-ladder.sh");
-    fs::read_to_string(path).unwrap_or_default()
+    repo_text(&path)
 }
 
 fn ladder_function(name: &str) -> String {
@@ -705,7 +723,7 @@ fn local_otel_failure_recovery_scopes_classified_metrics_to_the_traces_worker_in
 
 fn chart_runtime_e2e() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/chart-runtime-e2e.sh");
-    fs::read_to_string(path).unwrap_or_default()
+    repo_text(&path)
 }
 
 fn count_lines_containing(text: &str, needle: &str) -> usize {
@@ -1141,6 +1159,11 @@ fn nightly_pairs_every_checkout_with_persist_credentials_false() {
 #[test]
 fn nightly_never_echoes_the_openrouter_secret_on_a_run_line() {
     let text = nightly();
+    assert!(
+        text.contains("secrets.OPENROUTER_API_KEY"),
+        "the nightly workflow must reference secrets.OPENROUTER_API_KEY, or \
+         the run-line check below inspects nothing; file contents:\n{text}"
+    );
     for line in text.lines() {
         if line.contains("secrets.OPENROUTER_API_KEY") {
             assert!(
@@ -1320,6 +1343,10 @@ fn connector_local_rungs_bind_routes_immediately_before_captured_deploy() {
 fn local_rung_sandbox_sweep_is_project_scoped() {
     let teardown = ladder();
     assert!(
+        teardown.contains("orphans=\"$(docker ps -aq --filter \"label=$SANDBOX_LABEL\""),
+        "the ladder teardown must still sweep orphaned sandbox containers by label"
+    );
+    assert!(
         !teardown
             .contains("orphans=\"$(docker ps -aq --filter \"label=$SANDBOX_LABEL\" 2>/dev/null)\""),
         "sandbox sweep must not select every host-wide sandbox label"
@@ -1422,7 +1449,7 @@ fn product_observability_requires_four_valid_seeds_and_count_only_mcp_receipt() 
 
     let receipt_fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/fixtures/mcp-receipt/server.py");
-    let receipt_source = fs::read_to_string(&receipt_fixture).unwrap_or_default();
+    let receipt_source = repo_text(&receipt_fixture);
     assert!(
         receipt_source.contains(r#""tools/call""#),
         "the hosted MCP fixture must log exactly one private receipt per tools/call"
