@@ -160,11 +160,25 @@ exactly; it is not a security boundary against the tester itself.
 
 ## Next decisions before slice 2
 
-The owner must review the mark's authority and scope, principal issuance and
-rotation, route-specific membership, card ownership, verification and restore
-capabilities, content equivalence, conflict cleanup, fault controls and ship
-policy. Then propose the ADR 0181 exception through the Accepted ADR procedure;
-do not edit its frozen body as part of this example. The request's ADR 0174
-reference is incorrect: that ADR concerns publication precheck capabilities,
-not tester approval resolution. Locate the correct prior proposal before
-reviving it. Phase 0 records measured facts and unresolved external evidence.
+The platform side of slice 2 is proposed in Draft ADR 0202
+([#4059](https://github.com/curie-eng/curie/pull/4059)), which revives the capability first proposed in #3122. It covers the
+installation mark and its authority, a driver principal that only an explicit
+approver list accepts, route eligibility, card ownership and the admission check
+a driver runs before acting. Until it is Accepted, nothing here sends an action.
+
+Once it is Accepted, this tester's own slice 2 rules belong in this bundle's
+documentation, not in another ADR (`AGENTS.md`, "Decisions: ADR vs. GitHub
+issue"). Those rules cover marked action probes, the admission ping, answering
+cards and checking state. ADR 0181's frozen body stays as it is; ADR 0202
+supersedes it in part on acceptance.
+
+ADR 0202 leaves these decisions to the owner:
+- verification and restore capabilities;
+- content equivalence;
+- conflict cleanup;
+- fault controls;
+- the full GO policy for action-bearing suites.
+
+The request's ADR 0174 reference is incorrect: that ADR concerns publication
+precheck capabilities. Phase 0 records measured facts and unresolved external
+evidence.
