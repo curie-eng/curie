@@ -119,6 +119,9 @@ fn schedules_body() -> Value {
                         "last_fire_at": "2026-09-25T09:00:00Z",
                         "last_outcome": "failed",
                         "last_reason": null,
+                        "last_manual_fire_at": "2026-09-25T09:00:10Z",
+                        "last_manual_outcome": "skipped",
+                        "last_manual_reason": "run_in_flight",
                         "paused": false
                     },
                     {
@@ -129,6 +132,9 @@ fn schedules_body() -> Value {
                         "last_fire_at": "2026-09-21T09:00:00Z",
                         "last_outcome": "ran",
                         "last_reason": null,
+                        "last_manual_fire_at": null,
+                        "last_manual_outcome": null,
+                        "last_manual_reason": null,
                         "paused": false
                     }
                 ]
@@ -437,4 +443,39 @@ fn pause_and_resume_one_named_hook_through_local_and_cluster() {
         assert_eq!(request.method, "POST");
         assert_api_key(request);
     }
+}
+
+#[test]
+fn human_schedules_append_manual_history_after_the_scheduled_columns() {
+    let server = list_server();
+    let output = local(&[], &server.base_url, false);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("nightly-cleanup cron 0 9 * * * UTC 2026-09-25T09:00:00Z failed active 2026-09-25T09:00:10Z skipped"),
+        "both histories must be printed separately: {text}",
+    );
+    assert!(
+        text.contains("weekly-report cron 0 9 * * 1 UTC 2026-09-21T09:00:00Z ran active - -"),
+        "absent manual history must have placeholders: {text}",
+    );
+}
+
+#[test]
+fn manual_only_history_keeps_scheduled_placeholders_in_human_output() {
+    let mut body = schedules_body();
+    body["schedules"][0]["hooks"][0]["last_fire_at"] = Value::Null;
+    body["schedules"][0]["hooks"][0]["last_outcome"] = Value::Null;
+    body["schedules"][0]["hooks"][0]["last_manual_outcome"] = json!("blocked");
+    body["schedules"][0]["hooks"][0]["last_manual_reason"] = json!("agent_killed");
+    let encoded = body.to_string();
+    let server = serve(move |_| Response::json(200, &encoded));
+    let output = local(&[], &server.base_url, false);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert!(
+        stdout(&output)
+            .contains("nightly-cleanup cron 0 9 * * * UTC - - active 2026-09-25T09:00:10Z blocked"),
+        "{}",
+        describe(&output),
+    );
 }

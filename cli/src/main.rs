@@ -116,7 +116,7 @@ struct ClusterConn {
 }
 
 /// Same connection as [`ClusterConn`], but the flags are global so they parse
-/// after `cluster hook fire` as well as on `cluster hook`.
+/// after `cluster hook fire` or `cluster hook record` as well as on `cluster hook`.
 #[derive(Args, Debug, Clone)]
 struct ClusterHookConn {
     /// Platform API base URL. Omit to self-plumb a loopback tunnel to the release API.
@@ -1873,6 +1873,26 @@ enum LocalHookAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read one durable hook run, including a run that is still in flight.
+    Record {
+        /// Agent name or id.
+        agent: String,
+        /// Trigger name on the in-force bundle.
+        name: String,
+        /// Hook run id.
+        id: String,
+        #[arg(
+            long,
+            default_value = message::DEFAULT_LOCAL_API_URL,
+            env = "CURIE_API_URL"
+        )]
+        api_url: String,
+        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
+        api_key: String,
+        /// Print what would be requested and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Subcommands of `curie cluster hook`.
@@ -1887,6 +1907,18 @@ enum ClusterHookAction {
         /// How long to wait for the turn to settle, in seconds.
         #[arg(long, default_value_t = 120)]
         wait_secs: u64,
+        /// Print what would be requested and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Read one durable hook run, including a run that is still in flight.
+    Record {
+        /// Agent name or id.
+        agent: String,
+        /// Trigger name on the in-force bundle.
+        name: String,
+        /// Hook run id.
+        id: String,
         /// Print what would be requested and exit without making a request.
         #[arg(long)]
         dry_run: bool,
@@ -2661,7 +2693,7 @@ enum LocalAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`).
+    /// Fire a declared cron hook now or read a durable run record.
     Hook {
         #[command(subcommand)]
         action: LocalHookAction,
@@ -3750,7 +3782,7 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`).
+    /// Fire a declared cron hook now or read a durable run record.
     Hook {
         #[command(subcommand)]
         action: ClusterHookAction,
@@ -5477,16 +5509,15 @@ async fn run(command: Option<Command>) -> Result<()> {
                 })
                 .await?,
             ),
-            LocalAction::Hook { action } => {
-                let LocalHookAction::Fire {
+            LocalAction::Hook { action } => match action {
+                LocalHookAction::Fire {
                     agent,
                     name,
                     wait_secs,
                     api_url,
                     api_key,
                     dry_run,
-                } = action;
-                emit(
+                } => emit(
                     commands::hook_fire(commands::HookFireOpts {
                         api_url,
                         api_key,
@@ -5494,10 +5525,29 @@ async fn run(command: Option<Command>) -> Result<()> {
                         name,
                         dry_run,
                         wait_secs,
+                        tier: "local",
                     })
                     .await?,
-                )
-            }
+                ),
+                LocalHookAction::Record {
+                    agent,
+                    name,
+                    id,
+                    api_url,
+                    api_key,
+                    dry_run,
+                } => emit(
+                    commands::hook_record(commands::HookRecordOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        name,
+                        run_id: id,
+                        dry_run,
+                    })
+                    .await?,
+                ),
+            },
             LocalAction::Memory {
                 target,
                 add,
@@ -7135,12 +7185,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                 )
             }
             ClusterAction::Hook { action, conn } => {
-                let ClusterHookAction::Fire {
-                    agent,
-                    name,
-                    wait_secs,
-                    dry_run,
-                } = action;
+                let dry_run = match &action {
+                    ClusterHookAction::Fire { dry_run, .. }
+                    | ClusterHookAction::Record { dry_run, .. } => *dry_run,
+                };
                 let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(
                     ClusterConn {
                         api_url: conn.api_url,
@@ -7151,17 +7199,41 @@ async fn run(command: Option<Command>) -> Result<()> {
                     dry_run,
                 )
                 .await?;
-                emit(
-                    commands::hook_fire(commands::HookFireOpts {
-                        api_url,
-                        api_key,
+                match action {
+                    ClusterHookAction::Fire {
                         agent,
                         name,
-                        dry_run,
                         wait_secs,
-                    })
-                    .await?,
-                )
+                        dry_run,
+                    } => emit(
+                        commands::hook_fire(commands::HookFireOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            name,
+                            dry_run,
+                            wait_secs,
+                            tier: "cluster",
+                        })
+                        .await?,
+                    ),
+                    ClusterHookAction::Record {
+                        agent,
+                        name,
+                        id,
+                        dry_run,
+                    } => emit(
+                        commands::hook_record(commands::HookRecordOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            name,
+                            run_id: id,
+                            dry_run,
+                        })
+                        .await?,
+                    ),
+                }
             }
             ClusterAction::Delete {
                 agent,

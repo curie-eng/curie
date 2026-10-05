@@ -9856,11 +9856,16 @@ pub const HOOK_RECORD_REASON: &str =
     "the skill tier runs one bundle against a local runner and has no platform API or hook run record";
 /// Where a durable hook record lives instead.
 pub const HOOK_RECORD_ALT: &str =
-    "use `curie local hook fire` or `curie cluster hook fire`, which print the run record";
+    "use `curie local hook record <agent> <name> <id>` or `curie cluster hook record <agent> <name> <id>` to read the run record";
 
 /// `skill hook schedule` and `skill hook record` (ADR-0099, #2932).
 pub fn skill_hook_record_unavailable(verb: &str) -> anyhow::Error {
-    crate::exit::unsupported(verb, HOOK_RECORD_REASON, HOOK_RECORD_ALT)
+    let alternative = if verb == "record" {
+        HOOK_RECORD_ALT
+    } else {
+        "use `curie local hook fire` or `curie cluster hook fire`, which print the run record"
+    };
+    crate::exit::unsupported(verb, HOOK_RECORD_REASON, alternative)
 }
 
 /// The prompt of one cron hook declared in `.claude-plugin/plugin.json`.
@@ -9909,9 +9914,20 @@ pub struct HookFireOpts {
     pub name: String,
     pub dry_run: bool,
     pub wait_secs: u64,
+    pub tier: &'static str,
 }
 
-/// Output of `<tier> hook fire`.
+/// Inputs for `<tier> hook record`.
+pub struct HookRecordOpts {
+    pub api_url: String,
+    pub api_key: String,
+    pub agent: String,
+    pub name: String,
+    pub run_id: String,
+    pub dry_run: bool,
+}
+
+/// Output of `<tier> hook fire` and `<tier> hook record`.
 pub enum HookFireOutput {
     DryRun(crate::ui::DryRunPlan),
     Record(Box<crate::api::HookFireRecord>),
@@ -9967,8 +9983,8 @@ pub async fn hook_fire(opts: HookFireOpts) -> Result<HookFireOutput> {
     while record.outcome.is_none() {
         if Instant::now() >= deadline {
             return Err(crate::exit::transient(format!(
-                "hook {} did not settle within {}s; run {}",
-                opts.name, opts.wait_secs, record.id
+                "hook {} did not settle within {}s; inspect with `curie {} hook record {} {} {}`",
+                opts.name, opts.wait_secs, opts.tier, opts.agent, opts.name, record.id
             )));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -9976,6 +9992,21 @@ pub async fn hook_fire(opts: HookFireOpts) -> Result<HookFireOutput> {
             .get_hook_run(&opts.agent, &opts.name, &record.id)
             .await?;
     }
+    Ok(HookFireOutput::Record(Box::new(record)))
+}
+
+/// `<tier> hook record`: read and print a durable run without waiting for settlement.
+pub async fn hook_record(opts: HookRecordOpts) -> Result<HookFireOutput> {
+    if opts.dry_run {
+        let path = crate::api::hook_run_path(&opts.agent, &opts.name, &opts.run_id);
+        return Ok(HookFireOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!("GET {}{path}", opts.api_url.trim_end_matches('/'))],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let record = client
+        .get_hook_run(&opts.agent, &opts.name, &opts.run_id)
+        .await?;
     Ok(HookFireOutput::Record(Box::new(record)))
 }
 
@@ -10028,20 +10059,24 @@ impl crate::ui::CliOutput for SchedulesOutput {
                         let fire = hook.last_fire_at.as_deref().unwrap_or("-");
                         let outcome = hook.last_outcome.as_deref().unwrap_or("-");
                         let reason = hook.last_reason.as_deref().unwrap_or("");
+                        let manual_fire = hook.last_manual_fire_at.as_deref().unwrap_or("-");
+                        let manual_outcome = hook.last_manual_outcome.as_deref().unwrap_or("-");
                         if reason.is_empty() {
                             ui.payload(&format!(
-                                "{} {} {} {} {} {} {}",
+                                "{} {} {} {} {} {} {} {} {}",
                                 hook.name,
                                 hook.trigger,
                                 hook.schedule,
                                 hook.zone,
                                 fire,
                                 outcome,
-                                if hook.paused { "paused" } else { "active" }
+                                if hook.paused { "paused" } else { "active" },
+                                manual_fire,
+                                manual_outcome
                             ));
                         } else {
                             ui.payload(&format!(
-                                "{} {} {} {} {} {} {} {}",
+                                "{} {} {} {} {} {} {} {} {} {}",
                                 hook.name,
                                 hook.trigger,
                                 hook.schedule,
@@ -10049,7 +10084,9 @@ impl crate::ui::CliOutput for SchedulesOutput {
                                 fire,
                                 outcome,
                                 reason,
-                                if hook.paused { "paused" } else { "active" }
+                                if hook.paused { "paused" } else { "active" },
+                                manual_fire,
+                                manual_outcome
                             ));
                         }
                     }
@@ -10059,7 +10096,7 @@ impl crate::ui::CliOutput for SchedulesOutput {
     }
 }
 
-/// `<tier> schedules`: list cron hooks and the newest recorded slot (`GET /schedules`).
+/// `<tier> schedules`: list cron hooks and their scheduled and manual history (`GET /schedules`).
 pub async fn schedules(opts: SchedulesOpts) -> Result<SchedulesOutput> {
     let action = match (opts.pause.as_deref(), opts.resume.as_deref()) {
         (Some(name), None) => Some((name, true)),
