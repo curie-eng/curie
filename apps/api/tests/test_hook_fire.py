@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
 import redis.asyncio as redis
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api.config import get_settings
@@ -18,6 +19,17 @@ from curie_api.killswitch import kill_key
 from curie_api.models import HookRun
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+
+@pytest.fixture(autouse=True)
+def _owned_runs_stream(valkey: Any) -> None:
+    """Give each test its own runs stream, deleted on teardown.
+
+    The assertions count queued turns by hook name, so a shared stream would
+    also count turns left by earlier runs. ``valkey`` pulls in the conftest
+    ``runs_stream`` fixture. Autouse fixtures are set up before ``client``,
+    so the app reads the per-test stream name.
+    """
 
 
 def _cron(name: str, schedule: str) -> dict[str, str]:
