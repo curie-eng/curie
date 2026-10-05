@@ -6,18 +6,18 @@
 
 # TypeScript struct field names in the metrics table (`key:` is a field, not a
 # credential): apps/ui/src/views/obs/RealMetrics.tsx.
-eba9315b76cda2c258f3f7d2223dd5383f0e7fa4:apps/ui/src/views/obs/RealMetrics.tsx:generic-api-key:12
+878c939755fa4c70bdf88ddff7ba59e140ab4433:apps/ui/src/views/obs/RealMetrics.tsx:generic-api-key:12
 b92e955c86e199c23c7ae47697e3949cb6b41a29:apps/ui/src/views/obs/RealMetrics.tsx:generic-api-key:11
 
 # Dummy placeholder Slack tokens in a Rust test (xapp-123456789 / xoxb-123456789).
 # The current line on main carries its own inline gitleaks:allow marker; this
 # fingerprint stays because the old commit is still reachable in full history.
-7a7d2bd42b286326c1ffd87fcf6b08d7af9e65e5:cli/src/comms.rs:generic-api-key:347
+39fa838827ecc84227cd658ffae9169cab3b5d7c:cli/src/comms.rs:generic-api-key:347
 
 # Documented dev-default Langfuse bootstrap keys (pk-lf-curie-dev /
 # sk-lf-curie-dev) shown in curl examples. These are fixed public dev defaults
 # baked into the headless bootstrap, not production credentials.
-be962e4a37f8644539244e2e872937f2fd8371a0:AGENTS.md:curl-auth-user:105
+fcc22b2f8b0dc4ed071000cf7e69e8fa2345c4fe:AGENTS.md:curl-auth-user:105
 7279a29e6fd7115bc002d3fed6e73d636e8912d7:AGENTS.md:curl-auth-user:105
 8d6184d608c0bf28e7323e65578bee1e5f077fb5:CLAUDE.md:curl-auth-user:75
 
@@ -34,83 +34,83 @@ c8b1ccb28faa51d3ec996d60883fde48a303b0bd:docs/adr/0079-inbound-triggers-as-a-new
 # stopword pattern; these commits are immutable, so the full-history sweep
 # still reads the old fixture ids out of them. Every value is an invented
 # test channel, never a real workspace id.
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_agents.py:slack-conversation-id:303
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_agents.py:slack-conversation-id:306
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_agents.py:slack-conversation-id:310
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_agents.py:slack-conversation-id:318
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_agents.py:slack-conversation-id:322
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_agents.py:slack-conversation-id:382
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:163
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:168
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:200
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:223
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:225
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:307
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:309
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:318
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:326
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:337
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:339
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0023_agent_channels_kind_address_unique.py:slack-conversation-id:188
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:158
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:165
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:224
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:244
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:279
-38f45d7c53489d19f560347397e2204f6c4e413e:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:288
-38f45d7c53489d19f560347397e2204f6c4e413e:packages/aci-protocol/tests/test_mixed_version.py:slack-conversation-id:111
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:206
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:214
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:261
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:268
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:286
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:300
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:317
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:328
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:349
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:355
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:363
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:385
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:391
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:400
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:415
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:422
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:423
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:499
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:501
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:506
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_agents.py:slack-conversation-id:510
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:149
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:150
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:151
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:190
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:191
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:230
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:235
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:239
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:255
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:287
-64a7f242e13d36d79da60bd3d8de69f343d4a7db:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:288
-845d68c3205053ba073bffa0bc595791f2f5727d:apps/api/tests/test_channels.py:slack-conversation-id:364
-845d68c3205053ba073bffa0bc595791f2f5727d:apps/api/tests/test_channels.py:slack-conversation-id:394
-845d68c3205053ba073bffa0bc595791f2f5727d:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:330
-845d68c3205053ba073bffa0bc595791f2f5727d:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:334
-8ef3015d6a85e21fdb5972fabb68e553cb8200f7:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:216
-8ef3015d6a85e21fdb5972fabb68e553cb8200f7:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:218
-8ef3015d6a85e21fdb5972fabb68e553cb8200f7:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:247
-8ef3015d6a85e21fdb5972fabb68e553cb8200f7:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:249
-8ef3015d6a85e21fdb5972fabb68e553cb8200f7:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:314
-8ef3015d6a85e21fdb5972fabb68e553cb8200f7:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:315
-8ef3015d6a85e21fdb5972fabb68e553cb8200f7:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:318
-8ef3015d6a85e21fdb5972fabb68e553cb8200f7:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:325
-8ef3015d6a85e21fdb5972fabb68e553cb8200f7:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:328
-8ef3015d6a85e21fdb5972fabb68e553cb8200f7:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:331
-9df25cf47d31b98936ffbb24d275cd9e15501331:apps/api/tests/test_channels.py:slack-conversation-id:318
-9df25cf47d31b98936ffbb24d275cd9e15501331:apps/api/tests/test_channels.py:slack-conversation-id:322
-9df25cf47d31b98936ffbb24d275cd9e15501331:apps/api/tests/test_channels.py:slack-conversation-id:499
-9df25cf47d31b98936ffbb24d275cd9e15501331:apps/api/tests/test_channels.py:slack-conversation-id:501
-9df25cf47d31b98936ffbb24d275cd9e15501331:apps/api/tests/test_channels.py:slack-conversation-id:503
-9df25cf47d31b98936ffbb24d275cd9e15501331:apps/api/tests/test_channels.py:slack-conversation-id:963
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_agents.py:slack-conversation-id:303
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_agents.py:slack-conversation-id:306
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_agents.py:slack-conversation-id:310
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_agents.py:slack-conversation-id:318
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_agents.py:slack-conversation-id:322
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_agents.py:slack-conversation-id:382
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:163
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:168
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:200
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:223
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:225
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:307
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:309
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:318
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:326
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:337
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:339
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0023_agent_channels_kind_address_unique.py:slack-conversation-id:188
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:158
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:165
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:224
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:244
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:279
+1d45b0bd51241ed575bb243a988ee618e318c064:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:288
+1d45b0bd51241ed575bb243a988ee618e318c064:packages/aci-protocol/tests/test_mixed_version.py:slack-conversation-id:111
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:206
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:214
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:261
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:268
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:286
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:300
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:317
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:328
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:349
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:355
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:363
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:385
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:391
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:400
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:415
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:422
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:423
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:499
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:501
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:506
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_agents.py:slack-conversation-id:510
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:149
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:150
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:151
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:190
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:191
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:230
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:235
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:239
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:255
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:287
+ff771e3fd92b3bc9d620729d323e7190e90064aa:apps/api/tests/test_migration_0021_agent_channels.py:slack-conversation-id:288
+36a9bdf7672be80f3c992a44ae4d9360927bf982:apps/api/tests/test_channels.py:slack-conversation-id:364
+36a9bdf7672be80f3c992a44ae4d9360927bf982:apps/api/tests/test_channels.py:slack-conversation-id:394
+36a9bdf7672be80f3c992a44ae4d9360927bf982:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:330
+36a9bdf7672be80f3c992a44ae4d9360927bf982:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:334
+6018285a4384a1c1d23fdcc1f162e1c60b7dcfe6:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:216
+6018285a4384a1c1d23fdcc1f162e1c60b7dcfe6:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:218
+6018285a4384a1c1d23fdcc1f162e1c60b7dcfe6:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:247
+6018285a4384a1c1d23fdcc1f162e1c60b7dcfe6:apps/api/tests/test_migration_0022_approvals_reply_kind.py:slack-conversation-id:249
+6018285a4384a1c1d23fdcc1f162e1c60b7dcfe6:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:314
+6018285a4384a1c1d23fdcc1f162e1c60b7dcfe6:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:315
+6018285a4384a1c1d23fdcc1f162e1c60b7dcfe6:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:318
+6018285a4384a1c1d23fdcc1f162e1c60b7dcfe6:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:325
+6018285a4384a1c1d23fdcc1f162e1c60b7dcfe6:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:328
+6018285a4384a1c1d23fdcc1f162e1c60b7dcfe6:apps/api/tests/test_migration_0024_agent_channels_route.py:slack-conversation-id:331
+cebf51914f4b28b277f928faeaecdd1ab9a520e1:apps/api/tests/test_channels.py:slack-conversation-id:318
+cebf51914f4b28b277f928faeaecdd1ab9a520e1:apps/api/tests/test_channels.py:slack-conversation-id:322
+cebf51914f4b28b277f928faeaecdd1ab9a520e1:apps/api/tests/test_channels.py:slack-conversation-id:499
+cebf51914f4b28b277f928faeaecdd1ab9a520e1:apps/api/tests/test_channels.py:slack-conversation-id:501
+cebf51914f4b28b277f928faeaecdd1ab9a520e1:apps/api/tests/test_channels.py:slack-conversation-id:503
+cebf51914f4b28b277f928faeaecdd1ab9a520e1:apps/api/tests/test_channels.py:slack-conversation-id:963
 
 # UI mockup placeholder provider keys, from the pre-rename prototype. Both files
 # (apps/ui/src/views/Settings.tsx, AgentOS.html) are gone from the tree; the
@@ -139,16 +139,16 @@ de945b33ecb0930990c5af669c52d26b6fa2cfd3:apps/ui/src/views/obs/RealMetrics.tsx:g
 # commit that introduced it without the marker; these hashes are immutable,
 # reachable history now, same as the slack-conversation-id entries above.
 fc211a288aad285277413e684e96fbae063d27cf:cli/tests/surfaces_verb.rs:discord-client-id:203
-9b91df65bd4f578353af6d75358594fcedf01183:cli/tests/surfaces_verb.rs:discord-client-id:203
+a82a6001a3707be5fceb5a722905b298e1d88a9a:cli/tests/surfaces_verb.rs:discord-client-id:203
 a7c60011eb9aeac392845e3c3bcc0fd1a4b4dc19:cli/tests/surfaces_verb.rs:discord-client-id:203
 
 # Made-up key-shaped strings in the outbound redactor's block-break tests
 # (#3694): `sk-proj-1234567890abcd` and `sk-` + `proj0123456789abcdefXYZ` exist
 # to prove a block break never splits a key the redactor must catch. They are
 # not credentials.
-a95919ccfb6e368497c613d358721dcdc18ac7e6:runner/tests/test_redact.py:generic-api-key:724
-a95919ccfb6e368497c613d358721dcdc18ac7e6:runner/tests/test_redact.py:generic-api-key:734
+a6ad6a14d49962754a56754da7c216469acd3bb6:runner/tests/test_redact.py:generic-api-key:724
+a6ad6a14d49962754a56754da7c216469acd3bb6:runner/tests/test_redact.py:generic-api-key:734
 
 # Invented migration-preservation fixture repository and issue number, not a
 # downstream reference. Exact historical finding only; future references remain gated.
-afdf8c97efb448e35fcb53b53c718fb2fa550af9:apps/api/tests/test_migration_0074_deploy_notifications.py:cross-repo-issue-ref:39
+9044947acf8d50fe58cf087f42fd627e0212271d:apps/api/tests/test_migration_0074_deploy_notifications.py:cross-repo-issue-ref:39
