@@ -297,9 +297,10 @@ WHERE agent_id = :agent_id AND address = :address
 
 _INSERT_SQL = """
 INSERT INTO {schema}.hook_runs
-       (id, agent_id, name, slot_utc, version_id, outcome, started_at, ended_at,
+       (id, agent_id, name, slot_utc, version_id, outcome, reason, started_at, ended_at,
         lease_expires_at)
-VALUES (:id, :agent_id, :name, :slot, :version_id, CAST(:outcome AS text), now(),
+VALUES (:id, :agent_id, :name, :slot, :version_id, CAST(:outcome AS text),
+        CASE WHEN :terminal THEN :reason ELSE NULL END, now(),
         CASE WHEN :terminal THEN now() END,
         CASE WHEN :terminal THEN NULL ELSE now() + make_interval(secs => :lease_s) END)
 ON CONFLICT (agent_id, name, slot_utc) DO NOTHING
@@ -318,7 +319,7 @@ SELECT pg_advisory_xact_lock(hashtextextended(CAST(:agent_id AS text) || ':' || 
 # rollout) is held for one lease from its start.
 _RECLAIM_SQL = """
 UPDATE {schema}.hook_runs
-SET outcome = 'reclaimed', ended_at = now()
+SET outcome = 'reclaimed', reason = 'claim_expired', ended_at = now()
 WHERE agent_id = :agent_id AND name = :name AND outcome IS NULL
   AND slot_utc <> :slot
   AND COALESCE(lease_expires_at, started_at + make_interval(secs => :lease_s)) < now()
@@ -350,8 +351,9 @@ WHERE agent_id = :agent_id AND name = :name AND paused_at IS NULL
 
 _SKIP_SQL = """
 INSERT INTO {schema}.hook_runs
-       (id, agent_id, name, slot_utc, version_id, outcome, started_at, ended_at)
-SELECT fire.id, :agent_id, :name, fire.slot, :version_id, 'skipped', now(), now()
+       (id, agent_id, name, slot_utc, version_id, outcome, reason, started_at, ended_at)
+SELECT fire.id, :agent_id, :name, fire.slot, :version_id, 'skipped',
+       'catch_up_expired', now(), now()
 FROM unnest(CAST(:ids AS uuid[]), CAST(:slots AS timestamptz[])) AS fire(id, slot)
 WHERE true
 ON CONFLICT (agent_id, name, slot_utc) DO NOTHING
@@ -365,7 +367,7 @@ ORDER BY slot_utc
 """
 
 _SETTLE_DEFERRED_SQL = """
-UPDATE {schema}.hook_runs SET outcome = CAST(:outcome AS text), ended_at = now()
+UPDATE {schema}.hook_runs SET outcome = CAST(:outcome AS text), reason = :reason, ended_at = now()
 WHERE agent_id = :agent_id AND name = :name AND slot_utc = :slot AND outcome = 'deferred'
 RETURNING outcome
 """
@@ -373,14 +375,14 @@ RETURNING outcome
 # The reopen is a CAS on ``deferred``, so of two replicas retrying one slot
 # exactly one gets the row back in flight and enqueues it.
 _REOPEN_SQL = """
-UPDATE {schema}.hook_runs SET outcome = NULL, ended_at = NULL, started_at = now(),
+UPDATE {schema}.hook_runs SET outcome = NULL, reason = NULL, ended_at = NULL, started_at = now(),
        lease_expires_at = now() + make_interval(secs => :lease_s)
 WHERE agent_id = :agent_id AND name = :name AND slot_utc = :slot AND outcome = 'deferred'
 RETURNING id
 """
 
 _FAIL_RUN_SQL = """
-UPDATE {schema}.hook_runs SET outcome = 'failed', ended_at = now()
+UPDATE {schema}.hook_runs SET outcome = 'failed', reason = 'enqueue_failed', ended_at = now()
 WHERE id = :id AND agent_id = :agent_id AND name = :name AND outcome IS NULL
 RETURNING id
 """
@@ -575,9 +577,12 @@ class CronSchedulerLoop:
         slot: datetime,
         outcome: str | None,
         *,
+        reason: str | None = None,
         source_context: CronSourceContext | None = None,
     ) -> uuid.UUID | None:
         """@spec PROTECTED-HOOK-SOURCE-2."""
+        if outcome is None:
+            reason = None
         context = self._validate_source_context(source_context, target, name)
         if conn.engine is not self._engine:
             raise SourceGateInvalid("invalid_source_gate")
@@ -593,6 +598,7 @@ class CronSchedulerLoop:
                     "slot": slot,
                     "version_id": target.version_id,
                     "outcome": outcome,
+                    "reason": reason,
                     # Terminal outcomes close the row at once; NULL is in flight.
                     "terminal": outcome is not None,
                     "lease_s": self._claim_lease_s,
@@ -694,13 +700,24 @@ class CronSchedulerLoop:
         """@spec PROTECTED-HOOK-SOURCE-2."""
         name = str(trigger["name"])
         context = self._validate_source_context(source_context, target, name)
-        if await self._is_killed(target.agent_id) or self._budget_spent(target):
+        block_reason: str | None = None
+        if await self._is_killed(target.agent_id):
+            block_reason = "agent_killed"
+        elif self._budget_spent(target):
+            block_reason = "budget_exhausted"
+        if block_reason is not None:
             async with self._engine.begin() as conn:
                 reclaimed = await self._lock_and_reclaim(
                     conn, target, name, slot, summary, source_context=context
                 )
                 run_id = await self._insert(
-                    conn, target, name, slot, "blocked", source_context=context
+                    conn,
+                    target,
+                    name,
+                    slot,
+                    "blocked",
+                    reason=block_reason,
+                    source_context=context,
                 )
             self._record_reclaimed(target, name, reclaimed, summary)
             if run_id is not None:
@@ -718,7 +735,13 @@ class CronSchedulerLoop:
                     conn, target, name, slot, summary, source_context=context
                 )
                 run_id = await self._insert(
-                    conn, target, name, slot, "failed", source_context=context
+                    conn,
+                    target,
+                    name,
+                    slot,
+                    "failed",
+                    reason="target_unbound",
+                    source_context=context,
                 )
             self._record_reclaimed(target, name, reclaimed, summary)
             if run_id is not None:
@@ -734,13 +757,19 @@ class CronSchedulerLoop:
             )
             paused_at, _, _ = await self._control(conn, target, name)
             outcome: str | None
+            reason: str | None
             if paused_at is not None:
                 outcome = "deferred"
+                reason = "hook_paused"
             elif await self._blocked_by_in_flight(conn, target, name, slot):
                 outcome = "deferred" if defer_if_busy else "skipped"
+                reason = "run_in_flight"
             else:
                 outcome = None
-            run_id = await self._insert(conn, target, name, slot, outcome, source_context=context)
+                reason = None
+            run_id = await self._insert(
+                conn, target, name, slot, outcome, reason=reason, source_context=context
+            )
         self._record_reclaimed(target, name, reclaimed, summary)
         if run_id is None:
             # Another replica recorded this slot first.
@@ -969,7 +998,10 @@ class CronSchedulerLoop:
                 async with self._engine.begin() as conn:
                     await context.ensure_before_effect(target.agent_id, name)
                     settled = (
-                        await conn.execute(self._settle_deferred_sql, {**key, "outcome": "skipped"})
+                        await conn.execute(
+                            self._settle_deferred_sql,
+                            {**key, "outcome": "skipped", "reason": "deferred_expired"},
+                        )
                     ).first()
                 if settled is not None:
                     _record_fire("skipped")
@@ -977,11 +1009,19 @@ class CronSchedulerLoop:
                 else:
                     summary.lost += 1
                 continue
-            if await self._is_killed(target.agent_id) or self._budget_spent(target):
+            retry_block: str | None = None
+            if await self._is_killed(target.agent_id):
+                retry_block = "agent_killed"
+            elif self._budget_spent(target):
+                retry_block = "budget_exhausted"
+            if retry_block is not None:
                 async with self._engine.begin() as conn:
                     await context.ensure_before_effect(target.agent_id, name)
                     settled = (
-                        await conn.execute(self._settle_deferred_sql, {**key, "outcome": "blocked"})
+                        await conn.execute(
+                            self._settle_deferred_sql,
+                            {**key, "outcome": "blocked", "reason": retry_block},
+                        )
                     ).first()
                 if settled is not None:
                     _record_fire("blocked")
@@ -995,7 +1035,10 @@ class CronSchedulerLoop:
                 async with self._engine.begin() as conn:
                     await context.ensure_before_effect(target.agent_id, name)
                     settled = (
-                        await conn.execute(self._settle_deferred_sql, {**key, "outcome": "failed"})
+                        await conn.execute(
+                            self._settle_deferred_sql,
+                            {**key, "outcome": "failed", "reason": "target_unbound"},
+                        )
                     ).first()
                 if settled is not None:
                     _record_fire("failed")

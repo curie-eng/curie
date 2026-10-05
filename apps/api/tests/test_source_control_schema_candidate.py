@@ -32,25 +32,26 @@ def test_candidate_requires_exact_ledger_schema(resource: str) -> None:
         if resource == "api"
         else catalog()["candidate"]
     )
-    assert window == {"schema_min": "0076", "schema_head": "0076"}
+    assert window == {"schema_min": "0076", "schema_head": "0079"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
-def test_new_candidate_release_fields_are_0121(field: str) -> None:
+def test_new_candidate_release_fields_are_0122(field: str) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
     if field == "cargo":
         value = tomllib.loads((ROOT / "cli/Cargo.toml").read_text())["package"]["version"]
     else:
         chart = yaml.safe_load((ROOT / "charts/curie/Chart.yaml").read_text())
         value = chart["version" if field == "chart" else "appVersion"]
-    assert value == "0.12.1"
+    assert value == "0.12.2"
 
 
 def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
     data = catalog()
     assert data["windows"].get("0.12.1") == {"schema_min": "0076", "schema_head": "0076"}
-    assert data["revisions"][-2:] == ["0075", "0076"]
+    assert data["windows"].get("0.12.2") == {"schema_min": "0076", "schema_head": "0079"}
+    assert data["revisions"][-2:] == ["0076", "0079"]
     assert (
         json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())["0076"]
         == "expand"

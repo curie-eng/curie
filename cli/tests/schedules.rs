@@ -118,6 +118,7 @@ fn schedules_body() -> Value {
                         "zone": "UTC",
                         "last_fire_at": "2026-09-25T09:00:00Z",
                         "last_outcome": "failed",
+                        "last_reason": null,
                         "paused": false
                     },
                     {
@@ -127,6 +128,7 @@ fn schedules_body() -> Value {
                         "zone": "UTC",
                         "last_fire_at": "2026-09-21T09:00:00Z",
                         "last_outcome": "ran",
+                        "last_reason": null,
                         "paused": false
                     }
                 ]
@@ -235,6 +237,37 @@ fn dry_run_performs_no_http_and_plans_schedules() {
         "plan must name /schedules: {value}"
     );
     assert_schema(&value);
+}
+
+#[test]
+fn human_output_shows_last_reason_after_the_outcome() {
+    let mut body = schedules_body();
+    body["schedules"][0]["hooks"][0]["last_reason"] = json!("target_unbound");
+    let encoded = body.to_string();
+    let server = serve(move |req| match route(&req.path) {
+        "/schedules" => Response::json(200, &encoded),
+        other => Response::json(500, &format!(r#"{{"detail":"unexpected {other}"}}"#)),
+    });
+    let json_output = local(&[], &server.base_url, true);
+    assert_eq!(
+        json_output.status.code(),
+        Some(0),
+        "{}",
+        describe(&json_output)
+    );
+    let value = one_object(&json_output);
+    assert_eq!(
+        value["schedules"][0]["hooks"][0]["last_reason"],
+        json!("target_unbound")
+    );
+    assert_schema(&value);
+
+    let human = local(&[], &server.base_url, false);
+    assert_eq!(human.status.code(), Some(0), "{}", describe(&human));
+    let text = stdout(&human);
+    let outcome_at = text.find("failed").expect(&text);
+    let reason_at = text.find("target_unbound").expect(&text);
+    assert!(reason_at > outcome_at, "{text}");
 }
 
 #[test]

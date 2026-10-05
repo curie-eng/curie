@@ -695,6 +695,8 @@ pub struct ScheduleHook {
     pub zone: String,
     pub last_fire_at: Option<String>,
     pub last_outcome: Option<String>,
+    #[serde(default)]
+    pub last_reason: Option<String>,
     pub paused: bool,
 }
 
@@ -730,6 +732,8 @@ pub struct HookFireRecord {
     pub trigger: String,
     pub slot_utc: String,
     pub outcome: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
     pub started_at: String,
     pub ended_at: Option<String>,
 }

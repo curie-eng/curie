@@ -11,7 +11,7 @@ import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast, get_args
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
@@ -25,6 +25,7 @@ from ..db import SCHEMA
 from ..deps import SessionDep, StoreDep
 from ..schemas import (
     AgentSchedulesOut,
+    HookRunReason,
     ScheduleControlOut,
     ScheduleHookOut,
     ScheduleListOut,
@@ -63,7 +64,7 @@ ORDER BY a.id, (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
 
 _LATEST_SQL = """
 SELECT DISTINCT ON (name)
-       name, slot_utc, outcome
+       name, slot_utc, outcome, reason
 FROM {schema}.hook_runs
 WHERE agent_id = :agent_id
 ORDER BY name, slot_utc DESC
@@ -157,14 +158,14 @@ async def _in_force(session: AsyncSession, agent_id: uuid.UUID | None) -> list[d
 
 async def _latest(
     session: AsyncSession, agent_id: uuid.UUID
-) -> dict[str, tuple[datetime, str | None]]:
+) -> dict[str, tuple[datetime, str | None, str | None]]:
     statement = text(_LATEST_SQL.format(schema=SCHEMA))
     rows = (await session.execute(statement, {"agent_id": agent_id})).mappings().all()
-    latest: dict[str, tuple[datetime, str | None]] = {}
+    latest: dict[str, tuple[datetime, str | None, str | None]] = {}
     for row in rows:
         name = row["name"]
         if isinstance(name, str):
-            latest[name] = (row["slot_utc"], row["outcome"])
+            latest[name] = (row["slot_utc"], row["outcome"], row["reason"])
     return latest
 
 
@@ -194,6 +195,10 @@ async def _hooks_for(
         slot = latest.get(name)
         last_fire_at = None if slot is None else slot[0]
         last_outcome = None if slot is None else _OUTCOMES.get(slot[1] or "")
+        raw_reason = None if slot is None else slot[2]
+        if raw_reason is not None and raw_reason not in get_args(HookRunReason):
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "hook run reason is unknown")
+        last_reason = cast(HookRunReason | None, raw_reason)
         hooks.append(
             ScheduleHookOut(
                 name=name,
@@ -202,6 +207,7 @@ async def _hooks_for(
                 zone=zone,
                 last_fire_at=last_fire_at,
                 last_outcome=last_outcome,
+                last_reason=last_reason,
                 paused=name in paused,
             )
         )

@@ -9914,7 +9914,7 @@ pub struct HookFireOpts {
 /// Output of `<tier> hook fire`.
 pub enum HookFireOutput {
     DryRun(crate::ui::DryRunPlan),
-    Record(crate::api::HookFireRecord),
+    Record(Box<crate::api::HookFireRecord>),
 }
 
 impl crate::ui::CliOutput for HookFireOutput {
@@ -9930,10 +9930,18 @@ impl crate::ui::CliOutput for HookFireOutput {
             HookFireOutput::DryRun(plan) => plan.render(ui),
             HookFireOutput::Record(record) => {
                 let outcome = record.outcome.as_deref().unwrap_or("-");
-                ui.payload(&format!(
-                    "{} {} {} {} {}",
-                    record.agent, record.name, record.slot_utc, outcome, record.id
-                ));
+                let reason = record.reason.as_deref().unwrap_or("");
+                if reason.is_empty() {
+                    ui.payload(&format!(
+                        "{} {} {} {} {}",
+                        record.agent, record.name, record.slot_utc, outcome, record.id
+                    ));
+                } else {
+                    ui.payload(&format!(
+                        "{} {} {} {} {} {}",
+                        record.agent, record.name, record.slot_utc, outcome, reason, record.id
+                    ));
+                }
             }
         }
     }
@@ -9968,7 +9976,7 @@ pub async fn hook_fire(opts: HookFireOpts) -> Result<HookFireOutput> {
             .get_hook_run(&opts.agent, &opts.name, &record.id)
             .await?;
     }
-    Ok(HookFireOutput::Record(record))
+    Ok(HookFireOutput::Record(Box::new(record)))
 }
 
 /// Inputs for `<tier> schedules [--agent NAME_OR_ID]`.
@@ -10019,16 +10027,31 @@ impl crate::ui::CliOutput for SchedulesOutput {
                     for hook in &agent.hooks {
                         let fire = hook.last_fire_at.as_deref().unwrap_or("-");
                         let outcome = hook.last_outcome.as_deref().unwrap_or("-");
-                        ui.payload(&format!(
-                            "{} {} {} {} {} {} {}",
-                            hook.name,
-                            hook.trigger,
-                            hook.schedule,
-                            hook.zone,
-                            fire,
-                            outcome,
-                            if hook.paused { "paused" } else { "active" }
-                        ));
+                        let reason = hook.last_reason.as_deref().unwrap_or("");
+                        if reason.is_empty() {
+                            ui.payload(&format!(
+                                "{} {} {} {} {} {} {}",
+                                hook.name,
+                                hook.trigger,
+                                hook.schedule,
+                                hook.zone,
+                                fire,
+                                outcome,
+                                if hook.paused { "paused" } else { "active" }
+                            ));
+                        } else {
+                            ui.payload(&format!(
+                                "{} {} {} {} {} {} {} {}",
+                                hook.name,
+                                hook.trigger,
+                                hook.schedule,
+                                hook.zone,
+                                fire,
+                                outcome,
+                                reason,
+                                if hook.paused { "paused" } else { "active" }
+                            ));
+                        }
                     }
                 }
             }

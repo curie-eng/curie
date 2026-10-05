@@ -256,6 +256,7 @@ fn locked_schedule_list() -> serde_json::Value {
                         "zone": "UTC",
                         "last_fire_at": "2026-09-25T02:30:00Z",
                         "last_outcome": "failed",
+                        "last_reason": null,
                         "paused": false
                     }
                 ]
@@ -525,7 +526,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         "HookFireOutput",
         samples![
             "DryRun" => HookFireOutput::DryRun(plan()),
-            "Record" => HookFireOutput::Record(
+            "Record" => HookFireOutput::Record(Box::new(
                 serde_json::from_value::<HookFireRecord>(serde_json::json!({
                     "id": "22222222-2222-4222-8222-222222222222",
                     "agent_id": "11111111-1111-4111-8111-111111111111",
@@ -538,7 +539,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                     "ended_at": "2026-09-26T12:00:01Z"
                 }))
                 .unwrap(),
-            ),
+            )),
         ],
     );
     m.insert(

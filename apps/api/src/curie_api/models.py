@@ -1944,6 +1944,7 @@ class HookRun(Base):
         ForeignKey(f"{SCHEMA}.agent_versions.id", ondelete="CASCADE")
     )
     outcome: Mapped[str | None] = mapped_column(String, default=None)
+    reason: Mapped[str | None] = mapped_column(Text, default=None)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None

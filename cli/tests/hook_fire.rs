@@ -65,6 +65,10 @@ fn assert_schema(value: &Value) {
 }
 
 fn record(outcome: Option<&str>) -> Value {
+    record_with_reason(outcome, None)
+}
+
+fn record_with_reason(outcome: Option<&str>, reason: Option<&str>) -> Value {
     json!({
         "id": "22222222-2222-4222-8222-222222222222",
         "agent_id": "11111111-1111-4111-8111-111111111111",
@@ -73,6 +77,7 @@ fn record(outcome: Option<&str>) -> Value {
         "trigger": "cron",
         "slot_utc": "2026-09-26T12:00:00Z",
         "outcome": outcome,
+        "reason": reason,
         "started_at": "2026-09-26T12:00:00Z",
         "ended_at": if outcome.is_some() { json!("2026-09-26T12:00:01Z") } else { Value::Null }
     })
@@ -124,6 +129,63 @@ fn local_fire_waits_until_the_record_settles() {
     let recorded = server.recorded();
     assert!(recorded.iter().any(|req| req.method == "POST"));
     assert!(recorded.iter().any(|req| req.method == "GET"));
+}
+
+#[test]
+fn blocked_fire_json_and_human_output_carry_the_reason() {
+    let body = record_with_reason(Some("blocked"), Some("agent_killed")).to_string();
+    let server = serve(move |req| {
+        let path = req.path.split('?').next().unwrap_or("");
+        if req.method == "POST" && path.ends_with("/fire") {
+            return Response::json(200, &body);
+        }
+        Response::json(500, r#"{"detail":"unexpected"}"#)
+    });
+    let json_output = run_in(
+        &[
+            "--json",
+            "local",
+            "hook",
+            "fire",
+            "acme-bot",
+            "nightly-cleanup",
+            "--api-url",
+            &server.base_url,
+            "--api-key",
+            TEST_API_KEY,
+        ],
+        &[],
+    );
+    assert_eq!(
+        json_output.status.code(),
+        Some(0),
+        "{}",
+        describe(&json_output)
+    );
+    let value = one_object(&json_output);
+    assert_eq!(value["outcome"], json!("blocked"));
+    assert_eq!(value["reason"], json!("agent_killed"));
+    assert_schema(&value);
+
+    let human = run_in(
+        &[
+            "local",
+            "hook",
+            "fire",
+            "acme-bot",
+            "nightly-cleanup",
+            "--api-url",
+            &server.base_url,
+            "--api-key",
+            TEST_API_KEY,
+        ],
+        &[],
+    );
+    assert_eq!(human.status.code(), Some(0), "{}", describe(&human));
+    let text = stdout(&human);
+    let outcome_at = text.find("blocked").expect(&text);
+    let reason_at = text.find("agent_killed").expect(&text);
+    assert!(reason_at > outcome_at, "{text}");
 }
 
 #[test]
