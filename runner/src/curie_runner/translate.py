@@ -267,6 +267,9 @@ class TurnState:
     tool_results: list[tuple[str, str, bool, bool]] = field(default_factory=list)
     # How many of ``tool_results`` the session has already counted.
     tool_results_observed: int = 0
+    # Call ids of the curie-slack read tools seen this turn (ADR 0100), so the
+    # session stubs their results in the portable record. History only.
+    channel_read_call_ids: set[str] = field(default_factory=set)
 
 
 def translate_message(

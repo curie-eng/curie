@@ -594,6 +594,13 @@ def test_steer_token_does_not_outlive_the_live_turn(
             task = asyncio.create_task(h.kernel.process_event(first))
             try:
                 await _wait_until(lambda: h.runner.turn_active, "the first turn to be live")
+                # The fake runner marks the turn live as its headers go out,
+                # before the kernel records the turn's deadline. Shifting the
+                # clock in that gap would record the deadline late and void the
+                # cap this test pins.
+                await _wait_until(
+                    lambda: bool(h.kernel._turn_deadlines), "the live turn's deadline recorded"
+                )
                 clock.offset_s += later_s
                 second = _as(
                     _qevent("and this", thread="th-mt-r1c", placeholder="ph-2"), "U0BOB0001"

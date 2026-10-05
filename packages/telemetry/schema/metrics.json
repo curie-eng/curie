@@ -383,6 +383,7 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channel-read",
           "/channels/admission",
           "/channels/token",
           "/channels/turns",
@@ -449,6 +450,7 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
+          "/v1/internal/channel-read/context",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
@@ -480,7 +482,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 976,
+      "cardinality_bound": 992,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -532,6 +534,7 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channel-read",
           "/channels/admission",
           "/channels/token",
           "/channels/turns",
@@ -598,6 +601,7 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
+          "/v1/internal/channel-read/context",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
@@ -636,7 +640,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 4880,
+      "cardinality_bound": 4960,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -688,6 +692,7 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channel-read",
           "/channels/admission",
           "/channels/token",
           "/channels/turns",
@@ -754,6 +759,7 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
+          "/v1/internal/channel-read/context",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
@@ -792,7 +798,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 4880,
+      "cardinality_bound": 4960,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

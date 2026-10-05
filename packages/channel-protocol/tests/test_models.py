@@ -1,5 +1,12 @@
 import pytest
-from channel_protocol import Action, ChoiceIntent, ConfirmIntent, OutboundMessage
+from channel_protocol import (
+    Action,
+    ChannelCapabilities,
+    ChannelCapability,
+    ChoiceIntent,
+    ConfirmIntent,
+    OutboundMessage,
+)
 from pydantic import ValidationError
 
 
@@ -39,3 +46,17 @@ def test_text_fallback_is_required_and_unknown_fields_are_rejected() -> None:
         OutboundMessage.model_validate({"version": "1.0"})
     with pytest.raises(ValidationError):
         OutboundMessage.model_validate({"version": "1.0", "text": "ok", "blocks": []})
+
+
+def test_history_read_capability_round_trips() -> None:
+    # ADR 0100 section 2: an adapter that can retain history advertises the
+    # read half; one that cannot simply leaves it out of its list.
+    advertised = ChannelCapabilities(
+        version="1.0", capabilities=[ChannelCapability("history-read")]
+    )
+    decoded = ChannelCapabilities.model_validate_json(advertised.model_dump_json())
+    assert decoded.capabilities == [ChannelCapability.HISTORY_READ]
+    assert ChannelCapability.HISTORY_READ.value == "history-read"
+    assert ChannelCapabilities.model_validate_json(
+        '{"version": "1.0", "capabilities": ["history-read", "threading"]}'
+    ).capabilities == [ChannelCapability.HISTORY_READ, ChannelCapability.THREADING]

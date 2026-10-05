@@ -103,6 +103,38 @@ queued turn whose `tool_access` is set (a canary sets `read-only`):
   classes: a turn the runner refuses escalates under its class, never as
   `unclassified`.
 
+The worker's half of channel read (ADR 0100, `kernel/channel_read.py`), for a
+bundle whose manifest grants `channelRead: true`. The worker is the only issuer
+of the capability the runner's `curie-slack` tools use:
+
+- **WORKER-CHANNEL-READ-1:** At turn open, on every path that opens a turn (a
+  fresh claim, a replacement, an attachment handoff, a work-item continuation),
+  the worker reads the grant from the manifest of the bundle the sandbox booted
+  with, cached by bundle ref, and mints a `chr` capability through the API's
+  internal context route. An ungranted bundle makes no mint call and the event
+  carries a null `channel_read`. A retained sandbox keeps the deployment it
+  first booted with: a pin names the claim and deployment, and when the pin is
+  missing the claim's own bundle ref must equal the resolved one to recover it,
+  otherwise the turn gets no capability.
+- **WORKER-CHANNEL-READ-2:** A granted turn on a runner whose status does not
+  carry `channel_read` as literal `true` is refused once, escalated with the
+  class `channel-read-unenforced`, and not retried, whatever the mint outcome.
+  When the grant cannot be read from the bundle and the mint also fails, the
+  worker cannot tell whether enforcement is owed, so the turn is not run and is
+  retried like any turn the runner did not accept (`runner-error`).
+- **WORKER-CHANNEL-READ-3:** The capability is a lease. The API's active key
+  lives 90 seconds, and a heartbeat child of the attempt renews it every 30
+  seconds with an owner-checked refresh until the attempt ends, so a worker
+  that dies or loses Valkey lets it lapse within one lease. A steer renews
+  the live logical turn (same deployment, event and default channel, no owner)
+  only when the retained runner reports a live turn and advertises channel
+  read; any failure sends null, which clears the runner's credential.
+- **WORKER-CHANNEL-READ-4:** Every attempt end, including cancellation,
+  deletes the live record, tombstones the attempt's owner (so a mint the API
+  commits late is refused), and revokes by owner directly in the shared Valkey,
+  covering a mint whose answer was lost. A failed revoke is retried with
+  bounded backoff until the token's expiry and attempted again at shutdown.
+
 ## The eval lane (`curie_worker.eval`)
 
 Runs an eval suite against a plugin version and records the grid the eval matrix

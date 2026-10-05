@@ -144,6 +144,27 @@ def load_bundle_web_search_enabled(plugin_dir: str | None) -> bool:
     return enabled
 
 
+def load_bundle_channel_read(plugin_dir: str | None) -> bool:
+    """Whether the bundle manifest grants channel read (ADR 0100, #2877).
+
+    The grant is ``channelRead: true`` and defaults off. Any manifest this
+    reader cannot parse grants nothing; ``load_plugins`` is the gate that
+    refuses such a bundle at startup.
+    """
+
+    if not plugin_dir:
+        return False
+    manifest_path = resolve_manifest(plugin_dir)
+    if manifest_path is None:
+        return False
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = PluginManifest.model_validate(data)
+    except (json.JSONDecodeError, ValueError, OSError):
+        return False
+    return manifest.channelRead is True
+
+
 def load_bundle_system_prompt(plugin_dir: str | None) -> str | None:
     """Return the ``systemPrompt`` declared in the bundle manifest, if any.
 

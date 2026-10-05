@@ -27,6 +27,9 @@ from plugin_format import is_reserved_boot_env_name
 # (the Kubernetes adapter on claims, the Docker adapter on containers), so they
 # live here rather than in either concrete adapter.
 MANAGED_BY_LABEL = "curietech.ai/managed-by"
+# ADR 0100 (#2877): the bundle a Docker tier claim booted with, read back by
+# ``get_claim`` (a Kubernetes claim carries it in its spec env).
+BUNDLE_REF_LABEL = "curietech.ai/bundle-ref"
 MANAGED_BY_VALUE = "curie-sandbox-substrate"
 THREAD_HASH_LABEL = "curietech.ai/thread-hash"
 # Claim-object label (not spec.additionalPodMetadata). The adopted controller
@@ -87,6 +90,7 @@ def claim_warm_pool(
     if agent_name in agent_pools:
         return pool
     return base_pool
+
 
 # The worker's own credentials, which never enter a sandbox. The connector
 # caller signing key is here and the caller token it signs
@@ -206,6 +210,9 @@ class SandboxHandle:
     # False rehydrates legacy routes conservatively and forces one replacement
     # before an eligible turn may adopt them.
     carries_turn_progress: bool = False
+    # The ``CURIE_BUNDLE_REF`` this runner booted with (ADR 0100), or None on a
+    # route written before the field existed. Worker internal, never on ACI.
+    bundle_ref: str | None = None
 
     @property
     def sandbox_id(self) -> str:
@@ -358,6 +365,10 @@ class ClaimView:
     quota_rejection: QuotaRejection | None
     ready_reason: str | None
     ready_message: str | None
+    # The ``CURIE_BUNDLE_REF`` the claim was created with, or None when the
+    # adapter cannot report it (ADR 0100): the kernel uses it to recover which
+    # deployment a retained sandbox runs.
+    bundle_ref: str | None = None
 
 
 @dataclass(frozen=True)

@@ -334,6 +334,12 @@ def _manifest_object(root: Path) -> dict[str, Any]:
     return {}
 
 
+def declared_channel_read(root: Path) -> bool:
+    """Whether the bundle grants channel read (ADR 0100); only a literal true does."""
+
+    return _manifest_object(root).get("channelRead") is True
+
+
 def approval_tool_patterns(root: Path, agent_tools: list[str] | None) -> tuple[str, ...]:
     """Approval tool names from the bundle and the agent row.
 

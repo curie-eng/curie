@@ -76,6 +76,8 @@ from .memory import (
 )
 from .memory_facts import MemoryTurn
 from .otel import RunTracer, _GenerationSpan
+from .platform_slack.capability import ChannelReadTurn
+from .platform_slack.retention import strip_channel_bodies
 from .progress import ProgressActivity
 from .redact import OutboundRedactor
 from .sender_frame import frame_user_turn
@@ -86,6 +88,7 @@ from .tool_access import (
     TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
     TurnToolAccess,
 )
+from .tool_names import CHANNEL_READ_TOOL_NAMES
 from .translate import TurnState, translate_message
 from .turn_progress import ProgressCapability, TurnProgress
 from .usage_report import UsageSink
@@ -154,7 +157,9 @@ PUBLICATION_UNRECORDED_CLASSIFICATION = "publication-unrecorded"
 # Exact membership, as ``is_platform_owned_tool`` decides it (#2286), but over
 # the maximal set: a telemetry label grants nothing, so a ``curie-state`` name
 # counts as platform whether or not this session mounted that server.
-_PLATFORM_TOOL_NAMES = platform_tool_names(state_server_mounted=True)
+# The channel read tools (ADR 0100) join this label set only: they are
+# governed by toolPolicy and never exempt, and this label grants nothing.
+_PLATFORM_TOOL_NAMES = platform_tool_names(state_server_mounted=True) | CHANNEL_READ_TOOL_NAMES
 
 
 def _tool_result_origin(tool_name: str) -> str:
@@ -308,6 +313,7 @@ class SessionRunner:
         primary_model: str | None = None,
         turn_progress: TurnProgress | None = None,
         memory_turn: MemoryTurn | None = None,
+        channel_read: ChannelReadTurn | None = None,
         tool_access: TurnToolAccess | None = None,
         attachment_notice: str | None = None,
         channel_kind: str | None = None,
@@ -341,6 +347,11 @@ class SessionRunner:
         # Who the memory tools attribute a fact to (#1461); None when the
         # tools are not mounted. Set at each turn start from the inbound event.
         self._memory_turn = memory_turn
+        # The channel read holder (ADR 0100, #2877), shared with the mounted
+        # curie-slack tools; None when this boot mounted no such server. Opened
+        # at turn start, renewed or cleared at each steer, cleared on every
+        # terminal path before any await.
+        self._channel_read = channel_read
         # Session-wide activity counters for report_progress (#3077); None when
         # no progress tool is mounted.
         self._progress_activity = progress_activity
@@ -518,6 +529,12 @@ class SessionRunner:
         return self._history_durable
 
     @property
+    def enforces_channel_read(self) -> bool:
+        """Whether this session mounted and enforces channel read (ADR 0100)."""
+
+        return self._channel_read is not None
+
+    @property
     def enforced_tool_access(self) -> tuple[str, ...]:
         """The tool access values this session enforces, for ``/status``.
 
@@ -608,7 +625,15 @@ class SessionRunner:
             messages = close_suspended_tool_calls(messages)
         try:
             harness_replay: HarnessReplayState | None = None
-            exporter = getattr(self._session, "export_replay_state", None)
+            # Once a channel read body reached this SDK session, its native
+            # checkpoint holds that body, so none is exported until a new SDK
+            # session replaces it; replay falls back to the stubbed portable
+            # messages (ADR 0100 section 7).
+            exporter = (
+                None
+                if self._channel_read is not None and self._channel_read.replay_tainted
+                else getattr(self._session, "export_replay_state", None)
+            )
             if callable(exporter):
                 try:
                     with anyio.fail_after(_HISTORY_REPLAY_EXPORT_BUDGET_SECONDS):
@@ -783,12 +808,17 @@ class SessionRunner:
         lock is free the moment this runs.
         """
 
+        if self._channel_read is not None:
+            self._channel_read.end()
         async with self._turn_lock:
             if self._session is not None:
                 await self._session.close()
             self._advertised_tools = None
             self._session = self._factory()
             await self._session.connect()
+            if self._channel_read is not None:
+                # The new SDK session holds no channel body.
+                self._channel_read.clear_replay_taint()
             self._result_pending = False
             # A new SDK session carries no earlier prompt (RUNNER-TOOL-ACCESS-4).
             self._unrestricted_prompt_sent = False
@@ -816,6 +846,9 @@ class SessionRunner:
         self._advertised_tools = None
         self._session = self._factory()
         await self._session.connect()
+        if self._channel_read is not None:
+            # The new SDK session holds no channel body.
+            self._channel_read.clear_replay_taint()
         # Anything the old session owed died with it.
         self._result_pending = False
         self._read_only_prompt_sent = False
@@ -857,6 +890,10 @@ class SessionRunner:
         self._unrestricted_prompt_sent = True
         if event is not None and self._memory_turn is not None:
             self._memory_turn.begin(event)
+        if self._channel_read is not None:
+            # Replace or clear before the steered text reaches the model, so it
+            # never reads under an earlier generation (ADR 0100).
+            self._channel_read.steer(event)
         if event is not None:
             framed = frame_user_turn(event.type, event.user, text, self._channel_kind)
         else:
@@ -878,6 +915,8 @@ class SessionRunner:
         if self._persistence_owned:
             return
         self._interrupt_requested = True
+        if self._channel_read is not None:
+            self._channel_read.end()
         if self._turn_open and not self._turn_ready:
             # Accepted turn still in connector recovery: no query has been
             # sent, and run_turn checks the flag before sending one.
@@ -904,6 +943,10 @@ class SessionRunner:
             )
         ):
             return False
+        # Only after the epoch guard: a stale timeout never touches the
+        # current turn's channel read credential.
+        if self._channel_read is not None:
+            self._channel_read.end()
         timeout_interrupt_settled = anyio.Event()
         self._timeout_requested = True
         self._timeout_interrupt_settled = timeout_interrupt_settled
@@ -1021,6 +1064,8 @@ class SessionRunner:
             self._active_state = state
             if self._memory_turn is not None:
                 self._memory_turn.begin(event)
+            if self._channel_read is not None:
+                self._channel_read.begin(event)
             # A permission-gate block belongs to exactly one turn: clear any
             # prior turn's residue before the model runs (#245).
             if self._approval_gate is not None:
@@ -1335,6 +1380,10 @@ class SessionRunner:
                             # queue a stop that could be consumed by the next
                             # turn after this owner releases the lock.
                             self._turn_epoch = None
+                            # An abandoned turn loses its channel read credential
+                            # before the interrupt below can await.
+                            if self._turn_open and self._channel_read is not None:
+                                self._channel_read.end()
                             # If the turn never reached a terminal final (_turn_open
                             # still set), the consumer abandoned the stream mid-run
                             # (client disconnect -> GeneratorExit, or cancellation).
@@ -1364,6 +1413,8 @@ class SessionRunner:
                 if self._memory_turn is not None:
                     # However the turn ended, its write credential ends with it.
                     self._memory_turn.end()
+                if self._channel_read is not None:
+                    self._channel_read.end()
                 if self._turn_progress is not None:
                     self._turn_progress.close()
                 if self._approval_gate is not None:
@@ -1425,6 +1476,23 @@ class SessionRunner:
             discarded,
         )
         return True
+
+    @staticmethod
+    def _retain_no_channel_bodies(
+        message: ConversationMessage, state: TurnState
+    ) -> ConversationMessage:
+        """Stub channel read results in the portable record (ADR 0100 section 7)."""
+
+        if message.role == "assistant" and isinstance(message.content, list):
+            state.channel_read_call_ids.update(
+                str(block["id"])
+                for block in message.content
+                if block.get("type") == "tool_use"
+                and block.get("name") in CHANNEL_READ_TOOL_NAMES
+                and isinstance(block.get("id"), str)
+            )
+            return message
+        return strip_channel_bodies(message, state.channel_read_call_ids)
 
     def _metric_outcome(self, tracker: BudgetTracker) -> str:
         if self._timeout_requested:
@@ -1519,6 +1587,8 @@ class SessionRunner:
                     else None
                 )
             history_message = model_message_to_conversation(message)
+            if history_message is not None and self._channel_read is not None:
+                history_message = self._retain_no_channel_bodies(history_message, state)
             if history_message is not None:
                 if history_message.role == "assistant":
                     history_message = replace(

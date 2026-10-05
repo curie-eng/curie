@@ -225,7 +225,22 @@ def _claim_view(obj: dict[str, Any]) -> ClaimView:
         quota_rejection=_quota_rejection(status),
         ready_reason=ready_reason,
         ready_message=ready_message,
+        bundle_ref=_claim_bundle_ref(obj),
     )
+
+
+def _claim_bundle_ref(obj: dict[str, Any]) -> str | None:
+    """The runner's ``CURIE_BUNDLE_REF`` from the claim spec env, or None."""
+
+    for entry in (obj.get("spec") or {}).get("env") or []:
+        if (
+            isinstance(entry, dict)
+            and entry.get("name") == BUNDLE_REF_ENV
+            and not entry.get("containerName")
+            and isinstance(entry.get("value"), str)
+        ):
+            return str(entry["value"])
+    return None
 
 
 def _sandbox_view(obj: dict[str, Any]) -> SandboxView:

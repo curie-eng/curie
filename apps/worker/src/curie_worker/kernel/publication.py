@@ -37,7 +37,7 @@ from ..workitem_dispatch import (
 if TYPE_CHECKING:
     from .core import Kernel
 
-from . import clock, constants, failures, memory, routing
+from . import channel_read, clock, constants, failures, memory, routing
 from .log import logger
 
 
@@ -151,6 +151,7 @@ async def _continue_unpublished(
     workspace_deployment_id: uuid.UUID | None,
     remaining_s: float | None,
     memory_grant: memory.TurnMemoryGrant | None = None,
+    channel_read_grant: channel_read.TurnChannelReadGrant | None = None,
 ) -> failures.TurnOutcome:
     """Re-prompt a factory execute turn that ended without publishing, ONCE.
 
@@ -199,6 +200,12 @@ async def _continue_unpublished(
         # ADR-0188: the continuation opens a turn too, with its own
         # credential, minted from the budget its stream is bound from.
         event = self._with_memory_token(event, qevent, memory_grant, left)
+        # ADR 0100: and its own channel read open, as this attempt's owner, on
+        # the same logical turn (the queued event id is unchanged).
+        if channel_read_grant is not None:
+            event = await self._with_channel_read(
+                event, handle, left, grant=channel_read_grant, qevent=qevent
+            )
         turn = await self._runner.start_turn(
             handle.base_url, event, token=handle.token or None, remaining_s=left
         )
@@ -211,6 +218,17 @@ async def _continue_unpublished(
             terminal_ok=False,
             saw_side_effect=outcome.saw_side_effect,
             classification=constants.TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+            error_message=exc.public_detail,
+            tools_called=outcome.tools_called,
+            assistant_text=outcome.assistant_text,
+            continued=True,
+        )
+    except failures.ChannelReadUnenforced as exc:
+        logger.warning("work-item continuation refused for %s: %s", qevent.event_id, exc)
+        return failures.TurnOutcome(
+            terminal_ok=False,
+            saw_side_effect=outcome.saw_side_effect,
+            classification=constants.CHANNEL_READ_UNENFORCED_CLASSIFICATION,
             error_message=exc.public_detail,
             tools_called=outcome.tools_called,
             assistant_text=outcome.assistant_text,

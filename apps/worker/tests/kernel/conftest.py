@@ -678,6 +678,10 @@ class FakeRunner:
         # The tool access values this runner advertises under ``tool_access``
         # (TOOL-ACCESS-4). None models a runner that predates the key.
         self.tool_access_enforced: list[str] | None = None
+        # The value this runner advertises under ``channel_read`` (ADR 0100).
+        # None omits the key, as a runner that predates it does; anything else
+        # is sent as is, so a test can advertise ``False`` or ``"true"``.
+        self.channel_read_enforced: object = None
         # When set, /status answers 200 with no ``turn_active`` field.
         self.status_malformed = False
         self.status_delay_seconds = 0.0
@@ -691,6 +695,8 @@ class FakeRunner:
         self.queried: list[str] = []
         self.admissions: list[tuple[str, bool]] = []
         self.steers: list[str] = []
+        # Every accepted /v1/steer body as received.
+        self.steer_bodies: list[dict[str, object]] = []
         self.interrupts: int = 0
         self.hold: object | None = None  # asyncio.Event when a turn should hang
         self.accept: asyncio.Event | None = None  # gate after opened, before prepare
@@ -731,6 +737,8 @@ class FakeRunner:
         }
         if self.tool_access_enforced is not None:
             body["tool_access"] = list(self.tool_access_enforced)
+        if self.channel_read_enforced is not None:
+            body["channel_read"] = self.channel_read_enforced
         if request.path == "/v1/status":
             body["turn_epoch"] = self.turn_epoch
             if self.supports_capacity_admission:
@@ -813,6 +821,7 @@ class FakeRunner:
         if not self.turn_active or (self._admission_gate is not None and not self.turn_ready):
             return web.json_response({"error": "no active turn"}, status=409)
         self.steers.append(body["text"])
+        self.steer_bodies.append(body)
         return web.json_response({"ok": True})
 
     async def _turn_admit(self, request: web.Request) -> web.Response:

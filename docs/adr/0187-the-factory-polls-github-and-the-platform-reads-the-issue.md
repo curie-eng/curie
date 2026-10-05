@@ -10,6 +10,12 @@ the clause that reading the ticket is the bundle's job for the GitHub
 factory only, and consequence 6: the platform reads the ticket for every
 tracker. Everything else in this ADR stands.
 
+**Partially amended by [ADR 0199](0199-the-factory-admits-only-tickets-it-can-start-and-finish.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+"The platform reads the issue for the bundle", item 3. The platform reads and
+classifies the ticket once at admission and stores only a verdict and a
+digest, never ticket content. The sandbox read stays verbatim and unparsed.
+
 Accepted with explicit maintainer approval on 2026-10-01 (Brian Conn),
 alongside implementation under ADR 0102.
 

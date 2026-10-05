@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from aci_protocol import (
+    CHANNEL_READ_STATUS_FIELD,
     Event,
     QueuedTurn,
     TurnSource,
@@ -727,6 +728,7 @@ async def _route_and_start(
     else:
         active_before_steer = False
         live_turn_before_steer: str | None = None
+        channel_read_supported = False
         if retained_live_route:
             try:
                 # NOT given ``remaining_s``: see the note above _turn_active.
@@ -755,6 +757,9 @@ async def _route_and_start(
                 # the steer both run under the per-thread lock, so no other
                 # attempt can open a turn on this thread between them.
                 live_turn_before_steer = memory._live_memory_turn(status.get("turn_epoch"))
+                # ADR 0100: renew the channel read capability only for a
+                # runner that enforces it; any other answer clears it.
+                channel_read_supported = status.get(CHANNEL_READ_STATUS_FIELD) is True
         steer_event = event
         mint = constants._MEMORY_MINT.get()
         if mint is not None and retained_live_route and active_before_steer:
@@ -772,6 +777,16 @@ async def _route_and_start(
                 remaining_s,
                 cap_at=self._turn_deadlines.get(mint.grant.thread_key),
             )
+        # ADR 0100: a steer renews the live logical turn's channel read
+        # capability, or sends null, which clears the runner's. It never
+        # revokes, delivered or not: its generation lives under the opener's
+        # owner and dies with the opener's revoke.
+        steer_event = await self._steer_channel_read(
+            steer_event,
+            renew=retained_live_route and active_before_steer and channel_read_supported,
+            thread_key=thread_key,
+            remaining_s=remaining_s,
+        )
         steered = await self._runner.steer(
             handle.base_url, steer_event, token=handle.token or None, remaining_s=remaining_s
         )

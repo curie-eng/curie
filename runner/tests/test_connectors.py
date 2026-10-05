@@ -801,8 +801,9 @@ def test_the_reserved_list_matches_the_runner_constants() -> None:
 def test_the_boot_mounts_only_active_platform_servers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grant: bool | None, wildcard_policy: bool
 ) -> None:
-    # Reservation alone publishes no server. A grant or wildcard policy cannot
-    # activate operations that this prerequisite has not implemented.
+    # The grant alone mounts curie-slack on a real-model boot (#2877). Absent
+    # or false mounts nothing, and a wildcard policy never mounts it either:
+    # a pattern governs a mounted tool, it does not grant one.
     env = _boot_env(monkeypatch, tmp_path, "platform-set")
     manifest_path = Path(env["CURIE_PLUGIN_DIR"]) / ".claude-plugin" / "plugin.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -820,8 +821,11 @@ def test_the_boot_mounts_only_active_platform_servers(
         potential_write=True,
     ).mcp_servers
 
-    assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
-    assert "curie-slack" not in mounted
+    if grant is True:
+        assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME, "curie-slack"}
+    else:
+        assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
+        assert "curie-slack" not in mounted
     assert set(mounted) <= RESERVED_CONNECTOR_NAMES
 
 
