@@ -71,10 +71,12 @@ its unpublished factory runner image.
 
 ## Create the repository
 
-In the GitHub website, create a public repository with one commit (an initial
-README is enough). The factory branches from the default branch, so the
-repository needs that commit. It does not need CI. Note the `owner/name` form,
-for example `acme-corp/acme-bot`.
+In the GitHub website, create a repository with one commit (an initial README
+is enough). The repository may be public or private. Either way, the GitHub App
+must be installed on it, which the **Install App** step under
+[Rerun with the App](#rerun-with-the-app) covers. The factory branches from the
+default branch, so the repository needs that commit. It does not need CI. Note
+the `owner/name` form, for example `acme-corp/acme-bot`.
 
 ## Choose the target and run the command
 
