@@ -296,8 +296,9 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       {{- end }}
-      {{- if or $bf.enabled $wf.enabled $af.enabled $runner.hardening.enabled $stubCa }}
+      {{- if or $bf.enabled $wf.enabled $af.enabled $runner.hardening.enabled $stubCa (include "curie.codeHostTrust.name" .) }}
       volumes:
+        {{- include "curie.codeHostTrust.volume" . | nindent 8 }}
         {{- if $bf.enabled }}
         # Shared bundle volume: the init pair populates <mountPath>/current, the
         # runner reads it as CURIE_PLUGIN_DIR. sizeLimit is ADR-0059 decision
@@ -499,7 +500,7 @@ spec:
             - -c
             - |
               import base64, hashlib, json, os, pathlib, re, shutil, signal, subprocess, sys, time, urllib.request
-              from urllib.parse import urlsplit, urlunsplit
+              from urllib.parse import urlsplit
               class NoRedirect(urllib.request.HTTPRedirectHandler):
                   def redirect_request(self, request, fp, code, message, headers, new_url):
                       return None
@@ -569,15 +570,35 @@ spec:
                   ).strip()
               except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                   raise SystemExit("workspace-init: checkout origin is unreadable")
+              # The trusted origin and repository path come from the worker's
+              # claim, which took them from the API's credential (ADR 0197).
+              # The checkout must be exactly that path under that origin.
+              trusted = os.environ.get("CURIE_REPO_ORIGIN", "")
+              path = os.environ.get("CURIE_REPO_PATH", "")
+              if not trusted or not path:
+                  raise SystemExit("workspace-init: claim names no trusted repository origin and path")
               try:
-                  api = urlsplit(os.environ.get("CURIE_GITHUB_API_URL", "https://api.github.com").rstrip("/"))
-                  authority = "github.com" if api.netloc == "api.github.com" else api.netloc
-                  html_base = urlunsplit((api.scheme, authority, api.path.removesuffix("/api/v3"), "", ""))
+                  base = urlsplit(trusted)
                   parsed = urlsplit(origin)
-                  _ = parsed.port
+                  _ = base.port, parsed.port
               except ValueError:
                   raise SystemExit("workspace-init: checkout origin is invalid")
-              repo = origin[len(html_base) + 1:].removesuffix(".git")
+              segments = path.split("/")
+              if (
+                  base.scheme != "https"
+                  or not base.hostname
+                  or base.username is not None
+                  or base.password is not None
+                  or base.query
+                  or base.fragment
+                  or trusted.endswith("/")
+                  or len(segments) < 2
+                  or any(
+                      not re.fullmatch(r"[A-Za-z0-9._-]+", segment) or segment in {".", ".."}
+                      for segment in segments
+                  )
+              ):
+                  raise SystemExit("workspace-init: trusted repository origin or path is invalid")
               if (
                   parsed.scheme != "https"
                   or not parsed.hostname
@@ -585,11 +606,7 @@ spec:
                   or parsed.password is not None
                   or parsed.query
                   or parsed.fragment
-                  or not re.fullmatch(
-                      r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?",
-                      repo,
-                  )
-                  or origin != f"{html_base}/{repo}.git"
+                  or origin != f"{trusted}/{path}.git"
               ):
                   raise SystemExit("workspace-init: checkout origin is not credential-free")
               for child in stage.iterdir():
@@ -601,8 +618,10 @@ spec:
               value: ""
             - name: CURIE_WORKSPACE_SHA256
               value: ""
-            - name: CURIE_GITHUB_API_URL
-              value: {{ .Values.api.githubApiUrl | default "https://api.github.com" | quote }}
+            - name: CURIE_REPO_ORIGIN
+              value: ""
+            - name: CURIE_REPO_PATH
+              value: ""
           volumeMounts:
             - name: workspace
               mountPath: {{ $wf.mountPath }}
@@ -914,8 +933,7 @@ spec:
             {{- end }}
             - name: CURIE_PLUGIN_DIR
               value: {{ $runner.pluginDir | quote }}
-            - name: CURIE_GITHUB_API_URL
-              value: {{ .Values.api.githubApiUrl | default "https://api.github.com" | quote }}
+            {{- include "curie.codeHostTrust.clientEnv" . | nindent 12 }}
             # Generic identity for a pre-warmed, not-yet-claimed sandbox; the
             # substrate's resume path overrides it per-claim.
             - name: CURIE_SESSION_ID
@@ -979,8 +997,9 @@ spec:
             {{- toYaml $runner.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml $runner.resources | nindent 12 }}
-          {{- if or $bf.enabled $wf.enabled $af.enabled $runner.hardening.enabled $stubCa }}
+          {{- if or $bf.enabled $wf.enabled $af.enabled $runner.hardening.enabled $stubCa (include "curie.codeHostTrust.name" .) }}
           volumeMounts:
+            {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
             {{- if $bf.enabled }}
             - name: bundles
               mountPath: {{ $bf.mountPath }}

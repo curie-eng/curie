@@ -8,12 +8,19 @@ write only through `CodeHost`, and the internal worker routes in
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from dataclasses import dataclass
 
 from curie_api.forges.errors import Ambiguous, ForgeError
 from curie_api.forges.ports import CodeHost
-from curie_api.forges.types import Commit, PullRequest, RepositoryRef
+from curie_api.forges.types import (
+    Commit,
+    PullRequest,
+    PullRequestRef,
+    PullRequestState,
+    RepositoryRef,
+)
 
 
 class PullRequestRefused(Exception):
@@ -125,3 +132,70 @@ async def adopt_or_open(
             raise failure from None
         return _adopt(recovered, contract, expected_head_sha)
     return _adopt(opened, contract, expected_head_sha)
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+async def update_metadata(
+    code_host: CodeHost,
+    pull_request: PullRequestRef,
+    contract: PullRequestContract,
+    *,
+    expected_head_sha: str,
+    observed_title_sha256: str,
+    observed_body_sha256: str,
+) -> PullRequest:
+    """Apply an approved title and body change to the stored pull request.
+
+    A metadata-only revision pushes nothing, so no publication Job runs: this
+    is its whole effect. The pull request must still be the lineage's, on the
+    expected head, and unchanged since the approver saw it (its title and body
+    hash to the observed digests). A merged or closed pull request is returned
+    unchanged so the caller records the lineage terminal. The update's answer
+    must carry the code host's change time, which CI freshness is judged after.
+    """
+
+    current = await code_host.read_pull_request(pull_request)
+    if current.head_ref != contract.branch or current.base_ref != contract.base:
+        raise PullRequestRefused(
+            "pull_request_mismatch",
+            "the pull request does not match the approved publication contract",
+        )
+    if current.head_sha != expected_head_sha:
+        raise PullRequestRefused(
+            "pull_request_mismatch", "the pull request head does not match the expected commit"
+        )
+    if current.state is not PullRequestState.OPEN:
+        return current
+    if contract.draft and not current.draft:
+        raise PullRequestRefused(
+            "pull_request_mismatch", "the pull request is not the required draft"
+        )
+    if (_sha256(current.title), _sha256(current.body)) != (
+        observed_title_sha256,
+        observed_body_sha256,
+    ):
+        raise PullRequestRefused(
+            "metadata_changed", "pull request metadata changed after publication approval"
+        )
+    if (current.title, current.body) == (contract.title, contract.body):
+        raise PullRequestRefused(
+            "metadata_unchanged", "pull request metadata already matches the proposal"
+        )
+    updated = await code_host.update_pull_request(
+        pull_request,
+        title=contract.title if current.title != contract.title else None,
+        body=contract.body if current.body != contract.body else None,
+    )
+    if (updated.title, updated.body, updated.head_ref, updated.head_sha) != (
+        contract.title,
+        contract.body,
+        contract.branch,
+        expected_head_sha,
+    ) or updated.updated_at is None:
+        raise PullRequestRefused(
+            "metadata_unconfirmed", "the pull request metadata update was not confirmed"
+        )
+    return updated

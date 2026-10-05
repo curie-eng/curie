@@ -130,6 +130,10 @@ class PullRequest:
     # Whether the head conflicts with its base branch; None while the code host
     # has not computed it (a conflicted pull request runs no pull request CI).
     conflicted: bool | None = None
+    # When the code host last changed the pull request, as it reports it; None
+    # when the payload carried no usable time. A metadata-only revision records
+    # it so CI freshness is judged after the edit.
+    updated_at: datetime | None = None
 
 
 @dataclass(frozen=True)

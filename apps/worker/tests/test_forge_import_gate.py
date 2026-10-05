@@ -17,12 +17,7 @@ from curie_test_support.forge_imports import scan_source, scan_tree, worker_impo
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKER_SOURCE = REPO_ROOT / "apps" / "worker" / "src"
 
-ALLOWLIST: frozenset[str] = frozenset(
-    {
-        "apps/worker/src/curie_worker/config.py",
-        "apps/worker/src/curie_worker/publication_k8s.py",
-    }
-)
+ALLOWLIST: frozenset[str] = frozenset()
 
 
 def _offenders() -> dict[str, list[str]]:

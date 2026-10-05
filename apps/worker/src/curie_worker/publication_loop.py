@@ -25,10 +25,12 @@ from channel_protocol.reply import (
 from .approval_cards import ApprovalCardRef, ApprovalCardStore
 from .approvals import decided_field
 from .publication_k8s import (
+    HeaderForm,
     PublicationJobSettings,
     PublicationPayload,
     PublicationResourceError,
     PublicationResourceNames,
+    PublicationTransport,
     build_publication_resources,
     deterministic_publication_branch,
     publication_branch_is_valid,
@@ -36,11 +38,8 @@ from .publication_k8s import (
 )
 from .reply_sink import InvalidReplyTargetError, ReplySink, TargetRoute
 
-_PR_MARKER = re.compile(r"^CURIE_PR_URL=(https://[^\s]+/pull/[1-9][0-9]*)$", re.MULTILINE)
-_PR_NUMBER_MARKER = re.compile(r"^CURIE_PR_NUMBER=([1-9][0-9]*)$", re.MULTILINE)
+# The Job's one marker: the commit it pushed, printed after the push.
 _COMMIT_MARKER = re.compile(r"^CURIE_COMMIT_SHA=([0-9a-f]{40,64})$", re.MULTILINE)
-_PR_STATE_MARKER = re.compile(r"^CURIE_PR_STATE=(closed|merged)$", re.MULTILINE)
-_PR_UPDATED_MARKER = re.compile(r"^CURIE_PR_UPDATED_AT=([^\s]+)$", re.MULTILINE)
 # How many CONSECUTIVE unavailable identity reads one publication may escape
 # reconcile() uncharged before it falls back to the ordinary bounded path.
 # publication_authority.py maps 401, 403, 404, 429 and every 5xx onto
@@ -81,8 +80,21 @@ class PublicationRemoteTerminalError(PublicationReconcileError):
 
 @dataclass(frozen=True)
 class PublicationCredential:
+    """A push credential and its transport facts, as the API issued them (ADR 0197)."""
+
     clean_clone_url: str
     authorization_header: str
+    origin: str
+    header_form: HeaderForm
+    ca_bundle_ref: str | None = None
+
+    @property
+    def transport(self) -> PublicationTransport:
+        return PublicationTransport(
+            origin=self.origin,
+            header_form=self.header_form,
+            ca_bundle_ref=self.ca_bundle_ref,
+        )
 
 
 @dataclass(frozen=True)
@@ -92,18 +104,19 @@ class PublicationPullState:
     state: Literal["open", "closed", "merged"]
     head_sha: str
     head_ref: str
+    updated_at: datetime | None = None
 
 
 @dataclass(frozen=True)
 class PublicationJobObservation:
     phase: str
-    pr_url: str | None
     logs: str
-    pr_number: int | None = None
     commit_sha: str | None = None
-    pr_state: Literal["closed", "merged"] | None = None
     error: str | None = None
     exists: bool = True
+    # The transport facts the existing Job was built with; adoption rebuilds
+    # the expected resources from them. None when no Job exists.
+    transport: PublicationTransport | None = None
 
 
 @dataclass(frozen=True)
@@ -119,15 +132,11 @@ class PublicationWork:
     branch: str
     pr_number: int | None
     pr_url: str | None
-    github_repository_id: int | None
-    github_pr_node_id: str | None
     expected_prior_head: str
     expected_remote_head: str | None
     base_sha: str
     patch: bytes
     changed_paths: tuple[str, ...]
-    observed_title_sha256: str | None
-    observed_body_sha256: str | None
     title: str
     body: str
     target: ReplyTarget
@@ -137,9 +146,7 @@ class PublicationWork:
     # False only when this publication already launched and its execution is
     # no longer running. New launches stay excluded by the claim query.
     owner_running: bool = True
-    open_as_draft: bool = False
     branch_prefix: str | None = None
-    base_ref: str | None = None
 
 
 class PublicationStore(Protocol):
@@ -262,6 +269,10 @@ class PublicationCodeHost(Protocol):
         self, publication_id: uuid.UUID, *, expected_head_sha: str
     ) -> PublicationPullState | None | Awaitable[PublicationPullState | None]: ...
 
+    def update_pull_request_metadata(
+        self, publication_id: uuid.UUID
+    ) -> PublicationPullState | Awaitable[PublicationPullState]: ...
+
 
 class PublicationTranscript(Protocol):
     def record_result(
@@ -289,58 +300,29 @@ async def _cluster_call[T](
     return await _resolve(result)
 
 
-def _marker_url(logs: str) -> str | None:
-    match = _PR_MARKER.search(logs)
-    return match.group(1) if match else None
-
-
-def _marker_number(logs: str) -> int | None:
-    match = _PR_NUMBER_MARKER.search(logs)
-    return int(match.group(1)) if match else None
-
-
 def _marker_commit(logs: str) -> str | None:
     match = _COMMIT_MARKER.search(logs)
     return match.group(1) if match else None
 
 
-def _marker_state(logs: str) -> Literal["closed", "merged"] | None:
-    match = _PR_STATE_MARKER.search(logs)
-    return cast(Literal["closed", "merged"], match.group(1)) if match else None
+def _checked_pr_url(url: str, number: int) -> str:
+    """A pull request URL the API returned, checked for shape only.
 
+    The API derived it through the code host and checks it again against the
+    lineage when it advances; the worker knows no forge URL pattern.
+    """
 
-def _marker_updated_at(logs: str) -> datetime | None:
-    match = _PR_UPDATED_MARKER.search(logs)
-    if match is None:
-        return None
-    try:
-        value = datetime.fromisoformat(match.group(1))
-    except ValueError:
-        return None
-    return value if value.tzinfo is not None else None
-
-
-def _validated_pr_url(
-    work: PublicationWork, url: str | None, *, github_html_base: str
-) -> str | None:
-    """Accept only a pull request URL for the publication's exact repository."""
-
-    if url is None:
-        return None
-    expected = re.compile(
-        rf"{re.escape(github_html_base)}/{re.escape(work.repo_full_name)}/pull/[1-9][0-9]*",
-        re.IGNORECASE,
-    )
     parsed = urlsplit(url)
     if (
         parsed.scheme != "https"
+        or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
-        or expected.fullmatch(url) is None
+        or parsed.query
+        or parsed.fragment
+        or not url.endswith(f"/{number}")
     ):
-        raise PublicationReconcileError(
-            "publication result URL does not belong to the requested repository"
-        )
+        raise PublicationReconcileError("the pull request URL is not a clean HTTPS URL")
     return url
 
 
@@ -860,29 +842,21 @@ class PublicationReconciler:
         await self.deliver_pending_result(work.publication_id)
 
     @staticmethod
-    def _payload(work: PublicationWork, *, clean_clone_url: str) -> PublicationPayload:
+    def _payload(work: PublicationWork, transport: PublicationTransport) -> PublicationPayload:
         return PublicationPayload(
             publication_id=work.publication_id,
             revision_id=work.revision_id,
             revision_number=work.revision_number,
             repo_full_name=work.repo_full_name,
-            clean_clone_url=clean_clone_url,
+            clean_clone_url=f"{transport.origin}/{work.repo_full_name}.git",
             base_sha=work.base_sha,
             expected_prior_head=work.expected_prior_head,
             expected_remote_head=work.expected_remote_head,
             patch=work.patch,
             branch=work.branch,
-            pr_number=work.pr_number,
-            pr_url=work.pr_url,
-            github_repository_id=work.github_repository_id,
-            github_pr_node_id=work.github_pr_node_id,
             title=work.title,
-            body=work.body,
-            observed_title_sha256=work.observed_title_sha256,
-            observed_body_sha256=work.observed_body_sha256,
-            open_as_draft=work.open_as_draft,
+            transport=transport,
             branch_prefix=work.branch_prefix,
-            base_ref=work.base_ref,
         )
 
     async def _read_stored_pull(self, work: PublicationWork) -> PublicationPullState | None:
@@ -895,18 +869,143 @@ class PublicationReconciler:
             raise PublicationReconcileError(
                 "pull request head branch no longer matches the stored lineage branch"
             )
-        validated_url = _validated_pr_url(
-            work, pull.url, github_html_base=self._job_settings.github_html_base
-        )
         if (
-            validated_url is None
-            or work.pr_url is None
-            or validated_url.casefold() != work.pr_url.casefold()
+            work.pr_url is None
+            or _checked_pr_url(pull.url, pull.number).casefold() != work.pr_url.casefold()
         ):
             raise PublicationReconcileError(
                 "pull request URL no longer matches the stored lineage identity"
             )
         return pull
+
+    async def _record_terminal_pull(
+        self, work: PublicationWork, pull: PublicationPullState
+    ) -> None:
+        """Record a merged or closed pull request on a head this lineage trusts, then stop.
+
+        The pull request's head is trusted when it is the stored lineage head,
+        or when the API proves it is this revision's marked commit on the
+        expected parent. Otherwise the stored head is recorded, and with none
+        the lineage cannot be closed safely.
+        """
+
+        assert pull.state != "open"
+        trusted_head = work.expected_remote_head
+        if pull.head_sha != trusted_head:
+            try:
+                verified_head = await _resolve(
+                    self._code_host.verify_revision_commit(
+                        work.publication_id,
+                        pull.head_sha,
+                        revision_id=work.revision_id,
+                        expected_parent=work.expected_prior_head,
+                    )
+                )
+                if verified_head != pull.head_sha:
+                    raise PublicationReconcileError(
+                        "revision verification returned a different commit"
+                    )
+            except PublicationReconcileError:
+                if trusted_head is None:
+                    raise PublicationReconcileError(
+                        "terminal pull request head has no trusted lineage commit"
+                    ) from None
+            else:
+                trusted_head = verified_head
+        if trusted_head is None:
+            raise PublicationReconcileError(
+                "terminal pull request head has no trusted lineage commit"
+            )
+        await self._mark_lineage_terminal(
+            work,
+            pull.state,
+            pr_number=pull.number,
+            pr_url=_checked_pr_url(pull.url, pull.number),
+            head_sha=trusted_head,
+        )
+        raise PublicationReconcileError(f"pull request lineage is {pull.state}; start a new thread")
+
+    async def _settle_pull(
+        self,
+        work: PublicationWork,
+        pull: PublicationPullState,
+        *,
+        pushed_head: str,
+        names: PublicationResourceNames,
+        metadata_updated_at: datetime | None = None,
+    ) -> None:
+        """Publish ``pushed_head`` on ``pull``, or record the pull request terminal.
+
+        A pull request merged or closed while the Job was scheduled or pushing
+        is recorded from this read (ADR 0197, Consequence 6).
+        """
+
+        url = _checked_pr_url(pull.url, pull.number)
+        if pull.head_ref != work.branch:
+            raise PublicationReconcileError(
+                "pull request head branch no longer matches the stored lineage branch"
+            )
+        if work.pr_number is not None and pull.number != work.pr_number:
+            raise PublicationReconcileError("the API returned a different stored pull request")
+        if pull.state != "open":
+            if pull.head_sha == pushed_head:
+                await self._mark_lineage_terminal(
+                    work,
+                    pull.state,
+                    pr_number=pull.number,
+                    pr_url=url,
+                    head_sha=pushed_head,
+                )
+                raise PublicationReconcileError(
+                    f"pull request lineage is {pull.state}; start a new thread"
+                )
+            await self._record_terminal_pull(work, pull)
+        if pull.head_sha != pushed_head:
+            raise PublicationReconcileError(
+                "pull request head does not match the pushed publication commit"
+            )
+        await self._terminalize(
+            work,
+            outcome="published",
+            pr_url=url,
+            pr_number=pull.number,
+            new_head=pushed_head,
+            names=names,
+            metadata_updated_at=metadata_updated_at,
+        )
+
+    async def _settle_pushed(
+        self, work: PublicationWork, commit_sha: str, names: PublicationResourceNames
+    ) -> None:
+        """After the Job's push: prove the commit, then find or open its pull request.
+
+        The Job's marker is not authority on its own: the API proves the
+        remote commit is this revision's marked commit on the expected parent
+        before anything is recorded.
+        """
+
+        await _resolve(
+            self._code_host.verify_revision_commit(
+                work.publication_id,
+                commit_sha,
+                revision_id=work.revision_id,
+                expected_parent=work.expected_prior_head,
+            )
+        )
+        if work.pr_number is None:
+            pull = await _resolve(
+                self._code_host.recover_pull_request(
+                    work.publication_id, expected_head_sha=commit_sha
+                )
+            )
+            if pull is None:
+                raise PublicationReconcileError(
+                    "the pushed publication branch is absent on the code host"
+                )
+        else:
+            pull = await self._read_stored_pull(work)
+            assert pull is not None
+        await self._settle_pull(work, pull, pushed_head=commit_sha, names=names)
 
     async def _finish_observation(
         self,
@@ -914,86 +1013,68 @@ class PublicationReconciler:
         observation: PublicationJobObservation,
         names: PublicationResourceNames,
     ) -> bool:
-        pr_url = _validated_pr_url(
-            work,
-            observation.pr_url or _marker_url(observation.logs),
-            github_html_base=self._job_settings.github_html_base,
-        )
-        pr_number = observation.pr_number or _marker_number(observation.logs)
         commit_sha = observation.commit_sha or _marker_commit(observation.logs)
-        pr_state = observation.pr_state or _marker_state(observation.logs)
-        if observation.phase in {"pending", "running"} and (
-            pr_state is not None or pr_url is None or pr_number is None or commit_sha is None
-        ):
-            # The commit marker is the script's final line, so a complete
-            # success triple already proves the pull request exists. Settle it
-            # now instead of waiting on pod exit and Job status (#3074). Any
-            # other in-flight shape waits for the terminal phase.
-            return False
-        if pr_state is not None:
-            if pr_url is None or pr_number is None or commit_sha is None:
+        if commit_sha is None:
+            if observation.phase in {"pending", "running"}:
+                return False
+            if observation.phase == "failed":
                 raise PublicationReconcileError(
-                    "publication Job terminal state omitted exact pull request facts"
+                    observation.error or "publication Job failed without a pushed commit"
                 )
-            if pr_number != int(pr_url.rsplit("/", 1)[1]):
-                raise PublicationReconcileError(
-                    "publication Job terminal pull request facts are inconsistent"
-                )
-            if work.pr_number is not None and pr_number != work.pr_number:
-                raise PublicationReconcileError(
-                    "publication Job returned a different stored pull request"
-                )
-            if work.pr_url is not None and pr_url.casefold() != work.pr_url.casefold():
-                raise PublicationReconcileError(
-                    "publication Job returned a different stored pull request"
-                )
-            await self._mark_lineage_terminal(
-                work,
-                pr_state,
-                pr_number=pr_number,
-                pr_url=pr_url,
-                head_sha=commit_sha,
-            )
             raise PublicationReconcileError(
-                f"pull request lineage is {pr_state}; start a new thread"
+                "publication Job succeeded without its pushed commit marker"
             )
-        if pr_url is not None and pr_number is not None and commit_sha is not None:
-            if work.pr_number is not None and pr_number != work.pr_number:
+        # The commit marker is the script's final line, printed only after the
+        # push, so it settles the publication now instead of waiting on pod
+        # exit and Job status (#3074). The API finds or opens the pull request.
+        await self._settle_pushed(work, commit_sha, names)
+        return True
+
+    async def _publish_metadata(self, work: PublicationWork) -> None:
+        """A metadata-only revision: the API updates the stored pull request.
+
+        It has nothing to push, so no Job runs. A merged or closed pull request
+        is recorded terminal instead.
+        """
+
+        names = publication_resource_names(work.publication_id)
+        try:
+            if work.pr_number is None:
                 raise PublicationReconcileError(
-                    "publication Job returned a different stored pull request"
+                    "metadata-only publication requires a stored pull request"
                 )
-            await self._terminalize(
+            pull = await _resolve(self._code_host.update_pull_request_metadata(work.publication_id))
+            if pull.number != work.pr_number or (
+                work.pr_url is None
+                or _checked_pr_url(pull.url, pull.number).casefold() != work.pr_url.casefold()
+            ):
+                raise PublicationReconcileError(
+                    "pull request URL no longer matches the stored lineage identity"
+                )
+            if pull.state == "open" and pull.updated_at is None:
+                raise PublicationReconcileError(
+                    "metadata-only publication has no code host update time"
+                )
+        except PublicationIdentityUnavailable as identity_exc:
+            await self._identity_unavailable(work, identity_exc)
+            return
+        except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
+            await self._bounded_setup_failure(work, exc)
+            return
+        try:
+            await self._settle_pull(
                 work,
-                outcome="published",
-                pr_url=pr_url,
-                pr_number=pr_number,
-                new_head=commit_sha,
+                pull,
+                pushed_head=work.base_sha,
                 names=names,
-                metadata_updated_at=(
-                    _marker_updated_at(observation.logs) if not work.patch else None
-                ),
+                metadata_updated_at=pull.updated_at if pull.state == "open" else None,
             )
-            return True
-        # Jobs created by the immediately preceding release emitted only the
-        # URL marker. Preserve their terminal outbox behavior without claiming
-        # a lineage head that they did not prove. New lineage Jobs always emit
-        # all three markers and therefore take the CAS path above.
-        if pr_url is not None and pr_number is None and commit_sha is None:
-            await self._terminalize(
-                work,
-                outcome="published",
-                pr_url=pr_url,
-                names=names,
-                metadata_updated_at=None,
-            )
-            return True
-        if observation.phase == "failed":
-            raise PublicationReconcileError(
-                observation.error or "publication Job failed without lineage markers"
-            )
-        raise PublicationReconcileError(
-            "publication Job succeeded without complete lineage markers"
-        )
+        except PublicationIdentityUnavailable as identity_exc:
+            await self._identity_unavailable(work, identity_exc)
+        except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
+            if await _resolve(self._store.is_terminal(work.publication_id)):
+                raise
+            await self._bounded_setup_failure(work, exc)
 
     async def reconcile(self, work: PublicationWork, *, allow_launch: bool = True) -> None:
         names = publication_resource_names(work.publication_id)
@@ -1005,7 +1086,7 @@ class PublicationReconciler:
 
         # Pending, expired, and unknown states are never authority. Expiry is
         # terminalized by the API/store lane, as is denial; neither creates a
-        # cluster or GitHub side effect here.
+        # cluster or code host side effect here.
         if work.decision != "approved":
             return
         if not publication_branch_is_valid(work.branch, work.branch_prefix):
@@ -1019,6 +1100,21 @@ class PublicationReconciler:
             )
             return
 
+        if not work.patch:
+            if not allow_launch:
+                await _resolve(
+                    self._store.persist_result(
+                        work.publication_id,
+                        outcome="failed",
+                        pr_url=None,
+                        error="the factory run already ended",
+                        metadata_updated_at=None,
+                    )
+                )
+                return
+            await self._publish_metadata(work)
+            return
+
         try:
             observation = await _cluster_call(self._cluster.observe, names.job)
         except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
@@ -1027,19 +1123,19 @@ class PublicationReconciler:
 
         if observation.exists:
             # Validate deterministic collisions before trusting either an
-            # in-flight state or terminal Job markers. The placeholder is used
-            # only to construct the expected immutable Secret shape;
+            # in-flight state or the Job's commit marker. The placeholder is
+            # used only to construct the expected immutable Secret shape;
             # validate_existing deliberately does not compare Secret bytes, so
-            # a rotated installation token is never needed merely to adopt the
-            # already-created Job.
+            # a rotated credential is never needed merely to adopt the
+            # already-created Job. Its transport facts are rebuilt into the
+            # expected Job and validated with everything else.
             try:
+                if observation.transport is None:
+                    raise PublicationResourceError(
+                        "existing publication Job names no code host transport"
+                    )
                 probe_resources = build_publication_resources(
-                    self._payload(
-                        work,
-                        clean_clone_url=(
-                            f"{self._job_settings.github_html_base}/{work.repo_full_name}.git"
-                        ),
-                    ),
+                    self._payload(work, observation.transport),
                     credential="validation-placeholder",
                     settings=self._job_settings,
                 )
@@ -1047,11 +1143,16 @@ class PublicationReconciler:
             except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
                 await self._bounded_setup_failure(work, exc)
                 return
-            if observation.phase in {"pending", "running"}:
+            if observation.phase in {"pending", "running"} or (
+                observation.commit_sha or _marker_commit(observation.logs)
+            ):
                 try:
                     if await self._finish_observation(work, observation, probe_resources.names):
                         return
                 except PublicationIdentityUnavailable as identity_exc:
+                    # A transient lineage verification failure must never
+                    # consume a reconcile attempt. Lease expiry retries it
+                    # uncharged, bounded so a permanent failure still converges.
                     await self._identity_unavailable(work, identity_exc)
                     return
                 except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
@@ -1072,31 +1173,6 @@ class PublicationReconciler:
                     return
                 await self._release_in_flight(work)
                 return
-            marker_url = observation.pr_url or _marker_url(observation.logs)
-            marker_number = observation.pr_number or _marker_number(observation.logs)
-            marker_commit = observation.commit_sha or _marker_commit(observation.logs)
-            marker_state = observation.pr_state or _marker_state(observation.logs)
-            if (
-                marker_state is not None
-                or (
-                    marker_url is not None
-                    and marker_number is not None
-                    and marker_commit is not None
-                )
-                or (marker_url is not None and marker_number is None and marker_commit is None)
-            ):
-                try:
-                    await self._finish_observation(work, observation, probe_resources.names)
-                except PublicationIdentityUnavailable as identity_exc:
-                    # A transient lineage verification failure must never consume
-                    # a reconcile attempt. Lease expiry retries it uncharged,
-                    # bounded so a permanent failure still converges.
-                    await self._identity_unavailable(work, identity_exc)
-                except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
-                    if await _resolve(self._store.is_terminal(work.publication_id)):
-                        raise
-                    await self._bounded_setup_failure(work, exc)
-                return
 
         if not allow_launch:
             await _resolve(
@@ -1113,13 +1189,17 @@ class PublicationReconciler:
         credential: PublicationCredential
         try:
             # The approved decision is the only authority to redeem. Redeem
-            # exactly once, for the one immutable Job Secret; the pull request,
-            # branch and commit reads go through the API's code host.
+            # exactly once, for the one immutable Job Secret. The stored pull
+            # request is checked here, before the Job launches (ADR 0197,
+            # Consequence 6); the pull request, branch and commit reads go
+            # through the API's code host.
             credential = await _resolve(self._credentials.redeem(work.publication_id))
             pull = await self._read_stored_pull(work)
             if pull is None:
                 branch_head = await _resolve(self._code_host.read_branch_head(work.publication_id))
                 if branch_head is not None:
+                    # A lost Job or result: the branch already holds a pushed
+                    # revision. Prove it is this one, then settle its pull request.
                     await _resolve(
                         self._code_host.verify_revision_commit(
                             work.publication_id,
@@ -1137,80 +1217,10 @@ class PublicationReconciler:
                         raise PublicationReconcileError(
                             "verified publication branch has no recoverable pull request"
                         )
-                    validated_url = _validated_pr_url(
-                        work,
-                        recovered.url,
-                        github_html_base=self._job_settings.github_html_base,
-                    )
-                    if (
-                        validated_url is None
-                        or recovered.number != int(validated_url.rsplit("/", 1)[1])
-                        or recovered.head_ref != work.branch
-                        or recovered.head_sha != branch_head
-                    ):
-                        raise PublicationReconcileError(
-                            "recovered pull request does not match the verified publication"
-                        )
-                    if recovered.state == "closed" or recovered.state == "merged":
-                        await self._mark_lineage_terminal(
-                            work,
-                            recovered.state,
-                            pr_number=recovered.number,
-                            pr_url=validated_url,
-                            head_sha=recovered.head_sha,
-                        )
-                        raise PublicationReconcileError(
-                            f"pull request lineage is {recovered.state}; start a new thread"
-                        )
-                    if recovered.state != "open":
-                        raise PublicationReconcileError("GitHub pull request state is invalid")
-                    await self._terminalize(
-                        work,
-                        outcome="published",
-                        pr_url=validated_url,
-                        pr_number=recovered.number,
-                        new_head=recovered.head_sha,
-                        names=names,
-                        metadata_updated_at=None,
-                    )
+                    await self._settle_pull(work, recovered, pushed_head=branch_head, names=names)
                     return
             if pull is not None and pull.state != "open":
-                trusted_head = work.expected_remote_head
-                if pull.head_sha != trusted_head:
-                    try:
-                        verified_head = await _resolve(
-                            self._code_host.verify_revision_commit(
-                                work.publication_id,
-                                pull.head_sha,
-                                revision_id=work.revision_id,
-                                expected_parent=work.expected_prior_head,
-                            )
-                        )
-                        if verified_head != pull.head_sha:
-                            raise PublicationReconcileError(
-                                "revision verification returned a different commit"
-                            )
-                    except PublicationReconcileError:
-                        if trusted_head is None:
-                            raise PublicationReconcileError(
-                                "terminal pull request head has no trusted lineage commit"
-                            ) from None
-                    else:
-                        trusted_head = verified_head
-                if trusted_head is None:
-                    raise PublicationReconcileError(
-                        "terminal pull request head has no trusted lineage commit"
-                    )
-                await self._mark_lineage_terminal(
-                    work,
-                    pull.state,
-                    pr_number=pull.number,
-                    pr_url=pull.url,
-                    head_sha=trusted_head,
-                )
-                raise PublicationReconcileError(
-                    f"pull request lineage is {pull.state}; start a new thread"
-                )
+                await self._record_terminal_pull(work, pull)
             if pull is not None and pull.head_sha != work.expected_prior_head:
                 try:
                     await _resolve(
@@ -1263,18 +1273,16 @@ class PublicationReconciler:
             return
 
         if observation.exists:
-            # A validated terminal Job without usable markers may still be
-            # recoverable from GitHub above (the immediately preceding release
-            # emitted only a URL, and a crash can also lose pod logs). If GitHub
-            # still names the expected prior head or no branch exists, preserve
-            # the Job's terminal failure instead of attempting to mutate or
-            # replace deterministic resources.
+            # A validated terminal Job without its commit marker. The code host
+            # reads above found nothing pushed: the stored pull request still
+            # names the expected prior head, or no branch exists. Preserve the
+            # Job's terminal failure instead of mutating or replacing
+            # deterministic resources.
             if observation.phase == "failed":
-                # GitHub just proved nothing was pushed, and a failed Job
-                # (backoffLimit 0) cannot change outcome, so bounded retries
-                # would only hide the reason. Terminalize once so the thread
-                # sees why and may request a new approval.
-                # The store caps error at 2000 chars; bound the reason so the
+                # A failed Job (backoffLimit 0) cannot change outcome, so
+                # bounded retries would only hide the reason. Terminalize once
+                # so the thread sees why and may request a new approval. The
+                # store caps error at 2000 chars; bound the reason so the
                 # ask-again instruction always survives.
                 reason = (observation.error or "publication Job failed")[:1800]
                 logger.warning(
@@ -1302,7 +1310,7 @@ class PublicationReconciler:
 
         try:
             resources = build_publication_resources(
-                self._payload(work, clean_clone_url=credential.clean_clone_url),
+                self._payload(work, credential.transport),
                 credential=credential.authorization_header,
                 settings=self._job_settings,
             )
@@ -1314,7 +1322,7 @@ class PublicationReconciler:
         # resource before any Job log marker is trusted. This includes a Job
         # observed before the apply: an attacker cannot plant a same-name Job
         # and make its marker authoritative without passing the full spec and
-        # ownership contract.
+        # ownership contract, and the marker's commit is proven by the API.
         try:
             await _cluster_call(self._cluster.apply, resources)
         except PublicationResourceError as exc:

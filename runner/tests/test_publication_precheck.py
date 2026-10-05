@@ -154,6 +154,9 @@ async def _api(
         await server.close()
 
 
+_GITHUB_BOOT_ENV = {"CURIE_REPO_ORIGIN": "https://github.com", "CURIE_REPO_PATH": REPO}
+
+
 async def _boot(
     tmp_path: Path,
     repo: Path,
@@ -176,7 +179,9 @@ async def _boot(
             "CURIE_SESSION_ID": "publicationtest",
             "CURIE_SANDBOX_ID": "publicationbox",
             "CURIE_BUDGET": '{"max_output_tokens_per_run":10000,"max_usd_per_day":1.0}',
-            **(boot_env or {}),
+            # The worker sets the workspace's origin and path on every claim
+            # (ADR 0197); a test opts out by passing an explicit mapping.
+            **(_GITHUB_BOOT_ENV if boot_env is None else boot_env),
         }
     )
     # Production boot performs synchronous capability discovery with anyio.run.
@@ -331,7 +336,7 @@ def test_snapshot_trusts_the_boot_env_code_host_and_deep_path(
 
     With CURIE_REPO_ORIGIN and CURIE_REPO_PATH the snapshot succeeds and the
     remote comparison runs; without them the same workspace is refused before
-    any remote read, which is today's GitHub only check.
+    any remote read, since no GitHub default remains.
     """
 
     async def go() -> None:

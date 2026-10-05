@@ -19,11 +19,13 @@ from curie_runner.session import SessionRunner
 TOKEN = "runner-token-value"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 REPO = "acme-corp/acme-bot"
+# The boot env's CURIE_REPO_ORIGIN for a github.com workspace (ADR 0197).
+GITHUB = "https://github.com"
+TRUSTED = {"trusted_origin": GITHUB, "repository_path": REPO}
 
 
 @pytest.fixture
-def snapshot(monkeypatch: pytest.MonkeyPatch) -> Any:
-    monkeypatch.delenv("CURIE_GITHUB_API_URL", raising=False)
+def snapshot() -> Any:
     return importlib.import_module("curie_runner.workspace_snapshot")
 
 
@@ -68,6 +70,7 @@ def test_snapshot_captures_staged_unstaged_untracked_and_binary_changes(
     captured = snapshot.capture_workspace_snapshot(
         repo,
         expected_repo=REPO,
+        **TRUSTED,
         publication_title="Update assets",
         publication_body="Keep the exact requested body.",
     )
@@ -87,16 +90,17 @@ def test_snapshot_captures_staged_unstaged_untracked_and_binary_changes(
 
 
 @pytest.mark.parametrize("prefix", ["", "/forge"])
-def test_snapshot_accepts_the_configured_ghes_origin(
-    snapshot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefix: str
+def test_snapshot_accepts_a_ghes_origin_named_by_the_boot_env(
+    snapshot: Any, tmp_path: Path, prefix: str
 ) -> None:
     repo, base_sha = _repo(tmp_path)
     html_base = f"https://github.example.com{prefix}"
-    monkeypatch.setenv("CURIE_GITHUB_API_URL", f"{html_base}/api/v3")
     _git(repo, "remote", "set-url", "origin", f"{html_base}/{REPO}.git")
     (repo / "README.md").write_text("GHES change\n")
 
-    captured = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO)
+    captured = snapshot.capture_workspace_snapshot(
+        repo, expected_repo=REPO, trusted_origin=html_base, repository_path=REPO
+    )
 
     assert captured.repo_full_name == REPO
     assert captured.base_sha == base_sha
@@ -121,25 +125,42 @@ def test_snapshot_accepts_the_configured_ghes_origin(
     ],
 )
 def test_snapshot_refuses_noncanonical_or_foreign_origins(
-    snapshot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, origin: str
+    snapshot: Any, tmp_path: Path, origin: str
 ) -> None:
     repo, _ = _repo(tmp_path)
-    monkeypatch.setenv("CURIE_GITHUB_API_URL", "https://github.example.com/forge/api/v3")
     _git(repo, "remote", "set-url", "origin", origin)
     (repo / "README.md").write_text("must not publish\n")
 
-    with pytest.raises(snapshot.WorkspaceSnapshotError, match="origin"):
-        snapshot.capture_workspace_snapshot(repo, expected_repo=REPO)
+    with pytest.raises(
+        snapshot.WorkspaceSnapshotError,
+        match="workspace repository origin is not (credential-free trusted|the declared)",
+    ):
+        snapshot.capture_workspace_snapshot(
+            repo,
+            expected_repo=REPO,
+            trusted_origin="https://github.example.com/forge",
+            repository_path=REPO,
+        )
 
 
-def test_snapshot_default_github_host_refuses_an_unconfigured_ghes_origin(
-    snapshot: Any, tmp_path: Path
+@pytest.mark.parametrize(
+    ("trusted_origin", "repository_path"), [(None, REPO), (GITHUB, None), (None, None)]
+)
+def test_snapshot_refuses_when_the_boot_env_names_no_origin_or_path(
+    snapshot: Any, tmp_path: Path, trusted_origin: str | None, repository_path: str | None
 ) -> None:
+    # No GitHub default remains: a github.com workspace still needs
+    # CURIE_REPO_ORIGIN and CURIE_REPO_PATH from the worker.
     repo, _ = _repo(tmp_path)
-    _git(repo, "remote", "set-url", "origin", f"https://github.example.com/{REPO}.git")
+    (repo / "README.md").write_text("must not publish\n")
 
-    with pytest.raises(snapshot.WorkspaceSnapshotError, match="origin"):
-        snapshot.capture_workspace_snapshot(repo, expected_repo=REPO)
+    with pytest.raises(snapshot.WorkspaceSnapshotError, match="names no trusted repository"):
+        snapshot.capture_workspace_snapshot(
+            repo,
+            expected_repo=REPO,
+            trusted_origin=trusted_origin,
+            repository_path=repository_path,
+        )
 
 
 DEEP_ORIGIN = "https://gitlab.example.com/scm"
@@ -235,49 +256,6 @@ def test_snapshot_refuses_a_declared_path_that_is_not_a_repository_path(
         )
 
 
-def test_snapshot_without_a_declared_path_keeps_github_owner_name_under_a_trusted_origin(
-    snapshot: Any, tmp_path: Path
-) -> None:
-    repo, _ = _repo(tmp_path)
-    _git(repo, "remote", "set-url", "origin", f"{DEEP_ORIGIN}/{REPO}.git")
-    assert (
-        snapshot.capture_workspace_snapshot(repo, trusted_origin=DEEP_ORIGIN).repo_full_name
-        == REPO
-    )
-
-    _git(repo, "remote", "set-url", "origin", f"{DEEP_ORIGIN}/{DEEP_PATH}.git")
-    with pytest.raises(snapshot.WorkspaceSnapshotError, match="owner/repository"):
-        snapshot.capture_workspace_snapshot(repo, trusted_origin=DEEP_ORIGIN)
-
-
-def test_snapshot_github_default_is_unchanged_when_the_boot_env_sets_nothing(
-    snapshot: Any, tmp_path: Path
-) -> None:
-    repo, base_sha = _repo(tmp_path)
-    (repo / "README.md").write_text("GitHub change\n")
-    captured = snapshot.capture_workspace_snapshot(
-        repo, expected_repo=REPO, trusted_origin=None, repository_path=None
-    )
-    assert captured.repo_full_name == REPO
-    assert captured.base_sha == base_sha
-
-    # A deep path on github.com stays refused without a declared path, with
-    # today's message.
-    _git(repo, "remote", "set-url", "origin", f"https://github.com/{DEEP_PATH}.git")
-    with pytest.raises(
-        snapshot.WorkspaceSnapshotError,
-        match="^workspace repository origin is not an owner/repository URL$",
-    ):
-        snapshot.capture_workspace_snapshot(repo)
-
-    _git(repo, "remote", "set-url", "origin", f"{DEEP_ORIGIN}/{REPO}.git")
-    with pytest.raises(
-        snapshot.WorkspaceSnapshotError,
-        match="^workspace repository origin is not credential-free GitHub HTTPS$",
-    ):
-        snapshot.capture_workspace_snapshot(repo)
-
-
 def test_snapshot_preserves_real_top_level_a_and_b_paths_with_spaces(
     snapshot: Any, tmp_path: Path
 ) -> None:
@@ -301,7 +279,7 @@ def test_snapshot_preserves_real_top_level_a_and_b_paths_with_spaces(
     (repo / "a" / "read me.md").write_text("changed a\n")
     (repo / "b" / "release notes.md").write_text("changed b\n")
 
-    captured = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO)
+    captured = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO, **TRUSTED)
 
     assert captured.changed_paths == ("a/read me.md", "b/release notes.md")
     assert b"diff --git a/a/read me.md b/a/read me.md" in captured.patch
@@ -329,7 +307,7 @@ def test_snapshot_represents_pure_rename_as_source_and_destination_with_spaces(
     )
     _git(repo, "mv", source, destination)
 
-    captured = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO)
+    captured = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO, **TRUSTED)
 
     assert captured.changed_paths == (destination, source)
     assert f"diff --git a/{source} b/{source}".encode() in captured.patch
@@ -403,7 +381,9 @@ def test_snapshot_refuses_missing_empty_and_wrong_repository(
 
     repo, _ = _repo(tmp_path / "wrong")
     with pytest.raises(snapshot.WorkspaceSnapshotError, match="repository"):
-        snapshot.capture_workspace_snapshot(repo, expected_repo="acme-corp/other")
+        snapshot.capture_workspace_snapshot(
+            repo, expected_repo="acme-corp/other", **TRUSTED
+        )
 
 
 def _runner() -> SessionRunner:

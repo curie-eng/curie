@@ -10,9 +10,10 @@ class RepositoryCredentialOut(BaseModel):
     """One server-derived Git credential returned only to the trusted worker.
 
     ``origin``, ``header_form`` and ``ca_bundle_ref`` are the code host
-    transport facts (ADR 0197). Each defaults to today's GitHub behavior: the
-    configured GitHub host, an ``Authorization: Basic`` header, and the public
-    trust store.
+    transport facts (ADR 0197), issued by the code host with the credential:
+    the origin the header is scoped to (the clone URL is the origin plus the
+    repository path), the header git sends it in, and the path of the CA
+    bundle mounted where git runs. The worker derives none of them.
     """
 
     repo_full_name: str
@@ -20,14 +21,14 @@ class RepositoryCredentialOut(BaseModel):
     authorization_header: str
     revision: str | None = None
     # The origin (scheme, host and optional base path) this credential
-    # authenticates to. None is the configured GitHub host.
-    origin: str | None = None
+    # authenticates to, with no trailing slash and no credentials.
+    origin: str
     # Which header git sends the credential in. GitLab refuses a Bearer
     # header, so the form travels with the credential instead of being assumed.
     header_form: CredentialHeader = CredentialHeader.AUTHORIZATION_BASIC
-    # A reference to a PEM CA bundle for a self-managed code host, mounted
-    # where the clone runs. A reference, never certificate bytes. None trusts
-    # the public store, as today.
+    # The path of a PEM CA bundle for a self-managed code host, mounted where
+    # the clone or push runs (codeHostTrust in the chart). A reference, never
+    # certificate bytes. None trusts the public store.
     ca_bundle_ref: str | None = None
 
 

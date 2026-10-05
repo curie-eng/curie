@@ -29,6 +29,7 @@ from curie_api.publication_pulls import (
     PullRequestRefused,
     adopt_or_open,
     revision_refusal,
+    update_metadata,
 )
 from curie_api.schemas.publications import (
     PublicationBranchHeadOut,
@@ -107,6 +108,7 @@ def _out(pull: PullRequest) -> PublicationPullRequestOut:
         state=pull.state.value,
         head_sha=pull.head_sha,
         head_ref=pull.head_ref,
+        updated_at=pull.updated_at,
     )
 
 
@@ -249,4 +251,67 @@ async def recover_publication_pull_request(
         raise _forge_failure(exc) from None
     if pull is None:
         return Response(status_code=204, headers={"Cache-Control": "no-store"})
+    return _out(pull)
+
+
+@router.post("/{publication_id}/pull-request/metadata", response_model=PublicationPullRequestOut)
+async def update_publication_pull_request_metadata(
+    publication_id: uuid.UUID,
+    request: Request,
+    session: SessionDep,
+    response: Response,
+) -> PublicationPullRequestOut:
+    """Apply a metadata-only revision's title and body to its stored pull request.
+
+    A metadata-only revision has nothing to push, so no publication Job runs
+    and this update is its whole effect (ADR 0197, "Two ports" item 6). The
+    contract and the observed digests come from the stored publication. A
+    merged or closed pull request is answered unchanged, with its state, so
+    the worker records the lineage terminal.
+    """
+
+    response.headers["Cache-Control"] = "no-store"
+    publication, lineage = await _stored(session, publication_id)
+    if publication.status not in _ACTIVE:
+        _refuse("not_approved", "the publication is not approved for a pull request")
+    if lineage.status != "open":
+        _refuse("lineage_terminal", "the pull request for this thread is merged or closed")
+    if publication.patch_bytes != b"":
+        # A patch is pushed by the Job; a purged revision has nothing to apply.
+        _refuse("not_metadata_only", "the publication is not a metadata-only revision")
+    if (
+        lineage.pr_number is None
+        or publication.observed_title_sha256 is None
+        or publication.observed_body_sha256 is None
+    ):
+        _refuse(
+            "metadata_unobserved",
+            "a metadata-only revision needs a stored pull request and its observed metadata",
+        )
+    assert lineage.pr_number is not None
+    assert publication.observed_title_sha256 is not None
+    assert publication.observed_body_sha256 is not None
+    code_host = _code_host(request)
+    repository = _repository(publication, lineage)
+    try:
+        resolved = await resolve_stored(code_host, repository)
+        contract = PullRequestContract(
+            branch=lineage.branch,
+            base=await _base_ref(session, code_host, publication, resolved),
+            title=publication.title,
+            body=publication.body,
+            draft=publication.open_as_draft,
+        )
+        pull = await update_metadata(
+            code_host,
+            PullRequestRef(resolved, str(lineage.pr_number)),
+            contract,
+            expected_head_sha=publication.base_sha,
+            observed_title_sha256=publication.observed_title_sha256,
+            observed_body_sha256=publication.observed_body_sha256,
+        )
+    except PullRequestRefused as refused:
+        _refuse(refused.code, refused.message)
+    except ForgeError as exc:
+        raise _forge_failure(exc) from None
     return _out(pull)

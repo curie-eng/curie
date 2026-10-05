@@ -264,6 +264,12 @@ def _since(value: str | None) -> datetime | None:
     return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
 
 
+def _timestamp(value: Any) -> datetime | None:
+    """A GitHub timestamp as an aware UTC time, or None when it is not one."""
+
+    return _since(value) if isinstance(value, str) else None
+
+
 def _iso(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
@@ -489,7 +495,7 @@ class GitHubCodeHost:
         """
 
         try:
-            origin, header = await run_in_threadpool(
+            clone_url, header = await run_in_threadpool(
                 resolve_repository_credential, repository.path, self._settings
             )
         except GitHubAppError:
@@ -502,6 +508,11 @@ class GitHubCodeHost:
         except (binascii.Error, UnicodeDecodeError):
             raise Unauthorized("credential_unresolved") from None
         if kind != "Basic" or not username or not secret:
+            raise Unauthorized("credential_unresolved")
+        # The origin is the host and base path git authenticates to, never the
+        # repository URL: the clone URL is the origin plus the path.
+        origin = clone_url.removesuffix(f"/{repository.path}.git")
+        if origin == clone_url:
             raise Unauthorized("credential_unresolved")
         return Credential(
             origin=origin,
@@ -598,6 +609,7 @@ class GitHubCodeHost:
             body=body if isinstance(body, str) else "",
             draft=payload.get("draft") is True,
             conflicted=conflicted(payload),
+            updated_at=_timestamp(payload.get("updated_at")),
         )
 
     async def find_pull_request(

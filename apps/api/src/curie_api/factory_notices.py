@@ -40,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 from starlette.concurrency import run_in_threadpool
 
+from .code_host_trust import code_host_verify
 from .config import Settings
 from .factory_comment_text import marker_for, redact_factory_comment
 from .factory_progress import PhaseView, phase_view, pill_for
@@ -574,7 +575,9 @@ async def sync_status_comments(
 
     writes = 0
     attempted_ids: set[uuid.UUID] = set()
-    async with httpx.AsyncClient(timeout=settings.github_app_timeout_seconds) as client:
+    async with httpx.AsyncClient(
+        timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
+    ) as client:
         for _ in range(limit):
             async with sessionmaker() as session:
                 claim = await _claim_next(
