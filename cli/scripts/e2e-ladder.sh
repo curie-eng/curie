@@ -1196,6 +1196,24 @@ PY
 # Query one exact ID only. Raw CLI output remains in a mode-0600 file and only
 # sanitize_exact_trace_read reaches stdout.
 query_exact_seed_trace() {
+    # Defined inside the function so a harness that extracts only this function
+    # still records a miss. A failure writes the expected span and the query
+    # before the temp files are removed.
+    record_exact_trace_oracle_miss() {
+        local expected_csv="$1" tier="$2" trace_id="$3"
+        local query="curie --json ${tier} observability run ${trace_id}"
+        # A cluster read also carries the selected namespace and release.
+        # ${ns_rel[*]+x} stays unset-safe under `set -u` when this function
+        # is sourced alone for a local query.
+        if [[ "$tier" == "cluster" && -n "${ns_rel[*]+x}" ]]; then
+            query="curie --json cluster observability ${ns_rel[*]} run ${trace_id}"
+        fi
+        [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
+        {
+            printf 'expected span: %s\n' "$expected_csv"
+            printf 'query: %s\n' "$query"
+        } >> "$GITHUB_STEP_SUMMARY"
+    }
     local tier="$1" trace_id="$2" expected_csv="${3:-}" expected_decision="${4:-}" expected_state="${5:-present}" expected_tool="${6:-}"
     local attempt code=0 private_read safe_read membership observation_count saw_valid=0 saw_query_error=0
     local last_query_state="query-error"
@@ -1205,6 +1223,7 @@ query_exact_seed_trace() {
     private_read="$(mktemp "$WORKDIR/exact-trace.XXXXXX")"
     safe_read="$(mktemp "$WORKDIR/safe-trace.XXXXXX")"
     [[ "$trace_id" =~ ^[0-9a-f]{32}$ ]] || {
+        record_exact_trace_oracle_miss "$expected_csv" "$tier" "$trace_id"
         rm -f "$private_read" "$safe_read"
         echo "seed-invalid: exact trace id is not 32 lowercase hex characters" >&2
         return 1
@@ -1217,12 +1236,14 @@ query_exact_seed_trace() {
             "$BIN" --json cluster observability "${ns_rel[@]}" \
                 run "$trace_id" > "$private_read" 2>/dev/null || code=$?
         else
+            record_exact_trace_oracle_miss "$expected_csv" "$tier" "$trace_id"
             rm -f "$private_read" "$safe_read"
             echo "seed-invalid: exact trace query tier is unknown" >&2
             return 1
         fi
         if [[ "$expected_state" == "absent" ]]; then
             if (( code == 0 )); then
+                record_exact_trace_oracle_miss "$expected_csv" "$tier" "$trace_id"
                 rm -f "$private_read" "$safe_read"
                 echo "exact trace was queryable while the exporter was required to be failing" >&2
                 return 1
@@ -1247,6 +1268,7 @@ if not stable_not_found or not isinstance(fix, str) or not fix.strip():
     raise SystemExit(1)
 PY
             then
+                record_exact_trace_oracle_miss "$expected_csv" "$tier" "$trace_id"
                 rm -f "$private_read" "$safe_read"
                 echo "exact trace absence query returned an unexpected failure" >&2
                 return 1
@@ -1278,6 +1300,7 @@ if not isinstance(value.get("fix"), str) or not value["fix"].strip():
     raise SystemExit(1)
 PY
             then
+                record_exact_trace_oracle_miss "$expected_csv" "$tier" "$trace_id"
                 rm -f "$private_read" "$safe_read"
                 echo "exact trace observation returned an unexpected query failure" >&2
                 return 1
@@ -1298,6 +1321,7 @@ PY
             if ! sanitize_exact_trace_read "$trace_id" "$private_read" "$expected_csv" "$expected_decision" > "$safe_read"; then
                 last_query_state="malformed-response"
                 if [[ "$expected_state" == "observe" ]]; then
+                    record_exact_trace_oracle_miss "$expected_csv" "$tier" "$trace_id"
                     rm -f "$private_read" "$safe_read"
                     echo "exact trace response was malformed rather than selectively incomplete" >&2
                     return 1
@@ -1367,6 +1391,7 @@ PY
         # Only the allowlisted projection, never the original trace response.
         cat "$safe_read" >&2
     fi
+    record_exact_trace_oracle_miss "$expected_csv" "$tier" "$trace_id"
     rm -f "$private_read" "$safe_read"
     return 1
 }

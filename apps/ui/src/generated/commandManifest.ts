@@ -7802,6 +7802,11 @@ export const commandManifest = {
           "name": "model-script"
         },
         {
+          "about": "Check the OpenRouter credit on CURIE_CREDENTIALS before a graded ladder spends a build",
+          "hidden": false,
+          "name": "model-credit"
+        },
+        {
           "about": "Serve a TLS GitHub fixture or capture public check lifecycle recordings",
           "args": [
             {
