@@ -348,7 +348,28 @@ def _continue_on_error(step: dict[str, Any]) -> bool:
     return False
 
 
+# A failed build or ladder records one class line and stops. The `if` names
+# the failed step so a credit refusal is not labeled build-failed, and so a
+# ladder failure is not labeled build-failed. That outcome reference is how a
+# retry guard is detected, but these steps do not run the failed command again.
+_FAILURE_CLASS_SUMMARIES = frozenset(
+    {
+        'echo build-failed >> "$GITHUB_STEP_SUMMARY"',
+        'echo test-failed >> "$GITHUB_STEP_SUMMARY"',
+    }
+)
+
+
+def _is_failure_class_summary(step: dict[str, Any]) -> bool:
+    if step.get("uses"):
+        return False
+    body = step.get("run")
+    return isinstance(body, str) and body.strip() in _FAILURE_CLASS_SUMMARIES
+
+
 def _carries_retry(step: dict[str, Any]) -> bool:
+    if _is_failure_class_summary(step):
+        return False
     if _continue_on_error(step):
         return True
     condition = step.get("if")
@@ -502,6 +523,37 @@ def _trio_problems(base: str, trio: Trio) -> list[str]:
 
 def _render(entries: list[Identity]) -> str:
     return "\n".join(f"  {filename} :: {job} :: {name}" for filename, job, name in sorted(entries))
+
+
+def test_failure_class_summaries_are_not_retries() -> None:
+    """Recording build-failed or test-failed does not re-run the failed step.
+
+    The summary's `if` names `steps.<id>.outcome` so it can tell a build
+    failure from a ladder failure. That reference is also how a retry guard
+    is recognized. A step whose entire `run` is the class echo is not a retry.
+    Adding a command, or turning the step into an action, puts it back under
+    the closed-world rule.
+    """
+    found: list[Identity] = []
+    for filename, job_id, _index, step in _iter_steps():
+        if not _is_failure_class_summary(step):
+            continue
+        found.append((filename, job_id, _step_name(step) or "<unnamed>"))
+        assert not _carries_retry(step), found[-1]
+    assert found, "the graded ladder workflows must record build-failed and test-failed"
+    hidden = {
+        "name": "Record a build failure",
+        "if": "steps.build.outcome == 'failure'",
+        "run": 'echo build-failed >> "$GITHUB_STEP_SUMMARY"\ncargo test',
+    }
+    assert _carries_retry(hidden)
+    action = {
+        "name": "Record a build failure",
+        "uses": "actions/checkout@v7",
+        "run": 'echo build-failed >> "$GITHUB_STEP_SUMMARY"',
+        "if": "steps.build.outcome == 'failure'",
+    }
+    assert _carries_retry(action)
 
 
 def test_rule_1_every_retry_carrying_step_is_allowlisted() -> None:
