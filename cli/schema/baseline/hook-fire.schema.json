@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/hook-fire/v1.1.json",
-  "title": "curie <tier> hook fire --json",
-  "description": "The agent-facing payload of `curie local hook fire` and `curie cluster hook fire`: the dry-run plan, or the run record once the turn has settled.",
+  "$id": "https://schemas.curietech.ai/cli/hook-fire/v1.2.json",
+  "title": "curie <tier> hook fire or hook record --json",
+  "description": "The agent-facing payload of `curie local hook fire`, `curie cluster hook fire`, and their `hook record` readers: the dry-run plan, or a durable run record. Fire waits for settlement; record also reads in-flight runs.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -23,6 +23,7 @@
         "name": { "type": "string" },
         "trigger": { "type": "string" },
         "slot_utc": { "type": "string" },
+        "source": { "type": "string", "enum": ["schedule", "manual"] },
         "outcome": { "type": ["string", "null"] },
         "reason": { "type": ["string", "null"] },
         "started_at": { "type": "string" },

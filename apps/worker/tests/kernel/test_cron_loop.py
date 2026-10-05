@@ -93,7 +93,8 @@ class _Seed:
                 (
                     await conn.execute(
                         text(
-                            "SELECT id, outcome, slot_utc, ended_at, started_at, lease_expires_at "
+                            "SELECT id, outcome, slot_utc, ended_at, started_at, "
+                            "lease_expires_at, source "
                             "FROM curie.hook_runs "
                             "WHERE agent_id = :a AND name = :n ORDER BY slot_utc"
                         ),
@@ -1646,5 +1647,46 @@ def test_hook_run_reason_deferred_expired(sync_redis: redis.Redis, names: dict[s
             await seed.add_run(seed.slot, seed.slot, outcome="deferred")
             await _later_pass(seed, names["stream"], trigger, now)
             assert await _hook_run_reason(seed, seed.slot) == ("skipped", "deferred_expired")
+
+    asyncio.run(body())
+
+
+def test_hook_run_source_regular_and_blocked_rows_are_schedule(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    async def killed(_agent_id: uuid.UUID) -> bool:
+        return True
+
+    async def body() -> None:
+        async with _seed() as seed:
+            await _pass_once(seed, names["stream"], _trigger(seed))
+            rows = await seed.runs()
+            assert len(rows) == 1
+            assert rows[0].outcome is None
+            assert rows[0].source == "schedule"
+        async with _seed() as seed:
+            await _pass_once(seed, names["stream"], _trigger(seed), is_killed=killed)
+            rows = await seed.runs()
+            assert len(rows) == 1
+            assert rows[0].outcome == "blocked"
+            assert rows[0].source == "schedule"
+
+    asyncio.run(body())
+
+
+def test_hook_run_source_expired_catch_up_rows_are_schedule(
+    sync_redis: redis.Redis, names: dict[str, str]
+) -> None:
+    async def body() -> None:
+        async with _seed() as seed:
+            last = seed.slot - timedelta(hours=3)
+            await seed.add_run(last, last, outcome="ran")
+            await _pass_once(
+                seed, names["stream"], _trigger(seed, schedule=f"{seed.slot.minute} * * * *")
+            )
+            rows = await seed.runs()
+            skipped = [row for row in rows if row.outcome == "skipped"]
+            assert skipped
+            assert all(row.source == "schedule" for row in rows)
 
     asyncio.run(body())

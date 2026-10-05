@@ -3174,7 +3174,7 @@ export const commandManifest = {
           "name": "schedules"
         },
         {
-          "about": "Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`)",
+          "about": "Fire a declared cron hook now or read a durable run record",
           "hidden": false,
           "name": "hook",
           "subcommands": [
@@ -3240,6 +3240,65 @@ export const commandManifest = {
               ],
               "hidden": false,
               "name": "fire"
+            },
+            {
+              "about": "Read one durable hook run, including a run that is still in flight",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Trigger name on the in-force bundle",
+                  "id": "name",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Hook run id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Print what would be requested and exit without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "record"
             }
           ]
         },
@@ -6277,7 +6336,7 @@ export const commandManifest = {
           "name": "schedules"
         },
         {
-          "about": "Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`)",
+          "about": "Fire a declared cron hook now or read a durable run record",
           "args": [
             {
               "env": "CURIE_API_URL",
@@ -6367,6 +6426,46 @@ export const commandManifest = {
               ],
               "hidden": false,
               "name": "fire"
+            },
+            {
+              "about": "Read one durable hook run, including a run that is still in flight",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Trigger name on the in-force bundle",
+                  "id": "name",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Hook run id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Print what would be requested and exit without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "record"
             }
           ]
         },

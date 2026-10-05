@@ -373,13 +373,13 @@
       "result": "SchedulesOutput",
       "kind": "CliOutput",
       "schema": "schedules.schema.json",
-      "version": "2.1"
+      "version": "3.0"
     },
     {
       "result": "HookFireOutput",
       "kind": "CliOutput",
       "schema": "hook-fire.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "SreBotRenderOutput",

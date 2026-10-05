@@ -222,8 +222,15 @@ scheduler in the worker:
    each tick reads every in-force deployment's `cron` triggers, records the due slot in
    `hook_runs`, and enqueues one CRON turn. `GET /schedules`
    (`apps/api/src/curie_api/routers/schedules.py::list_schedules`, #2933) lists
-   those hooks with the newest slot. `curie local schedules` and
-   `curie cluster schedules` read that route. Operator guide: [Cron triggers](../../guides/cron-triggers.md).
+   those hooks with independent newest scheduled and manual histories, selected
+   by the persisted `hook_runs.source` (`schedule` or `manual`). Scheduled
+   `last_fire_at`, `last_outcome`, and `last_reason` exclude manual fires;
+   `last_manual_fire_at`, `last_manual_outcome`, and `last_manual_reason` report
+   the newest manual fire. `curie local schedules` and `curie cluster schedules`
+   read that route. `curie local hook record <agent> <name> <id>` and its cluster
+   counterpart read one persisted run, including an open or non-`ran` row,
+   without waiting and exit 0 when found. Operator guide:
+   [Cron triggers](../../guides/cron-triggers.md).
 
 Plus three further wake paths that also enqueue a run without going through any of those
 eight: the Slack block-action handler

@@ -297,9 +297,9 @@ WHERE agent_id = :agent_id AND address = :address
 
 _INSERT_SQL = """
 INSERT INTO {schema}.hook_runs
-       (id, agent_id, name, slot_utc, version_id, outcome, reason, started_at, ended_at,
+       (id, agent_id, name, slot_utc, version_id, source, outcome, reason, started_at, ended_at,
         lease_expires_at)
-VALUES (:id, :agent_id, :name, :slot, :version_id, CAST(:outcome AS text),
+VALUES (:id, :agent_id, :name, :slot, :version_id, 'schedule', CAST(:outcome AS text),
         CASE WHEN :terminal THEN :reason ELSE NULL END, now(),
         CASE WHEN :terminal THEN now() END,
         CASE WHEN :terminal THEN NULL ELSE now() + make_interval(secs => :lease_s) END)
@@ -351,8 +351,8 @@ WHERE agent_id = :agent_id AND name = :name AND paused_at IS NULL
 
 _SKIP_SQL = """
 INSERT INTO {schema}.hook_runs
-       (id, agent_id, name, slot_utc, version_id, outcome, reason, started_at, ended_at)
-SELECT fire.id, :agent_id, :name, fire.slot, :version_id, 'skipped',
+       (id, agent_id, name, slot_utc, version_id, source, outcome, reason, started_at, ended_at)
+SELECT fire.id, :agent_id, :name, fire.slot, :version_id, 'schedule', 'skipped',
        'catch_up_expired', now(), now()
 FROM unnest(CAST(:ids AS uuid[]), CAST(:slots AS timestamptz[])) AS fire(id, slot)
 WHERE true

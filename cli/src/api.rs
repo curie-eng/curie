@@ -697,6 +697,9 @@ pub struct ScheduleHook {
     pub last_outcome: Option<String>,
     #[serde(default)]
     pub last_reason: Option<String>,
+    pub last_manual_fire_at: Option<String>,
+    pub last_manual_outcome: Option<String>,
+    pub last_manual_reason: Option<String>,
     pub paused: bool,
 }
 
@@ -722,7 +725,7 @@ pub struct ScheduleList {
     pub schedules: Vec<AgentSchedules>,
 }
 
-/// One test-fire run record (`HookFireOut`, #2932).
+/// One durable hook run record (`HookFireOut`, #2932).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct HookFireRecord {
     pub id: String,
@@ -731,6 +734,7 @@ pub struct HookFireRecord {
     pub name: String,
     pub trigger: String,
     pub slot_utc: String,
+    pub source: String,
     pub outcome: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,

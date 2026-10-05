@@ -1060,3 +1060,43 @@ fn help_never_discloses_the_curie_api_key_value() {
         );
     }
 }
+
+#[test]
+fn hook_record_is_available_on_local_and_cluster_with_three_positionals() {
+    let manifest = live_command_manifest();
+    for tier in ["local", "cluster"] {
+        let tier_command = manifest["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == tier)
+            .unwrap();
+        let hook = tier_command["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == "hook")
+            .unwrap();
+        let record = hook["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == "record")
+            .unwrap_or_else(|| panic!("{tier} hook must expose record"));
+        let positionals: Vec<_> = record["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|arg| arg["positional"] == true)
+            .collect();
+        assert_eq!(positionals.len(), 3, "{tier}: {positionals:?}");
+        assert!(
+            positionals.iter().all(|arg| arg["required"] == true),
+            "{tier}: {positionals:?}"
+        );
+        let output = run_help(&[tier, "hook", "record"]);
+        assert!(output.status.success(), "{tier}: {}", output_text(&output));
+        let text = output_text(&output);
+        assert!(text.contains("--dry-run"), "{tier}: {text}");
+    }
+}

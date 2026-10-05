@@ -1930,6 +1930,10 @@ class HookRun(Base):
             "('ran', 'deferred', 'skipped', 'blocked', 'reclaimed', 'failed')",
             name="hook_runs_outcome_ck",
         ),
+        CheckConstraint(
+            "source IN ('schedule', 'manual')",
+            name="hook_runs_source_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1942,6 +1946,9 @@ class HookRun(Base):
     slot_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     version_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agent_versions.id", ondelete="CASCADE")
+    )
+    source: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'schedule'")
     )
     outcome: Mapped[str | None] = mapped_column(String, default=None)
     reason: Mapped[str | None] = mapped_column(Text, default=None)

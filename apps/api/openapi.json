@@ -4390,6 +4390,14 @@
             "title": "Slot Utc",
             "type": "string"
           },
+          "source": {
+            "enum": [
+              "schedule",
+              "manual"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
           "started_at": {
             "format": "date-time",
             "title": "Started At",
@@ -4406,6 +4414,7 @@
           "agent",
           "name",
           "trigger",
+          "source",
           "slot_utc",
           "outcome",
           "started_at",
@@ -7086,7 +7095,7 @@
         "type": "object"
       },
       "ScheduleHookOut": {
-        "description": "One cron hook on the in-force bundle, with its newest slot.",
+        "description": "One cron hook with its newest scheduled and manual run histories.",
         "properties": {
           "last_fire_at": {
             "anyOf": [
@@ -7099,6 +7108,65 @@
               }
             ],
             "title": "Last Fire At"
+          },
+          "last_manual_fire_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Manual Fire At"
+          },
+          "last_manual_outcome": {
+            "anyOf": [
+              {
+                "enum": [
+                  "ran",
+                  "deferred",
+                  "skipped",
+                  "blocked",
+                  "reclaimed",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Manual Outcome"
+          },
+          "last_manual_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "turn_error",
+                  "target_unbound",
+                  "approval_gate_targetless",
+                  "agent_killed",
+                  "budget_exhausted",
+                  "run_in_flight",
+                  "catch_up_expired",
+                  "deferred_expired",
+                  "reply_undeliverable",
+                  "prior_side_effect",
+                  "deployment_missing",
+                  "hook_paused",
+                  "live_session",
+                  "enqueue_failed",
+                  "claim_expired"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Manual Reason"
           },
           "last_outcome": {
             "anyOf": [
@@ -7175,6 +7243,9 @@
           "zone",
           "last_fire_at",
           "last_outcome",
+          "last_manual_fire_at",
+          "last_manual_outcome",
+          "last_manual_reason",
           "paused"
         ],
         "title": "ScheduleHookOut",
@@ -15833,7 +15904,7 @@
     },
     "/schedules": {
       "get": {
-        "description": "Cron hooks on each in-force deployment, newest slot first in the record.",
+        "description": "Cron hooks on each in-force deployment, with separate latest run histories.",
         "operationId": "list_schedules_schedules_get",
         "parameters": [
           {
