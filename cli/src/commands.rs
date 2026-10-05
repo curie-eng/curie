@@ -9964,7 +9964,7 @@ pub async fn hook_fire(opts: HookFireOpts) -> Result<HookFireOutput> {
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let mut record = client.fire_hook(&opts.agent, &opts.name).await?;
     let deadline = Instant::now() + Duration::from_secs(opts.wait_secs);
-    while record.outcome.is_none() {
+    while matches!(record.outcome.as_deref(), None | Some("deferred")) {
         if Instant::now() >= deadline {
             return Err(crate::exit::transient(format!(
                 "hook {} did not settle within {}s; run {}",
@@ -9975,6 +9975,20 @@ pub async fn hook_fire(opts: HookFireOpts) -> Result<HookFireOutput> {
         record = client
             .get_hook_run(&opts.agent, &opts.name, &record.id)
             .await?;
+    }
+    if record.outcome.as_deref() != Some("ran") {
+        let mut message = format!(
+            "hook {} ran and recorded {}",
+            record.name,
+            record.outcome.as_deref().unwrap_or("-")
+        );
+        if let Some(reason) = record.reason.as_deref().filter(|reason| !reason.is_empty()) {
+            message.push_str(&format!(": {reason}"));
+        }
+        let output = HookFireOutput::Record(Box::new(record));
+        return Err(
+            crate::ui::ui().failed_report(&output, crate::exit::CliError::failure(message).into())
+        );
     }
     Ok(HookFireOutput::Record(Box::new(record)))
 }

@@ -69,6 +69,9 @@ fn record(outcome: Option<&str>) -> Value {
 }
 
 fn record_with_reason(outcome: Option<&str>, reason: Option<&str>) -> Value {
+    // Wire shape and allowed outcomes/reasons come from the API producer:
+    // apps/api/openapi.json components.schemas.HookFireOut and
+    // apps/api/src/curie_api/routers/hook_fire.py::_record.
     json!({
         "id": "22222222-2222-4222-8222-222222222222",
         "agent_id": "11111111-1111-4111-8111-111111111111",
@@ -102,6 +105,79 @@ fn fire_server(settle: bool) -> MockServer {
     })
 }
 
+fn fire_command(tier: &str, server: &MockServer, flags: &[&str], wait_secs: &str) -> Output {
+    let mut args = flags.to_vec();
+    args.extend([
+        tier,
+        "hook",
+        "fire",
+        "acme-bot",
+        "nightly-cleanup",
+        "--api-url",
+        &server.base_url,
+        "--api-key",
+        TEST_API_KEY,
+        "--wait-secs",
+        wait_secs,
+    ]);
+    run_in(&args, &[("KUBECONFIG", MISSING_KUBECONFIG)])
+}
+
+fn assert_terminal_outcome(outcome: &str, reason: Option<&str>, expected_exit: i32) {
+    let expected = record_with_reason(Some(outcome), reason);
+    let body = expected.to_string();
+    let server = serve(move |req| {
+        if req.method == "POST" && req.path.ends_with("/fire") {
+            return Response::json(200, &body);
+        }
+        Response::json(500, r#"{"detail":"unexpected"}"#)
+    });
+    for tier in ["local", "cluster"] {
+        let output = fire_command(tier, &server, &["--json"], "5");
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "{tier}: {}",
+            describe(&output)
+        );
+        let value = one_object(&output);
+        assert_eq!(value, expected, "{tier}: raw API record must be preserved");
+        assert_schema(&value);
+
+        for flags in [&[][..], &["-q"][..]] {
+            let human = fire_command(tier, &server, flags, "5");
+            assert_eq!(
+                human.status.code(),
+                Some(expected_exit),
+                "{tier} {flags:?}: {}",
+                describe(&human)
+            );
+            let text = stdout(&human);
+            for field in ["acme-bot", "nightly-cleanup", outcome] {
+                assert!(text.contains(field), "{tier} {flags:?}: {text}");
+            }
+            assert!(
+                text.contains(expected["id"].as_str().unwrap()),
+                "{tier} {flags:?}: {text}"
+            );
+            if expected_exit != 0 {
+                let stderr = String::from_utf8_lossy(&human.stderr);
+                let message = format!("hook nightly-cleanup ran and recorded {outcome}");
+                if let Some(reason) = reason {
+                    assert!(text.contains(reason), "{tier} {flags:?}: {text}");
+                    assert!(
+                        stderr.contains(&format!("{message}: {reason}")),
+                        "{tier} {flags:?}: {stderr}"
+                    );
+                } else {
+                    assert!(stderr.contains(&message), "{tier} {flags:?}: {stderr}");
+                }
+            }
+        }
+    }
+    assert!(server.recorded().iter().all(|req| req.method == "POST"));
+}
+
 #[test]
 fn local_fire_waits_until_the_record_settles() {
     let server = fire_server(true);
@@ -132,83 +208,99 @@ fn local_fire_waits_until_the_record_settles() {
 }
 
 #[test]
-fn blocked_fire_json_and_human_output_carry_the_reason() {
-    let body = record_with_reason(Some("blocked"), Some("agent_killed")).to_string();
+fn ran_fire_succeeds_at_both_tiers() {
+    assert_terminal_outcome("ran", None, 0);
+}
+
+#[test]
+fn failed_fire_preserves_the_record_and_fails_at_both_tiers() {
+    assert_terminal_outcome("failed", Some("turn_error"), 1);
+}
+
+#[test]
+fn blocked_fire_preserves_the_record_and_reason_at_both_tiers() {
+    assert_terminal_outcome("blocked", Some("agent_killed"), 1);
+}
+
+#[test]
+fn skipped_fire_preserves_the_record_and_fails_without_polling_at_both_tiers() {
+    assert_terminal_outcome("skipped", Some("run_in_flight"), 1);
+}
+
+#[test]
+fn reclaimed_fire_preserves_the_record_and_fails_at_both_tiers() {
+    assert_terminal_outcome("reclaimed", Some("claim_expired"), 1);
+}
+
+#[test]
+fn failed_fire_without_a_reason_still_reports_the_outcome_at_both_tiers() {
+    assert_terminal_outcome("failed", None, 1);
+}
+
+#[test]
+fn deferred_fire_waits_until_ran_at_both_tiers() {
+    let deferred = record_with_reason(Some("deferred"), Some("live_session")).to_string();
+    let ran = record(Some("ran"));
+    let body = ran.to_string();
     let server = serve(move |req| {
-        let path = req.path.split('?').next().unwrap_or("");
-        if req.method == "POST" && path.ends_with("/fire") {
+        if req.method == "POST" && req.path.ends_with("/fire") {
+            return Response::json(200, &deferred);
+        }
+        if req.method == "GET" && req.path.contains("/runs/") {
             return Response::json(200, &body);
         }
         Response::json(500, r#"{"detail":"unexpected"}"#)
     });
-    let json_output = run_in(
-        &[
-            "--json",
-            "local",
-            "hook",
-            "fire",
-            "acme-bot",
-            "nightly-cleanup",
-            "--api-url",
-            &server.base_url,
-            "--api-key",
-            TEST_API_KEY,
-        ],
-        &[],
-    );
-    assert_eq!(
-        json_output.status.code(),
-        Some(0),
-        "{}",
-        describe(&json_output)
-    );
-    let value = one_object(&json_output);
-    assert_eq!(value["outcome"], json!("blocked"));
-    assert_eq!(value["reason"], json!("agent_killed"));
-    assert_schema(&value);
-
-    let human = run_in(
-        &[
-            "local",
-            "hook",
-            "fire",
-            "acme-bot",
-            "nightly-cleanup",
-            "--api-url",
-            &server.base_url,
-            "--api-key",
-            TEST_API_KEY,
-        ],
-        &[],
-    );
-    assert_eq!(human.status.code(), Some(0), "{}", describe(&human));
-    let text = stdout(&human);
-    let outcome_at = text.find("blocked").expect(&text);
-    let reason_at = text.find("agent_killed").expect(&text);
-    assert!(reason_at > outcome_at, "{text}");
+    for tier in ["local", "cluster"] {
+        let before = server.recorded().len();
+        let output = fire_command(tier, &server, &["--json"], "5");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{tier}: {}",
+            describe(&output)
+        );
+        let value = one_object(&output);
+        assert_eq!(value, ran, "{tier}: deferred must not be the final result");
+        assert_schema(&value);
+        assert!(server.recorded()[before..]
+            .iter()
+            .any(|req| req.method == "GET"));
+    }
 }
 
 #[test]
-fn skipped_fire_is_printed_without_waiting() {
-    let server = fire_server(false);
-    let output = run_in(
-        &[
-            "--json",
-            "local",
-            "hook",
-            "fire",
-            "acme-bot",
-            "nightly-cleanup",
-            "--api-url",
-            &server.base_url,
-            "--api-key",
-            TEST_API_KEY,
-        ],
-        &[],
-    );
-    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
-    assert_eq!(one_object(&output)["outcome"], json!("skipped"));
-    assert!(server.recorded().iter().all(|req| req.method != "GET"));
+fn deferred_fire_times_out_at_both_tiers() {
+    let deferred = record_with_reason(Some("deferred"), Some("live_session")).to_string();
+    let server = serve(move |req| {
+        if (req.method == "POST" && req.path.ends_with("/fire"))
+            || (req.method == "GET" && req.path.contains("/runs/"))
+        {
+            return Response::json(200, &deferred);
+        }
+        Response::json(500, r#"{"detail":"unexpected"}"#)
+    });
+    for tier in ["local", "cluster"] {
+        let before = server.recorded().len();
+        let output = fire_command(tier, &server, &["--json"], "1");
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{tier}: {}",
+            describe(&output)
+        );
+        let value = one_object(&output);
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("did not settle within 1s"),
+            "{tier}: {value}"
+        );
+        assert!(server.recorded()[before..]
+            .iter()
+            .any(|req| req.method == "GET"));
+    }
 }
 
 #[test]
@@ -343,7 +435,7 @@ fn cluster_fire_uses_the_explicit_api() {
         ],
         &[("KUBECONFIG", MISSING_KUBECONFIG)],
     );
-    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
     assert_eq!(one_object(&output)["outcome"], json!("skipped"));
 }
 
