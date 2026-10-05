@@ -8,6 +8,13 @@ the resume turn, setting ``resumed_at`` only AFTER a successful enqueue
 (enqueue-first-then-mark), so a failed enqueue is retried on the next pass
 rather than lost.
 
+An inline enqueue that raised in this process is retried on the very next pass
+(#4016), not after the grace horizon below. ``ResumeQueue`` records every resume
+turn whose XADD raised (the resolve endpoint, the resolve-path expiry branch,
+the expiry sweeper, and administrative recovery all enqueue through it), and
+each pass drains that record first. Before #4016 a resolve that hit a
+just-restarted Valkey waited out the full grace, three hours under the chart.
+
 An ``expired`` record is an owed wake on the same terms (#418): since #412 both
 expiry paths enqueue a wake of their own, so a NULL ``resumed_at`` there means
 the same failed enqueue -- and, unlike a resolved record, the flipped row is no
@@ -24,12 +31,19 @@ so a row re-opened this pass is re-enqueued in the same pass.
 
 Three qualifications shape the design:
 
-- **Grace window (load-bearing).** ``reconcile_once`` only considers records
-  resolved at least ``grace_seconds`` ago. Helm derives this value from the
-  worker's delivery budget plus its delivery-shutdown reserve, giving the
-  resume delivered inline time to finish before the backstop retries it.
-  Callers outside Helm should use a conservative grace that covers the worker's
-  configured turn lifecycle. The worker serializes concurrent copies of a
+- **Grace window (load-bearing).** Apart from the recorded undelivered
+  resumes, ``reconcile_once`` only considers records resolved at least
+  ``grace_seconds`` ago. Helm derives this value from the worker's delivery
+  budget plus its delivery-shutdown reserve, giving the resume delivered inline
+  time to finish before the backstop retries it. The grace still governs every
+  row whose enqueue was not observed failing in this process: a wake that may
+  have landed (a failed mark after a successful enqueue), and any failure the
+  record lost to a process restart or refused past its cap. A recorded failure
+  bypasses it because the producer saw the XADD raise; if an ambiguous XADD
+  (a timeout after the server applied it) did land, the expedited copy is a
+  redundant wake that the worker's deterministic event-id claim and done marker
+  absorb. Callers outside Helm should use a conservative grace that covers the
+  worker's configured turn lifecycle. The worker serializes concurrent copies of a
   resume event with an active claim, so a duplicate does not enter the live
   turn. The two clocks it compares (``resolved_at`` is the DB ``func.now()``,
   ``resolved_before`` is this pod's clock) only add a small skew margin on top
@@ -58,8 +72,9 @@ Three qualifications shape the design:
   ``SELECT ... FOR UPDATE SKIP LOCKED`` claim locks each candidate in its own
   short transaction, so two replicas do not grab the same row; (2) *inline
   resolver vs reconciler*: the grace lets the original delivery finish before
-  the backstop retries; and (3) *duplicate worker deliveries*: the worker
-  claims the deterministic resume event id under the active delivery lease.
+  the backstop retries, and only a wake whose XADD raised skips it; and
+  (3) *duplicate worker deliveries*: the worker claims the deterministic
+  resume event id under the active delivery lease.
   The claim is renewed with that lease. A duplicate entry that loses the claim
   is acknowledged as redundant, while the original delivery stays pending and
   recoverable. If the holder crashes, a new claimant detects that the recorded
@@ -72,6 +87,7 @@ Three qualifications shape the design:
 """
 
 import asyncio
+import enum
 import logging
 import time
 import uuid
@@ -129,6 +145,14 @@ def _parse_dead_lettered_resume(
         return None
     dt_naive = dt.astimezone(UTC).replace(tzinfo=None) if dt.tzinfo else dt
     return approval_id, dt_naive
+
+
+class _Outcome(enum.Enum):
+    """What one per-row re-enqueue attempt did."""
+
+    ENQUEUED = "enqueued"
+    NOT_CLAIMED = "not_claimed"
+    FAILED = "failed"
 
 
 class ResumeReconciler:
@@ -196,19 +220,54 @@ class ResumeReconciler:
         return result
 
     async def _reconcile_once(self) -> int:
-        """Re-enqueue every owed wake past the grace horizon; return the count.
+        """Re-enqueue every owed wake this pass may retry; return the count.
 
-        Candidates are read once (unlocked) past the grace horizon; then each is
-        claimed atomically in its OWN short transaction via ``claim_resume_row``
-        (``SELECT ... FOR UPDATE SKIP LOCKED``). A row a concurrent replica
-        already holds is skipped this pass and retried next -- two replicas never
-        both enqueue one record. Per-record failure is isolated: the enqueue and
-        mark live inside ``session.begin()``, so a single-record Valkey blip
-        rolls that row's transaction back (``resumed_at`` stays NULL for the next
-        pass, preserving enqueue-first-then-mark durability) without aborting the
-        batch. The row lock is held only for that one record's brief enqueue+mark,
-        never across the whole batch.
+        Two sources, in order. First, every approval whose resume enqueue was
+        observed failing in this process (``ResumeQueue.undelivered_resumes``,
+        #4016), regardless of the grace window: that wake is
+        known not to have landed, so there is no in-flight delivery for the
+        grace to protect. Second, the unchanged grace query: candidates read once
+        (unlocked) past the grace horizon, skipping ids the first step already
+        handled this pass.
+
+        Each id goes through ``_reenqueue_one``'s own short transaction, claimed
+        via ``claim_resume_row`` (``SELECT ... FOR UPDATE SKIP LOCKED``), so a row
+        a concurrent replica already holds is skipped and two replicas never both
+        enqueue one record. Per-record failure is isolated: a single-record Valkey
+        blip rolls that row's transaction back (``resumed_at`` stays NULL for the
+        next pass, preserving enqueue-first-then-mark durability) without
+        aborting the batch, and the row lock is never held across the batch.
         """
+
+        count = 0
+        handled: set[uuid.UUID] = set()
+        for approval_id in self._resume_queue.undelivered_resumes():
+            handled.add(approval_id)
+            outcome = await self._reenqueue_one(approval_id)
+            if outcome is _Outcome.ENQUEUED:
+                # enqueue discarded the id from the record on success.
+                count += 1
+            elif outcome is _Outcome.NOT_CLAIMED:
+                # SKIP LOCKED returns None both when the row no longer owes a wake
+                # (gone, already resumed, not resumable, or a publication) and
+                # when a peer transaction merely holds its lock. Re-read without a
+                # lock: forget the id only in the first case. A locked row that
+                # still owes a wake stays recorded, so if the holder rolls back the
+                # next pass retries it instead of waiting out the full grace.
+                # A failed read keeps the id, isolating it like a failed enqueue.
+                try:
+                    async with self._sessionmaker() as session:
+                        still_owed = await crud.approval_owes_resume(session, approval_id)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "approval %s owed-wake check failed, will retry next pass",
+                        approval_id,
+                        exc_info=True,
+                    )
+                    still_owed = True
+                if not still_owed:
+                    self._resume_queue.forget_undelivered(approval_id)
+            # _Outcome.FAILED: enqueue re-recorded the id; it stays owed.
 
         resolved_before = datetime.now(UTC).replace(tzinfo=None) - timedelta(
             seconds=self._grace_seconds
@@ -218,32 +277,43 @@ class ResumeReconciler:
                 session, resolved_before=resolved_before, limit=self._batch_limit
             )
 
-        count = 0
         for approval_id in candidate_ids:
-            async with self._sessionmaker() as session:
-                try:
-                    async with session.begin():
-                        approval = await crud.claim_resume_row(session, approval_id)
-                        if approval is None:
-                            # Another replica holds it, or it is already resumed;
-                            # exit the txn block cleanly, releasing any lock.
-                            continue
-                        turn = resume_turn_for(approval)
-                        await self._resume_queue.enqueue(
-                            turn, parent=approval_trace_context(approval)
-                        )
-                        approval.resumed_at = datetime.now(UTC).replace(tzinfo=None)
-                    # session.begin() committed here, releasing the row lock.
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "approval %s resume re-enqueue failed, will retry next pass",
-                        approval_id,
-                        exc_info=True,
-                    )
-                    continue
+            if approval_id in handled:
+                continue
+            if await self._reenqueue_one(approval_id) is _Outcome.ENQUEUED:
                 count += 1
-                logger.info("approval %s resume turn re-enqueued", approval_id)
         return count
+
+    async def _reenqueue_one(self, approval_id: uuid.UUID) -> _Outcome:
+        """Claim one owed-wake row, enqueue its resume turn, then mark it.
+
+        Enqueue-first-then-mark inside ``session.begin()``: a failed enqueue or
+        mark rolls back, leaving ``resumed_at`` NULL for a later pass.
+        """
+
+        async with self._sessionmaker() as session:
+            try:
+                async with session.begin():
+                    approval = await crud.claim_resume_row(session, approval_id)
+                    if approval is None:
+                        # Another replica holds it, or it is already resumed;
+                        # exit the txn block cleanly, releasing any lock.
+                        return _Outcome.NOT_CLAIMED
+                    turn = resume_turn_for(approval)
+                    await self._resume_queue.enqueue(
+                        turn, parent=approval_trace_context(approval)
+                    )
+                    approval.resumed_at = datetime.now(UTC).replace(tzinfo=None)
+                # session.begin() committed here, releasing the row lock.
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "approval %s resume re-enqueue failed, will retry next pass",
+                    approval_id,
+                    exc_info=True,
+                )
+                return _Outcome.FAILED
+        logger.info("approval %s resume turn re-enqueued", approval_id)
+        return _Outcome.ENQUEUED
 
     async def reopen_dead_lettered_resumes(self) -> int:
         """Re-open approvals whose DELIVERED resume turn was dead-lettered (#532).

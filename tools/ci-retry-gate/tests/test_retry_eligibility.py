@@ -53,6 +53,7 @@ RETRY_ALLOWLIST = frozenset(
         ("ci.yaml", "e2e-ladder-cluster", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-chart-regressions", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-rollout-recovery", "Create the kind cluster"),
+        ("ci.yaml", "e2e-cluster-approval-resume-restarts", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-upgrade-matrix", "Create the disposable kind cluster"),
         # Issue #3866: the same acquisition class as the #1106 wraps, on the
         # ci.yaml and helm-ci.yaml steps that were still a single attempt.
@@ -82,6 +83,7 @@ RETRY_ALLOWLIST = frozenset(
             "Install uv for the connector readiness render",
         ),
         ("ci.yaml", "e2e-cluster-rollout-recovery", "Install Helm"),
+        ("ci.yaml", "e2e-cluster-approval-resume-restarts", "Install Helm"),
         ("ci.yaml", "e2e-released-upgrade", "Install Helm"),
         ("ci.yaml", "e2e-released-upgrade", "Create the disposable kind cluster"),
         ("ci.yaml", "e2e-released-upgrade-negative", "Install Helm"),
