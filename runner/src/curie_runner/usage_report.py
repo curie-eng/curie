@@ -16,7 +16,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
+import re
+from collections.abc import Collection, Mapping
 from dataclasses import replace
 from typing import Any, Protocol, cast
 
@@ -49,6 +50,9 @@ REVIEWER = "reviewer"
 _WIRE_KEYS = ("input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens")
 
 Observed = Mapping[tuple[str, str], Mapping[str, int]]
+
+# A trailing context-window token on a model id, such as ``[1m]`` (#3992).
+_CONTEXT_WINDOW_SUFFIX = re.compile(r"\[[^\[\]]*\]$")
 
 
 class UsageSink(Protocol):
@@ -125,6 +129,35 @@ def _turn_id(message: ResultMessage, models: list[dict[str, Any]]) -> str:
     return f"{message.session_id}:{digest}"
 
 
+def _base_model(model: str) -> str:
+    return _CONTEXT_WINDOW_SUFFIX.sub("", model) or model
+
+
+def _usage_key(model: str, keys: Collection[str]) -> str:
+    """The ``model_usage`` key an observed model id belongs to.
+
+    The SDK keys ``model_usage`` with the configured id, which can end in a
+    context-window token such as ``[1m]``, while ``AssistantMessage.model``
+    carries the base id. An id with no exact key pairs with the one key that
+    shares its base; with none or several it stays as it is.
+    """
+
+    if model in keys:
+        return model
+    base = _base_model(model)
+    candidates = [key for key in keys if _base_model(key) == base]
+    return candidates[0] if len(candidates) == 1 else model
+
+
+def _paired(observed: Observed, keys: Collection[str]) -> dict[tuple[str, str], dict[str, int]]:
+    paired: dict[tuple[str, str], dict[str, int]] = {}
+    for (role, model), counts in observed.items():
+        bucket = paired.setdefault((role, _usage_key(model, keys)), dict.fromkeys(_WIRE_KEYS, 0))
+        for key in _WIRE_KEYS:
+            bucket[key] += _count(counts.get(key))
+    return paired
+
+
 def _split(
     model: str,
     totals: dict[str, Any],
@@ -164,18 +197,21 @@ def build_usage_body(
     is given every entry carries a ``role``, when omitted entries carry none.
     """
 
-    seen: Observed = observed if observed is not None else {}
     models: list[dict[str, Any]] = []
     represented: set[str] = set()
     model_usage = getattr(message, "model_usage", None)
     if isinstance(model_usage, dict) and model_usage:
+        keys = {model for model in model_usage if isinstance(model, str) and model}
+        seen: Observed = _paired(observed or {}, keys)
+        primary = _usage_key(primary_model, keys) if primary_model else primary_model
         for model, raw in model_usage.items():
             if isinstance(model, str) and model and isinstance(raw, dict):
                 represented.add(model)
-                split = _split(model, _entry(model, raw, _MODEL_USAGE_KEYS), seen, primary_model)
+                split = _split(model, _entry(model, raw, _MODEL_USAGE_KEYS), seen, primary)
                 # A zero cumulative entry means the model gained nothing this turn.
                 models.extend(e for e in split if any(e[key] for key in _WIRE_KEYS))
     else:
+        seen = observed if observed is not None else {}
         usage = getattr(message, "usage", None)
         if isinstance(usage, dict) and usage and primary_model:
             represented.add(primary_model)
@@ -277,9 +313,10 @@ class UsageReporter:
         else:
             turn = _turn_counts(previous, parsed)
             baseline = {model: dict(counts) for model, counts in {**previous, **parsed}.items()}
-        for model, counts in list(turn.items()):
-            unmatched = self._unmatched_reviewer.get(model)
-            if unmatched is None:
+        for reviewed, unmatched in list(self._unmatched_reviewer.items()):
+            model = _usage_key(reviewed, turn)
+            counts = turn.get(model)
+            if counts is None:
                 continue
             for key in _WIRE_KEYS:
                 caught_up = min(counts[key], unmatched[key])
@@ -288,7 +325,7 @@ class UsageReporter:
             if not any(counts.values()):
                 del turn[model]
             if not any(unmatched.values()):
-                del self._unmatched_reviewer[model]
+                del self._unmatched_reviewer[reviewed]
         if not turn:
             return None, session_id, baseline
         isolated = replace(message, model_usage=cast(Any, _wire_to_model_usage(turn)), usage={})

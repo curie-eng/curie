@@ -980,3 +980,104 @@ def test_a_failed_reviewer_report_is_replayed_with_its_role_before_the_next_delt
     assert set(kept) == {("implementer", PRIMARY)}
     assert kept[("implementer", PRIMARY)]["input_tokens"] == 50
     assert kept[("implementer", PRIMARY)]["output_tokens"] == 5
+
+
+# --- a context-window suffix on model_usage keys (#3992) ---------------------------
+#
+# The SDK keys ``model_usage`` with the configured id, which can carry a trailing
+# context-window token such as ``[1m]``; ``AssistantMessage.model`` carries the
+# base id. The counts below are the ones a factory run stored for one request.
+
+FAST = "z-ai/glm-5.3-flash"
+OPUS = "anthropic/claude-opus-5.5"
+OPUS_1M = f"{OPUS}[1m]"
+
+
+@pytest.mark.parametrize("primary", [FAST, OPUS_1M])
+def test_a_suffixed_model_usage_key_pairs_with_its_base_model_observations(
+    primary: str,
+) -> None:
+    observed = {
+        ("implementer", FAST): _wire(35696, 9279, cached=750720),
+        ("reviewer", OPUS): _wire(16, 64, cached=45517, write=29094),
+    }
+    if primary == FAST:
+        observed[("implementer", OPUS)] = _wire(0, 4434)
+    message = _result(
+        model_usage={
+            FAST: _model_usage(35696, 9279, cached=750720),
+            OPUS_1M: _model_usage(16, 4498, cached=45517, write=29094),
+        },
+        uuid="turn-suffixed",
+    )
+
+    body = build_usage_body(message, primary, observed=observed)
+
+    assert body is not None
+    models = _by_role_model(body)
+    assert set(models) == {
+        ("implementer", FAST),
+        ("implementer", OPUS_1M),
+        ("reviewer", OPUS_1M),
+    }
+    assert {key: models[("reviewer", OPUS_1M)][key] for key in _wire(0, 0)} == _wire(
+        16, 64, cached=45517, write=29094
+    )
+    assert {key: models[("implementer", OPUS_1M)][key] for key in _wire(0, 0)} == _wire(0, 4434)
+    assert {
+        key: sum(entry[key] for entry in body["models"] if entry["model"] == OPUS_1M)
+        for key in _wire(0, 0)
+    } == _wire(16, 4498, cached=45517, write=29094)
+
+
+def test_a_different_bracketed_model_does_not_take_another_models_observations() -> None:
+    other = "anthropic/claude-opus-5[1m]"
+    observed = {("reviewer", OPUS): _wire(16, 64)}
+    message = _result(model_usage={other: _model_usage(100, 50)}, uuid="turn-other")
+
+    body = build_usage_body(message, other, observed=observed)
+
+    assert body is not None
+    models = _by_role_model(body)
+    assert set(models) == {("implementer", other), ("reviewer", OPUS)}
+    assert {key: models[("implementer", other)][key] for key in _wire(0, 0)} == _wire(100, 50)
+
+
+def test_reviewer_usage_reported_before_its_suffixed_totals_is_not_counted_again() -> None:
+    """The SDK cost guide defines model_usage as cumulative within a session:
+    https://code.claude.com/docs/en/agent-sdk/cost-tracking
+    """
+    recorder = _Recorder()
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            reporter = UsageReporter(
+                str(server.make_url("/v1/work-item-progress/example-request/usage")), TOKEN
+            )
+            reporter.observe(_assistant(FAST, _sdk_usage(100, 10)))
+            reporter.observe(
+                _assistant(
+                    OPUS,
+                    _sdk_usage(16, 64, cached=45517, write=29094),
+                    parent="toolu_example",
+                    message_id="msg_reviewer_early",
+                )
+            )
+            await reporter.report(
+                _result(model_usage={FAST: _model_usage(100, 10)}, uuid="turn_early"), FAST
+            )
+            await reporter.report(
+                _result(
+                    model_usage={
+                        FAST: _model_usage(100, 10),
+                        OPUS_1M: _model_usage(16, 64, cached=45517, write=29094),
+                    },
+                    uuid="turn_caught_up",
+                ),
+                FAST,
+            )
+
+    anyio.run(go)
+    assert [body["turn_id"] for body, _ in recorder.received] == ["turn_early"]
+    early = _by_role_model(recorder.received[0][0])
+    assert set(early) == {("implementer", FAST), ("reviewer", OPUS)}
