@@ -1206,7 +1206,7 @@ fn cluster_down_failforward_error_is_transient_with_resume_fix() {
     // The resume command an incomplete teardown surfaces: only the outstanding
     // steps, label-scoped per #707 (the ownership-scope invariant).
     let resume =
-        "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found";
+        "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found --timeout=300s";
     let err: anyhow::Error =
         CliError::transient("cluster teardown could not complete; the API server was unreachable")
             .with_fix(resume)
