@@ -37,6 +37,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Publication lineage authority | CLEAN | 1 (API authority through PublicationLineageClient) | not separately graded | #2274, #3923 | [Publication lineage authority](interfaces/publication-lineage-authority/INTERFACE.md) |
 | Cluster lifecycle | SOFT | 1 (Rust CLI over Helm and kubectl) | not separately graded | #2301, #3923 | [Cluster lifecycle](interfaces/cluster-lifecycle/INTERFACE.md) |
 | Model pricing / PriceBook | CLEAN | 1 price source (OpenRouterPriceBook) + disabled fallback | not separately graded | #3223, #3923 | [Model pricing / PriceBook](interfaces/model-pricing/INTERFACE.md) |
+| Forge tracker and code host | CLEAN | 1 in-memory pair behind the Tracker and CodeHost ports (GitHub adapter pending) | not separately graded | #3831 | [Forge tracker and code host](interfaces/forge-tracker/INTERFACE.md) |
 <!-- END GENERATED: seam-table -->
 
 ## Kind legend
