@@ -19,6 +19,7 @@ from curie_api.schemas.workspaces import (
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import SessionDep
+from ..forges import types as forge_types
 from ..models import Deployment, WorkItem
 from ..repository_auth import resolve_repository_credential
 from ..workspace_policy import credential_mode, repository_is_allowed
@@ -57,6 +58,14 @@ async def select_workspace_repository(
 ) -> WorkspaceSelectionOut:
     """Select once per agent/thread, or validate and reuse the winner."""
 
+    if data.repo_full_name is not None and data.repository_kind != forge_types.GITHUB:
+        # The only runtime workspace allowlist is GITHUB_REPO_ALLOWLIST. A path
+        # on another code host must not match a GitHub owner/* entry, so
+        # nothing admits it until that host has an allowlist of its own.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "repository is not allowed for runtime workspaces",
+        )
     deployment = await _workspace_deployment(session, deployment_id)
     selected = await crud_workspaces.get_thread_workspace(
         session,

@@ -13,8 +13,10 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from .forges import types as forge_types
+from .forges.paths import valid_repository_path
 from .hook_partition import HOOK_NAME, PARTITION_VALUE, resolve_pointer
-from .workspace_policy import repository_is_allowed, valid_repository_name
+from .workspace_policy import repository_is_allowed
 
 MappingStatus = Literal[
     "unconfigured",
@@ -207,7 +209,7 @@ def resolve_source_binding(
         )
 
     _workload, repository, revision = matched[0]
-    if not valid_repository_name(repository) or not repository_is_allowed(
+    if not valid_repository_path(forge_types.GITHUB, repository) or not repository_is_allowed(
         repository, allowlist
     ):
         return MappingOutcome(

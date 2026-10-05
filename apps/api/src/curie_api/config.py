@@ -40,7 +40,9 @@ from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .e2e_connector import E2EInstall
-from .workspace_policy import valid_allowlist_entry, valid_repository_name
+from .forges import types as forge_types
+from .forges.paths import valid_repository_path
+from .workspace_policy import valid_allowlist_entry
 
 # Dev-only default secrets. The production boot gate refuses to start when any of
 # these is still in place under ENVIRONMENT=prod.
@@ -938,7 +940,7 @@ class Settings(BaseSettings):
             raise ValueError("GITHUB_FACTORY_PYTHON_CI must be a JSON object")
         policies: dict[str, dict[str, Any]] = {}
         for repo, policy in value.items():
-            if not isinstance(repo, str) or not valid_repository_name(repo):
+            if not isinstance(repo, str) or not valid_repository_path(forge_types.GITHUB, repo):
                 raise ValueError(f"GITHUB_FACTORY_PYTHON_CI key {repo!r} is not owner/name")
             if not isinstance(policy, dict) or set(policy) - {
                 "check",
@@ -983,7 +985,7 @@ class Settings(BaseSettings):
             raise ValueError("GITHUB_FACTORY_METADATA_CI must be a JSON object")
         policies: dict[str, dict[str, Any]] = {}
         for repo, policy in value.items():
-            if not isinstance(repo, str) or not valid_repository_name(repo):
+            if not isinstance(repo, str) or not valid_repository_path(forge_types.GITHUB, repo):
                 raise ValueError(f"GITHUB_FACTORY_METADATA_CI key {repo!r} is not owner/name")
             if not isinstance(policy, dict) or set(policy) - {"checks", "statuses"}:
                 raise ValueError(f"GITHUB_FACTORY_METADATA_CI[{repo!r}] has an invalid shape")
@@ -1014,7 +1016,7 @@ class Settings(BaseSettings):
             raise ValueError("GITHUB_FACTORY_BASES must be a JSON object")
         entries: dict[str, dict[str, Any]] = {}
         for repo, entry in value.items():
-            if not isinstance(repo, str) or not valid_repository_name(repo):
+            if not isinstance(repo, str) or not valid_repository_path(forge_types.GITHUB, repo):
                 raise ValueError(f"GITHUB_FACTORY_BASES key {repo!r} is not owner/name")
             if not isinstance(entry, dict) or set(entry) - {"bases", "default_base"}:
                 raise ValueError(f"GITHUB_FACTORY_BASES[{repo!r}] has an invalid shape")

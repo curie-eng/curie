@@ -4771,6 +4771,12 @@ export interface components {
             /** Total Usd */
             total_usd: number;
         };
+        /**
+         * CredentialHeader
+         * @description The header form git accepts on a forge. GitLab refuses a Bearer header.
+         * @enum {string}
+         */
+        CredentialHeader: "authorization_basic" | "authorization_bearer" | "private_token";
         /** Declaration */
         Declaration: {
             /** Loops */
@@ -6759,12 +6765,23 @@ export interface components {
         /**
          * RepositoryCredentialOut
          * @description One server-derived Git credential returned only to the trusted worker.
+         *
+         *     ``origin``, ``header_form`` and ``ca_bundle_ref`` are the code host
+         *     transport facts (ADR 0197). Each defaults to today's GitHub behavior: the
+         *     configured GitHub host, an ``Authorization: Basic`` header, and the public
+         *     trust store.
          */
         RepositoryCredentialOut: {
             /** Authorization Header */
             authorization_header: string;
+            /** Ca Bundle Ref */
+            ca_bundle_ref?: string | null;
             /** Clone Url */
             clone_url: string;
+            /** @default authorization_basic */
+            header_form?: components["schemas"]["CredentialHeader"];
+            /** Origin */
+            origin?: string | null;
             /** Repo Full Name */
             repo_full_name: string;
             /** Revision */
@@ -7924,8 +7941,14 @@ export interface components {
             base_branch?: string | null;
             /** Base Commit */
             base_commit?: string | null;
+            /** Ca Bundle Ref */
+            ca_bundle_ref?: string | null;
             /** Clone Url */
             clone_url: string;
+            /** @default authorization_basic */
+            header_form?: components["schemas"]["CredentialHeader"];
+            /** Origin */
+            origin?: string | null;
             /** Repo Full Name */
             repo_full_name: string;
             /** Revision */
@@ -7951,6 +7974,12 @@ export interface components {
             conversation_id: string;
             /** Repo Full Name */
             repo_full_name?: string | null;
+            /**
+             * Repository Kind
+             * @default github
+             * @enum {string}
+             */
+            repository_kind?: "github" | "gitlab" | "bitbucket_cloud" | "bitbucket_dc";
         };
     };
     responses: never;

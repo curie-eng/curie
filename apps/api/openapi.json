@@ -4425,6 +4425,16 @@
         "title": "CostReport",
         "type": "object"
       },
+      "CredentialHeader": {
+        "description": "The header form git accepts on a forge. GitLab refuses a Bearer header.",
+        "enum": [
+          "authorization_basic",
+          "authorization_bearer",
+          "private_token"
+        ],
+        "title": "CredentialHeader",
+        "type": "string"
+      },
       "Declaration": {
         "additionalProperties": false,
         "properties": {
@@ -8757,15 +8767,41 @@
         "type": "object"
       },
       "RepositoryCredentialOut": {
-        "description": "One server-derived Git credential returned only to the trusted worker.",
+        "description": "One server-derived Git credential returned only to the trusted worker.\n\n``origin``, ``header_form`` and ``ca_bundle_ref`` are the code host\ntransport facts (ADR 0197). Each defaults to today's GitHub behavior: the\nconfigured GitHub host, an ``Authorization: Basic`` header, and the public\ntrust store.",
         "properties": {
           "authorization_header": {
             "title": "Authorization Header",
             "type": "string"
           },
+          "ca_bundle_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ca Bundle Ref"
+          },
           "clone_url": {
             "title": "Clone Url",
             "type": "string"
+          },
+          "header_form": {
+            "$ref": "#/components/schemas/CredentialHeader",
+            "default": "authorization_basic"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Origin"
           },
           "repo_full_name": {
             "title": "Repo Full Name",
@@ -11504,9 +11540,35 @@
             ],
             "title": "Base Commit"
           },
+          "ca_bundle_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ca Bundle Ref"
+          },
           "clone_url": {
             "title": "Clone Url",
             "type": "string"
+          },
+          "header_form": {
+            "$ref": "#/components/schemas/CredentialHeader",
+            "default": "authorization_basic"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Origin"
           },
           "repo_full_name": {
             "title": "Repo Full Name",
@@ -11599,6 +11661,17 @@
               }
             ],
             "title": "Repo Full Name"
+          },
+          "repository_kind": {
+            "default": "github",
+            "enum": [
+              "github",
+              "gitlab",
+              "bitbucket_cloud",
+              "bitbucket_dc"
+            ],
+            "title": "Repository Kind",
+            "type": "string"
           }
         },
         "required": [

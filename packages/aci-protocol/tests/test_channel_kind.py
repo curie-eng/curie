@@ -22,7 +22,7 @@ def _env() -> dict[str, str]:
 
 
 def test_channel_kind_parses_when_present_and_is_absent_as_none() -> None:
-    assert PROTOCOL_VERSION == "0.5.19"
+    assert PROTOCOL_VERSION == "0.5.20"
     parsed = BootEnv.from_env(_env() | {"CURIE_CHANNEL_KIND": "slack"})
     assert parsed.channel_kind == "slack"
     missing = BootEnv.from_env(_env())

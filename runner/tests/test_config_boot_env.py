@@ -231,6 +231,34 @@ def test_memory_fact_limit_falls_back_to_200_rather_than_raising(raw: str) -> No
     assert config.memory_max_facts == 200
 
 
+def test_repository_trust_comes_through_the_declared_surface() -> None:
+    """ADR 0197: the code host origin and deep path reach the snapshot check."""
+
+    config = RunnerConfig.from_env(
+        dict(
+            _BASE,
+            CURIE_REPO_ORIGIN="https://gitlab.example.com",
+            CURIE_REPO_PATH="platform/team/infra",
+        )
+    )
+
+    assert config.repo_origin == "https://gitlab.example.com"
+    assert config.repo_path == "platform/team/infra"
+
+
+@pytest.mark.parametrize("raw", [None, ""])
+def test_repository_trust_is_absent_on_a_github_boot(raw: str | None) -> None:
+    """Unset or blank is a GitHub boot: the configured host and owner/name."""
+
+    env = dict(_BASE)
+    if raw is not None:
+        env |= {"CURIE_REPO_ORIGIN": raw, "CURIE_REPO_PATH": raw}
+    config = RunnerConfig.from_env(env)
+
+    assert config.repo_origin is None
+    assert config.repo_path is None
+
+
 def test_malformed_budget_still_raises() -> None:
     with pytest.raises(ValidationError):
         RunnerConfig.from_env(dict(_BASE, CURIE_BUDGET="{not json"))
