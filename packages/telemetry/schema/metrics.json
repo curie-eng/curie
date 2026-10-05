@@ -413,6 +413,10 @@
           "/observability/metrics/summary",
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
+          "/channel-identities",
+          "/channel-identities/{identity_id}",
+          "/provider-installations",
+          "/provider-installations/{installation_id}",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -476,7 +480,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 944,
+      "cardinality_bound": 976,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -558,6 +562,10 @@
           "/observability/metrics/summary",
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
+          "/channel-identities",
+          "/channel-identities/{identity_id}",
+          "/provider-installations",
+          "/provider-installations/{installation_id}",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -628,7 +636,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 4720,
+      "cardinality_bound": 4880,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -710,6 +718,10 @@
           "/observability/metrics/summary",
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
+          "/channel-identities",
+          "/channel-identities/{identity_id}",
+          "/provider-installations",
+          "/provider-installations/{installation_id}",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -780,7 +792,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 4720,
+      "cardinality_bound": 4880,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

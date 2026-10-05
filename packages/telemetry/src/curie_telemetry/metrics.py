@@ -345,6 +345,11 @@ _HTTP_OPERATIONS = [
     "/observability/metrics/summary",
     "/observability/runners",
     "/observability/runners/{namespace}/{pod}/logs",
+    # Provider installation and channel identity admin CRUD (#2909, ADR 0193).
+    "/channel-identities",
+    "/channel-identities/{identity_id}",
+    "/provider-installations",
+    "/provider-installations/{installation_id}",
     "/publications",
     "/publications/precheck",
     "/publications/{publication_id}",

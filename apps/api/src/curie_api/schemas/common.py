@@ -1,7 +1,14 @@
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from ..runner_resources import RunnerResourcesError, validate_runner_resources
+
+# Shared by provider_installations and channel_identities (#2909): a
+# provider installation's and a channel identity's `provider` column both
+# draw from this vocabulary, and the admin routes' list filters on it too.
+ProviderName = Literal[
+    "slack", "m365", "github", "jira", "linear", "confluence", "quickbooks", "other"
+]
 
 
 def nullable_override_validator(field: str, examples: str) -> Callable[[str | None], str | None]:
