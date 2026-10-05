@@ -12,12 +12,13 @@ from plugin_format.connectors import ADMITS_SELF
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..config import get_settings
+from ..forges import types as forge_types
+from ..forges.paths import valid_repository_path
 from ..hook_partition import HOOK_NAME, validate_pointer_syntax
 from ..models import MAX_EXECUTION_DEADLINE_SECONDS, MIN_EXECUTION_DEADLINE_SECONDS
 from ..publication_policy import POLICY_APPROVE, POLICY_AUTO, validate_branch_prefix
 from ..repo_full_name import RepoFullName
 from ..source_binding import validate_revision, validate_source_binding_keys, validate_workload_key
-from ..workspace_policy import valid_repository_name
 from .approvals import ApprovalRouteBinding, ApprovalRouteBindingOut
 from .channels import ChannelBindingOut, ChannelBindingWrite
 from .common import (
@@ -312,7 +313,7 @@ class SourceBindingEntry(BaseModel):
     @field_validator("repository")
     @classmethod
     def _check_repository(cls, value: str) -> str:
-        if not valid_repository_name(value):
+        if not valid_repository_path(forge_types.GITHUB, value):
             raise ValueError("repository must be one canonical owner/repository name")
         return value
 

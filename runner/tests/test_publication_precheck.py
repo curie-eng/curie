@@ -161,6 +161,7 @@ async def _boot(
     monkeypatch: pytest.MonkeyPatch,
     *,
     sdk_env: dict[str, str] | None = None,
+    boot_env: dict[str, str] | None = None,
 ) -> SessionRunner:
     bundle = tmp_path / "bundle"
     (bundle / ".claude-plugin").mkdir(parents=True)
@@ -175,6 +176,7 @@ async def _boot(
             "CURIE_SESSION_ID": "publicationtest",
             "CURIE_SANDBOX_ID": "publicationbox",
             "CURIE_BUDGET": '{"max_output_tokens_per_run":10000,"max_usd_per_day":1.0}',
+            **(boot_env or {}),
         }
     )
     # Production boot performs synchronous capability discovery with anyio.run.
@@ -314,6 +316,53 @@ def test_empty_diff_refusal_shares_one_decision_and_finishes_done(
             assert CAPABILITY not in json.dumps(frames)
             assert CAPABILITY not in caplog.text
             assert all(CAPABILITY not in query for query in model.queries)
+
+    anyio.run(go)
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+def test_snapshot_trusts_the_boot_env_code_host_and_deep_path(
+    tmp_path: Path,
+    workspace: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    trusted: bool,
+) -> None:
+    """ADR 0197: a deep GitLab path is checked against the boot env's trust.
+
+    With CURIE_REPO_ORIGIN and CURIE_REPO_PATH the snapshot succeeds and the
+    remote comparison runs; without them the same workspace is refused before
+    any remote read, which is today's GitHub only check.
+    """
+
+    async def go() -> None:
+        repo, head = workspace
+        _git(
+            repo,
+            "remote",
+            "set-url",
+            "origin",
+            "https://gitlab.example.com/platform/team/infra.git",
+        )
+        boot_env = (
+            {
+                "CURIE_REPO_ORIGIN": "https://gitlab.example.com",
+                "CURIE_REPO_PATH": "platform/team/infra",
+            }
+            if trusted
+            else {}
+        )
+        async with _api([(200, {"result": "unchanged"})]) as (url, calls):
+            runner = await _boot(tmp_path, repo, url, monkeypatch, boot_env=boot_env)
+            gate = runner._approval_gate
+            assert gate is not None
+            model = _PublicationModel(gate, [("publish1", {"title": TITLE, "body": BODY})])
+            frames = await _run(runner, model, _event(_context(head, url)))
+            if trusted:
+                _assert_refusal(model, gate, frames, "no_change")
+                assert len(calls) == 1
+            else:
+                _assert_refusal(model, gate, frames, "precheck_unavailable")
+                assert calls == []
 
     anyio.run(go)
 

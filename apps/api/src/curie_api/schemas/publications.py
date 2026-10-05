@@ -8,8 +8,9 @@ from typing import Literal
 from aci_protocol.turn import SLACK_KIND, route_identity
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ..forges import types as forge_types
+from ..forges.paths import REPOSITORY_FULL_NAME_PATTERN, valid_repository_path
 from ..identities import refuse_undeclared
-from ..workspace_policy import REPOSITORY_FULL_NAME_PATTERN, valid_repository_name
 from .channels import (
     BUILTIN_CLUSTER_MESSAGE_ADAPTER,
     CHANNEL_KIND,
@@ -51,7 +52,7 @@ class PublicationCreate(BaseModel):
     @field_validator("repo_full_name")
     @classmethod
     def _canonical_publication_repo(cls, value: str) -> str:
-        if not valid_repository_name(value):
+        if not valid_repository_path(forge_types.GITHUB, value):
             raise ValueError("repo_full_name must be one canonical owner/repository name")
         return value
 

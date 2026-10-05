@@ -206,6 +206,9 @@ def _full_boot_env() -> BootEnv:
         deployment_environment="prod",
         channel_bound=True,
         channel_kind="slack",
+        repo_origin="https://gitlab.example.com",
+        repo_path="platform/team/infra",
+        repo_ca_bundle="/etc/curie/ca/forge.pem",
         model_env_key="MY_PROVIDER_KEY",
         metrics_temporality_preference="delta",
         max_turns=50,
@@ -577,6 +580,9 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         memory_writes=True,
         channel_bound=True,
         channel_kind="slack",
+        repo_origin="https://gitlab.example.com",
+        repo_path="platform/team/infra",
+        repo_ca_bundle="/etc/curie/ca/forge.pem",
     )
     worker_owned = set(BootEnv.env_keys(producer="worker"))
     assert set(maximal) <= worker_owned
@@ -872,6 +878,9 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_DEPLOYMENT_ENVIRONMENT",
         "CURIE_CHANNEL_BOUND",
         "CURIE_CHANNEL_KIND",
+        "CURIE_REPO_ORIGIN",
+        "CURIE_REPO_PATH",
+        "CURIE_REPO_CA_BUNDLE",
         "CURIE_MODEL_ENV_KEY",
         "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
         "CURIE_MAX_TURNS",

@@ -142,6 +142,142 @@ def test_snapshot_default_github_host_refuses_an_unconfigured_ghes_origin(
         snapshot.capture_workspace_snapshot(repo, expected_repo=REPO)
 
 
+DEEP_ORIGIN = "https://gitlab.example.com/scm"
+DEEP_PATH = "platform/team/infra"
+
+
+@pytest.mark.parametrize("path", [DEEP_PATH, "acme/api", "a/b/c/d/e/project.name"])
+def test_snapshot_accepts_a_declared_path_of_any_depth_under_the_trusted_origin(
+    snapshot: Any, tmp_path: Path, path: str
+) -> None:
+    repo, base_sha = _repo(tmp_path)
+    _git(repo, "remote", "set-url", "origin", f"{DEEP_ORIGIN}/{path}.git")
+    (repo / "README.md").write_text("GitLab change\n")
+
+    captured = snapshot.capture_workspace_snapshot(
+        repo,
+        expected_repo=path,
+        trusted_origin=f"{DEEP_ORIGIN}/",
+        repository_path=path,
+    )
+
+    assert captured.repo_full_name == path
+    assert captured.base_sha == base_sha
+    assert captured.changed_paths == ("README.md",)
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        # A different host, even one serving the same path.
+        f"https://gitlab.other.example.com/scm/{DEEP_PATH}.git",
+        # The configured GitHub host is no longer trusted once an origin is set.
+        f"https://github.com/{DEEP_PATH}.git",
+        # The trusted host without its base path.
+        f"https://gitlab.example.com/{DEEP_PATH}.git",
+        # Right host, a path other than the declared one.
+        f"{DEEP_ORIGIN}/platform/team/other.git",
+        f"{DEEP_ORIGIN}/platform/team.git",
+        f"{DEEP_ORIGIN}/platform/team/infra/extra.git",
+        # Noncanonical forms of the declared path.
+        f"http://gitlab.example.com/scm/{DEEP_PATH}.git",
+        f"https://bot@gitlab.example.com/scm/{DEEP_PATH}.git",
+        f"{DEEP_ORIGIN}/{DEEP_PATH}",
+        f"{DEEP_ORIGIN}/platform//team/infra.git",
+        f"{DEEP_ORIGIN}/{DEEP_PATH}.git?ref=main",
+    ],
+)
+def test_snapshot_refuses_any_origin_but_the_declared_path_on_the_trusted_host(
+    snapshot: Any, tmp_path: Path, origin: str
+) -> None:
+    repo, _ = _repo(tmp_path)
+    _git(repo, "remote", "set-url", "origin", origin)
+    (repo / "README.md").write_text("must not publish\n")
+
+    with pytest.raises(snapshot.WorkspaceSnapshotError, match="origin"):
+        snapshot.capture_workspace_snapshot(
+            repo, trusted_origin=DEEP_ORIGIN, repository_path=DEEP_PATH
+        )
+
+
+@pytest.mark.parametrize(
+    "trusted_origin",
+    [
+        "http://gitlab.example.com/scm",
+        "https://bot:secret@gitlab.example.com/scm",
+        "https://gitlab.example.com/scm?x=1",
+        "https://gitlab.example.com:notaport/scm",
+        "gitlab.example.com/scm",
+    ],
+)
+def test_snapshot_fails_closed_on_a_malformed_trusted_origin(
+    snapshot: Any, tmp_path: Path, trusted_origin: str
+) -> None:
+    repo, _ = _repo(tmp_path)
+    _git(repo, "remote", "set-url", "origin", f"{DEEP_ORIGIN}/{DEEP_PATH}.git")
+
+    with pytest.raises(snapshot.WorkspaceSnapshotError, match="origin is invalid"):
+        snapshot.capture_workspace_snapshot(
+            repo, trusted_origin=trusted_origin, repository_path=DEEP_PATH
+        )
+
+
+@pytest.mark.parametrize("declared", ["infra", "platform/../infra", "platform/./infra", ""])
+def test_snapshot_refuses_a_declared_path_that_is_not_a_repository_path(
+    snapshot: Any, tmp_path: Path, declared: str
+) -> None:
+    repo, _ = _repo(tmp_path)
+    _git(repo, "remote", "set-url", "origin", f"{DEEP_ORIGIN}/{declared}.git")
+
+    with pytest.raises(snapshot.WorkspaceSnapshotError, match="declared repository path"):
+        snapshot.capture_workspace_snapshot(
+            repo, trusted_origin=DEEP_ORIGIN, repository_path=declared
+        )
+
+
+def test_snapshot_without_a_declared_path_keeps_github_owner_name_under_a_trusted_origin(
+    snapshot: Any, tmp_path: Path
+) -> None:
+    repo, _ = _repo(tmp_path)
+    _git(repo, "remote", "set-url", "origin", f"{DEEP_ORIGIN}/{REPO}.git")
+    assert (
+        snapshot.capture_workspace_snapshot(repo, trusted_origin=DEEP_ORIGIN).repo_full_name
+        == REPO
+    )
+
+    _git(repo, "remote", "set-url", "origin", f"{DEEP_ORIGIN}/{DEEP_PATH}.git")
+    with pytest.raises(snapshot.WorkspaceSnapshotError, match="owner/repository"):
+        snapshot.capture_workspace_snapshot(repo, trusted_origin=DEEP_ORIGIN)
+
+
+def test_snapshot_github_default_is_unchanged_when_the_boot_env_sets_nothing(
+    snapshot: Any, tmp_path: Path
+) -> None:
+    repo, base_sha = _repo(tmp_path)
+    (repo / "README.md").write_text("GitHub change\n")
+    captured = snapshot.capture_workspace_snapshot(
+        repo, expected_repo=REPO, trusted_origin=None, repository_path=None
+    )
+    assert captured.repo_full_name == REPO
+    assert captured.base_sha == base_sha
+
+    # A deep path on github.com stays refused without a declared path, with
+    # today's message.
+    _git(repo, "remote", "set-url", "origin", f"https://github.com/{DEEP_PATH}.git")
+    with pytest.raises(
+        snapshot.WorkspaceSnapshotError,
+        match="^workspace repository origin is not an owner/repository URL$",
+    ):
+        snapshot.capture_workspace_snapshot(repo)
+
+    _git(repo, "remote", "set-url", "origin", f"{DEEP_ORIGIN}/{REPO}.git")
+    with pytest.raises(
+        snapshot.WorkspaceSnapshotError,
+        match="^workspace repository origin is not credential-free GitHub HTTPS$",
+    ):
+        snapshot.capture_workspace_snapshot(repo)
+
+
 def test_snapshot_preserves_real_top_level_a_and_b_paths_with_spaces(
     snapshot: Any, tmp_path: Path
 ) -> None:
