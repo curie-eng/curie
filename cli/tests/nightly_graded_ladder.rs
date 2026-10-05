@@ -1175,6 +1175,221 @@ fn nightly_never_echoes_the_openrouter_secret_on_a_run_line() {
     }
 }
 
+fn workflow_jobs(text: &str) -> Vec<&str> {
+    let rest = text
+        .split_once("\njobs:\n")
+        .map(|(_, rest)| rest)
+        .expect("workflow must declare a jobs block");
+    let mut ranges = Vec::new();
+    let mut offset = 0usize;
+    for line in rest.split_inclusive('\n') {
+        let bare = line.trim_end_matches(['\r', '\n']);
+        if let Some(key) = bare.strip_prefix("  ") {
+            let name = key.strip_suffix(':').unwrap_or("");
+            if !key.starts_with(' ')
+                && !key.starts_with('#')
+                && key.ends_with(':')
+                && !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                ranges.push(offset);
+            }
+        }
+        offset += line.len();
+    }
+    assert!(
+        !ranges.is_empty(),
+        "workflow jobs block must name at least one job"
+    );
+    ranges
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            let end = ranges.get(index + 1).copied().unwrap_or(rest.len());
+            &rest[*start..end]
+        })
+        .collect()
+}
+
+fn graded_parity_jobs(text: &str) -> Vec<&str> {
+    let jobs: Vec<&str> = workflow_jobs(text)
+        .into_iter()
+        .filter(|job| {
+            job.lines()
+                .any(|line| line.contains("name:") && line.contains("Graded parity ladder"))
+        })
+        .collect();
+    assert_eq!(
+        jobs.len(),
+        3,
+        "expected three Graded parity ladder jobs, found {}",
+        jobs.len()
+    );
+    jobs
+}
+
+fn assert_openrouter_secret_lines(text: &str, label: &str) {
+    let mut saw = false;
+    for line in text.lines() {
+        if line.contains("secrets.OPENROUTER_API_KEY") {
+            saw = true;
+            assert!(
+                line.contains("CURIE_CREDENTIALS:"),
+                "{label}: every secrets.OPENROUTER_API_KEY line must also \
+                 assign CURIE_CREDENTIALS: on that same line: {line}"
+            );
+            assert!(
+                !line.contains("run:"),
+                "{label}: secrets.OPENROUTER_API_KEY must not appear on a run: \
+                 line: {line}"
+            );
+        }
+    }
+    assert!(
+        saw,
+        "{label} must reference secrets.OPENROUTER_API_KEY at least once"
+    );
+}
+
+fn assert_model_credit_between(job: &str, earlier: &str, first_later: &str, label: &str) {
+    let credit = job
+        .find("curie dev model-credit")
+        .unwrap_or_else(|| panic!("{label} must run `curie dev model-credit`\n{job}"));
+    let earlier_at = job
+        .find(earlier)
+        .unwrap_or_else(|| panic!("{label} must contain `{earlier}`"));
+    let later_at = job
+        .find(first_later)
+        .unwrap_or_else(|| panic!("{label} must contain `{first_later}`"));
+    let ladder_at = job
+        .find("bash cli/scripts/e2e-ladder.sh")
+        .unwrap_or_else(|| panic!("{label} must run the ladder script"));
+    assert!(
+        earlier_at < credit,
+        "{label}: `curie dev model-credit` must follow `{earlier}`"
+    );
+    assert!(
+        credit < later_at,
+        "{label}: `curie dev model-credit` must precede the first `{first_later}`"
+    );
+    assert!(
+        credit < ladder_at,
+        "{label}: `curie dev model-credit` must precede the ladder script"
+    );
+}
+
+fn assert_ladder_failure_markers(job: &str, label: &str) {
+    let build_failed = "echo build-failed >> \"$GITHUB_STEP_SUMMARY\"";
+    let test_failed = "echo test-failed >> \"$GITHUB_STEP_SUMMARY\"";
+    let ladder_script = "bash cli/scripts/e2e-ladder.sh";
+    let ladder_at = job
+        .find(ladder_script)
+        .unwrap_or_else(|| panic!("{label} must run the ladder script"));
+    let build_at = job
+        .find(build_failed)
+        .unwrap_or_else(|| panic!("{label} must echo build-failed before the ladder"));
+    assert!(
+        build_at < ladder_at,
+        "{label}: build-failed must be written before the ladder script"
+    );
+    let ladder_steps: Vec<&str> = job
+        .split("\n      - ")
+        .skip(1)
+        .filter(|step| step.contains(ladder_script))
+        .collect();
+    assert_eq!(
+        ladder_steps.len(),
+        1,
+        "{label}: expected one ladder script step"
+    );
+    assert!(
+        ladder_steps[0]
+            .lines()
+            .any(|line| line.trim() == "id: ladder"),
+        "{label}: the ladder script step must contain `id: ladder`:\n{}",
+        ladder_steps[0]
+    );
+    let id_at = line_offset(job, "id: ladder")
+        .unwrap_or_else(|| panic!("{label} must contain a line `id: ladder`"));
+    let test_at = job
+        .find(test_failed)
+        .unwrap_or_else(|| panic!("{label} must echo test-failed after id: ladder"));
+    assert!(
+        id_at < test_at,
+        "{label}: test-failed must follow the ladder step id"
+    );
+}
+
+fn line_offset(text: &str, trimmed: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']).trim() == trimmed {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+#[test]
+fn graded_workflows_run_model_credit_before_image_builds_and_the_ladder() {
+    let nightly = nightly();
+    let sdk = workflow_text("sdk-approval-gate.yaml");
+    assert!(
+        nightly.contains("curie dev model-credit"),
+        "nightly-graded-ladder.yaml must run curie dev model-credit"
+    );
+    assert!(
+        sdk.contains("curie dev model-credit"),
+        "sdk-approval-gate.yaml must run curie dev model-credit"
+    );
+    for job in graded_parity_jobs(&nightly) {
+        assert_model_credit_between(
+            job,
+            "chmod +x cli/target/release/curie",
+            "docker/build-push-action",
+            "nightly graded ladder job",
+        );
+    }
+    let live_jobs: Vec<&str> = workflow_jobs(&sdk)
+        .into_iter()
+        .filter(|job| job.contains("bash cli/scripts/e2e-ladder.sh"))
+        .collect();
+    assert_eq!(live_jobs.len(), 1, "sdk-approval-gate has one ladder job");
+    assert_model_credit_between(
+        live_jobs[0],
+        "cargo build --release --locked",
+        "docker/setup-buildx-action",
+        "sdk approval live job",
+    );
+}
+
+#[test]
+fn openrouter_secret_lines_are_curie_credentials_env_mappings() {
+    assert_openrouter_secret_lines(&nightly(), "nightly-graded-ladder.yaml");
+    assert_openrouter_secret_lines(
+        &workflow_text("sdk-approval-gate.yaml"),
+        "sdk-approval-gate.yaml",
+    );
+}
+
+#[test]
+fn ladder_jobs_record_build_failed_and_test_failed_around_the_ladder_step() {
+    let nightly = nightly();
+    for job in graded_parity_jobs(&nightly) {
+        assert_ladder_failure_markers(job, "nightly graded ladder job");
+    }
+    let sdk = workflow_text("sdk-approval-gate.yaml");
+    let live_jobs: Vec<&str> = workflow_jobs(&sdk)
+        .into_iter()
+        .filter(|job| job.contains("bash cli/scripts/e2e-ladder.sh"))
+        .collect();
+    assert_eq!(live_jobs.len(), 1, "sdk-approval-gate has one ladder job");
+    assert_ladder_failure_markers(live_jobs[0], "sdk approval live job");
+}
+
 // --- Assertion group 5: the eval-block TEXT contracts ----------------------
 //
 // The four tests below are exact-substring assertions on the ladder script's
@@ -5870,4 +6085,111 @@ stop_local_otel_sink
             assert!(!calls.contains("network rm acme-other_runner"), "{calls}");
         }
     }
+}
+
+fn exact_trace_names(workdir: &Path) -> Vec<String> {
+    fs::read_dir(workdir)
+        .expect("read oracle workdir")
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name();
+            let name = name.to_string_lossy().into_owned();
+            if name.starts_with("exact-trace.") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Run the extracted `query_exact_seed_trace`. The success path calls
+/// `sanitize_exact_trace_read`, so that sibling is defined too.
+fn run_query_exact_seed_trace(
+    bin_body: &str,
+    trace_id: &str,
+    expected_span: &str,
+) -> (Output, String, Vec<String>) {
+    let harness = tempfile::tempdir().expect("oracle harness");
+    let workdir = harness.path().join("work");
+    fs::create_dir(&workdir).expect("oracle workdir");
+    let summary_path = harness.path().join("github-step-summary.txt");
+    fs::write(&summary_path, "").expect("create step summary");
+    let bin_path = harness.path().join("observability-bin");
+    test_executable::install(&bin_path, bin_body);
+    let mut script = format!(
+        "set -u\n\
+         export WORKDIR={workdir}\n\
+         export OBSERVABILITY_POLL_ATTEMPTS=1\n\
+         export OBSERVABILITY_POLL_INTERVAL_SECONDS=0\n\
+         export GITHUB_STEP_SUMMARY={summary}\n\
+         export BIN={bin}\n",
+        workdir = sh_single_quote(&workdir),
+        summary = sh_single_quote(&summary_path),
+        bin = sh_single_quote(&bin_path),
+    );
+    script.push_str(&ladder_function("sanitize_exact_trace_read"));
+    script.push_str(&ladder_function("query_exact_seed_trace"));
+    script.push_str(&format!(
+        "query_exact_seed_trace local {trace_id} {expected_span} '' present\nexit $?\n",
+        trace_id = sh_single_quote(Path::new(trace_id)),
+        expected_span = sh_single_quote(Path::new(expected_span)),
+    ));
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("run query_exact_seed_trace");
+    let summary = fs::read_to_string(&summary_path).expect("read step summary");
+    let leftover = exact_trace_names(&workdir);
+    (output, summary, leftover)
+}
+
+#[test]
+fn oracle_writes_expected_span_and_query_before_teardown() {
+    let trace_id = "0123456789abcdef0123456789abcdef";
+    let (output, summary, leftover) =
+        run_query_exact_seed_trace("#!/bin/sh\nexit 1\n", trace_id, "curie.turn.process");
+    assert!(
+        !output.status.success(),
+        "a failing exact-trace query must return non-zero: {}",
+        transcript(&output)
+    );
+    assert!(
+        summary
+            .lines()
+            .any(|line| line == "expected span: curie.turn.process"),
+        "summary must name the expected span:\n{summary}"
+    );
+    assert!(
+        summary.lines().any(|line| {
+            line == format!("query: curie --json local observability run {trace_id}")
+        }),
+        "summary must name the observability query:\n{summary}"
+    );
+    assert!(
+        leftover.is_empty(),
+        "exact-trace temp files must be gone: {leftover:?}"
+    );
+}
+
+#[test]
+fn oracle_success_does_not_write_a_failure_summary() {
+    let trace_id = "fedcba9876543210fedcba9876543210";
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' '{{\"trace\":{{\"id\":\"{trace_id}\"}},\"tree\":[{{\"name\":\"agent.run\",\"type\":\"SPAN\",\"children\":[]}}]}}'\nexit 0\n"
+    );
+    let (output, summary, leftover) = run_query_exact_seed_trace(&body, trace_id, "agent.run");
+    assert!(
+        output.status.success(),
+        "a matching agent.run span must exit 0: {}",
+        transcript(&output)
+    );
+    assert!(
+        summary.is_empty(),
+        "a successful query must leave the summary empty:\n{summary}"
+    );
+    assert!(
+        leftover.is_empty(),
+        "exact-trace temp files must be gone: {leftover:?}"
+    );
 }
