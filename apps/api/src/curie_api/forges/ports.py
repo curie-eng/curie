@@ -131,6 +131,14 @@ class Tracker(Protocol):
         """Optional: issues this one depends on (ADR 0165)."""
         ...
 
+    async def in_group(self, actor: Actor, group_id: str) -> bool:
+        """Optional: whether ``actor`` is in the tracker group ``group_id``.
+
+        A binding whose start authority is a group asks this (ADR 0197,
+        "Authority" item 2). ``group_id`` is the tracker's immutable group id.
+        """
+        ...
+
 
 class CodeHost(Protocol):
     """Where code, pull requests, CI and review live (ADR 0197, "Two ports" item 2)."""

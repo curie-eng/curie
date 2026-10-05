@@ -130,6 +130,7 @@ class InMemoryHarness:
         if minimal:
             tracker_caps[Operation.LINK_PULL_REQUEST] = Support.NOOP
             tracker_caps[Operation.DEPENDENCIES] = Support.NOOP
+            tracker_caps[Operation.GROUP_MEMBERSHIP] = Support.UNSUPPORTED
             code_caps[Operation.RERUN_FAILED] = Support.NOOP
             code_caps[Operation.CI_DIAGNOSTICS] = Support.UNSUPPORTED
             code_caps[Operation.USER_CAN_WRITE] = Support.UNSUPPORTED

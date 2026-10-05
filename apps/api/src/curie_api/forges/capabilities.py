@@ -36,6 +36,7 @@ class Operation(enum.StrEnum):
     CLOSING_REFERENCE = "tracker.closing_reference"
     LINK_PULL_REQUEST = "tracker.link_pull_request"
     DEPENDENCIES = "tracker.dependencies"
+    GROUP_MEMBERSHIP = "tracker.group_membership"
     # CodeHost
     RESOLVE_REPOSITORY = "code_host.resolve_repository"
     CREDENTIAL = "code_host.credential"
@@ -75,6 +76,7 @@ OPTIONAL_OPERATIONS: frozenset[Operation] = frozenset(
     {
         Operation.LINK_PULL_REQUEST,
         Operation.DEPENDENCIES,
+        Operation.GROUP_MEMBERSHIP,
         Operation.CI_DIAGNOSTICS,
         Operation.RERUN_FAILED,
         Operation.USER_CAN_WRITE,
@@ -100,8 +102,8 @@ def tier(operation: Operation) -> CapabilityTier:
 # its write check says nothing about a repository on another forge.
 NATIVE_FORGES: frozenset[str] = frozenset({types.GITHUB, types.GITLAB, types.MEMORY})
 # A tracker-only kind pairs with any code host and authorizes from its binding.
-TRACKER_ONLY: frozenset[str] = frozenset({types.JIRA, types.MEMORY_TRACKER_ONLY})
-CODE_HOST_ONLY: frozenset[str] = frozenset({types.BITBUCKET_CLOUD, types.BITBUCKET_DATA_CENTER})
+TRACKER_ONLY: frozenset[str] = frozenset({types.JIRA_CLOUD, types.MEMORY_TRACKER_ONLY})
+CODE_HOST_ONLY: frozenset[str] = frozenset({types.BITBUCKET_CLOUD, types.BITBUCKET_DC})
 
 
 @dataclass(frozen=True)
