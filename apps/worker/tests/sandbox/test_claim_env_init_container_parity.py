@@ -33,8 +33,7 @@ from curie_worker.sandbox.k8s import (
     BUNDLE_INIT_CONTAINERS,
     BUNDLE_REF_ENV,
     WORKSPACE_INIT_CONTAINERS,
-    WORKSPACE_REF_ENV,
-    WORKSPACE_SHA256_ENV,
+    WORKSPACE_INIT_ENV,
 )
 
 _REPO = Path(__file__).resolve().parents[4]
@@ -65,18 +64,15 @@ def _unquote(value: str) -> str:
 # declaration. The chart is the other half of this contract.
 _TARGETED: dict[str, frozenset[str]] = {
     **{c: frozenset({BUNDLE_REF_ENV}) for c in BUNDLE_INIT_CONTAINERS},
-    **{
-        c: frozenset({WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV})
-        for c in WORKSPACE_INIT_CONTAINERS
-    },
+    **{c: frozenset(WORKSPACE_INIT_ENV) for c in WORKSPACE_INIT_CONTAINERS},
     **{c: frozenset({ATTACHMENTS_REF_ENV}) for c in ATTACHMENT_INIT_CONTAINERS},
 }
 
 # CURIE_ env an init container reads that is deliberately NOT claim-settable
-# (chart-wired from values or a Secret). CURIE_GITHUB_API_URL comes from the
-# operator's api.githubApiUrl value and defines the trusted checkout origin.
-# Allowing a claim to replace it would let that claim authorize another host.
-_CHART_WIRED_ONLY: frozenset[str] = frozenset({"CURIE_GITHUB_API_URL"})
+# (chart-wired from values or a Secret). None today: the trusted checkout
+# origin and path are claim env the worker sets from the API's credential
+# (ADR 0197), and the claim is the worker's, never the turn's.
+_CHART_WIRED_ONLY: frozenset[str] = frozenset()
 
 
 class TemplateScanError(AssertionError):

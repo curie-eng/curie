@@ -307,6 +307,9 @@ class PublicationPullRequestOut(BaseModel):
     state: Literal["open", "closed", "merged"]
     head_sha: str
     head_ref: str
+    # When the code host last changed it; set on a metadata update's answer,
+    # which the lineage advance records for CI freshness.
+    updated_at: datetime | None = None
 
 
 class PublicationBranchHeadOut(BaseModel):

@@ -18,6 +18,7 @@ from curie_api.schemas.workitems import WorkItemOutcomeList, WorkItemOutcomeOut,
 
 from .. import factory_usage, workitem_outcomes
 from ..auth import require_api_key
+from ..code_host_trust import code_host_verify
 from ..config import get_settings
 from ..deps import SessionDep
 from ..forges.hosts import code_host_for
@@ -62,7 +63,7 @@ async def get_work_item(
     if loaded is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
     view, item, lineage = loaded
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(verify=code_host_verify(settings)) as client:
         view.ci = await workitem_outcomes.observe_ci(
             code_host_for(settings, client), settings, lineage, item
         )

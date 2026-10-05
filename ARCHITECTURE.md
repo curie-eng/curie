@@ -568,7 +568,7 @@ flowchart LR
     end
 
     Sandbox["runner sandbox<br/>factory bundle"]
-    Job["publication Job<br/>push branch · open or update PR"]
+    Job["publication Job<br/>push branch only"]
 
     GH -- labels, mentions, review feedback --> Intake
     Intake --> WIS
@@ -585,7 +585,8 @@ flowchart LR
     PubLoop -- claim approved publication --> PG
     PubLoop --> Job
     Job --> GH
-    PubLoop -- advance lineage --> PubAPI
+    PubLoop -- find or open PR, metadata, advance lineage --> PubAPI
+    PubAPI -- CodeHost --> GH
     Rec -- CI checks, status comment, labels --> GH
 ```
 
@@ -617,10 +618,16 @@ flowchart LR
   writes the approval and publication together, under the per-agent policy of
   [ADR 0147](docs/adr/0147-publication-approval-is-a-per-agent-operator-policy.md).
   [`apps/worker/src/curie_worker/publication_loop.py::PublicationReconcileLoop`](apps/worker/src/curie_worker/publication_loop.py)
-  runs a Kubernetes Job that pushes the branch and opens or updates the pull
-  request
-  ([`apps/worker/src/curie_worker/publication_k8s.py::KubernetesPublicationCluster`](apps/worker/src/curie_worker/publication_k8s.py)),
-  then advances the lineage, which links it to the WorkItem
+  runs a Kubernetes Job that only pushes the branch
+  ([`apps/worker/src/curie_worker/publication_k8s.py::KubernetesPublicationCluster`](apps/worker/src/curie_worker/publication_k8s.py)).
+  The Job takes the origin, header form and optional CA bundle from the API's
+  push credential and makes no code host API call. Before launch the loop
+  asks the API whether the stored pull request is still open; after the push
+  the API proves the marked commit and finds or opens the pull request through
+  its `CodeHost`
+  ([`apps/api/src/curie_api/routers/publication_code_host.py`](apps/api/src/curie_api/routers/publication_code_host.py)).
+  A metadata only revision runs no Job: the API updates the title and body.
+  The loop then advances the lineage, which links it to the WorkItem
   ([`apps/api/src/curie_api/crud/lineages.py::advance_publication_lineage`](apps/api/src/curie_api/crud/lineages.py)).
 
 ### One factory run, end to end
@@ -659,7 +666,9 @@ sequenceDiagram
         W->>DB: publication + approval (fenced to the running request)
     end
     P->>DB: claim approved publication
-    P->>GH: Job pushes branch, opens or updates the PR
+    P->>GH: through the API, check the stored PR is still open
+    P->>GH: Job pushes the branch, no code host API call
+    P->>GH: through the API CodeHost, prove the commit, find or open the PR
     P->>DB: advance lineage, link it to the WorkItem
     R->>DB: claim publication settlement
     R->>GH: observe checks on the published head

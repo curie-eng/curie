@@ -337,8 +337,14 @@ spec:
               value: {{ .Values.worker.publication.jobActiveDeadlineSeconds | quote }}
             - name: CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS
               value: {{ .Values.worker.publication.gitCommandTimeoutSeconds | quote }}
-            - name: CURIE_PUBLICATION_GITHUB_API_URL
-              value: {{ .Values.api.githubApiUrl | quote }}
+            {{- if include "curie.codeHostTrust.name" . }}
+            # The publication Job mounts the code host CA bundle from this
+            # ConfigMap at the path each push credential names (ADR 0197).
+            - name: CURIE_CODE_HOST_CA_CONFIGMAP
+              value: {{ include "curie.codeHostTrust.name" . | quote }}
+            - name: CURIE_CODE_HOST_CA_CONFIGMAP_KEY
+              value: {{ include "curie.codeHostTrust.key" . | quote }}
+            {{- end }}
             - name: CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS
               value: {{ .Values.worker.publication.reconcileIntervalSeconds | quote }}
             - name: CURIE_PUBLICATION_LEASE_SECONDS
@@ -660,6 +666,7 @@ spec:
               mountPath: /etc/curie/github-stub
               readOnly: true
             {{- end }}
+            {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
       volumes:
         - name: workspace-clone
           emptyDir:
@@ -669,4 +676,5 @@ spec:
           configMap:
             name: {{ .Values.api.githubStubCaConfigMap }}
         {{- end }}
+        {{- include "curie.codeHostTrust.volume" . | nindent 8 }}
 {{- end }}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import os
 import ssl
 import time
@@ -20,11 +21,15 @@ from curie_worker.publication_k8s import (
     PublicationJobSettings,
     PublicationPayload,
     PublicationResourceError,
+    PublicationTransport,
     build_publication_resources,
+    job_transport,
+    validate_adopted_resource,
 )
 from curie_worker.publication_loop import (
     PublicationCredential,
     PublicationJobObservation,
+    PublicationPullState,
     PublicationReconciler,
 )
 from curie_worker.publication_store import PostgresPublicationStore
@@ -33,13 +38,13 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 OPT_IN = os.environ.get("CURIE_PUBLICATION_CLUSTER_PROOF") == "1"
-pytestmark = [
-    pytest.mark.anyio,
-    pytest.mark.skipif(
-        not OPT_IN,
-        reason="set CURIE_PUBLICATION_CLUSTER_PROOF=1 through the owned cluster wrapper",
-    ),
-]
+pytestmark = [pytest.mark.anyio]
+# The cluster proofs need the owned kind wrapper; the builder contract checks
+# at the end of this module run anywhere.
+requires_cluster = pytest.mark.skipif(
+    not OPT_IN,
+    reason="set CURIE_PUBLICATION_CLUSTER_PROOF=1 through the owned cluster wrapper",
+)
 
 REPO_FULL_NAME = "acme-corp/acme-bot"
 OWNER_NAME = "publication-owner"
@@ -49,6 +54,7 @@ ADOPT_ID = uuid.UUID("20000001-2222-4222-8222-000000000001")
 MISMATCH_ID = uuid.UUID("20000002-2222-4222-8222-000000000002")
 FAILURE_ID = uuid.UUID("20000003-2222-4222-8222-000000000003")
 POSITIVE_ID = uuid.UUID("20000004-2222-4222-8222-000000000004")
+TRANSPORT_ID = uuid.UUID("20000005-2222-4222-8222-000000000005")
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-000000000003")
 VERSION_ID = uuid.UUID("33333333-3333-4333-8333-000000000003")
 DEPLOYMENT_ID = uuid.UUID("44444444-4444-4444-8444-000000000003")
@@ -72,8 +78,14 @@ def _namespace() -> str:
     return _required("CURIE_PUBLICATION_NAMESPACE")
 
 
-def _pull_url() -> str:
-    return f"{_required('CURIE_PUBLICATION_FIXTURE_CLUSTER_API')}/{REPO_FULL_NAME}/pull/1"
+def _origin() -> str:
+    return _required("CURIE_PUBLICATION_FIXTURE_CLUSTER_API")
+
+
+def _transport() -> PublicationTransport:
+    # The fixture CA is baked into the fixture runner image's system trust
+    # store, so the Job needs no mounted code host CA bundle.
+    return PublicationTransport(origin=_origin(), header_form="authorization_bearer")
 
 
 def _cluster() -> KubernetesPublicationCluster:
@@ -102,8 +114,6 @@ def _settings() -> PublicationJobSettings:
         ephemeral_limit="1Gi",
         active_deadline_seconds=90,
         git_timeout_seconds=20,
-        github_timeout_seconds=20,
-        github_api_url=_required("CURIE_PUBLICATION_FIXTURE_CLUSTER_API"),
     )
 
 
@@ -112,33 +122,27 @@ def _payload(
     *,
     base_sha: str,
     patch: bytes,
+    transport: PublicationTransport | None = None,
 ) -> PublicationPayload:
+    transport = transport or _transport()
     return PublicationPayload(
         publication_id=publication_id,
         revision_id=publication_id,
         revision_number=1,
         repo_full_name=REPO_FULL_NAME,
-        clean_clone_url=f"{_required('CURIE_PUBLICATION_FIXTURE_CLUSTER_API')}/{REPO_FULL_NAME}.git",
+        clean_clone_url=f"{transport.origin}/{REPO_FULL_NAME}.git",
         base_sha=base_sha,
         expected_prior_head=base_sha,
         expected_remote_head=None,
         patch=patch,
         branch=f"curie/publication-{publication_id.hex}",
-        pr_number=None,
-        pr_url=None,
         title="Publish cluster proof",
-        body="Approved publication cluster proof.",
-        observed_title_sha256=None,
-        observed_body_sha256=None,
-        github_repository_id=None,
-        github_pr_node_id=None,
+        transport=transport,
     )
 
 
 def _ssl_context() -> ssl.SSLContext:
-    return ssl.create_default_context(
-        cafile=_required("CURIE_PUBLICATION_FIXTURE_CA")
-    )
+    return ssl.create_default_context(cafile=_required("CURIE_PUBLICATION_FIXTURE_CA"))
 
 
 async def _forward_fixture_request(request: httpx.Request) -> None:
@@ -196,6 +200,7 @@ def _live_objects(
     return config_map, secret, job
 
 
+@requires_cluster
 async def test_first_publication_is_created_then_adopted_after_api_normalization() -> None:
     cluster = _cluster()
     resources = build_publication_resources(
@@ -206,8 +211,7 @@ async def test_first_publication_is_created_then_adopted_after_api_normalization
     container = resources.job["spec"]["template"]["spec"]["containers"][0]
     env = {item["name"]: item["value"] for item in container["env"]}
     assert env["EXPECTED_REMOTE_HEAD"] == ""
-    assert env["PR_NUMBER"] == ""
-    assert env["PR_URL"] == ""
+    assert not any(name.startswith(("PR_", "GITHUB_")) for name in env)
     assert resources.job["spec"]["template"]["spec"]["imagePullSecrets"] == []
     assert resources.job["spec"]["template"]["spec"]["priorityClassName"] == ""
 
@@ -219,27 +223,21 @@ async def test_first_publication_is_created_then_adopted_after_api_normalization
     pod_spec = observed["spec"]["template"]["spec"]
     assert pod_spec.get("imagePullSecrets") is None
     assert pod_spec.get("priorityClassName") is None
-    observed_env = {
-        item["name"]: item.get("value")
-        for item in pod_spec["containers"][0]["env"]
-    }
+    observed_env = {item["name"]: item.get("value") for item in pod_spec["containers"][0]["env"]}
     assert observed_env["EXPECTED_REMOTE_HEAD"] is None
-    assert observed_env["PR_NUMBER"] is None
-    assert observed_env["PR_URL"] is None
+    assert observed_env["PUBLICATION_BRANCH_PREFIX"] is None
 
     cluster.apply(resources)
+    cluster.validate_existing(resources)
     assert cluster._core.read_namespaced_config_map(
         resources.names.config_map, _namespace()
     ).metadata.uid
-    assert cluster._core.read_namespaced_secret(
-        resources.names.secret, _namespace()
-    ).metadata.uid
-    assert cluster._batch.read_namespaced_job(
-        resources.names.job, _namespace()
-    ).metadata.uid
+    assert cluster._core.read_namespaced_secret(resources.names.secret, _namespace()).metadata.uid
+    assert cluster._batch.read_namespaced_job(resources.names.job, _namespace()).metadata.uid
 
 
-async def test_success_markers_cannot_authorize_a_mismatched_job() -> None:
+@requires_cluster
+async def test_success_marker_cannot_authorize_a_mismatched_job() -> None:
     cluster = _cluster()
     resources = build_publication_resources(
         _payload(MISMATCH_ID, base_sha=await _base_sha(), patch=b"not a patch\n"),
@@ -250,11 +248,7 @@ async def test_success_markers_cannot_authorize_a_mismatched_job() -> None:
     planted_job["spec"]["template"]["spec"]["containers"][0]["command"] = [
         "/bin/bash",
         "-c",
-        (
-            f"printf '%s\\n' 'CURIE_PR_URL={_pull_url()}' "
-            "'CURIE_PR_NUMBER=1' "
-            f"'CURIE_COMMIT_SHA={'b' * 40}'"
-        ),
+        f"printf '%s\\n' 'CURIE_COMMIT_SHA={'b' * 40}'",
     ]
     cluster._core.create_namespaced_config_map(_namespace(), body=config_map)
     cluster._core.create_namespaced_secret(_namespace(), body=secret)
@@ -262,15 +256,50 @@ async def test_success_markers_cannot_authorize_a_mismatched_job() -> None:
 
     observation = await _wait_terminal(cluster, resources.names.job)
     assert observation.phase == "succeeded"
-    assert observation.pr_url == _pull_url()
-    assert observation.pr_number == 1
     assert observation.commit_sha == "b" * 40
+    # The planted Job kept the builder's env, so its transport reads back
+    # intact; only the full contract check stops the marker from counting.
+    assert observation.transport == _transport()
 
     with pytest.raises(
         PublicationResourceError,
         match=rf"refusing to adopt Job {resources.names.job!r}: spec mismatch",
     ):
         cluster.apply(resources)
+    with pytest.raises(
+        PublicationResourceError,
+        match=rf"refusing to adopt Job {resources.names.job!r}: spec mismatch",
+    ):
+        cluster.validate_existing(resources)
+
+
+@requires_cluster
+async def test_observe_returns_the_transport_the_builder_wrote_and_refuses_another() -> None:
+    cluster = _cluster()
+    base_sha = await _base_sha()
+    written = _payload(TRANSPORT_ID, base_sha=base_sha, patch=b"not a patch\n")
+    resources = build_publication_resources(written, credential=AUTHORIZATION, settings=_settings())
+    cluster.apply(resources)
+
+    # Read back through the apiserver, after its normalization of the Job.
+    observation = cluster.observe(resources.names.job)
+    assert observation.exists
+    assert observation.transport == written.transport
+    cluster.validate_existing(resources)
+
+    for other in (
+        dataclasses.replace(written.transport, header_form="private_token"),
+        dataclasses.replace(written.transport, origin=f"{_origin()}/elsewhere"),
+    ):
+        mismatched = build_publication_resources(
+            _payload(TRANSPORT_ID, base_sha=base_sha, patch=b"not a patch\n", transport=other),
+            credential=AUTHORIZATION,
+            settings=_settings(),
+        )
+        with pytest.raises(PublicationResourceError, match=r"refusing to adopt "):
+            cluster.validate_existing(mismatched)
+        with pytest.raises(PublicationResourceError, match=r"refusing to adopt "):
+            cluster.apply(mismatched)
 
 
 class _Credentials:
@@ -279,9 +308,13 @@ class _Credentials:
 
     async def redeem(self, publication_id: uuid.UUID) -> PublicationCredential:
         self.calls.append(publication_id)
+        transport = _transport()
         return PublicationCredential(
-            clean_clone_url=f"{_required('CURIE_PUBLICATION_FIXTURE_CLUSTER_API')}/{REPO_FULL_NAME}.git",
+            clean_clone_url=f"{transport.origin}/{REPO_FULL_NAME}.git",
             authorization_header=AUTHORIZATION,
+            origin=transport.origin,
+            header_form=transport.header_form,
+            ca_bundle_ref=transport.ca_bundle_ref,
         )
 
 
@@ -403,7 +436,9 @@ class _NoBranchCodeHost:
     async def read_branch_head(self, publication_id: uuid.UUID) -> str | None:
         return None
 
-    async def read_pull_request(self, publication_id: uuid.UUID, pr_number: int) -> None:
+    async def read_pull_request(
+        self, publication_id: uuid.UUID, pr_number: int
+    ) -> PublicationPullState:
         raise AssertionError("a failed Job has no stored pull request to read")
 
     async def verify_revision_commit(
@@ -421,7 +456,11 @@ class _NoBranchCodeHost:
     ) -> None:
         return None
 
+    async def update_pull_request_metadata(self, publication_id: uuid.UUID) -> PublicationPullState:
+        raise AssertionError("a patch publication never takes the metadata-only path")
 
+
+@requires_cluster
 async def test_real_git_failure_is_terminalized_once_without_spending_retry() -> None:
     engine = create_async_engine(_required("TEST_DATABASE_URL"))
     try:
@@ -443,7 +482,8 @@ async def test_real_git_failure_is_terminalized_once_without_spending_retry() ->
         replies = _Replies()
         transcript = _Transcript()
         async with httpx.AsyncClient(
-            verify=_ssl_context(), timeout=10,
+            verify=_ssl_context(),
+            timeout=10,
             event_hooks={"request": [_forward_fixture_request]},
         ) as client:
             reconciler = PublicationReconciler(
@@ -469,6 +509,7 @@ async def test_real_git_failure_is_terminalized_once_without_spending_retry() ->
                 f"curie-publication-{FAILURE_ID.hex[:20]}",
             )
             assert observation.phase == "failed"
+            assert observation.transport == _transport()
             assert observation.error is not None
             assert "error: No valid patches in input" in observation.error
             assert "container exited" in observation.error
@@ -481,16 +522,20 @@ async def test_real_git_failure_is_terminalized_once_without_spending_retry() ->
             await reconciler.reconcile(work)
             async with engine.connect() as connection:
                 terminal = (
-                    await connection.execute(
-                        text(
-                            "SELECT status, error, patch_bytes, reconcile_attempts, "
-                            "terminal_at, resource_cleanup_completed_at, version, "
-                            "result_reported_at "
-                            "FROM curie.publications WHERE id = :id"
-                        ),
-                        {"id": FAILURE_ID},
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT status, error, patch_bytes, reconcile_attempts, "
+                                "terminal_at, resource_cleanup_completed_at, version, "
+                                "result_reported_at "
+                                "FROM curie.publications WHERE id = :id"
+                            ),
+                            {"id": FAILURE_ID},
+                        )
                     )
-                ).mappings().one()
+                    .mappings()
+                    .one()
+                )
             assert terminal["status"] == "failed"
             assert terminal["patch_bytes"] is None
             assert terminal["reconcile_attempts"] == 0
@@ -511,16 +556,20 @@ async def test_real_git_failure_is_terminalized_once_without_spending_retry() ->
             await reconciler.reconcile(work)
             async with engine.connect() as connection:
                 replay = (
-                    await connection.execute(
-                        text(
-                            "SELECT status, error, patch_bytes, reconcile_attempts, "
-                            "terminal_at, resource_cleanup_completed_at, version, "
-                            "result_reported_at "
-                            "FROM curie.publications WHERE id = :id"
-                        ),
-                        {"id": FAILURE_ID},
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT status, error, patch_bytes, reconcile_attempts, "
+                                "terminal_at, resource_cleanup_completed_at, version, "
+                                "result_reported_at "
+                                "FROM curie.publications WHERE id = :id"
+                            ),
+                            {"id": FAILURE_ID},
+                        )
                     )
-                ).mappings().one()
+                    .mappings()
+                    .one()
+                )
             assert dict(replay) == before_replay
             assert len(replies.texts) == 1
             assert transcript.texts == replies.texts
@@ -528,7 +577,8 @@ async def test_real_git_failure_is_terminalized_once_without_spending_retry() ->
         await engine.dispose()
 
 
-async def test_generated_script_pushes_and_creates_pull_request() -> None:
+@requires_cluster
+async def test_generated_script_only_pushes_the_marked_commit() -> None:
     cluster = _cluster()
     base_sha = await _base_sha()
     patch = (
@@ -545,9 +595,10 @@ async def test_generated_script_pushes_and_creates_pull_request() -> None:
         credential=AUTHORIZATION,
         settings=_settings(),
     )
-    assert resources.job["spec"]["template"]["spec"]["containers"][0][
-        "command"
-    ] == ["/bin/bash", "/publication/publish.sh"]
+    assert resources.job["spec"]["template"]["spec"]["containers"][0]["command"] == [
+        "/bin/bash",
+        "/publication/publish.sh",
+    ]
 
     cluster.apply(resources)
     actual_config_map = cluster._core.read_namespaced_config_map(
@@ -558,9 +609,7 @@ async def test_generated_script_pushes_and_creates_pull_request() -> None:
         resources.names.job,
         _namespace(),
     )
-    assert actual_config_map.data["publish.sh"] == resources.config_map["data"][
-        "publish.sh"
-    ]
+    assert actual_config_map.data["publish.sh"] == resources.config_map["data"]["publish.sh"]
     assert actual_job.spec.template.spec.containers[0].command == [
         "/bin/bash",
         "/publication/publish.sh",
@@ -569,28 +618,122 @@ async def test_generated_script_pushes_and_creates_pull_request() -> None:
     observation = await _wait_terminal(cluster, resources.names.job)
     assert observation.phase == "succeeded", observation.error
     assert observation.error is None
-    assert observation.pr_url == _pull_url()
-    assert observation.pr_number == 1
+    assert observation.transport == payload.transport
     assert observation.commit_sha is not None
     assert observation.commit_sha != base_sha
-    assert f"CURIE_PR_URL={_pull_url()}" in observation.logs
-    assert "CURIE_PR_NUMBER=1" in observation.logs
     assert f"CURIE_COMMIT_SHA={observation.commit_sha}" in observation.logs
+    # The Job is push-only: it emits no pull request marker and the code host
+    # holds no pull request afterwards. The worker asks the API to open one.
+    assert "CURIE_PR_" not in observation.logs
 
     branch_path = quote(payload.branch, safe="")
-    ref_response = await _fixture_get(
-        f"/repos/{REPO_FULL_NAME}/git/ref/heads/{branch_path}"
-    )
+    ref_response = await _fixture_get(f"/repos/{REPO_FULL_NAME}/git/ref/heads/{branch_path}")
     assert ref_response.status_code == 200, ref_response.text
     assert ref_response.json()["object"]["sha"] == observation.commit_sha
-    pulls_response = await _fixture_get(
-        f"/repos/{REPO_FULL_NAME}/pulls?state=all&head="
-        f"{quote('acme-corp:' + payload.branch, safe='')}"
+    state_response = await _fixture_get("/__fixture/state")
+    assert state_response.status_code == 200, state_response.text
+    assert state_response.json()["pull"] is None
+
+
+def _contract_settings() -> PublicationJobSettings:
+    return PublicationJobSettings(
+        namespace="curie-publication-contract",
+        runner_image="curie-runner:contract",
+        image_pull_policy="Never",
+        image_pull_secrets=(),
+        priority_class_name="",
+        service_account_name=SERVICE_ACCOUNT,
+        owner_name=OWNER_NAME,
+        git_user_name="Curie Publisher",
+        git_user_email="publisher@example.com",
+        cpu_request="25m",
+        cpu_limit="500m",
+        memory_request="64Mi",
+        memory_limit="512Mi",
+        ephemeral_request="128Mi",
+        ephemeral_limit="1Gi",
+        ca_bundle_config_map="code-host-trust",
     )
-    assert pulls_response.status_code == 200, pulls_response.text
-    pulls = pulls_response.json()
-    assert len(pulls) == 1
-    assert pulls[0]["html_url"] == _pull_url()
-    assert pulls[0]["head"]["sha"] == observation.commit_sha
-    assert pulls[0]["head"]["ref"] == payload.branch
-    assert pulls[0]["base"]["sha"] == base_sha
+
+
+def _contract_payload(transport: PublicationTransport) -> PublicationPayload:
+    return PublicationPayload(
+        publication_id=TRANSPORT_ID,
+        revision_id=TRANSPORT_ID,
+        revision_number=1,
+        repo_full_name=REPO_FULL_NAME,
+        clean_clone_url=f"{transport.origin}/{REPO_FULL_NAME}.git",
+        base_sha="a" * 40,
+        expected_prior_head="a" * 40,
+        expected_remote_head=None,
+        patch=b"diff --git a/README.md b/README.md\n",
+        branch=f"curie/publication-{TRANSPORT_ID.hex}",
+        title="Publish contract proof",
+        transport=transport,
+    )
+
+
+CONTRACT_TRANSPORT = PublicationTransport(
+    origin="https://git.example.test/base",
+    header_form="private_token",
+    ca_bundle_ref="/etc/curie/code-host-trust/ca.pem",
+)
+
+
+def test_job_transport_reads_back_what_the_builder_wrote() -> None:
+    resources = build_publication_resources(
+        _contract_payload(CONTRACT_TRANSPORT),
+        credential="fixture-private-token",
+        settings=_contract_settings(),
+    )
+    assert job_transport(resources.job) == CONTRACT_TRANSPORT
+
+    pod_spec = resources.job["spec"]["template"]["spec"]
+    assert {
+        "name": "code-host-trust",
+        "mountPath": "/etc/curie/code-host-trust",
+        "readOnly": True,
+    } in pod_spec["containers"][0]["volumeMounts"]
+    assert {
+        "name": "code-host-trust",
+        "configMap": {
+            "name": "code-host-trust",
+            "items": [{"key": "ca.crt", "path": "ca.pem"}],
+        },
+    } in pod_spec["volumes"]
+
+
+def test_adoption_refuses_a_job_whose_transport_was_altered() -> None:
+    settings = _contract_settings()
+    built = build_publication_resources(
+        _contract_payload(CONTRACT_TRANSPORT),
+        credential="fixture-private-token",
+        settings=settings,
+    )
+    # The untouched Job adopts against the expected set rebuilt from its own env.
+    rebuilt = build_publication_resources(
+        _contract_payload(job_transport(built.job) or CONTRACT_TRANSPORT),
+        credential="validation-placeholder",
+        settings=settings,
+    )
+    validate_adopted_resource("Job", rebuilt.job, built.job)
+
+    # Redirect the existing Job's push origin, as the reconciler would see it:
+    # the expected set is rebuilt from the altered env and still refused.
+    altered = copy.deepcopy(built.job)
+    for item in altered["spec"]["template"]["spec"]["containers"][0]["env"]:
+        if item["name"] == "CODE_HOST_ORIGIN":
+            item["value"] = "https://attacker.example.test"
+    read_back = job_transport(altered)
+    assert read_back is not None
+    assert read_back.origin == "https://attacker.example.test"
+    expected = build_publication_resources(
+        _contract_payload(read_back),
+        credential="validation-placeholder",
+        settings=settings,
+    )
+    with pytest.raises(PublicationResourceError, match=r"refusing to adopt Job .*mismatch"):
+        validate_adopted_resource("Job", expected.job, altered)
+    # Against the original contract, the altered Job is refused just the same.
+    with pytest.raises(PublicationResourceError, match=r"refusing to adopt Job .*mismatch"):
+        validate_adopted_resource("Job", rebuilt.job, altered)

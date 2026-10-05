@@ -584,7 +584,7 @@ def test_the_credential_renders_the_same_git_header_for_both_scopes() -> None:
     credentials = _with_host(lambda _request: httpx.Response(500), body)
 
     for credential in credentials:
-        assert credential.origin == f"https://github.com/{REPO}.git"
+        assert credential.origin == "https://github.com"
         assert f"Authorization: {GIT_HEADER}" == credential.git_header()
         assert "fixture-installation-token" not in repr(credential)
 

@@ -78,8 +78,11 @@ def _redeemed_base(client: Any, number: int, monkeypatch: pytest.MonkeyPatch) ->
     """What credential redemption returns for the WorkItem's conversation."""
 
     monkeypatch.setattr(
-        "curie_api.routers.workspaces.resolve_repository_credential",
-        lambda _repo, _settings: (f"https://github.com/{REPO}.git", "Basic fixture"),
+        "curie_api.forges.github.code_host.resolve_repository_credential",
+        lambda _repo, _settings: (
+            f"https://github.com/{REPO}.git",
+            "Basic eC1hY2Nlc3MtdG9rZW46Zml4dHVyZQ==",  # x-access-token:fixture
+        ),
     )
     item = _item(number)
     headers = {"X-API-Key": get_settings().api_key}

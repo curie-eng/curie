@@ -2470,6 +2470,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/publications/{publication_id}/pull-request/metadata": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Update Publication Pull Request Metadata
+         * @description Apply a metadata-only revision's title and body to its stored pull request.
+         *
+         *     A metadata-only revision has nothing to push, so no publication Job runs
+         *     and this update is its whole effect (ADR 0197, "Two ports" item 6). The
+         *     contract and the observed digests come from the stored publication. A
+         *     merged or closed pull request is answered unchanged, with its state, so
+         *     the worker records the lineage terminal.
+         */
+        post: operations["update_publication_pull_request_metadata_v1_internal_publications__publication_id__pull_request_metadata_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/publications/{publication_id}/revision-commit": {
         parameters: {
             query?: never;
@@ -6615,6 +6641,8 @@ export interface components {
              * @enum {string}
              */
             state: "open" | "closed" | "merged";
+            /** Updated At */
+            updated_at?: string | null;
             /** Url */
             url: string;
         };
@@ -6897,9 +6925,10 @@ export interface components {
          * @description One server-derived Git credential returned only to the trusted worker.
          *
          *     ``origin``, ``header_form`` and ``ca_bundle_ref`` are the code host
-         *     transport facts (ADR 0197). Each defaults to today's GitHub behavior: the
-         *     configured GitHub host, an ``Authorization: Basic`` header, and the public
-         *     trust store.
+         *     transport facts (ADR 0197), issued by the code host with the credential:
+         *     the origin the header is scoped to (the clone URL is the origin plus the
+         *     repository path), the header git sends it in, and the path of the CA
+         *     bundle mounted where git runs. The worker derives none of them.
          */
         RepositoryCredentialOut: {
             /** Authorization Header */
@@ -6911,7 +6940,7 @@ export interface components {
             /** @default authorization_basic */
             header_form?: components["schemas"]["CredentialHeader"];
             /** Origin */
-            origin?: string | null;
+            origin: string;
             /** Repo Full Name */
             repo_full_name: string;
             /** Revision */
@@ -8078,7 +8107,7 @@ export interface components {
             /** @default authorization_basic */
             header_form?: components["schemas"]["CredentialHeader"];
             /** Origin */
-            origin?: string | null;
+            origin: string;
             /** Repo Full Name */
             repo_full_name: string;
             /** Revision */
@@ -13551,6 +13580,39 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_publication_pull_request_metadata_v1_internal_publications__publication_id__pull_request_metadata_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicationPullRequestOut"];
+                };
             };
             /** @description Validation Error */
             422: {

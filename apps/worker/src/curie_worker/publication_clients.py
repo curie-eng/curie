@@ -10,6 +10,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
+from .publication_k8s import HEADER_FORMS, HeaderForm, clean_origin, valid_repository_path
 from .publication_loop import (
     PublicationCredential,
     PublicationIdentityUnavailable,
@@ -123,14 +124,12 @@ class PublicationCredentialClient:
         self,
         *,
         api_base_url: str,
-        github_html_base: str,
         worker_token: str,
         client: httpx.AsyncClient,
     ) -> None:
         if not worker_token:
             raise ValueError("publication credentials require internal worker auth")
         self._base = api_base_url.rstrip("/")
-        self._github_html_base = github_html_base.rstrip("/")
         self._headers = {"X-Curie-Worker-Token": worker_token}
         self._client = client
 
@@ -158,18 +157,31 @@ class PublicationCredentialClient:
             repo = str(body["repo_full_name"])
             clone_url = str(body["clone_url"])
             authorization = str(body["authorization_header"])
-        except (KeyError, TypeError, ValueError) as exc:
+            origin = str(body["origin"])
+            header_form = str(body["header_form"])
+            ca_bundle_ref = body.get("ca_bundle_ref")
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise PublicationReconcileError("publication credential response was unusable") from exc
-        parsed = urlsplit(clone_url)
+        # The origin, path and header form are data from the API (ADR 0197);
+        # the worker checks only that they agree and carry no credential.
         if (
-            parsed.scheme != "https"
-            or parsed.hostname != urlsplit(self._github_html_base).hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or clone_url != f"{self._github_html_base}/{repo}.git"
+            not clean_origin(origin)
+            or not valid_repository_path(repo)
+            or urlsplit(clone_url).username is not None
+            or clone_url != f"{origin}/{repo}.git"
         ):
             raise PublicationReconcileError(
                 "publication credential response carried a non-canonical clone URL"
+            )
+        if header_form not in HEADER_FORMS:
+            raise PublicationReconcileError(
+                "publication credential response named an unknown header form"
+            )
+        if ca_bundle_ref is not None and (
+            not isinstance(ca_bundle_ref, str) or not ca_bundle_ref.startswith("/")
+        ):
+            raise PublicationReconcileError(
+                "publication credential response carried an invalid CA bundle reference"
             )
         if not authorization or any(char in authorization for char in ("\r", "\n", "\0")):
             raise PublicationReconcileError(
@@ -178,6 +190,9 @@ class PublicationCredentialClient:
         return PublicationCredential(
             clean_clone_url=clone_url,
             authorization_header=authorization,
+            origin=origin,
+            header_form=cast(HeaderForm, header_form),
+            ca_bundle_ref=ca_bundle_ref,
         )
 
 
@@ -376,6 +391,16 @@ class PublicationCodeHostClient:
             raise PublicationReconcileError("revision verification returned a different commit")
         return commit_sha
 
+    async def update_pull_request_metadata(self, publication_id: uuid.UUID) -> PublicationPullState:
+        """Apply a metadata-only revision to its stored pull request, through the API."""
+
+        response = await self._call(
+            "POST",
+            self._url(publication_id, "pull-request/metadata"),
+            "pull request metadata update",
+        )
+        return _pull_state(response)
+
     async def recover_pull_request(
         self, publication_id: uuid.UUID, *, expected_head_sha: str
     ) -> PublicationPullState | None:
@@ -424,7 +449,9 @@ def _pull_state(response: httpx.Response) -> PublicationPullState:
         state = row["state"]
         head_sha = row["head_sha"]
         head_ref = row["head_ref"]
-    except (KeyError, TypeError, ValueError) as exc:
+        raw_updated_at = row.get("updated_at")
+        updated_at = datetime.fromisoformat(raw_updated_at) if raw_updated_at is not None else None
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise PublicationReconcileError("the API returned an invalid pull request") from exc
     parsed = urlsplit(url) if isinstance(url, str) else None
     if (
@@ -440,6 +467,7 @@ def _pull_state(response: httpx.Response) -> PublicationPullState:
         or _SHA.fullmatch(head_sha) is None
         or not isinstance(head_ref, str)
         or not head_ref
+        or (updated_at is not None and updated_at.tzinfo is None)
     ):
         raise PublicationReconcileError("the API returned an invalid pull request")
     return PublicationPullState(
@@ -448,4 +476,5 @@ def _pull_state(response: httpx.Response) -> PublicationPullState:
         state=cast(Literal["open", "closed", "merged"], state),
         head_sha=head_sha,
         head_ref=head_ref,
+        updated_at=updated_at,
     )

@@ -16,6 +16,7 @@ from __future__ import annotations
 import itertools
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 
 from curie_api.forges import types
 from curie_api.forges.capabilities import (
@@ -479,6 +480,7 @@ class _PullRequest:
     title: str
     body: str
     draft: bool = False
+    updated_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -636,6 +638,7 @@ class InMemoryCodeHost(_Declared):
             title=pull.title,
             body=pull.body,
             draft=pull.draft,
+            updated_at=pull.updated_at,
         )
 
     # Port -----------------------------------------------------------------
@@ -651,7 +654,7 @@ class InMemoryCodeHost(_Declared):
         self._gate(Operation.CREDENTIAL)
         current = self._repository(repository)
         return Credential(
-            origin=f"https://{self.host}/{current.path}.git",
+            origin=f"https://{self.host}",
             header=CredentialHeader.AUTHORIZATION_BEARER,
             secret=f"memory-{scope}-{current.project_id}",
             scope=scope,
@@ -718,6 +721,7 @@ class InMemoryCodeHost(_Declared):
             pull.title = title
         if body is not None:
             pull.body = body
+        pull.updated_at = datetime.now(UTC)
         self.ledger.record()
         return self._view(pull)
 

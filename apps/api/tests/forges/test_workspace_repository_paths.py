@@ -64,15 +64,21 @@ def test_selection_without_a_repository_needs_no_path_check() -> None:
     assert request.repo_full_name is None
 
 
-def test_credential_transport_facts_default_to_today_github_behavior() -> None:
+def test_a_credential_always_names_its_origin_and_defaults_to_github_transport() -> None:
     for model in (RepositoryCredentialOut, WorkspaceCredentialOut):
+        with pytest.raises(ValidationError, match="origin"):
+            model(
+                repo_full_name="acme-corp/acme-bot",
+                clone_url="https://github.com/acme-corp/acme-bot.git",
+                authorization_header="Basic abc",
+            )
         credential = model(
             repo_full_name="acme-corp/acme-bot",
             clone_url="https://github.com/acme-corp/acme-bot.git",
             authorization_header="Basic abc",
+            origin="https://github.com",
         )
 
-        assert credential.origin is None
         assert credential.header_form is CredentialHeader.AUTHORIZATION_BASIC
         assert credential.ca_bundle_ref is None
 

@@ -8456,6 +8456,18 @@
             "title": "State",
             "type": "string"
           },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
           "url": {
             "title": "Url",
             "type": "string"
@@ -8883,7 +8895,7 @@
         "type": "object"
       },
       "RepositoryCredentialOut": {
-        "description": "One server-derived Git credential returned only to the trusted worker.\n\n``origin``, ``header_form`` and ``ca_bundle_ref`` are the code host\ntransport facts (ADR 0197). Each defaults to today's GitHub behavior: the\nconfigured GitHub host, an ``Authorization: Basic`` header, and the public\ntrust store.",
+        "description": "One server-derived Git credential returned only to the trusted worker.\n\n``origin``, ``header_form`` and ``ca_bundle_ref`` are the code host\ntransport facts (ADR 0197), issued by the code host with the credential:\nthe origin the header is scoped to (the clone URL is the origin plus the\nrepository path), the header git sends it in, and the path of the CA\nbundle mounted where git runs. The worker derives none of them.",
         "properties": {
           "authorization_header": {
             "title": "Authorization Header",
@@ -8909,15 +8921,8 @@
             "default": "authorization_basic"
           },
           "origin": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Origin"
+            "title": "Origin",
+            "type": "string"
           },
           "repo_full_name": {
             "title": "Repo Full Name",
@@ -8938,7 +8943,8 @@
         "required": [
           "repo_full_name",
           "clone_url",
-          "authorization_header"
+          "authorization_header",
+          "origin"
         ],
         "title": "RepositoryCredentialOut",
         "type": "object"
@@ -11676,15 +11682,8 @@
             "default": "authorization_basic"
           },
           "origin": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Origin"
+            "title": "Origin",
+            "type": "string"
           },
           "repo_full_name": {
             "title": "Repo Full Name",
@@ -11705,7 +11704,8 @@
         "required": [
           "repo_full_name",
           "clone_url",
-          "authorization_header"
+          "authorization_header",
+          "origin"
         ],
         "title": "WorkspaceCredentialOut",
         "type": "object"
@@ -22479,6 +22479,66 @@
           }
         },
         "summary": "Recover Publication Pull Request",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/publications/{publication_id}/pull-request/metadata": {
+      "post": {
+        "description": "Apply a metadata-only revision's title and body to its stored pull request.\n\nA metadata-only revision has nothing to push, so no publication Job runs\nand this update is its whole effect (ADR 0197, \"Two ports\" item 6). The\ncontract and the observed digests come from the stored publication. A\nmerged or closed pull request is answered unchanged, with its state, so\nthe worker records the lineage terminal.",
+        "operationId": "update_publication_pull_request_metadata_v1_internal_publications__publication_id__pull_request_metadata_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationPullRequestOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Publication Pull Request Metadata",
         "tags": [
           "internal-publications"
         ]

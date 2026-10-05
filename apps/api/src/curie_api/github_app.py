@@ -35,6 +35,7 @@ from typing import Any
 import httpx
 import jwt
 
+from .code_host_trust import code_host_verify
 from .config import Settings
 from .repo_full_name import (
     InvalidRepoFullName,
@@ -259,7 +260,10 @@ class GitHubCredentials:
         )
         with self._mint_lock_for(repo_full_name):
             try:
-                with httpx.Client(timeout=self.settings.github_app_timeout_seconds) as client:
+                with httpx.Client(
+                    timeout=self.settings.github_app_timeout_seconds,
+                    verify=code_host_verify(self.settings),
+                ) as client:
                     response = client.get(url, headers=self._headers(), follow_redirects=False)
                 if response.status_code != 200:
                     if response.status_code < 500 and response.status_code not in {
@@ -499,7 +503,10 @@ class GitHubCredentials:
 
     def _request(self, method: str, url: str, body: dict[str, Any] | None) -> dict[str, Any]:
         try:
-            with httpx.Client(timeout=self.settings.github_app_timeout_seconds) as client:
+            with httpx.Client(
+                timeout=self.settings.github_app_timeout_seconds,
+                verify=code_host_verify(self.settings),
+            ) as client:
                 response = client.request(method, url, json=body, headers=self._headers())
         except httpx.HTTPError as exc:
             raise GitHubAppError(f"could not reach GitHub at {url}: {exc}") from exc

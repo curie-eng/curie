@@ -3,33 +3,42 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import importlib
 import json
 import os
+import re
 import shutil
 import subprocess
-import threading
 import uuid
 from copy import deepcopy
 from dataclasses import replace
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
-from urllib.parse import parse_qs, urlsplit
+from typing import Any
 
 import pytest
-from kubernetes.client import ApiException
+from kubernetes.client import (
+    ApiClient,
+    ApiException,
+    V1Job,
+    V1JobCondition,
+    V1JobStatus,
+    V1ObjectMeta,
+)
 
 PUBLICATION_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
 WRITE_CREDENTIAL = "publication-write-credential-value"
-CLEAN_URL = "https://github.com/acme-corp/acme-bot.git"
-PR_API_URL = "https://api.github.com/repos/acme-corp/acme-bot/pulls"
+ORIGIN = "https://github.com"
+CLEAN_URL = f"{ORIGIN}/acme-corp/acme-bot.git"
+GITLAB_ORIGIN = "https://gitlab.example.com/forge"
+GITLAB_REPO = "group/sub/acme-bot"
+GITLAB_URL = f"{GITLAB_ORIGIN}/{GITLAB_REPO}.git"
 REVISION_ID = uuid.UUID("44444444-4444-4444-8444-444444444444")
 LINEAGE_BRANCH = "curie/thread-lineage-example"
 PRIOR_HEAD = "b" * 40
 REVISION_HEAD = "d" * 40
+CA_REF = "/etc/curie/code-host-trust/ca.crt"
+BASIC_TEST_CREDENTIAL = "Basic " + base64.b64encode(b"x-access-token:local-test-token").decode()
 
 
 @pytest.fixture
@@ -57,6 +66,18 @@ def _settings(module: Any) -> Any:
     )
 
 
+def _transport(
+    module: Any,
+    *,
+    origin: str = ORIGIN,
+    header_form: str = "authorization_basic",
+    ca_bundle_ref: str | None = None,
+) -> Any:
+    return module.PublicationTransport(
+        origin=origin, header_form=header_form, ca_bundle_ref=ca_bundle_ref
+    )
+
+
 def _payload(module: Any, patch: bytes = b"diff --git a/a b/a\n") -> Any:
     return module.PublicationPayload(
         publication_id=PUBLICATION_ID,
@@ -69,14 +90,17 @@ def _payload(module: Any, patch: bytes = b"diff --git a/a b/a\n") -> Any:
         expected_remote_head=None,
         patch=patch,
         branch=LINEAGE_BRANCH,
-        pr_number=None,
-        pr_url=None,
         title="Update repository",
-        body="Approved platform publication.",
-        observed_title_sha256=None,
-        observed_body_sha256=None,
-        github_repository_id=9001 if not patch else None,
-        github_pr_node_id="PR_example_123" if not patch else None,
+        transport=_transport(module),
+    )
+
+
+def _gitlab_payload(module: Any, header_form: str = "private_token") -> Any:
+    return replace(
+        _payload(module),
+        repo_full_name=GITLAB_REPO,
+        clean_clone_url=GITLAB_URL,
+        transport=_transport(module, origin=GITLAB_ORIGIN, header_form=header_form),
     )
 
 
@@ -88,40 +112,43 @@ def _resources(module: Any, patch: bytes = b"diff --git a/a b/a\n") -> Any:
     )
 
 
-def _job_env(resources: Any) -> dict[str, str]:
-    container = resources.job["spec"]["template"]["spec"]["containers"][0]
-    return {item["name"]: item["value"] for item in container["env"]}
-
-
-def _lineage_resources(module: Any) -> Any:
-    payload = module.PublicationPayload(
-        publication_id=PUBLICATION_ID,
-        revision_id=REVISION_ID,
-        revision_number=2,
-        repo_full_name="acme-corp/acme-bot",
-        clean_clone_url=CLEAN_URL,
-        base_sha=PRIOR_HEAD,
-        expected_prior_head=PRIOR_HEAD,
-        expected_remote_head=PRIOR_HEAD,
-        patch=b"diff --git a/a b/a\n",
-        branch=LINEAGE_BRANCH,
-        pr_number=123,
-        pr_url="https://github.com/acme-corp/acme-bot/pull/123",
-        title="Update repository",
-        body="Approved platform publication.",
-        observed_title_sha256=None,
-        observed_body_sha256=None,
-        github_repository_id=9001,
-        github_pr_node_id="PR_example_123",
-    )
+def _build(module: Any, payload: Any, settings: Any | None = None) -> Any:
     return module.build_publication_resources(
         payload,
         credential=WRITE_CREDENTIAL,
-        settings=_settings(module),
+        settings=settings or _settings(module),
     )
 
 
-def test_branch_prefix_mismatch_exits_before_any_git_or_github_call(
+def _ca_settings(module: Any) -> Any:
+    return replace(
+        _settings(module),
+        ca_bundle_config_map="curie-code-host-trust",
+        ca_bundle_key="corporate-root.pem",
+    )
+
+
+def _container(resources: Any) -> dict[str, Any]:
+    container: dict[str, Any] = resources.job["spec"]["template"]["spec"]["containers"][0]
+    return container
+
+
+def _job_env(resources: Any) -> dict[str, str]:
+    return {item["name"]: item["value"] for item in _container(resources)["env"]}
+
+
+def _lineage_resources(module: Any) -> Any:
+    payload = replace(
+        _payload(module),
+        revision_number=2,
+        base_sha=PRIOR_HEAD,
+        expected_prior_head=PRIOR_HEAD,
+        expected_remote_head=PRIOR_HEAD,
+    )
+    return _build(module, payload)
+
+
+def test_branch_prefix_mismatch_exits_before_any_git_call(
     publication_k8s: Any,
     tmp_path: Path,
 ) -> None:
@@ -130,11 +157,7 @@ def test_branch_prefix_mismatch_exits_before_any_git_or_github_call(
         branch="factory/publication-abc",
         branch_prefix="factory/",
     )
-    resources = publication_k8s.build_publication_resources(
-        payload,
-        credential=WRITE_CREDENTIAL,
-        settings=_settings(publication_k8s),
-    )
+    resources = _build(publication_k8s, payload)
     script = tmp_path / "publish.sh"
     script.write_text(resources.config_map["data"]["publish.sh"])
     completed = subprocess.run(
@@ -156,62 +179,13 @@ def test_a_cleared_prefix_still_accepts_the_stored_platform_branch(
         branch="factory/publication-abc",
         branch_prefix=None,
     )
-    resources = publication_k8s.build_publication_resources(
-        payload,
-        credential=WRITE_CREDENTIAL,
-        settings=_settings(publication_k8s),
-    )
+    resources = _build(publication_k8s, payload)
     assert _job_env(resources)["BRANCH"] == "factory/publication-abc"
     assert _job_env(resources)["PUBLICATION_BRANCH_PREFIX"] == ""
 
     unsafe = replace(_payload(publication_k8s), branch="release/v1", branch_prefix=None)
     with pytest.raises(publication_k8s.PublicationResourceError, match="lineage branch"):
-        publication_k8s.build_publication_resources(
-            unsafe,
-            credential=WRITE_CREDENTIAL,
-            settings=_settings(publication_k8s),
-        )
-
-
-def test_draft_publication_refuses_a_non_draft_pull_request(
-    publication_k8s: Any,
-    tmp_path: Path,
-) -> None:
-    payload = replace(_payload(publication_k8s), open_as_draft=True)
-    resources = publication_k8s.build_publication_resources(
-        payload,
-        credential=WRITE_CREDENTIAL,
-        settings=_settings(publication_k8s),
-    )
-    created = _pull_response()
-    created["draft"] = False
-    refused, _ = _run_github_guard(
-        tmp_path,
-        resources,
-        mode="post-push",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, []),
-            (201, {}, created),
-        ],
-    )
-    assert refused.returncode != 0
-    assert "required draft" in refused.stderr
-
-    accepted = _pull_response()
-    accepted["draft"] = True
-    opened, requests = _run_github_guard(
-        tmp_path,
-        resources,
-        mode="post-push",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, []),
-            (201, {}, accepted),
-        ],
-    )
-    assert opened.returncode == 0, opened.stderr
-    assert any(path.endswith("/pulls") for path, _auth in requests)
+        _build(publication_k8s, unsafe)
 
 
 def test_900000_raw_patch_bytes_fit_binary_data_and_900001_is_refused(
@@ -227,6 +201,11 @@ def test_900000_raw_patch_bytes_fit_binary_data_and_900001_is_refused(
         _resources(publication_k8s, b"x" * 900_001)
 
 
+def test_an_empty_patch_builds_no_job(publication_k8s: Any) -> None:
+    with pytest.raises(publication_k8s.PublicationResourceError, match="non-empty patch"):
+        _resources(publication_k8s, b"")
+
+
 @pytest.mark.parametrize(
     "base_sha",
     ["abc", "A" * 40, "g" * 40, "a" * 65, "a" * 39, "a" * 40 + ";touch /tmp/x"],
@@ -235,17 +214,10 @@ def test_publication_base_sha_is_revalidated_before_entering_job_argv(
     publication_k8s: Any,
     base_sha: str,
 ) -> None:
-    payload = _payload(publication_k8s)
-    invalid = publication_k8s.PublicationPayload(
-        **{**payload.__dict__, "base_sha": base_sha}
-    )
+    invalid = replace(_payload(publication_k8s), base_sha=base_sha)
 
     with pytest.raises(publication_k8s.PublicationResourceError, match="base SHA"):
-        publication_k8s.build_publication_resources(
-            invalid,
-            credential=WRITE_CREDENTIAL,
-            settings=_settings(publication_k8s),
-        )
+        _build(publication_k8s, invalid)
 
 
 def test_publication_resource_names_and_stored_lineage_branch_are_deterministic(
@@ -269,9 +241,7 @@ def test_built_job_is_bounded_secret_free_and_outside_sandbox_selectors(
     pod = job["spec"]["template"]
     pod_spec = pod["spec"]
     container = pod_spec["containers"][0]
-    serialized_public = json.dumps(
-        {"job": job, "config_map": resources.config_map}, sort_keys=True
-    )
+    serialized_public = json.dumps({"job": job, "config_map": resources.config_map}, sort_keys=True)
 
     assert job["spec"]["backoffLimit"] == 0
     assert job["spec"]["activeDeadlineSeconds"] == 300
@@ -285,10 +255,11 @@ def test_built_job_is_bounded_secret_free_and_outside_sandbox_selectors(
     env_by_name = {item["name"]: item["value"] for item in container["env"]}
     assert {
         ("GIT_TIMEOUT_SECONDS", "60"),
-        ("GITHUB_TIMEOUT_SECONDS", "30"),
-        ("GITHUB_API_URL", "https://api.github.com"),
-        ("GITHUB_HTML_BASE", "https://github.com"),
+        ("CODE_HOST_ORIGIN", ORIGIN),
+        ("CODE_HOST_HEADER_FORM", "authorization_basic"),
+        ("CLEAN_CLONE_URL", CLEAN_URL),
     } <= set(env_by_name.items())
+    assert not [name for name in env_by_name if name.startswith(("GITHUB_", "PR_"))]
     assert container["resources"] == {
         "requests": {"cpu": "100m", "memory": "256Mi", "ephemeral-storage": "1Gi"},
         "limits": {"cpu": "1", "memory": "1Gi", "ephemeral-storage": "4Gi"},
@@ -300,7 +271,7 @@ def test_built_job_is_bounded_secret_free_and_outside_sandbox_selectors(
     assert resources.secret["stringData"]["credential"] == WRITE_CREDENTIAL
 
 
-def test_publish_script_uses_clean_remote_file_askpass_rest_and_redacted_marker(
+def test_publish_script_only_pushes_and_calls_no_code_host_api(
     publication_k8s: Any,
 ) -> None:
     resources = _resources(publication_k8s)
@@ -309,27 +280,31 @@ def test_publish_script_uses_clean_remote_file_askpass_rest_and_redacted_marker(
 
     assert "GIT_ASKPASS" in script
     assert "/credentials/credential" in script
-    assert "git_with_timeout clone \"$CLEAN_CLONE_URL\"" in script
-    assert "git_with_timeout remote set-url origin \"$CLEAN_CLONE_URL\"" in script
+    assert 'git_with_timeout clone "$CLEAN_CLONE_URL"' in script
+    assert 'git_with_timeout remote set-url origin "$CLEAN_CLONE_URL"' in script
     assert (
-        "git_with_timeout -c user.name=\"$GIT_USER_NAME\" "
-        "-c user.email=\"$GIT_USER_EMAIL\" commit" in script
+        'git_with_timeout -c user.name="$GIT_USER_NAME" '
+        '-c user.email="$GIT_USER_EMAIL" commit' in script
     )
     assert "git_with_timeout apply --check" in script
     assert "git_with_timeout push" in script
     assert (
-        'timeout --signal=TERM "${GIT_TIMEOUT_SECONDS}s" '
-        'git -c http.followRedirects=false "$@"' in script
+        'timeout --signal=TERM "${GIT_TIMEOUT_SECONDS}s" git -c http.followRedirects=false \\\n'
+        '    -c include.path=/tmp/curie-git-auth.config "$@"' in script
     )
-    assert 'timeout=int(os.environ["GITHUB_TIMEOUT_SECONDS"])' in script
-    assert PR_API_URL not in script, "repository-specific URLs must be derived at runtime"
-    assert 'github_api = os.environ["GITHUB_API_URL"].rstrip("/")' in script
-    assert 'repo_api = f"{github_api}/repos/{repo}"' in script
-    assert "https://api.github.com" not in script
-    assert "gh " not in script
-    assert "CURIE_PR_URL=" in script
+    # No REST client, no forge URL, no pull request marker: the API owns all of it.
+    for forbidden in (
+        "urllib",
+        "http.client",
+        "api.github.com",
+        "GITHUB_",
+        "CURIE_PR_",
+        "/pulls",
+        "set -x",
+    ):
+        assert forbidden not in script, forbidden
+    assert re.search(r"(^|[\s;|(])gh\s", script) is None, "no gh CLI"
     assert "redact" in script.lower()
-    assert "set -x" not in script
     assert WRITE_CREDENTIAL not in script
     assert WRITE_CREDENTIAL not in serialized_job
 
@@ -341,39 +316,32 @@ def test_lineage_revision_job_marks_one_commit_and_uses_exact_head_occupancy_cas
 
     resources = _lineage_resources(publication_k8s)
     script = resources.config_map["data"]["publish.sh"]
-    container = resources.job["spec"]["template"]["spec"]["containers"][0]
-    env = {item["name"]: item["value"] for item in container["env"]}
+    env = _job_env(resources)
 
     assert env["BRANCH"] == LINEAGE_BRANCH
     assert env["EXPECTED_PRIOR_HEAD"] == PRIOR_HEAD
     assert env["EXPECTED_REMOTE_HEAD"] == PRIOR_HEAD
     assert env["REVISION_ID"] == str(REVISION_ID)
-    assert env["PR_NUMBER"] == "123"
-    assert env["PR_URL"] == "https://github.com/acme-corp/acme-bot/pull/123"
     assert "Curie-Revision: $REVISION_ID" in script
-    assert (
-        '--force-with-lease=refs/heads/$BRANCH:$EXPECTED_REMOTE_HEAD' in script
-    )
-    assert "CURIE_COMMIT_SHA=" in script
-    assert "CURIE_PR_NUMBER=" in script
+    assert "--force-with-lease=refs/heads/$BRANCH:$EXPECTED_REMOTE_HEAD" in script
     assert "git push --force " not in script
     assert f"publication-{PUBLICATION_ID.hex}" not in LINEAGE_BRANCH
-    preflight = script.index("CURIE_GITHUB_PHASE=pre-push python")
+    head_check = script.index('git_with_timeout ls-remote origin "refs/heads/$BRANCH"')
+    apply = script.index('git_with_timeout apply --binary "$patch_path"')
+    commit = script.index("commit \\\n")
     push = script.index("git_with_timeout push")
-    postflight = script.index("CURIE_GITHUB_PHASE=post-push python")
     success = script.index('echo "CURIE_COMMIT_SHA=$commit_sha"')
-    assert preflight < push < postflight < success
+    assert head_check < apply < commit < push < success
+    assert script.rstrip().endswith('echo "CURIE_COMMIT_SHA=$commit_sha"')
 
 
-def test_lineage_job_refuses_every_remote_head_except_prior_or_own_marked_commit(
+def test_lineage_job_refuses_every_remote_head_except_the_expected_one(
     publication_k8s: Any,
 ) -> None:
     script = _lineage_resources(publication_k8s).config_map["data"]["publish.sh"]
 
     assert "ls-remote" in script
-    assert "EXPECTED_REMOTE_HEAD" in script
-    assert "REVISION_ID" in script
-    assert "Curie-Revision:" in script
+    assert '"$remote_head" != "$EXPECTED_REMOTE_HEAD"' in script
     assert "publication branch head conflict" in script
     assert "force-with-lease=refs/heads/$BRANCH:$EXPECTED_REMOTE_HEAD" in script
 
@@ -381,970 +349,344 @@ def test_lineage_job_refuses_every_remote_head_except_prior_or_own_marked_commit
 def test_lineage_revision_payload_rejects_checkout_and_expected_head_disagreement(
     publication_k8s: Any,
 ) -> None:
-    payload = publication_k8s.PublicationPayload(
-        publication_id=PUBLICATION_ID,
-        revision_id=REVISION_ID,
+    payload = replace(
+        _payload(publication_k8s),
         revision_number=2,
-        repo_full_name="acme-corp/acme-bot",
-        clean_clone_url=CLEAN_URL,
         base_sha="c" * 40,
         expected_prior_head=PRIOR_HEAD,
         expected_remote_head=PRIOR_HEAD,
-        patch=b"diff --git a/a b/a\n",
-        branch=LINEAGE_BRANCH,
-        pr_number=123,
-        pr_url="https://github.com/acme-corp/acme-bot/pull/123",
-        title="Update repository",
-        body="Approved platform publication.",
-        observed_title_sha256=None,
-        observed_body_sha256=None,
-        github_repository_id=9001,
-        github_pr_node_id="PR_example_123",
     )
 
     with pytest.raises(publication_k8s.PublicationResourceError, match="expected prior head"):
-        publication_k8s.build_publication_resources(
-            payload,
-            credential=WRITE_CREDENTIAL,
-            settings=_settings(publication_k8s),
-        )
+        _build(publication_k8s, payload)
 
 
-def test_publish_job_refuses_redirects_for_git_and_github_rest(
+def test_publish_job_refuses_redirects_for_git(
     publication_k8s: Any,
 ) -> None:
-    """Neither credential-bearing transport may follow an attacker-controlled redirect."""
+    """The credential-bearing transport may not follow an attacker-controlled redirect."""
 
     script = _resources(publication_k8s).config_map["data"]["publish.sh"]
 
-    assert 'git -c http.followRedirects=false "$@"' in script
-    assert "from urllib.request import HTTPRedirectHandler, Request, build_opener" in script
-    assert "class _NoRedirect(HTTPRedirectHandler):" in script
-    assert "opener = build_opener(_NoRedirect())" in script
-    assert "opener.open(req, timeout=int(os.environ[\"GITHUB_TIMEOUT_SECONDS\"]))" in script
-    assert "urlopen(req" not in script
-
-
-def _pull_response(
-    *,
-    state: str = "open",
-    merged: bool = False,
-    number: int = 123,
-    url: str = "https://github.com/acme-corp/acme-bot/pull/123",
-    head: str = LINEAGE_BRANCH,
-    head_sha: str | None = None,
-    base: str = "main",
-) -> dict[str, Any]:
-    head_payload: dict[str, Any] = {
-        "ref": head,
-        "repo": {"full_name": "acme-corp/acme-bot"},
-    }
-    if head_sha is not None:
-        head_payload["sha"] = head_sha
-    return {
-        "number": number,
-        "node_id": "PR_example_123",
-        "html_url": url,
-        "state": state,
-        "merged": merged,
-        "title": "Update repository",
-        "body": "Approved platform publication.",
-        "updated_at": "2026-09-25T21:00:00Z",
-        "head": head_payload,
-        "base": {"ref": base, "repo": {"full_name": "acme-corp/acme-bot"}},
-    }
-
-
-def _terminal_markers(state: str, head_sha: str) -> str:
-    return (
-        "CURIE_PR_URL=https://github.com/acme-corp/acme-bot/pull/123\n"
-        "CURIE_PR_NUMBER=123\n"
-        f"CURIE_COMMIT_SHA={head_sha}\n"
-        f"CURIE_PR_STATE={state}\n"
-    )
-
-
-class _GitHubApiHandler(BaseHTTPRequestHandler):
-    queued_responses: list[tuple[int, dict[str, str], Any]] = []
-    requests: list[tuple[str, str | None]] = []
-    post_count = 0
-    patch_bodies: list[dict[str, Any]] = []
-
-    def _respond(self) -> None:
-        type(self).requests.append((self.path, self.headers.get("Authorization")))
-        status, headers, payload = type(self).queued_responses.pop(0)
-        self.send_response(status)
-        for name, value in headers.items():
-            self.send_header(name, value)
-        if payload is not None:
-            body = json.dumps(payload).encode()
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-        else:
-            body = b""
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self) -> None:
-        self._respond()
-
-    def do_POST(self) -> None:
-        type(self).post_count += 1
-        content_length = int(self.headers.get("Content-Length", "0"))
-        self.rfile.read(content_length)
-        self._respond()
-
-    def do_PATCH(self) -> None:
-        content_length = int(self.headers.get("Content-Length", "0"))
-        type(self).patch_bodies.append(json.loads(self.rfile.read(content_length)))
-        self._respond()
-
-    def log_message(self, _format: str, *args: object) -> None:
-        return
-
-
-def _embedded_github_script(resources: Any) -> str:
-    script = resources.config_map["data"]["publish.sh"]
-    marker = "cat >/tmp/curie-github.py <<'PY'\n"
-    return cast(str, script.split(marker, 1)[1].split("\nPY\n", 1)[0])
-
-
-def _run_github_guard(
-    tmp_path: Path,
-    resources: Any,
-    *,
-    mode: str,
-    responses: list[tuple[int, dict[str, str], Any]],
-    expected_head: str | None = None,
-) -> tuple[subprocess.CompletedProcess[str], list[tuple[str, str | None]]]:
-    credential = tmp_path / "credential"
-    credential.write_text(WRITE_CREDENTIAL)
-    facts = tmp_path / "pr-facts.json"
-    expected_head = expected_head or (
-        PRIOR_HEAD if mode in {"pre-push", "metadata-only"} else REVISION_HEAD
-    )
-    prepared = deepcopy(responses)
-    if prepared and isinstance(prepared[0][2], dict):
-        prepared[0][2].setdefault("id", 9001)
-    for _status, _headers, payload in prepared:
-        rows = payload if isinstance(payload, list) else [payload]
-        for row in rows:
-            if isinstance(row, dict) and isinstance(row.get("head"), dict):
-                row["head"].setdefault("sha", expected_head)
-    _GitHubApiHandler.queued_responses = prepared
-    _GitHubApiHandler.requests = []
-    _GitHubApiHandler.post_count = 0
-    _GitHubApiHandler.patch_bodies = []
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _GitHubApiHandler)
-    thread = threading.Thread(target=server.serve_forever)
-    thread.start()
-    try:
-        completed = subprocess.run(
-            ["python3", "-c", _embedded_github_script(resources)],
-            env={
-                **os.environ,
-                **_job_env(resources),
-                "GITHUB_API_URL": f"http://127.0.0.1:{server.server_port}",
-                "CURIE_GITHUB_PHASE": mode,
-                "CURIE_EXPECTED_HEAD": expected_head,
-                "CURIE_CREDENTIAL_PATH": str(credential),
-                "CURIE_PR_FACTS_PATH": str(facts),
-            },
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    finally:
-        server.shutdown()
-        thread.join()
-        server.server_close()
-    return completed, list(_GitHubApiHandler.requests)
-
-
-def test_body_only_revision_updates_stored_pull_without_a_commit_or_push(
-    publication_k8s: Any, tmp_path: Path
-) -> None:
-    # GitHub documents PATCH /repos/{owner}/{repo}/pulls/{pull_number} with
-    # title and body fields and a 200 response:
-    # https://docs.github.com/en/rest/pulls/pulls#update-a-pull-request
-    payload = replace(_payload(publication_k8s, b""),
-        revision_number=2, base_sha=PRIOR_HEAD,
-        expected_prior_head=PRIOR_HEAD, expected_remote_head=PRIOR_HEAD,
-        pr_number=123, pr_url="https://github.com/acme-corp/acme-bot/pull/123",
-        body="Corrected body for CI.\n",
-        observed_title_sha256=hashlib.sha256(b"Update repository").hexdigest(),
-        observed_body_sha256=hashlib.sha256(b"Approved platform publication.").hexdigest(),
-    )
-    resources = publication_k8s.build_publication_resources(
-        payload, credential=WRITE_CREDENTIAL, settings=_settings(publication_k8s)
-    )
-    assert _job_env(resources)["EXPECTED_GITHUB_REPOSITORY_ID"] == "9001"
-    assert _job_env(resources)["EXPECTED_GITHUB_PR_NODE_ID"] == "PR_example_123"
-    old_pull = _pull_response()
-    updated_pull = {**old_pull, "body": payload.body}
-    completed, requests = _run_github_guard(
-        tmp_path, resources, mode="metadata-only",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, old_pull),
-            (200, {}, updated_pull),
-        ],
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert "CURIE_PR_UPDATED_AT=2026-09-25T21:00:00+00:00" in completed.stdout
-    assert _GitHubApiHandler.patch_bodies == [{"body": payload.body}]
-    assert requests[-1][0] == "/repos/acme-corp/acme-bot/pulls/123"
-    script = resources.config_map["data"]["publish.sh"]
-    assert 'if [[ ! -s "$patch_path" ]]; then' in script
-    assert 'echo "CURIE_COMMIT_SHA=$BASE_SHA"' in script
-    assert script.index('echo "CURIE_COMMIT_SHA=$BASE_SHA"') < script.index('git_with_timeout push')
-
-
-@pytest.mark.parametrize(
-    ("repository_id", "pr_node_id"),
-    [(9002, "PR_example_123"), (9001, "PR_other_123")],
-)
-def test_metadata_revision_refuses_changed_immutable_github_identity_before_patch(
-    publication_k8s: Any,
-    tmp_path: Path,
-    repository_id: int,
-    pr_node_id: str,
-) -> None:
-    # GitHub REST returns repository id and pull request node_id:
-    # https://docs.github.com/en/rest/repos/repos#get-a-repository
-    # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
-    payload = replace(
-        _payload(publication_k8s, b""),
-        revision_number=2,
-        base_sha=PRIOR_HEAD,
-        expected_prior_head=PRIOR_HEAD,
-        expected_remote_head=PRIOR_HEAD,
-        pr_number=123,
-        pr_url="https://github.com/acme-corp/acme-bot/pull/123",
-        body="Corrected body for CI.\n",
-        observed_title_sha256=hashlib.sha256(b"Update repository").hexdigest(),
-        observed_body_sha256=hashlib.sha256(b"Approved platform publication.").hexdigest(),
-    )
-    resources = publication_k8s.build_publication_resources(
-        payload, credential=WRITE_CREDENTIAL, settings=_settings(publication_k8s)
-    )
-    current_pull = {**_pull_response(), "node_id": pr_node_id}
-    completed, _ = _run_github_guard(
-        tmp_path,
-        resources,
-        mode="metadata-only",
-        responses=[
-            (200, {}, {"id": repository_id, "default_branch": "main"}),
-            (200, {}, current_pull),
-            (200, {}, {**current_pull, "body": payload.body}),
-        ],
-    )
-    assert completed.returncode != 0
-    assert "identity" in completed.stderr
-    assert _GitHubApiHandler.patch_bodies == []
-
-
-@pytest.mark.parametrize("missing", ["github_repository_id", "github_pr_node_id"])
-def test_metadata_revision_requires_stored_immutable_github_identity(
-    publication_k8s: Any, missing: str
-) -> None:
-    payload = replace(
-        _payload(publication_k8s, b""),
-        pr_number=123,
-        pr_url="https://github.com/acme-corp/acme-bot/pull/123",
-        observed_title_sha256=hashlib.sha256(b"Update repository").hexdigest(),
-        observed_body_sha256=hashlib.sha256(b"Approved platform publication.").hexdigest(),
-        **{missing: None},
-    )
-    with pytest.raises(publication_k8s.PublicationResourceError, match="stored GitHub identity"):
-        publication_k8s.build_publication_resources(
-            payload, credential=WRITE_CREDENTIAL, settings=_settings(publication_k8s)
-        )
-
-
-def test_body_only_revision_refuses_ambiguous_patch_response_despite_matching_get(
-    publication_k8s: Any, tmp_path: Path
-) -> None:
-    payload = replace(
-        _payload(publication_k8s, b""),
-        revision_number=2,
-        base_sha=PRIOR_HEAD,
-        expected_prior_head=PRIOR_HEAD,
-        expected_remote_head=PRIOR_HEAD,
-        pr_number=123,
-        pr_url="https://github.com/acme-corp/acme-bot/pull/123",
-        body="Corrected body for CI.\n",
-        observed_title_sha256=hashlib.sha256(b"Update repository").hexdigest(),
-        observed_body_sha256=hashlib.sha256(b"Approved platform publication.").hexdigest(),
-    )
-    resources = publication_k8s.build_publication_resources(
-        payload, credential=WRITE_CREDENTIAL, settings=_settings(publication_k8s)
-    )
-    old_pull = _pull_response()
-    # A gateway timeout cannot establish whether GitHub applied the PATCH.
-    # A later GET can match the proposal without proving this revision owns
-    # its update time.
-    updated_pull = {
-        **old_pull,
-        "body": payload.body,
-        "updated_at": "2026-09-25T21:01:00Z",
-    }
-    completed, requests = _run_github_guard(
-        tmp_path,
-        resources,
-        mode="metadata-only",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, old_pull),
-            (504, {}, {"message": "upstream response lost"}),
-            (200, {}, updated_pull),
-        ],
-    )
-    assert _GitHubApiHandler.patch_bodies == [{"body": payload.body}]
-    assert [path for path, _auth in requests[:3]] == [
-        "/repos/acme-corp/acme-bot",
-        "/repos/acme-corp/acme-bot/pulls/123",
-        "/repos/acme-corp/acme-bot/pulls/123",
+    assert "git -c http.followRedirects=false" in script
+    # Every git call goes through the wrapper, so none can skip the flag.
+    git_calls = [
+        line.strip()
+        for line in script.splitlines()
+        if not line.strip().startswith("#")
+        and (line.strip().startswith("git ") or " git " in f" {line.strip()}")
     ]
-    assert all(
-        path == "/repos/acme-corp/acme-bot/pulls/123"
-        for path, _auth in requests[3:]
-    )
-    assert completed.returncode != 0
-    assert "CURIE_PR_UPDATED_AT=" not in completed.stdout
-    assert "CURIE_PR_URL=" not in completed.stdout
-    assert "CURIE_PR_NUMBER=" not in completed.stdout
+    assert git_calls, "the script must call git"
+    for line in git_calls:
+        assert line.startswith(("git_with_timeout", "timeout --signal=TERM")), line
 
 
-def test_body_only_revision_refuses_pull_already_equal_to_proposal(
-    publication_k8s: Any, tmp_path: Path
-) -> None:
-    payload = replace(
-        _payload(publication_k8s, b""),
-        revision_number=2,
-        base_sha=PRIOR_HEAD,
-        expected_prior_head=PRIOR_HEAD,
-        expected_remote_head=PRIOR_HEAD,
-        pr_number=123,
-        pr_url="https://github.com/acme-corp/acme-bot/pull/123",
-        body="Corrected body for CI.\n",
-        observed_title_sha256=hashlib.sha256(b"Update repository").hexdigest(),
-        observed_body_sha256=hashlib.sha256(b"Approved platform publication.").hexdigest(),
-    )
-    resources = publication_k8s.build_publication_resources(
-        payload, credential=WRITE_CREDENTIAL, settings=_settings(publication_k8s)
-    )
-    current_pull = {**_pull_response(), "body": payload.body}
-    completed, requests = _run_github_guard(
-        tmp_path,
-        resources,
-        mode="metadata-only",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, current_pull),
-        ],
-    )
-    assert len(requests) == 2
-    assert _GitHubApiHandler.patch_bodies == []
-    assert completed.returncode != 0
-    assert "CURIE_PR_UPDATED_AT=" not in completed.stdout
-    assert "CURIE_PR_URL=" not in completed.stdout
-    assert "CURIE_PR_NUMBER=" not in completed.stdout
-
-
-def test_body_only_revision_refuses_external_edit_after_approval(
-    publication_k8s: Any, tmp_path: Path
-) -> None:
-    payload = replace(
-        _payload(publication_k8s, b""),
-        revision_number=2,
-        base_sha=PRIOR_HEAD,
-        expected_prior_head=PRIOR_HEAD,
-        expected_remote_head=PRIOR_HEAD,
-        pr_number=123,
-        pr_url="https://github.com/acme-corp/acme-bot/pull/123",
-        body="Corrected body for CI.\n",
-        observed_title_sha256=hashlib.sha256(b"Update repository").hexdigest(),
-        observed_body_sha256=hashlib.sha256(b"Approved platform publication.").hexdigest(),
-    )
-    resources = publication_k8s.build_publication_resources(
-        payload, credential=WRITE_CREDENTIAL, settings=_settings(publication_k8s)
-    )
-    changed_pull = {**_pull_response(), "body": "A maintainer edited this body."}
-    completed, requests = _run_github_guard(
-        tmp_path,
-        resources,
-        mode="metadata-only",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, changed_pull),
-        ],
-    )
-    assert completed.returncode != 0
-    assert "changed after publication approval" in completed.stderr
-    assert len(requests) == 2
-    assert _GitHubApiHandler.patch_bodies == []
-
-
-def test_body_only_revision_accepts_github_null_for_observed_empty_body(
-    publication_k8s: Any, tmp_path: Path
-) -> None:
-    payload = replace(
-        _payload(publication_k8s, b""),
-        revision_number=2,
-        base_sha=PRIOR_HEAD,
-        expected_prior_head=PRIOR_HEAD,
-        expected_remote_head=PRIOR_HEAD,
-        pr_number=123,
-        pr_url="https://github.com/acme-corp/acme-bot/pull/123",
-        body="A new body.\n",
-        observed_title_sha256=hashlib.sha256(b"Update repository").hexdigest(),
-        observed_body_sha256=hashlib.sha256(b"").hexdigest(),
-    )
-    resources = publication_k8s.build_publication_resources(
-        payload, credential=WRITE_CREDENTIAL, settings=_settings(publication_k8s)
-    )
-    old_pull = {**_pull_response(), "body": None}
-    updated_pull = {**old_pull, "body": payload.body}
-    completed, _ = _run_github_guard(
-        tmp_path,
-        resources,
-        mode="metadata-only",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, old_pull),
-            (200, {}, updated_pull),
-        ],
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert _GitHubApiHandler.patch_bodies == [{"body": payload.body}]
-
-
-def test_metadata_only_first_publication_is_refused(publication_k8s: Any) -> None:
-    with pytest.raises(publication_k8s.PublicationResourceError, match="stored pull request"):
-        publication_k8s.build_publication_resources(
-            _payload(publication_k8s, b""),
-            credential=WRITE_CREDENTIAL,
-            settings=_settings(publication_k8s),
-        )
+# Transport: origin, header form, CA bundle (ADR 0197).
 
 
 @pytest.mark.parametrize(
-    ("state", "merged", "marker"),
-    [("closed", False, "closed"), ("closed", True, "merged")],
-)
-def test_revision_guard_refuses_closed_or_merged_pull_before_push(
-    publication_k8s: Any,
-    tmp_path: Path,
-    state: str,
-    merged: bool,
-    marker: str,
-) -> None:
-    resources = _lineage_resources(publication_k8s)
-    completed, requests = _run_github_guard(
-        tmp_path,
-        resources,
-        mode="pre-push",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, _pull_response(state=state, merged=merged)),
-        ],
-    )
-
-    assert completed.returncode != 0
-    assert completed.stdout == _terminal_markers(marker, PRIOR_HEAD)
-    assert requests == [
-        ("/repos/acme-corp/acme-bot", f"Bearer {WRITE_CREDENTIAL}"),
-        ("/repos/acme-corp/acme-bot/pulls/123", f"Bearer {WRITE_CREDENTIAL}"),
-    ]
-
-
-@pytest.mark.parametrize(
-    ("state", "merged", "marker"),
-    [("closed", False, "closed"), ("closed", True, "merged")],
-)
-def test_revision_guard_refuses_closed_or_merged_pull_after_push_without_success(
-    publication_k8s: Any,
-    tmp_path: Path,
-    state: str,
-    merged: bool,
-    marker: str,
-) -> None:
-    resources = _lineage_resources(publication_k8s)
-    before, _ = _run_github_guard(
-        tmp_path,
-        resources,
-        mode="pre-push",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, _pull_response()),
-        ],
-    )
-    assert before.returncode == 0
-
-    after, requests = _run_github_guard(
-        tmp_path,
-        resources,
-        mode="post-push",
-        responses=[(200, {}, _pull_response(state=state, merged=merged))],
-    )
-
-    assert after.returncode != 0
-    assert after.stdout == _terminal_markers(marker, REVISION_HEAD)
-    assert requests == [
-        ("/repos/acme-corp/acme-bot/pulls/123", f"Bearer {WRITE_CREDENTIAL}")
-    ]
-
-
-@pytest.mark.parametrize("mode", ["pre-push", "post-push"])
-@pytest.mark.parametrize(
-    "mismatch",
+    ("clone_url", "repo"),
     [
-        {"number": 124},
-        {"url": "https://github.com/acme-corp/acme-bot/pull/124"},
-        {"head": "curie/different-lineage"},
-        {"base": "different-base"},
+        pytest.param("https://gitlab.example.com/acme-corp/acme-bot.git", None, id="other-host"),
+        pytest.param("http://github.com/acme-corp/acme-bot.git", None, id="plain-http"),
+        pytest.param(
+            "https://x-access-token:tok@github.com/acme-corp/acme-bot.git",
+            None,
+            id="userinfo",
+        ),
+        pytest.param("https://github.com/acme-corp/acme-bot", None, id="no-dot-git"),
+        pytest.param("https://github.com.evil.example/acme-corp/acme-bot.git", None, id="suffix"),
+        pytest.param(CLEAN_URL, "acme-corp/../acme-bot", id="dot-dot-repo"),
     ],
 )
-def test_revision_guard_refuses_pull_identity_mismatch_at_both_boundaries(
-    publication_k8s: Any,
-    tmp_path: Path,
-    mode: str,
-    mismatch: dict[str, Any],
+def test_builder_refuses_a_clone_url_outside_the_origin(
+    publication_k8s: Any, clone_url: str, repo: str | None
 ) -> None:
-    resources = _lineage_resources(publication_k8s)
-    if mode == "post-push":
-        healthy, _ = _run_github_guard(
-            tmp_path,
-            resources,
-            mode="pre-push",
-            responses=[
-                (200, {}, {"default_branch": "main"}),
-                (200, {}, _pull_response()),
-            ],
-        )
-        assert healthy.returncode == 0
-        responses: list[tuple[int, dict[str, str], Any]] = [
-            (200, {}, _pull_response(**mismatch))
-        ]
-    else:
-        responses = [
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, _pull_response(**mismatch)),
-        ]
+    payload = replace(_payload(publication_k8s), clean_clone_url=clone_url)
+    if repo is not None:
+        payload = replace(payload, repo_full_name=repo)
 
-    completed, _ = _run_github_guard(
-        tmp_path, resources, mode=mode, responses=responses
-    )
-
-    assert completed.returncode != 0
-    assert completed.stdout == ""
-    assert "CURIE_PR_URL=" not in completed.stdout
-
-
-def test_revision_guard_does_not_follow_or_forward_auth_on_redirect(
-    publication_k8s: Any,
-    tmp_path: Path,
-) -> None:
-    resources = _lineage_resources(publication_k8s)
-    target_requests: list[str | None] = []
-
-    class TargetHandler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            target_requests.append(self.headers.get("Authorization"))
-            self.send_response(200)
-            self.end_headers()
-
-        def log_message(self, _format: str, *args: object) -> None:
-            return
-
-    target = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
-    target_thread = threading.Thread(target=target.serve_forever)
-    target_thread.start()
-    try:
-        completed, requests = _run_github_guard(
-            tmp_path,
-            resources,
-            mode="pre-push",
-            responses=[
-                (200, {}, {"default_branch": "main"}),
-                (
-                    302,
-                    {"Location": f"http://127.0.0.1:{target.server_port}/capture"},
-                    None,
-                ),
-            ],
-        )
-    finally:
-        target.shutdown()
-        target_thread.join()
-        target.server_close()
-
-    assert completed.returncode != 0
-    assert target_requests == []
-    assert requests[-1][0] == "/repos/acme-corp/acme-bot/pulls/123"
-
-
-def test_revision_guard_revalidates_healthy_stable_pull_before_and_after_push(
-    publication_k8s: Any,
-    tmp_path: Path,
-) -> None:
-    resources = _lineage_resources(publication_k8s)
-    before, _ = _run_github_guard(
-        tmp_path,
-        resources,
-        mode="pre-push",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, _pull_response()),
-        ],
-    )
-    assert before.returncode == 0
-    assert before.stdout == ""
-
-    after, requests = _run_github_guard(
-        tmp_path,
-        resources,
-        mode="post-push",
-        responses=[(200, {}, _pull_response())],
-    )
-
-    assert after.returncode == 0
-    assert after.stdout == (
-        "CURIE_PR_URL=https://github.com/acme-corp/acme-bot/pull/123\n"
-        "CURIE_PR_NUMBER=123\n"
-    )
-    assert requests == [
-        ("/repos/acme-corp/acme-bot/pulls/123", f"Bearer {WRITE_CREDENTIAL}")
-    ]
-
-
-def test_post_push_guard_rejects_concurrent_branch_replacement_before_markers(
-    publication_k8s: Any,
-    tmp_path: Path,
-) -> None:
-    resources = _lineage_resources(publication_k8s)
-    before, _ = _run_github_guard(
-        tmp_path,
-        resources,
-        mode="pre-push",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, _pull_response()),
-        ],
-    )
-    assert before.returncode == 0
-
-    completed, requests = _run_github_guard(
-        tmp_path,
-        resources,
-        mode="post-push",
-        responses=[(200, {}, _pull_response(head_sha="c" * 40))],
-        expected_head=REVISION_HEAD,
-    )
-
-    assert completed.returncode != 0
-    assert completed.stdout == ""
-    assert "expected publication commit" in completed.stderr
-    assert requests == [
-        ("/repos/acme-corp/acme-bot/pulls/123", f"Bearer {WRITE_CREDENTIAL}")
-    ]
-
-
-def test_embedded_github_client_executes_healthy_two_revision_path(
-    publication_k8s: Any,
-    tmp_path: Path,
-) -> None:
-    first_revision = _resources(publication_k8s)
-    first, first_requests = _run_github_guard(
-        tmp_path,
-        first_revision,
-        mode="post-push",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, []),
-            (201, {}, _pull_response()),
-        ],
-    )
-    assert first.returncode == 0
-    assert first.stdout == (
-        "CURIE_PR_URL=https://github.com/acme-corp/acme-bot/pull/123\n"
-        "CURIE_PR_NUMBER=123\n"
-    )
-    assert [path.split("?", 1)[0] for path, _auth in first_requests] == [
-        "/repos/acme-corp/acme-bot",
-        "/repos/acme-corp/acme-bot/pulls",
-        "/repos/acme-corp/acme-bot/pulls",
-    ]
-
-    second_revision = _lineage_resources(publication_k8s)
-    before, _ = _run_github_guard(
-        tmp_path,
-        second_revision,
-        mode="pre-push",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, _pull_response()),
-        ],
-    )
-    after, _ = _run_github_guard(
-        tmp_path,
-        second_revision,
-        mode="post-push",
-        responses=[(200, {}, _pull_response())],
-    )
-
-    assert before.returncode == 0
-    assert after.returncode == 0
-    assert after.stdout.endswith("CURIE_PR_NUMBER=123\n")
-
-
-def test_first_revision_recovers_pull_after_ambiguous_create_failure(
-    publication_k8s: Any,
-    tmp_path: Path,
-) -> None:
-    completed, requests = _run_github_guard(
-        tmp_path,
-        _resources(publication_k8s),
-        mode="post-push",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, []),
-            (500, {}, {"message": "ambiguous failure"}),
-            (200, {}, [_pull_response()]),
-        ],
-    )
-
-    assert completed.returncode == 0
-    assert completed.stdout.endswith("CURIE_PR_NUMBER=123\n")
-    assert len(requests) == 4
+    with pytest.raises(publication_k8s.PublicationResourceError, match="clone URL|repository path"):
+        _build(publication_k8s, payload)
 
 
 @pytest.mark.parametrize(
-    ("state", "merged", "marker"),
-    [("closed", False, "closed"), ("closed", True, "merged")],
+    "origin",
+    [
+        "http://github.com",
+        "https://github.com/",
+        "https://user:pw@github.com",
+        "https://github.com?x=1",
+        "https://",
+    ],
 )
-def test_first_revision_recognizes_terminal_pull_without_posting(
-    publication_k8s: Any,
-    tmp_path: Path,
-    state: str,
-    merged: bool,
-    marker: str,
+def test_builder_refuses_an_unclean_origin(publication_k8s: Any, origin: str) -> None:
+    payload = replace(
+        _payload(publication_k8s),
+        clean_clone_url=f"{origin}/acme-corp/acme-bot.git",
+        transport=_transport(publication_k8s, origin=origin),
+    )
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="origin"):
+        _build(publication_k8s, payload)
+
+
+def test_builder_refuses_an_unknown_header_form(publication_k8s: Any) -> None:
+    payload = replace(
+        _payload(publication_k8s),
+        transport=_transport(publication_k8s, header_form="cookie"),
+    )
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="header form"):
+        _build(publication_k8s, payload)
+
+
+def test_script_refuses_a_clone_url_outside_the_origin_before_reading_the_credential(
+    publication_k8s: Any, tmp_path: Path
 ) -> None:
-    completed, requests = _run_github_guard(
-        tmp_path,
-        _resources(publication_k8s),
-        mode="post-push",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, [_pull_response(state=state, merged=merged)]),
-        ],
-    )
-
-    assert completed.returncode != 0
-    assert completed.stdout == _terminal_markers(marker, REVISION_HEAD)
-    assert [path.split("?", 1)[0] for path, _auth in requests] == [
-        "/repos/acme-corp/acme-bot",
-        "/repos/acme-corp/acme-bot/pulls",
-    ]
-    assert "state=all" in requests[-1][0]
-
-
-def test_first_revision_lost_create_response_recognizes_terminal_without_repost(
-    publication_k8s: Any,
-    tmp_path: Path,
-) -> None:
-    completed, requests = _run_github_guard(
-        tmp_path,
-        _resources(publication_k8s),
-        mode="post-push",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, []),
-            (500, {}, {"message": "response lost after create"}),
-            (200, {}, [_pull_response(state="closed")]),
-        ],
-    )
-
-    assert completed.returncode != 0
-    assert completed.stdout == _terminal_markers("closed", REVISION_HEAD)
-    assert [method_path.split("?", 1)[0] for method_path, _auth in requests].count(
-        "/repos/acme-corp/acme-bot/pulls"
-    ) == 3
-    assert _GitHubApiHandler.post_count == 1
-
-
-class _LocalGitHubState:
-    def __init__(self, *, git: str, remote: Path) -> None:
-        self.git = git
-        self.remote = remote
-        self.pr_number: int | None = None
-        self.requests: list[tuple[str, str, dict[str, list[str]]]] = []
-        self.post_payloads: list[dict[str, Any]] = []
-
-    def branch_head(self) -> str:
-        return subprocess.run(
-            [
-                self.git,
-                "--git-dir",
-                str(self.remote),
-                "rev-parse",
-                f"refs/heads/{LINEAGE_BRANCH}",
-            ],
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout.strip()
-
-    def pull(self) -> dict[str, Any]:
-        assert self.pr_number is not None
-        return _pull_response(
-            number=self.pr_number,
-            url=f"https://github.com/acme-corp/acme-bot/pull/{self.pr_number}",
-            head_sha=self.branch_head(),
-        )
-
-
-def _local_github_handler(state: _LocalGitHubState) -> type[BaseHTTPRequestHandler]:
-    class Handler(BaseHTTPRequestHandler):
-        def _send(self, status: int, payload: Any) -> None:
-            body = json.dumps(payload).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self) -> None:
-            parsed = urlsplit(self.path)
-            query = parse_qs(parsed.query)
-            state.requests.append(("GET", parsed.path, query))
-            if parsed.path == "/repos/acme-corp/acme-bot":
-                self._send(200, {"default_branch": "main"})
-                return
-            if parsed.path == "/repos/acme-corp/acme-bot/pulls":
-                self._send(200, [] if state.pr_number is None else [state.pull()])
-                return
-            if parsed.path == "/repos/acme-corp/acme-bot/pulls/123":
-                self._send(200, state.pull())
-                return
-            self._send(404, {"message": "not found"})
-
-        def do_POST(self) -> None:
-            parsed = urlsplit(self.path)
-            state.requests.append(("POST", parsed.path, {}))
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length))
-            assert isinstance(payload, dict)
-            state.post_payloads.append(payload)
-            if parsed.path != "/repos/acme-corp/acme-bot/pulls":
-                self._send(404, {"message": "not found"})
-                return
-            if state.pr_number is not None:
-                self._send(422, {"message": "pull request already exists"})
-                return
-            state.pr_number = 123
-            self._send(201, state.pull())
-
-        def log_message(self, _format: str, *args: object) -> None:
-            return
-
-    return Handler
-
-
-def _run_generated_publish_script(
-    tmp_path: Path,
-    resources: Any,
-    *,
-    remote: Path,
-    api_url: str,
-    ordinal: str,
-    path_prefix: Path | None = None,
-    extra_env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    root = tmp_path / f"run-{ordinal}"
-    root.mkdir()
-    credential = root / "credential"
-    credential.write_text("Bearer local-test-token")
-    patch = root / "changes.patch"
-    patch.write_bytes(
-        base64.b64decode(resources.config_map["binaryData"]["changes.patch"])
-    )
-    script = root / "publish.sh"
+    resources = _build(publication_k8s, _gitlab_payload(publication_k8s))
+    script = tmp_path / "publish.sh"
     script.write_text(resources.config_map["data"]["publish.sh"])
-    remote_url = remote.resolve().as_uri()
-    env = {
-        **os.environ,
-        **_job_env(resources),
-        "GITHUB_API_URL": api_url,
-        "CURIE_CREDENTIAL_PATH": str(credential),
-        "CURIE_PATCH_PATH": str(patch),
-        "CURIE_WORK_DIR": str(root / "work"),
-        "GIT_ALLOW_PROTOCOL": "file",
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": f"url.{remote_url}.insteadOf",
-        "GIT_CONFIG_VALUE_0": CLEAN_URL,
-    }
-    if path_prefix is not None:
-        env["PATH"] = f"{path_prefix}{os.pathsep}{env['PATH']}"
-    if extra_env is not None:
-        env.update(extra_env)
-    return subprocess.run(
+    missing_credential = tmp_path / "never-read"
+
+    completed = subprocess.run(
         ["/bin/bash", str(script)],
-        env=env,
+        env={
+            **os.environ,
+            **_job_env(resources),
+            # A same-prefix host must not pass as "under" the origin.
+            "CLEAN_CLONE_URL": "https://gitlab.example.com/forgery/group/acme-bot.git",
+            "CURIE_CREDENTIAL_PATH": str(missing_credential),
+            "CURIE_WORK_DIR": str(tmp_path / "work"),
+        },
         text=True,
         capture_output=True,
         check=False,
     )
 
+    assert completed.returncode == 1
+    assert "not under the code host origin" in completed.stderr
+    assert not (tmp_path / "work").exists()
 
-def _publication_resources_for_commit(
-    module: Any,
-    *,
-    publication_id: uuid.UUID,
-    revision_id: uuid.UUID,
-    revision_number: int,
-    base_sha: str,
-    expected_remote_head: str | None,
-    pr_number: int | None,
-    patch: bytes,
-) -> Any:
-    return module.build_publication_resources(
-        module.PublicationPayload(
-            publication_id=publication_id,
-            revision_id=revision_id,
-            revision_number=revision_number,
-            repo_full_name="acme-corp/acme-bot",
-            clean_clone_url=CLEAN_URL,
-            base_sha=base_sha,
-            expected_prior_head=base_sha,
-            expected_remote_head=expected_remote_head,
-            patch=patch,
-            branch=LINEAGE_BRANCH,
-            pr_number=pr_number,
-            pr_url=(
-                "https://github.com/acme-corp/acme-bot/pull/123"
-                if pr_number is not None
-                else None
-            ),
-            title="Update repository",
-            body="Approved platform publication.",
-            observed_title_sha256=None,
-            observed_body_sha256=None,
-            github_repository_id=9001 if pr_number is not None else None,
-            github_pr_node_id="PR_example_123" if pr_number is not None else None,
-        ),
-        credential="Bearer local-test-token",
-        settings=_settings(module),
+
+def test_a_non_github_origin_with_a_nested_repository_path_builds(
+    publication_k8s: Any,
+) -> None:
+    resources = _build(publication_k8s, _gitlab_payload(publication_k8s))
+    env = _job_env(resources)
+
+    assert env["CODE_HOST_ORIGIN"] == GITLAB_ORIGIN
+    assert env["CODE_HOST_HEADER_FORM"] == "private_token"
+    assert env["CLEAN_CLONE_URL"] == GITLAB_URL
+    assert env["REPO_FULL_NAME"] == GITLAB_REPO
+    assert "github" not in json.dumps(resources.job).lower()
+
+
+def test_a_ca_bundle_mounts_the_configmap_read_only_and_points_every_client_at_it(
+    publication_k8s: Any,
+) -> None:
+    payload = replace(
+        _payload(publication_k8s),
+        transport=_transport(publication_k8s, ca_bundle_ref=CA_REF),
+    )
+    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s))
+    pod_spec = resources.job["spec"]["template"]["spec"]
+    container = _container(resources)
+    env = _job_env(resources)
+
+    trust_volumes = [v for v in pod_spec["volumes"] if v["name"] == "code-host-trust"]
+    assert trust_volumes == [
+        {
+            "name": "code-host-trust",
+            "configMap": {
+                "name": "curie-code-host-trust",
+                "items": [{"key": "corporate-root.pem", "path": "ca.crt"}],
+            },
+        }
+    ]
+    trust_mounts = [m for m in container["volumeMounts"] if m["name"] == "code-host-trust"]
+    assert trust_mounts == [
+        {
+            "name": "code-host-trust",
+            "mountPath": "/etc/curie/code-host-trust",
+            "readOnly": True,
+        }
+    ]
+    for name in ("CURIE_REPO_CA_BUNDLE", "GIT_SSL_CAINFO", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        assert env[name] == CA_REF, name
+    # The bundle is public trust material, never the credential's Secret.
+    assert "secret" not in trust_volumes[0]
+
+
+def test_no_ca_bundle_adds_no_volume_mount_or_trust_env(publication_k8s: Any) -> None:
+    # A configured ConfigMap alone does not mount anything; the credential's ref does.
+    for settings in (_settings(publication_k8s), _ca_settings(publication_k8s)):
+        resources = _build(publication_k8s, _payload(publication_k8s), settings)
+        pod_spec = resources.job["spec"]["template"]["spec"]
+        container = _container(resources)
+        env = _job_env(resources)
+
+        assert [v["name"] for v in pod_spec["volumes"]] == [
+            "publication",
+            "credentials",
+            "work",
+            "tmp",
+        ]
+        assert [m["name"] for m in container["volumeMounts"]] == [
+            "publication",
+            "credentials",
+            "work",
+            "tmp",
+        ]
+        for name in (
+            "CURIE_REPO_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+            "SSL_CERT_FILE",
+            "REQUESTS_CA_BUNDLE",
+        ):
+            assert name not in env, name
+    # The two builds are identical, so the operator setting cannot drift a running Job.
+    assert (
+        _build(publication_k8s, _payload(publication_k8s)).job
+        == _build(publication_k8s, _payload(publication_k8s), _ca_settings(publication_k8s)).job
     )
 
 
-def test_generated_publish_script_keeps_one_pr_lineage_and_refuses_lease_race(
-    publication_k8s: Any,
-    tmp_path: Path,
+def test_a_ca_bundle_ref_without_a_configmap_is_refused(publication_k8s: Any) -> None:
+    payload = replace(
+        _payload(publication_k8s),
+        transport=_transport(publication_k8s, ca_bundle_ref=CA_REF),
+    )
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="no codeHostTrust"):
+        _build(publication_k8s, payload)
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "relative/ca.crt",
+        "/ca.crt",
+        "/etc/curie/../ca.crt",
+        "/etc/curie/trust/",
+        "/tmp/trust/ca.crt",
+        "/credentials/ca.crt",
+        "/publication/ca.crt",
+        "/work/ca.crt",
+    ],
+)
+def test_a_ca_bundle_ref_that_cannot_be_mounted_safely_is_refused(
+    publication_k8s: Any, ref: str
 ) -> None:
+    payload = replace(
+        _payload(publication_k8s),
+        transport=_transport(publication_k8s, ca_bundle_ref=ref),
+    )
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="CA bundle"):
+        _build(publication_k8s, payload, _ca_settings(publication_k8s))
+
+
+@pytest.mark.parametrize(
+    ("origin", "header_form", "ca_bundle_ref"),
+    [
+        (ORIGIN, "authorization_basic", None),
+        (GITLAB_ORIGIN, "private_token", None),
+        (GITLAB_ORIGIN, "authorization_bearer", CA_REF),
+    ],
+)
+def test_job_transport_round_trips_what_the_builder_wrote(
+    publication_k8s: Any, origin: str, header_form: str, ca_bundle_ref: str | None
+) -> None:
+    transport = _transport(
+        publication_k8s, origin=origin, header_form=header_form, ca_bundle_ref=ca_bundle_ref
+    )
+    repo = "acme-corp/acme-bot" if origin == ORIGIN else GITLAB_REPO
+    payload = replace(
+        _payload(publication_k8s),
+        repo_full_name=repo,
+        clean_clone_url=f"{origin}/{repo}.git",
+        transport=transport,
+    )
+    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s))
+
+    assert publication_k8s.job_transport(resources.job) == transport
+    # The real client hands back a V1Job model, not a dict.
+    model = ApiClient().deserialize(SimpleNamespace(data=json.dumps(resources.job)), "V1Job")
+    assert isinstance(model, V1Job)
+    assert publication_k8s.job_transport(model) == transport
+    # The rebuilt resources match the adopted Job exactly.
+    rebuilt = _build(
+        publication_k8s,
+        replace(payload, transport=publication_k8s.job_transport(model)),
+        _ca_settings(publication_k8s),
+    )
+    publication_k8s.validate_adopted_resource("Job", rebuilt.job, model)
+
+
+def test_job_transport_is_none_when_the_job_names_no_valid_transport(
+    publication_k8s: Any,
+) -> None:
+    resources = _resources(publication_k8s)
+
+    no_origin = deepcopy(resources.job)
+    container = no_origin["spec"]["template"]["spec"]["containers"][0]
+    container["env"] = [e for e in container["env"] if e["name"] != "CODE_HOST_ORIGIN"]
+    assert publication_k8s.job_transport(no_origin) is None
+
+    unknown_form = deepcopy(resources.job)
+    for item in unknown_form["spec"]["template"]["spec"]["containers"][0]["env"]:
+        if item["name"] == "CODE_HOST_HEADER_FORM":
+            item["value"] = "cookie"
+    assert publication_k8s.job_transport(unknown_form) is None
+
+    two_containers = deepcopy(resources.job)
+    pod_spec = two_containers["spec"]["template"]["spec"]
+    pod_spec["containers"].append(deepcopy(pod_spec["containers"][0]))
+    assert publication_k8s.job_transport(two_containers) is None
+
+
+def test_an_adopted_job_with_an_altered_transport_fails_the_contract(
+    publication_k8s: Any,
+) -> None:
+    resources = _resources(publication_k8s)
+    altered = deepcopy(resources.job)
+    for item in altered["spec"]["template"]["spec"]["containers"][0]["env"]:
+        if item["name"] == "CODE_HOST_ORIGIN":
+            item["value"] = "https://evil.example"
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
+        publication_k8s.validate_adopted_resource("Job", resources.job, altered)
+
+    bearer = _build(
+        publication_k8s,
+        replace(
+            _payload(publication_k8s),
+            transport=_transport(publication_k8s, header_form="authorization_bearer"),
+        ),
+    )
+    annotation = "curietech.ai/publication-contract-sha256"
+    assert (
+        bearer.job["metadata"]["annotations"][annotation]
+        != resources.job["metadata"]["annotations"][annotation]
+    )
+    with pytest.raises(publication_k8s.PublicationResourceError, match="metadata contract"):
+        publication_k8s.validate_adopted_resource(
+            "ConfigMap", bearer.config_map, resources.config_map
+        )
+
+
+# Executing the generated script against local bare repositories.
+
+
+def _git() -> str:
     git = shutil.which("git")
     assert git is not None
+    return git
+
+
+def _seed_remote(tmp_path: Path) -> tuple[Path, str]:
+    git = _git()
     remote = tmp_path / "remote.git"
     seed = tmp_path / "seed"
     subprocess.run([git, "init", "--bare", str(remote)], check=True, capture_output=True)
@@ -1356,7 +698,7 @@ def test_generated_publish_script_keeps_one_pr_lineage_and_refuses_lease_race(
     )
     (seed / "README.md").write_text("base\n")
     subprocess.run([git, "-C", str(seed), "add", "README.md"], check=True)
-    subprocess.run([git, "-C", str(seed), "commit", "-m", "Base"], check=True)
+    subprocess.run([git, "-C", str(seed), "commit", "-m", "Base"], check=True, capture_output=True)
     base_sha = subprocess.run(
         [git, "-C", str(seed), "rev-parse", "HEAD"],
         text=True,
@@ -1367,159 +709,249 @@ def test_generated_publish_script_keeps_one_pr_lineage_and_refuses_lease_race(
         [git, "-C", str(seed), "remote", "add", "origin", remote.resolve().as_uri()],
         check=True,
     )
-    subprocess.run([git, "-C", str(seed), "push", "origin", "main"], check=True)
+    subprocess.run(
+        [git, "-C", str(seed), "push", "origin", "main"], check=True, capture_output=True
+    )
     subprocess.run(
         [git, "--git-dir", str(remote), "symbolic-ref", "HEAD", "refs/heads/main"],
         check=True,
     )
+    return remote, base_sha
 
-    state = _LocalGitHubState(git=git, remote=remote)
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _local_github_handler(state))
-    thread = threading.Thread(target=server.serve_forever)
-    thread.start()
-    api_url = f"http://127.0.0.1:{server.server_port}"
-    try:
-        first_resources = _publication_resources_for_commit(
-            publication_k8s,
-            publication_id=PUBLICATION_ID,
-            revision_id=REVISION_ID,
-            revision_number=1,
+
+def _branch_head(remote: Path) -> str:
+    return subprocess.run(
+        [_git(), "--git-dir", str(remote), "rev-parse", f"refs/heads/{LINEAGE_BRANCH}"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+
+
+def _run_generated_publish_script(
+    tmp_path: Path,
+    resources: Any,
+    *,
+    remote: Path,
+    ordinal: str,
+    credential: str = BASIC_TEST_CREDENTIAL,
+    path_prefix: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    root = tmp_path / f"run-{ordinal}"
+    root.mkdir()
+    credential_file = root / "credential"
+    credential_file.write_text(credential)
+    patch = root / "changes.patch"
+    patch.write_bytes(base64.b64decode(resources.config_map["binaryData"]["changes.patch"]))
+    # In the pod /tmp is a private emptyDir. Here it is the host's shared /tmp,
+    # so each run gets its own directory for the auth files; nothing else changes.
+    private_tmp = root / "tmp"
+    private_tmp.mkdir()
+    script_text = resources.config_map["data"]["publish.sh"]
+    assert "/tmp/curie-git-auth.config" in script_text
+    script = root / "publish.sh"
+    script.write_text(script_text.replace("/tmp/curie-", f"{private_tmp}/curie-"))
+    env = _job_env(resources)
+    env = {
+        **os.environ,
+        **env,
+        "CURIE_CREDENTIAL_PATH": str(credential_file),
+        "CURIE_PATCH_PATH": str(patch),
+        "CURIE_WORK_DIR": str(root / "work"),
+        "GIT_ALLOW_PROTOCOL": "file",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": f"url.{remote.resolve().as_uri()}.insteadOf",
+        "GIT_CONFIG_VALUE_0": env["CLEAN_CLONE_URL"],
+    }
+    if path_prefix is not None:
+        env["PATH"] = f"{path_prefix}{os.pathsep}{env['PATH']}"
+    if extra_env is not None:
+        env.update(extra_env)
+    completed = subprocess.run(
+        ["/bin/bash", str(script)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    # The EXIT trap leaves no credential material behind, on success or failure.
+    assert sorted(path.name for path in private_tmp.iterdir()) == []
+    return completed
+
+
+def _publication_resources_for_commit(
+    module: Any,
+    *,
+    publication_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    revision_number: int,
+    base_sha: str,
+    expected_remote_head: str | None,
+    patch: bytes,
+    transport: Any | None = None,
+    repo_full_name: str = "acme-corp/acme-bot",
+) -> Any:
+    transport = transport or _transport(module)
+    return module.build_publication_resources(
+        module.PublicationPayload(
+            publication_id=publication_id,
+            revision_id=revision_id,
+            revision_number=revision_number,
+            repo_full_name=repo_full_name,
+            clean_clone_url=f"{transport.origin}/{repo_full_name}.git",
             base_sha=base_sha,
-            expected_remote_head=None,
-            pr_number=None,
-            patch=(
-                b"diff --git a/README.md b/README.md\n"
-                b"--- a/README.md\n+++ b/README.md\n"
-                b"@@ -1 +1,2 @@\n base\n+first\n"
-            ),
-        )
-        first = _run_generated_publish_script(
-            tmp_path,
-            first_resources,
-            remote=remote,
-            api_url=api_url,
-            ordinal="one",
-        )
-        assert first.returncode == 0, first.stderr
-        first_head = state.branch_head()
-        assert f"CURIE_COMMIT_SHA={first_head}" in first.stdout
-        assert "CURIE_PR_URL=https://github.com/acme-corp/acme-bot/pull/123" in first.stdout
-        assert "CURIE_PR_NUMBER=123" in first.stdout
-        first_parents = subprocess.run(
-            [git, "--git-dir", str(remote), "rev-list", "--parents", "-n", "1", first_head],
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout.split()
-        assert first_parents == [first_head, base_sha]
+            expected_prior_head=base_sha,
+            expected_remote_head=expected_remote_head,
+            patch=patch,
+            branch=LINEAGE_BRANCH,
+            title="Update repository",
+            transport=transport,
+        ),
+        credential=BASIC_TEST_CREDENTIAL,
+        settings=_settings(module),
+    )
 
-        second_revision = uuid.UUID("77777777-7777-4777-8777-777777777777")
-        second_resources = _publication_resources_for_commit(
-            publication_k8s,
-            publication_id=uuid.UUID("66666666-6666-4666-8666-666666666666"),
-            revision_id=second_revision,
-            revision_number=2,
-            base_sha=first_head,
-            expected_remote_head=first_head,
-            pr_number=123,
-            patch=(
-                b"diff --git a/README.md b/README.md\n"
-                b"--- a/README.md\n+++ b/README.md\n"
-                b"@@ -1,2 +1,3 @@\n base\n first\n+second\n"
-            ),
-        )
-        second = _run_generated_publish_script(
-            tmp_path,
-            second_resources,
-            remote=remote,
-            api_url=api_url,
-            ordinal="two",
-        )
-        assert second.returncode == 0, second.stderr
-        second_head = state.branch_head()
-        assert f"CURIE_COMMIT_SHA={second_head}" in second.stdout
-        assert "CURIE_PR_URL=https://github.com/acme-corp/acme-bot/pull/123" in second.stdout
-        assert "CURIE_PR_NUMBER=123" in second.stdout
-        second_parents = subprocess.run(
-            [git, "--git-dir", str(remote), "rev-list", "--parents", "-n", "1", second_head],
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout.split()
-        assert second_parents == [second_head, first_head]
-        commit_count = subprocess.run(
-            [
-                git,
-                "--git-dir",
-                str(remote),
-                "rev-list",
-                "--count",
-                f"{base_sha}..{second_head}",
-            ],
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout.strip()
-        assert commit_count == "2"
-        assert len(state.post_payloads) == 1
-        assert state.post_payloads[0]["head"] == LINEAGE_BRANCH
-        assert all(
-            query.get("state") == ["all"]
-            for method, path, query in state.requests
-            if method == "GET" and path.endswith("/pulls")
-        )
 
-        contender = tmp_path / "contender"
-        subprocess.run(
-            [git, "clone", remote.resolve().as_uri(), str(contender)],
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            [git, "-C", str(contender), "fetch", "origin", LINEAGE_BRANCH],
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            [git, "-C", str(contender), "checkout", "--detach", second_head],
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            [git, "-C", str(contender), "config", "user.name", "Race Writer"],
-            check=True,
-        )
-        subprocess.run(
-            [git, "-C", str(contender), "config", "user.email", "race@example.com"],
-            check=True,
-        )
-        (contender / "race.txt").write_text("replacement\n")
-        subprocess.run([git, "-C", str(contender), "add", "race.txt"], check=True)
-        subprocess.run([git, "-C", str(contender), "commit", "-m", "Race"], check=True)
-        replacement_head = subprocess.run(
-            [git, "-C", str(contender), "rev-parse", "HEAD"],
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout.strip()
-        subprocess.run(
-            [
-                git,
-                "-C",
-                str(contender),
-                "push",
-                "origin",
-                f"{replacement_head}:refs/curie-test/race-candidate",
-            ],
-            check=True,
-            capture_output=True,
-        )
+_FIRST_PATCH = (
+    b"diff --git a/README.md b/README.md\n"
+    b"--- a/README.md\n+++ b/README.md\n"
+    b"@@ -1 +1,2 @@\n base\n+first\n"
+)
 
-        wrapper_dir = tmp_path / "git-wrapper"
-        wrapper_dir.mkdir()
-        wrapper = wrapper_dir / "git"
-        wrapper.write_text(
-            """#!/usr/bin/env python3
+
+def _commit_message(remote: Path, sha: str) -> str:
+    return subprocess.run(
+        [_git(), "--git-dir", str(remote), "log", "-1", "--format=%B", sha],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+
+
+def test_generated_publish_script_keeps_one_lineage_and_refuses_lease_race(
+    publication_k8s: Any,
+    tmp_path: Path,
+) -> None:
+    git = _git()
+    remote, base_sha = _seed_remote(tmp_path)
+
+    first_resources = _publication_resources_for_commit(
+        publication_k8s,
+        publication_id=PUBLICATION_ID,
+        revision_id=REVISION_ID,
+        revision_number=1,
+        base_sha=base_sha,
+        expected_remote_head=None,
+        patch=_FIRST_PATCH,
+    )
+    first = _run_generated_publish_script(tmp_path, first_resources, remote=remote, ordinal="one")
+    assert first.returncode == 0, first.stderr
+    first_head = _branch_head(remote)
+    assert first.stdout.strip().splitlines()[-1] == f"CURIE_COMMIT_SHA={first_head}"
+    assert "CURIE_PR_" not in first.stdout
+    first_parents = subprocess.run(
+        [git, "--git-dir", str(remote), "rev-list", "--parents", "-n", "1", first_head],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.split()
+    assert first_parents == [first_head, base_sha]
+    assert _commit_message(remote, first_head).rstrip("\n") == (
+        f"Update repository\n\nCurie-Revision: {REVISION_ID}"
+    )
+    author = subprocess.run(
+        [git, "--git-dir", str(remote), "log", "-1", "--format=%an <%ae>", first_head],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    assert author == "Curie Publisher <publisher@example.com>"
+
+    second_revision = uuid.UUID("77777777-7777-4777-8777-777777777777")
+    second_resources = _publication_resources_for_commit(
+        publication_k8s,
+        publication_id=uuid.UUID("66666666-6666-4666-8666-666666666666"),
+        revision_id=second_revision,
+        revision_number=2,
+        base_sha=first_head,
+        expected_remote_head=first_head,
+        patch=(
+            b"diff --git a/README.md b/README.md\n"
+            b"--- a/README.md\n+++ b/README.md\n"
+            b"@@ -1,2 +1,3 @@\n base\n first\n+second\n"
+        ),
+    )
+    second = _run_generated_publish_script(tmp_path, second_resources, remote=remote, ordinal="two")
+    assert second.returncode == 0, second.stderr
+    second_head = _branch_head(remote)
+    assert f"CURIE_COMMIT_SHA={second_head}" in second.stdout
+    second_parents = subprocess.run(
+        [git, "--git-dir", str(remote), "rev-list", "--parents", "-n", "1", second_head],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.split()
+    assert second_parents == [second_head, first_head]
+    assert f"Curie-Revision: {second_revision}" in _commit_message(remote, second_head)
+    commit_count = subprocess.run(
+        [git, "--git-dir", str(remote), "rev-list", "--count", f"{base_sha}..{second_head}"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    assert commit_count == "2"
+
+    contender = tmp_path / "contender"
+    subprocess.run(
+        [git, "clone", remote.resolve().as_uri(), str(contender)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [git, "-C", str(contender), "fetch", "origin", LINEAGE_BRANCH],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [git, "-C", str(contender), "checkout", "--detach", second_head],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run([git, "-C", str(contender), "config", "user.name", "Race Writer"], check=True)
+    subprocess.run(
+        [git, "-C", str(contender), "config", "user.email", "race@example.com"],
+        check=True,
+    )
+    (contender / "race.txt").write_text("replacement\n")
+    subprocess.run([git, "-C", str(contender), "add", "race.txt"], check=True)
+    subprocess.run(
+        [git, "-C", str(contender), "commit", "-m", "Race"], check=True, capture_output=True
+    )
+    replacement_head = subprocess.run(
+        [git, "-C", str(contender), "rev-parse", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    subprocess.run(
+        [
+            git,
+            "-C",
+            str(contender),
+            "push",
+            "origin",
+            f"{replacement_head}:refs/curie-test/race-candidate",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    wrapper_dir = tmp_path / "git-wrapper"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "git"
+    wrapper.write_text(
+        """#!/usr/bin/env python3
 import os
 import subprocess
 import sys
@@ -1543,151 +975,269 @@ if "push" in args and not marker.exists():
     )
 os.execv(real_git, [real_git, *args])
 """
-        )
-        wrapper.chmod(0o700)
-        third_resources = _publication_resources_for_commit(
-            publication_k8s,
-            publication_id=uuid.UUID("88888888-8888-4888-8888-888888888888"),
-            revision_id=uuid.UUID("99999999-9999-4999-8999-999999999999"),
-            revision_number=3,
-            base_sha=second_head,
-            expected_remote_head=second_head,
-            pr_number=123,
-            patch=(
-                b"diff --git a/README.md b/README.md\n"
-                b"--- a/README.md\n+++ b/README.md\n"
-                b"@@ -1,3 +1,4 @@\n base\n first\n second\n+third\n"
-            ),
-        )
-        raced = _run_generated_publish_script(
-            tmp_path,
-            third_resources,
-            remote=remote,
-            api_url=api_url,
-            ordinal="race",
-            path_prefix=wrapper_dir,
-            extra_env={
-                "CURIE_TEST_REAL_GIT": git,
-                "CURIE_TEST_REMOTE": str(remote),
-                "CURIE_TEST_RACE_REF": f"refs/heads/{LINEAGE_BRANCH}",
-                "CURIE_TEST_RACE_SHA": replacement_head,
-                "CURIE_TEST_RACE_MARKER": str(tmp_path / "race-fired"),
-            },
-        )
-        assert raced.returncode != 0
-        assert "CURIE_PR_URL=" not in raced.stdout
-        assert "CURIE_PR_NUMBER=" not in raced.stdout
-        assert "CURIE_COMMIT_SHA=" not in raced.stdout
-        assert (tmp_path / "race-fired").is_file()
-        assert state.branch_head() == replacement_head
-        assert len(state.post_payloads) == 1
-    finally:
-        server.shutdown()
-        thread.join()
-        server.server_close()
-
-
-def test_job_injects_a_non_default_github_api_base_without_baking_it_into_script(
-    publication_k8s: Any,
-) -> None:
-    api_base = "https://github.example.com/forge/api/v3"
-    html_base = "https://github.example.com/forge"
-    resources = publication_k8s.build_publication_resources(
-        replace(
-            _payload(publication_k8s),
-            clean_clone_url=f"{html_base}/acme-corp/acme-bot.git",
-        ),
-        credential=WRITE_CREDENTIAL,
-        settings=replace(_settings(publication_k8s), github_api_url=api_base),
     )
-    container = resources.job["spec"]["template"]["spec"]["containers"][0]
-    env_by_name = {item["name"]: item["value"] for item in container["env"]}
-    script = resources.config_map["data"]["publish.sh"]
-
-    assert env_by_name["GITHUB_API_URL"] == api_base
-    assert env_by_name["GITHUB_HTML_BASE"] == html_base
-    assert api_base not in script
-    assert WRITE_CREDENTIAL not in script
-    assert WRITE_CREDENTIAL not in json.dumps(resources.job)
+    wrapper.chmod(0o700)
+    third_resources = _publication_resources_for_commit(
+        publication_k8s,
+        publication_id=uuid.UUID("88888888-8888-4888-8888-888888888888"),
+        revision_id=uuid.UUID("99999999-9999-4999-8999-999999999999"),
+        revision_number=3,
+        base_sha=second_head,
+        expected_remote_head=second_head,
+        patch=(
+            b"diff --git a/README.md b/README.md\n"
+            b"--- a/README.md\n+++ b/README.md\n"
+            b"@@ -1,3 +1,4 @@\n base\n first\n second\n+third\n"
+        ),
+    )
+    raced = _run_generated_publish_script(
+        tmp_path,
+        third_resources,
+        remote=remote,
+        ordinal="race",
+        path_prefix=wrapper_dir,
+        extra_env={
+            "CURIE_TEST_REAL_GIT": git,
+            "CURIE_TEST_REMOTE": str(remote),
+            "CURIE_TEST_RACE_REF": f"refs/heads/{LINEAGE_BRANCH}",
+            "CURIE_TEST_RACE_SHA": replacement_head,
+            "CURIE_TEST_RACE_MARKER": str(tmp_path / "race-fired"),
+        },
+    )
+    assert raced.returncode != 0
+    assert "CURIE_COMMIT_SHA=" not in raced.stdout
+    assert (tmp_path / "race-fired").is_file()
+    assert _branch_head(remote) == replacement_head
 
 
 @pytest.mark.parametrize(
-    ("api_url", "html_base"),
+    "expected_is_none",
     [
-        ("https://api.github.com", "https://github.com"),
-        ("https://github.example.com/api/v3/", "https://github.example.com"),
-        ("https://github.example.com/forge/api/v3", "https://github.example.com/forge"),
+        pytest.param(True, id="branch-exists-but-expected-absent"),
+        pytest.param(False, id="branch-moved-past-expected"),
     ],
 )
-def test_job_settings_derive_the_publication_html_origin(
-    publication_k8s: Any, api_url: str, html_base: str
+def test_generated_publish_script_refuses_an_unexpected_remote_head_before_committing(
+    publication_k8s: Any, tmp_path: Path, expected_is_none: bool
 ) -> None:
-    settings = replace(_settings(publication_k8s), github_api_url=api_url)
+    remote, base_sha = _seed_remote(tmp_path)
+    first = _run_generated_publish_script(
+        tmp_path,
+        _publication_resources_for_commit(
+            publication_k8s,
+            publication_id=PUBLICATION_ID,
+            revision_id=REVISION_ID,
+            revision_number=1,
+            base_sha=base_sha,
+            expected_remote_head=None,
+            patch=_FIRST_PATCH,
+        ),
+        remote=remote,
+        ordinal="one",
+    )
+    assert first.returncode == 0, first.stderr
+    head = _branch_head(remote)
 
-    assert settings.github_html_base == html_base
-
-
-@pytest.mark.parametrize("returned_base", ["https://github.example.com/forge", "https://github.com"])
-def test_enterprise_job_guard_validates_the_configured_pull_request_origin(
-    publication_k8s: Any, tmp_path: Path, returned_base: str
-) -> None:
-    # GitHub Enterprise REST uses the same pull request response fields:
-    # https://docs.github.com/en/enterprise-server@3.17/rest/pulls/pulls#get-a-pull-request
-    html_base = "https://github.example.com/forge"
-    payload = replace(
-        _payload(publication_k8s),
+    stale = _publication_resources_for_commit(
+        publication_k8s,
+        publication_id=uuid.UUID("66666666-6666-4666-8666-666666666666"),
+        revision_id=uuid.UUID("77777777-7777-4777-8777-777777777777"),
         revision_number=2,
-        clean_clone_url=f"{html_base}/acme-corp/acme-bot.git",
-        base_sha=PRIOR_HEAD,
-        expected_prior_head=PRIOR_HEAD,
-        expected_remote_head=PRIOR_HEAD,
-        pr_number=123,
-        pr_url=f"{html_base}/acme-corp/acme-bot/pull/123",
+        base_sha=base_sha,
+        expected_remote_head=None if expected_is_none else base_sha,
+        patch=_FIRST_PATCH,
     )
-    resources = publication_k8s.build_publication_resources(
-        payload,
-        credential=WRITE_CREDENTIAL,
-        settings=replace(_settings(publication_k8s), github_api_url=f"{html_base}/api/v3"),
+    refused = _run_generated_publish_script(tmp_path, stale, remote=remote, ordinal="stale")
+
+    assert refused.returncode == 1
+    assert "publication branch head conflict" in refused.stderr
+    assert "CURIE_COMMIT_SHA=" not in refused.stdout
+    assert _branch_head(remote) == head
+
+
+_AUTH_CAPTURE_WRAPPER = """#!/usr/bin/env python3
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+real_git = os.environ["CURIE_TEST_REAL_GIT"]
+capture = Path(os.environ["CURIE_TEST_CAPTURE"])
+if "clone" in args and not capture.exists():
+    capture.mkdir()
+    include = next(a.split("=", 1)[1] for a in args if a.startswith("include.path="))
+    shutil.copy(include, capture / "auth.config")
+    (capture / "argv").write_text("\\n".join(args))
+    origin = os.environ["CODE_HOST_ORIGIN"]
+    for prompt, name in (
+        (f"Username for '{origin}': ", "askpass-user"),
+        (f"Password for '{origin}': ", "askpass-pass"),
+    ):
+        answer = subprocess.run(
+            [os.environ["GIT_ASKPASS"], prompt], capture_output=True, text=True, check=True
+        )
+        (capture / name).write_text(answer.stdout)
+os.execv(real_git, [real_git, *args])
+"""
+
+
+def _run_with_auth_capture(
+    module: Any, tmp_path: Path, *, header_form: str, credential: str
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    remote, base_sha = _seed_remote(tmp_path)
+    wrapper_dir = tmp_path / "git-wrapper"
+    wrapper_dir.mkdir()
+    (wrapper_dir / "git").write_text(_AUTH_CAPTURE_WRAPPER)
+    (wrapper_dir / "git").chmod(0o700)
+    capture = tmp_path / "capture"
+    resources = _publication_resources_for_commit(
+        module,
+        publication_id=PUBLICATION_ID,
+        revision_id=REVISION_ID,
+        revision_number=1,
+        base_sha=base_sha,
+        expected_remote_head=None,
+        patch=_FIRST_PATCH,
+        transport=_transport(module, origin=GITLAB_ORIGIN, header_form=header_form),
+        repo_full_name=GITLAB_REPO,
     )
-    completed, requests = _run_github_guard(
+    completed = _run_generated_publish_script(
         tmp_path,
         resources,
-        mode="pre-push",
-        responses=[
-            (200, {}, {"default_branch": "main"}),
-            (200, {}, _pull_response(url=f"{returned_base}/acme-corp/acme-bot/pull/123")),
-        ],
+        remote=remote,
+        ordinal="auth",
+        credential=credential,
+        path_prefix=wrapper_dir,
+        extra_env={"CURIE_TEST_REAL_GIT": _git(), "CURIE_TEST_CAPTURE": str(capture)},
+    )
+    return completed, capture, remote
+
+
+def _url_matched_header(config: Path, url: str) -> str | None:
+    """What git itself would send for ``url`` from the generated include file."""
+
+    found = subprocess.run(
+        [_git(), "config", "--file", str(config), "--get-urlmatch", "http.extraHeader", url],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return found.stdout.strip() if found.returncode == 0 else None
+
+
+def test_basic_header_form_answers_askpass_and_writes_no_header(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    completed, capture, remote = _run_with_auth_capture(
+        publication_k8s,
+        tmp_path,
+        header_form="authorization_basic",
+        credential=BASIC_TEST_CREDENTIAL + "\n",
     )
 
-    assert len(requests) == 2
-    if returned_base == html_base:
-        assert completed.returncode == 0, completed.stderr
-    else:
-        assert completed.returncode != 0
-        assert "CURIE_PR_URL=" not in completed.stdout
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip().endswith(f"CURIE_COMMIT_SHA={_branch_head(remote)}")
+    assert (capture / "askpass-user").read_text() == "x-access-token"
+    assert (capture / "askpass-pass").read_text() == "local-test-token"
+    assert (capture / "auth.config").read_text() == ""
+    argv = (capture / "argv").read_text().splitlines()
+    assert "http.followRedirects=false" in argv
+    assert argv[-2:] == [GITLAB_URL, "repo"]
+    assert "local-test-token" not in completed.stdout + completed.stderr
 
 
-def test_enterprise_job_refuses_a_public_github_clone_before_resource_creation(
-    publication_k8s: Any,
+@pytest.mark.parametrize(
+    ("header_form", "credential", "header"),
+    [
+        pytest.param(
+            "authorization_bearer",
+            "Bearer glpat-local-token",
+            "Authorization: Bearer glpat-local-token",
+            id="bearer",
+        ),
+        pytest.param(
+            "private_token",
+            "glpat-local-token",
+            "PRIVATE-TOKEN: glpat-local-token",
+            id="private-token",
+        ),
+    ],
+)
+def test_header_forms_scope_one_extra_header_to_the_origin_only(
+    publication_k8s: Any, tmp_path: Path, header_form: str, credential: str, header: str
 ) -> None:
-    with pytest.raises(publication_k8s.PublicationResourceError, match="clone URL"):
-        publication_k8s.build_publication_resources(
-            _payload(publication_k8s),
-            credential=WRITE_CREDENTIAL,
-            settings=replace(
-                _settings(publication_k8s),
-                github_api_url="https://github.example.com/forge/api/v3",
-            ),
-        )
+    completed, capture, remote = _run_with_auth_capture(
+        publication_k8s, tmp_path, header_form=header_form, credential=credential
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip().endswith(f"CURIE_COMMIT_SHA={_branch_head(remote)}")
+    config = capture / "auth.config"
+    assert config.read_text() == f'[http "{GITLAB_ORIGIN}/"]\n\textraHeader = "{header}"\n'
+    # Real git URL matching: the header goes to the origin's repositories only.
+    assert _url_matched_header(config, GITLAB_URL) == header
+    assert _url_matched_header(config, "https://gitlab.example.com/other/repo.git") is None
+    assert _url_matched_header(config, "https://evil.example/forge/group/repo.git") is None
+    # Askpass has nothing to give, so git cannot fall back to sending the token as Basic.
+    assert (capture / "askpass-user").read_text() == ""
+    assert (capture / "askpass-pass").read_text() == ""
+    assert "glpat-local-token" not in completed.stdout + completed.stderr
 
 
-def _assert_script_redacts_authorization(script: str) -> None:
+@pytest.mark.parametrize(
+    ("header_form", "credential", "message"),
+    [
+        pytest.param(
+            "authorization_basic", "Bearer abc", "not Basic authorization", id="basic-got-bearer"
+        ),
+        pytest.param(
+            "authorization_basic", "Basic !!!not-base64", "not valid Basic", id="basic-garbage"
+        ),
+        pytest.param(
+            "authorization_basic",
+            "Basic " + base64.b64encode(b"no-colon").decode(),
+            "not valid Basic",
+            id="basic-no-colon",
+        ),
+        pytest.param(
+            "authorization_bearer", BASIC_TEST_CREDENTIAL, "not Bearer", id="bearer-got-basic"
+        ),
+        pytest.param(
+            "private_token", 'tok"\n[http]\n\textraHeader = x', "forbidden", id="config-injection"
+        ),
+        pytest.param("private_token", "tok\\x", "forbidden", id="backslash"),
+    ],
+)
+def test_a_credential_that_does_not_fit_its_header_form_is_refused_before_clone(
+    publication_k8s: Any, tmp_path: Path, header_form: str, credential: str, message: str
+) -> None:
+    completed, capture, remote = _run_with_auth_capture(
+        publication_k8s, tmp_path, header_form=header_form, credential=credential
+    )
+
+    assert completed.returncode != 0
+    assert message in completed.stderr
+    assert not capture.exists(), "git clone must not run"
+    assert "CURIE_COMMIT_SHA=" not in completed.stdout
+    if "abc" in credential or "tok" in credential:
+        assert credential not in completed.stderr
+
+
+# Redaction.
+
+
+def _assert_script_redacts_credentials(script: str) -> None:
     redact_function = script[
         script.index("redact() {") : script.index("\n}\n\ngit_with_timeout") + 2
     ]
     sensitive = (
         "Authorization: Basic dXNlcjp3cml0ZS10b2tlbg==\n"
         "authorization: Bearer github_pat_sensitive\n"
+        "PRIVATE-TOKEN: glpat-sensitive\n"
+        "fatal: unable to access "
+        "'https://oauth2:glpat-userinfo@gitlab.example.com/forge/group/acme-bot.git/'\n"
     )
     completed = subprocess.run(
         ["/bin/bash", "-c", f"{redact_function}\nredact"],
@@ -1696,33 +1246,50 @@ def _assert_script_redacts_authorization(script: str) -> None:
         capture_output=True,
         check=True,
     )
-    assert completed.stdout == "Authorization: [REDACTED]\nAuthorization: [REDACTED]\n"
-    assert "dXNlc" not in completed.stdout
-    assert "github_pat_sensitive" not in completed.stdout
+    assert completed.stdout == (
+        "Authorization: [REDACTED]\n"
+        "Authorization: [REDACTED]\n"
+        "Authorization: [REDACTED]\n"
+        "fatal: unable to access 'https://gitlab.example.com/forge/group/acme-bot.git/'\n"
+    )
+    for secret in ("dXNlc", "github_pat_sensitive", "glpat-sensitive", "glpat-userinfo"):
+        assert secret not in completed.stdout
 
 
+@pytest.mark.parametrize(
+    ("original", "mutated"),
+    [
+        pytest.param("[Bb][Ee][Aa][Rr][Ee][Rr]", "[Xx][Ee][Aa][Rr][Ee][Rr]", id="bearer"),
+        pytest.param("|PRIVATE-TOKEN):", "|PRIVATE-XOKEN):", id="private-token"),
+        pytest.param("s#(https?://)[^/@", "s#(xttps?://)[^/@", id="userinfo"),
+    ],
+)
 def test_publish_script_executes_redaction_and_the_assertion_catches_a_mutation(
-    publication_k8s: Any,
+    publication_k8s: Any, original: str, mutated: str
 ) -> None:
     script = _resources(publication_k8s).config_map["data"]["publish.sh"]
 
     subprocess.run(["/bin/bash", "-n"], input=script, text=True, check=True)
-    _assert_script_redacts_authorization(script)
-    mutation = script.replace("[Bb][Ee][Aa][Rr][Ee][Rr]", "[Xx][Ee][Aa][Rr][Ee][Rr]")
+    _assert_script_redacts_credentials(script)
+    assert original in script
     with pytest.raises(AssertionError):
-        _assert_script_redacts_authorization(mutation)
+        _assert_script_redacts_credentials(script.replace(original, mutated))
 
 
-def test_absent_pull_job_queries_stored_lineage_head_before_posting_once(
-    publication_k8s: Any,
-) -> None:
-    script = _resources(publication_k8s).config_map["data"]["publish.sh"]
-    lookup = script.index("head=")
-    post = script.index("POST")
+def test_worker_side_redaction_scrubs_a_non_github_origin(publication_k8s: Any) -> None:
+    text = (
+        "fatal: unable to access "
+        "'https://oauth2:glpat-userinfo@gitlab.example.com/forge/group/acme-bot.git/'\n"
+        "PRIVATE-TOKEN: glpat-header\n"
+        "private-token:glpat-lower\n"
+        "Authorization: Bearer glpat-bearer\n"
+    )
 
-    assert lookup < post
-    assert "CURIE_PR_URL=" in script
-    assert "urllib" in script or "http.client" in script
+    redacted = publication_k8s._redact(text)
+
+    for secret in ("glpat-userinfo", "oauth2", "glpat-header", "glpat-lower", "glpat-bearer"):
+        assert secret not in redacted, secret
+    assert "https://[REDACTED]@gitlab.example.com/forge/group/acme-bot.git/" in redacted
 
 
 def test_every_dynamic_resource_has_the_helm_owner_reference(
@@ -1779,9 +1346,7 @@ class _FakeCoreApi:
         self.secrets[body["metadata"]["name"]] = value
         self.created.append(("Secret", body["metadata"]["name"]))
 
-    def delete_namespaced_secret(
-        self, name: str, namespace: str, *, body: dict[str, Any]
-    ) -> None:
+    def delete_namespaced_secret(self, name: str, namespace: str, *, body: dict[str, Any]) -> None:
         self.secret_deletes.append((name, deepcopy(body)))
         del self.secrets[name]
 
@@ -1838,9 +1403,9 @@ def test_create_or_adopt_validates_immutable_spec_and_live_owner_before_mutating
         cluster.apply(resources)
     core.secrets[resources.names.secret]["data"]["credential"] = original_credential
 
-    core.config_maps[resources.names.config_map]["metadata"]["ownerReferences"][0][
-        "uid"
-    ] = "different-owner-uid"
+    core.config_maps[resources.names.config_map]["metadata"]["ownerReferences"][0]["uid"] = (
+        "different-owner-uid"
+    )
     with pytest.raises(publication_k8s.PublicationResourceError, match="metadata contract"):
         cluster.apply(resources)
 
@@ -1861,13 +1426,27 @@ def test_stale_immutable_secret_is_uid_replaced_only_when_job_is_gone(
 
     cluster.apply(rotated)
 
-    assert core.secret_deletes == [
-        (resources.names.secret, {"preconditions": {"uid": old_uid}})
-    ]
+    assert core.secret_deletes == [(resources.names.secret, {"preconditions": {"uid": old_uid}})]
     assert batch.created == [resources.names.job, resources.names.job]
-    assert base64.b64decode(
-        core.secrets[resources.names.secret]["data"]["credential"]
-    ).decode() == "rotated-publication-write-credential"
+    assert (
+        base64.b64decode(core.secrets[resources.names.secret]["data"]["credential"]).decode()
+        == "rotated-publication-write-credential"
+    )
+
+
+def _v1_job(
+    uid: str,
+    *,
+    succeeded: int = 0,
+    failed: int = 0,
+    conditions: list[V1JobCondition] | None = None,
+) -> V1Job:
+    """The model the real BatchV1Api.read_namespaced_job returns."""
+
+    return V1Job(
+        metadata=V1ObjectMeta(uid=uid),
+        status=V1JobStatus(succeeded=succeeded, failed=failed, conditions=conditions),
+    )
 
 
 def test_observe_reads_logs_only_from_a_pod_owned_by_the_exact_job(
@@ -1877,10 +1456,7 @@ def test_observe_reads_logs_only_from_a_pod_owned_by_the_exact_job(
     cluster.namespace = "curie-publications"
     job_uid = "job-uid-123"
     cluster._batch = SimpleNamespace(
-        read_namespaced_job=lambda *_args: SimpleNamespace(
-            metadata=SimpleNamespace(uid=job_uid),
-            status=SimpleNamespace(succeeded=1, failed=0, conditions=[]),
-        )
+        read_namespaced_job=lambda *_args: _v1_job(job_uid, succeeded=1)
     )
     log_reads: list[str] = []
     hostile = SimpleNamespace(
@@ -1899,23 +1475,20 @@ def test_observe_reads_logs_only_from_a_pod_owned_by_the_exact_job(
     def read_log(name: str, *_args: object, **_kwargs: object) -> str:
         log_reads.append(name)
         if name == "hostile-pod":
-            return "CURIE_PR_URL=https://github.com/attacker/repo/pull/1"
-        return _terminal_markers("closed", REVISION_HEAD)
+            return f"CURIE_COMMIT_SHA={'e' * 40}\n"
+        return f"CURIE_COMMIT_SHA={REVISION_HEAD}\n"
 
     cluster._core = SimpleNamespace(
-        list_namespaced_pod=lambda *_args, **_kwargs: SimpleNamespace(
-            items=[hostile, owned]
-        ),
+        list_namespaced_pod=lambda *_args, **_kwargs: SimpleNamespace(items=[hostile, owned]),
         read_namespaced_pod_log=read_log,
     )
 
     observed = cluster.observe("curie-publication-22222222222242228222")
 
     assert log_reads == ["owned-pod"]
-    assert observed.pr_url == "https://github.com/acme-corp/acme-bot/pull/123"
-    assert observed.pr_number == 123
+    assert observed.phase == "succeeded"
     assert observed.commit_sha == REVISION_HEAD
-    assert observed.pr_state == "closed"
+    assert observed.error is None
 
 
 def test_observe_reads_terminal_status_from_dict_shaped_kubernetes_objects(
@@ -1929,20 +1502,62 @@ def test_observe_reads_terminal_status_from_dict_shaped_kubernetes_objects(
             "status": {
                 "succeeded": 0,
                 "failed": 1,
-                "conditions": [
-                    {"status": "True", "reason": "DeadlineExceeded"}
-                ],
+                "conditions": [{"status": "True", "reason": "DeadlineExceeded"}],
             },
         }
     )
-    cluster._core = SimpleNamespace(
-        list_namespaced_pod=lambda *_args, **_kwargs: {"items": []}
-    )
+    cluster._core = SimpleNamespace(list_namespaced_pod=lambda *_args, **_kwargs: {"items": []})
 
     observed = cluster.observe("curie-publication-22222222222242228222")
 
     assert observed.phase == "failed"
     assert observed.error == "DeadlineExceeded; pod logs were unavailable"
+    assert observed.transport is None
+
+
+def test_observe_reports_the_transport_the_existing_job_was_built_with(
+    publication_k8s: Any,
+) -> None:
+    payload = replace(
+        _gitlab_payload(publication_k8s, "authorization_bearer"),
+        transport=_transport(
+            publication_k8s,
+            origin=GITLAB_ORIGIN,
+            header_form="authorization_bearer",
+            ca_bundle_ref=CA_REF,
+        ),
+    )
+    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s))
+    live = deepcopy(resources.job)
+    live["metadata"]["uid"] = "job-uid-live"
+    live["status"] = {"active": 1}
+    model = ApiClient().deserialize(SimpleNamespace(data=json.dumps(live)), "V1Job")
+    cluster = object.__new__(publication_k8s.KubernetesPublicationCluster)
+    cluster.namespace = "curie"
+    cluster._batch = SimpleNamespace(read_namespaced_job=lambda *_args: model)
+    cluster._core = SimpleNamespace(list_namespaced_pod=lambda *_args, **_kwargs: {"items": []})
+
+    observed = cluster.observe(resources.names.job)
+
+    assert observed.phase == "running"
+    assert observed.commit_sha is None
+    assert observed.transport == payload.transport
+
+
+def test_observe_of_a_missing_job_reports_not_existing(publication_k8s: Any) -> None:
+    cluster = object.__new__(publication_k8s.KubernetesPublicationCluster)
+    cluster.namespace = "curie"
+
+    def missing(*_args: object) -> None:
+        raise ApiException(status=404)
+
+    cluster._batch = SimpleNamespace(read_namespaced_job=missing)
+
+    observed = cluster.observe("curie-publication-22222222222242228222")
+
+    assert observed.exists is False
+    assert observed.phase == "pending"
+    assert observed.transport is None
 
 
 def _real_client_pod_log(raw: bytes) -> Any:
@@ -1977,32 +1592,18 @@ def _owned_pod(name: str, job_uid: str) -> Any:
     )
 
 
-@pytest.mark.parametrize(
-    "pr_url",
-    [
-        pytest.param("https://github.com/acme-corp/acme-bot/pull/123", id="public"),
-        pytest.param(
-            "https://github.example.com/forge/acme-corp/acme-bot/pull/123",
-            id="enterprise",
-        ),
-    ],
-)
-def test_observe_parses_pr_markers_from_the_real_clients_pod_log_shape(
-    publication_k8s: Any, pr_url: str,
+def test_observe_parses_the_commit_marker_from_the_real_clients_pod_log_shape(
+    publication_k8s: Any,
 ) -> None:
     cluster = object.__new__(publication_k8s.KubernetesPublicationCluster)
     cluster.namespace = "curie-publications"
     job_uid = "job-uid-success"
     cluster._batch = SimpleNamespace(
-        read_namespaced_job=lambda *_args: SimpleNamespace(
-            metadata=SimpleNamespace(uid=job_uid),
-            status=SimpleNamespace(succeeded=1, failed=0, conditions=[]),
-        )
+        read_namespaced_job=lambda *_args: _v1_job(job_uid, succeeded=1)
     )
     raw = (
         b"Cloning into 'repo'...\n"
-        + f"CURIE_PR_URL={pr_url}\n".encode()
-        + b"CURIE_PR_NUMBER=123\n"
+        b"[curie/thread-lineage-example 0123456] Update repository\n"
         + f"CURIE_COMMIT_SHA={REVISION_HEAD}\n".encode()
     )
     cluster._core = SimpleNamespace(
@@ -2014,9 +1615,8 @@ def test_observe_parses_pr_markers_from_the_real_clients_pod_log_shape(
 
     observed = cluster.observe("curie-publication-22222222222242228222")
 
-    assert observed.pr_url == pr_url
-    assert observed.pr_number == 123
     assert observed.commit_sha == REVISION_HEAD
+    assert observed.logs.endswith(f"CURIE_COMMIT_SHA={REVISION_HEAD}\n")
 
 
 def test_observe_failed_job_error_is_not_a_bytes_repr_on_the_real_client_shape(
@@ -2025,32 +1625,24 @@ def test_observe_failed_job_error_is_not_a_bytes_repr_on_the_real_client_shape(
     cluster = object.__new__(publication_k8s.KubernetesPublicationCluster)
     cluster.namespace = "curie-publications"
     job_uid = "job-uid-failed"
+    condition = {
+        "status": "True",
+        "reason": "BackoffLimitExceeded",
+        "message": "Job has reached the specified backoff limit",
+    }
     cluster._batch = SimpleNamespace(
-        read_namespaced_job=lambda *_args: SimpleNamespace(
-            metadata=SimpleNamespace(uid=job_uid),
-            status=SimpleNamespace(
-                succeeded=0,
-                failed=1,
-                conditions=[
-                    SimpleNamespace(
-                        type="FailureTarget",
-                        status="True",
-                        reason="BackoffLimitExceeded",
-                        message="Job has reached the specified backoff limit",
-                    ),
-                    SimpleNamespace(
-                        type="Failed",
-                        status="True",
-                        reason="BackoffLimitExceeded",
-                        message="Job has reached the specified backoff limit",
-                    ),
-                ],
-            ),
+        read_namespaced_job=lambda *_args: _v1_job(
+            job_uid,
+            failed=1,
+            conditions=[
+                V1JobCondition(type="FailureTarget", **condition),
+                V1JobCondition(type="Failed", **condition),
+            ],
         )
     )
     raw = (
         b"Cloning into 'repo'...\n"
-        b"fatal: Authentication failed for 'https://github.com/o/r.git/'\n"
+        b"fatal: Authentication failed for 'https://gitlab.example.com/o/r.git/'\n"
     )
     cluster._core = SimpleNamespace(
         list_namespaced_pod=lambda *_args, **_kwargs: SimpleNamespace(
@@ -2072,20 +1664,13 @@ def test_observe_failed_job_error_is_not_a_bytes_repr_on_the_real_client_shape(
 def test_resource_builder_binds_clone_url_to_publication_repository(
     publication_k8s: Any,
 ) -> None:
-    payload = _payload(publication_k8s)
-    payload = publication_k8s.PublicationPayload(
-        **{
-            **payload.__dict__,
-            "clean_clone_url": "https://github.com/other-corp/other-repo.git",
-        }
+    payload = replace(
+        _payload(publication_k8s),
+        clean_clone_url="https://github.com/other-corp/other-repo.git",
     )
 
     with pytest.raises(publication_k8s.PublicationResourceError, match="clone URL"):
-        publication_k8s.build_publication_resources(
-            payload,
-            credential="publication-write-credential",
-            settings=_settings(publication_k8s),
-        )
+        _build(publication_k8s, payload)
 
 
 def test_publication_cluster_has_no_legacy_combined_cleanup_shim(
@@ -2111,12 +1696,10 @@ def _omitempty(value: Any) -> Any:
 
 
 def _apiserver_minimal_resources(module: Any) -> Any:
-    return module.build_publication_resources(
+    return _build(
+        module,
         _payload(module),
-        credential=WRITE_CREDENTIAL,
-        settings=replace(
-            _settings(module), priority_class_name="", image_pull_secrets=()
-        ),
+        replace(_settings(module), priority_class_name="", image_pull_secrets=()),
     )
 
 
@@ -2145,16 +1728,18 @@ def test_omitempty_tolerance_still_refuses_non_empty_where_empty_expected(
     resources = _apiserver_minimal_resources(publication_k8s)
 
     planted_env = _omitempty(deepcopy(resources.job))
+    planted = False
     for item in planted_env["spec"]["template"]["spec"]["containers"][0]["env"]:
-        if item["name"] == "PR_URL":
-            item["value"] = "https://evil.example/pull/1"
+        if item["name"] == "EXPECTED_REMOTE_HEAD":
+            assert "value" not in item
+            item["value"] = "e" * 40
+            planted = True
+    assert planted
     with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
         publication_k8s.validate_adopted_resource("Job", resources.job, planted_env)
 
     planted_priority = _omitempty(deepcopy(resources.job))
-    planted_priority["spec"]["template"]["spec"][
-        "priorityClassName"
-    ] = "system-node-critical"
+    planted_priority["spec"]["template"]["spec"]["priorityClassName"] = "system-node-critical"
     with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
         publication_k8s.validate_adopted_resource("Job", resources.job, planted_priority)
 
@@ -2201,9 +1786,7 @@ def test_omitempty_tolerance_refuses_valueFrom_secretKeyRef_on_omitted_env(
     env = container["env"]
     empty_items = [item for item in env if "value" not in item]
     assert empty_items, "expected at least one omitted-value env entry to attack"
-    empty_items[0]["valueFrom"] = {
-        "secretKeyRef": {"name": secret_name, "key": "credential"}
-    }
+    empty_items[0]["valueFrom"] = {"secretKeyRef": {"name": secret_name, "key": "credential"}}
 
     with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
         publication_k8s.validate_adopted_resource("Job", resources.job, planted)
@@ -2280,31 +1863,48 @@ def _failed_owned_pod(exit_code: int = 128) -> dict[str, Any]:
             "containerStatuses": [
                 {
                     "name": "publish",
-                    "state": {
-                        "terminated": {"reason": "Error", "exitCode": exit_code}
-                    },
+                    "state": {"terminated": {"reason": "Error", "exitCode": exit_code}},
                 }
             ]
         },
     }
 
 
+@pytest.mark.parametrize(
+    ("leak_lines", "kept"),
+    [
+        pytest.param(
+            [
+                "Authorization: Bearer SECRETTOKEN",
+                "fatal: repository 'https://x-access-token:SECRETTOKEN@github.com/o/r.git/'"
+                " not found",
+            ],
+            "github.com/o/r.git/' not found",
+            id="github",
+        ),
+        pytest.param(
+            [
+                "PRIVATE-TOKEN: SECRETTOKEN",
+                "fatal: repository "
+                "'https://oauth2:SECRETTOKEN@gitlab.example.com/forge/o/r.git/' not found",
+            ],
+            "gitlab.example.com/forge/o/r.git/' not found",
+            id="non-github",
+        ),
+    ],
+)
 def test_observe_failed_job_names_reason_exit_code_and_redacted_git_error(
-    publication_k8s: Any,
+    publication_k8s: Any, leak_lines: list[str], kept: str
 ) -> None:
     logs = "\n".join(
         [
             "CURIE_PUBLICATION_STAGE=clone",
             "Cloning into 'repo'...",
-            "Authorization: Bearer SECRETTOKEN",
-            "fatal: repository 'https://x-access-token:SECRETTOKEN@github.com/o/r.git/'"
-            " not found",
+            *leak_lines,
             "CURIE_PUBLICATION_STAGE=failed",
         ]
     )
-    cluster = _failed_job_cluster(
-        publication_k8s, pods=[_failed_owned_pod(128)], logs=logs
-    )
+    cluster = _failed_job_cluster(publication_k8s, pods=[_failed_owned_pod(128)], logs=logs)
 
     observed = cluster.observe("curie-publication-22222222222242228222")
 
@@ -2313,7 +1913,7 @@ def test_observe_failed_job_names_reason_exit_code_and_redacted_git_error(
     assert "BackoffLimitExceeded" in error
     assert "exit code 128" in error
     assert "fatal: repository 'https://" in error
-    assert "github.com/o/r.git/' not found" in error
+    assert kept in error
     assert "CURIE_PUBLICATION_STAGE" not in error
     assert "SECRETTOKEN" not in error
     assert "SECRETTOKEN" not in observed.logs
@@ -2324,9 +1924,7 @@ def test_observe_failed_job_error_is_bounded_for_huge_logs(
     publication_k8s: Any,
 ) -> None:
     logs = "\n".join(f"fatal: line {index} " + "x" * 200 for index in range(60))
-    cluster = _failed_job_cluster(
-        publication_k8s, pods=[_failed_owned_pod(1)], logs=logs
-    )
+    cluster = _failed_job_cluster(publication_k8s, pods=[_failed_owned_pod(1)], logs=logs)
 
     observed = cluster.observe("curie-publication-22222222222242228222")
 
@@ -2339,9 +1937,7 @@ def test_observe_failed_job_error_is_bounded_for_huge_logs(
 def test_observe_failed_job_without_pod_says_logs_were_unavailable(
     publication_k8s: Any,
 ) -> None:
-    cluster = _failed_job_cluster(
-        publication_k8s, pods=[], logs="", reason="DeadlineExceeded"
-    )
+    cluster = _failed_job_cluster(publication_k8s, pods=[], logs="", reason="DeadlineExceeded")
 
     observed = cluster.observe("curie-publication-22222222222242228222")
 

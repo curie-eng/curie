@@ -215,27 +215,23 @@ def test_publication_slack_egress_is_observed_exactly_once(
         engine_dependency: Any = object()
         http_dependency: Any = object()
         card_store_dependency: Any = object()
-        github_api_url = "https://github.example.com/forge/api/v3"
         platform_api_url = "https://api.example.com"
         worker_token = "fixture-publication-worker-token"
         code_host_calls: list[tuple[str, str, Any]] = []
-        credential_calls: list[tuple[str, str, str, Any]] = []
+        credential_calls: list[tuple[str, str, Any]] = []
 
         def publication_code_host(*, api_base_url: str, worker_token: str, client: Any) -> object:
             code_host_calls.append((api_base_url, worker_token, client))
             return object()
 
-        def publication_credentials(
-            *, api_base_url: str, github_html_base: str, worker_token: str, client: Any
-        ) -> object:
-            credential_calls.append((api_base_url, github_html_base, worker_token, client))
+        def publication_credentials(*, api_base_url: str, worker_token: str, client: Any) -> object:
+            credential_calls.append((api_base_url, worker_token, client))
             return object()
 
         monkeypatch.setattr(run_module, "PublicationCodeHostClient", publication_code_host)
         monkeypatch.setattr(run_module, "PublicationCredentialClient", publication_credentials)
         loop = run_module._build_publication_loop(
             WorkerConfig(
-                publication_github_api_url=github_api_url,
                 api_base_url=platform_api_url,
                 internal_worker_token=worker_token,
             ),
@@ -247,10 +243,8 @@ def test_publication_slack_egress_is_observed_exactly_once(
         )
         assert loop is not None
         assert code_host_calls == [(platform_api_url, worker_token, http_dependency)]
-        assert credential_calls == [
-            (platform_api_url, "https://github.example.com/forge", worker_token, http_dependency)
-        ]
-        assert loop._reconciler._job_settings.github_api_url == github_api_url  # noqa: SLF001
+        # ADR 0197: the worker names no code host; the credential carries the origin.
+        assert credential_calls == [(platform_api_url, worker_token, http_dependency)]
         publication_replies = loop._reconciler._replies  # noqa: SLF001
         post = ReplyPost(
             version=REPLY_WIRE_VERSION,

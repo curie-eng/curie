@@ -1247,6 +1247,23 @@ grafanaConnector:
 # dev/e2e use values-dev.yaml, which repoints each image at a locally-built,
 # cluster-imported image with imagePullPolicy Never (mirroring the runner pattern).
 # ---------------------------------------------------------------------------
+# Code host trust (ADR 0197, issue #3831). A self-managed code host whose TLS
+# certificate no public root covers needs one PEM CA bundle. Name a ConfigMap
+# you create and the key holding the PEM; the chart mounts it read-only at
+# /etc/curie/code-host-trust/ca.crt in the api, the worker, every agent
+# sandbox and every publication Job, and points git (GIT_SSL_CAINFO,
+# http.sslCAInfo) and HTTP clients (SSL_CERT_FILE, REQUESTS_CA_BUNDLE) at it.
+# The api's code host HTTP clients add it to the public roots; git and the
+# sandbox's SSL_CERT_FILE and REQUESTS_CA_BUNDLE use the file as their whole
+# store, so put the public roots in the bundle too if the sandbox reaches
+# public HTTPS hosts through those clients. Empty name: nothing is mounted and
+# nothing changes.
+codeHostTrust:
+  caBundle:
+    configMapRef:
+      name: ""
+      key: ca.crt
+# ---------------------------------------------------------------------------
 api:
   deploy: true
   # Runner sandbox egress to an external API endpoint (#2317, #2367). Rail 1
@@ -1459,7 +1476,9 @@ api:
   # is rejected with git.origin_mismatch. Set it to a GitHub Enterprise Server
   # base to deploy from GHE.
   githubCloneBase: "https://github.com"
-  # REST base used by credential minting, polling, and managed publication.
+  # REST base used by credential minting, polling, and the API's pull request
+  # calls for managed publication. The worker and the sandbox do not read it;
+  # they receive the code host origin with each credential.
   githubApiUrl: "https://api.github.com"
   # Optional ConfigMap name whose key ca.pem is a private CA for a GitHub
   # stub. Empty leaves TLS trust on the image bundle. When set, the api,

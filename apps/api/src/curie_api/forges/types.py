@@ -127,6 +127,10 @@ class PullRequest:
     title: str = ""
     body: str = ""
     draft: bool = False
+    # When the code host last changed the pull request, as it reports it; None
+    # when the payload carried no usable time. A metadata-only revision records
+    # it so CI freshness is judged after the edit.
+    updated_at: datetime | None = None
 
 
 @dataclass(frozen=True)

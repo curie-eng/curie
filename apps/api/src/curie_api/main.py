@@ -31,6 +31,7 @@ from curie_api.crud import agents as crud_agents
 
 from . import __version__
 from .channel_identities import start_static_slack_bootstrap
+from .code_host_trust import code_host_verify
 from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
 from .db import create_engine, create_sessionmaker, create_source_gate_engine
@@ -114,7 +115,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = create_engine()
     app.state.engine = engine
     app.state.sessionmaker = create_sessionmaker(engine)
-    http_client = httpx.AsyncClient(timeout=10.0)
+    # The shared client reaches the code host, so it trusts the operator's
+    # code host CA bundle as well as the public roots (#3831).
+    http_client = httpx.AsyncClient(timeout=10.0, verify=code_host_verify(settings))
     app.state.http_client = http_client
     app.state.langfuse = LangfuseClient(settings, http_client)
     store = BundleStore(settings)

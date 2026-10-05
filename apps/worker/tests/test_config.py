@@ -1789,21 +1789,27 @@ def test_hook_claim_lease_shorter_than_the_budget_is_refused(
     assert "CURIE_HOOK_CLAIM_LEASE_S" in str(exc_info.value)
 
 
-@pytest.mark.parametrize(
-    ("api_url", "html_base"),
-    [
-        ("https://api.github.com", "https://github.com"),
-        ("https://api.github.com/", "https://github.com"),
-        ("https://github.example.com/api/v3", "https://github.example.com"),
-        ("https://github.example.com/api/v3/", "https://github.example.com"),
-        ("https://github.example.com/forge/api/v3", "https://github.example.com/forge"),
-        ("https://github.example.com:8443/forge/api/v3/", "https://github.example.com:8443/forge"),
-    ],
-)
-def test_publication_html_base_is_derived_from_the_configured_api_url(
-    monkeypatch: pytest.MonkeyPatch, api_url: str, html_base: str
+def test_the_worker_reads_no_code_host_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ADR 0197: the worker receives the code host origin as data with each credential."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_PUBLICATION_GITHUB_API_URL", "https://github.example.com/api/v3")
+
+    config = WorkerConfig()
+
+    assert not hasattr(config, "publication_github_api_url")
+    assert not hasattr(config, "publication_github_html_base")
+
+
+def test_the_publication_job_trust_bundle_comes_from_the_chart_configmap(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_PUBLICATION_GITHUB_API_URL", api_url)
+    assert WorkerConfig().publication_ca_bundle_config_map == ""
+    assert WorkerConfig().publication_ca_bundle_key == "ca.crt"
 
-    assert WorkerConfig().publication_github_html_base == html_base
+    monkeypatch.setenv("CURIE_CODE_HOST_CA_CONFIGMAP", "corp-ca")
+    monkeypatch.setenv("CURIE_CODE_HOST_CA_CONFIGMAP_KEY", "bundle.pem")
+
+    assert WorkerConfig().publication_ca_bundle_config_map == "corp-ca"
+    assert WorkerConfig().publication_ca_bundle_key == "bundle.pem"

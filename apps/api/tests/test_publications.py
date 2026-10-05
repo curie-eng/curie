@@ -203,6 +203,12 @@ def _workspace_identity(payload: Mapping[str, Any]) -> str:
     )
 
 
+
+def _worker_request() -> Any:
+    """A request for a direct route call; the GitHub credential reads no HTTP client."""
+
+    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(http_client=None)))
+
 def test_publication_schema_refuses_github_workflow_changes() -> None:
     payload = _publication_payload(str(uuid.uuid4()))
     payload["changed_paths"] = [".github/workflows/publish.yml"]
@@ -1139,10 +1145,10 @@ def test_publication_credential_resolution_does_not_block_the_event_loop(
         # failed 1 in 20 under `pytest -n 4` on 4 vCPU (run 34542518036).
         if not loop_progressed.wait(timeout=10):
             raise AssertionError("credential resolver blocked the event loop")
-        return "https://github.com/acme-corp/acme-bot.git", "Basic test"
+        return "https://github.com/acme-corp/acme-bot.git", "Basic eC1hY2Nlc3MtdG9rZW46dGVzdA=="
 
     monkeypatch.setattr(
-        "curie_api.routers.publications.resolve_repository_credential", blocking_resolver
+        "curie_api.forges.github.code_host.resolve_repository_credential", blocking_resolver
     )
 
     async def exercise() -> str:
@@ -1151,7 +1157,9 @@ def test_publication_credential_resolution_does_not_block_the_event_loop(
         try:
             async with sessionmaker() as session:
                 call = asyncio.create_task(
-                    redeem_publication_credential(uuid.UUID(publication["id"]), session, Response())
+                    redeem_publication_credential(
+                        uuid.UUID(publication["id"]), _worker_request(), session, Response()
+                    )
                 )
 
                 async def prove_progress() -> None:
@@ -1166,7 +1174,7 @@ def test_publication_credential_resolution_does_not_block_the_event_loop(
         finally:
             await engine.dispose()
 
-    assert asyncio.run(exercise()) == "Basic test"
+    assert asyncio.run(exercise()) == "Basic eC1hY2Nlc3MtdG9rZW46dGVzdA=="
 
 
 def test_publication_repo_must_match_the_thread_selection(
@@ -2569,7 +2577,6 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                 )
                 credentials = WorkspaceCredentialClient(
                     api_url="https://api.example.test",
-                    github_api_url=get_settings().github_api_url,
                     worker_token=WORKER_TOKEN,
                     transport=_testclient_transport(client),
                 )
@@ -2585,6 +2592,9 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                         snapshotter=lambda: capture_workspace_snapshot(
                             repo,
                             expected_repo=REPO,
+                            # The boot env's CURIE_REPO_ORIGIN and CURIE_REPO_PATH.
+                            trusted_origin="https://github.com",
+                            repository_path=REPO,
                             publication_title="Update README",
                             publication_body="Prepared by coder.",
                         ),
@@ -2961,7 +2971,6 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
                 )
                 credentials = WorkspaceCredentialClient(
                     api_url="https://api.example.test",
-                    github_api_url=get_settings().github_api_url,
                     worker_token=WORKER_TOKEN,
                     transport=_testclient_transport(client),
                 )
@@ -3456,7 +3465,7 @@ def test_publication_credential_is_approved_only_server_derived_and_audited(
         "authorization_header": "Basic "
         + base64.b64encode(b"x-access-token:ghp_publication_operator").decode(),
         "revision": None,
-        "origin": None,
+        "origin": "https://github.com",
         "header_form": "authorization_basic",
         "ca_bundle_ref": None,
     }
@@ -4123,7 +4132,7 @@ def test_terminal_lineage_refuses_revision_and_credential_before_resolution(
         raise AssertionError("terminal lineage reached credential resolution")
 
     monkeypatch.setattr(
-        "curie_api.routers.publications.resolve_repository_credential",
+        "curie_api.forges.github.code_host.resolve_repository_credential",
         forbidden_resolver,
     )
     credential = client.post(
@@ -6302,14 +6311,20 @@ class _TerminalObservationCluster:
         self.terminal_cleanups = 0
 
     def observe(self, _job_name: str) -> Any:
+        from curie_worker.publication_k8s import PublicationTransport
         from curie_worker.publication_loop import PublicationJobObservation
 
+        # The Job reports only its pushed commit and the transport it was
+        # built with; the pull request comes from the API afterwards.
         return PublicationJobObservation(
             phase="succeeded",
-            pr_url=PR_URL,
-            pr_number=PR_NUMBER,
             commit_sha=FIRST_REVISION_SHA,
             logs="",
+            transport=PublicationTransport(
+                origin="https://github.com",
+                header_form="authorization_basic",
+                ca_bundle_ref=None,
+            ),
         )
 
     def validate_existing(self, _resources: Any) -> None:
@@ -6323,6 +6338,38 @@ class _TerminalObservationCluster:
 
     def cleanup_terminal(self, _names: Any) -> None:
         self.terminal_cleanups += 1
+
+
+class _PushedPullCodeHost:
+    """The API's answers after the push: the marked commit and its open PR."""
+
+    def __init__(self, branch: str) -> None:
+        self.branch = branch
+        self.calls: list[str] = []
+
+    def verify_revision_commit(
+        self,
+        _publication_id: uuid.UUID,
+        commit_sha: str,
+        *,
+        revision_id: uuid.UUID,
+        expected_parent: str,
+    ) -> str:
+        del revision_id, expected_parent
+        self.calls.append("verify_revision_commit")
+        return commit_sha
+
+    def recover_pull_request(self, _publication_id: uuid.UUID, *, expected_head_sha: str) -> Any:
+        from curie_worker.publication_loop import PublicationPullState
+
+        self.calls.append("recover_pull_request")
+        return PublicationPullState(
+            number=PR_NUMBER,
+            url=PR_URL,
+            state="open",
+            head_sha=expected_head_sha,
+            head_ref=self.branch,
+        )
 
 
 class _UnexpectedPublicationCredentials:
@@ -6399,7 +6446,7 @@ async def _reconcile_through_lineage_patch(
                 store=store,
                 credentials=_UnexpectedPublicationCredentials(),
                 cluster=cluster,
-                code_host=SimpleNamespace(),
+                code_host=_PushedPullCodeHost(work.branch),
                 lineage=PublicationLineageClient(
                     api_base_url="http://api.example.test",
                     worker_token=WORKER_TOKEN,

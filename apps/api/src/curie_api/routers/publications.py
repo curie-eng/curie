@@ -16,7 +16,6 @@ from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from starlette.concurrency import run_in_threadpool
 
 from curie_api.crud import agents as crud_agents
 from curie_api.crud import approvals as crud_approvals
@@ -47,6 +46,7 @@ from ..config import get_settings
 from ..deps import SessionDep
 from ..forges.errors import ForgeError, Unauthorized, Unavailable
 from ..forges.hosts import code_host_for, pull_request_ref
+from ..forges.types import CredentialScope
 from ..models import (
     ExecutionRequest,
     Publication,
@@ -68,7 +68,7 @@ from ..publication_truth import (
     read_publication_authority,
     read_publication_metadata,
 )
-from ..repository_auth import resolve_repository_credential
+from ..repository_access import issue_repository_credential
 from ..workspace_policy import credential_mode, repository_is_allowed
 from . import publication_code_host
 from .publication_precheck import precheck_error
@@ -711,6 +711,7 @@ def _credential_issue_detail(settings: Any, approval: Any) -> str:
 )
 async def redeem_publication_credential(
     publication_id: uuid.UUID,
+    request: Request,
     session: SessionDep,
     response: Response,
 ) -> RepositoryCredentialOut:
@@ -803,8 +804,16 @@ async def redeem_publication_credential(
             {"code": cancelled.code, "message": cancelled.message},
         )
     try:
-        clone_url, authorization_header = await run_in_threadpool(
-            resolve_repository_credential, repo, settings
+        issued = await issue_repository_credential(
+            settings,
+            request.app.state.http_client,
+            repo_full_name=repo,
+            project_id=(
+                publication.lineage.github_repository_id
+                if publication.lineage is not None
+                else None
+            ),
+            scope=CredentialScope.PUSH,
         )
     except Exception as exc:
         await crud_publications.append_credential_redemption_audit(
@@ -832,8 +841,11 @@ async def redeem_publication_credential(
     )
     return RepositoryCredentialOut(
         repo_full_name=repo,
-        clone_url=clone_url,
-        authorization_header=authorization_header,
+        clone_url=issued.clone_url,
+        authorization_header=issued.authorization_header,
+        origin=issued.origin,
+        header_form=issued.header_form,
+        ca_bundle_ref=issued.ca_bundle_ref,
     )
 
 

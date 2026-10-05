@@ -89,7 +89,6 @@ class PostgresPublicationStore:
         self._engine = engine
         self._table = f'"{schema}".publications'
         self._requests = f'"{schema}".execution_requests'
-        self._work_items = f'"{schema}".work_items'
         self._approvals = f'"{schema}".approvals'
         self._lineages = f'"{schema}".thread_publication_lineages'
         self._lease_owner = lease_owner
@@ -344,12 +343,10 @@ class PostgresPublicationStore:
             SELECT p.id, p.approval_id, p.repo_full_name, p.status, p.version,
                    p.lineage_id, p.revision_number, p.expected_prior_head,
                    p.base_sha, p.patch_bytes, p.changed_paths, p.title, p.body,
-                   p.observed_title_sha256, p.observed_body_sha256,
                    p.reply_kind, p.reply_channel, p.reply_placeholder,
                    p.reply_endpoint, p.reply_adapter,
                    l.version AS lineage_version, l.branch, l.pr_number,
                    l.pr_url, l.head_sha,
-                   l.github_repository_id, l.github_pr_node_id,
                    a.conversation_id,
                    (
                      p.execution_request_id IS NULL
@@ -359,13 +356,10 @@ class PostgresPublicationStore:
                            AND e.status = 'running'
                      )
                    ) AS owner_running,
-                   p.open_as_draft, p.branch_prefix,
-                   w.base_branch AS base_ref
+                   p.branch_prefix
               FROM {self._table} p
               JOIN {self._approvals} a ON a.id = p.approval_id
               JOIN {self._lineages} l ON l.id = p.lineage_id
-              LEFT JOIN {self._requests} er ON er.id = p.execution_request_id
-              LEFT JOIN {self._work_items} w ON w.id = er.work_item_id
              WHERE p.patch_bytes IS NOT NULL
                AND p.status IN ('approved', 'launching', 'running')
                AND p.approval_card_reported_at IS NOT NULL
@@ -451,14 +445,6 @@ class PostgresPublicationStore:
             branch=str(row["branch"]),
             pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
             pr_url=str(row["pr_url"]) if row["pr_url"] is not None else None,
-            github_repository_id=(
-                int(row["github_repository_id"])
-                if row["github_repository_id"] is not None
-                else None
-            ),
-            github_pr_node_id=(
-                str(row["github_pr_node_id"]) if row["github_pr_node_id"] is not None else None
-            ),
             expected_prior_head=str(row["expected_prior_head"]),
             expected_remote_head=(
                 str(row["head_sha"])
@@ -468,8 +454,6 @@ class PostgresPublicationStore:
             base_sha=str(row["base_sha"]),
             patch=patch,
             changed_paths=tuple(str(path) for path in paths),
-            observed_title_sha256=row["observed_title_sha256"],
-            observed_body_sha256=row["observed_body_sha256"],
             title=str(row["title"]),
             body=str(row["body"]),
             target=ReplyTarget(
@@ -485,9 +469,7 @@ class PostgresPublicationStore:
             version=version,
             lease_owner=self._lease_owner,
             owner_running=bool(row["owner_running"]),
-            open_as_draft=bool(row["open_as_draft"]),
             branch_prefix=(str(row["branch_prefix"]) if row["branch_prefix"] is not None else None),
-            base_ref=str(row["base_ref"]) if row["base_ref"] is not None else None,
         )
 
     async def is_terminal(self, publication_id: uuid.UUID) -> bool:

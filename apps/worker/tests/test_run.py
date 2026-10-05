@@ -411,10 +411,24 @@ def test_docker_runner_uses_its_network_specific_otlp_endpoint(
     )
 
 
-@pytest.mark.parametrize("prefix", ["", "/forge"])
-def test_docker_runner_snapshot_uses_the_workers_configured_github_url(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, prefix: str
+@pytest.mark.parametrize(
+    ("origin", "repo_name"),
+    [
+        ("https://github.example.com", "acme-corp/acme-bot"),
+        ("https://github.example.com/forge", "acme-corp/acme-bot"),
+        ("https://gitlab.example.com", "group/sub/project"),
+    ],
+)
+def test_docker_runner_snapshot_checks_the_claims_code_host_origin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, origin: str, repo_name: str
 ) -> None:
+    """ADR 0197: the docker runner takes the origin and path from the boot env.
+
+    The worker reads no GitHub URL. The workspace claim carries the origin and
+    path from the API's credential, the docker substrate forwards them as boot
+    env, and the runner's snapshot accepts exactly that path under that origin.
+    """
+
     from curie_runner.workspace_snapshot import capture_workspace_snapshot
 
     calls: list[list[str]] = []
@@ -429,16 +443,11 @@ def test_docker_runner_snapshot_uses_the_workers_configured_github_url(
         calls.append(args)
         return ""
 
-    html_base = f"https://github.example.com{prefix}"
-    github_api_url = f"{html_base}/api/v3"
     monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
     monkeypatch.setattr(DockerSandboxClient, "_docker", capture_docker)
     client = _sandbox_client(
-        WorkerConfig(fake_model=True, publication_github_api_url=github_api_url),
-        {
-            "CURIE_SANDBOX_SUBSTRATE": "docker",
-            "CURIE_GITHUB_API_URL": "https://other.example.com/api/v3",
-        },
+        WorkerConfig(fake_model=True),
+        {"CURIE_SANDBOX_SUBSTRATE": "docker"},
         _SUB,
     )
     assert isinstance(client, DockerSandboxClient)
@@ -447,18 +456,18 @@ def test_docker_runner_snapshot_uses_the_workers_configured_github_url(
         pool="pool",
         env={
             "CURIE_FAKE_MODEL": "1",
-            "CURIE_GITHUB_API_URL": "https://other.example.com/api/v3",
+            "CURIE_REPO_ORIGIN": origin,
+            "CURIE_REPO_PATH": repo_name,
         },
     )
-    assignments = [arg for arg in calls[0] if arg.startswith("CURIE_GITHUB_API_URL=")]
-    assert assignments == [f"CURIE_GITHUB_API_URL={github_api_url}"]
-    # Feed the emitted container setting into the actual runner snapshot
-    # boundary, proving a managed GHES checkout remains publishable locally.
-    monkeypatch.setenv("CURIE_GITHUB_API_URL", assignments[0].partition("=")[2])
-    repo_name = "acme-corp/acme-bot"
+    assert not any(arg.startswith("CURIE_GITHUB_API_URL=") for arg in calls[0])
+    forwarded = dict(
+        arg.partition("=")[::2] for arg in calls[0] if arg.startswith("CURIE_REPO_")
+    )
+    assert forwarded == {"CURIE_REPO_ORIGIN": origin, "CURIE_REPO_PATH": repo_name}
     for args in (
         ("init", "--quiet"),
-        ("remote", "add", "origin", f"{html_base}/{repo_name}.git"),
+        ("remote", "add", "origin", f"{origin}/{repo_name}.git"),
     ):
         subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
     (tmp_path / "README.md").write_text("base\n")
@@ -470,13 +479,18 @@ def test_docker_runner_snapshot_uses_the_workers_configured_github_url(
         ],
         cwd=tmp_path, check=True, capture_output=True,
     )
-    (tmp_path / "README.md").write_text("GHES change\n")
+    (tmp_path / "README.md").write_text("Code host change\n")
 
-    captured = capture_workspace_snapshot(tmp_path, expected_repo=repo_name)
+    captured = capture_workspace_snapshot(
+        tmp_path,
+        expected_repo=repo_name,
+        trusted_origin=forwarded["CURIE_REPO_ORIGIN"],
+        repository_path=forwarded["CURIE_REPO_PATH"],
+    )
 
     assert captured.repo_full_name == repo_name
     assert captured.changed_paths == ("README.md",)
-    assert b"GHES change" in captured.patch
+    assert b"Code host change" in captured.patch
 
 
 def test_sandbox_client_docker_prepulls_image(monkeypatch) -> None:

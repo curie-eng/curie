@@ -16,6 +16,7 @@ import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -163,6 +164,12 @@ def worker_client(_disposable_db: Any, monkeypatch: pytest.MonkeyPatch) -> Itera
     _RESOLVERS.clear()
     get_settings.cache_clear()
 
+
+
+def _worker_request() -> Any:
+    """A request for a direct route call; the GitHub credential reads no HTTP client."""
+
+    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(http_client=None)))
 
 def test_legacy_deployment_workspace_field_preserves_explicit_values(
     client: TestClient, auth_headers: dict[str, str], clean_db: None
@@ -481,8 +488,8 @@ def test_workspace_credential_is_worker_only_server_derived_and_no_store(
         "authorization_header": "Basic "
         + base64.b64encode(b"x-access-token:ghp_operator_workspace").decode(),
         "revision": None,
-        # The ADR 0197 transport facts default to today's GitHub behavior.
-        "origin": None,
+        # The ADR 0197 transport facts, issued by the GitHub code host.
+        "origin": "https://github.com",
         "header_form": "authorization_basic",
         "ca_bundle_ref": None,
         "base_branch": None,
@@ -560,10 +567,10 @@ def test_workspace_credential_resolution_does_not_block_the_event_loop(
         resolver_started.set()
         if not loop_progressed.wait(timeout=0.5):
             raise AssertionError("credential resolver blocked the event loop")
-        return "https://github.com/acme-corp/acme-bot.git", "Basic test"
+        return "https://github.com/acme-corp/acme-bot.git", "Basic eC1hY2Nlc3MtdG9rZW46dGVzdA=="
 
     monkeypatch.setattr(
-        "curie_api.routers.workspaces.resolve_repository_credential", blocking_resolver
+        "curie_api.forges.github.code_host.resolve_repository_credential", blocking_resolver
     )
 
     async def exercise() -> str:
@@ -575,6 +582,7 @@ def test_workspace_credential_resolution_does_not_block_the_event_loop(
                     redeem_workspace_credential(
                         uuid.UUID(deployment["id"]),
                         WorkspaceCredentialRequest(conversation_id="thread-nonblocking"),
+                        _worker_request(),
                         session,
                         Response(),
                     )
@@ -592,7 +600,7 @@ def test_workspace_credential_resolution_does_not_block_the_event_loop(
         finally:
             await engine.dispose()
 
-    assert asyncio.run(exercise()) == "Basic test"
+    assert asyncio.run(exercise()) == "Basic eC1hY2Nlc3MtdG9rZW46dGVzdA=="
 
 
 def test_workspace_credential_prefers_app_installation_token_over_pat(

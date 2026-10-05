@@ -371,7 +371,6 @@ def _sandbox_client(
         client = DockerSandboxClient(
             image=env.get("CURIE_RUNNER_IMAGE", "curie-runner"),
             bundle_store=bundle_store,
-            github_api_url=config.publication_github_api_url,
             network=env.get("CURIE_DOCKER_NETWORK") or None,
             otel_endpoint=runner_otel_endpoint or None,
             default_plugin_dir=config.bundle_plugin_dir,
@@ -473,7 +472,6 @@ def build(
             preparer=WorkspacePreparer(
                 credentials=WorkspaceCredentialClient(
                     api_url=config.api_base_url,
-                    github_api_url=config.publication_github_api_url,
                     worker_token=config.internal_worker_token,
                 ),
                 commands=SubprocessCommands(),
@@ -1318,7 +1316,6 @@ def _build_publication_loop(
         store=store,
         credentials=PublicationCredentialClient(
             api_base_url=config.api_base_url,
-            github_html_base=config.publication_github_html_base,
             worker_token=config.internal_worker_token,
             client=http,
         ),
@@ -1358,7 +1355,8 @@ def _build_publication_loop(
             owner_name=config.publication_owner_name,
             git_user_name=config.publication_git_user_name,
             git_user_email=config.publication_git_user_email,
-            github_api_url=config.publication_github_api_url,
+            ca_bundle_config_map=config.publication_ca_bundle_config_map,
+            ca_bundle_key=config.publication_ca_bundle_key,
             active_deadline_seconds=(config.publication_job_active_deadline_seconds),
             git_timeout_seconds=config.publication_git_command_timeout_seconds,
             cpu_request=config.publication_cpu_request,

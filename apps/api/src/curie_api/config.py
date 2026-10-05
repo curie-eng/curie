@@ -348,6 +348,16 @@ class Settings(BaseSettings):
     # ever reach this host (#1122). Point it at a GitHub Enterprise Server base
     # to deploy from GHE, exactly as with `github_api_url` above.
     github_clone_base: str = "https://github.com"
+    # A PEM CA bundle for a code host whose certificate no public root covers
+    # (ADR 0197, #3831): the path the chart mounts the operator's
+    # codeHostTrust.caBundle at. The API's code host HTTP clients trust it in
+    # addition to the public roots, and it is returned as ``ca_bundle_ref``
+    # with every repository credential so the worker, the sandbox and the
+    # publication Job trust the same file. Empty trusts the public roots only.
+    code_host_ca_bundle: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_CODE_HOST_CA_BUNDLE", "code_host_ca_bundle"),
+    )
     # Upper bound on the GitHub webhook request body, enforced before the body is
     # fully buffered, parsed, or HMAC-authenticated (#633) so an unauthenticated
     # oversized request cannot exhaust memory. GitHub caps webhook payloads at

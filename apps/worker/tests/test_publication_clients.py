@@ -16,6 +16,7 @@ from curie_worker.publication_clients import (
     PublicationTranscriptClient,
 )
 from curie_worker.publication_loop import (
+    PublicationCredential,
     PublicationIdentityUnavailable,
     PublicationLineageRefused,
     PublicationReconcileError,
@@ -287,35 +288,70 @@ async def test_code_host_client_refuses_construction_without_internal_worker_aut
             PublicationCodeHostClient(api_base_url=LINEAGE_API_BASE, worker_token="", client=client)
 
 
-@pytest.mark.parametrize("html_base", ["https://github.com", "https://github.example.com/forge"])
-async def test_publication_credential_accepts_only_the_configured_clone_origin(
-    html_base: str,
-) -> None:
-    clone_url = f"{html_base}/{REPO}.git"
-    requests: list[httpx.Request] = []
+def _credential_body(**overrides: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "repo_full_name": REPO,
+        "clone_url": f"https://github.example.com/forge/{REPO}.git",
+        "authorization_header": "Basic eC1hY2Nlc3MtdG9rZW46Zml4dHVyZQ==",
+        "origin": "https://github.example.com/forge",
+        "header_form": "authorization_basic",
+        "ca_bundle_ref": None,
+    }
+    body.update(overrides)
+    return body
 
+
+async def _redeem(body: dict[str, object], requests: list[httpx.Request] | None = None) -> object:
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(
-            200,
-            headers={"Cache-Control": "no-store"},
-            json={
-                "repo_full_name": REPO,
-                "clone_url": clone_url,
-                "authorization_header": "Bearer fixture-publication-token",
-            },
-        )
+        if requests is not None:
+            requests.append(request)
+        return httpx.Response(200, headers={"Cache-Control": "no-store"}, json=body)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        credential = await PublicationCredentialClient(
-            api_base_url=LINEAGE_API_BASE,
-            worker_token=WORKER_TOKEN,
-            github_html_base=html_base,
-            client=http,
+        return await PublicationCredentialClient(
+            api_base_url=LINEAGE_API_BASE, worker_token=WORKER_TOKEN, client=http
         ).redeem(PUBLICATION_ID)
 
-    assert credential.clean_clone_url == clone_url
-    assert credential.authorization_header == "Bearer fixture-publication-token"
+
+@pytest.mark.parametrize(
+    ("origin", "repo", "header_form", "ca_bundle_ref"),
+    [
+        ("https://github.com", REPO, "authorization_basic", None),
+        ("https://github.example.com/forge", REPO, "authorization_basic", None),
+        # Any code host the API names (ADR 0197): a nested path, another
+        # header form and a mounted trust bundle are data, not GitHub rules.
+        (
+            "https://gitlab.example.com",
+            "group/sub/project",
+            "private_token",
+            "/etc/curie/code-host-trust/ca.crt",
+        ),
+    ],
+)
+async def test_publication_credential_takes_origin_header_form_and_ca_as_data(
+    origin: str, repo: str, header_form: str, ca_bundle_ref: str | None
+) -> None:
+    clone_url = f"{origin}/{repo}.git"
+    requests: list[httpx.Request] = []
+
+    credential = await _redeem(
+        _credential_body(
+            repo_full_name=repo,
+            clone_url=clone_url,
+            origin=origin,
+            header_form=header_form,
+            ca_bundle_ref=ca_bundle_ref,
+        ),
+        requests,
+    )
+
+    assert credential == PublicationCredential(
+        clean_clone_url=clone_url,
+        authorization_header="Basic eC1hY2Nlc3MtdG9rZW46Zml4dHVyZQ==",
+        origin=origin,
+        header_form=header_form,  # type: ignore[arg-type]
+        ca_bundle_ref=ca_bundle_ref,
+    )
     assert len(requests) == 1
     assert requests[0].method == "POST"
     assert requests[0].url.path == f"/v1/internal/publications/{PUBLICATION_ID}/credential"
@@ -323,39 +359,52 @@ async def test_publication_credential_accepts_only_the_configured_clone_origin(
 
 
 @pytest.mark.parametrize(
-    "clone_url",
+    ("overrides", "message"),
     [
-        f"https://github.com/{REPO}.git",
-        f"https://other.example.com/forge/{REPO}.git",
-        f"https://github.example.com/{REPO}.git",
-        f"https://user@github.example.com/forge/{REPO}.git",
-        f"https://github.example.com/forge/{REPO}.git?token=example",
-        f"https://github.example.com/forge/{REPO}.git#example",
+        ({"clone_url": f"https://github.com/{REPO}.git"}, "clone URL"),
+        ({"clone_url": f"https://other.example.com/forge/{REPO}.git"}, "clone URL"),
+        ({"clone_url": f"https://github.example.com/{REPO}.git"}, "clone URL"),
+        ({"clone_url": f"https://user@github.example.com/forge/{REPO}.git"}, "clone URL"),
+        ({"clone_url": f"https://github.example.com/forge/{REPO}.git?token=example"}, "clone URL"),
+        ({"clone_url": f"https://github.example.com/forge/{REPO}.git#example"}, "clone URL"),
+        ({"origin": "https://user@github.example.com/forge"}, "clone URL"),
+        ({"origin": "http://github.example.com/forge"}, "clone URL"),
+        ({"header_form": "cookie"}, "header form"),
+        ({"ca_bundle_ref": "relative/ca.crt"}, "CA bundle"),
+        ({"authorization_header": "Basic a\nb"}, "authorization"),
     ],
 )
-async def test_enterprise_publication_credential_refuses_foreign_clone_origins(
-    clone_url: str,
+async def test_publication_credential_refuses_an_unclean_transport(
+    overrides: dict[str, object], message: str
 ) -> None:
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            headers={"Cache-Control": "no-store"},
-            json={
-                "repo_full_name": REPO,
-                "clone_url": clone_url,
-                "authorization_header": "Bearer fixture-publication-token",
-            },
-        )
+    with pytest.raises(PublicationReconcileError, match=message):
+        await _redeem(_credential_body(**overrides))
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        credential_client = PublicationCredentialClient(
-            api_base_url=LINEAGE_API_BASE,
-            worker_token=WORKER_TOKEN,
-            github_html_base="https://github.example.com/forge",
-            client=http,
-        )
-        with pytest.raises(PublicationReconcileError, match="clone URL"):
-            await credential_client.redeem(PUBLICATION_ID)
+
+async def test_metadata_update_is_asked_of_the_api_and_carries_its_update_time() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_pull_out(updated_at="2026-10-05T12:00:00Z"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        pull = await _code_host(handler, client).update_pull_request_metadata(PUBLICATION_ID)
+
+    [request] = requests
+    assert request.method == "POST"
+    assert request.url.path == f"/v1/internal/publications/{PUBLICATION_ID}/pull-request/metadata"
+    assert request.headers["X-Curie-Worker-Token"] == WORKER_TOKEN
+    assert pull.updated_at is not None and pull.updated_at.tzinfo is not None
+
+
+async def test_a_naive_update_time_from_the_api_is_refused() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_pull_out(updated_at="2026-10-05T12:00:00"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PublicationReconcileError, match="invalid pull request"):
+            await _code_host(handler, client).update_pull_request_metadata(PUBLICATION_ID)
 
 
 async def test_publication_result_is_appended_once_to_the_durable_transcript() -> None:

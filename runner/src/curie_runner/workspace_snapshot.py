@@ -23,10 +23,6 @@ from .subprocess_env import shell_and_hook_env
 MAX_PATCH_BYTES = 900_000
 _GIT_TIMEOUT_SECONDS = 30
 _SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
-_REPO_FULL_NAME = re.compile(
-    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
-    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?$"
-)
 # One segment of a declared repository path (ADR 0197): GitLab nests groups, so
 # a code host other than GitHub has any number of these. Dot segments are
 # refused separately, since a URL would resolve them away.
@@ -211,17 +207,14 @@ def _valid_repository_path(path: str) -> bool:
 def _canonical_repo(
     origin: str, *, trusted_origin: str | None, repository_path: str | None
 ) -> str:
+    if trusted_origin is None or repository_path is None:
+        # The worker sets both on every workspace claim (ADR 0197); without
+        # them the runner has no trusted origin to check against.
+        raise WorkspaceSnapshotError(
+            "the boot env names no trusted repository origin and path for the workspace"
+        )
     try:
-        if trusted_origin is None:
-            api = urlsplit(
-                os.environ.get("CURIE_GITHUB_API_URL", "https://api.github.com").rstrip("/")
-            )
-            authority = "github.com" if api.netloc == "api.github.com" else api.netloc
-            html_base = urlunsplit(
-                (api.scheme, authority, api.path.removesuffix("/api/v3"), "", "")
-            )
-        else:
-            html_base = _trusted_base(trusted_origin)
+        html_base = _trusted_base(trusted_origin)
         parsed = urlsplit(origin)
         _ = parsed.port
     except ValueError as exc:
@@ -235,18 +228,11 @@ def _canonical_repo(
         or parsed.fragment
         or not origin.startswith(f"{html_base}/")
     ):
-        host = "GitHub" if trusted_origin is None else "trusted code host"
         raise WorkspaceSnapshotError(
-            f"workspace repository origin is not credential-free {host} HTTPS"
+            "workspace repository origin is not credential-free trusted code host HTTPS"
         )
     repo = origin[len(html_base) + 1 :].removesuffix(".git")
-    if repository_path is None:
-        # No declared path: today's GitHub rule, exactly owner/name.
-        if not _REPO_FULL_NAME.fullmatch(repo) or origin != f"{html_base}/{repo}.git":
-            raise WorkspaceSnapshotError(
-                "workspace repository origin is not an owner/repository URL"
-            )
-    elif (
+    if (
         not _valid_repository_path(repository_path)
         or repo.casefold() != repository_path.casefold()
         or origin != f"{html_base}/{repo}.git"
@@ -322,10 +308,10 @@ def capture_workspace_snapshot(
     """Capture the workspace as a publication patch, refusing an untrusted origin.
 
     ``trusted_origin`` and ``repository_path`` are the boot env's
-    ``CURIE_REPO_ORIGIN`` and ``CURIE_REPO_PATH`` (ADR 0197). ``None`` means the
-    boot env did not set them, which is a GitHub boot: the configured GitHub
-    host and exactly ``owner/name``. A set path is accepted at any depth, but
-    the workspace origin must be exactly that path under the trusted origin.
+    ``CURIE_REPO_ORIGIN`` and ``CURIE_REPO_PATH`` (ADR 0197), which the worker
+    sets on every workspace claim. Without them the snapshot is refused. The
+    path is accepted at any depth, but the workspace origin must be exactly
+    that path under the trusted origin.
     """
 
     repo = Path(workspace)

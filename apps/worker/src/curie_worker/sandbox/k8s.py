@@ -22,7 +22,12 @@ from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 
 from ..attachments import ATTACHMENTS_REF_ENV
-from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
+from ..workspace import (
+    REPO_ORIGIN_ENV,
+    REPO_PATH_ENV,
+    WORKSPACE_REF_ENV,
+    WORKSPACE_SHA256_ENV,
+)
 from .claim_tokens import (
     CLAIM_LABEL,
     ClaimObjectNames,
@@ -64,6 +69,10 @@ EXT_VERSION = "v1beta1"
 BUNDLE_REF_ENV = BootEnv.env_key("bundle_ref")
 BUNDLE_INIT_CONTAINERS = ("bundle-fetch", "bundle-extract")
 WORKSPACE_INIT_CONTAINERS = ("workspace-init",)
+# The claim env each workspace init container receives by name. The origin and
+# path are the trusted checkout origin (ADR 0197); the worker sets them from
+# the API's credential, never from turn text.
+WORKSPACE_INIT_ENV = (WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV, REPO_ORIGIN_ENV, REPO_PATH_ENV)
 # The attachment lane's own init container (#2567): it redeems the minted
 # one-object capabilities and materializes the files into the emptyDir the
 # runner mounts. Named here for the same reason the two above are -- the
@@ -683,27 +692,18 @@ class KubernetesSandboxClient:
                         }
                     )
             # Workspace fetch/extract consumes only the short-lived exact-object
-            # reference and digest. It receives no worker-auth, object-store, or
-            # GitHub credential.
+            # reference and digest, plus the trusted origin and repository path
+            # it checks the checkout against (ADR 0197). It receives no
+            # worker-auth, object-store, or code host credential.
             workspace_ref = env.get(WORKSPACE_REF_ENV)
-            workspace_sha256 = env.get(WORKSPACE_SHA256_ENV)
             if workspace_ref is not None:
                 for container in WORKSPACE_INIT_CONTAINERS:
-                    entries.append(
-                        {
-                            "containerName": container,
-                            "name": WORKSPACE_REF_ENV,
-                            "value": workspace_ref,
-                        }
-                    )
-                    if workspace_sha256 is not None:
-                        entries.append(
-                            {
-                                "containerName": container,
-                                "name": WORKSPACE_SHA256_ENV,
-                                "value": workspace_sha256,
-                            }
-                        )
+                    for key in WORKSPACE_INIT_ENV:
+                        value = env.get(key)
+                        if value is not None:
+                            entries.append(
+                                {"containerName": container, "name": key, "value": value}
+                            )
             # The attachment capability reaches ONLY its own init container. An
             # unnamed entry would also hand the presigned URL to the model's own
             # process -- a capability the agent has no need for and, being a
