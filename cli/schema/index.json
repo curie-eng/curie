@@ -7,7 +7,7 @@
       "result": "AllTargetsDeployOutput",
       "kind": "CliOutput",
       "schema": "deploy.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "ApplyOutput",
@@ -121,7 +121,7 @@
       "result": "DeployOutput",
       "kind": "CliOutput",
       "schema": "deploy.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "DiffOutput",
@@ -397,7 +397,7 @@
       "result": "all_targets_deploy_failure_json",
       "kind": "builder",
       "schema": "deploy.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "error_json",

@@ -282,6 +282,14 @@ The case file and sidecar are packaged in the same immutable deployed bundle.
 The deploy receipt's `bundle_sha256` identifies the exact bundle used for
 local and cluster parity.
 
+Local and cluster deploy receipts list every cron declaration with its name,
+schedule, zone (default `UTC`), and target (`targetless` when absent). An explicit
+target that does not resolve to one bound channel produces a warning after a
+successful deploy; deploy still exits 0. With `--json`, deploy schema v1.2 always
+includes `cron_triggers` and `warnings` arrays, including empty arrays, and an
+absent target is `null`. Each result from `cluster deploy --all-targets` carries
+the same fields.
+
 Run the same authored suite at each tier:
 
 ```bash
@@ -334,7 +342,7 @@ HTTP surface directly. No platform, no queue, no API, no Slack, no cluster.
 | Command | What it does |
 |---|---|
 | `curie skill up` | Boot the local runner image in Docker with the ACI boot env (runner/README.md recipe), wait for health, print the boxed env summary.<br>• `--fake-model` runs offline.<br>• `--network`/`--otel-endpoint` join the compose stack for traces.<br>• `--model <id>` forwards `CURIE_MODEL` (omit for the SDK default).<br>• `--local-model [<id>]` runs a real model through a local Ollama sidecar (default `qwen3:4b`). Its assets are never downloaded implicitly: `up` refuses when the pinned `ollama/ollama` image (~8.9 GB) or the model is not already cached, naming what is missing and its size. `--pull-model` accepts the download for that run (ADR 0093, #1183).<br>• `--secret <NAME>` forwards bundle MCP secrets by name (Curie private storage when the env var isn't exported).<br>• `--env-file <PATH>` reads the model credential from a bundle `.env` as a last resort (precedence: shell env > stored secret > file; only `CURIE_CREDENTIALS`/`CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY`), so a bundle boots live with no `source` step (#749).<br>• Hosted connectors must report healthy via their Docker healthcheck when one is supplied, or stay continuously running for 2 seconds when one is absent. Set `CURIE_CONNECTOR_START_TIMEOUT_SECONDS` to a positive whole number of seconds to change the connector startup budget; the default is 60 seconds. The readiness deadline starts at the first readiness check, after staging and starting the connectors. A connector readiness failure exits nonzero, names the full declared connector key, and releases startup resources including the bundle snapshot. This proves process and health readiness, not tool or MCP discovery.<br>• A leftover container of the same name fails the boot with a clear fix instead of a raw Docker conflict error; `--replace` removes it and boots fresh. |
-| `curie skill check` | Run an offline, credential free MCP load check and report declared servers, matches, and verdict. Declared cron triggers produce one warning here and on `local deploy` or `cluster deploy` because no tier fires them yet (#268); malformed declarations remain validation errors. |
+| `curie skill check` | Run an offline, credential free MCP load check and report declared servers, matches, and verdict. Declared cron triggers produce one warning here because the skill tier has no scheduler. Local and cluster installs fire cron triggers; deploy warns when an explicit target does not resolve to one bound channel. Malformed declarations remain validation errors. |
 | `curie skill approvals` | View the bundle's declared `approvalPolicy` gates, read straight from `.claude-plugin/plugin.json` (or `plugin.json`); no docker, no network.<br>• `--gate <TOOL>` (repeatable) or `--clear` mutate nothing -- they print the `CURIE_APPROVAL_REQUIRED_TOOLS=...` assignment to export, then re-run your original `skill up` invocation with `--secret CURIE_APPROVAL_REQUIRED_TOOLS` added, since the runner only resolves that env once at container boot. |
 | `curie skill versions` | Not available at this tier (exit 4): `skill up` runs a local snapshot of the bundle on disk (its digest is on `skill status`), and nothing is deployed, so no version is assigned. Use `curie local versions <agent>` or `curie cluster versions <agent>`. |
 | `curie skill memory` | Not available at this tier (exit 4): this tier configures no memory namespace. Use `curie local memory <agent>` or `curie cluster memory <agent>`. |

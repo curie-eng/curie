@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/deploy/v1.1.json",
+  "$id": "https://schemas.curietech.ai/cli/deploy/v1.2.json",
   "title": "curie <tier> deploy --json",
   "description": "The agent facing payload of `curie local deploy` / `curie cluster deploy`: a single target result, ordered results for all targets, or reconciliation failures for all targets.",
   "oneOf": [
@@ -105,6 +105,42 @@
             "environment",
             "status"
           ]
+        },
+        "cron_triggers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "schedule": {
+                "type": "string"
+              },
+              "zone": {
+                "type": "string"
+              },
+              "target": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "schedule",
+              "zone",
+              "target"
+            ]
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       },
       "required": [

@@ -113,6 +113,7 @@ struct DeployStub {
     listed: Vec<Value>,
     agent: Value,
     uploads: bool,
+    bundle_rejection: Option<String>,
     deployment: (u16, String),
 }
 
@@ -122,6 +123,7 @@ impl DeployStub {
             listed: vec![agent.clone()],
             agent,
             uploads: true,
+            bundle_rejection: None,
             deployment: (201, deployment_created()),
         }
     }
@@ -131,6 +133,7 @@ impl DeployStub {
             listed,
             agent,
             uploads,
+            bundle_rejection,
             deployment,
         } = self;
         let listed = Value::Array(listed).to_string();
@@ -151,12 +154,15 @@ impl DeployStub {
                         r#"{{"id":"{VERSION_ID}","agent_id":"{AGENT_ID}","version_label":"0.1.0-1","bundle_ref":null,"bundle_sha256":null,"created_by":"tester","created_at":"2026-09-14T00:00:00Z"}}"#
                     ),
                 ),
-                ("PUT", p) if uploads && p == bundle => Response::json(
-                    201,
-                    &format!(
-                        r#"{{"version_id":"{VERSION_ID}","bundle_ref":"bundles/x.tar.gz","bundle_sha256":"deadbeef","size_bytes":512}}"#
+                ("PUT", p) if uploads && p == bundle => match &bundle_rejection {
+                    Some(body) => Response::json(422, body),
+                    None => Response::json(
+                        201,
+                        &format!(
+                            r#"{{"version_id":"{VERSION_ID}","bundle_ref":"bundles/x.tar.gz","bundle_sha256":"deadbeef","size_bytes":512}}"#
+                        ),
                     ),
-                ),
+                },
                 ("POST", "/deployments") if uploads => Response::json(deployment.0, &deployment.1),
                 ("GET", "/deployments") => Response::json(200, "[]"),
                 ("GET", p) if p.starts_with(&versions) && p.ends_with("/files") => {
@@ -234,6 +240,7 @@ async fn first_gated_deploy_creates_the_agent_then_refuses_before_any_version() 
         listed: vec![],
         agent: agent_json("deal-desk", None),
         uploads: false,
+        bundle_rejection: None,
         deployment: (500, UNEXPECTED.to_string()),
     }
     .serve();
@@ -581,7 +588,11 @@ async fn two_top_level_directories_do_not_unwrap() {
     // unwrap into `payload/` and finds no root manifest. The CLI must not
     // refuse on `payload/plugin.json`'s route either: it fails open the same
     // way it does today (no manifest found at the archive root), so the deploy
-    // proceeds to the version request.
+    // proceeds to the version and upload requests. The provider's upload gate
+    // rejects the archive: plugin_format.archive::bundle_root does not unwrap,
+    // plugin_format.validate::_validate_manifest reports manifest.missing,
+    // curie_api.deploy::validate_archive raises BundleInvalid, and
+    // curie_api.routers.bundles::upload_bundle returns the nested HTTP 422 body.
     let dir = gated_bundle(&[("Bash", "ops")]);
     std::fs::write(
         dir.path().join(".curieignore"),
@@ -597,18 +608,46 @@ async fn two_top_level_directories_do_not_unwrap() {
     std::fs::create_dir(dir.path().join("extra")).expect("create a second top-level dir");
     std::fs::write(dir.path().join("extra/note.txt"), "not a manifest")
         .expect("write a file under the second top-level dir");
-    let server = DeployStub::existing(agent_json("deal-desk", None)).serve();
+    let mut stub = DeployStub::existing(agent_json("deal-desk", None));
+    stub.bundle_rejection = Some(json!({
+        "detail": {
+            "detail": "bundle failed validation",
+            "errors": [{
+                "code": "manifest.missing",
+                "message": "no plugin manifest found at .claude-plugin/plugin.json or plugin.json",
+                "location": "<extraction root>"
+            }]
+        }
+    }).to_string());
+    let server = stub.serve();
 
-    deploy(deploy_opts(&server, dir.path(), DeployTier::Cluster, None))
+    let err = deploy(deploy_opts(&server, dir.path(), DeployTier::Cluster, None))
         .await
-        .expect(
-            "two top-level directories means the platform does not unwrap into payload/, so \
-             the deploy must proceed (fail-open: the CLI finds no root manifest either)",
-        );
+        .expect_err("the API must reject an archive with no root manifest on upload");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("uploading the bundle failed with 422")
+            && message.contains("manifest.missing"),
+        "the API's upload rejection must retain its missing-manifest error: {message}"
+    );
 
     assert!(
         sent(&server, "POST", &format!("/agents/{AGENT_ID}/versions")),
         "the deploy must reach the version request: {:?}",
+        flow(&server)
+    );
+    assert!(
+        sent(
+            &server,
+            "PUT",
+            &format!("/agents/{AGENT_ID}/versions/{VERSION_ID}/bundle")
+        ),
+        "the approval precheck must fail open until the API upload gate: {:?}",
+        flow(&server)
+    );
+    assert!(
+        !sent(&server, "POST", "/deployments"),
+        "a rejected upload must not create a deployment: {:?}",
         flow(&server)
     );
 }
@@ -620,6 +659,7 @@ fn deploy_json_refusal_is_one_error_object_with_fix() {
         listed: vec![],
         agent: agent_json("deal-desk", None),
         uploads: false,
+        bundle_rejection: None,
         deployment: (500, UNEXPECTED.to_string()),
     }
     .serve();
