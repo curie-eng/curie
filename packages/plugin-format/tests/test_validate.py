@@ -351,8 +351,19 @@ def test_cron_out_of_range_field_is_named_with_its_range(
         ("* 5-1 * * *", "hour", "5-1"),
         ("*/0 * * * *", "minute", "*/0"),
         ("* * * * 99999", "day-of-week", "99999"),
+        ("* * abc * *", "day-of-month", "abc"),
+        ("* * jan * *", "day-of-month", "jan"),
     ],
-    ids=["unknown-text", "unknown-month", "empty-part", "reversed", "zero-step", "oversized"],
+    ids=[
+        "unknown-text",
+        "unknown-month",
+        "empty-part",
+        "reversed",
+        "zero-step",
+        "oversized",
+        "dom-unknown-text",
+        "dom-month-name",
+    ],
 )
 def test_cron_malformed_field_is_named(
     tmp_path: Path, schedule: str, field: str, text: str
