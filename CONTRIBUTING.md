@@ -82,19 +82,24 @@ need to change code, cut a worktree.
 
 ## Running the checks
 
-Once the primary checkout contains the tracked hook, run `curie dev hooks
-install` there or from any linked worktree. This sets the repository's shared
-`core.hooksPath` to the primary checkout's tracked `hooks/` directory, so new
-linked worktrees use the hook automatically. Keep the primary checkout in place.
-Keep it on a revision containing `hooks/pre-push`; switching it to an older
-revision removes the hook for every linked worktree. An existing custom
-`core.hooksPath` is preserved. Once installed, Git no longer runs hooks from
-`.git/hooks`.
-Each push checks Rust formatting when the pushed commits change
-`cli/` Rust files, and checks Python formatting and lint only for Python files
-changed by those commits. The hook prints the command to fix a failure. It
-checks the currently checked out `HEAD`; commit local source edits before
-pushing. It does not replace the full CI checks below.
+After committing a change, run `curie dev preflight --fast` before pushing.
+The command selects the cheap pull request gates for the changed paths and runs
+their CI commands. Use `--base <branch>` to compare against a fetched
+`origin/<branch>` (the default is `main`), `--dry-run` to print the selected
+commands, and `--json` to receive one structured report. A failing gate includes
+its output tail.
+
+`curie install` and `curie update` set `core.hooksPath=.githooks` when no custom
+path is configured. You can also run `curie dev hooks install`. The relative
+path is shared by linked worktrees, and each worktree runs its own tracked
+`.githooks/pre-push`. An existing different path is preserved with a warning;
+to select the Curie hooks explicitly, run
+`git config --local core.hooksPath .githooks`. Git then uses this directory
+instead of `.git/hooks`.
+
+The tracked hook runs fast preflight before a push. Use `git push --no-verify`
+only when you deliberately need to bypass it. Fast preflight does not replace
+the full checks below.
 
 CI (`.github/workflows/ci.yaml`) runs the same commands below. Run the ones for
 the area you touched before opening a PR. Scope test runs to what you changed;

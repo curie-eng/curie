@@ -161,11 +161,11 @@ fn visible(output: &Output) -> String {
 
 fn assert_preflight_schema(report: &serde_json::Value) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("schema/preflight.schema.json");
-    let schema: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("committed schema {} must exist: {error}", path.display())),
-    )
-    .expect("preflight schema must be JSON");
+    let schema: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("committed schema {} must exist: {error}", path.display())
+        }))
+        .expect("preflight schema must be JSON");
     let validator = jsonschema::validator_for(&schema).expect("preflight schema must compile");
     assert!(
         validator.is_valid(report),
