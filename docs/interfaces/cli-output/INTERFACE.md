@@ -133,7 +133,7 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   longer schema-free: there are 63 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
-  against real `to_json()` output across 79 tests in `cli/tests/json_contract.rs`.
+  against real `to_json()` output across 82 tests in `cli/tests/json_contract.rs`.
   The dark factory render receipt uses schema version 2. Its `runner_image`
   and `runner_note` fields are required and accept a string or `null`; the
   binary render tests validate the actual receipt against the committed schema.
