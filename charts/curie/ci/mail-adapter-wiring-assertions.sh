@@ -35,6 +35,8 @@
 #   9  CURIE_MAIL_ALLOWED_SENDERS renders from mailAdapter.allowedSenders, and an
 #      EMPTY list renders an empty value rather than being omitted, so the
 #      adapter's boot gate fires instead of the variable silently defaulting.
+#      The candidate also renders CURIE_MAIL_ALLOW_ALL_SENDERS=false against
+#      retained v0.12.0 defaults, which have no allowAllSenders key.
 #   10 Every configured knob arrives under the exact name MailAdapterConfig
 #      reads. A typo in an env NAME renders green and is then ignored at runtime.
 #   11 replicas is 1, --set mailAdapter.replicas=3 does not change it (the knob
@@ -497,6 +499,33 @@ assert_env_value "$on_dir" CURIE_MAIL_ALLOWED_SENDERS "" \
 senders_dir="$(render senders "${ON[@]}" "${CREDS[@]}" --set 'mailAdapter.allowedSenders={ops@example.com,dev@example.com}')"
 assert_env_value "$senders_dir" CURIE_MAIL_ALLOWED_SENDERS "ops@example.com,dev@example.com" \
   "The configured allow-list must reach the process comma-joined."
+
+# Helm --reuse-values replaces the candidate's defaults with the released
+# defaults; an old values overlay would silently retain the new key. Use the
+# actual locally tracked release values, without a network or provider call.
+retained_chart="$TMP/retained-v0.12.0"
+cp -R "$CHART" "$retained_chart"
+git -C "$REPO_ROOT" show v0.12.0:charts/curie/values.yaml > "$retained_chart/values.yaml" \
+  || fail "the tracked v0.12.0 values.yaml is required for the retained-values proof"
+python3 - "$retained_chart/values.yaml" <<'PY' \
+  || fail "v0.12.0 must contain mailAdapter defaults without allowAllSenders"
+import sys
+
+import yaml
+
+values = yaml.safe_load(open(sys.argv[1]))
+mail = values.get("mailAdapter")
+if not isinstance(mail, dict) or "allowAllSenders" in mail:
+    raise SystemExit("retained values must predate mailAdapter.allowAllSenders")
+PY
+retained_dir="$TMP/render-retained-v0.12.0"
+mkdir -p "$retained_dir"
+helm template "$RELEASE" "$retained_chart" --namespace default --is-upgrade \
+  --output-dir "$retained_dir" "${ON[@]}" "${CREDS[@]}" \
+  --set 'mailAdapter.allowedSenders={ops@example.com}' >/dev/null \
+  || fail "candidate templates must render against retained v0.12.0 defaults"
+assert_env_value "$retained_dir" CURIE_MAIL_ALLOW_ALL_SENDERS "false" \
+  "Retained release values without allowAllSenders must keep wildcard consent false."
 
 # ---------------------------------------------------------------------------
 # 10: every configured knob arrives under the exact name MailAdapterConfig reads.
