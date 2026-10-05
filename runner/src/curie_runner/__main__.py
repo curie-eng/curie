@@ -61,8 +61,8 @@ from .harness.claude.approval import (
     build_can_use_tool,
     build_memory_tools,
 )
-from .harness.claude.preflight_blocked import PreflightBlockedSession
 from .harness.claude.platform_slack import build_channel_read_server
+from .harness.claude.preflight_blocked import PreflightBlockedSession
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
     BUILTIN_HARNESS_CANONICAL_PATHS,
