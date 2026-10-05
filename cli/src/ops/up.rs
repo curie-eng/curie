@@ -3248,7 +3248,8 @@ enum ClusterUpInference {
         owner_release: Option<String>,
         image: Option<String>,
     },
-    GvisorOff,
+    GvisorOffFromLookup,
+    GvisorOffFromAdmission,
 }
 
 impl ClusterUpInference {
@@ -3277,7 +3278,10 @@ impl ClusterUpInference {
                     image.as_deref().unwrap_or("unknown")
                 )),
             },
-            Self::GvisorOff => ui.note(&format!(
+            Self::GvisorOffFromLookup => ui.note(&format!(
+                "inferred that the cluster has no `gvisor` RuntimeClass from the RuntimeClass lookup (NotFound); applying `--set {GVISOR_MODE_KEY}=off`"
+            )),
+            Self::GvisorOffFromAdmission => ui.note(&format!(
                 "inferred that the cluster has no `gvisor` RuntimeClass from admission; applying `--set {GVISOR_MODE_KEY}=off`"
             )),
         }
@@ -5583,7 +5587,7 @@ async fn run_prepared_up(
                         .into());
                     }
                     value_plan.set(GVISOR_MODE_KEY, "off");
-                    ClusterUpInference::GvisorOff.render(ui);
+                    ClusterUpInference::GvisorOffFromLookup.render(ui);
                     cmds = up_commands_with_plan(&opts, &value_plan);
                     gvisor_preflight =
                         rendered_gvisor_preflight_job(&opts.chart, &opts.common, &value_plan)
@@ -5649,7 +5653,7 @@ async fn run_prepared_up(
                 }
                 step.warn("retrying");
                 value_plan.set(GVISOR_MODE_KEY, "off");
-                ClusterUpInference::GvisorOff.render(ui);
+                ClusterUpInference::GvisorOffFromAdmission.render(ui);
                 if let Err(error) = discard_failed_gvisor_install_if_never_deployed(
                     &cl,
                     &opts.common,
