@@ -1289,6 +1289,8 @@ enum DevAction {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Check the OpenRouter credit on CURIE_CREDENTIALS before a graded ladder spends a build.
+    ModelCredit,
     /// Serve a TLS GitHub fixture or capture public check lifecycle recordings.
     GithubStub {
         /// `serve` or `capture`, followed by fixture flags.
@@ -4805,6 +4807,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 commands::dev_script("cli/scripts/model-script.sh", &args).await
             }
+            DevAction::ModelCredit => curie::openrouter_credit::model_credit().await,
             DevAction::GithubStub { args } => {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 commands::dev_script("cli/scripts/github-stub.sh", &args).await

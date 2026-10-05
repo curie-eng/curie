@@ -52,7 +52,11 @@ jobs:
         with:
           workspaces: cli
       - name: Release build
+        id: cli-build
         run: cargo build --release --locked
+      - name: Record a build failure
+        if: steps.cli-build.outcome == 'failure'
+        run: echo build-failed >> "$GITHUB_STEP_SUMMARY"
       - name: Upload curie binary
         uses: actions/upload-artifact@v7
         with:
@@ -110,6 +114,17 @@ jobs:
           path: cli/target/release
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
+      - name: Check OpenRouter model credit
+        env:
+          CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          set +e
+          class="$(cli/target/release/curie dev model-credit)"
+          status=$?
+          set -e
+          printf '%s\n' "$class" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       # Image builds mirror e2e-ladder exactly: a named cache-only buildx
       # builder that is NOT made the default (`use: false`) so the
       # compose-triggered worker-local overlay build still resolves the
@@ -121,6 +136,7 @@ jobs:
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
+        id: build-runner
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -134,6 +150,7 @@ jobs:
       - name: Retag the runner image for the compose worker (CURIE_RUNNER_IMAGE, no registry auth)
         run: docker tag curie-runner ghcr.io/curie-eng/curie-runner:latest
       - name: Build the api image locally (satisfies curie-api + curie-migrate, no registry auth)
+        id: build-api
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -145,6 +162,7 @@ jobs:
           cache-from: type=gha,scope=ladder-api
           cache-to: type=gha,mode=max,scope=ladder-api
       - name: Build the worker base image locally (satisfies the worker-local overlay's FROM, no registry auth)
+        id: build-worker
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -166,7 +184,11 @@ jobs:
       # the first rung and adds the hosting and changed-source rebuild cases.
       # No CURIE_E2E_CONNECTOR_REGISTRY: these two rungs deliver into the local
       # Docker daemon by design, which only the cluster rung refuses.
+      - name: Record a build failure
+        if: ${{ steps.build-runner.outcome == 'failure' || steps.build-api.outcome == 'failure' || steps.build-worker.outcome == 'failure' }}
+        run: echo build-failed >> "$GITHUB_STEP_SUMMARY"
       - name: Graded parity ladder (skill + local rungs)
+        id: ladder
         env:
           CURIE_BIN: cli/target/release/curie
           CURIE_BASE_TAG: ci-local
@@ -178,6 +200,9 @@ jobs:
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
           CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
         run: bash cli/scripts/e2e-ladder.sh
+      - name: Record a test failure
+        if: steps.ladder.outcome == 'failure'
+        run: echo test-failed >> "$GITHUB_STEP_SUMMARY"
 
   # Graded sibling of ci.yaml's e2e-ladder-release (#947): the same
   # generated-release-compose round trip, armed live. ci.yaml exercises this rung
@@ -204,6 +229,17 @@ jobs:
           path: cli/target/release
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
+      - name: Check OpenRouter model credit
+        env:
+          CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          set +e
+          class="$(cli/target/release/curie dev model-credit)"
+          status=$?
+          set -e
+          printf '%s\n' "$class" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       # Image builds mirror e2e-ladder-release exactly: a named cache-only buildx
       # builder that is NOT made the default (`use: false`) so the
       # compose-triggered worker-local overlay build below still resolves its
@@ -215,6 +251,7 @@ jobs:
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
+        id: build-runner
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -228,6 +265,7 @@ jobs:
       - name: Retag the runner image for the compose worker (CURIE_RUNNER_IMAGE, no registry auth)
         run: docker tag curie-runner ghcr.io/curie-eng/curie-runner:latest
       - name: Build the api image locally (satisfies curie-api + curie-migrate, no registry auth)
+        id: build-api
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -239,6 +277,7 @@ jobs:
           cache-from: type=gha,scope=ladder-api
           cache-to: type=gha,mode=max,scope=ladder-api
       - name: Build the worker base image locally (satisfies the worker-local overlay's FROM, no registry auth)
+        id: build-worker
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -256,6 +295,7 @@ jobs:
       # Dispatcher is required even without --slack because local message
       # runs a one-shot container from that image (#1915).
       - name: Build the dispatcher image locally (one-shot local message producer, no registry auth)
+        id: build-dispatcher
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -272,6 +312,7 @@ jobs:
       # that profile pins the ui image too (#2005). The ui image is not a FROM
       # consumer, so it builds on the named cache-only builder like api/worker.
       - name: Build the ui image locally (satisfies the generated release compose, no registry auth)
+        id: build-ui
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -290,12 +331,14 @@ jobs:
       - name: Tag the api image for the generated release compose (ghcr.io/curie-eng/curie-api:latest, no registry auth)
         run: docker tag ghcr.io/curie-eng/curie-api:ci-local ghcr.io/curie-eng/curie-api:latest
       - name: Build the worker-local overlay for the generated release compose (ghcr.io/curie-eng/curie-worker-local:latest, no registry auth)
+        id: build-worker-local
         run: docker build --build-arg BASE_TAG=ci-local -t ghcr.io/curie-eng/curie-worker-local:latest -f compose/worker-local.Dockerfile compose
       # Derive any remaining GHCR refs from the generated compose profile
       # (plus dispatcher/runner extras the rung still needs) instead of
       # adding images one at a time (#2005, #2245). Cached builds above
       # satisfy the common images; this step builds whatever is still missing.
       - name: Build any remaining release-compose images the selected profile requires
+        id: ensure-release-images
         run: python3 compose/ensure_release_images.py --profiles full --build-missing
       # Live grading, same posture as the other rungs: CURIE_E2E_LIVE drops the
       # fake fixture and the ladder reads the OpenRouter credential from
@@ -303,7 +346,11 @@ jobs:
       # a run: or argv line. No CURIE_BASE_TAG here (unlike the skill+local job):
       # this rung runs against the generated release compose, whose image refs are
       # the `:latest` tags built above, not a base-tag override.
+      - name: Record a build failure
+        if: ${{ steps.build-runner.outcome == 'failure' || steps.build-api.outcome == 'failure' || steps.build-worker.outcome == 'failure' || steps.build-dispatcher.outcome == 'failure' || steps.build-ui.outcome == 'failure' || steps.build-worker-local.outcome == 'failure' || steps.ensure-release-images.outcome == 'failure' }}
+        run: echo build-failed >> "$GITHUB_STEP_SUMMARY"
       - name: Graded parity ladder (local-release rung against generated compose.release.yaml, live model)
+        id: ladder
         env:
           CURIE_BIN: cli/target/release/curie
           CURIE_E2E_TIERS: local-release
@@ -311,6 +358,9 @@ jobs:
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
           CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
         run: bash cli/scripts/e2e-ladder.sh
+      - name: Record a test failure
+        if: steps.ladder.outcome == 'failure'
+        run: echo test-failed >> "$GITHUB_STEP_SUMMARY"
 
   # Graded sibling of ci.yaml's e2e-ladder-cluster: same kind substrate and
   # round-trip mechanics, but the install is graded (not sealed) and the run
@@ -331,6 +381,17 @@ jobs:
           path: cli/target/release
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
+      - name: Check OpenRouter model credit
+        env:
+          CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          set +e
+          class="$(cli/target/release/curie dev model-credit)"
+          status=$?
+          set -e
+          printf '%s\n' "$class" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       - name: Install Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
@@ -346,6 +407,7 @@ jobs:
         with:
           use: false
       - name: Build the api image locally
+        id: build-api
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -357,6 +419,7 @@ jobs:
           cache-from: type=gha,scope=ladder-api
           cache-to: type=gha,mode=max,scope=ladder-api
       - name: Build the worker image locally
+        id: build-worker
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -368,6 +431,7 @@ jobs:
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
       - name: Build the ui image locally
+        id: build-ui
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -379,6 +443,7 @@ jobs:
           cache-from: type=gha,scope=ladder-ui
           cache-to: type=gha,mode=max,scope=ladder-ui
       - name: Build the runner image locally
+        id: build-runner
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -517,7 +582,11 @@ jobs:
       # local-daemon lock), and this job has none -- every image reaches the
       # cluster through `kind load`, with no registry auth anywhere in the
       # workflow -- so the cluster connector rung stays unwired until one exists.
+      - name: Record a build failure
+        if: ${{ steps.build-api.outcome == 'failure' || steps.build-worker.outcome == 'failure' || steps.build-ui.outcome == 'failure' || steps.build-runner.outcome == 'failure' }}
+        run: echo build-failed >> "$GITHUB_STEP_SUMMARY"
       - name: Graded parity ladder (cluster rung, live model)
+        id: ladder
         env:
           CURIE_BIN: cli/target/release/curie
           CURIE_E2E_TIERS: cluster
@@ -525,6 +594,9 @@ jobs:
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
           CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
         run: bash cli/scripts/e2e-ladder.sh
+      - name: Record a test failure
+        if: steps.ladder.outcome == 'failure'
+        run: echo test-failed >> "$GITHUB_STEP_SUMMARY"
       # Surface why on any failure above: pod states, recent events, and the
       # worker/runner logs are what localize a reachability or scheduling break.
       # Deliberately no `kubectl get secret`: the credential reaches the pod via

@@ -262,6 +262,12 @@
       "version": "1.0"
     },
     {
+      "result": "ModelCreditOutput",
+      "kind": "CliOutput",
+      "schema": "model-credit.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ObservabilityOnlyOutput",
       "kind": "CliOutput",
       "schema": "observability-only.schema.json",

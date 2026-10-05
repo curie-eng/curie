@@ -91,42 +91,32 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      # No credential means NO PROOF, and no proof must never read as a pass.
-      #
-      # Two routes reach this branch, and neither can be fixed by re-running
-      # the same event: a fork PR, whose `pull_request` run is issued a
-      # GITHUB_TOKEN that cannot read repository secrets at all, and -- the
-      # case this workflow was actually built for -- a Dependabot PR, whose
-      # `pull_request` runs read the separate Dependabot secret store rather
-      # than the regular `secrets.*` one. The ticket's own motivating scenario
-      # is "Dependabot groups every Python bump into one weekly PR", so the
-      # primary trigger for this gate is exactly the one that arrives without
-      # OPENROUTER_API_KEY.
-      #
-      # An earlier revision reported-and-passed here (summary notice, exit 0).
-      # That is the precise defect class this workflow exists to close: a green
-      # check that proved nothing, which is how #1852 shipped in the first
-      # place. A skipped live proof that still reports success lets a
-      # claude-agent-sdk bump merge on a vacuous green, so this step FAILS.
-      # The GITHUB_STEP_SUMMARY notice stays -- it is what tells a maintainer
-      # which trusted path re-establishes the proof -- but the check goes red
-      # until one of them actually runs. Deliberately NOT solved with
-      # `pull_request_target`: that would run untrusted PR code with the live
-      # credential in scope, trading a vacuous green for a secret-exfiltration
-      # vector.
-      #
-      # Because this step FAILS rather than skipping, every later step in this
-      # job is skipped by the implicit `success()` condition: the expensive
-      # build and the live ladder never execute without a credential, and no
-      # per-step condition is needed to arrange that. (An action's own post
-      # step still runs -- those default to `always()` -- which is checkout
-      # cleanup, not proof work.) A step guard here would be unreachable, and
-      # an unreachable guard reads as load-bearing to the next editor.
-      - id: fork_guard
-        name: Require a usable model credential (no credential == no proof, fail)
+      - name: Toolchain
+        working-directory: cli
+        run: rustc --version
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: cli
+      - name: Release build
+        id: cli-build
+        working-directory: cli
+        run: cargo build --release --locked
+      # The CLI is already built. This check is unconditional and fails the job
+      # on any class other than credit-sufficient, before the image build.
+      # credential-missing (a fork or Dependabot run, which has no repository
+      # secret) also writes the maintainer summary. It never exits 0.
+      - name: Check OpenRouter model credit
+        env:
+          CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           set -euo pipefail
-          if [[ -z "${{ secrets.OPENROUTER_API_KEY }}" ]]; then
+          set +e
+          class="$(cli/target/release/curie dev model-credit)"
+          status=$?
+          set -e
+          printf '%s\n' "$class" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$class" == "credential-missing" ]]; then
             {
               echo "### SDK approval-gate live proof DID NOT RUN -- this check is red on purpose"
               echo ""
@@ -141,19 +131,8 @@ jobs:
               echo ""
               echo "Do not merge on this red check without one of the above. See #2094, #1852, #2068."
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error title=Live approval-gate proof did not run::No OPENROUTER_API_KEY is available to this run, so the live claude-agent-sdk approval-gate proof could not execute. Failing rather than reporting a green check that proved nothing -- see the job summary for the two trusted ways to run it." >&2
-            exit 1
           fi
-      - name: Toolchain
-        working-directory: cli
-        run: rustc --version
-      - name: Cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: cli
-      - name: Release build
-        working-directory: cli
-        run: cargo build --release --locked
+          exit "$status"
       # Image build mirrors nightly-graded-ladder.yaml's ladder-skill-local job
       # exactly: a named cache-only buildx builder that is NOT made the
       # default (`use: false`) so the compose-triggered worker-local overlay
@@ -167,6 +146,7 @@ jobs:
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
+        id: build-runner
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -187,7 +167,11 @@ jobs:
       # without it, case_live_approval_gate_denies prints its skip line and
       # this job runs sealed and green forever while proving nothing about
       # #1852/#2068.
+      - name: Record a build failure
+        if: ${{ steps.cli-build.outcome == 'failure' || steps.build-runner.outcome == 'failure' }}
+        run: echo build-failed >> "$GITHUB_STEP_SUMMARY"
       - name: Live approval-gate ladder case (skill rung)
+        id: ladder
         env:
           CURIE_BIN: cli/target/release/curie
           CURIE_BASE_TAG: ci-local
@@ -196,3 +180,6 @@ jobs:
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
           CURIE_MODEL: z-ai/glm-5.2
         run: bash cli/scripts/e2e-ladder.sh
+      - name: Record a test failure
+        if: steps.ladder.outcome == 'failure'
+        run: echo test-failed >> "$GITHUB_STEP_SUMMARY"
