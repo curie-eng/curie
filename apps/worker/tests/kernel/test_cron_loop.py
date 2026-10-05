@@ -1557,3 +1557,94 @@ def test_resume_slot_waits_for_a_pre_pause_fire_to_finish(
             assert fires == [_fire_labels("deferred")]
 
     asyncio.run(body())
+
+
+async def _hook_run_reason(seed: Any, slot: datetime) -> tuple[str | None, str | None]:
+    async with seed.engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT outcome, reason FROM curie.hook_runs "
+                    "WHERE agent_id = :agent AND slot_utc = :slot"
+                ),
+                {"agent": seed.agent_id, "slot": slot},
+            )
+        ).one()
+    return row.outcome, row.reason
+
+
+def test_hook_run_reason_agent_killed(sync_redis: redis.Redis, names: dict[str, str]) -> None:
+    async def killed(_agent_id: uuid.UUID) -> bool:
+        return True
+
+    async def body() -> None:
+        async with _seed() as seed:
+            await _pass_once(seed, names["stream"], _trigger(seed), is_killed=killed)
+            assert await _hook_run_reason(seed, seed.slot) == ("blocked", "agent_killed")
+
+    asyncio.run(body())
+
+
+def test_hook_run_reason_budget_exhausted(sync_redis: redis.Redis, names: dict[str, str]) -> None:
+    async def body() -> None:
+        async with _seed(max_usd_per_day=0) as seed:
+            await _pass_once(seed, names["stream"], _trigger(seed))
+            assert await _hook_run_reason(seed, seed.slot) == ("blocked", "budget_exhausted")
+
+    asyncio.run(body())
+
+
+def test_hook_run_reason_target_unbound(sync_redis: redis.Redis, names: dict[str, str]) -> None:
+    async def body() -> None:
+        async with _seed() as seed:
+            unbound = "C0EXAMPLE9"
+            await _pass_once(seed, names["stream"], _trigger(seed, target=unbound))
+            assert await _hook_run_reason(seed, seed.slot) == ("failed", "target_unbound")
+
+    asyncio.run(body())
+
+
+def test_hook_run_reason_run_in_flight(sync_redis: redis.Redis, names: dict[str, str]) -> None:
+    async def body() -> None:
+        async with _seed() as seed:
+            now = seed.slot + timedelta(seconds=30)
+            previous = seed.slot - timedelta(days=1)
+            await seed.add_run(previous, now - timedelta(seconds=10))
+            await _pass_once(seed, names["stream"], _trigger(seed))
+            assert await _hook_run_reason(seed, seed.slot) == ("skipped", "run_in_flight")
+
+    asyncio.run(body())
+
+
+def test_hook_run_reason_catch_up_expired(sync_redis: redis.Redis, names: dict[str, str]) -> None:
+    async def body() -> None:
+        async with _seed() as seed:
+            last = seed.slot - timedelta(hours=3)
+            await seed.add_run(last, last)
+            async with seed.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE curie.hook_runs SET outcome = 'ran', ended_at = now() "
+                        "WHERE agent_id = :a"
+                    ),
+                    {"a": seed.agent_id},
+                )
+            trigger = _trigger(seed, schedule=f"{seed.slot.minute} * * * *")
+            await _pass_once(seed, names["stream"], trigger)
+            skipped = seed.slot - timedelta(hours=1)
+            assert await _hook_run_reason(seed, skipped) == ("skipped", "catch_up_expired")
+
+    asyncio.run(body())
+
+
+def test_hook_run_reason_deferred_expired(sync_redis: redis.Redis, names: dict[str, str]) -> None:
+    async def body() -> None:
+        async with _seed() as seed:
+            now = seed.slot + timedelta(hours=25)
+            dow = (seed.slot.weekday() + 1) % 7
+            trigger = _trigger(seed, schedule=f"{seed.slot.minute} {seed.slot.hour} * * {dow}")
+            await seed.add_run(seed.slot, seed.slot, outcome="deferred")
+            await _later_pass(seed, names["stream"], trigger, now)
+            assert await _hook_run_reason(seed, seed.slot) == ("skipped", "deferred_expired")
+
+    asyncio.run(body())

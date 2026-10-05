@@ -150,7 +150,13 @@ from .capacity_wait import (
 from .config import WorkerConfig
 from .connector_grant import mint as mint_connector_grant
 from .delivery_lease import DeliveryLease, LeaseLostError
-from .hook_runs import HookRunOutcome, HookRunRecorder, HookRunRecorderError, retry_expiry
+from .hook_runs import (
+    HookRunOutcome,
+    HookRunReason,
+    HookRunRecorder,
+    HookRunRecorderError,
+    retry_expiry,
+)
 from .killswitch import KillSwitch
 from .markers import CompletionRecord, DoneMarkerValue, MalformedCompletionError, Markers
 from .progress import ProgressStore
@@ -2784,6 +2790,7 @@ class Kernel:
                         telemetry_outcome="interrupted",
                         lease=lease,
                         hook_outcome="skipped",
+                        hook_reason="deferred_expired",
                     )
                     return
 
@@ -2876,6 +2883,7 @@ class Kernel:
                         telemetry_outcome="interrupted",
                         lease=lease,
                         hook_outcome="failed",
+                        hook_reason="reply_undeliverable",
                     )
                     return
 
@@ -2940,6 +2948,7 @@ class Kernel:
                     telemetry_outcome="classified_failure",
                     lease=lease,
                     hook_outcome="failed",
+                    hook_reason="prior_side_effect",
                 )
                 return
 
@@ -2999,6 +3008,7 @@ class Kernel:
                         telemetry_outcome="interrupted",
                         lease=lease,
                         hook_outcome="failed",
+                        hook_reason="deployment_missing",
                     )
                     return
                 _TURN_AGENT.set(resolved.agent_name)
@@ -3012,6 +3022,7 @@ class Kernel:
                         telemetry_outcome="interrupted",
                         lease=lease,
                         hook_outcome="blocked",
+                        hook_reason="agent_killed",
                     )
                     return
                 agent_id = resolved.agent_id
@@ -3446,6 +3457,9 @@ class Kernel:
                             telemetry_outcome="deadline_halted",
                             lease=lease,
                             hook_outcome=_hook_failure_outcome(),
+                            hook_reason=(
+                                "turn_error" if _hook_failure_outcome() == "failed" else None
+                            ),
                         )
                         return
                 try:
@@ -3524,10 +3538,22 @@ class Kernel:
                         expired = isinstance(busy, CatchUpExpired) or (
                             expiry is not None and datetime.now(UTC) >= expiry
                         )
+                        if expired:
+                            busy_outcome: HookRunOutcome = "skipped"
+                            busy_reason: HookRunReason = (
+                                "deferred_expired"
+                                if expiry is not None and datetime.now(UTC) >= expiry
+                                else "catch_up_expired"
+                            )
+                        else:
+                            busy_outcome = "deferred"
+                            busy_reason = (
+                                "hook_paused" if isinstance(busy, HookPaused) else "live_session"
+                            )
                         logger.info(
                             "cron event %s met a live session or its bound; %s",
                             event_id,
-                            "skipped" if expired else "deferred",
+                            busy_outcome,
                         )
                         await self._complete(
                             qevent,
@@ -3535,7 +3561,8 @@ class Kernel:
                             "dropped",
                             telemetry_outcome="interrupted",
                             lease=lease,
-                            hook_outcome="skipped" if expired else "deferred",
+                            hook_outcome=busy_outcome,
+                            hook_reason=busy_reason,
                         )
                         return
                     raise
@@ -3551,6 +3578,7 @@ class Kernel:
                         telemetry_outcome="classified_failure",
                         lease=lease,
                         hook_outcome="failed",
+                        hook_reason="approval_gate_targetless",
                     )
                     return
 
@@ -3574,6 +3602,7 @@ class Kernel:
                         telemetry_outcome="classified_failure",
                         lease=lease,
                         hook_outcome=_hook_failure_outcome(),
+                        hook_reason=("turn_error" if _hook_failure_outcome() == "failed" else None),
                     )
                     return
 
@@ -3612,6 +3641,7 @@ class Kernel:
                         ),
                         lease=lease,
                         hook_outcome=_hook_success_outcome(),
+                        hook_reason=("turn_error" if _hook_success_outcome() == "failed" else None),
                     )
                     return
 
@@ -3629,6 +3659,7 @@ class Kernel:
                         ),
                         lease=lease,
                         hook_outcome=_hook_success_outcome(),
+                        hook_reason=("turn_error" if _hook_success_outcome() == "failed" else None),
                         turn=outcome,
                     )
                     return
@@ -3657,6 +3688,7 @@ class Kernel:
                         telemetry_outcome="side_effect_halted",
                         lease=lease,
                         hook_outcome=_hook_failure_outcome(),
+                        hook_reason=("turn_error" if _hook_failure_outcome() == "failed" else None),
                         turn=outcome,
                     )
                     return
@@ -3685,6 +3717,7 @@ class Kernel:
                         telemetry_outcome="deadline_halted",
                         lease=lease,
                         hook_outcome=_hook_failure_outcome(),
+                        hook_reason=("turn_error" if _hook_failure_outcome() == "failed" else None),
                     )
                     return
                 retryable = retryable and qevent.source is not TurnSource.CRON
@@ -3725,6 +3758,13 @@ class Kernel:
                         ),
                         lease=lease,
                         hook_outcome=_hook_failure_outcome(),
+                        hook_reason=(
+                            None
+                            if _hook_failure_outcome() != "failed"
+                            else "budget_exhausted"
+                            if outcome.classification == "budget-exceeded"
+                            else "turn_error"
+                        ),
                         turn=outcome,
                     )
                     return
@@ -4372,6 +4412,7 @@ class Kernel:
             telemetry_outcome="interrupted",
             lease=lease,
             hook_outcome="failed",
+            hook_reason="target_unbound",
         )
 
     async def _drop_sibling_turn(
@@ -4452,7 +4493,7 @@ class Kernel:
             if shield:
                 close_task = asyncio.create_task(
                     asyncio.wait_for(
-                        carry.recorder.close(carry.ref, "failed"),
+                        carry.recorder.close(carry.ref, "failed", "turn_error"),
                         timeout=5.0,
                     )
                 )
@@ -4468,7 +4509,7 @@ class Kernel:
                         continue
                 close_task.result()
             else:
-                await carry.recorder.close(carry.ref, "failed")
+                await carry.recorder.close(carry.ref, "failed", "turn_error")
         except BaseException:
             logger.error(
                 "hook run failure close failed for event %s while preserving %s",
@@ -4486,6 +4527,7 @@ class Kernel:
         telemetry_outcome: str,
         lease: DeliveryLease | None = None,
         hook_outcome: HookRunOutcome | None = None,
+        hook_reason: HookRunReason | None = None,
         turn: TurnOutcome | None = None,
     ) -> None:
         """The terminal ordering, at every durable ``mark_done`` call site.
@@ -4625,6 +4667,8 @@ class Kernel:
             # event, so every targetless terminal closes the row: "ran" only when
             # an attempt started and ended ok, otherwise "failed" (#2963).
             hook_outcome = "failed"
+            if hook_reason is None:
+                hook_reason = "turn_error"
         hook_carry = _HOOK_RUN_CARRY.get()
         if (
             hook_outcome is not None
@@ -4633,7 +4677,7 @@ class Kernel:
             and hook_carry.ref is not None
             and not (_is_fenced(lease) and lease is not None and lease.lost.is_set())
         ):
-            await hook_carry.recorder.close(hook_carry.ref, hook_outcome)
+            await hook_carry.recorder.close(hook_carry.ref, hook_outcome, hook_reason)
         event_id = qevent.event_id
         if _is_targetless(qevent):
             await self._settle_targetless(qevent, outcome, telemetry_outcome, lease)

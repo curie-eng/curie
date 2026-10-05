@@ -117,7 +117,11 @@ has no scheduler and no run table.
 A hook that failed on its newest slot is visible in that one response,
 including when the three newest slots all failed. A slot that has not ended
 yet has no outcome. The scheduler records `ran`, `failed`, `blocked`, `deferred`,
-`skipped`, and `reclaimed`.
+`skipped`, and `reclaimed`. A row that is not `ran` and not still in flight
+also carries a `reason` code, such as `agent_killed` or `target_unbound`.
+`ran`, an open row, and a row written before the column existed leave `reason`
+empty. Human output prints the code after the outcome when it is present.
+`--json` includes `reason` on a hook fire and `last_reason` on a schedule.
 
 A fire aimed at a thread that holds a live session does not steer that
 session or open a second one. It records `deferred`, and the scheduler fires

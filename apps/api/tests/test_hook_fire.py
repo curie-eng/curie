@@ -176,6 +176,8 @@ def test_fire_queues_one_turn_and_a_second_fire_is_skipped(
     second = _fire(client, auth_headers, "acme-fire", "nightly-cleanup")
     assert second.status_code == 200, second.text
     assert second.json()["outcome"] == "skipped"
+    assert second.json()["reason"] == "run_in_flight"
+    assert body["reason"] is None
     assert len(_payloads_for("nightly-cleanup")) == 1
 
     fetched = client.get(
@@ -212,6 +214,7 @@ def test_unknown_hook_and_in_flight_and_kill_do_not_queue(
     blocked = _fire(client, auth_headers, "acme-fire-neg", "nightly-cleanup")
     assert blocked.status_code == 200, blocked.text
     assert blocked.json()["outcome"] == "blocked"
+    assert blocked.json()["reason"] == "agent_killed"
     assert len(_payloads_for("nightly-cleanup")) == before
 
 
@@ -233,6 +236,7 @@ def test_open_row_skips_without_a_new_turn(
     fired = _fire(client, auth_headers, "acme-fire-open", "nightly-cleanup")
     assert fired.status_code == 200, fired.text
     assert fired.json()["outcome"] == "skipped"
+    assert fired.json()["reason"] == "run_in_flight"
     assert len(_payloads_for("nightly-cleanup")) == before
 
 
@@ -307,6 +311,7 @@ def test_a_target_bound_under_several_identities_none_default_fails(
     fired = _fire(client, auth_headers, "acme-fire-no-default", "ambiguous-check")
     assert fired.status_code == 200, fired.text
     assert fired.json()["outcome"] == "failed"
+    assert fired.json()["reason"] == "target_unbound"
     assert [
         item
         for item in _payloads_for("ambiguous-check")
@@ -350,4 +355,56 @@ def test_a_target_bound_under_two_kinds_fails_even_with_a_default_identity(
     fired = _fire(client, auth_headers, "acme-fire-two-kinds", "kinds-check")
     assert fired.status_code == 200, fired.text
     assert fired.json()["outcome"] == "failed"
+    assert fired.json()["reason"] == "target_unbound"
     assert _payloads_for("kinds-check") == []
+
+
+def test_spent_budget_records_blocked_budget_exhausted(
+    tmp_path: Any, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    root = _bundle(tmp_path, [_cron("nightly-cleanup", "0 9 * * *")])
+    agent_id, version_id = _publish(
+        client, auth_headers, _archive(root), "acme-fire-budget", channel="C0EXAMPLE1"
+    )
+    _deploy(client, auth_headers, agent_id, version_id, "dev")
+
+    async def spend() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("UPDATE curie.agents SET max_usd_per_day = 0 WHERE id = :id"),
+                    {"id": uuid.UUID(agent_id)},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(spend())
+    fired = _fire(client, auth_headers, "acme-fire-budget", "nightly-cleanup")
+    assert fired.status_code == 200, fired.text
+    assert fired.json()["outcome"] == "blocked"
+    assert fired.json()["reason"] == "budget_exhausted"
+    assert [
+        item
+        for item in _payloads_for("nightly-cleanup")
+        if item["event_id"].startswith(f"cron:{agent_id}:")
+    ] == []
+
+
+def test_unbound_target_records_failed_target_unbound(
+    tmp_path: Any, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    root = _bundle(tmp_path, [{**_cron("nightly-cleanup", "0 9 * * *"), "target": "C0EXAMPLE9"}])
+    agent_id, version_id = _publish(
+        client, auth_headers, _archive(root), "acme-fire-unbound", channel="C0EXAMPLE1"
+    )
+    _deploy(client, auth_headers, agent_id, version_id, "dev")
+    fired = _fire(client, auth_headers, "acme-fire-unbound", "nightly-cleanup")
+    assert fired.status_code == 200, fired.text
+    assert fired.json()["outcome"] == "failed"
+    assert fired.json()["reason"] == "target_unbound"
+    assert [
+        item
+        for item in _payloads_for("nightly-cleanup")
+        if item["event_id"].startswith(f"cron:{agent_id}:")
+    ] == []

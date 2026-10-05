@@ -438,7 +438,7 @@ mod tests {
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         let candidate = source_candidate_window();
         assert_eq!(candidate.schema_min, "0076");
-        assert_eq!(candidate.schema_head, "0076");
+        assert_eq!(candidate.schema_head, "0079");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -447,6 +447,7 @@ mod tests {
         let current = candidate_window(&candidate.schema_min, &candidate.schema_head)
             .expect("candidate bounds are catalogued and ordered");
         assert!(live_in_window("0076", &current));
+        assert!(live_in_window("0079", &current));
         assert!(!live_in_window("0075", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
         assert_eq!(retained.schema_min, "0070");
@@ -458,10 +459,15 @@ mod tests {
         assert!(!live_in_window("0075", &retained));
         assert!(!live_in_window("0069", &retained));
 
-        let candidate_release = window_for("0.12.1").expect("promoted candidate is catalogued");
+        let released_patch = window_for("0.12.1").expect("released patch remains catalogued");
+        assert_eq!(released_patch.schema_min, "0076");
+        assert_eq!(released_patch.schema_head, "0076");
+        assert!(live_in_window("0076", &released_patch));
+        assert!(!live_in_window("0079", &released_patch));
+        let candidate_release = window_for("0.12.2").expect("promoted candidate is catalogued");
         assert_eq!(candidate_release.schema_min, candidate.schema_min);
         assert_eq!(candidate_release.schema_head, candidate.schema_head);
-        assert!(live_in_window("0076", &candidate_release));
+        assert!(live_in_window("0079", &candidate_release));
         assert!(!live_in_window("0075", &candidate_release));
         let stable = window_for("0.12.0").expect("released window remains catalogued");
         assert_eq!(stable.schema_min, "0070");
@@ -486,8 +492,9 @@ mod tests {
     fn source_control_candidate_0122_requires_ledger_schema() {
         let window = window_for("0.12.2").expect("source control candidate is catalogued");
         assert_eq!(window.schema_min, "0076");
-        assert_eq!(window.schema_head, "0076");
+        assert_eq!(window.schema_head, "0079");
         assert!(live_in_window("0076", &window));
+        assert!(live_in_window("0079", &window));
         assert!(!live_in_window("0075", &window));
     }
 

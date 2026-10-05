@@ -4357,6 +4357,34 @@
             ],
             "title": "Outcome"
           },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "turn_error",
+                  "target_unbound",
+                  "approval_gate_targetless",
+                  "agent_killed",
+                  "budget_exhausted",
+                  "run_in_flight",
+                  "catch_up_expired",
+                  "deferred_expired",
+                  "reply_undeliverable",
+                  "prior_side_effect",
+                  "deployment_missing",
+                  "hook_paused",
+                  "live_session",
+                  "enqueue_failed",
+                  "claim_expired"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
           "slot_utc": {
             "format": "date-time",
             "title": "Slot Utc",
@@ -7090,6 +7118,34 @@
               }
             ],
             "title": "Last Outcome"
+          },
+          "last_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "turn_error",
+                  "target_unbound",
+                  "approval_gate_targetless",
+                  "agent_killed",
+                  "budget_exhausted",
+                  "run_in_flight",
+                  "catch_up_expired",
+                  "deferred_expired",
+                  "reply_undeliverable",
+                  "prior_side_effect",
+                  "deployment_missing",
+                  "hook_paused",
+                  "live_session",
+                  "enqueue_failed",
+                  "claim_expired"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Reason"
           },
           "name": {
             "title": "Name",

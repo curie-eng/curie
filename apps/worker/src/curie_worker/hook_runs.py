@@ -20,6 +20,25 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 # migration 0048 already allows it. "deferred" is a fire that met a live session
 # on its thread (#2929); the scheduler reopens it on a later tick.
 HookRunOutcome = Literal["ran", "failed", "blocked", "deferred", "skipped"]
+# Closed set pinned by tests/vectors/hook-run-reasons.json. NULL means ran,
+# in flight, or a row written before the reason column existed.
+HookRunReason = Literal[
+    "turn_error",
+    "target_unbound",
+    "approval_gate_targetless",
+    "agent_killed",
+    "budget_exhausted",
+    "run_in_flight",
+    "catch_up_expired",
+    "deferred_expired",
+    "reply_undeliverable",
+    "prior_side_effect",
+    "deployment_missing",
+    "hook_paused",
+    "live_session",
+    "enqueue_failed",
+    "claim_expired",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -214,8 +233,23 @@ class HookRunRecorder:
             ) from exc
         return renewed is not None
 
-    async def close(self, ref: HookRunRef, outcome: HookRunOutcome) -> None:
-        """Set one open run terminally without overwriting an earlier outcome."""
+    async def close(
+        self,
+        ref: HookRunRef,
+        outcome: HookRunOutcome,
+        reason: HookRunReason | None = None,
+    ) -> None:
+        """Set one open run terminally without overwriting an earlier outcome.
+
+        ``ran`` stores no reason. Every other outcome requires one.
+        """
+        if outcome == "ran":
+            reason = None
+        elif reason is None:
+            raise HookRunRecorderError(
+                "hook run reason is required unless the outcome is ran",
+                code="invalid_ref",
+            )
         key = _parse_ref(ref)
         closed = False
         try:
@@ -224,7 +258,7 @@ class HookRunRecorder:
                     await connection.execute(
                         text(
                             f"UPDATE {self._schema}.hook_runs "
-                            "SET outcome = :outcome, ended_at = now() "
+                            "SET outcome = :outcome, reason = :reason, ended_at = now() "
                             "WHERE agent_id = :agent_id "
                             "AND name = :name AND slot_utc = :slot_utc "
                             "AND outcome IS NULL RETURNING outcome"
@@ -234,6 +268,7 @@ class HookRunRecorder:
                             "name": key.name,
                             "slot_utc": key.slot_utc,
                             "outcome": outcome,
+                            "reason": reason,
                         },
                     )
                 ).one_or_none()

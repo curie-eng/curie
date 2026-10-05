@@ -53,7 +53,7 @@ def worker_db(worker_templates: Any) -> Iterator[Any]:
     saved = os.environ.get("DATABASE_URL")
     clone = support.IsolatedMigrationDb(base, name, templates)
     try:
-        clone.at("0076")
+        clone.at("0079")
         url = support.render_url(base.set(database=name))
         os.environ["DATABASE_URL"] = url
         support.get_settings.cache_clear()

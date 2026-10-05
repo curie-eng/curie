@@ -821,3 +821,28 @@ def test_targetless_turn_refused_before_runner_start_fails_the_hook_run(
             assert not await _has_outbox_record(h, event.event_id)
 
     asyncio.run(go())
+
+
+def test_hook_run_reason_approval_gate_targetless(make_harness, make_hook_run) -> None:
+    async def go() -> None:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id),
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+            ) as h,
+        ):
+            h.runner.default_script = [
+                Final(
+                    text="Requesting sign off",
+                    status=SessionStatus.AWAITING_APPROVAL,
+                    approval_summary="Tool call awaiting approval: deploy",
+                )
+            ]
+            await h.kernel.process_event(_targetless(run.ref))
+            outcome, _ended = await run.state() or (None, None)
+            assert outcome == "failed"
+            assert await run.reason() == "approval_gate_targetless"
+
+    asyncio.run(go())
