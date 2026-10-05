@@ -9509,7 +9509,7 @@ fn namespace_create_cmd() -> OpsCommand {
     OpsCommand::new("kubectl", vec![plain("create"), plain("-f"), plain("-")])
 }
 
-fn namespace_inventory_cmd(namespace: &str, resource: &str) -> OpsCommand {
+pub(crate) fn namespace_inventory_cmd(namespace: &str, resource: &str) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![
@@ -9585,7 +9585,7 @@ fn parse_namespace_probe(namespace: &str, output: &str) -> Result<NamespaceProbe
     }))
 }
 
-fn namespaced_resources_cmd() -> OpsCommand {
+pub(crate) fn namespaced_resources_cmd() -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![

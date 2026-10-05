@@ -605,6 +605,11 @@ install of Curie on the same cluster (which normally means two releases
 sharing the default name `curie` in different namespaces), tearing one down
 never touches the other's namespaces.
 
+The sweep waits at most 300 seconds. If an owned namespace is still present,
+the command exits 3 and names the namespace, its phase, its conditions, and
+the remaining objects. It does not remove finalizers or finalize the
+namespace. Rerunning is safe.
+
 It's also safe to re-run if something goes wrong. If the underlying
 uninstall fails (say, a brief Kubernetes API-server hiccup), teardown doesn't just
 stop -- it keeps going and cleans up whatever it safely can, so you're not
