@@ -1347,9 +1347,12 @@ Each refusal is a `factory_ignored` code (`ordinary_comment`,
 `lineage_unbound`, `lineage_closed`, `installation_mismatch`,
 `sender_permission_refused`, `terminal_pull_request`, `active_request`, and
 others). An accepted mention becomes the work item's next execution request.
-The first line of that request's objective is the same-repository feedback
-URL, which keeps the existing issue, pull request, or review thread as the
-reply target.
+The request stores its reply target when it is admitted: the review thread
+for an inline review comment, the pull request conversation for a PR comment
+or a submitted review, and the tracker issue for every other request. The
+objective still opens with the feedback URL for the agent, but nothing routes
+on it. Upgrading to schema 0089 backfills the stored target of existing
+requests from that first line.
 A revision's status comment lives where its reply lives, on the pull
 request: in the review thread for an inline comment, otherwise as a PR comment
 that links the feedback. If GitHub refuses the thread reply with 422, the

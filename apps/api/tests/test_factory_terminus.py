@@ -956,7 +956,7 @@ _REVISION_PR = iter(range(501, 600))
 
 
 def _revision_objective(pr: int, fragment: str) -> str:
-    """Line 1 is the canonical URL. Notice routing reads only that line."""
+    """Line 1 is the canonical URL, for the agent. Routing reads the typed target."""
 
     url = f"https://github.com/{REPO}/pull/{pr}#{fragment}"
     provenance = json.dumps(
@@ -981,7 +981,28 @@ def _work_item_row(work_item_id: uuid.UUID) -> dict[str, Any]:
     )[0]
 
 
-def _insert_revision(work_item_id: uuid.UUID, number: int, objective: str) -> uuid.UUID:
+def _revision_reply(pr: int, fragment: str) -> dict[str, str | None]:
+    """The typed reply target admission stores for this feedback (#3831)."""
+
+    url = f"https://github.com/{REPO}/pull/{pr}#{fragment}"
+    thread = fragment.removeprefix("discussion_r") if fragment.startswith("discussion_r") else None
+    return {
+        "reply_target_kind": "pull_request" if thread is None else "review_thread",
+        "reply_target_pr_number": str(pr),
+        "reply_target_comment_id": thread,
+        "reply_target_url": url,
+    }
+
+
+REVISION_REPLY_COLUMNS = (
+    "reply_target_kind, reply_target_pr_number, reply_target_comment_id, reply_target_url"
+)
+REVISION_REPLY_VALUES = (
+    ":reply_target_kind, :reply_target_pr_number, :reply_target_comment_id, :reply_target_url"
+)
+
+
+def _insert_revision(work_item_id: uuid.UUID, number: int, pr: int, fragment: str) -> uuid.UUID:
     request_id = uuid.uuid4()
 
     async def go() -> None:
@@ -992,17 +1013,20 @@ def _insert_revision(work_item_id: uuid.UUID, number: int, objective: str) -> uu
                     text(
                         "INSERT INTO curie.execution_requests "
                         "(id, work_item_id, sequence, status, wait_deadline, objective, "
-                        "requester, reply_kind, reply_address, reply_conversation_id) "
+                        "requester, reply_kind, reply_address, reply_conversation_id, "
+                        f"{REVISION_REPLY_COLUMNS}) "
                         "VALUES (:id, :work_item, 2, 'waiting', "
                         "clock_timestamp() + interval '30 seconds', :objective, "
-                        "'github:6601:octocat', 'github', :repo, :conversation)"
+                        "'github:6601:octocat', 'github', :repo, :conversation, "
+                        f"{REVISION_REPLY_VALUES})"
                     ),
                     {
                         "id": request_id,
                         "work_item": work_item_id,
-                        "objective": objective,
+                        "objective": _revision_objective(pr, fragment),
                         "repo": REPO,
                         "conversation": f"issue-{number}",
+                        **_revision_reply(pr, fragment),
                     },
                 )
                 await conn.execute(
@@ -1117,8 +1141,7 @@ def _complete_revision(
 ) -> tuple[int, int, uuid.UUID]:
     number, pr, first = _published_issue(client, github, sink)
     sink.requests.clear()
-    objective = _revision_objective(pr, fragment)
-    revision = _insert_revision(first["work_item_id"], number, objective)
+    revision = _insert_revision(first["work_item_id"], number, pr, fragment)
     _start_running(revision)
     _attach_revision_publication(first["work_item_id"], revision)
     _reconcile()
@@ -1246,14 +1269,14 @@ def test_a_marker_already_on_the_pull_request_is_not_posted_again(
     sink.by_path = True
     number, pr, first = _published_issue(client, github, sink)
     sink.requests.clear()
-    revision = _insert_revision(first["work_item_id"], number, _revision_objective(pr, fragment))
+    revision = _insert_revision(first["work_item_id"], number, pr, fragment)
     sink.lists[f"/repos/{REPO}/{listed.format(pr=pr)}"] = [
         {
             "id": 7555,
             "body": result_section(
                 "completed",
                 pr_url=None,
-                feedback_url=_revision_objective(pr, fragment),
+                feedback_url=f"https://github.com/{REPO}/pull/{pr}#{fragment}",
             )
             + f"\n{marker_for(revision)}\n",
         }
@@ -1289,7 +1312,7 @@ def test_a_lost_thread_reply_response_rescans_every_list(admitted: Any) -> None:
     number, pr, first = _published_issue(client, github, sink)
     sink.requests.clear()
     fragment = "discussion_r88109"
-    revision = _insert_revision(first["work_item_id"], number, _revision_objective(pr, fragment))
+    revision = _insert_revision(first["work_item_id"], number, pr, fragment)
     sink.lists[f"/repos/{REPO}/issues/{pr}/comments"] = [
         {"id": 9000 + i, "body": f"unrelated comment {i}"} for i in range(550)
     ]

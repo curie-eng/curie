@@ -28,6 +28,7 @@ from curie_api.config import get_settings
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import lineages as crud_lineages
 from curie_api.forges.github.ci import CiDetail
+from curie_api.forges.types import GITHUB, PullRequestRef, ReplyTarget, RepositoryRef
 from curie_api.github_app import (
     _RESOLVERS,
     GitHubAppError,
@@ -1016,12 +1017,7 @@ def test_closed_lineage_cancellation_names_the_closed_lineage(
     publication = _publish(stack, agent["deployment_id"])
     _resolve(stack, auth_headers, publication["approval_id"])
     _open_pr(stack, publication["id"])
-    revision = _admit_revision(
-        _facts(
-            agent["agent_id"],
-            objective=f"{PR_URL}#issuecomment-1\nRevise after review feedback",
-        )
-    )
+    revision = _admit_revision(_revision_facts(agent["agent_id"], PR_NUMBER))
     assert revision.work_item_id == active.work_item_id
     _complete(active)
     _execute(
@@ -1056,6 +1052,73 @@ def test_closed_lineage_cancellation_names_the_closed_lineage(
     ]
     assert body["requests"][-1]["terminal_cause"] == "lineage_closed"
     _assert_common(body)
+
+
+def _revision_facts(agent_id: str, pr: int) -> SimpleNamespace:
+    """Review feedback facts: the reply target is typed, the objective is prose.
+
+    The objective deliberately carries no feedback URL, so promotion can only
+    learn the pull request from the stored reply target (#3831).
+    """
+
+    pull = PullRequestRef(RepositoryRef(GITHUB, "github.com", "101", REPO), str(pr))
+    return _facts(
+        agent_id,
+        objective="Revise after review feedback",
+        reply_target=ReplyTarget.on_pull_request(pull),
+        reply_url=f"https://github.com/{REPO}/pull/{pr}#issuecomment-1",
+    )
+
+
+@pytest.mark.parametrize(
+    ("lineage_status", "reply_pr", "status", "cause"),
+    [
+        ("closed", PR_NUMBER, "cancelled", "lineage_closed"),
+        ("open", PR_NUMBER + 1, "cancelled", "lineage_closed"),
+        ("open", PR_NUMBER, "waiting", None),
+    ],
+    ids=["closed-lineage", "other-pull-request", "open-lineage"],
+)
+def test_queued_revision_promotion_reads_the_stored_reply_target(
+    stack: TestClient,
+    auth_headers: dict[str, str],
+    lineage_status: str,
+    reply_pr: int,
+    status: str,
+    cause: str | None,
+) -> None:
+    agent = _agent(stack, auth_headers)
+    active = _completed(stack, agent)
+    publication = _publish(stack, agent["deployment_id"])
+    _resolve(stack, auth_headers, publication["approval_id"])
+    _open_pr(stack, publication["id"])
+    revision = _admit_revision(_revision_facts(agent["agent_id"], reply_pr))
+
+    async def stored(session: AsyncSession) -> Any:
+        row = await session.get(ExecutionRequest, revision.request_id)
+        assert row is not None
+        return (row.reply_target_kind, row.reply_target_pr_number, row.reply_target_comment_id)
+
+    assert with_session(stored) == ("pull_request", str(reply_pr), None)
+    _complete(active)
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET status = :status, "
+        "version = version + 1 WHERE id = :id",
+        {"status": lineage_status, "id": uuid.UUID(publication["lineage_id"])},
+    )
+
+    async def promote(session: AsyncSession) -> None:
+        outcome = await workitems.admit_next_revision(
+            session,
+            work_item_id=active.work_item_id,
+            wait_deadline=datetime.now(UTC) + timedelta(minutes=10),
+        )
+        assert isinstance(outcome, workitems.WorkItemOutcome), outcome
+        assert outcome.request is not None
+        assert outcome.request.id == revision.request_id
+        assert (outcome.request.status, outcome.request.terminal_cause) == (status, cause)
+
+    with_session(promote)
 
 
 def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:

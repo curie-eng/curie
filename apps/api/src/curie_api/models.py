@@ -777,6 +777,21 @@ class WorkItem(Base):
     )
 
 
+# The typed reply target's shape. Migration 0078 carries a frozen copy.
+REPLY_TARGET_CHECK = (
+    "((reply_target_kind = 'issue' AND reply_target_pr_number IS NULL "
+    "AND reply_target_comment_id IS NULL AND reply_target_url IS NULL) "
+    "OR (reply_target_kind = 'pull_request' "
+    "AND length(btrim(reply_target_pr_number)) > 0 "
+    "AND reply_target_comment_id IS NULL "
+    "AND (reply_target_url IS NULL OR length(btrim(reply_target_url)) > 0)) "
+    "OR (reply_target_kind = 'review_thread' "
+    "AND length(btrim(reply_target_pr_number)) > 0 "
+    "AND length(btrim(reply_target_comment_id)) > 0 "
+    "AND (reply_target_url IS NULL OR length(btrim(reply_target_url)) > 0))) IS TRUE"
+)
+
+
 class ExecutionRequest(Base):
     """One bounded execution attempt owned by a WorkItem."""
 
@@ -899,6 +914,7 @@ class ExecutionRequest(Base):
             "AND length(btrim(reply_conversation_id)) > 0)",
             name="execution_requests_snapshot_ck",
         ),
+        CheckConstraint(REPLY_TARGET_CHECK, name="execution_requests_reply_target_ck"),
         UniqueConstraint(
             "work_item_id",
             "sequence",
@@ -1005,6 +1021,16 @@ class ExecutionRequest(Base):
     reply_kind: Mapped[str | None] = mapped_column(Text, default=None)
     reply_address: Mapped[str | None] = mapped_column(Text, default=None)
     reply_conversation_id: Mapped[str | None] = mapped_column(Text, default=None)
+    # Where the factory status reply lands (ADR 0197 decision fact 4): the
+    # tracker issue, a pull request conversation, or one review thread. A
+    # revision answers on its pull request; every other request on the issue.
+    # Identifiers are text because a forge's PR or comment id need not be an int.
+    reply_target_kind: Mapped[str] = mapped_column(
+        Text, default="issue", server_default="issue"
+    )
+    reply_target_pr_number: Mapped[str | None] = mapped_column(Text, default=None)
+    reply_target_comment_id: Mapped[str | None] = mapped_column(Text, default=None)
+    reply_target_url: Mapped[str | None] = mapped_column(Text, default=None)
 
     work_item: Mapped[WorkItem] = relationship(back_populates="execution_requests")
 

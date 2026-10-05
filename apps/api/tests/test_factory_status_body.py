@@ -11,8 +11,14 @@ import pytest
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER, result_section, status_body
 from curie_api.factory_progress import PhaseSlot, PhaseView, StageSlot
-from curie_api.factory_reply_target import ReplyTarget
 from curie_api.forges.github.marked_comments import _deliver, _GitHub, _patch, upsert_issue_notice
+from curie_api.forges.types import (
+    GITHUB,
+    PullRequestRef,
+    ReplyTarget,
+    RepositoryRef,
+    TrackerIssueRef,
+)
 from curie_api.models import FactoryStatusComment, WorkItem
 
 REQUEST = uuid.UUID("00000000-0000-0000-0000-000000003125")
@@ -353,16 +359,18 @@ def test_every_factory_comment_creation_redacts_at_the_http_boundary(target_kind
                 return httpx.Response(422, json={"message": "Validation Failed"})
             return httpx.Response(201, json={"id": 3936})
 
+        repository = RepositoryRef(GITHUB, "github.com", "4401", "acme-corp/acme-bot")
+        pull = PullRequestRef(repository, "7")
         if target_kind in {"thread", "thread_fallback"}:
-            target = ReplyTarget("thread", pr_number=7, comment_id=33, url=_PR_URL)
+            target = ReplyTarget.on_thread(pull, "33")
             expected = ["/repos/acme-corp/acme-bot/pulls/7/comments/33/replies"]
             if target_kind == "thread_fallback":
                 expected.append("/repos/acme-corp/acme-bot/issues/7/comments")
         elif target_kind == "pr":
-            target = ReplyTarget("pr", pr_number=7, url=_PR_URL)
+            target = ReplyTarget.on_pull_request(pull)
             expected = ["/repos/acme-corp/acme-bot/issues/7/comments"]
         else:
-            target = ReplyTarget("issue")
+            target = ReplyTarget.on_issue(TrackerIssueRef(GITHUB, "github.com", "4401", "3936"))
             expected = ["/repos/acme-corp/acme-bot/issues/3936/comments"]
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(github)) as client:

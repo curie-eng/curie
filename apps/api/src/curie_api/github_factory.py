@@ -27,6 +27,7 @@ from .factory_notices import mark_status_comment_stale
 from .forges.github.binding import _binding, github_reply_route
 from .forges.github.identity import _issue_lock_keys, delivery_uuid
 from .forges.github.transport import get_github_json, repository_identity_matches
+from .forges.types import ReplyTarget
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_factory_events import (
     FactoryNotice,
@@ -94,6 +95,10 @@ class Facts:
     request_id: uuid.UUID
     # The base a fresh admission resolved (ADR 0186), written on a new WorkItem.
     base: factory_base.ResolvedBase | None = None
+    # Where the request's status reply lands, and the feedback URL it answers.
+    # None is the tracker issue; review feedback sets its pull request target.
+    reply_target: ReplyTarget | None = None
+    reply_url: str | None = None
 
 
 @dataclass(frozen=True)

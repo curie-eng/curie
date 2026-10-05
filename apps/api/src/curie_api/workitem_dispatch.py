@@ -33,6 +33,7 @@ from curie_api.workitems.lifecycle import (
 )
 
 from .config import get_settings
+from .factory_reply_target import reply_columns
 from .models import Agent, AgentChannel, ExecutionRequest, Publication, WorkItem
 from .threadkeys import (
     legacy_route_adapter_of,
@@ -161,23 +162,26 @@ def _facts_conversation(facts: Any, adapter: str | None) -> str:
     )
 
 
-def _snapshot_values(facts: Any) -> dict[str, str]:
+def _snapshot_values(facts: Any) -> dict[str, str | None]:
+    # Only factory review feedback names a pull request reply target; every
+    # other admission (an issue label or mention, the work-items API) answers
+    # on the tracker issue.
+    reply = reply_columns(
+        getattr(facts, "reply_target", None), getattr(facts, "reply_url", None)
+    )
     return {
         "objective": facts.objective,
         "requester": facts.requester,
         "reply_kind": facts.kind,
         "reply_address": facts.address,
         "reply_conversation_id": facts.reply_conversation_id,
+        **reply,
     }
 
 
 def _snapshot_matches(row: ExecutionRequest, facts: Any) -> bool:
-    return bool(
-        row.objective == facts.objective
-        and row.requester == facts.requester
-        and row.reply_kind == facts.kind
-        and row.reply_address == facts.address
-        and row.reply_conversation_id == facts.reply_conversation_id
+    return all(
+        getattr(row, column) == value for column, value in _snapshot_values(facts).items()
     )
 
 

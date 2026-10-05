@@ -22,7 +22,6 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from .. import transcripts
 from ..config import get_settings
-from ..factory_reply_target import parse_reply_target
 from ..forges.github.binding import github_reply_route
 from ..models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
@@ -602,7 +601,7 @@ async def create_revision_request(
     request_id: uuid.UUID,
     wait_deadline: datetime,
     expected_work_item_version: int,
-    snapshot: Mapping[str, str],
+    snapshot: Mapping[str, str | None],
 ) -> WorkItemResult:
     """Store a mention in sequence without interrupting the live request."""
 
@@ -711,22 +710,18 @@ async def admit_next_revision(
     cause: str | None = None
     if work_item.cancelled_at is not None:
         cause = "issue_cancelled"
-    elif request.objective is not None:
-        target = parse_reply_target(
-            request.objective,
-            repo_full_name=work_item.repo_full_name,
-            clone_base=get_settings().github_clone_base,
-        )
-        if target.pr_number is not None:
-            lineage = await session.get(
-                ThreadPublicationLineage, work_item.publication_lineage_id
-            ) if work_item.publication_lineage_id is not None else None
-            if (
-                lineage is None
-                or lineage.status != "open"
-                or lineage.pr_number != target.pr_number
-            ):
-                cause = "lineage_closed"
+    elif request.reply_target_pr_number is not None:
+        # A revision answers on its pull request: it runs only while that
+        # pull request is still the WorkItem's open lineage.
+        lineage = await session.get(
+            ThreadPublicationLineage, work_item.publication_lineage_id
+        ) if work_item.publication_lineage_id is not None else None
+        if (
+            lineage is None
+            or lineage.status != "open"
+            or str(lineage.pr_number) != request.reply_target_pr_number
+        ):
+            cause = "lineage_closed"
     if cause is not None:
         status = "cancelled"
         values: dict[str, Any] = {"terminal_at": now, "terminal_cause": cause}
