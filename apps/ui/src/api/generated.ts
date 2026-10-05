@@ -1023,6 +1023,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/channel-identities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Channel Identities */
+        get: operations["list_channel_identities_channel_identities_get"];
+        put?: never;
+        /** Create Channel Identity */
+        post: operations["create_channel_identity_channel_identities_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/channel-identities/{identity_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Channel Identity */
+        get: operations["get_channel_identity_channel_identities__identity_id__get"];
+        put?: never;
+        post?: never;
+        /** Delete Channel Identity */
+        delete: operations["delete_channel_identity_channel_identities__identity_id__delete"];
+        options?: never;
+        head?: never;
+        /** Update Channel Identity */
+        patch: operations["update_channel_identity_channel_identities__identity_id__patch"];
+        trace?: never;
+    };
     "/channel-read": {
         parameters: {
             query?: never;
@@ -1619,6 +1656,43 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/provider-installations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Provider Installations */
+        get: operations["list_provider_installations_provider_installations_get"];
+        put?: never;
+        /** Create Provider Installation */
+        post: operations["create_provider_installation_provider_installations_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/provider-installations/{installation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Provider Installation */
+        get: operations["get_provider_installation_provider_installations__installation_id__get"];
+        put?: never;
+        post?: never;
+        /** Delete Provider Installation */
+        delete: operations["delete_provider_installation_provider_installations__installation_id__delete"];
+        options?: never;
+        head?: never;
+        /** Update Provider Installation */
+        patch: operations["update_provider_installation_provider_installations__installation_id__patch"];
         trace?: never;
     };
     "/publications": {
@@ -3807,6 +3881,118 @@ export interface components {
             allowed_callers: string[] | null;
         };
         /**
+         * ChannelIdentityCreate
+         * @description One channel identity, created by an administrator.
+         *
+         *     ``credential_ref`` and ``webhook_verification_ref`` are plain strings
+         *     here, with no Field constraints, on purpose: FastAPI's 422 echoes the
+         *     rejected input, and a value pasted where a reference belongs is exactly
+         *     the credential that must not come back. The router checks both against
+         *     the reference grammar and answers with a message that omits the value.
+         */
+        ChannelIdentityCreate: {
+            /** Attributes */
+            attributes?: {
+                [key: string]: unknown;
+            };
+            /** Credential Ref */
+            credential_ref?: string | null;
+            /**
+             * Name
+             * @default default
+             */
+            name?: string;
+            /**
+             * Provider
+             * @enum {string}
+             */
+            provider: "slack" | "m365" | "github" | "jira" | "linear" | "confluence" | "quickbooks" | "other";
+            /** Provider Installation Id */
+            provider_installation_id?: string | null;
+            /** Scopes */
+            scopes?: string[];
+            /**
+             * Status
+             * @default active
+             * @enum {string}
+             */
+            status?: "active" | "disabled" | "revoked";
+            /** Tenant Id */
+            tenant_id?: string | null;
+            /** Webhook Verification Ref */
+            webhook_verification_ref?: string | null;
+        };
+        /** ChannelIdentityOut */
+        ChannelIdentityOut: {
+            /** Attributes */
+            attributes: {
+                [key: string]: unknown;
+            };
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Credential Ref */
+            credential_ref: string | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Installation Mismatch */
+            installation_mismatch: boolean;
+            /** Name */
+            name: string;
+            /**
+             * Provider
+             * @enum {string}
+             */
+            provider: "slack" | "m365" | "github" | "jira" | "linear" | "confluence" | "quickbooks" | "other";
+            /** Provider Installation Id */
+            provider_installation_id: string | null;
+            /** Scopes */
+            scopes: string[];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "active" | "disabled" | "revoked";
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+            /** Webhook Verification Ref */
+            webhook_verification_ref: string | null;
+        };
+        /**
+         * ChannelIdentityUpdate
+         * @description Partial update: an omitted field is unchanged, and null clears a nullable one.
+         *
+         *     ``provider_installation_id`` is nullable in the database, so explicit
+         *     null is a real operation here -- it detaches the identity -- unlike the
+         *     other fields below, which reject it.
+         */
+        ChannelIdentityUpdate: {
+            /** Attributes */
+            attributes?: {
+                [key: string]: unknown;
+            } | null;
+            /** Credential Ref */
+            credential_ref?: string | null;
+            /** Name */
+            name?: string | null;
+            /** Provider Installation Id */
+            provider_installation_id?: string | null;
+            /** Scopes */
+            scopes?: string[] | null;
+            /** Status */
+            status?: ("active" | "disabled" | "revoked") | null;
+            /** Webhook Verification Ref */
+            webhook_verification_ref?: string | null;
+        };
+        /**
          * ChannelReadContext
          * @description The capability and the logical turn digest the worker revokes by.
          */
@@ -5082,6 +5268,88 @@ export interface components {
          * @enum {string}
          */
         ProgressState: "queued" | "investigating" | "awaiting-approval" | "preparing-workspace" | "testing" | "publishing" | "complete" | "failed" | "cancelled";
+        /**
+         * ProviderInstallationCreate
+         * @description A connected external account, created by an administrator.
+         */
+        ProviderInstallationCreate: {
+            /**
+             * Authority
+             * @default
+             */
+            authority?: string;
+            /** Display Name */
+            display_name?: string | null;
+            /** External Account Id */
+            external_account_id: string;
+            /** Installed By Principal Id */
+            installed_by_principal_id?: string | null;
+            /**
+             * Provider
+             * @enum {string}
+             */
+            provider: "slack" | "m365" | "github" | "jira" | "linear" | "confluence" | "quickbooks" | "other";
+            /**
+             * Status
+             * @default connected
+             * @enum {string}
+             */
+            status?: "connected" | "disconnected";
+            /** Tenant Id */
+            tenant_id?: string | null;
+        };
+        /** ProviderInstallationOut */
+        ProviderInstallationOut: {
+            /** Authority */
+            authority: string;
+            /** Disconnected At */
+            disconnected_at: string | null;
+            /** Display Name */
+            display_name: string | null;
+            /** External Account Id */
+            external_account_id: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /**
+             * Installed At
+             * Format: date-time
+             */
+            installed_at: string;
+            /** Installed By Principal Id */
+            installed_by_principal_id: string | null;
+            /**
+             * Provider
+             * @enum {string}
+             */
+            provider: "slack" | "m365" | "github" | "jira" | "linear" | "confluence" | "quickbooks" | "other";
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "connected" | "disconnected";
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
+        /**
+         * ProviderInstallationUpdate
+         * @description Partial update: an omitted field is unchanged, and null clears a nullable one.
+         */
+        ProviderInstallationUpdate: {
+            /** Authority */
+            authority?: string | null;
+            /** Display Name */
+            display_name?: string | null;
+            /** External Account Id */
+            external_account_id?: string | null;
+            /** Status */
+            status?: ("connected" | "disconnected") | null;
+        };
         /**
          * PublicationContext
          * @description API issued authority and observation for one execution's publication read.
@@ -8897,6 +9165,176 @@ export interface operations {
             };
         };
     };
+    list_channel_identities_channel_identities_get: {
+        parameters: {
+            query?: {
+                provider?: ("slack" | "m365" | "github" | "jira" | "linear" | "confluence" | "quickbooks" | "other") | null;
+                tenant_id?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelIdentityOut"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_channel_identity_channel_identities_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChannelIdentityCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelIdentityOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_channel_identity_channel_identities__identity_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                identity_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelIdentityOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_channel_identity_channel_identities__identity_id__delete: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                identity_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_channel_identity_channel_identities__identity_id__patch: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                identity_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChannelIdentityUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelIdentityOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     read_channel_channel_read_post: {
         parameters: {
             query?: never;
@@ -9916,6 +10354,176 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PodLogs"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_provider_installations_provider_installations_get: {
+        parameters: {
+            query?: {
+                provider?: ("slack" | "m365" | "github" | "jira" | "linear" | "confluence" | "quickbooks" | "other") | null;
+                tenant_id?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderInstallationOut"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_provider_installation_provider_installations_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProviderInstallationCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderInstallationOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_provider_installation_provider_installations__installation_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                installation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderInstallationOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_provider_installation_provider_installations__installation_id__delete: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                installation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_provider_installation_provider_installations__installation_id__patch: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                installation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProviderInstallationUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderInstallationOut"];
                 };
             };
             /** @description Validation Error */
