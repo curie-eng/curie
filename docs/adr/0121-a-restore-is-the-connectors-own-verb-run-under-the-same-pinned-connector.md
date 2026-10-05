@@ -2,7 +2,11 @@
 
 Date: 2026-08-25
 
-Status: Draft
+Status: Accepted
+
+Maintainer jw3329 explicitly approved acceptance on 2026-10-05, together with
+[ADR 0124](0124-a-snapshot-is-sealed-to-the-connector-that-wrote-it.md), its prerequisite, and
+[ADR 0203](0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md), which relies on this executor.
 
 Answers the one decision
 [ADR-0117](0117-a-tool-that-changes-the-world-reports-what-it-changed.md)
@@ -115,9 +119,12 @@ and the code, not the container.
    So the checkable rule is about capability, and it is deliberately broader than
    the runtime question: **a connector advertising any tool that is not read-only
    must also advertise `restore`, or it advertises no restore at all and is
-   treated as restoring nothing.** Both halves are inspectable before deploy --
-   `readOnlyHint` is already how this repository's own gate finds write tools --
-   and neither is a claim about a specific action.
+   treated as restoring nothing.** Both halves are inspectable before deploy
+   from the advertised tool list, and neither is a claim about a specific
+   action. No gate reads MCP `readOnlyHint` today: the runtime gate in
+   `runner/src/curie_runner/side_effects.py` classifies by a harness-declared
+   read-only tool-name allowlist, deny by default, so the deploy-time check
+   this decision needs is new work, not an existing gate.
 
    This is not the manifest ADR-0117 rejected. That rejection was of a
    declaration that an action *is reversible*, because it could disagree with

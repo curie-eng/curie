@@ -4,6 +4,11 @@ Date: 2026-08-21
 
 Status: Accepted
 
+**Amended by [ADR 0203](0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+decision 3 no longer leaves the undo of an action executed under a remediation
+policy ungated; that undo is approval gated on the policy's route.
+
 **Amended by [ADR-0180](0180-the-turn-receipt-is-an-install-choice.md)**
 (back link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 decision 7's receipt is now an install choice. `all`, the default, renders it
