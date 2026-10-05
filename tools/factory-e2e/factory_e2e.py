@@ -60,6 +60,39 @@ doctor`), a second issue queued meanwhile shows the paused-for-upgrade status
 comment, and deleting the drain Job clears the marker within one lease so the
 queued request starts. A Job deleted while helm still waits clears it at once.
 
+`--candidate-images build` (any mode) tests a commit with no published
+images, a pull request head included (`--candidate refs/pull/<n>/head`). From
+the candidate's tracked tree it builds the api, worker, dispatcher,
+mail-adapter, ui and runner images with the contexts and Dockerfiles of the
+release workflow, on the buildx builder BUILDX_BUILDER names (never selected
+or changed), for the cluster nodes' platforms. On a kind context (`kind-<name>`,
+or `--kind-cluster`) it loads them with `kind load`; otherwise it pushes them
+to CURIE_FACTORY_LAYER_REGISTRY under a fresh `factory-e2e-<random>` prefix,
+tagged `cand-<short sha>`. The install points every component and the runner
+at those images, the bundle's runner layer is built FROM the built runner, and
+after install every pod's container imageID must equal the built digest;
+both are recorded in the evidence. The default `published` installs the
+release workflow's `sha-<commit>` images as before.
+
+`github-loop [--issue-file] [--revision-file]` drives the whole loop through
+the GitHub entry of the forge-neutral loop driver (LoopDriver, forges/github.py):
+the labelled run opens a pull request; the test actor sets CI red on its first
+head with one failing commit status (the factory CI gate reads statuses, so
+the first head is red whatever the fixture workflow says, and the status
+names a small change to push); the factory's CI fix round pushes a new commit
+whose checks are green and the first request completes; a pull request review
+from the test actor that mentions the factory adds a second request that
+pushes another commit to the same pull request; the test actor merges it; and
+GitHub, the api work-items route and `curie cluster work-items <id> --json`
+must all read it merged. judge_github_loop decides. It needs
+CURIE_FACTORY_MODEL_API_KEY.
+
+`accept [--forge <name>]` is the acceptance runner: for each forge entry
+registered by a module in tools/factory-e2e/forges/ (only `github` today), it
+runs the preflight plus that entry's loop scenario as one `run`, then prints a
+summary and writes it to `--evidence` when given. A new forge is a new entry
+file that calls register_forge; nothing shared changes.
+
 The App, fixture repository, mention author and model credentials come only
 from operator files or environment variables; nothing here names a real one.
 Standard library only, so it runs from a bare source checkout.
@@ -73,6 +106,7 @@ import dataclasses
 import datetime as dt
 import fcntl
 import http.client
+import importlib.util
 import ipaddress
 import json
 import os
@@ -93,7 +127,12 @@ import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+
+if __name__ == "__main__":
+    # Forge entry modules import this module by name; run as a script it must
+    # be the same module object, not a second copy.
+    sys.modules.setdefault("factory_e2e", sys.modules[__name__])
 
 GITHUB_API = "https://api.github.com"
 GHCR = "https://ghcr.io"
@@ -278,6 +317,7 @@ SCENARIOS: dict[str, ScenarioDriver | None] = {
     "cancel-running": None,
     "evaluation": None,
     "quiesce": None,
+    "github-loop": None,
 }
 SCENARIO_NAMES = tuple(SCENARIOS)
 
@@ -520,6 +560,260 @@ def unpublished_images(
     """Every chart and runner image with no manifest for ``tag`` on GHCR."""
 
     return [image for image in [*CHART_COMPONENTS.values(), RUNNER_IMAGE] if not head(image, tag)]
+
+
+# --------------------------------------------------------------------------
+# Candidate images built from the checkout (--candidate-images build)
+# --------------------------------------------------------------------------
+
+CANDIDATE_IMAGE_MODES = ("published", "build")
+# Build context and Dockerfile per image, mirroring the image matrix in
+# .github/workflows/release.yaml (no build args there for these six).
+CANDIDATE_BUILDS: dict[str, tuple[str, str]] = {
+    "curie-api": (".", "apps/api/Dockerfile"),
+    "curie-worker": (".", "apps/worker/Dockerfile"),
+    "curie-dispatcher": (".", "apps/dispatcher/Dockerfile"),
+    "curie-mail-adapter": (".", "apps/mail-adapter/Dockerfile"),
+    "curie-ui": (".", "apps/ui/Dockerfile"),
+    RUNNER_IMAGE: (".", "runner/Dockerfile"),
+}
+KIND_CONTEXT_PREFIX = "kind-"
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+@dataclasses.dataclass(frozen=True)
+class CandidateImage:
+    """One image built from the candidate checkout.
+
+    ``digests`` are the ids a running container may report for it: the pushed
+    manifest digest, or for a kind load the local image id plus any repo digest
+    the node recorded on import.
+    """
+
+    name: str
+    repository: str
+    tag: str
+    digests: tuple[str, ...]
+
+    @property
+    def ref(self) -> str:
+        return f"{self.repository}:{self.tag}"
+
+    @property
+    def pinned(self) -> str:
+        """The digest reference a registry pull resolves; the tag when loaded."""
+
+        return f"{self.repository}@{self.digests[0]}" if self.digests else self.ref
+
+
+def candidate_image_tag(candidate: str) -> str:
+    return f"cand-{candidate[:12]}"
+
+
+def kind_cluster_name(context: str, *, named: str | None = None) -> str | None:
+    """The kind cluster a context targets, or None when images must be pushed.
+
+    kind names its contexts ``kind-<cluster>``; ``named`` (--kind-cluster)
+    covers a renamed context and wins over the prefix.
+    """
+
+    if named:
+        return named
+    if context.startswith(KIND_CONTEXT_PREFIX):
+        return context.removeprefix(KIND_CONTEXT_PREFIX)
+    return None
+
+
+def candidate_repository_prefix(registry: str | None, kind: bool, token: str) -> str:
+    """A fresh repository prefix per run, so no run reuses another's images."""
+
+    if kind:
+        return f"factory-e2e-{token}"
+    if not registry:
+        raise ConfigError(
+            "--candidate-images build pushes to CURIE_FACTORY_LAYER_REGISTRY on a cluster "
+            "that is not kind; set it to a registry the cluster can pull from"
+        )
+    return f"{registry.rstrip('/')}/factory-e2e-{token}"
+
+
+def candidate_platforms(architectures: Sequence[str]) -> list[str]:
+    """``linux/<arch>`` for every node architecture; one entry builds single-platform."""
+
+    found = sorted({f"linux/{arch.strip()}" for arch in architectures if arch.strip()})
+    if not found:
+        raise PreflightFailed("the cluster reported no node architecture")
+    return found
+
+
+def candidate_build_argv(
+    *,
+    builder: str,
+    ref: str,
+    dockerfile: Path,
+    context_dir: Path,
+    platforms: Sequence[str],
+    load: bool,
+    metadata_file: Path | None = None,
+) -> list[str]:
+    """`docker buildx build` on the named builder. Never selects or changes a default builder.
+
+    ``load`` puts a single-platform image in the local daemon for `kind load`;
+    otherwise every platform is pushed and the digest lands in ``metadata_file``.
+    """
+
+    if load and len(platforms) != 1:
+        raise ConfigError(f"a kind load builds one platform, the cluster reports {platforms}")
+    argv = [
+        "docker",
+        "buildx",
+        "build",
+        "--builder",
+        builder,
+        "--platform",
+        ",".join(platforms),
+        "--provenance=false",
+        "-f",
+        str(dockerfile),
+        "-t",
+        ref,
+    ]
+    if load:
+        argv.append("--load")
+    else:
+        if metadata_file is None:
+            raise ValueError("a pushed build needs a metadata file for its digest")
+        argv += ["--push", "--metadata-file", str(metadata_file)]
+    argv.append(str(context_dir))
+    return argv
+
+
+def pushed_digest(metadata: Mapping[str, Any]) -> str:
+    """The manifest digest buildx reports in its `--metadata-file`."""
+
+    digest = metadata.get("containerimage.digest")
+    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+        raise PreflightFailed("buildx reported no containerimage.digest for a pushed image")
+    return digest
+
+
+def digest_of(image_id: str) -> str | None:
+    """The trailing ``sha256:<hex>`` of a container status imageID, if any."""
+
+    matches = _DIGEST.findall(image_id or "")
+    return matches[-1] if matches else None
+
+
+def candidate_values(images: Mapping[str, CandidateImage], *, kind: bool) -> dict[str, Any]:
+    """Chart values that point every component and the runner at built images. Pure.
+
+    A kind-loaded image exists only in the node store, so nothing may try a
+    registry pull of it: components drop to IfNotPresent and the prewarm
+    DaemonSet too.
+    """
+
+    values: dict[str, Any] = {}
+    for component, name in CHART_COMPONENTS.items():
+        image = images[name]
+        entry: dict[str, Any] = {"repository": image.repository, "tag": image.tag}
+        if kind:
+            entry["pullPolicy"] = "IfNotPresent"
+        values[component] = {"image": entry}
+    runner = images[RUNNER_IMAGE]
+    values["agentSandbox"] = {
+        "runner": {"image": runner.repository, "tag": runner.tag, "imagePullPolicy": "IfNotPresent"}
+    }
+    if kind:
+        values["agentSandbox"]["runner"]["prewarm"] = {"imagePullPolicy": "IfNotPresent"}
+    return values
+
+
+def judge_running_images(
+    pods: Mapping[str, Any], images: Mapping[str, CandidateImage], *, required: Sequence[str]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Every running container of a candidate repository, and how it disagrees. Pure.
+
+    ``pods`` is a `kubectl get pods -o json` body. A container counts when its
+    spec image names a candidate repository; its status imageID must carry one
+    of that image's digests. Each name in ``required`` must be seen running.
+    """
+
+    by_repository = {image.repository: image for image in images.values()}
+    records: list[dict[str, Any]] = []
+    failures: list[str] = []
+    seen: set[str] = set()
+    for pod in pods.get("items") or []:
+        if not isinstance(pod, dict):
+            continue
+        name = str((pod.get("metadata") or {}).get("name") or "")
+        spec = pod.get("spec") or {}
+        status = pod.get("status") or {}
+        spec_images = {
+            str(c.get("name")): str(c.get("image") or "")
+            for c in [*(spec.get("initContainers") or []), *(spec.get("containers") or [])]
+            if isinstance(c, dict)
+        }
+        statuses = [
+            s
+            for s in [
+                *(status.get("initContainerStatuses") or []),
+                *(status.get("containerStatuses") or []),
+            ]
+            if isinstance(s, dict)
+        ]
+        for container in statuses:
+            spec_image = spec_images.get(str(container.get("name")), "")
+            repository = re.split(r"[@:](?=[^/]*$)", spec_image, maxsplit=1)[0]
+            image = by_repository.get(repository)
+            if image is None:
+                continue
+            image_id = str(container.get("imageID") or "")
+            running = digest_of(image_id)
+            record = {
+                "pod": name,
+                "container": container.get("name"),
+                "image": spec_image,
+                "image_id": image_id,
+                "expected": list(image.digests),
+            }
+            records.append(record)
+            if running is None:
+                failures.append(f"{name}/{container.get('name')} reports no image id yet")
+            elif running not in image.digests:
+                failures.append(
+                    f"{name}/{container.get('name')} runs {running}, not the built "
+                    f"{image.name} ({', '.join(image.digests)})"
+                )
+            else:
+                seen.add(image.name)
+    for wanted in required:
+        if wanted not in seen:
+            failures.append(f"no running container uses the built {wanted}")
+    return records, failures
+
+
+def candidate_workload_images(
+    workloads: Mapping[str, Any], images: Mapping[str, CandidateImage]
+) -> list[str]:
+    """Names of built images some Deployment, StatefulSet or DaemonSet runs. Pure."""
+
+    by_repository = {image.repository: image.name for image in images.values()}
+    found: set[str] = set()
+    for item in workloads.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        pod_spec = ((item.get("spec") or {}).get("template") or {}).get("spec") or {}
+        for container in [
+            *(pod_spec.get("initContainers") or []),
+            *(pod_spec.get("containers") or []),
+        ]:
+            if not isinstance(container, dict):
+                continue
+            image = str(container.get("image") or "")
+            repository = re.split(r"[@:](?=[^/]*$)", image, maxsplit=1)[0]
+            if repository in by_repository:
+                found.add(by_repository[repository])
+    return sorted(found)
 
 
 def load_config(
@@ -876,8 +1170,14 @@ def install_values(
     sandbox_pod_quota: int | None = None,
     card_base_url: str = "",
     local_images: bool = False,
+    candidate_images: Mapping[str, CandidateImage] | None = None,
+    kind: bool = False,
 ) -> dict[str, Any]:
     """Helm values for the disposable install. Written to a 0600 file, never argv.
+
+    Without ``candidate_images`` every image is the published ``sha-<candidate>``
+    tag. With them, each component and the runner point at the images built
+    from the checkout (``candidate_values``).
 
     ``card_base_url`` is the public base the webhook is registered under; the
     api serves the status card there, so GitHub can fetch the image.
@@ -921,6 +1221,11 @@ def install_values(
         "runner": runner_values,
         "controller": {"deploy": not consumer_controller},
     }
+    if candidate_images is not None:
+        built = candidate_values(candidate_images, kind=kind)
+        for component in CHART_COMPONENTS:
+            values[component]["image"] = built[component]["image"]
+        values["agentSandbox"]["runner"] = built["agentSandbox"]["runner"]
     # A disposable install proves the factory flow, not sandbox isolation, and
     # most scratch clusters carry no gVisor runtime class.
     values["security"] = {"gvisor": {"mode": "off"}}
@@ -1587,6 +1892,14 @@ def _stop(process: subprocess.Popen[Any]) -> bool:
 # --------------------------------------------------------------------------
 
 
+def _image_remover(ref: str) -> Callable[[], dict[str, Any]]:
+    def remove() -> dict[str, Any]:
+        result = subprocess.run(["docker", "image", "rm", ref], capture_output=True, check=False)
+        return {"removed": result.returncode == 0}
+
+    return remove
+
+
 class Preflight:
     def __init__(
         self,
@@ -1603,9 +1916,24 @@ class Preflight:
         expect_reasons: Sequence[str] = (),
         scenario_name: str | None = None,
         revision_text: str | None = None,
+        candidate_images: str = "published",
+        kind_cluster: str | None = None,
     ) -> None:
         if expect not in EXPECTATIONS:
             raise ConfigError(f"--expect must be one of {EXPECTATIONS}")
+        if candidate_images not in CANDIDATE_IMAGE_MODES:
+            raise ConfigError(f"--candidate-images must be one of {CANDIDATE_IMAGE_MODES}")
+        self.candidate_image_mode = candidate_images
+        self.kind_cluster = (
+            kind_cluster_name(config.kube_context, named=kind_cluster)
+            if candidate_images == "build"
+            else None
+        )
+        # Filled by build_candidate_images; None installs the published images.
+        self.candidate_images: dict[str, CandidateImage] | None = None
+        self._candidate_platforms: list[str] = []
+        self._candidate_fetched = False
+        self._layer_base = ""
         self.issue_spec = issue_spec
         self.scenario_name = scenario_name
         self.revision_text = revision_text
@@ -1625,7 +1953,12 @@ class Preflight:
             "schema": "curie.factory-e2e.evidence/v1",
             "mode": "preflight",
             "candidate_commit": candidate,
-            "image_tag": f"sha-{candidate}",
+            "image_tag": (
+                candidate_image_tag(candidate)
+                if candidate_images == "build"
+                else f"sha-{candidate}"
+            ),
+            "candidate_image_mode": candidate_images,
             "kube_context": config.kube_context,
             "namespace": namespace,
             "release": RELEASE,
@@ -1739,6 +2072,9 @@ class Preflight:
             raise ConfigError(f"required tools not on PATH: {', '.join(absent)}")
 
     def check_images(self) -> None:
+        if self.candidate_image_mode == "build":
+            self.check_build_tools()
+            return
         tag = f"sha-{self.candidate}"
         missing = unpublished_images(tag)
         if missing:
@@ -1790,8 +2126,208 @@ class Preflight:
         self.evidence["actor_login"] = actor_login
         self.step("App JWT and actor token verified", actor_login=actor_login)
 
+    def check_build_tools(self) -> None:
+        """What a candidate build needs, refused before anything live is touched."""
+
+        if not os.environ.get("BUILDX_BUILDER"):
+            raise ConfigError(
+                "--candidate-images build needs BUILDX_BUILDER naming the buildx builder to "
+                "build on; the driver never selects or changes the default builder"
+            )
+        wanted = ["docker"] + (["kind"] if self.kind_cluster else [])
+        absent = [tool for tool in wanted if shutil.which(tool) is None]
+        if absent:
+            raise ConfigError(f"required tools not on PATH: {', '.join(absent)}")
+        if self.kind_cluster is None and not self.config.layer_registry:
+            raise ConfigError(
+                "--candidate-images build on a cluster that is not kind pushes every image to "
+                "CURIE_FACTORY_LAYER_REGISTRY; set it to a registry the cluster can pull from"
+            )
+        self.step(
+            "candidate build tools present",
+            builder=os.environ["BUILDX_BUILDER"],
+            delivery="kind load" if self.kind_cluster else "registry push",
+        )
+
+    def _fetch_candidate(self) -> None:
+        if not self._candidate_fetched:
+            run(["git", "-C", str(self.repo_root), "fetch", "--quiet", "origin", self.candidate])
+            self._candidate_fetched = True
+
+    def export_source(self) -> Path:
+        """The candidate commit's whole tracked tree, the build context CI checks out."""
+
+        self._fetch_candidate()
+        source = self.workdir / "source"
+        shutil.rmtree(source, ignore_errors=True)
+        source.mkdir()
+        archive = self.workdir / "source.tar"
+        run(
+            [
+                "git",
+                "-C",
+                str(self.repo_root),
+                "archive",
+                "--output",
+                str(archive),
+                self.candidate,
+            ]
+        )
+        run(["tar", "-xf", str(archive), "-C", str(source)])
+        archive.unlink()
+        return source
+
+    def node_platforms(self) -> list[str]:
+        out = self.kubectl(
+            "get", "nodes", "-o", "jsonpath={.items[*].status.nodeInfo.architecture}"
+        )
+        return candidate_platforms(out.split())
+
+    def _buildx(self, argv: list[str], name: str) -> None:
+        result = subprocess.run(argv, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout).strip()[-1500:]
+            raise PreflightFailed(f"building {name} from the candidate failed: {tail}")
+
+    def _kind_digests(self, ref: str) -> tuple[str, ...]:
+        """The local image id, plus any repo digest the kind node recorded on load."""
+
+        image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", ref]).strip()
+        digests = [image_id] if _DIGEST.fullmatch(image_id) else []
+        node = f"{self.kind_cluster}-control-plane"
+        inspected = subprocess.run(
+            ["docker", "exec", node, "crictl", "inspecti", "-o", "json", ref],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        try:
+            status = json.loads(inspected.stdout).get("status") or {}
+        except (ValueError, AttributeError):
+            status = {}
+        for value in [status.get("id"), *(status.get("repoDigests") or [])]:
+            found = digest_of(str(value or ""))
+            if found and found not in digests:
+                digests.append(found)
+        if not digests:
+            raise PreflightFailed(f"could not read the image id of {ref}")
+        return tuple(digests)
+
+    def build_candidate_images(self) -> None:
+        """Build every image the chart installs, plus the runner, from the checkout.
+
+        On kind each image is loaded into the cluster; otherwise it is pushed
+        under a fresh repository prefix in CURIE_FACTORY_LAYER_REGISTRY. The
+        runner is also pushed whenever the bundle's runner layer is built,
+        because the layer builds FROM it through the registry.
+        """
+
+        builder = os.environ["BUILDX_BUILDER"]
+        source = self.export_source()
+        kind = self.kind_cluster is not None
+        platforms = self.node_platforms()
+        if kind and len(platforms) > 1:
+            platforms = platforms[:1]
+        self._candidate_platforms = platforms
+        tag = candidate_image_tag(self.candidate)
+        token = uuid.uuid4().hex[:10]
+        prefix = candidate_repository_prefix(self.config.layer_registry, kind, token)
+        layer = self.config.layer_registry is not None and bundle_declares_runner_layer(
+            self.config.bundle_dir
+        )
+        images: dict[str, CandidateImage] = {}
+        for name, (context, dockerfile) in CANDIDATE_BUILDS.items():
+            repository = f"{prefix}/{name}"
+            ref = f"{repository}:{tag}"
+            log(f"buildx {name} from the candidate ({', '.join(platforms)})")
+            if kind:
+                self._buildx(
+                    candidate_build_argv(
+                        builder=builder,
+                        ref=ref,
+                        dockerfile=source / dockerfile,
+                        context_dir=source / context,
+                        platforms=platforms,
+                        load=True,
+                    ),
+                    name,
+                )
+                self.teardown.push(f"remove local image {name}", _image_remover(ref))
+                run(["kind", "load", "docker-image", ref, "--name", str(self.kind_cluster)])
+                digests = self._kind_digests(ref)
+            else:
+                digests = (self._push_candidate(builder, ref, source, context, dockerfile, name),)
+            images[name] = CandidateImage(name, repository, tag, digests)
+        if kind and layer:
+            # The layer builds FROM the runner through the registry.
+            assert self.config.layer_registry is not None
+            pushed = f"{self.config.layer_registry.rstrip('/')}/factory-e2e-{token}/{RUNNER_IMAGE}"
+            context, dockerfile = CANDIDATE_BUILDS[RUNNER_IMAGE]
+            digest = self._push_candidate(
+                builder, f"{pushed}:{tag}", source, context, dockerfile, RUNNER_IMAGE
+            )
+            self._layer_base = f"{pushed}@{digest}"
+        elif layer:
+            self._layer_base = images[RUNNER_IMAGE].pinned
+        shutil.rmtree(source, ignore_errors=True)
+        self.candidate_images = images
+        self.evidence["candidate_images"] = {
+            "mode": "build",
+            "delivery": "kind load" if kind else "registry push",
+            "kind_cluster": self.kind_cluster,
+            "platforms": platforms,
+            "tag": tag,
+            "images": {
+                name: {"repository": image.repository, "digests": list(image.digests)}
+                for name, image in images.items()
+            },
+            "runner_layer_base": self._layer_base,
+        }
+        self.step("candidate images built", tag=tag, platforms=platforms, images=len(images))
+
+    def _push_candidate(
+        self, builder: str, ref: str, source: Path, context: str, dockerfile: str, name: str
+    ) -> str:
+        metadata = self.workdir / f"buildx-{name}.json"
+        log(f"buildx push {name}")
+        self._buildx(
+            candidate_build_argv(
+                builder=builder,
+                ref=ref,
+                dockerfile=source / dockerfile,
+                context_dir=source / context,
+                platforms=self._candidate_platforms,
+                load=False,
+                metadata_file=metadata,
+            ),
+            name,
+        )
+        try:
+            digest = pushed_digest(json.loads(metadata.read_text()))
+        finally:
+            metadata.unlink(missing_ok=True)
+        return digest
+
+    def assert_running_images(self) -> None:
+        """Each pod built from a candidate image runs exactly the built digest."""
+
+        if self.candidate_images is None:
+            return
+        workloads = json.loads(
+            self.kubectl(
+                "-n", self.namespace, "get", "deployments,statefulsets,daemonsets", "-o", "json"
+            )
+        )
+        required = candidate_workload_images(workloads, self.candidate_images)
+        pods = json.loads(self.kubectl("-n", self.namespace, "get", "pods", "-o", "json"))
+        records, failures = judge_running_images(pods, self.candidate_images, required=required)
+        self.evidence["running_images"] = records
+        if failures:
+            raise PreflightFailed("running images differ from the build: " + "; ".join(failures))
+        self.step("running images are the candidate build", containers=len(records))
+
     def extract_chart(self) -> Path:
-        run(["git", "-C", str(self.repo_root), "fetch", "--quiet", "origin", self.candidate])
+        self._fetch_candidate()
         archive = self.workdir / "chart.tar"
         run(
             [
@@ -2050,6 +2586,8 @@ class Preflight:
             consumer_controller=consumer,
             egress_cidrs=egress_cidrs,
             sandbox_pod_quota=quota,
+            candidate_images=self.candidate_images,
+            kind=self.kind_cluster is not None,
         )
         values_file = self.workdir / "values.json"
         fd = os.open(values_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -2079,6 +2617,7 @@ class Preflight:
         for kind in ("deployment", "statefulset"):
             for workload in self.kubectl("-n", self.namespace, "get", kind, "-o", "name").split():
                 self.kubectl("-n", self.namespace, "rollout", "status", workload, "--timeout=15m")
+        self.assert_running_images()
         self.step(
             "installed",
             chart="charts/curie@candidate",
@@ -2261,7 +2800,16 @@ class Preflight:
         copy = self.workdir / "bundle"
         shutil.rmtree(copy, ignore_errors=True)
         shutil.copytree(bundle, copy)
-        runner = f"{GHCR.removeprefix('https://')}/{IMAGE_OWNER}/{RUNNER_IMAGE}:sha-{self.candidate}"
+        if self._layer_base:
+            # Built from the checkout: the layer must sit on that runner, for
+            # the platforms it was built for.
+            runner = self._layer_base
+            platforms = [arg for p in self._candidate_platforms for arg in ("--platform", p)]
+        else:
+            runner = (
+                f"{GHCR.removeprefix('https://')}/{IMAGE_OWNER}/{RUNNER_IMAGE}:sha-{self.candidate}"
+            )
+            platforms = []
         log(f"curie build (the bundle's runner layer on {runner})")
         argv = [
             self.config.curie_bin,
@@ -2272,6 +2820,7 @@ class Preflight:
             registry,
             "--runner-image",
             runner,
+            *platforms,
         ]
         result = subprocess.run(argv, capture_output=True, text=True, check=False)
         if result.returncode != 0:
@@ -2629,6 +3178,8 @@ class Preflight:
             egress_cidrs=self._egress_cidrs,
             sandbox_pod_quota=quota,
             card_base_url=self.tunnel_url,
+            candidate_images=self.candidate_images,
+            kind=self.kind_cluster is not None,
         )
         values_file = self.workdir / "values.json"
         fd = os.open(str(values_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -2937,6 +3488,8 @@ class Preflight:
         self._lock(f"context-{self.config.kube_context}", "this kube context")
         self.check_images()
         self.check_app()
+        if self.candidate_image_mode == "build":
+            self.build_candidate_images()
         self.sweep_stale_namespaces()
         self.create_namespace()
         self.install()
@@ -3011,6 +3564,11 @@ class Preflight:
     def cli_work_items(self, work_item_id: str) -> dict[str, Any]:
         """`curie cluster work-items <id> --json`: secrets only in the environment."""
 
+        return parse_work_item_cli(*self.cli_work_items_raw(work_item_id))
+
+    def cli_work_items_raw(self, work_item_id: str) -> tuple[int, str]:
+        """The exit code and stdout of `curie cluster work-items <id> --json`."""
+
         if self._kubeconfig is None:
             self._kubeconfig = self._write_kubeconfig()
         argv = [
@@ -3035,7 +3593,7 @@ class Preflight:
             "CURIE_CONFIG_DIR": str(self._curie_config_dir()),
         }
         result = subprocess.run(argv, capture_output=True, text=True, env=env, check=False)
-        return parse_work_item_cli(result.returncode, result.stdout)
+        return result.returncode, result.stdout
 
     def cli_check(
         self,
@@ -5064,6 +5622,361 @@ SCENARIOS["quiesce"] = quiesce
 
 
 # --------------------------------------------------------------------------
+# Forge-neutral loop: ticket, change, red then green CI, review, merge
+# --------------------------------------------------------------------------
+
+# How long a merged change may take to read back as merged on the WorkItem.
+LOOP_MERGE_OBSERVE_SECONDS = 600
+# The change is polled fast so the red CI lands before the gate settles green.
+LOOP_CHANGE_POLL_SECONDS = 3
+DEFAULT_LOOP_ISSUE = (
+    "Add nautical miles to unitconv",
+    "The Python unitconv project in this repository converts between units. Add the "
+    "nautical mile (symbol `nmi`, exactly 1852 meters) to the length family so it "
+    "converts to and from every existing length unit, add unit tests for it, and "
+    "mention it in the README. Run the full test suite and fix every failure before "
+    "opening the pull request.",
+)
+DEFAULT_LOOP_REVIEW_TEXT = (
+    "Please make one follow-up change on this pull request: add a round trip unit test "
+    "that converts 3.5 nautical miles to meters and back. Push it to this same branch."
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class ChangeRef:
+    """The change request (a pull request on GitHub) a WorkItem published."""
+
+    number: int
+    url: str
+
+
+class LoopDriver(Protocol):
+    """The forge steps the loop needs. Each forge entry implements them once.
+
+    The WorkItem side is the platform's own api and CLI, so it is not here.
+    """
+
+    forge: str
+
+    def open_ticket(self, title: str, body: str) -> int: ...
+
+    def mark_ticket(self, ticket: int, since: float) -> str:
+        """Assert admission of the marked ticket; the admitted WorkItem id."""
+        ...
+
+    def await_change(self, work_item_id: str) -> ChangeRef | None: ...
+
+    def change_head(self, change: ChangeRef) -> tuple[str | None, int | None]: ...
+
+    def set_ci_red(self, sha: str) -> dict[str, Any]: ...
+
+    def ci_state(self, sha: str) -> dict[str, Any]: ...
+
+    def post_review(self, change: ChangeRef, text: str) -> dict[str, Any]:
+        """Request a change as the test actor; delivery facts in the result."""
+        ...
+
+    def merge(self, change: ChangeRef) -> dict[str, Any]: ...
+
+    def change_merged(self, change: ChangeRef) -> bool | None: ...
+
+    def changes_opened(self) -> list[int]: ...
+
+    def default_branch_head(self) -> str: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class ForgeEntry:
+    """One forge the acceptance runner drives: its loop scenario and driver."""
+
+    name: str
+    scenario: str
+    driver: Callable[[Preflight], LoopDriver]
+
+
+# Populated by the entry modules in tools/factory-e2e/forges/, one file per
+# forge, so a new forge is a new file and no edit here.
+FORGES: dict[str, ForgeEntry] = {}
+FORGE_DIR = Path(__file__).resolve().parent / "forges"
+
+
+def forge_loop_scenario(name: str) -> ScenarioDriver:
+    def drive(p: Preflight) -> dict[str, Any]:
+        entry = FORGES.get(name)
+        if entry is None:
+            raise ConfigError(f"no forge entry {name!r}; expected {FORGE_DIR}/{name}.py")
+        return run_loop(p, entry.driver(p))
+
+    return drive
+
+
+def register_forge(entry: ForgeEntry) -> None:
+    FORGES[entry.name] = entry
+    if SCENARIOS.get(entry.scenario) is None:
+        SCENARIOS[entry.scenario] = forge_loop_scenario(entry.name)
+
+
+def load_forge_entries(directory: Path = FORGE_DIR) -> list[str]:
+    """Import every forge entry module once; each registers itself."""
+
+    loaded: list[str] = []
+    for path in sorted(directory.glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        module_name = f"factory_e2e_forges.{path.stem}"
+        if module_name not in sys.modules:
+            spec = importlib.util.spec_from_file_location(module_name, path)
+            if spec is None or spec.loader is None:
+                raise ConfigError(f"cannot load forge entry {path}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                del sys.modules[module_name]
+                raise
+        loaded.append(path.stem)
+    return loaded
+
+
+def work_item_cli_pr_status(stdout: str) -> str | None:
+    """``item.pr.status`` from `curie cluster work-items <id> --json`. Pure."""
+
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        return None
+    item = parsed.get("item") if isinstance(parsed, dict) else None
+    pr = item.get("pr") if isinstance(item, dict) else None
+    status = pr.get("status") if isinstance(pr, dict) else None
+    return status if isinstance(status, str) else None
+
+
+def judge_github_loop(obs: Mapping[str, Any]) -> list[str]:
+    """Every way the full loop falls short. Empty means it passed. Pure.
+
+    The loop: one change opened, CI red on its first head, a CI fix commit that
+    turns it green and completes the first request, a review that adds a second
+    request pushing another commit to the same change, then a merge by the test
+    actor that the forge and the WorkItem (api and CLI) both read as merged.
+    """
+
+    failures: list[str] = []
+    number = obs.get("change_number")
+    if not number:
+        failures.append("the run opened no pull request")
+        failures.extend(f"cli: {f}" for f in obs.get("cli_failures") or [])
+        return failures
+    red = obs.get("red_ci") or {}
+    if red.get("state") != "failure" or red.get("sha") != obs.get("head_initial"):
+        failures.append("CI was not set red on the pull request's first head")
+    first = list(obs.get("first_run_statuses") or [])
+    if not first or first[-1] != "completed":
+        last = first[-1] if first else None
+        failures.append(f"the first request ended {last!r}, expected 'completed' after CI recovery")
+    head_ci = obs.get("head_after_ci")
+    if not head_ci or head_ci == obs.get("head_initial"):
+        failures.append("no CI fix commit: the head did not move after the red CI")
+    if int(obs.get("commits_after_ci") or 0) <= int(obs.get("commits_initial") or 0):
+        failures.append("the CI fix added no commit")
+    ci_state = (obs.get("ci_after_fix") or {}).get("state")
+    if ci_state != "passing":
+        failures.append(f"checks on the CI fix head read {ci_state!r}, expected 'passing'")
+    if obs.get("review_delivery_status_code") != 200:
+        failures.append(f"the review delivery got HTTP {obs.get('review_delivery_status_code')}")
+    if obs.get("review_delivery_api_status") != "factory_admitted":
+        failures.append(
+            f"the review was not admitted: api status {obs.get('review_delivery_api_status')!r}"
+        )
+    statuses = list(obs.get("request_statuses") or [])
+    if len(statuses) != 2:
+        failures.append(f"the WorkItem has {len(statuses)} request(s), expected 2")
+    elif statuses[-1] != "completed":
+        failures.append(f"the review request ended {statuses[-1]!r}, expected 'completed'")
+    head_review = obs.get("head_after_review")
+    if not head_review or head_review == head_ci:
+        failures.append("the review revision pushed no commit")
+    if int(obs.get("commits_after_review") or 0) <= int(obs.get("commits_after_ci") or 0):
+        failures.append("the review revision added no commit")
+    if obs.get("work_item_change_number") != number:
+        failures.append(
+            f"the WorkItem records pull request #{obs.get('work_item_change_number')}, "
+            f"not #{number}"
+        )
+    numbers = list(obs.get("change_numbers") or [])
+    if numbers != [number]:
+        failures.append(f"pull requests {numbers} were opened, expected only #{number}")
+    if obs.get("default_branch_moved_before_merge"):
+        failures.append("the default branch moved before the merge")
+    merge = obs.get("merge") or {}
+    if merge.get("status_code") != 200 or merge.get("merged") is not True:
+        failures.append(f"the test actor's merge failed (HTTP {merge.get('status_code')})")
+    if obs.get("forge_merged") is not True:
+        failures.append("the forge does not read the pull request as merged")
+    if obs.get("work_item_pr_status") != "merged":
+        failures.append(
+            f"the WorkItem api reads the pull request {obs.get('work_item_pr_status')!r}, "
+            "expected 'merged'"
+        )
+    if obs.get("cli_pr_status") != "merged":
+        failures.append(
+            f"`curie cluster work-items` reads the pull request {obs.get('cli_pr_status')!r}, "
+            "expected 'merged'"
+        )
+    failures.extend(f"cli: {f}" for f in obs.get("cli_failures") or [])
+    return failures
+
+
+def await_work_item_change(p: Preflight, work_item_id: str) -> ChangeRef | None:
+    """The change the WorkItem records, polled fast; None if the request ends without one.
+
+    Bounded like ``_await_ending``: the execution deadline plus the publication
+    allowance once started, else NEVER_STARTED_CAP_SECONDS from labelling.
+    """
+
+    while True:
+        detail = p.work_item_detail(work_item_id) or {}
+        pr = detail.get("pr")
+        if isinstance(pr, dict) and pr.get("number"):
+            return ChangeRef(int(pr["number"]), str(pr.get("url") or ""))
+        requests = [r for r in detail.get("requests") or [] if isinstance(r, dict)]
+        if requests and not any(r.get("status") in ACTIVE_REQUEST_STATUSES for r in requests):
+            return None
+        latest = _latest_request(detail)
+        started = _parse_time((latest or {}).get("started_at"))
+        give_up = (
+            started.timestamp() + EXECUTION_BOUND_SECONDS + PUBLICATION_ALLOWANCE_SECONDS
+            if started is not None
+            else p.labelled_at + NEVER_STARTED_CAP_SECONDS
+        )
+        if time.time() > give_up:
+            return None
+        time.sleep(LOOP_CHANGE_POLL_SECONDS)
+
+
+def _work_item_pr(detail: Mapping[str, Any]) -> dict[str, Any]:
+    pr = detail.get("pr")
+    return pr if isinstance(pr, dict) else {}
+
+
+def _await_work_item_merged(p: Preflight, work_item_id: str) -> dict[str, Any]:
+    deadline = time.time() + LOOP_MERGE_OBSERVE_SECONDS
+    detail: dict[str, Any] = {}
+    while True:
+        detail = p.work_item_detail(work_item_id) or detail
+        if _work_item_pr(detail).get("status") == "merged":
+            return detail
+        if time.time() > deadline:
+            return detail
+        time.sleep(POLL_SECONDS)
+
+
+def run_loop(p: Preflight, driver: LoopDriver) -> dict[str, Any]:
+    """Drive one forge through the whole loop and judge it with judge_github_loop."""
+
+    obs = _new_obs(p) if p.issue_number else {"cli": [], "cli_failures": []}
+    obs["forge"] = driver.forge
+    if not p.issue_number:
+        title, body = p.issue_spec or DEFAULT_LOOP_ISSUE
+        since = time.time()
+        p.labelled_at = since
+        ticket = driver.open_ticket(title, body)
+        driver.mark_ticket(ticket, since)
+        obs.update(_new_obs(p))
+        obs["forge"] = driver.forge
+    work_item_id = str(obs["work_item_id"])
+    # The merge moves the default branch; teardown puts it back.
+    p.pin_fixture_base()
+
+    log("loop: waiting for the labelled run to open a pull request")
+    change = driver.await_change(work_item_id)
+    if change is None:
+        return _finish(p, obs, judge_github_loop(obs))
+    obs["change_number"] = change.number
+    obs["change_url"] = change.url
+    head, commits = driver.change_head(change)
+    obs["head_initial"], obs["commits_initial"] = head, commits
+    _timeline(obs, "pull request opened", number=change.number, head_sha=head)
+    if head:
+        obs["red_ci"] = driver.set_ci_red(head)
+        _timeline(obs, "CI set red", **obs["red_ci"])
+
+    log("loop: waiting for the CI fix and the first request to end")
+    detail, terminal = _await_ending(
+        p, work_item_id, since=p.labelled_at, ended=lambda _d: True, what="CI recovery"
+    )
+    obs["first_run_terminal"] = terminal
+    obs["first_run_statuses"] = _ordered_statuses(detail)
+    obs["first_run_cause"] = (_latest_request(detail) or {}).get("terminal_cause")
+    obs["head_after_ci"], obs["commits_after_ci"] = driver.change_head(change)
+    obs["ci_on_initial_head"] = driver.ci_state(head) if head else None
+    obs["ci_after_fix"] = (
+        driver.ci_state(str(obs["head_after_ci"])) if obs["head_after_ci"] else None
+    )
+    _timeline(obs, "first request ended", head_sha=obs["head_after_ci"])
+    p.cli_check(
+        obs,
+        work_item_id,
+        expected_state=str(detail.get("state")),
+        expected_statuses=obs["first_run_statuses"],
+        label="after CI recovery",
+    )
+    requests_before = len(detail.get("requests") or [])
+
+    review = driver.post_review(change, p.revision_text or DEFAULT_LOOP_REVIEW_TEXT)
+    obs.update({f"review_{key}": value for key, value in review.items()})
+    _timeline(obs, "review posted", **review)
+    log("loop: waiting for the review revision to end")
+    detail, terminal = _await_ending(
+        p,
+        work_item_id,
+        since=time.time(),
+        ended=lambda _d: True,
+        what="review revision",
+        min_requests=requests_before + 1,
+    )
+    obs["review_terminal"] = terminal
+    obs["request_statuses"] = _ordered_statuses(detail)
+    obs["head_after_review"], obs["commits_after_review"] = driver.change_head(change)
+    obs["work_item_change_number"] = _work_item_pr(detail).get("number")
+    obs["default_branch_moved_before_merge"] = driver.default_branch_head() != p.head_before
+    _timeline(obs, "review revision ended", head_sha=obs["head_after_review"])
+    p.cli_check(
+        obs,
+        work_item_id,
+        expected_state=str(detail.get("state")),
+        expected_statuses=obs["request_statuses"],
+        label="after review revision",
+    )
+
+    obs["merge"] = driver.merge(change)
+    _timeline(obs, "merged by the test actor", **obs["merge"])
+    obs["forge_merged"] = driver.change_merged(change)
+    detail = _await_work_item_merged(p, work_item_id)
+    obs["work_item_pr_status"] = _work_item_pr(detail).get("status")
+    exit_code, stdout = p.cli_work_items_raw(work_item_id)
+    obs["cli_pr_status"] = work_item_cli_pr_status(stdout)
+    obs["cli"].append(
+        {
+            "check": "after merge",
+            "at": _now_iso(),
+            **parse_work_item_cli(exit_code, stdout),
+            "pr_status": obs["cli_pr_status"],
+        }
+    )
+    if exit_code != 0:
+        obs["cli_failures"].append(f"after merge: work-items exited {exit_code}, expected 0")
+    obs["change_numbers"] = driver.changes_opened()
+    _timeline(obs, "merge observed", work_item=obs["work_item_pr_status"])
+    p.cli_not_found_check(obs)
+    return _finish(p, obs, judge_github_loop(obs))
+
+
+SCENARIOS["github-loop"] = forge_loop_scenario("github")
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 
@@ -5078,9 +5991,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     common.add_argument(
         "--candidate",
         help=(
-            "commit whose published images to install (default: the newest commit of "
-            "origin/next with every image published)"
+            "commit or ref to install, a pull request head included with --candidate-images "
+            "build (default: the newest commit of origin/next with every image published, or "
+            "the tip of origin/next when building)"
         ),
+    )
+    common.add_argument(
+        "--candidate-images",
+        choices=CANDIDATE_IMAGE_MODES,
+        default="published",
+        help=(
+            "published: install the release workflow's sha-<commit> images. build: build every "
+            "chart image and the runner from the candidate checkout on BUILDX_BUILDER, load them "
+            "into kind or push them to CURIE_FACTORY_LAYER_REGISTRY, and assert the running "
+            "image ids"
+        ),
+    )
+    common.add_argument(
+        "--kind-cluster",
+        help="kind cluster to load built images into (default: from a kind-<name> context)",
     )
     common.add_argument("--namespace", help=f"owned namespace (default {NAMESPACE_PREFIX}<commit>)")
     common.add_argument(
@@ -5112,7 +6041,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "preflight", parents=[common], help="install, deliver one labelled issue, assert admission"
     )
     scenario = sub.add_parser("run", parents=[common], help="preflight, then one scenario driver")
-    scenario.add_argument("--scenario", required=True, choices=SCENARIO_NAMES)
+    scenario.add_argument("--scenario", required=True, choices=tuple(SCENARIOS))
     scenario.add_argument(
         "--issue-file",
         type=Path,
@@ -5125,7 +6054,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     scenario.add_argument(
         "--revision-file",
         type=Path,
-        help="revision: the mention comment's text (default: a small follow-up change)",
+        help=(
+            "revision and github-loop: the mention or review text (default: a small "
+            "follow-up change)"
+        ),
     )
     scenario.add_argument(
         "--expect",
@@ -5158,7 +6090,89 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=Path("tools/model-script/transcripts/unitconv-issue.json"),
     )
     scripted.add_argument("--model-base-url")
+
+    accept = sub.add_parser(
+        "accept",
+        parents=[common],
+        help="for each registered forge entry: preflight, then that forge's full loop",
+    )
+    accept.add_argument(
+        "--forge",
+        action="append",
+        choices=tuple(FORGES),
+        default=[],
+        help="a forge entry to accept (repeatable; default every registered entry)",
+    )
+    accept.add_argument("--issue-file", type=Path, help="the loop ticket (default: a small task)")
+    accept.add_argument("--revision-file", type=Path, help="the review text")
     return parser.parse_args(argv)
+
+
+def accept_runs(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
+    """The `run` argv for each forge the acceptance runner drives. Pure over FORGES."""
+
+    names = list(dict.fromkeys(args.forge)) or sorted(FORGES)
+    passthrough: list[str] = ["--candidate-images", args.candidate_images]
+    for flag, value in (
+        ("--context", args.context),
+        ("--candidate", args.candidate),
+        ("--kind-cluster", args.kind_cluster),
+        ("--namespace", args.namespace),
+        ("--issue-file", args.issue_file),
+        ("--revision-file", args.revision_file),
+    ):
+        if value is not None:
+            passthrough += [flag, str(value)]
+    passthrough += ["--admission-timeout", str(args.admission_timeout)]
+    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    base = args.evidence.parent if args.evidence else _repo_root() / "target" / "factory-e2e"
+    return [
+        (
+            name,
+            [
+                "run",
+                "--scenario",
+                FORGES[name].scenario,
+                *passthrough,
+                "--evidence",
+                str(base / f"accept-{name}-{stamp}.json"),
+            ],
+        )
+        for name in names
+    ]
+
+
+def accept(args: argparse.Namespace, *, run_one: Callable[[list[str]], int] | None = None) -> int:
+    """Preflight plus the full loop for every registered forge entry, one after another."""
+
+    runner = run_one or main
+    if not FORGES:
+        print(f"factory-e2e: no forge entries under {FORGE_DIR}", file=sys.stderr)
+        return EXIT_CONFIG
+    results = []
+    code = 0
+    for name, argv in accept_runs(args):
+        log(f"accept: forge {name}")
+        result = runner(argv)
+        results.append(
+            {
+                "forge": name,
+                "scenario": FORGES[name].scenario,
+                "exit_code": result,
+                "evidence": argv[argv.index("--evidence") + 1],
+            }
+        )
+        code = code or result
+    summary = {
+        "schema": "curie.factory-e2e.accept/v1",
+        "result": "passed" if code == 0 else "failed",
+        "forges": results,
+    }
+    if args.evidence:
+        args.evidence.parent.mkdir(parents=True, exist_ok=True)
+        args.evidence.write_text(json.dumps(summary, indent=2) + "\n")
+    print(json.dumps(summary, indent=2))
+    return code
 
 
 def _repo_root() -> Path:
@@ -5179,7 +6193,8 @@ def _resolve_candidate(
 
     Without --candidate: the newest first-parent commit of origin/next whose
     images are all published, so a run started while CI still builds the tip
-    uses the last complete build instead of refusing.
+    uses the last complete build instead of refusing. A build run passes a
+    ``published`` that accepts every commit, so it takes the tip.
     """
 
     if requested is None:
@@ -5621,6 +6636,8 @@ def main(argv: list[str] | None = None) -> int:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return int(module.main(args))
+    if args.mode == "accept":
+        return accept(args)
     driver: ScenarioDriver | None = None
     issue_spec: tuple[str, str] | None = None
     expect = "any"
@@ -5663,6 +6680,19 @@ def main(argv: list[str] | None = None) -> int:
                         raise ConfigError(
                             f"cannot read the revision file {args.revision_file}: {exc.strerror}"
                         ) from None
+            elif args.scenario in {entry.scenario for entry in FORGES.values()}:
+                issue_spec = (
+                    parse_issue_file(args.issue_file)
+                    if args.issue_file is not None
+                    else DEFAULT_LOOP_ISSUE
+                )
+                if args.revision_file is not None:
+                    try:
+                        revision_text = args.revision_file.read_text().strip() or None
+                    except OSError as exc:
+                        raise ConfigError(
+                            f"cannot read the revision file {args.revision_file}: {exc.strerror}"
+                        ) from None
             elif args.scenario in ("cancel-running", "quiesce"):
                 issue_spec = (
                     parse_issue_file(args.issue_file)
@@ -5672,11 +6702,9 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(os.environ, context=args.context)
         if args.model_base_url:
             config = dataclasses.replace(config, model_base_url=args.model_base_url)
-        if args.mode == "run" and args.scenario in (
-            "revision",
-            "cancel-running",
-            "evaluation",
-            "quiesce",
+        if args.mode == "run" and (
+            args.scenario in ("revision", "cancel-running", "evaluation", "quiesce")
+            or args.scenario in {entry.scenario for entry in FORGES.values()}
         ):
             if not config.model_api_key:
                 raise ConfigError(
@@ -5691,7 +6719,11 @@ def main(argv: list[str] | None = None) -> int:
                     "CURIE_FACTORY_MODEL"
                 )
         repo_root = _repo_root()
-        candidate = _resolve_candidate(repo_root, args.candidate)
+        candidate = (
+            _resolve_candidate(repo_root, args.candidate, published=lambda _commit: True)
+            if args.candidate_images == "build"
+            else _resolve_candidate(repo_root, args.candidate)
+        )
         namespace = (
             validate_namespace(args.namespace) if args.namespace else default_namespace(candidate)
         )
@@ -5716,6 +6748,8 @@ def main(argv: list[str] | None = None) -> int:
         expect_reasons=expect_reasons,
         scenario_name=args.scenario if args.mode == "run" else None,
         revision_text=revision_text,
+        candidate_images=args.candidate_images,
+        kind_cluster=args.kind_cluster,
     )
     if args.mode == "run":
         preflight.evidence["mode"] = f"run:{args.scenario}"
@@ -5772,6 +6806,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"factory-e2e: {preflight.evidence['result']}; evidence {evidence_path}", file=sys.stderr)
     return code
 
+
+load_forge_entries()
 
 if __name__ == "__main__":
     sys.exit(main())
