@@ -1,7 +1,7 @@
 """A factory ticket declares its base branch and keeps it (#3095, ADR 0186).
 
 GitHub REST shapes follow:
-https://docs.github.com/en/rest/branches/branches#get-a-branch
+https://docs.github.com/en/rest/git/refs#get-a-reference
 https://docs.github.com/en/rest/issues/events
 https://docs.github.com/en/rest/issues/comments#list-issue-comments
 https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
@@ -76,7 +76,7 @@ class BaseGitHubAPI(GitHubAPI):
                     "default_branch": self.default_branch,
                 },
             )
-        branch_prefix = f"/repos/{REPO}/branches/"
+        branch_prefix = f"/repos/{REPO}/git/ref/heads/"
         if path.startswith(branch_prefix):
             name = path[len(branch_prefix) :]
             self.branch_requests.append(name)
@@ -84,8 +84,8 @@ class BaseGitHubAPI(GitHubAPI):
                 return httpx.Response(502, json={"message": "Bad Gateway"})
             sha = self.branches.get(name)
             if sha is None:
-                return httpx.Response(404, json={"message": "Branch not found"})
-            return httpx.Response(200, json={"name": name, "commit": {"sha": sha}})
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json={"ref": f"refs/heads/{name}", "object": {"sha": sha}})
         parts = path.split("/")
         # /repos/{owner}/{name}/issues/{number}/comments
         if len(parts) == 7 and parts[4] == "issues" and parts[6] == "comments":
@@ -138,10 +138,8 @@ def base_app(monkeypatch: pytest.MonkeyPatch, clean_db: None) -> Any:
     for key, value in _ENV.items():
         monkeypatch.setenv(key, value)
     _configure(monkeypatch, TRAIN)
-    monkeypatch.setattr(
-        "curie_api.github_factory.credentials_for",
-        lambda _settings: _Credentials(),
-    )
+    for module in ("github_factory", "repository_auth"):
+        monkeypatch.setattr(f"curie_api.{module}.credentials_for", lambda _settings: _Credentials())
     api = BaseGitHubAPI()
     with TestClient(create_app()) as client:
         external = httpx.AsyncClient(transport=httpx.MockTransport(api.handle))
@@ -674,7 +672,7 @@ def test_reconcile_refuses_a_missing_base_with_one_comment_across_passes(
     from curie_api.factory_label_reconcile import reconcile_missed_labels
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
-    for module in ("github_factory", "factory_label_reconcile"):
+    for module in ("github_factory", "factory_label_reconcile", "repository_auth"):
         monkeypatch.setattr(
             f"curie_api.{module}.credentials_for", lambda _s: _ReconcileCredentials()
         )

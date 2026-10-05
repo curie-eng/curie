@@ -248,6 +248,10 @@ class Settings(BaseSettings):
     # seconds; 45 sits in the 30 to 60 second band.
     github_factory_intake: Literal["poll", "webhook"] = "poll"
     github_factory_poll_interval_s: float = Field(default=45, gt=0, allow_inf_nan=False)
+    # How often the API reads each factory pull request still open on its
+    # lineage, to record one merged or closed outside a publication (#3831).
+    # Runs with the work item reconciler and factory ingress; 0 disables it.
+    factory_lineage_reconcile_interval_s: float = Field(default=60, ge=0, allow_inf_nan=False)
     # Public origin GitHub's image proxy fetches the live status card from
     # (#3077), e.g. https://curie.example.com. Empty omits the card image; the
     # status comment still carries the checklist and the result.

@@ -9,7 +9,7 @@ https://docs.github.com/en/rest/issues/events#list-issue-events
 https://docs.github.com/en/rest/issues/comments#list-issue-comments-for-a-repository
 https://docs.github.com/en/rest/pulls/comments#list-review-comments-in-a-repository
 https://docs.github.com/en/rest/pulls/reviews#list-reviews-for-a-pull-request
-https://docs.github.com/en/rest/branches/branches#get-a-branch
+https://docs.github.com/en/rest/git/refs#get-a-reference
 https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
 https://docs.github.com/en/rest/issues/comments#update-an-issue-comment
 https://docs.github.com/en/rest/using-the-rest-api/getting-started-with-the-rest-api#conditional-requests
@@ -83,6 +83,7 @@ _CREDENTIAL_MODULES = (
     "curie_api.github_factory_review",
     "curie_api.factory_notices",
     "curie_api.factory_poll_intake",
+    "curie_api.repository_auth",
 )
 
 
@@ -349,13 +350,13 @@ class PollGitHub:
                     "default_branch": self.default_branch,
                 },
             )
-        branch_prefix = f"{root}/branches/"
+        branch_prefix = f"{root}/git/ref/heads/"
         if path.startswith(branch_prefix):
             branch = path.removeprefix(branch_prefix)
             sha = self.branches.get(branch)
             if sha is None:
-                return httpx.Response(404, json={"message": "Branch not found"})
-            return httpx.Response(200, json={"name": branch, "commit": {"sha": sha}})
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json={"ref": f"refs/heads/{branch}", "object": {"sha": sha}})
         if path == f"{root}/issues":
             listed = [
                 self._issue_body(issue)
@@ -497,6 +498,9 @@ class _Credentials:
 
     def token_for_verified_installation(self, repo: str, installation_id: int) -> str:
         return self.fresh_installation_token(repo, installation_id)[1]
+
+    def token_for(self, repo: str) -> str:
+        return self.fresh_installation_token(repo)[1]
 
 
 def _patch_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -694,9 +698,9 @@ def test_poll_records_the_verified_selected_base(
     branch_reads = [
         request.url.path
         for request in github.calls
-        if request.url.path.startswith(f"/repos/{REPO}/branches/")
+        if request.url.path.startswith(f"/repos/{REPO}/git/ref/heads/")
     ]
-    assert branch_reads == [f"/repos/{REPO}/branches/{branch}"]
+    assert branch_reads == [f"/repos/{REPO}/git/ref/heads/{branch}"]
 
 
 @pytest.mark.parametrize(
@@ -782,7 +786,7 @@ def test_poll_records_later_base_labels_without_readmitting_or_moving_the_base(
     assert (after[0]["base_branch"], after[0]["base_commit"]) == ("next", _NEXT_SHA)
     assert after[0]["base_label_ignored"] == "main"
     assert after[0]["status"] == first[0]["status"]
-    assert not any("/branches/" in request.url.path for request in github.calls)
+    assert not any("/git/ref/heads/" in request.url.path for request in github.calls)
 
     github.issues[number].base_labels = ("base:next",)
     github._etags["issues"] = f'"restored-base-{number}"'
@@ -792,7 +796,7 @@ def test_poll_records_later_base_labels_without_readmitting_or_moving_the_base(
     assert [row["id"] for row in restored] == [first[0]["id"]]
     assert (restored[0]["base_branch"], restored[0]["base_commit"]) == ("next", _NEXT_SHA)
     assert restored[0]["base_label_ignored"] is None
-    assert not any("/branches/" in request.url.path for request in github.calls)
+    assert not any("/git/ref/heads/" in request.url.path for request in github.calls)
 
 
 def test_poll_cancels_a_closed_labeled_issue(

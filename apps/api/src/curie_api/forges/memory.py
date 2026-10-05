@@ -26,12 +26,13 @@ from curie_api.forges.capabilities import (
     Support,
     validate_declaration,
 )
-from curie_api.forges.errors import NotFound, Unavailable, Unsupported
+from curie_api.forges.errors import Ambiguous, NotFound, Unavailable, Unsupported
 from curie_api.forges.ports import CodeHost, MarkedComments, Tracker
 from curie_api.forges.types import (
     Actor,
     CheckState,
     CiDiagnostic,
+    CiReport,
     CiRollup,
     Commit,
     Credential,
@@ -50,6 +51,11 @@ from curie_api.forges.types import (
     PullRequestState,
     ReplyTarget,
     RepositoryRef,
+    RerunAttempt,
+    RerunJob,
+    RerunObserver,
+    RerunOutcome,
+    RerunRecord,
     ReviewFeedback,
     TrackerIssueRef,
     UpsertResult,
@@ -472,6 +478,7 @@ class _PullRequest:
     state: PullRequestState
     title: str
     body: str
+    draft: bool = False
 
 
 @dataclass(frozen=True)
@@ -559,7 +566,13 @@ class InMemoryCodeHost(_Declared):
         reported = self._checks.setdefault(sha, {})
         for key, state in checks.items():
             reported[key] = NormalizedCheck(
-                key, state, sha, key.title(), f"https://{self.host}/ci/{sha[:12]}/{key}"
+                key,
+                state,
+                sha,
+                key.title(),
+                f"https://{self.host}/ci/{sha[:12]}/{key}",
+                check_id=str(next(self._ids)),
+                native=True,
             )
             if excerpt is not None and state in {CheckState.FAILURE, CheckState.CANCELLED}:
                 self._excerpts[(sha, key)] = excerpt
@@ -622,6 +635,7 @@ class InMemoryCodeHost(_Declared):
             url=f"https://{self.host}/{repository.path}/pull/{pull.ref.number}",
             title=pull.title,
             body=pull.body,
+            draft=pull.draft,
         )
 
     # Port -----------------------------------------------------------------
@@ -667,7 +681,9 @@ class InMemoryCodeHost(_Declared):
             for pull in self._pulls.values()
             if pull.ref.repository == repository and pull.head_ref == head_ref
         ]
-        return self._view(matches[-1]) if matches else None
+        if len(matches) > 1:
+            raise Ambiguous("multiple_pull_requests")
+        return self._view(matches[0]) if matches else None
 
     async def open_pull_request(
         self,
@@ -677,6 +693,7 @@ class InMemoryCodeHost(_Declared):
         base_ref: str,
         title: str,
         body: str,
+        draft: bool = False,
     ) -> PullRequest:
         self._gate(Operation.OPEN_PULL_REQUEST)
         self._repository(repository)
@@ -686,7 +703,9 @@ class InMemoryCodeHost(_Declared):
         ) not in self._branches:
             raise NotFound("branch")
         ref = PullRequestRef(repository, str(len(self._pulls) + 1))
-        self._pulls[ref] = _PullRequest(ref, head_ref, base_ref, PullRequestState.OPEN, title, body)
+        self._pulls[ref] = _PullRequest(
+            ref, head_ref, base_ref, PullRequestState.OPEN, title, body, draft
+        )
         self.ledger.record()
         return self._view(self._pulls[ref])
 
@@ -737,31 +756,55 @@ class InMemoryCodeHost(_Declared):
         return any(item.feedback == feedback for item in self._feedback.get(pull.ref, []))
 
     async def ci_diagnostics(
-        self, repository: RepositoryRef, head_sha: str
-    ) -> tuple[CiDiagnostic, ...]:
+        self, repository: RepositoryRef, head_sha: str, *, base_ref: str | None
+    ) -> CiReport:
         self._gate(Operation.CI_DIAGNOSTICS)
         self._repository(repository)
-        return tuple(
-            CiDiagnostic(key, excerpt)
-            for (sha, key), excerpt in self._excerpts.items()
-            if sha == head_sha
+        reported = self._checks.get(head_sha, {})
+        rollup = CiRollup.on_head(head_sha, tuple(reported.values()))
+        base: CiRollup | None = None
+        base_sha = self._branches.get((repository, base_ref)) if base_ref is not None else None
+        if rollup.failing_keys and base_sha is not None:
+            base = CiRollup.on_head(base_sha, tuple(self._checks.get(base_sha, {}).values()))
+        return CiReport(
+            rollup,
+            tuple(
+                CiDiagnostic(key, excerpt, check_id=reported[key].check_id, summary=excerpt)
+                for (sha, key), excerpt in self._excerpts.items()
+                if sha == head_sha and key in reported
+            ),
+            base,
         )
 
-    async def rerun_failed(self, repository: RepositoryRef, head_sha: str) -> int:
+    async def rerun_failed(
+        self,
+        repository: RepositoryRef,
+        jobs: Sequence[RerunJob],
+        *,
+        settled: Collection[str] = (),
+        on_attempt: RerunObserver | None = None,
+    ) -> RerunRecord:
+        """Each job is its own rerun unit: its check goes back to pending."""
+
+        resolved = tuple(replace(job, unit=job.unit or job.check_id) for job in jobs)
+        record = RerunRecord(resolved)
         if not self._gate(Operation.RERUN_FAILED):
-            return 0
+            return record
         self._repository(repository)
-        reported = self._checks.get(head_sha, {})
-        failed = [
-            key
-            for key, check in reported.items()
-            if check.state in {CheckState.FAILURE, CheckState.CANCELLED}
-        ]
-        for key in failed:
-            reported[key] = replace(reported[key], state=CheckState.PENDING)
-        if failed:
+        for job in resolved:
+            assert job.unit is not None
+            if job.unit in settled or any(a.unit == job.unit for a in record.attempts):
+                continue
+            for checks in self._checks.values():
+                for key, check in checks.items():
+                    if check.check_id == job.check_id:
+                        checks[key] = replace(check, state=CheckState.PENDING)
             self.ledger.record()
-        return len(failed)
+            attempt = RerunAttempt(job.unit, RerunOutcome.ACCEPTED)
+            record = replace(record, attempts=(*record.attempts, attempt))
+            if on_attempt is not None and not await on_attempt(record):
+                break
+        return record
 
     async def user_can_write(self, repository: RepositoryRef, actor: Actor) -> bool:
         self._gate(Operation.USER_CAN_WRITE)

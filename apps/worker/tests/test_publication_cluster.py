@@ -14,7 +14,7 @@ from urllib.parse import quote
 import httpx
 import pytest
 from channel_protocol.reply import ReplyAck
-from curie_worker.publication_clients import GitHubPublicationLookup, PublicationLineageClient
+from curie_worker.publication_clients import PublicationLineageClient
 from curie_worker.publication_k8s import (
     KubernetesPublicationCluster,
     PublicationJobSettings,
@@ -397,6 +397,31 @@ async def _seed_failed_publication(engine: AsyncEngine, base_sha: str) -> None:
         )
 
 
+class _NoBranchCodeHost:
+    """The API's code host routes for a publication whose branch was never pushed."""
+
+    async def read_branch_head(self, publication_id: uuid.UUID) -> str | None:
+        return None
+
+    async def read_pull_request(self, publication_id: uuid.UUID, pr_number: int) -> None:
+        raise AssertionError("a failed Job has no stored pull request to read")
+
+    async def verify_revision_commit(
+        self,
+        publication_id: uuid.UUID,
+        commit_sha: str,
+        *,
+        revision_id: uuid.UUID,
+        expected_parent: str,
+    ) -> str:
+        raise AssertionError("a failed Job has no revision commit to verify")
+
+    async def recover_pull_request(
+        self, publication_id: uuid.UUID, *, expected_head_sha: str
+    ) -> None:
+        return None
+
+
 async def test_real_git_failure_is_terminalized_once_without_spending_retry() -> None:
     engine = create_async_engine(_required("TEST_DATABASE_URL"))
     try:
@@ -425,10 +450,9 @@ async def test_real_git_failure_is_terminalized_once_without_spending_retry() ->
                 store=store,
                 credentials=credentials,
                 cluster=cluster,
-                github=GitHubPublicationLookup(
-                    client,
-                    api_base_url=_required("CURIE_PUBLICATION_FIXTURE_CLUSTER_API"),
-                ),
+                # The Job fails before any success marker, so the API's code
+                # host routes are asked at most for the absent branch.
+                code_host=_NoBranchCodeHost(),
                 replies=replies,
                 # This Job fails before any success marker, so the API is never called.
                 lineage=PublicationLineageClient(

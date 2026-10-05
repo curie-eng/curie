@@ -68,7 +68,7 @@ from .ledger_client import ThreadAttachmentLedgerClient
 from .markers import Markers
 from .progress import ProgressStore
 from .publication_clients import (
-    GitHubPublicationLookup,
+    PublicationCodeHostClient,
     PublicationCredentialClient,
     PublicationLineageClient,
     PublicationTranscriptClient,
@@ -1323,7 +1323,11 @@ def _build_publication_loop(
             client=http,
         ),
         cluster=cluster,
-        github=GitHubPublicationLookup(http, api_base_url=config.publication_github_api_url),
+        code_host=PublicationCodeHostClient(
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
+            client=http,
+        ),
         lineage=PublicationLineageClient(
             api_base_url=config.api_base_url,
             worker_token=config.internal_worker_token,

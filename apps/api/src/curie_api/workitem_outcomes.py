@@ -23,12 +23,18 @@ import re
 import uuid
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from curie_api.forges.errors import ForgeError
+from curie_api.forges.hosts import repository_ref
+from curie_api.forges.ports import CodeHost
+from curie_api.forges.types import RollupState
 from curie_api.schemas.workitems import (
+    WorkItemCiOut,
+    WorkItemCiState,
     WorkItemCorrectnessOut,
     WorkItemOutcomeOut,
     WorkItemOutcomeState,
@@ -52,6 +58,13 @@ from .models import (
 )
 
 OBJECTIVE_LIMIT = 512
+_SHA = re.compile(r"[0-9a-fA-F]{7,64}")
+_CI_STATES: dict[RollupState, WorkItemCiState] = {
+    RollupState.NONE: "none",
+    RollupState.PENDING: "pending",
+    RollupState.SUCCESS: "passing",
+    RollupState.FAILURE: "failing",
+}
 
 _PUBLISHING = frozenset({"approved", "launching", "running"})
 _ACTIVE_REQUEST_STATUSES = frozenset({"waiting", "running", "cancellation_requested"})
@@ -606,3 +619,43 @@ async def load_outcome(
         return None
     ((view, lineage),) = await _views(session, [item], settings)
     return view, item, lineage
+
+
+async def observe_ci(
+    code_host: CodeHost,
+    settings: Settings,
+    lineage: ThreadPublicationLineage | None,
+    work_item: WorkItem,
+) -> WorkItemCiOut:
+    """CI on the lineage's published head, live and never persisted.
+
+    Every failure is ``unavailable`` with the code host's fixed reason code,
+    which never carries a response body, header, URL or token.
+    """
+
+    if lineage is None or lineage.pr_number is None:
+        return WorkItemCiOut(state="not_applicable", reason="no_pull_request")
+    head_sha = lineage.head_sha
+    if not isinstance(head_sha, str) or not _SHA.fullmatch(head_sha):
+        return WorkItemCiOut(state="unavailable", reason="no_head_sha", observed_at=_now())
+    repository = repository_ref(
+        settings,
+        path=lineage.repo_full_name,
+        project_id=lineage.github_repository_id or work_item.github_repository_id,
+    )
+    try:
+        rollup = await code_host.observe_ci(repository, head_sha)
+    except ForgeError as exc:
+        return WorkItemCiOut(
+            state="unavailable",
+            reason=str(exc) or "unavailable",
+            head_sha=head_sha,
+            observed_at=_now(),
+        )
+    return WorkItemCiOut(
+        state=_CI_STATES[rollup.state], reason=None, head_sha=head_sha, observed_at=_now()
+    )
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)

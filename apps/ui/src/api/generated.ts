@@ -2388,6 +2388,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/publications/{publication_id}/branch-head": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Publication Branch Head
+         * @description The deterministic lineage branch's head, creating nothing.
+         */
+        get: operations["read_publication_branch_head_v1_internal_publications__publication_id__branch_head_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/publications/{publication_id}/credential": {
         parameters: {
             query?: never;
@@ -2420,6 +2440,54 @@ export interface paths {
         head?: never;
         /** Advance Publication Lineage */
         patch: operations["advance_publication_lineage_v1_internal_publications__publication_id__lineage_patch"];
+        trace?: never;
+    };
+    "/v1/internal/publications/{publication_id}/pull-request": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Publication Pull Request
+         * @description The stored pull request, read now by its number and nothing else.
+         */
+        get: operations["read_publication_pull_request_v1_internal_publications__publication_id__pull_request_get"];
+        put?: never;
+        /**
+         * Recover Publication Pull Request
+         * @description Adopt the branch's pull request, or open it when the branch exists.
+         *
+         *     The contract is the stored publication's title, body and draft flag, the
+         *     lineage branch, and the admitted WorkItem's base or else the repository's
+         *     default branch (`curie_api.publication_pulls.adopt_or_open`).
+         */
+        post: operations["recover_publication_pull_request_v1_internal_publications__publication_id__pull_request_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publications/{publication_id}/revision-commit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Verify Publication Revision
+         * @description Prove a remote commit is this revision's marked commit on its expected parent.
+         */
+        post: operations["verify_publication_revision_v1_internal_publications__publication_id__revision_commit_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/v1/internal/remediation/nominations": {
@@ -6166,6 +6234,14 @@ export interface components {
             status?: ("connected" | "disconnected") | null;
         };
         /**
+         * PublicationBranchHeadOut
+         * @description The head of a publication's branch; ``None`` when the branch does not exist.
+         */
+        PublicationBranchHeadOut: {
+            /** Head Sha */
+            head_sha: string | null;
+        };
+        /**
          * PublicationContext
          * @description API issued authority and observation for one execution's publication read.
          *
@@ -6510,6 +6586,60 @@ export interface components {
              * @enum {string}
              */
             result: "unchanged" | "metadata_changed";
+        };
+        /**
+         * PublicationPullRecover
+         * @description Adopt the publication branch's pull request, or open it when the branch
+         *     holds exactly ``expected_head_sha``.
+         */
+        PublicationPullRecover: {
+            /** Expected Head Sha */
+            expected_head_sha: string;
+        };
+        /**
+         * PublicationPullRequestOut
+         * @description One pull request, read through the code host for the worker (ADR 0197, item 6).
+         *
+         *     The worker holds no forge code: it receives the pull request's number,
+         *     URL, state and head as data and never a provider payload.
+         */
+        PublicationPullRequestOut: {
+            /** Head Ref */
+            head_ref: string;
+            /** Head Sha */
+            head_sha: string;
+            /** Number */
+            number: number;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "open" | "closed" | "merged";
+            /** Url */
+            url: string;
+        };
+        /** PublicationRevisionOut */
+        PublicationRevisionOut: {
+            /** Commit Sha */
+            commit_sha: string;
+        };
+        /**
+         * PublicationRevisionVerify
+         * @description A remote commit the worker asks the API to prove is this revision's.
+         *
+         *     ``revision_id`` and ``expected_parent`` must equal the stored publication's
+         *     own; the API derives both and refuses any other.
+         */
+        PublicationRevisionVerify: {
+            /** Commit Sha */
+            commit_sha: string;
+            /** Expected Parent */
+            expected_parent: string;
+            /**
+             * Revision Id
+             * Format: uuid
+             */
+            revision_id: string;
         };
         /**
          * QueuedTurn
@@ -13251,6 +13381,39 @@ export interface operations {
             };
         };
     };
+    read_publication_branch_head_v1_internal_publications__publication_id__branch_head_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicationBranchHeadOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     redeem_publication_credential_v1_internal_publications__publication_id__credential_post: {
         parameters: {
             query?: never;
@@ -13308,6 +13471,122 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PublicationLineageOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_publication_pull_request_v1_internal_publications__publication_id__pull_request_get: {
+        parameters: {
+            query: {
+                pr_number: number;
+            };
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicationPullRequestOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    recover_publication_pull_request_v1_internal_publications__publication_id__pull_request_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PublicationPullRecover"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicationPullRequestOut"];
+                };
+            };
+            /** @description The publication branch does not exist */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    verify_publication_revision_v1_internal_publications__publication_id__revision_commit_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PublicationRevisionVerify"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicationRevisionOut"];
                 };
             };
             /** @description Validation Error */

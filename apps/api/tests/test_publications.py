@@ -1524,7 +1524,7 @@ def test_cluster_message_publication_card_consumer_is_delivered_or_bounded(
             ),
             credentials=None,
             cluster=None,
-            github=None,
+            code_host=None,
             lineage=None,
             replies=sink,
             job_settings=None,  # type: ignore[arg-type]
@@ -2006,7 +2006,7 @@ def test_publication_resolved_before_card_registration_settles_the_card_once(
             ),
             credentials=None,
             cluster=None,
-            github=None,
+            code_host=None,
             lineage=None,
             replies=sink,
             job_settings=None,  # type: ignore[arg-type]
@@ -6399,7 +6399,7 @@ async def _reconcile_through_lineage_patch(
                 store=store,
                 credentials=_UnexpectedPublicationCredentials(),
                 cluster=cluster,
-                github=SimpleNamespace(),
+                code_host=SimpleNamespace(),
                 lineage=PublicationLineageClient(
                     api_base_url="http://api.example.test",
                     worker_token=WORKER_TOKEN,

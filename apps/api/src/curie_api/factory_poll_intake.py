@@ -33,24 +33,33 @@ from sqlalchemy import desc, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.concurrency import run_in_threadpool
 
-from curie_api.factory_label_reconcile import bound_repositories, last_label_event, parse_time
+from curie_api.factory_label_reconcile import bound_repositories, parse_time
 
 from . import github_factory
 from .config import Settings
+from .forges.errors import Unavailable
+from .forges.github.comments import static_token
 from .forges.github.review_polling import (
-    _admit_one_feedback,
-    _admit_review_comments,
-    _admit_reviews,
-    _advance,
-    _Cursor,
-    _human_actor,
-    _open_pulls,
-    _pull,
-    _repository_payload,
-    _since_param,
-    _trailing_id,
+    Cursor,
+    admit_one_feedback,
+    admit_review_comments,
+    admit_reviews,
+    advance,
+    human_actor,
+    open_pulls,
+    read_pull,
+    repository_payload,
+    since_param,
+    trailing_id,
 )
-from .forges.github.transport import _list, _Unavailable, get_github_json, github_headers
+from .forges.github.tracker import (
+    GitHubTracker,
+    label_names,
+    last_event_of_kind,
+    last_label_event,
+    read_repository,
+)
+from .forges.github.transport import PollUnavailable
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_factory_events import FactoryNotice, mentions_login
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
@@ -70,33 +79,6 @@ def _engine(sessionmaker: async_sessionmaker[AsyncSession]) -> Any:
     if bind is not None:
         return bind
     raise RuntimeError("factory poll sessionmaker has no bind")
-
-
-def _label_names(issue: dict[str, Any]) -> set[str] | None:
-    labels = issue.get("labels")
-    if not isinstance(labels, list):
-        return None
-    names: set[str] = set()
-    for label in labels:
-        if not isinstance(label, dict) or not isinstance(label.get("name"), str):
-            return None
-        names.add(label["name"])
-    return names
-
-
-def _last_kind(
-    events: list[Any], kind: str, *, label: str | None = None
-) -> dict[str, Any] | None:
-    found: dict[str, Any] | None = None
-    for event in events:
-        if not isinstance(event, dict) or event.get("event") != kind:
-            continue
-        if label is not None:
-            raw = event.get("label")
-            if not isinstance(raw, dict) or raw.get("name") != label:
-                continue
-        found = event
-    return found
 
 
 async def _label_already_admitted(
@@ -167,7 +149,8 @@ async def _poll_locked(
         try:
             await _poll_repository(sessionmaker, settings, client, repo)
         except (
-            _Unavailable,
+            Unavailable,
+            PollUnavailable,
             FeedbackUnavailable,
             GitHubAppError,
             GitHubInstallationRefused,
@@ -189,25 +172,26 @@ async def _poll_repository(
     )
     api = settings.github_api_url.rstrip("/")
     repo_path = f"/repos/{repo_url_path(repo)}"
-    repository = await get_github_json(
-        client, api=api, token=token, path=repo_path, refusal="repository_unavailable"
-    )
+    repository = await read_repository(client, api=api, repo_full_name=repo, token=token)
     repository_id = repository.get("id")
     if type(repository_id) is not int or repository_id <= 0:
-        raise _Unavailable(repo_path)
+        raise Unavailable(repo_path)
     if not isinstance(repository.get("full_name"), str):
-        raise _Unavailable(repo_path)
+        raise Unavailable(repo_path)
     cursor.repository_id = repository_id
+    tracker = GitHubTracker.from_settings(
+        settings,
+        client,
+        repo_full_name=repo,
+        repository_id=repository_id,
+        token=static_token(token),
+    )
     await _admit_labeled(
         sessionmaker,
         settings,
         client,
         cursor,
-        api=api,
-        token=token,
-        repo=repo,
-        repo_path=repo_path,
-        repository_id=repository_id,
+        tracker,
         installation_id=installation_id,
     )
     await _cancel_stale(
@@ -215,11 +199,7 @@ async def _poll_repository(
         settings,
         client,
         cursor,
-        api=api,
-        token=token,
-        repo=repo,
-        repo_path=repo_path,
-        repository_id=repository_id,
+        tracker,
         installation_id=installation_id,
     )
     await _admit_mentions(
@@ -227,16 +207,15 @@ async def _poll_repository(
         settings,
         client,
         cursor,
+        tracker,
         now=now,
         api=api,
         token=token,
-        repo=repo,
         repo_path=repo_path,
-        repository_id=repository_id,
         installation_id=installation_id,
     )
-    owned = await _open_pulls(sessionmaker, repo, repository_id)
-    await _admit_review_comments(
+    owned = await open_pulls(sessionmaker, repo, repository_id)
+    await admit_review_comments(
         sessionmaker,
         settings,
         client,
@@ -250,7 +229,7 @@ async def _poll_repository(
         installation_id=installation_id,
         owned=owned,
     )
-    await _admit_reviews(
+    await admit_reviews(
         sessionmaker,
         settings,
         client,
@@ -266,42 +245,18 @@ async def _poll_repository(
     await _save_cursor(sessionmaker, repo, cursor)
 
 
-async def _events(
-    client: httpx.AsyncClient, *, api: str, token: str, repo_path: str, number: int
-) -> list[Any]:
-    items, _etag = await _list(
-        client,
-        api=api,
-        token=token,
-        path=f"{repo_path}/issues/{number}/events",
-        params={},
-        etag=None,
-    )
-    return [] if items is None else items
-
-
 async def _admit_labeled(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
     client: httpx.AsyncClient,
-    cursor: _Cursor,
+    cursor: Cursor,
+    tracker: GitHubTracker,
     *,
-    api: str,
-    token: str,
-    repo: str,
-    repo_path: str,
-    repository_id: int,
     installation_id: int,
 ) -> None:
     label = settings.github_factory_label
-    listed, etag = await _list(
-        client,
-        api=api,
-        token=token,
-        path=f"{repo_path}/issues",
-        params={"state": "open", "labels": label},
-        etag=cursor.etags.get("issues"),
-    )
+    repo, repository_id = tracker.repo_full_name, tracker.repository_id
+    listed, etag = await tracker.labeled_open_issues(cursor.etags.get("issues"))
     if listed is None:
         return
     deferred = False
@@ -312,13 +267,11 @@ async def _admit_labeled(
         if type(number) is not int or number <= 0:
             continue
         try:
-            events = await _events(
-                client, api=api, token=token, repo_path=repo_path, number=number
-            )
+            events = await tracker.issue_events(number)
             event = last_label_event(events, label)
             if event is None or type(event.get("id")) is not int:
                 continue
-            sender = _human_actor(event)
+            sender = human_actor(event)
             if sender is None:
                 continue
             sender_id, sender_login = sender
@@ -341,7 +294,7 @@ async def _admit_labeled(
                 # Reusing the admission here would cancel or replace the live run.
                 notice = replace(notice, disposition="base_label")
             await _apply_notice(sessionmaker, settings, client, notice)
-        except (_Unavailable, FeedbackUnavailable, FeedbackIgnored):
+        except (Unavailable, FeedbackUnavailable, FeedbackIgnored):
             deferred = True
             logger.info("factory labeled issue poll for %s issue %s deferred", repo, number)
     if etag and not deferred:
@@ -352,15 +305,12 @@ async def _cancel_stale(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
     client: httpx.AsyncClient,
-    cursor: _Cursor,
+    cursor: Cursor,
+    tracker: GitHubTracker,
     *,
-    api: str,
-    token: str,
-    repo: str,
-    repo_path: str,
-    repository_id: int,
     installation_id: int,
 ) -> None:
+    repo, repository_id = tracker.repo_full_name, tracker.repository_id
     async with sessionmaker() as session:
         items = list(
             await session.scalars(
@@ -382,18 +332,12 @@ async def _cancel_stale(
     for number in numbers:
         key = f"issue:{number}:{label}"
         try:
-            issue, etag = await _conditional_issue(
-                client,
-                api=api,
-                token=token,
-                path=f"{repo_path}/issues/{number}",
-                etag=cursor.etags.get(key),
-            )
+            issue, etag = await tracker.conditional_issue(number, cursor.etags.get(key))
             if issue is None or "pull_request" in issue:
                 continue
-            names = _label_names(issue)
+            names = label_names(issue)
             if names is None or issue.get("state") not in {"open", "closed"}:
-                raise _Unavailable(f"{repo_path}/issues/{number}")
+                raise Unavailable(f"issue {number}")
             if issue.get("state") == "closed":
                 action, kind = "closed", "closed"
             elif label not in names:
@@ -405,13 +349,11 @@ async def _cancel_stale(
             # Retry cancellation authority on every pass until it succeeds.
             # A cached issue must not hide a later permission or event repair.
             cursor.etags.pop(key, None)
-            events = await _events(
-                client, api=api, token=token, repo_path=repo_path, number=number
-            )
-            event = _last_kind(events, kind, label=label if kind == "unlabeled" else None)
+            events = await tracker.issue_events(number)
+            event = last_event_of_kind(events, kind, label=label if kind == "unlabeled" else None)
             if event is None:
                 continue
-            sender = _human_actor(event)
+            sender = human_actor(event)
             if sender is None:
                 continue
             sender_id, sender_login = sender
@@ -429,45 +371,8 @@ async def _cancel_stale(
                 label=label,
             )
             await _apply_notice(sessionmaker, settings, client, notice)
-        except (_Unavailable, FeedbackUnavailable, FeedbackIgnored):
+        except (Unavailable, FeedbackUnavailable, FeedbackIgnored):
             logger.info("factory stale issue poll for %s issue %s deferred", repo, number)
-
-
-async def _conditional_issue(
-    client: httpx.AsyncClient,
-    *,
-    api: str,
-    token: str,
-    path: str,
-    etag: str | None,
-) -> tuple[dict[str, Any] | None, str | None]:
-    """Read current state, without charging unchanged issues to the rate budget.
-
-    Authenticated conditional requests returning 304 do not count against the
-    primary rate limit. A cached value is used only for an open labeled issue.
-    https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#use-conditional-requests-if-appropriate
-    """
-
-    headers = github_headers(token)
-    if etag:
-        headers["If-None-Match"] = etag
-    try:
-        response = await client.get(
-            f"{api}{path}", headers=headers, follow_redirects=False
-        )
-    except httpx.HTTPError:
-        raise _Unavailable(path) from None
-    if response.status_code == 304 and etag:
-        return None, response.headers.get("etag") or etag
-    if response.status_code != 200:
-        raise _Unavailable(path)
-    try:
-        issue = response.json()
-    except ValueError:
-        raise _Unavailable(path) from None
-    if not isinstance(issue, dict):
-        raise _Unavailable(path)
-    return issue, response.headers.get("etag")
 
 
 async def _issue_numbers(
@@ -487,45 +392,34 @@ async def _admit_mentions(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
     client: httpx.AsyncClient,
-    cursor: _Cursor,
+    cursor: Cursor,
+    tracker: GitHubTracker,
     *,
     now: datetime,
     api: str,
     token: str,
-    repo: str,
     repo_path: str,
-    repository_id: int,
     installation_id: int,
 ) -> None:
-    listed, etag = await _list(
-        client,
-        api=api,
-        token=token,
-        path=f"{repo_path}/issues/comments",
-        params={
-            "since": _since_param(cursor.comments_since, now),
-            "sort": "created",
-            "direction": "asc",
-        },
-        etag=cursor.etags.get("issue-comments"),
+    repo, repository_id = tracker.repo_full_name, tracker.repository_id
+    listed, etag = await tracker.issue_comments_since(
+        since_param(cursor.comments_since, now), cursor.etags.get("issue-comments")
     )
     if listed is None:
         return
     factory_issues = await _issue_numbers(sessionmaker, repository_id)
-    owned_pulls = set(
-        await _open_pulls(sessionmaker, repo, repository_id)
-    )
+    owned_pulls = set(await open_pulls(sessionmaker, repo, repository_id))
     for comment in listed:
         if not isinstance(comment, dict):
             continue
         if comment.get("performed_via_github_app") is not None:
             continue
-        sender = _human_actor({"user": comment.get("user")})
+        sender = human_actor({"user": comment.get("user")})
         if sender is None:
             continue
         body = comment.get("body")
         comment_id = comment.get("id")
-        number = _trailing_id(comment.get("issue_url"))
+        number = trailing_id(comment.get("issue_url"))
         if (
             not isinstance(body, str)
             or type(comment_id) is not int
@@ -534,10 +428,8 @@ async def _admit_mentions(
         ):
             continue
         if number in owned_pulls:
-            pull = await _pull(
-                client, api=api, token=token, repo_path=repo_path, number=number
-            )
-            await _admit_one_feedback(
+            pull = await read_pull(client, api=api, token=token, repo_path=repo_path, number=number)
+            await admit_one_feedback(
                 sessionmaker,
                 settings,
                 client,
@@ -545,7 +437,7 @@ async def _admit_mentions(
                 payload={
                     "action": "created",
                     "installation": {"id": installation_id},
-                    "repository": _repository_payload(repository_id, repo),
+                    "repository": repository_payload(repository_id, repo),
                     "sender": comment.get("user"),
                     "issue": {
                         "number": number,
@@ -576,7 +468,7 @@ async def _admit_mentions(
             comment_body=body,
         )
         await _apply_notice(sessionmaker, settings, client, notice)
-    cursor.comments_since = _advance(cursor.comments_since, listed, "created_at", "updated_at")
+    cursor.comments_since = advance(cursor.comments_since, listed, "created_at", "updated_at")
     if etag:
         cursor.etags["issue-comments"] = etag
 
@@ -598,7 +490,7 @@ async def _apply_notice(
             elif notice.disposition == "base_label":
                 await github_factory.record_base_label_notice(session, notice, verified, settings)
             else:
-                await github_factory.admit_notice(session, notice, settings, verified, client)
+                await github_factory.admit_notice(session, notice, settings, verified)
         except FeedbackUnavailable:
             await session.rollback()
             raise
@@ -608,16 +500,14 @@ async def _apply_notice(
         await session.commit()
 
 
-async def _load_cursor(
-    sessionmaker: async_sessionmaker[AsyncSession], repo: str
-) -> _Cursor:
+async def _load_cursor(sessionmaker: async_sessionmaker[AsyncSession], repo: str) -> Cursor:
     async with sessionmaker() as session:
         row = await session.get(FactoryPollCursor, repo)
         if row is None:
-            return _Cursor()
+            return Cursor()
         raw = row.etags if isinstance(row.etags, dict) else {}
         etags = {str(key): value for key, value in raw.items() if isinstance(value, str)}
-        return _Cursor(
+        return Cursor(
             comments_since=row.comments_since,
             review_comments_since=row.review_comments_since,
             reviews_since=row.reviews_since,
@@ -627,7 +517,7 @@ async def _load_cursor(
 
 
 async def _save_cursor(
-    sessionmaker: async_sessionmaker[AsyncSession], repo: str, cursor: _Cursor
+    sessionmaker: async_sessionmaker[AsyncSession], repo: str, cursor: Cursor
 ) -> None:
     async with sessionmaker() as session:
         row = await session.get(FactoryPollCursor, repo)

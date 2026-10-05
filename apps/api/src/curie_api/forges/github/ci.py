@@ -189,10 +189,23 @@ async def mint_ci_token(
     in the caller's local; every failure maps to a fixed reason code.
     """
 
+    return await mint_repository_token(
+        settings,
+        lineage.repo_full_name,
+        lineage.github_installation_id or work_item.github_installation_id,
+        head_sha,
+    )
+
+
+async def mint_repository_token(
+    settings: Settings, repo_full_name: str, installation_id: int | None, head_sha: str | None
+) -> tuple[str | None, CiObservation | None]:
+    """`mint_ci_token` for a repository named directly; ``None`` rediscovers
+    the installation."""
+
     resolver = credentials_for(settings)
     if not resolver.app_configured:
         return None, _unavailable("app_not_configured", head_sha)
-    installation_id = lineage.github_installation_id or work_item.github_installation_id
     if not _CI_CREDENTIAL_GUARD.acquire(blocking=False):
         # Every slot is held by a mint that has not finished; refuse now rather
         # than pile another thread onto the repository lock.
@@ -208,7 +221,7 @@ async def mint_ci_token(
             _mint_and_release,
             permit,
             resolver,
-            lineage.repo_full_name,
+            repo_full_name,
             installation_id,
             abandon_on_cancel=True,
         )
@@ -295,9 +308,10 @@ class CiDetail:
     annotations: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
     job_logs: dict[int, str] = field(default_factory=dict)
     job_log_unavailable: set[int] = field(default_factory=set)
-    # The check runs and commit statuses of the commit the PR's base branch
-    # points to at this observation (#4105). Both None when not read or
-    # unreadable; set both or neither.
+    # The commit the PR's base branch points to at this observation, with its
+    # check runs and commit statuses (#4105). All None when not read or
+    # unreadable; set all or none.
+    base_sha: str | None = None
     base_check_runs: list[dict[str, Any]] | None = None
     base_statuses: list[dict[str, Any]] | None = None
 
@@ -341,10 +355,10 @@ async def _read_base_checks(
     get: Callable[[str, dict[str, Any]], Awaitable[tuple[Any, str | None]]],
     base_ref: str,
     log_deadline: float,
-) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
-    """Check runs and statuses of the base branch's current head (#4105).
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """The base branch's current head, with its check runs and statuses (#4105).
 
-    Returns ``(None, None)`` on any failure: an unreadable base only means every
+    Returns None on any failure: an unreadable base only means every
     head failure counts as caused by the change, never an unavailable head. It
     runs after the annotation and job log reads and only spends what is left of
     ``log_deadline``, so a slow base never delays the head observation.
@@ -359,23 +373,23 @@ async def _read_base_checks(
             commit = branch.get("commit") if reason is None and isinstance(branch, dict) else None
             sha = commit.get("sha") if isinstance(commit, dict) else None
             if not isinstance(sha, str) or not _COMMIT_SHA_RE.fullmatch(sha):
-                return None, None
+                return None
             runs_payload, reason = await get(
                 f"/commits/{sha}/check-runs",
                 {"per_page": CHECK_RUNS_PAGE, "filter": "latest"},
             )
             if reason is not None or _check_runs_reason(runs_payload) is not None:
-                return None, None
+                return None
             status_payload, reason = await get(
                 f"/commits/{sha}/status", {"per_page": CHECK_RUNS_PAGE}
             )
             statuses = _statuses_list(status_payload) if reason is None else None
             if statuses is None:
-                return None, None
-            return list(runs_payload["check_runs"]), statuses
+                return None
+            return sha, list(runs_payload["check_runs"]), statuses
     except Exception:  # noqa: BLE001
         # TimeoutError included: the base read is advisory and never fails the head.
-        return None, None
+        return None
 
 
 def _signed_job_log_url(location: str | None) -> httpx.URL | None:
@@ -485,7 +499,42 @@ async def _observe_ci_detail(
     head_sha = getattr(lineage, "head_sha", None) if lineage is not None else None
     if not isinstance(head_sha, str) or not SHA_RE.fullmatch(head_sha):
         return _detail_unavailable("no_head_sha", None)
-    token, refused = await mint_ci_token(lineage, work_item, settings, head_sha)
+    return await read_ci_detail(
+        settings,
+        client,
+        repo_full_name=lineage.repo_full_name,
+        installation_id=lineage.github_installation_id or work_item.github_installation_id,
+        head_sha=head_sha,
+        log_deadline=log_deadline,
+        diagnostics=True,
+        base_ref=getattr(lineage, "base_ref", None),
+    )
+
+
+async def read_ci_detail(
+    settings: Settings,
+    client: httpx.AsyncClient,
+    *,
+    repo_full_name: str,
+    installation_id: int | None,
+    head_sha: str,
+    log_deadline: float | None,
+    diagnostics: bool,
+    base_ref: str | None,
+) -> CiDetail:
+    """Check runs and commit statuses on ``head_sha``; with ``diagnostics``, also
+    the failing runs' annotations and Actions job logs. With ``base_ref``, a
+    failing head also reads the base branch head's checks (#4105).
+
+    Unbounded: the caller owns the deadline. ``log_deadline`` is the loop time
+    by which job log downloads must end.
+    """
+
+    if not SHA_RE.fullmatch(head_sha):
+        return _detail_unavailable("no_head_sha", None)
+    token, refused = await mint_repository_token(
+        settings, repo_full_name, installation_id, head_sha
+    )
     if refused is not None:
         return _detail_unavailable(refused.reason or "github_error", head_sha)
     assert token is not None
@@ -496,10 +545,7 @@ async def _observe_ci_detail(
     }
     try:
         try:
-            base = (
-                f"{settings.github_api_url.rstrip('/')}/repos/"
-                f"{repo_url_path(lineage.repo_full_name)}"
-            )
+            base = f"{settings.github_api_url.rstrip('/')}/repos/{repo_url_path(repo_full_name)}"
         except ValueError:
             return _detail_unavailable("github_error", head_sha)
 
@@ -546,6 +592,14 @@ async def _observe_ci_detail(
         annotations: dict[int, list[dict[str, Any]]] = {}
         job_logs: dict[int, str] = {}
         job_log_unavailable: set[int] = set()
+        if not diagnostics:
+            return CiDetail(
+                state="observed",
+                reason=None,
+                head_sha=head_sha,
+                check_runs=check_runs,
+                statuses=list(statuses),
+            )
         failing_ids = [
             run["id"]
             for run in check_runs
@@ -575,8 +629,12 @@ async def _observe_ci_detail(
             )
         )
         job_log_unavailable.update(action_ids[CI_DETAIL_LOGGED_JOBS:])
+        loop = asyncio.get_running_loop()
+        deadline = (
+            log_deadline if log_deadline is not None else loop.time() + CI_JOB_LOG_TIMEOUT_SECONDS
+        )
         for job_id in action_ids[:CI_DETAIL_LOGGED_JOBS]:
-            time_left = max(0.0, log_deadline - asyncio.get_running_loop().time())
+            time_left = max(0.0, deadline - loop.time())
             log = await _fetch_job_log(
                 client,
                 base,
@@ -589,11 +647,14 @@ async def _observe_ci_detail(
             else:
                 job_log_unavailable.add(job_id)
         # Last, so it only spends what the log deadline leaves (#4105).
-        base_check_runs: list[dict[str, Any]] | None = None
-        base_statuses: list[dict[str, Any]] | None = None
-        base_ref = getattr(lineage, "base_ref", None)
-        if isinstance(base_ref, str) and base_ref and _has_failure(check_runs, statuses):
-            base_check_runs, base_statuses = await _read_base_checks(get, base_ref, log_deadline)
+        base_read: tuple[str, list[dict[str, Any]], list[dict[str, Any]]] | None = None
+        if (
+            isinstance(base_ref, str)
+            and base_ref
+            and log_deadline is not None
+            and _has_failure(check_runs, statuses)
+        ):
+            base_read = await _read_base_checks(get, base_ref, log_deadline)
     finally:
         del token
         headers.clear()
@@ -606,6 +667,138 @@ async def _observe_ci_detail(
         annotations=annotations,
         job_logs=job_logs,
         job_log_unavailable=job_log_unavailable,
-        base_check_runs=base_check_runs,
-        base_statuses=base_statuses,
+        base_sha=base_read[0] if base_read is not None else None,
+        base_check_runs=base_read[1] if base_read is not None else None,
+        base_statuses=base_read[2] if base_read is not None else None,
     )
+
+
+# --- Actions reruns (#3741) --------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ActionsRerun:
+    """One GitHub answer for a rerun request.
+
+    ``retry`` is a transport or rate-limit failure and is not the one allowed
+    attempt. ``refused`` is a definitive client response. The response body is
+    never copied.
+    """
+
+    outcome: str
+    reason: str | None = None
+    run_id: int | None = None
+
+
+RERUN_REFUSED = {
+    401: "github_unauthorized",
+    403: "github_forbidden",
+    404: "github_not_found",
+    422: "rerun_rejected",
+}
+ACTIONS_RUN_ID = re.compile(r"/actions/runs/([1-9][0-9]{0,18})(?:/|$)")
+
+
+def run_id_from_details(details_url: Any) -> int | None:
+    if not isinstance(details_url, str):
+        return None
+    matched = ACTIONS_RUN_ID.search(details_url)
+    if matched is None:
+        return None
+    return int(matched.group(1))
+
+
+def rerun_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+async def github_send(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    timeout: float,
+) -> httpx.Response | ActionsRerun:
+    try:
+        # build_request inherits client auth. send(..., auth=None) strips it so
+        # the installation token is the only credential on the wire.
+        request = client.build_request(method, url, headers=headers, timeout=timeout)
+        return await client.send(request, auth=None, follow_redirects=False)
+    except httpx.TimeoutException:
+        # The server may already have accepted the request.
+        return ActionsRerun("unconfirmed", "timeout")
+    except httpx.HTTPError:
+        return ActionsRerun("unconfirmed", "github_error")
+
+
+def status_rerun(status_code: int, *, ok: int) -> ActionsRerun | None:
+    if status_code == ok:
+        return None
+    if status_code == 429 or status_code >= 500:
+        reason = "github_rate_limited" if status_code == 429 else "github_error"
+        return ActionsRerun("retry", reason)
+    return ActionsRerun("refused", RERUN_REFUSED.get(status_code, "rerun_rejected"))
+
+
+async def lookup_run_id(
+    client: httpx.AsyncClient,
+    base: str,
+    headers: dict[str, str],
+    timeout: float,
+    job_id: int,
+) -> ActionsRerun:
+    """Read ``run_id`` when the check run did not carry an Actions URL.
+
+    ``GET /repos/{owner}/{repo}/actions/jobs/{job_id}`` returns the workflow
+    run id. Only that integer is kept.
+    https://docs.github.com/en/rest/actions/workflow-jobs#get-a-job-for-a-workflow-run
+    """
+
+    sent = await github_send(client, "GET", f"{base}/actions/jobs/{job_id}", headers, timeout)
+    if isinstance(sent, ActionsRerun):
+        return sent
+    refused = status_rerun(sent.status_code, ok=200)
+    if refused is not None:
+        return refused
+    try:
+        payload = sent.json()
+    except ValueError:
+        return ActionsRerun("refused", "rerun_rejected")
+    run_id = payload.get("run_id") if isinstance(payload, dict) else None
+    if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id < 1:
+        return ActionsRerun("refused", "rerun_rejected")
+    return ActionsRerun("requested", run_id=run_id)
+
+
+async def post_failed_run(
+    client: httpx.AsyncClient,
+    base: str,
+    headers: dict[str, str],
+    timeout: float,
+    run_id: int,
+) -> ActionsRerun:
+    """Ask GitHub to rerun every failed job in one workflow run.
+
+    ``POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs``
+    answers 201 Created. A missing Actions permission is 403. The body is
+    never read.
+    https://docs.github.com/en/rest/actions/workflow-runs#re-run-failed-jobs-from-a-workflow-run
+    """
+
+    sent = await github_send(
+        client,
+        "POST",
+        f"{base}/actions/runs/{run_id}/rerun-failed-jobs",
+        headers,
+        timeout,
+    )
+    if isinstance(sent, ActionsRerun):
+        return sent
+    refused = status_rerun(sent.status_code, ok=201)
+    if refused is not None:
+        return refused
+    return ActionsRerun("requested", run_id=run_id)

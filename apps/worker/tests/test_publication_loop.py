@@ -382,13 +382,14 @@ class _Cluster:
         self.active_jobs.discard(names.job)
 
 
-class _GitHub:
+class _CodeHost:
+    """The API's code host routes, as the worker sees them."""
+
     def __init__(self) -> None:
-        self.number_calls: list[tuple[str, int]] = []
-        self.branch_calls: list[tuple[str, str]] = []
-        self.recover_calls: list[tuple[str, str, str]] = []
-        self.verify_calls: list[tuple[str, str, uuid.UUID, str]] = []
-        self.authorization_headers: list[str] = []
+        self.number_calls: list[tuple[uuid.UUID, int]] = []
+        self.branch_calls: list[uuid.UUID] = []
+        self.recover_calls: list[tuple[uuid.UUID, str]] = []
+        self.verify_calls: list[tuple[uuid.UUID, str, uuid.UUID, str]] = []
         self.state = "open"
         self.head_sha = PRIOR_HEAD
         self.branch_head: str | None = None
@@ -399,18 +400,8 @@ class _GitHub:
         self.verified_revision_id: uuid.UUID | None = None
         self.verified_expected_parent: str | None = None
 
-    def read_pr_by_number(
-        self,
-        repo_full_name: str,
-        pr_number: int,
-        authorization_header: str,
-    ) -> Any:
-        self.authorization_headers.append(authorization_header)
-        if not authorization_header:
-            raise AssertionError(
-                "GitHub lineage lookup happened before publication credential redemption"
-            )
-        self.number_calls.append((repo_full_name, pr_number))
+    def read_pull_request(self, publication_id: uuid.UUID, pr_number: int) -> Any:
+        self.number_calls.append((publication_id, pr_number))
         return SimpleNamespace(
             number=pr_number,
             url=PR_URL,
@@ -421,21 +412,13 @@ class _GitHub:
 
     def verify_revision_commit(
         self,
-        repo_full_name: str,
+        publication_id: uuid.UUID,
         commit_sha: str,
         *,
         revision_id: uuid.UUID,
         expected_parent: str,
-        authorization_header: str,
     ) -> str:
-        self.authorization_headers.append(authorization_header)
-        if not authorization_header:
-            raise AssertionError(
-                "GitHub revision verification happened before credential redemption"
-            )
-        self.verify_calls.append(
-            (repo_full_name, commit_sha, revision_id, expected_parent)
-        )
+        self.verify_calls.append((publication_id, commit_sha, revision_id, expected_parent))
         if (
             commit_sha != self.verified_revision_head
             or revision_id != self.verified_revision_id
@@ -446,31 +429,14 @@ class _GitHub:
             )
         return commit_sha
 
-    def read_branch_head(
-        self,
-        repo_full_name: str,
-        branch: str,
-        authorization_header: str,
-    ) -> str | None:
-        self.authorization_headers.append(authorization_header)
-        self.branch_calls.append((repo_full_name, branch))
+    def read_branch_head(self, publication_id: uuid.UUID) -> str | None:
+        self.branch_calls.append(publication_id)
         return self.branch_head
 
-    def recover_pr_by_head(
-        self,
-        repo_full_name: str,
-        branch: str,
-        title: str,
-        body: str,
-        *,
-        expected_head_sha: str,
-        authorization_header: str,
-        draft: bool = False,
-        base: str | None = None,
+    def recover_pull_request(
+        self, publication_id: uuid.UUID, *, expected_head_sha: str
     ) -> Any | None:
-        del draft, base
-        self.authorization_headers.append(authorization_header)
-        self.recover_calls.append((repo_full_name, branch, expected_head_sha))
+        self.recover_calls.append((publication_id, expected_head_sha))
         if expected_head_sha != self.recovered_head_sha:
             raise PublicationReconcileError(
                 "recoverable pull request head does not match the expected commit"
@@ -720,12 +686,12 @@ def _loop(
     cards: _Cards | None = None,
     transcript: _Transcript | None | object = _DEFAULT_TRANSCRIPT,
     lineage: _Lineage | None = None,
-) -> tuple[Any, _Store, _Credentials, _Cluster, _GitHub, _Replies]:
+) -> tuple[Any, _Store, _Credentials, _Cluster, _CodeHost, _Replies]:
     k8s = importlib.import_module("curie_worker.publication_k8s")
     store = _Store()
     credentials = _Credentials(module)
     cluster = _Cluster(module)
-    github = _GitHub()
+    github = _CodeHost()
     replies = _Replies()
     cards = cards or _Cards()
     if transcript is _DEFAULT_TRANSCRIPT:
@@ -735,7 +701,7 @@ def _loop(
         credentials=credentials,
         lineage=lineage if lineage is not None else _Lineage(),
         cluster=cluster,
-        github=github,
+        code_host=github,
         replies=replies,
         card_store=cards,
         transcript=transcript if isinstance(transcript, _Transcript) else None,
@@ -1242,12 +1208,8 @@ async def test_two_approved_revisions_keep_one_lineage_branch_and_pull_number(
 
     assert credentials.calls == [PUBLICATION_ID, second_publication_id]
     assert github.number_calls == [
-        ("acme-corp/acme-bot", 123),
-        ("acme-corp/acme-bot", 123),
-    ]
-    assert github.authorization_headers == [
-        "Basic publication-write-credential-value",
-        "Basic publication-write-credential-value",
+        (PUBLICATION_ID, 123),
+        (second_publication_id, 123),
     ]
     assert len(cluster.applied) == 2
     job_envs = [_job_env(resource) for resource in cluster.applied]
@@ -1316,13 +1278,9 @@ async def test_foreign_remote_head_is_never_adopted_as_the_approved_revision(
     await loop.reconcile(_lineage_work(publication))
 
     assert credentials.calls == [PUBLICATION_ID]
-    assert github.number_calls == [("acme-corp/acme-bot", 123)]
+    assert github.number_calls == [(PUBLICATION_ID, 123)]
     assert github.verify_calls == [
-        ("acme-corp/acme-bot", "d" * 40, REVISION_ID, PRIOR_HEAD)
-    ]
-    assert github.authorization_headers == [
-        "Basic publication-write-credential-value",
-        "Basic publication-write-credential-value",
+        (PUBLICATION_ID, "d" * 40, REVISION_ID, PRIOR_HEAD)
     ]
     assert cluster.applied == []
     assert store.completed == {}
@@ -1448,20 +1406,14 @@ async def test_ttl_deleted_first_revision_job_recovers_exact_marked_commit_and_p
     assert credentials.calls == [PUBLICATION_ID, PUBLICATION_ID]
     assert len(cluster.applied) == 1, "recovery must not recreate the publication Job"
     assert github.branch_calls == [
-        ("acme-corp/acme-bot", LINEAGE_BRANCH),
-        ("acme-corp/acme-bot", LINEAGE_BRANCH),
+        PUBLICATION_ID,
+        PUBLICATION_ID,
     ]
     assert github.verify_calls == [
-        ("acme-corp/acme-bot", REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
+        (PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
     ]
     assert github.recover_calls == [
-        ("acme-corp/acme-bot", LINEAGE_BRANCH, REVISION_HEAD)
-    ]
-    assert github.authorization_headers == [
-        "Bearer rotated-installation-token-1",
-        "Bearer rotated-installation-token-2",
-        "Bearer rotated-installation-token-2",
-        "Bearer rotated-installation-token-2",
+        (PUBLICATION_ID, REVISION_HEAD)
     ]
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert loop._lineage.advances[0]["pr_number"] == 123
@@ -1481,10 +1433,10 @@ async def test_first_revision_recovery_refuses_pr_head_replaced_after_commit_pro
 
     assert credentials.calls == [PUBLICATION_ID]
     assert github.verify_calls == [
-        ("acme-corp/acme-bot", REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
+        (PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
     ]
     assert github.recover_calls == [
-        ("acme-corp/acme-bot", LINEAGE_BRANCH, REVISION_HEAD)
+        (PUBLICATION_ID, REVISION_HEAD)
     ]
     assert cluster.applied == []
     assert store.completed == {}
@@ -1512,7 +1464,7 @@ async def test_first_revision_recovery_persists_terminal_pull_without_repost(
 
     assert credentials.calls == [PUBLICATION_ID]
     assert github.recover_calls == [
-        ("acme-corp/acme-bot", LINEAGE_BRANCH, REVISION_HEAD)
+        (PUBLICATION_ID, REVISION_HEAD)
     ]
     assert store.lineage_terminals == [
         {
@@ -1551,7 +1503,7 @@ async def test_stored_terminal_pull_never_adopts_a_foreign_replacement_head(
 
     assert credentials.calls == [PUBLICATION_ID]
     assert github.verify_calls == [
-        ("acme-corp/acme-bot", foreign_head, REVISION_ID, PRIOR_HEAD)
+        (PUBLICATION_ID, foreign_head, REVISION_ID, PRIOR_HEAD)
     ]
     assert store.lineage_terminals == [
         {
@@ -1617,7 +1569,7 @@ async def test_stored_terminal_pull_accepts_an_exact_verified_revision_head(
     await loop.reconcile(_lineage_work(publication))
 
     assert github.verify_calls == [
-        ("acme-corp/acme-bot", REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
+        (PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
     ]
     assert store.lineage_terminals == [
         {
@@ -1914,7 +1866,7 @@ async def test_missing_job_never_overwrites_an_unmarked_lineage_branch_head(
 
     assert credentials.calls == [PUBLICATION_ID]
     assert github.verify_calls == [
-        ("acme-corp/acme-bot", "d" * 40, REVISION_ID, PRIOR_HEAD)
+        (PUBLICATION_ID, "d" * 40, REVISION_ID, PRIOR_HEAD)
     ]
     assert github.recover_calls == []
     assert cluster.applied == []
@@ -1940,13 +1892,9 @@ async def test_exact_marked_remote_revision_is_adopted_before_recreating_a_missi
     await loop.reconcile(work)
 
     assert credentials.calls == [PUBLICATION_ID]
-    assert github.number_calls == [("acme-corp/acme-bot", 123)]
+    assert github.number_calls == [(PUBLICATION_ID, 123)]
     assert github.verify_calls == [
-        ("acme-corp/acme-bot", REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
-    ]
-    assert github.authorization_headers == [
-        "Basic publication-write-credential-value",
-        "Basic publication-write-credential-value",
+        (PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
     ]
     assert cluster.applied == [], "remote adoption must happen before a replacement Job"
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
@@ -2263,13 +2211,9 @@ async def test_terminal_job_recovers_exact_marked_revision_after_lost_response(
     await loop.reconcile(_lineage_work(publication))
 
     assert credentials.calls == [PUBLICATION_ID]
-    assert github.number_calls == [("acme-corp/acme-bot", 123)]
+    assert github.number_calls == [(PUBLICATION_ID, 123)]
     assert github.verify_calls == [
-        ("acme-corp/acme-bot", REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
-    ]
-    assert github.authorization_headers == [
-        "Basic publication-write-credential-value",
-        "Basic publication-write-credential-value",
+        (PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
     ]
     assert cluster.applied == []
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
@@ -2584,7 +2528,7 @@ async def test_failed_first_revision_job_with_no_push_terminalizes_on_first_reco
     await loop.reconcile(_work(publication))
 
     assert len(cluster.validated_existing) == 1
-    assert github.branch_calls == [("acme-corp/acme-bot", LINEAGE_BRANCH)]
+    assert github.branch_calls == [PUBLICATION_ID]
     _assert_terminal_no_push_failure(store, cluster, replies)
 
     await loop.reconcile(_work(publication))
@@ -2601,7 +2545,7 @@ async def test_failed_lineage_job_with_unmoved_pr_head_terminalizes_on_first_rec
 
     await loop.reconcile(_lineage_work(publication))
 
-    assert github.number_calls == [("acme-corp/acme-bot", 123)]
+    assert github.number_calls == [(PUBLICATION_ID, 123)]
     assert github.verify_calls == []
     _assert_terminal_no_push_failure(store, cluster, replies)
 
@@ -2671,13 +2615,13 @@ def _uncharged_bound(module: Any) -> int:
     return int(module._MAX_UNCHARGED_IDENTITY_ESCAPES)
 
 
-def _recovery_work(module: Any, cluster: _Cluster, github: _GitHub) -> Any:
+def _recovery_work(module: Any, cluster: _Cluster, github: _CodeHost) -> Any:
     github.branch_head = REVISION_HEAD
     github.allow_exact_revision(REVISION_HEAD, REVISION_ID, PRIOR_HEAD)
     return _work(module)
 
 
-def _later_revision_work(module: Any, cluster: _Cluster, github: _GitHub) -> Any:
+def _later_revision_work(module: Any, cluster: _Cluster, github: _CodeHost) -> Any:
     github.head_sha = PRIOR_HEAD
     return _lineage_work(module)
 

@@ -42,6 +42,7 @@ from .graveyardwatcher import GraveyardWatcher
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
+from .lineage_reconciler import start_lineage_reconciler
 from .protected_reconciler import ProtectedAdmissionReconciler
 from .resumequeue import ResumeQueue
 from .resumereconciler import ResumeReconciler
@@ -220,6 +221,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.resume_reconciler_enabled
         else None
     )
+    app.state.lineage_reconciler_task = start_lineage_reconciler(
+        app.state.sessionmaker, settings, http_client
+    )
     # The expiry sweeper (#412) flips lapsed pending approvals and resumes their
     # stranded sessions. It shares this lifecycle's resources (sessionmaker,
     # resume_queue); interval <= 0 disables it (no task started).
@@ -335,6 +339,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 work_item_task.cancel()
                 try:
                     await work_item_task
+                except asyncio.CancelledError:
+                    pass
+            lineage_task = getattr(app.state, "lineage_reconciler_task", None)
+            if lineage_task is not None:
+                lineage_task.cancel()
+                try:
+                    await lineage_task
                 except asyncio.CancelledError:
                     pass
             task = getattr(app.state, "resume_reconciler_task", None)

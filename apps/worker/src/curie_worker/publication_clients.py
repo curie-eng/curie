@@ -1,4 +1,4 @@
-"""Worker-authenticated API and GitHub clients for publication recovery."""
+"""Worker-authenticated API clients for publication recovery."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from .config import github_html_base
 from .publication_loop import (
     PublicationCredential,
     PublicationIdentityUnavailable,
@@ -108,13 +107,9 @@ class PublicationTranscriptClient:
         try:
             value = current.json()["value"]
         except (KeyError, TypeError, ValueError) as exc:
-            raise PublicationReconcileError(
-                "publication transcript response was unusable"
-            ) from exc
+            raise PublicationReconcileError("publication transcript response was unusable") from exc
         if not isinstance(value, list):
-            raise PublicationReconcileError(
-                "publication transcript is not an append-only log"
-            )
+            raise PublicationReconcileError("publication transcript is not an append-only log")
         return any(
             isinstance(existing, dict) and existing.get("publication_id") == marker
             for existing in value
@@ -164,9 +159,7 @@ class PublicationCredentialClient:
             clone_url = str(body["clone_url"])
             authorization = str(body["authorization_header"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise PublicationReconcileError(
-                "publication credential response was unusable"
-            ) from exc
+            raise PublicationReconcileError("publication credential response was unusable") from exc
         parsed = urlsplit(clone_url)
         if (
             parsed.scheme != "https"
@@ -231,9 +224,7 @@ class PublicationLineageClient:
                     "pr_url": pr_url,
                     "head_sha": head_sha,
                     "metadata_updated_at": (
-                        metadata_updated_at.isoformat()
-                        if metadata_updated_at is not None
-                        else None
+                        metadata_updated_at.isoformat() if metadata_updated_at is not None else None
                     ),
                 },
                 follow_redirects=False,
@@ -276,470 +267,185 @@ class PublicationLineageClient:
         return cast(Literal["merged", "closed"], observed)
 
 
-class GitHubPublicationLookup:
-    """Read stored pull request identity and verify revision ancestry."""
+class PublicationCodeHostClient:
+    """Read and open a publication's pull request through the API (ADR 0197, item 6).
+
+    The worker holds no forge code. Each call names one stored publication;
+    the API derives the repository, branch and contract from that row, acts
+    through its code host, and returns the facts as data.
+    """
 
     def __init__(
         self,
-        client: httpx.AsyncClient,
         *,
-        api_base_url: str = "https://api.github.com",
+        api_base_url: str,
+        worker_token: str,
+        client: httpx.AsyncClient,
     ) -> None:
+        if not worker_token:
+            raise ValueError("publication code host calls require internal worker auth")
+        self._base = api_base_url.rstrip("/")
+        self._headers = {"X-Curie-Worker-Token": worker_token}
         self._client = client
-        self._api_base = api_base_url.rstrip("/")
-        self._html_base = github_html_base(api_base_url)
 
-    async def read_pr_by_number(
+    def _url(self, publication_id: uuid.UUID, suffix: str) -> str:
+        return f"{self._base}/v1/internal/publications/{publication_id}/{suffix}"
+
+    async def _call(
         self,
-        repo_full_name: str,
-        pr_number: int,
-        authorization_header: str,
-    ) -> PublicationPullState:
-        if not authorization_header:
-            raise PublicationReconcileError(
-                "stored pull request lookup requires authorization"
-            )
-        if pr_number <= 0:
-            raise PublicationReconcileError("stored pull request lookup is invalid")
+        method: str,
+        url: str,
+        what: str,
+        *,
+        params: dict[str, int] | None = None,
+        body: dict[str, object] | None = None,
+    ) -> httpx.Response:
         try:
-            response = await self._client.get(
-                f"{self._api_base}/repos/{repo_full_name}/pulls/{pr_number}",
-                headers=self._headers(authorization_header),
+            response = await self._client.request(
+                method,
+                url,
+                params=params,
+                json=body,
+                headers=self._headers,
                 follow_redirects=False,
             )
         except httpx.HTTPError as exc:
-            raise PublicationReconcileError("stored pull request lookup was unreachable") from exc
-        if response.status_code != 200:
-            raise PublicationReconcileError(
-                f"stored pull request lookup returned HTTP {response.status_code}"
-            )
-        try:
-            row = response.json()
-            number = int(row["number"])
-            url = str(row["html_url"])
-            head = row["head"]
-            head_ref = str(head["ref"])
-            head_sha = str(head["sha"])
-            raw_state = str(row["state"])
-            merged_at = row.get("merged_at")
-        except (KeyError, TypeError, ValueError) as exc:
-            raise PublicationReconcileError("GitHub returned an invalid pull request") from exc
-        parsed_url = urlsplit(url)
-        if (
-            parsed_url.scheme != "https"
-            or parsed_url.username is not None
-            or parsed_url.password is not None
-            or number != pr_number
-            or re.fullmatch(
-                rf"{re.escape(self._html_base)}/{re.escape(repo_full_name)}/pull/{pr_number}",
-                url,
-                re.IGNORECASE,
-            )
-            is None
-        ):
-            raise PublicationReconcileError("GitHub returned the wrong stored pull request")
-        if re.fullmatch(r"[0-9a-f]{40,64}", head_sha) is None or not head_ref:
-            raise PublicationReconcileError("GitHub pull request head is invalid")
-        state = "merged" if merged_at is not None else raw_state
-        if state not in {"open", "closed", "merged"}:
-            raise PublicationReconcileError("GitHub pull request state is invalid")
-        return PublicationPullState(
-            number=number,
-            url=url,
-            state=cast(Literal["open", "closed", "merged"], state),
-            head_sha=head_sha,
-            head_ref=head_ref,
+            raise PublicationReconcileError(f"{what} was unreachable") from exc
+        if response.status_code in (200, 204):
+            return response
+        message = _refusal_message(response)
+        raise PublicationReconcileError(
+            f"{what} returned HTTP {response.status_code}" + (f": {message}" if message else "")
         )
+
+    async def read_pull_request(
+        self, publication_id: uuid.UUID, pr_number: int
+    ) -> PublicationPullState:
+        if pr_number <= 0:
+            raise PublicationReconcileError("stored pull request lookup is invalid")
+        response = await self._call(
+            "GET",
+            self._url(publication_id, "pull-request"),
+            "stored pull request lookup",
+            params={"pr_number": pr_number},
+        )
+        pull = _pull_state(response)
+        if pull.number != pr_number:
+            raise PublicationReconcileError("the API returned the wrong stored pull request")
+        return pull
+
+    async def read_branch_head(self, publication_id: uuid.UUID) -> str | None:
+        """The deterministic branch head, or None when the branch does not exist."""
+
+        response = await self._call(
+            "GET", self._url(publication_id, "branch-head"), "branch lookup"
+        )
+        try:
+            head_sha = response.json()["head_sha"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PublicationReconcileError("branch lookup response was unusable") from exc
+        if head_sha is None:
+            return None
+        if not isinstance(head_sha, str) or _SHA.fullmatch(head_sha) is None:
+            raise PublicationReconcileError("branch lookup returned an invalid branch head")
+        return head_sha
 
     async def verify_revision_commit(
         self,
-        repo_full_name: str,
+        publication_id: uuid.UUID,
         commit_sha: str,
         *,
         revision_id: uuid.UUID,
         expected_parent: str,
-        authorization_header: str,
     ) -> str:
-        if not authorization_header:
-            raise PublicationReconcileError("revision verification requires authorization")
+        response = await self._call(
+            "POST",
+            self._url(publication_id, "revision-commit"),
+            "revision verification",
+            body={
+                "commit_sha": commit_sha,
+                "revision_id": str(revision_id),
+                "expected_parent": expected_parent,
+            },
+        )
         try:
-            response = await self._client.get(
-                f"{self._api_base}/repos/{repo_full_name}/git/commits/{commit_sha}",
-                headers=self._headers(authorization_header),
-                follow_redirects=False,
-            )
-        except httpx.HTTPError as exc:
-            raise PublicationReconcileError("revision commit lookup was unreachable") from exc
-        if response.status_code != 200:
-            raise PublicationReconcileError(
-                f"revision commit lookup returned HTTP {response.status_code}"
-            )
-        try:
-            row = response.json()
-            observed_sha = str(row["sha"])
-            message = str(row["message"])
-            parents = row["parents"]
-            parent = str(parents[0]["sha"])
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
-            raise PublicationReconcileError("GitHub returned an invalid revision commit") from exc
-        marker = f"Curie-Revision: {revision_id}"
-        if observed_sha != commit_sha or marker not in message.splitlines():
-            raise PublicationReconcileError("remote commit has no matching revision marker")
-        if len(parents) != 1 or parent != expected_parent:
-            raise PublicationReconcileError("remote revision has the wrong expected parent")
-        return observed_sha
-
-    async def read_branch_head(
-        self,
-        repo_full_name: str,
-        branch: str,
-        authorization_header: str,
-    ) -> str | None:
-        """Return the deterministic branch head without creating any GitHub object."""
-
-        if not authorization_header:
-            raise PublicationReconcileError("GitHub branch lookup requires authorization")
-        try:
-            response = await self._client.get(
-                f"{self._api_base}/repos/{repo_full_name}/git/ref/heads/{quote(branch, safe='')}",
-                headers=self._headers(authorization_header),
-                follow_redirects=False,
-            )
-        except httpx.HTTPError as exc:
-            raise PublicationReconcileError("GitHub branch lookup was unreachable") from exc
-        if response.status_code == 404:
-            return None
-        if response.status_code != 200:
-            raise PublicationReconcileError(
-                f"GitHub branch lookup returned HTTP {response.status_code}"
-            )
-        try:
-            head_sha = str(response.json()["object"]["sha"])
+            observed = response.json()["commit_sha"]
         except (KeyError, TypeError, ValueError) as exc:
-            raise PublicationReconcileError("GitHub returned an invalid branch ref") from exc
-        if re.fullmatch(r"[0-9a-f]{40,64}", head_sha) is None:
-            raise PublicationReconcileError("GitHub returned an invalid branch head")
-        return head_sha
+            raise PublicationReconcileError("revision verification response was unusable") from exc
+        if observed != commit_sha:
+            raise PublicationReconcileError("revision verification returned a different commit")
+        return commit_sha
 
-    async def recover_pr_by_head(
-        self,
-        repo_full_name: str,
-        branch: str,
-        title: str,
-        body: str,
-        *,
-        expected_head_sha: str,
-        authorization_header: str,
-        draft: bool = False,
-        base: str | None = None,
+    async def recover_pull_request(
+        self, publication_id: uuid.UUID, *, expected_head_sha: str
     ) -> PublicationPullState | None:
-        """Adopt a PR, or create it only when its deterministic branch exists."""
+        """Adopt the branch's pull request, or open it when the branch exists."""
 
-        if not authorization_header:
+        if _SHA.fullmatch(expected_head_sha) is None:
             raise PublicationReconcileError(
-                "GitHub deterministic-head recovery requires authorization"
+                "deterministic-head recovery expected commit is invalid"
             )
-        if re.fullmatch(r"[0-9a-f]{40,64}", expected_head_sha) is None:
-            raise PublicationReconcileError(
-                "GitHub deterministic-head recovery expected commit is invalid"
-            )
-        default_branch = base or await self._default_branch(
-            repo_full_name,
-            authorization_header=authorization_header,
+        response = await self._call(
+            "POST",
+            self._url(publication_id, "pull-request"),
+            "deterministic-head recovery",
+            body={"expected_head_sha": expected_head_sha},
         )
-        existing = await self._find(
-            repo_full_name,
-            branch,
-            title=title,
-            body=body,
-            base=default_branch,
-            expected_head_sha=expected_head_sha,
-            authorization_header=authorization_header,
-            draft=draft,
-        )
-        if existing is not None:
-            return existing
-
-        headers = self._headers(authorization_header)
-        repo_api = f"{self._api_base}/repos/{repo_full_name}"
-        ref_url = f"{repo_api}/git/ref/heads/{quote(branch, safe='')}"
-        try:
-            ref_response = await self._client.get(
-                ref_url,
-                headers=headers,
-                follow_redirects=False,
-            )
-        except httpx.HTTPError as exc:
-            raise PublicationReconcileError(
-                "GitHub deterministic branch lookup was unreachable"
-            ) from exc
-        if ref_response.status_code == 404:
+        if response.status_code == 204:
             return None
-        if ref_response.status_code != 200:
+        pull = _pull_state(response)
+        if pull.head_sha != expected_head_sha:
             raise PublicationReconcileError(
-                "GitHub deterministic branch lookup returned HTTP "
-                f"{ref_response.status_code}"
+                "recovered pull request head does not match the expected commit"
             )
-        try:
-            ref_head_sha = str(ref_response.json()["object"]["sha"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise PublicationReconcileError(
-                "GitHub returned an invalid deterministic branch ref"
-            ) from exc
-        if ref_head_sha != expected_head_sha:
-            raise PublicationReconcileError(
-                "GitHub deterministic branch no longer matches the expected commit"
-            )
+        return pull
 
-        pulls_url = f"{repo_api}/pulls"
-        try:
-            created = await self._client.post(
-                pulls_url,
-                headers=headers,
-                json={
-                    "title": title,
-                    "head": branch,
-                    "base": default_branch,
-                    "body": body,
-                    **({"draft": True} if draft else {}),
-                },
-                follow_redirects=False,
-            )
-        except httpx.HTTPError:
-            created = None
-        if created is not None and created.status_code == 201:
-            return self._pull_state(
-                created,
-                repo_full_name,
-                branch=branch,
-                title=title,
-                body=body,
-                base=default_branch,
-                expected_head_sha=expected_head_sha,
-                draft=draft,
-            )
 
-        # A lost POST response or a concurrent reconciler is ambiguous. Query
-        # the deterministic head once more before surfacing an error.
-        recovered = await self._find(
-            repo_full_name,
-            branch,
-            title=title,
-            body=body,
-            base=default_branch,
-            expected_head_sha=expected_head_sha,
-            authorization_header=authorization_header,
-            draft=draft,
-        )
-        if recovered is not None:
-            return recovered
-        status = "unreachable" if created is None else f"HTTP {created.status_code}"
-        raise PublicationReconcileError(f"GitHub pull request creation returned {status}")
+_SHA = re.compile(r"[0-9a-f]{40,64}")
 
-    @staticmethod
-    def _headers(authorization_header: str) -> dict[str, str]:
-        return {
-            "Accept": "application/vnd.github+json",
-            "Authorization": authorization_header,
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "curie-publication-worker",
-        }
 
-    async def _default_branch(
-        self,
-        repo_full_name: str,
-        *,
-        authorization_header: str,
-    ) -> str:
-        try:
-            response = await self._client.get(
-                f"{self._api_base}/repos/{repo_full_name}",
-                headers=self._headers(authorization_header),
-                follow_redirects=False,
-            )
-        except httpx.HTTPError as exc:
-            raise PublicationReconcileError("GitHub repository lookup was unreachable") from exc
-        if response.status_code != 200:
-            raise PublicationReconcileError(
-                f"GitHub repository lookup returned HTTP {response.status_code}"
-            )
-        try:
-            default_branch = response.json()["default_branch"]
-        except (KeyError, TypeError, ValueError) as exc:
-            raise PublicationReconcileError(
-                "GitHub repository response omitted its default branch"
-            ) from exc
-        if not isinstance(default_branch, str) or not default_branch:
-            raise PublicationReconcileError(
-                "GitHub repository response carried an invalid default branch"
-            )
-        return default_branch
+def _refusal_message(response: httpx.Response) -> str:
+    try:
+        detail = response.json().get("detail")
+    except (AttributeError, ValueError):
+        return ""
+    if isinstance(detail, dict) and isinstance(detail.get("message"), str):
+        return str(detail["message"])[:500]
+    return detail[:500] if isinstance(detail, str) else ""
 
-    def _pull_state(
-        self,
-        response: httpx.Response,
-        repo_full_name: str,
-        *,
-        branch: str,
-        title: str,
-        body: str,
-        base: str,
-        expected_head_sha: str,
-        draft: bool = False,
-    ) -> PublicationPullState:
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise PublicationReconcileError("GitHub returned an invalid pull request") from exc
-        if not isinstance(payload, dict):
-            raise PublicationReconcileError("GitHub returned an invalid pull request")
-        url = payload.get("html_url")
-        head = payload.get("head")
-        base_payload = payload.get("base")
-        expected = {
-            "title": title,
-            "body": body,
-            "head_ref": branch,
-            "head_repo": repo_full_name,
-            "base_ref": base,
-            "base_repo": repo_full_name,
-        }
-        actual = {
-            "title": payload.get("title"),
-            "body": payload.get("body"),
-            "head_ref": head.get("ref") if isinstance(head, dict) else None,
-            "head_repo": (
-                (head.get("repo") or {}).get("full_name")
-                if isinstance(head, dict) and isinstance(head.get("repo"), dict)
-                else None
-            ),
-            "head_sha": head.get("sha") if isinstance(head, dict) else None,
-            "base_ref": (
-                base_payload.get("ref") if isinstance(base_payload, dict) else None
-            ),
-            "base_repo": (
-                (base_payload.get("repo") or {}).get("full_name")
-                if isinstance(base_payload, dict)
-                and isinstance(base_payload.get("repo"), dict)
-                else None
-            ),
-        }
 
-        def same_repository(value: object, expected_value: object) -> bool:
-            return isinstance(value, str) and value.casefold() == str(
-                expected_value
-            ).casefold()
+def _pull_state(response: httpx.Response) -> PublicationPullState:
+    """A pull request the API returned, checked for shape, never trusted for identity."""
 
-        repo_fields = ("head_repo", "base_repo")
-        if any(
-            not same_repository(actual[field], expected[field])
-            for field in repo_fields
-        ) or any(
-            actual[field] != expected[field]
-            for field in expected
-            if field not in repo_fields
-        ):
-            raise PublicationReconcileError(
-                "GitHub pull request does not match the approved publication contract"
-            )
-        if draft and payload.get("draft") is not True:
-            raise PublicationReconcileError("GitHub pull request is not the required draft")
-        head_sha = actual["head_sha"]
-        if (
-            not isinstance(head_sha, str)
-            or re.fullmatch(r"[0-9a-f]{40,64}", head_sha) is None
-            or head_sha != expected_head_sha
-        ):
-            raise PublicationReconcileError(
-                "GitHub pull request head does not match the expected commit"
-            )
-        if not isinstance(url, str):
-            raise PublicationReconcileError("GitHub returned an invalid pull request URL")
-        parsed_url = urlsplit(url)
-        if (
-            parsed_url.scheme != "https"
-            or parsed_url.username is not None
-            or parsed_url.password is not None
-            or re.fullmatch(
-                rf"{re.escape(self._html_base)}/{re.escape(repo_full_name)}/pull/[1-9][0-9]*",
-                url,
-                re.IGNORECASE,
-            )
-            is None
-        ):
-            raise PublicationReconcileError("GitHub returned an invalid pull request URL")
-        number = payload.get("number")
-        if (
-            isinstance(number, bool)
-            or not isinstance(number, int)
-            or number <= 0
-            or not url.casefold().endswith(f"/pull/{number}".casefold())
-        ):
-            raise PublicationReconcileError("GitHub returned an invalid pull request URL")
-        raw_state = payload.get("state")
-        if payload.get("merged_at") is not None or payload.get("merged") is True:
-            state = "merged"
-        elif isinstance(raw_state, str):
-            state = raw_state
-        else:
-            state = ""
-        if state not in {"open", "closed", "merged"}:
-            raise PublicationReconcileError("GitHub pull request state is invalid")
-        return PublicationPullState(
-            number=number,
-            url=url,
-            state=cast(Literal["open", "closed", "merged"], state),
-            head_sha=head_sha,
-            head_ref=branch,
-        )
-
-    async def _find(
-        self,
-        repo_full_name: str,
-        branch: str,
-        *,
-        title: str,
-        body: str,
-        base: str,
-        expected_head_sha: str,
-        authorization_header: str,
-        draft: bool = False,
-    ) -> PublicationPullState | None:
-        owner = repo_full_name.split("/", 1)[0]
-        try:
-            response = await self._client.get(
-                f"{self._api_base}/repos/{repo_full_name}/pulls",
-                params={"state": "all", "head": f"{owner}:{branch}"},
-                headers=self._headers(authorization_header),
-                follow_redirects=False,
-            )
-        except httpx.HTTPError as exc:
-            raise PublicationReconcileError(
-                "GitHub deterministic-head lookup was unreachable"
-            ) from exc
-        if response.status_code != 200:
-            raise PublicationReconcileError(
-                f"GitHub deterministic-head lookup returned HTTP {response.status_code}"
-            )
-        try:
-            rows = response.json()
-        except ValueError as exc:
-            raise PublicationReconcileError(
-                "GitHub deterministic-head lookup returned invalid JSON"
-            ) from exc
-        if not isinstance(rows, list) or not rows:
-            return None
-        if len(rows) != 1:
-            raise PublicationReconcileError(
-                "GitHub deterministic-head lookup returned multiple pull requests"
-            )
-        return self._pull_state(
-            httpx.Response(200, json=rows[0]),
-            repo_full_name,
-            branch=branch,
-            title=title,
-            body=body,
-            base=base,
-            expected_head_sha=expected_head_sha,
-            draft=draft,
-        )
+    try:
+        row = response.json()
+        number = row["number"]
+        url = row["url"]
+        state = row["state"]
+        head_sha = row["head_sha"]
+        head_ref = row["head_ref"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PublicationReconcileError("the API returned an invalid pull request") from exc
+    parsed = urlsplit(url) if isinstance(url, str) else None
+    if (
+        isinstance(number, bool)
+        or not isinstance(number, int)
+        or number <= 0
+        or parsed is None
+        or parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or state not in {"open", "closed", "merged"}
+        or not isinstance(head_sha, str)
+        or _SHA.fullmatch(head_sha) is None
+        or not isinstance(head_ref, str)
+        or not head_ref
+    ):
+        raise PublicationReconcileError("the API returned an invalid pull request")
+    return PublicationPullState(
+        number=number,
+        url=url,
+        state=cast(Literal["open", "closed", "merged"], state),
+        head_sha=head_sha,
+        head_ref=head_ref,
+    )

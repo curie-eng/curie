@@ -79,10 +79,12 @@ class GitHubAPI:
             return httpx.Response(
                 200, json={"id": REPO_ID, "full_name": REPO, "default_branch": "main"}
             )
-        if path.startswith(f"/repos/{REPO}/branches/"):
+        if path.startswith(f"/repos/{REPO}/git/ref/heads/"):
             # Admission resolves the base and reads its commit (#3095).
-            name = path.removeprefix(f"/repos/{REPO}/branches/")
-            return httpx.Response(200, json={"name": name, "commit": {"sha": "0" * 39 + "1"}})
+            name = path.removeprefix(f"/repos/{REPO}/git/ref/heads/")
+            return httpx.Response(
+                200, json={"ref": f"refs/heads/{name}", "object": {"sha": "0" * 39 + "1"}}
+            )
         if path == f"/repos/{REPO}/issues":
             assert request.url.params.get("labels") == LABEL
             assert request.url.params.get("state") == "open"
@@ -149,13 +151,16 @@ class _Credentials:
     def token_for_verified_installation(self, repo: str, installation_id: int) -> str:
         return self.fresh_installation_token(repo, installation_id)[1]
 
+    def token_for(self, repo: str) -> str:
+        return self.fresh_installation_token(repo)[1]
+
 
 @pytest.fixture
 def factory(monkeypatch: pytest.MonkeyPatch, clean_db: None) -> Any:
     for key, value in _ENV.items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
-    for module in ("github_factory", "factory_label_reconcile"):
+    for module in ("github_factory", "factory_label_reconcile", "repository_auth"):
         monkeypatch.setattr(f"curie_api.{module}.credentials_for", lambda _s: _Credentials())
     github = GitHubAPI()
     with TestClient(create_app()) as client:

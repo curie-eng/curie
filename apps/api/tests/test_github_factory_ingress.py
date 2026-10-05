@@ -25,7 +25,7 @@ from typing import Any
 import httpx
 import pytest
 from curie_api.config import get_settings
-from curie_api.forges.github.identity import _issue_lock_keys
+from curie_api.forges.github.identity import issue_lock_keys_for
 from curie_api.github_factory import (
     admit_notice,
     handle_factory_delivery,
@@ -83,10 +83,8 @@ def factory_app(monkeypatch: pytest.MonkeyPatch, clean_db: None, github_api: Git
     for key, value in _ENV.items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
-    monkeypatch.setattr(
-        "curie_api.github_factory.credentials_for",
-        lambda _settings: _Credentials(),
-    )
+    for module in ("github_factory", "repository_auth"):
+        monkeypatch.setattr(f"curie_api.{module}.credentials_for", lambda _settings: _Credentials())
     with TestClient(create_app()) as client:
         external = httpx.AsyncClient(transport=httpx.MockTransport(github_api.handle))
         client.app.state.http_client = external
@@ -495,7 +493,7 @@ def test_admission_retains_issue_lock_until_caller_commit(
         label=LABEL,
         mention=MENTION,
     )
-    classid, objid = _issue_lock_keys(REPO_ID, number)
+    classid, objid = issue_lock_keys_for(REPO_ID, number)
     _, api = factory_app
 
     async def go() -> None:
@@ -510,7 +508,7 @@ def test_admission_retains_issue_lock_until_caller_commit(
                 caller_pid = await session.scalar(text("SELECT pg_backend_pid()"))
                 await lock_issue(session, REPO_ID, number)
                 verified = await verify_current(notice, settings=get_settings(), client=github)
-                admitted = await admit_notice(session, notice, get_settings(), verified, github)
+                admitted = await admit_notice(session, notice, get_settings(), verified)
                 assert admitted.status == "factory_admitted", admitted
                 assert not await observer.scalar(
                     text(
@@ -648,7 +646,7 @@ def test_signed_closure_during_admission_waits_and_then_cancels(
     api.issue_number = number
     entered = threading.Event()
     release = asyncio.Event()
-    classid, objid = _issue_lock_keys(REPO_ID, number)
+    classid, objid = issue_lock_keys_for(REPO_ID, number)
 
     async def observe_cancellation_blocked() -> None:
         engine = create_async_engine(get_settings().database_url)

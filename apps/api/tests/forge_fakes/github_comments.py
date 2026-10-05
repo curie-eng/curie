@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import threading
@@ -112,6 +113,7 @@ class _Credentials:
             raise RuntimeError("unexpected installation")
         return "ghs_factory_terminus_fixture"
 
+
     def fresh_installation_token(
         self, repo: str, installation_id: int | None = None
     ) -> tuple[int, str]:
@@ -120,6 +122,7 @@ class _Credentials:
         return 0, "fixture"
 
 
+_GIT_HEADER = "Basic " + base64.b64encode(b"x-access-token:ghs_factory_terminus_fixture").decode()
 _ISSUE_OR_PR = re.compile(r"^/repos/[^/]+/[^/]+/(?:issues|pulls)/(\d+)$")
 _COMMENT = re.compile(r"^/repos/[^/]+/[^/]+/(issues|pulls)/comments/(\d+)$")
 _LABELS = re.compile(r"^/repos/[^/]+/[^/]+/issues/(\d+)/labels(?:/(.+))?$")
@@ -412,6 +415,12 @@ def comments(monkeypatch: pytest.MonkeyPatch, clean_db: None) -> Any:
         monkeypatch.setattr(
             "curie_api.github_factory.credentials_for",
             lambda _settings: _Credentials(),
+        )
+        # The code host's git credential: this stand-in serves plain HTTP, which
+        # the canonical HTTPS origin check would refuse.
+        monkeypatch.setattr(
+            "curie_api.forges.github.code_host.resolve_repository_credential",
+            lambda repo, settings: (f"{settings.github_html_base}/{repo}.git", _GIT_HEADER),
         )
         monkeypatch.setattr(
             "curie_api.forges.github.ci.credentials_for",

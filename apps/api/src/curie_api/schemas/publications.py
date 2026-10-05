@@ -290,3 +290,49 @@ class PublicationOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     terminal_at: datetime | None
+
+
+_COMMIT_SHA_PATTERN = r"^[0-9a-f]{40,64}$"
+
+
+class PublicationPullRequestOut(BaseModel):
+    """One pull request, read through the code host for the worker (ADR 0197, item 6).
+
+    The worker holds no forge code: it receives the pull request's number,
+    URL, state and head as data and never a provider payload.
+    """
+
+    number: int = Field(gt=0)
+    url: str
+    state: Literal["open", "closed", "merged"]
+    head_sha: str
+    head_ref: str
+
+
+class PublicationBranchHeadOut(BaseModel):
+    """The head of a publication's branch; ``None`` when the branch does not exist."""
+
+    head_sha: str | None
+
+
+class PublicationRevisionVerify(BaseModel):
+    """A remote commit the worker asks the API to prove is this revision's.
+
+    ``revision_id`` and ``expected_parent`` must equal the stored publication's
+    own; the API derives both and refuses any other.
+    """
+
+    commit_sha: str = Field(pattern=_COMMIT_SHA_PATTERN)
+    revision_id: uuid.UUID
+    expected_parent: str = Field(pattern=_COMMIT_SHA_PATTERN)
+
+
+class PublicationRevisionOut(BaseModel):
+    commit_sha: str
+
+
+class PublicationPullRecover(BaseModel):
+    """Adopt the publication branch's pull request, or open it when the branch
+    holds exactly ``expected_head_sha``."""
+
+    expected_head_sha: str = Field(pattern=_COMMIT_SHA_PATTERN)

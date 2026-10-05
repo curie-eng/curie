@@ -1012,7 +1012,8 @@ def _push_during_observation(
 
     from curie_api.forges.github import ci
 
-    original = ci.observe_ci_detail
+    # The gate reads CI through the code host, which reads it here.
+    original = ci.read_ci_detail
     pushed: list[str] = []
 
     async def racing(*args: Any, **kwargs: Any) -> Any:
@@ -1029,7 +1030,7 @@ def _push_during_observation(
             )
         return detail
 
-    monkeypatch.setattr(ci, "observe_ci_detail", racing)
+    monkeypatch.setattr(ci, "read_ci_detail", racing)
     return pushed
 
 
@@ -1527,7 +1528,7 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
 
     elapsed = [0.0]
     original_now = workitems.database_now
-    original_observe = ci.observe_ci_detail
+    original_observe = ci.read_ci_detail
 
     async def now(session: AsyncSession) -> Any:
         return await original_now(session) + timedelta(seconds=elapsed[0])
@@ -1538,7 +1539,7 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
         return detail
 
     monkeypatch.setattr(workitems, "database_now", now)
-    monkeypatch.setattr(ci, "observe_ci_detail", slow_observe)
+    monkeypatch.setattr(ci, "read_ci_detail", slow_observe)
 
     _passes_on_one_reconciler(3)
 
@@ -1961,6 +1962,9 @@ def recorded_github(
         stub.start()
         environment = {
             "GITHUB_API_URL": stub.base_url,
+            # The code host's repository credential is the clone credential,
+            # which only travels to the configured clone origin.
+            "GITHUB_CLONE_BASE": stub.base_url,
             "SSL_CERT_FILE": str(stub.ca_file),
             "GITHUB_APP_ID": "51",
             "GITHUB_APP_PRIVATE_KEY": app_key,

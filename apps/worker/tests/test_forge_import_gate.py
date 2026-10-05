@@ -20,7 +20,6 @@ WORKER_SOURCE = REPO_ROOT / "apps" / "worker" / "src"
 ALLOWLIST: frozenset[str] = frozenset(
     {
         "apps/worker/src/curie_worker/config.py",
-        "apps/worker/src/curie_worker/publication_clients.py",
         "apps/worker/src/curie_worker/publication_k8s.py",
     }
 )

@@ -7,17 +7,19 @@ from typing import Any, Literal
 
 import httpx
 
-from curie_api.factory_comment_text import _redact_factory_comment, marker_for
+from curie_api.factory_comment_text import marker_for, redact_factory_comment
 from curie_api.forges.types import ReplyTarget
 from curie_api.models import FactoryStatusComment, WorkItem
 
-_REFUSED_STATUSES = {401, 403, 404}
+REFUSED_STATUSES = {401, 403, 404}
 _PAGES_PER_PASS = 5
 _UNPROCESSABLE = ("unprocessable", "http_422")
 # A thread target scans two lists with one stored page. Pages of the review
 # comment list are stored as-is; once that list is exhausted, the conversation
 # list page is stored above this offset.
 _SECOND_LIST_OFFSET = 1_000_000
+
+CommentList = Literal["issue", "review"]
 
 
 @dataclass(frozen=True)
@@ -27,17 +29,20 @@ class _MarkerScan:
     refusal: str | None = None
     unavailable: bool = False
     next_page: int | None = None
+    list_kind: CommentList | None = None
 
 
 @dataclass(frozen=True)
-class _GitHub:
+class GitHubCommentClient:
     client: httpx.AsyncClient
     api: str
     repo_path: str
     headers: dict[str, str]
 
 
-async def _subject_title(github: _GitHub, work_item: WorkItem, target: ReplyTarget) -> str | None:
+async def subject_title(
+    github: GitHubCommentClient, work_item: WorkItem, target: ReplyTarget
+) -> str | None:
     """The issue or PR title for the card, read once. A failed read stays NULL."""
 
     if target.pull_request is None:
@@ -56,11 +61,8 @@ async def _subject_title(github: _GitHub, work_item: WorkItem, target: ReplyTarg
     return None
 
 
-CommentList = Literal["issue", "review"]
-
-
-async def _deliver(
-    github: _GitHub,
+async def deliver(
+    github: GitHubCommentClient,
     work_item: WorkItem,
     row: FactoryStatusComment,
     target: ReplyTarget,
@@ -135,8 +137,8 @@ def _created(
     return ("posted", int(outcome[1]), listed, True)
 
 
-async def _patch(
-    github: _GitHub, row: FactoryStatusComment, body: str
+async def patch_comment(
+    github: GitHubCommentClient, row: FactoryStatusComment, body: str
 ) -> Literal["edited", "gone"] | str | None:
     """Edit the comment in place: ``edited``, ``gone`` (404), a refusal, or None."""
 
@@ -146,7 +148,7 @@ async def _patch(
         edited = await github.client.patch(
             url,
             headers=github.headers,
-            json={"body": _redact_factory_comment(body)},
+            json={"body": redact_factory_comment(body)},
             follow_redirects=False,
         )
     except httpx.HTTPError:
@@ -192,14 +194,14 @@ async def _post(
         created = await client.post(
             url,
             headers=headers,
-            json={"body": _redact_factory_comment(body)},
+            json={"body": redact_factory_comment(body)},
             follow_redirects=False,
         )
     except httpx.HTTPError:
         return None
     if created.status_code == 422:
         return _UNPROCESSABLE
-    if created.status_code in _REFUSED_STATUSES:
+    if created.status_code in REFUSED_STATUSES:
         return ("refused", f"http_{created.status_code}")
     if created.status_code not in {200, 201}:
         return None
@@ -240,7 +242,7 @@ async def find_marker(
             )
         except httpx.HTTPError:
             return _MarkerScan(unavailable=True)
-        if listed.status_code in _REFUSED_STATUSES:
+        if listed.status_code in REFUSED_STATUSES:
             return _MarkerScan(refusal=f"http_{listed.status_code}")
         if listed.status_code != 200:
             return _MarkerScan(unavailable=True)
@@ -282,50 +284,123 @@ def _marked_comment(
     return None
 
 
-async def upsert_issue_notice(
+@dataclass(frozen=True)
+class MarkerWrite:
+    """One marker upsert: ``written``, ``unchanged`` or ``unavailable``.
+
+    ``status`` is the HTTP status that refused a read or a write, when one did.
+    """
+
+    outcome: Literal["written", "unchanged", "unavailable"]
+    comment_id: int | None = None
+    comment_list: CommentList | None = None
+    body: str = ""
+    status: int | None = None
+
+
+def _refused_status(reason: str) -> int:
+    return int(reason.removeprefix("http_"))
+
+
+def _written(outcome: tuple[str, str] | None, listed: CommentList, body: str) -> MarkerWrite:
+    if outcome is None:
+        return MarkerWrite("unavailable")
+    if outcome[0] != "posted":
+        return MarkerWrite("unavailable", status=_refused_status(outcome[1]))
+    return MarkerWrite("written", int(outcome[1]), listed, body)
+
+
+async def find_own_marker(
     client: httpx.AsyncClient,
     *,
     api: str,
     repo_path: str,
     headers: dict[str, str],
-    issue_number: int,
+    number: int,
+    thread_id: int | None,
     marker: str,
-    body: str,
-    app_id: str = "",
-) -> Literal["written", "unchanged", "unavailable"]:
-    """Keep one marked issue comment carrying ``body``: post it, edit it, or leave it.
+    app_id: str,
+) -> MarkerWrite | _MarkerScan:
+    """The app's own comment carrying ``marker``, on every list the target uses.
 
-    The marker scan is the same one the status comment uses. A scan that could
-    not reach the end of the list is ``unavailable``, never a second post.
+    A review thread reply lands on the review comment list, and its 422
+    fallback on the conversation list, so a thread scans both. Returns the
+    scan that found it (or found nothing), or an ``unavailable`` write when a
+    list could not be read to its end.
     """
 
-    body = _redact_factory_comment(body)
-    comments_path = f"{repo_path}/issues/{issue_number}/comments"
-    found = await find_marker(
+    lists: list[tuple[CommentList, str]] = [("issue", f"{repo_path}/issues/{number}/comments")]
+    if thread_id is not None:
+        lists.insert(0, ("review", f"{repo_path}/pulls/{number}/comments"))
+    for listed, path in lists:
+        found = await find_marker(
+            client, api, path, headers, marker, start_page=1, app_id=app_id.strip()
+        )
+        if found.refusal is not None:
+            return MarkerWrite("unavailable", status=_refused_status(found.refusal))
+        if found.unavailable or found.next_page is not None:
+            return MarkerWrite("unavailable")
+        if found.comment_id is not None:
+            return _MarkerScan(comment_id=found.comment_id, body=found.body, list_kind=listed)
+    return _MarkerScan()
+
+
+async def upsert_marker(
+    client: httpx.AsyncClient,
+    *,
+    api: str,
+    repo_path: str,
+    headers: dict[str, str],
+    number: int,
+    thread_id: int | None,
+    marker: str,
+    body: str,
+    app_id: str,
+) -> MarkerWrite:
+    """Keep one own marked comment carrying ``body``: post it, edit it, or leave it.
+
+    The marker scan is the same one the status comment uses. A scan that could
+    not reach the end of a list is ``unavailable``, never a second post. A
+    thread target replies in its thread and falls back to a conversation
+    comment when GitHub refuses the reply with 422.
+    """
+
+    body = redact_factory_comment(body)
+    found = await find_own_marker(
         client,
-        api,
-        comments_path,
-        headers,
-        marker,
-        start_page=1,
-        app_id=app_id.strip(),
+        api=api,
+        repo_path=repo_path,
+        headers=headers,
+        number=number,
+        thread_id=thread_id,
+        marker=marker,
+        app_id=app_id,
     )
-    if found.unavailable or found.refusal is not None or found.next_page is not None:
-        return "unavailable"
+    if isinstance(found, MarkerWrite):
+        return found
     if found.comment_id is not None:
+        assert found.list_kind is not None
         if found.body == body:
-            return "unchanged"
+            return MarkerWrite("unchanged", found.comment_id, found.list_kind, body)
+        kind = "pulls" if found.list_kind == "review" else "issues"
         try:
             edited = await client.patch(
-                f"{api}{repo_path}/issues/comments/{found.comment_id}",
+                f"{api}{repo_path}/{kind}/comments/{found.comment_id}",
                 headers=headers,
                 json={"body": body},
                 follow_redirects=False,
             )
         except httpx.HTTPError:
-            return "unavailable"
-        return "written" if edited.status_code == 200 else "unavailable"
-    posted = await _post(client, f"{api}{comments_path}", headers, body)
-    if posted is None or posted[0] != "posted":
-        return "unavailable"
-    return "written"
+            return MarkerWrite("unavailable")
+        if edited.status_code == 200:
+            return MarkerWrite("written", found.comment_id, found.list_kind, body)
+        return MarkerWrite("unavailable", status=edited.status_code)
+    if thread_id is not None:
+        root = await _thread_root(client, api, repo_path, headers, thread_id)
+        replied = await _post(
+            client, f"{api}{repo_path}/pulls/{number}/comments/{root}/replies", headers, body
+        )
+        if replied != _UNPROCESSABLE:
+            return _written(replied, "review", body)
+    posted = await _post(client, f"{api}{repo_path}/issues/{number}/comments", headers, body)
+    return _written(posted, "issue", body)

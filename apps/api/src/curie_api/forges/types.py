@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import enum
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
@@ -73,6 +74,9 @@ class RepositoryRef:
     host: str
     project_id: str
     path: str = field(compare=False)
+    # Filled by `resolve_repository`; None when the reference was built from
+    # stored facts without a read. Never part of identity.
+    default_branch: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         _require_text(
@@ -122,6 +126,7 @@ class PullRequest:
     url: str
     title: str = ""
     body: str = ""
+    draft: bool = False
 
 
 @dataclass(frozen=True)
@@ -235,16 +240,66 @@ class CheckState(enum.StrEnum):
     CANCELLED = "cancelled"
 
 
+class CheckSource(enum.StrEnum):
+    """What reported a check: a check or job run, or a commit status an
+    external system posted against the commit."""
+
+    RUN = "run"
+    STATUS = "status"
+
+
 @dataclass(frozen=True)
 class NormalizedCheck:
     """One CI check on one exact commit. ``key`` is the stable, configurable
-    check identity (ADR 0197 consequence 7); ``name`` is for display."""
+    check identity (ADR 0197 consequence 7); ``name`` is for display.
+
+    ``reported_state`` is the code host's own word for the state (a conclusion
+    such as ``timed_out``, or a run status such as ``queued``), reported to
+    people and agents as the host said it; it defaults to ``state``.
+    ``started_at`` is when this run started, or when the status was posted.
+    ``check_id`` is the host's id for this run of the check, so a rerun's new
+    attempt can be told from the failure it replaces. ``native`` marks a check
+    run by the code host's own CI, the only kind ``rerun_failed`` can rerun.
+    """
 
     key: str
     state: CheckState
     head_sha: str
     name: str
     url: str | None = None
+    source: CheckSource = CheckSource.RUN
+    reported_state: str = ""
+    started_at: datetime | None = None
+    check_id: str | None = None
+    native: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.reported_state:
+            object.__setattr__(self, "reported_state", self.state.value)
+
+
+# Normalized check keys (ADR 0197 consequence 7): a check run is keyed by its
+# name and a commit status by ``status:<context>``, so the two never collide.
+STATUS_KEY_PREFIX = "status:"
+_ESCAPED_CHECK_PREFIX = "check:"
+
+
+def check_run_key(name: str) -> str:
+    """The normalized key of a check run: its name.
+
+    A name that already starts with ``status:`` or ``check:`` is escaped with
+    ``check:``, so no check run key can equal a commit status key.
+    """
+
+    if name.startswith((STATUS_KEY_PREFIX, _ESCAPED_CHECK_PREFIX)):
+        return f"{_ESCAPED_CHECK_PREFIX}{name}"
+    return name
+
+
+def status_key(context: str) -> str:
+    """The normalized key of a commit status: ``status:<context>``."""
+
+    return f"{STATUS_KEY_PREFIX}{context}"
 
 
 class RollupState(enum.StrEnum):
@@ -286,13 +341,130 @@ class CiRollup:
             state = RollupState.SUCCESS
         return cls(head_sha=head_sha, state=state, checks=own)
 
+    @property
+    def failing_keys(self) -> frozenset[str]:
+        """The keys of the checks failing on this head."""
+
+        return frozenset(check.key for check in self.checks if check.state in _FAILING)
+
+
+@dataclass(frozen=True)
+class CiAnnotation:
+    """One line a failing check pointed at."""
+
+    path: str | None
+    line: int | None
+    message: str | None
+
 
 @dataclass(frozen=True)
 class CiDiagnostic:
-    """A failing check's log excerpt, from the optional ``ci_diagnostics``."""
+    """What one failing check said, from the optional ``ci_diagnostics``.
+
+    Every part is redacted. ``excerpt`` joins them, newest text last.
+    ``check_id`` is the failing check's `NormalizedCheck.check_id`. ``log`` is
+    the tail of its log; ``log_unavailable`` says a log exists but could not
+    be read now.
+    """
 
     check_key: str
     excerpt: str
+    check_id: str | None = None
+    title: str | None = None
+    summary: str | None = None
+    annotations: tuple[CiAnnotation, ...] = ()
+    log: str | None = None
+    log_unavailable: bool = False
+
+
+@dataclass(frozen=True)
+class CiReport:
+    """The checks on one head and the diagnostics of its failing ones, read once.
+
+    ``base`` is the checks on the current head of the base branch the caller
+    named, read only when a head check fails (#4105). It is None when it was
+    not read or could not be; it never fails the head's report.
+    """
+
+    rollup: CiRollup
+    diagnostics: tuple[CiDiagnostic, ...]
+    base: CiRollup | None = None
+
+
+@dataclass(frozen=True)
+class RerunJob:
+    """A failed native check run to rerun, and the rerun unit once known.
+
+    ``unit`` is what the code host reruns as one request (a workflow run on
+    GitHub); several jobs may share one. A caller that already knows it passes
+    it back so the host is not asked again.
+    """
+
+    check_id: str
+    name: str
+    url: str | None = None
+    unit: str | None = None
+
+    @classmethod
+    def of(cls, check: NormalizedCheck) -> RerunJob:
+        assert check.check_id is not None
+        return cls(check.check_id, check.name, check.url)
+
+
+def failed_native_jobs(checks: tuple[NormalizedCheck, ...]) -> tuple[RerunJob, ...]:
+    """The failed or cancelled native check runs, in order, once each."""
+
+    jobs: dict[str, RerunJob] = {}
+    for check in checks:
+        if (
+            check.native
+            and check.source is CheckSource.RUN
+            and check.state in _FAILING
+            and check.check_id is not None
+            and check.check_id not in jobs
+        ):
+            jobs[check.check_id] = RerunJob.of(check)
+    return tuple(jobs.values())
+
+
+class RerunOutcome(enum.StrEnum):
+    """The code host's answer to one rerun request."""
+
+    ACCEPTED = "accepted"
+    # A definitive refusal; asking again will not change it.
+    REFUSED = "refused"
+    # Transport, rate limit or a server error; nothing was rerun.
+    RETRY = "retry"
+    # Sent, but the answer was lost; it may have been accepted, so it is not
+    # sent again.
+    UNCONFIRMED = "unconfirmed"
+
+
+@dataclass(frozen=True)
+class RerunAttempt:
+    unit: str
+    outcome: RerunOutcome
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class RerunRecord:
+    """What one ``rerun_failed`` call did, unit by unit.
+
+    ``jobs`` are the jobs asked for, each with its resolved ``unit``.
+    ``attempts`` holds one answer per unit asked, in order; a ``RETRY`` or
+    ``UNCONFIRMED`` answer ends the call. ``stopped`` is set when the call
+    ended before any unit could be asked (no credential, or a unit that could
+    not be resolved), with its ``reason``.
+    """
+
+    jobs: tuple[RerunJob, ...]
+    attempts: tuple[RerunAttempt, ...] = ()
+    stopped: RerunOutcome | None = None
+    reason: str | None = None
+
+
+RerunObserver = Callable[[RerunRecord], Awaitable[bool]]
 
 
 class Disposition(enum.StrEnum):

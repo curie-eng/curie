@@ -11,7 +11,12 @@ import pytest
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER, result_section, status_body
 from curie_api.factory_progress import PhaseSlot, PhaseView, StageSlot
-from curie_api.forges.github.marked_comments import _deliver, _GitHub, _patch, upsert_issue_notice
+from curie_api.forges.github.comments import GitHubMarkedComments, static_token
+from curie_api.forges.github.marked_comments import (
+    GitHubCommentClient,
+    deliver,
+    patch_comment,
+)
 from curie_api.forges.types import (
     GITHUB,
     PullRequestRef,
@@ -374,8 +379,10 @@ def test_every_factory_comment_creation_redacts_at_the_http_boundary(target_kind
             expected = ["/repos/acme-corp/acme-bot/issues/3936/comments"]
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(github)) as client:
-            outcome = await _deliver(
-                _GitHub(client, "https://api.github.com", "/repos/acme-corp/acme-bot", {}),
+            outcome = await deliver(
+                GitHubCommentClient(
+                    client, "https://api.github.com", "/repos/acme-corp/acme-bot", {}
+                ),
                 WorkItem(github_issue_number=3936),
                 FactoryStatusComment(execution_request_id=REQUEST, scan_page=1),
                 target,
@@ -401,8 +408,10 @@ def test_every_factory_comment_update_redacts_at_the_http_boundary(comment_list:
             return httpx.Response(200, json={"id": 3936})
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(github)) as client:
-            outcome = await _patch(
-                _GitHub(client, "https://api.github.com", "/repos/acme-corp/acme-bot", {}),
+            outcome = await patch_comment(
+                GitHubCommentClient(
+                    client, "https://api.github.com", "/repos/acme-corp/acme-bot", {}
+                ),
                 FactoryStatusComment(comment_id=3936, comment_list=comment_list),
                 f"{_PROVIDER_DETAIL}\n{_PR_URL}\n{marker_for(REQUEST)}\n{FINAL_MARKER}\n",
             )
@@ -437,18 +446,24 @@ def test_marked_notice_create_update_and_unchanged_use_the_redacted_body(existin
             writes.append((request.method, stored))
             return httpx.Response(200 if request.method == "PATCH" else 201, json={"id": 3936})
 
+        target = ReplyTarget.on_issue(TrackerIssueRef(GITHUB, "github.com", "4401", "3936"))
         async with httpx.AsyncClient(transport=httpx.MockTransport(github)) as client:
+            comments = GitHubMarkedComments(
+                client,
+                api="https://api.github.com",
+                host="github.com",
+                repo_full_name="acme-corp/acme-bot",
+                repository_id=4401,
+                token=static_token("fixture-installation-token"),
+                app_id="42",
+            )
             for expected_outcome in ["written", "unchanged"]:
-                outcome = await upsert_issue_notice(
-                    client,
-                    api="https://api.github.com",
-                    repo_path="/repos/acme-corp/acme-bot",
-                    headers={},
-                    issue_number=3936,
-                    marker=marker_for(REQUEST),
-                    body=f"{_PROVIDER_DETAIL}\n{_PR_URL}\n{marker_for(REQUEST)}\n",
-                    app_id="42",
+                upserted = await comments.upsert_marked(
+                    target,
+                    f"curie-execution-request:{REQUEST}",
+                    f"{_PROVIDER_DETAIL}\n{_PR_URL}",
                 )
+                outcome = "written" if upserted.written else "unchanged"
                 assert outcome == expected_outcome
         assert len(writes) == 1
         assert writes[0][0] == ("PATCH" if existing else "POST")

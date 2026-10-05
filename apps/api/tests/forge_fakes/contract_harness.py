@@ -2,16 +2,20 @@
 
 The suite under ``apps/api/tests/forges/contract`` calls only port methods and
 this harness. Each adapter pair supplies one harness: today the in-memory pair
-in two declarations; a GitHub harness backed by the fakes in this package
-joins the registry in ``apps/api/tests/forges/contract/conftest.py`` without
-editing any vector.
+in two declarations, and the GitHub tracker and code host over the fake in
+``forge_fakes/github.py``. Each joins the registry in
+``apps/api/tests/forges/contract/conftest.py`` without editing any vector.
 """
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Mapping
-from typing import Protocol
+from typing import Any, Protocol
 
+import httpx
+import pytest
+from curie_api.config import Settings
 from curie_api.forges import types
 from curie_api.forges.capabilities import (
     CODE_HOST_OPERATIONS,
@@ -19,6 +23,11 @@ from curie_api.forges.capabilities import (
     Operation,
     Support,
 )
+from curie_api.forges.github import ci as github_ci
+from curie_api.forges.github import code_host as github_code_host
+from curie_api.forges.github.code_host import GitHubCodeHost
+from curie_api.forges.github.comments import GitHubMarkedComments, static_token
+from curie_api.forges.github.tracker import GitHubTracker
 from curie_api.forges.memory import (
     InMemoryCodeHost,
     InMemoryMarkedComments,
@@ -34,10 +43,13 @@ from curie_api.forges.types import (
     FeedbackKind,
     PullRequest,
     PullRequestRef,
+    PullRequestState,
     ReplyTarget,
     RepositoryRef,
     TrackerIssueRef,
 )
+
+from forge_fakes.github import CONTRACT_APP_ID, REPO, REPO_ID, GitHubRepositoryFake
 
 
 class AdapterHarness(Protocol):
@@ -76,13 +88,20 @@ class AdapterHarness(Protocol):
         self, pull_request: PullRequestRef, author: Actor, body: str, kind: FeedbackKind
     ) -> None: ...
 
+    def review_thread(self, pull_request: PullRequestRef) -> str:
+        """The id of a review thread a person opened on ``pull_request``."""
+
+    def close_pull_request(self, pull_request: PullRequestRef, *, merged: bool) -> None:
+        """Someone closes ``pull_request``, merging it when ``merged``."""
+
     def add_foreign_comment(
         self, target: ReplyTarget, author: Actor, marker: str, body: str
     ) -> None:
         """``author`` posts ``body`` carrying ``marker`` embedded exactly as the
         adapter embeds it, so only identity can tell it from our own."""
 
-    def comment_bodies(self, target: ReplyTarget) -> list[tuple[Actor, str]]: ...
+    def comment_bodies(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
+        """Comments posted on ``target``; on a thread, the replies in it."""
 
     def fail_next_page(self, *, after: int = 0) -> None:
         """The listing page read after ``after`` more successful reads fails once.
@@ -181,6 +200,13 @@ class InMemoryHarness:
         thread = "t1" if kind is FeedbackKind.REVIEW_COMMENT else None
         self._code_host.seed_feedback(pull_request, author, body, kind, thread_id=thread)
 
+    def review_thread(self, pull_request: PullRequestRef) -> str:
+        return "t1"
+
+    def close_pull_request(self, pull_request: PullRequestRef, *, merged: bool) -> None:
+        state = PullRequestState.MERGED if merged else PullRequestState.CLOSED
+        self._code_host.set_state(pull_request, state)
+
     def _comments_side(self, target: ReplyTarget) -> InMemoryMarkedComments:
         if target.kind == "issue":
             return self._tracker.marked_comments
@@ -202,7 +228,162 @@ class InMemoryHarness:
         return self._ledger.writes
 
 
-def _conforms(harness: InMemoryHarness) -> AdapterHarness:
-    """Type-checked proof that the in-memory harness satisfies the protocol."""
+def _github_user(actor: Actor) -> dict[str, Any]:
+    return {"id": int(actor.id), "login": actor.login, "type": "User"}
+
+
+_GIT_HEADER = "Basic " + base64.b64encode(b"x-access-token:fixture-installation-token").decode()
+
+
+class _AppCredentials:
+    """The App installation token mint, without the App (`curie_api.github_app`)."""
+
+    app_configured = True
+
+    def fresh_installation_token(
+        self, repo_full_name: str, expected_installation_id: int | None = None
+    ) -> tuple[int, str]:
+        assert repo_full_name == REPO
+        return 5501, "fixture-installation-token"
+
+
+class GitHubHarness:
+    """The GitHub tracker and code host over `GitHubRepositoryFake`, paging at two.
+
+    The code host's two credential sources, the repository git credential and
+    the App installation token mint, are replaced with fixtures; every other
+    call goes over HTTP to the fake.
+    """
+
+    name = "github"
+    base_branch = "main"
+    writer = WRITER
+    outsider = OUTSIDER
+    label = LABEL
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            github_code_host,
+            "resolve_repository_credential",
+            lambda path, settings: (f"{settings.github_html_base}/{path}.git", _GIT_HEADER),
+        )
+        monkeypatch.setattr(github_ci, "credentials_for", lambda _settings: _AppCredentials())
+        self.fake = GitHubRepositoryFake()
+        client = httpx.AsyncClient(transport=httpx.MockTransport(self.fake.handle))
+        token = static_token("fixture-installation-token")
+        self._tracker = GitHubTracker(
+            client,
+            api="https://api.github.com",
+            html_base="https://github.com",
+            repo_full_name=REPO,
+            repository_id=REPO_ID,
+            token=token,
+            label=LABEL,
+            mention="curie",
+            app_id=str(CONTRACT_APP_ID),
+            page_size=2,
+        )
+        settings = Settings(github_api_url="https://api.github.com")
+        self._code_host = GitHubCodeHost(
+            settings,
+            client,
+            marked_comments=GitHubMarkedComments(
+                client,
+                api="https://api.github.com",
+                host="github.com",
+                repo_full_name=REPO,
+                repository_id=REPO_ID,
+                token=token,
+                app_id=str(CONTRACT_APP_ID),
+            ),
+            repository_paths={str(REPO_ID): REPO},
+            page_size=2,
+        )
+        self.tracker: Tracker = self._tracker
+        self.code_host: CodeHost = self._code_host
+        self.repository = RepositoryRef(
+            types.GITHUB, self._code_host.host, str(REPO_ID), REPO, default_branch="main"
+        )
+
+    def seed_issue(self, title: str, body: str) -> TrackerIssueRef:
+        return self._tracker.issue(self.fake.seed_issue(title, body))
+
+    def apply_label(self, issue: TrackerIssueRef, actor: Actor) -> None:
+        self.fake.label_event(int(issue.issue_id), "labeled", LABEL, _github_user(actor))
+
+    def remove_label(self, issue: TrackerIssueRef, actor: Actor) -> None:
+        self.fake.label_event(int(issue.issue_id), "unlabeled", LABEL, _github_user(actor))
+
+    def set_write_access(self, actor: Actor, allowed: bool) -> None:
+        self.fake.permissions[actor.login] = (int(actor.id), "write" if allowed else "read")
+
+    def feedback_allowlist(self) -> frozenset[str]:
+        return frozenset()
+
+    def push_head(self, branch: str) -> str:
+        return self.fake.push_head(branch)
+
+    def report_checks(self, sha: str, checks: Mapping[str, CheckState]) -> None:
+        for key, state in checks.items():
+            self.fake.report_check(sha, key, state.value)
+
+    def add_review_feedback(
+        self, pull_request: PullRequestRef, author: Actor, body: str, kind: FeedbackKind
+    ) -> None:
+        number, user = int(pull_request.number), _github_user(author)
+        if kind is FeedbackKind.COMMENT:
+            self.fake.add_comment(number, user, body, app=False)
+        elif kind is FeedbackKind.REVIEW_COMMENT:
+            self.fake.add_review_comment(number, user, body, app=False)
+        else:
+            self.fake.add_review(number, user, body)
+
+    def review_thread(self, pull_request: PullRequestRef) -> str:
+        opened = self.fake.add_review_comment(
+            int(pull_request.number), _github_user(WRITER), "Why this way?", app=False
+        )
+        return str(opened["id"])
+
+    def close_pull_request(self, pull_request: PullRequestRef, *, merged: bool) -> None:
+        self.fake.set_pull_state(int(pull_request.number), merged=merged)
+
+    def add_foreign_comment(
+        self, target: ReplyTarget, author: Actor, marker: str, body: str
+    ) -> None:
+        text = GitHubMarkedComments.embed(marker, body)
+        user = _github_user(author)
+        if target.issue is not None:
+            self.fake.add_comment(int(target.issue.issue_id), user, text, app=False)
+            return
+        assert target.pull_request is not None
+        number = int(target.pull_request.number)
+        if target.thread_id is None:
+            self.fake.add_comment(number, user, text, app=False)
+        else:
+            self.fake.add_review_comment(
+                number, user, text, app=False, in_reply_to=int(target.thread_id)
+            )
+
+    def comment_bodies(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
+        if target.thread_id is not None:
+            thread = int(target.thread_id)
+            listed = [c for c in self.fake.review_comments if c.get("in_reply_to_id") == thread]
+        else:
+            ref = target.issue.issue_id if target.issue is not None else None
+            if ref is None:
+                assert target.pull_request is not None
+                ref = target.pull_request.number
+            listed = [c for c in self.fake.comments if c["_number"] == int(ref)]
+        return [(Actor(str(c["user"]["id"]), c["user"]["login"]), c["body"]) for c in listed]
+
+    def fail_next_page(self, *, after: int = 0) -> None:
+        self.fake.fail_next_page(after=after)
+
+    def write_count(self) -> int:
+        return self.fake.writes
+
+
+def _conforms(harness: InMemoryHarness | GitHubHarness) -> AdapterHarness:
+    """Type-checked proof that each harness satisfies the protocol."""
 
     return harness

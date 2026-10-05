@@ -129,7 +129,7 @@ def issue_lock_keys(issue: TrackerIssueRef) -> tuple[int, int]:
     """The two-int advisory lock key serializing work on one tracker issue."""
 
     if issue.kind == GITHUB:
-        return github_identity._issue_lock_keys(
+        return github_identity.issue_lock_keys_for(
             _github_number(issue.scope_id, "repository id"),
             _github_number(issue.issue_id, "issue number"),
         )

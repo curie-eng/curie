@@ -236,42 +236,30 @@ class PublicationCluster(Protocol):
     def cleanup_terminal(self, names: PublicationResourceNames) -> None | Awaitable[None]: ...
 
 
-class PublicationGitHub(Protocol):
-    def read_pr_by_number(
-        self,
-        repo_full_name: str,
-        pr_number: int,
-        authorization_header: str,
+class PublicationCodeHost(Protocol):
+    """Pull request, branch and commit facts for one publication, from the API.
+
+    ADR 0197 "Two ports" item 6: the worker holds no forge code; each call
+    names the publication and the API derives everything else from it.
+    """
+
+    def read_pull_request(
+        self, publication_id: uuid.UUID, pr_number: int
     ) -> PublicationPullState | Awaitable[PublicationPullState]: ...
 
     def verify_revision_commit(
         self,
-        repo_full_name: str,
+        publication_id: uuid.UUID,
         commit_sha: str,
         *,
         revision_id: uuid.UUID,
         expected_parent: str,
-        authorization_header: str,
     ) -> str | Awaitable[str]: ...
 
-    def read_branch_head(
-        self,
-        repo_full_name: str,
-        branch: str,
-        authorization_header: str,
-    ) -> str | None | Awaitable[str | None]: ...
+    def read_branch_head(self, publication_id: uuid.UUID) -> str | None | Awaitable[str | None]: ...
 
-    def recover_pr_by_head(
-        self,
-        repo_full_name: str,
-        branch: str,
-        title: str,
-        body: str,
-        *,
-        expected_head_sha: str,
-        authorization_header: str,
-        draft: bool = False,
-        base: str | None = None,
+    def recover_pull_request(
+        self, publication_id: uuid.UUID, *, expected_head_sha: str
     ) -> PublicationPullState | None | Awaitable[PublicationPullState | None]: ...
 
 
@@ -365,7 +353,7 @@ class PublicationReconciler:
         store: PublicationStore,
         credentials: PublicationCredentialSource,
         cluster: PublicationCluster,
-        github: PublicationGitHub,
+        code_host: PublicationCodeHost,
         replies: ReplySink,
         lineage: PublicationLineageAuthority,
         job_settings: PublicationJobSettings,
@@ -376,7 +364,7 @@ class PublicationReconciler:
         self._lineage = lineage
         self._credentials = credentials
         self._cluster = cluster
-        self._github = github
+        self._code_host = code_host
         self._replies = replies
         self._job_settings = job_settings
         self._card_store = card_store
@@ -897,19 +885,11 @@ class PublicationReconciler:
             base_ref=work.base_ref,
         )
 
-    async def _read_stored_pull(
-        self,
-        work: PublicationWork,
-        authorization_header: str,
-    ) -> PublicationPullState | None:
+    async def _read_stored_pull(self, work: PublicationWork) -> PublicationPullState | None:
         if work.pr_number is None:
             return None
         pull = await _resolve(
-            self._github.read_pr_by_number(
-                work.repo_full_name,
-                work.pr_number,
-                authorization_header,
-            )
+            self._code_host.read_pull_request(work.publication_id, work.pr_number)
         )
         if pull.head_ref != work.branch:
             raise PublicationReconcileError(
@@ -1133,41 +1113,24 @@ class PublicationReconciler:
         credential: PublicationCredential
         try:
             # The approved decision is the only authority to redeem. Redeem
-            # exactly once, then use this authorization for every private
-            # GitHub observation and for the one immutable Job Secret.
+            # exactly once, for the one immutable Job Secret; the pull request,
+            # branch and commit reads go through the API's code host.
             credential = await _resolve(self._credentials.redeem(work.publication_id))
-            pull = await self._read_stored_pull(
-                work,
-                credential.authorization_header,
-            )
+            pull = await self._read_stored_pull(work)
             if pull is None:
-                branch_head = await _resolve(
-                    self._github.read_branch_head(
-                        work.repo_full_name,
-                        work.branch,
-                        credential.authorization_header,
-                    )
-                )
+                branch_head = await _resolve(self._code_host.read_branch_head(work.publication_id))
                 if branch_head is not None:
                     await _resolve(
-                        self._github.verify_revision_commit(
-                            work.repo_full_name,
+                        self._code_host.verify_revision_commit(
+                            work.publication_id,
                             branch_head,
                             revision_id=work.revision_id,
                             expected_parent=work.expected_prior_head,
-                            authorization_header=credential.authorization_header,
                         )
                     )
                     recovered = await _resolve(
-                        self._github.recover_pr_by_head(
-                            work.repo_full_name,
-                            work.branch,
-                            work.title,
-                            work.body,
-                            expected_head_sha=branch_head,
-                            authorization_header=credential.authorization_header,
-                            draft=work.open_as_draft,
-                            base=work.base_ref,
+                        self._code_host.recover_pull_request(
+                            work.publication_id, expected_head_sha=branch_head
                         )
                     )
                     if recovered is None:
@@ -1216,12 +1179,11 @@ class PublicationReconciler:
                 if pull.head_sha != trusted_head:
                     try:
                         verified_head = await _resolve(
-                            self._github.verify_revision_commit(
-                                work.repo_full_name,
+                            self._code_host.verify_revision_commit(
+                                work.publication_id,
                                 pull.head_sha,
                                 revision_id=work.revision_id,
                                 expected_parent=work.expected_prior_head,
-                                authorization_header=credential.authorization_header,
                             )
                         )
                         if verified_head != pull.head_sha:
@@ -1252,12 +1214,11 @@ class PublicationReconciler:
             if pull is not None and pull.head_sha != work.expected_prior_head:
                 try:
                     await _resolve(
-                        self._github.verify_revision_commit(
-                            work.repo_full_name,
+                        self._code_host.verify_revision_commit(
+                            work.publication_id,
                             pull.head_sha,
                             revision_id=work.revision_id,
                             expected_parent=work.expected_prior_head,
-                            authorization_header=credential.authorization_header,
                         )
                     )
                 except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary

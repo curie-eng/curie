@@ -6,29 +6,26 @@ deployment default, or the repository default branch. Two distinct labels, an
 unallowed branch, or a branch the repository does not have are refused with
 one marked issue comment, never substituted.
 
-GitHub REST:
-https://docs.github.com/en/rest/branches/branches#get-a-branch
+The branch read and the comment go through the forge ports: the code host's
+``branch_head`` and the tracker's `MarkedComments`.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any, Literal
-from urllib.parse import quote
-
-import httpx
 
 from .config import Settings
 from .factory_notices import code_span
-from .forges.github.marked_comments import upsert_issue_notice
-from .forges.github.transport import github_headers
+from .forges.errors import ForgeError
+from .forges.ports import CodeHost, MarkedComments
+from .forges.types import ReplyTarget, RepositoryRef, TrackerIssueRef
 from .github_factory_events import BASE_LABEL_PREFIX
 from .github_review_events import FeedbackUnavailable
 from .repo_full_name import entry_for_repo
 
-REFUSAL_MARKER = "<!-- curie-factory-base-refusal -->"
-_SHA = re.compile(r"[0-9a-f]{40}")
+# The core-owned marker; the tracker's comment adapter decides how to embed it.
+REFUSAL_MARKER = "curie-factory-base-refusal"
 
 
 @dataclass(frozen=True)
@@ -118,61 +115,28 @@ def label_disagreement(
     return branch if branch is not None and branch != recorded else None
 
 
-async def read_base_commit(
-    client: httpx.AsyncClient,
-    *,
-    api: str,
-    token: str,
-    repo_path: str,
-    branch: str,
-) -> str | None:
-    """The branch head commit, or None when the repository has no such branch."""
-
-    try:
-        response = await client.get(
-            f"{api}{repo_path}/branches/{quote(branch, safe='/')}",
-            headers=github_headers(token),
-            follow_redirects=False,
-        )
-    except httpx.HTTPError:
-        raise FeedbackUnavailable("base_unavailable") from None
-    if response.status_code == 404:
-        return None
-    if response.status_code != 200:
-        raise FeedbackUnavailable("base_unavailable")
-    try:
-        payload = response.json()
-    except ValueError:
-        raise FeedbackUnavailable("base_unavailable") from None
-    commit = payload.get("commit") if isinstance(payload, dict) else None
-    sha = commit.get("sha") if isinstance(commit, dict) else None
-    if not isinstance(sha, str) or _SHA.fullmatch(sha) is None:
-        raise FeedbackUnavailable("base_unavailable")
-    return sha
-
-
 async def resolve_base(
-    client: httpx.AsyncClient,
     *,
     settings: Settings,
-    token: str,
     repo_full_name: str,
-    repo_path: str,
     labels: set[str],
     default_branch: str | None,
+    code_host: CodeHost,
+    repository: RepositoryRef,
 ) -> ResolvedBase | BaseRefusal:
-    """Choose the base and read its head commit. A missing branch is refused."""
+    """Choose the base and read its head commit. A missing branch is refused.
+
+    The code host answers the branch's head commit, None when ``repository``
+    has no such branch, and raises a `ForgeError` when it cannot answer now.
+    """
 
     choice = choose_base(labels, bases_for(settings, repo_full_name), default_branch)
     if isinstance(choice, BaseRefusal):
         return choice
-    commit = await read_base_commit(
-        client,
-        api=settings.github_api_url.rstrip("/"),
-        token=token,
-        repo_path=repo_path,
-        branch=choice.branch,
-    )
+    try:
+        commit = await code_host.branch_head(repository, choice.branch)
+    except ForgeError:
+        raise FeedbackUnavailable("base_unavailable") from None
     if commit is None:
         return BaseRefusal(
             "base_missing", f"base {code_span(choice.branch)} does not exist in the repository"
@@ -181,33 +145,22 @@ async def resolve_base(
 
 
 def refusal_body(refusal: BaseRefusal) -> str:
+    """The refusal comment's text; the comment adapter appends the marker."""
+
     return (
         f"Curie did not start this issue: {refusal.reason}. Fix the `base:` label or the"
         " deployment's allowed bases; Curie will pick the issue up again on its next pass."
-        f"\n\n{REFUSAL_MARKER}\n"
     )
 
 
 async def comment_refusal(
-    client: httpx.AsyncClient,
-    *,
-    settings: Settings,
-    token: str,
-    repo_path: str,
-    issue_number: int,
-    refusal: BaseRefusal,
+    comments: MarkedComments, issue: TrackerIssueRef, refusal: BaseRefusal
 ) -> None:
     """Keep the one refusal comment current. It is edited, never duplicated."""
 
-    outcome = await upsert_issue_notice(
-        client,
-        api=settings.github_api_url.rstrip("/"),
-        repo_path=repo_path,
-        headers=github_headers(token),
-        issue_number=issue_number,
-        marker=REFUSAL_MARKER,
-        body=refusal_body(refusal),
-        app_id=settings.github_app_id,
-    )
-    if outcome == "unavailable":
-        raise FeedbackUnavailable("base_refusal_unavailable")
+    try:
+        await comments.upsert_marked(
+            ReplyTarget.on_issue(issue), REFUSAL_MARKER, refusal_body(refusal)
+        )
+    except ForgeError:
+        raise FeedbackUnavailable("base_refusal_unavailable") from None

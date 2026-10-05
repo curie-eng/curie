@@ -16,7 +16,7 @@ def delivery_uuid(delivery_id: str) -> uuid.UUID:
     return delivery
 
 
-def _issue_lock_keys(repository_id: int, issue_number: int) -> tuple[int, int]:
+def issue_lock_keys_for(repository_id: int, issue_number: int) -> tuple[int, int]:
     digest = hashlib.sha256(f"curie-factory:{repository_id}:{issue_number}".encode()).digest()
     return (
         int.from_bytes(digest[:4], "big", signed=True),

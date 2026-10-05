@@ -12,9 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from curie_api.config import Settings
-from curie_api.factory_label_reconcile import parse_time
-from curie_api.forges.github.transport import _list, get_github_json
-from curie_api.github_factory_review import admit_parsed_feedback
+from curie_api.forges.github.transport import get_github_json, list_pages, parse_time
 from curie_api.github_review_events import (
     FeedbackIgnored,
     FeedbackUnavailable,
@@ -27,7 +25,7 @@ _LOOKBACK = timedelta(hours=1)
 
 
 @dataclass
-class _Cursor:
+class Cursor:
     comments_since: datetime | None = None
     review_comments_since: datetime | None = None
     reviews_since: datetime | None = None
@@ -35,14 +33,14 @@ class _Cursor:
     repository_id: int | None = None
 
 
-def _since_param(stored: datetime | None, now: datetime) -> str:
+def since_param(stored: datetime | None, now: datetime) -> str:
     moment = stored if stored is not None else now - _LOOKBACK
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=UTC)
     return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _advance(current: datetime | None, items: list[Any], *keys: str) -> datetime | None:
+def advance(current: datetime | None, items: list[Any], *keys: str) -> datetime | None:
     newest = current
     for item in items:
         if not isinstance(item, dict):
@@ -54,7 +52,7 @@ def _advance(current: datetime | None, items: list[Any], *keys: str) -> datetime
     return newest
 
 
-def _trailing_id(url: Any) -> int | None:
+def trailing_id(url: Any) -> int | None:
     if not isinstance(url, str) or not url:
         return None
     tail = url.rstrip("/").rsplit("/", 1)[-1]
@@ -64,7 +62,7 @@ def _trailing_id(url: Any) -> int | None:
     return number if number > 0 else None
 
 
-def _human_actor(event: dict[str, Any]) -> tuple[int, str] | None:
+def human_actor(event: dict[str, Any]) -> tuple[int, str] | None:
     if event.get("performed_via_github_app") is not None:
         return None
     actor = event.get("actor") if "actor" in event else event.get("user")
@@ -76,7 +74,7 @@ def _human_actor(event: dict[str, Any]) -> tuple[int, str] | None:
         return None
 
 
-async def _open_pulls(
+async def open_pulls(
     sessionmaker: async_sessionmaker[AsyncSession], repo: str, repository_id: int
 ) -> list[int]:
     async with sessionmaker() as session:
@@ -94,7 +92,7 @@ async def _open_pulls(
     return [number for number in rows if isinstance(number, int) and number > 0]
 
 
-async def _pull(
+async def read_pull(
     client: httpx.AsyncClient, *, api: str, token: str, repo_path: str, number: int
 ) -> dict[str, Any]:
     return await get_github_json(
@@ -106,11 +104,11 @@ async def _pull(
     )
 
 
-def _repository_payload(repository_id: int, repo: str) -> dict[str, Any]:
+def repository_payload(repository_id: int, repo: str) -> dict[str, Any]:
     return {"id": repository_id, "full_name": repo}
 
 
-async def _admit_one_feedback(
+async def admit_one_feedback(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
     client: httpx.AsyncClient,
@@ -127,6 +125,10 @@ async def _admit_one_feedback(
         )
     except FeedbackIgnored:
         return
+    # Imported here: the admission path imports the factory intake, which
+    # imports this module's helpers through the tracker.
+    from curie_api.github_factory_review import admit_parsed_feedback
+
     async with sessionmaker() as session:
         try:
             await admit_parsed_feedback(session, feedback, settings=settings, client=client)
@@ -139,11 +141,11 @@ async def _admit_one_feedback(
         await session.commit()
 
 
-async def _admit_review_comments(
+async def admit_review_comments(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
     client: httpx.AsyncClient,
-    cursor: _Cursor,
+    cursor: Cursor,
     *,
     now: datetime,
     api: str,
@@ -154,13 +156,13 @@ async def _admit_review_comments(
     installation_id: int,
     owned: list[int],
 ) -> None:
-    listed, etag = await _list(
+    listed, etag = await list_pages(
         client,
         api=api,
         token=token,
         path=f"{repo_path}/pulls/comments",
         params={
-            "since": _since_param(cursor.review_comments_since, now),
+            "since": since_param(cursor.review_comments_since, now),
             "sort": "created",
             "direction": "asc",
         },
@@ -173,17 +175,17 @@ async def _admit_review_comments(
     for comment in listed:
         if not isinstance(comment, dict) or comment.get("performed_via_github_app") is not None:
             continue
-        if _human_actor({"user": comment.get("user")}) is None:
+        if human_actor({"user": comment.get("user")}) is None:
             continue
-        number = _trailing_id(comment.get("pull_request_url"))
+        number = trailing_id(comment.get("pull_request_url"))
         if number is None or number not in owned_set:
             continue
         if number not in pulls:
-            pulls[number] = await _pull(
+            pulls[number] = await read_pull(
                 client, api=api, token=token, repo_path=repo_path, number=number
             )
         user = comment.get("user")
-        await _admit_one_feedback(
+        await admit_one_feedback(
             sessionmaker,
             settings,
             client,
@@ -191,24 +193,24 @@ async def _admit_review_comments(
             payload={
                 "action": "created",
                 "installation": {"id": installation_id},
-                "repository": _repository_payload(repository_id, repo),
+                "repository": repository_payload(repository_id, repo),
                 "sender": user,
                 "pull_request": pulls[number],
                 "comment": comment,
             },
         )
-    cursor.review_comments_since = _advance(
+    cursor.review_comments_since = advance(
         cursor.review_comments_since, listed, "created_at", "updated_at"
     )
     if etag:
         cursor.etags["review-comments"] = etag
 
 
-async def _admit_reviews(
+async def admit_reviews(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
     client: httpx.AsyncClient,
-    cursor: _Cursor,
+    cursor: Cursor,
     *,
     api: str,
     token: str,
@@ -224,7 +226,7 @@ async def _admit_reviews(
             del cursor.etags[key]
     for number in owned:
         key = f"reviews:{number}"
-        listed, etag = await _list(
+        listed, etag = await list_pages(
             client,
             api=api,
             token=token,
@@ -234,13 +236,13 @@ async def _admit_reviews(
         )
         if listed is None:
             continue
-        pull = await _pull(client, api=api, token=token, repo_path=repo_path, number=number)
+        pull = await read_pull(client, api=api, token=token, repo_path=repo_path, number=number)
         for review in listed:
             if not isinstance(review, dict) or review.get("performed_via_github_app") is not None:
                 continue
-            if _human_actor({"user": review.get("user")}) is None:
+            if human_actor({"user": review.get("user")}) is None:
                 continue
-            await _admit_one_feedback(
+            await admit_one_feedback(
                 sessionmaker,
                 settings,
                 client,
@@ -248,7 +250,7 @@ async def _admit_reviews(
                 payload={
                     "action": "submitted",
                     "installation": {"id": installation_id},
-                    "repository": _repository_payload(repository_id, repo),
+                    "repository": repository_payload(repository_id, repo),
                     "sender": review.get("user"),
                     "pull_request": pull,
                     "review": review,

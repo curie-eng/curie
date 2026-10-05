@@ -78,7 +78,7 @@ _PROVIDER_WORKSPACE_ASSIGN = re.compile(
 )
 
 
-def _redact_factory_comment(body: str) -> str:
+def redact_factory_comment(body: str) -> str:
     """Redact secrets and contextual provider identifiers before publication."""
 
     def redact_url(match: re.Match[str]) -> str:

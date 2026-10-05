@@ -11,13 +11,16 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import pytest
-from forge_fakes.contract_harness import AdapterHarness, InMemoryHarness
+from forge_fakes.contract_harness import AdapterHarness, GitHubHarness, InMemoryHarness
 
-HarnessFactory = Callable[[], AdapterHarness]
+# A factory may patch the credential sources its adapter reads, so it is
+# handed the vector's monkeypatch, which undoes them after the vector.
+HarnessFactory = Callable[[pytest.MonkeyPatch], AdapterHarness]
 
 HARNESSES: list[object] = [
-    pytest.param(lambda: InMemoryHarness(minimal=False), id="memory"),
-    pytest.param(lambda: InMemoryHarness(minimal=True), id="memory-minimal"),
+    pytest.param(lambda _patch: InMemoryHarness(minimal=False), id="memory"),
+    pytest.param(lambda _patch: InMemoryHarness(minimal=True), id="memory-minimal"),
+    pytest.param(GitHubHarness, id="github"),
 ]
 
 
@@ -27,6 +30,6 @@ def anyio_backend() -> str:
 
 
 @pytest.fixture(params=HARNESSES)
-def harness(request: pytest.FixtureRequest) -> AdapterHarness:
+def harness(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> AdapterHarness:
     factory: HarnessFactory = request.param
-    return factory()
+    return factory(monkeypatch)

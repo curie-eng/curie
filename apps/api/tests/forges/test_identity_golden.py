@@ -14,7 +14,7 @@ import uuid
 from datetime import UTC, datetime
 
 import pytest
-from curie_api.forges.github.identity import _issue_lock_keys, label_event_delivery_id
+from curie_api.forges.github.identity import issue_lock_keys_for, label_event_delivery_id
 from curie_api.forges.identity import (
     feedback_event_id,
     issue_lock_keys,
@@ -159,7 +159,7 @@ def test_reconcile_label_event_delivery_id() -> None:
 def test_issue_lock_keys(repository_id: int, issue_number: int) -> None:
     issue = TrackerIssueRef(GITHUB, "github.com", str(repository_id), str(issue_number))
     golden = GOLDEN_LOCK_KEYS[(repository_id, issue_number)]
-    assert _issue_lock_keys(repository_id, issue_number) == issue_lock_keys(issue) == golden
+    assert issue_lock_keys_for(repository_id, issue_number) == issue_lock_keys(issue) == golden
 
 
 def test_the_display_key_and_host_take_no_part_in_a_github_identity() -> None:

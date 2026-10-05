@@ -16,7 +16,13 @@ from curie_api.forges.capabilities import (
     validate_pairing,
 )
 from curie_api.forges.errors import Unsupported
-from curie_api.forges.types import CheckState, RollupState
+from curie_api.forges.types import (
+    CheckState,
+    RerunOutcome,
+    RerunRecord,
+    RollupState,
+    failed_native_jobs,
+)
 from forge_fakes.contract_harness import AdapterHarness, InMemoryHarness, open_pull
 
 Call = Callable[[], Awaitable[Any]]
@@ -27,12 +33,15 @@ async def _optional_calls(harness: AdapterHarness) -> dict[Operation, Call]:
     pull = await open_pull(harness, "factory/capabilities")
     harness.report_checks(pull.head_sha, {"unit": CheckState.FAILURE})
     tracker, code_host, repository = harness.tracker, harness.code_host, harness.repository
+    jobs = failed_native_jobs((await code_host.observe_ci(repository, pull.head_sha)).checks)
     return {
         Operation.LINK_PULL_REQUEST: lambda: tracker.link_pull_request(issue, pull),
         Operation.DEPENDENCIES: lambda: tracker.dependencies(issue),
         Operation.GROUP_MEMBERSHIP: lambda: tracker.in_group(harness.writer, "starters"),
-        Operation.CI_DIAGNOSTICS: lambda: code_host.ci_diagnostics(repository, pull.head_sha),
-        Operation.RERUN_FAILED: lambda: code_host.rerun_failed(repository, pull.head_sha),
+        Operation.CI_DIAGNOSTICS: lambda: code_host.ci_diagnostics(
+            repository, pull.head_sha, base_ref=None
+        ),
+        Operation.RERUN_FAILED: lambda: code_host.rerun_failed(repository, jobs),
         Operation.USER_CAN_WRITE: lambda: code_host.user_can_write(repository, harness.writer),
     }
 
@@ -62,7 +71,10 @@ async def test_no_op_operations_write_nothing_and_unsupported_ones_raise(
             assert refused.value.operation is operation
         elif support is Support.NOOP:
             result = await call()
-            assert result in (None, (), 0)
+            if isinstance(result, RerunRecord):
+                assert result.attempts == () and result.stopped is None
+            else:
+                assert result in (None, (), 0)
         else:
             await call()
             continue
@@ -74,13 +86,50 @@ async def test_supported_rerun_reruns_the_failed_check(harness: AdapterHarness) 
     if not supports(harness.code_host.capabilities, Operation.RERUN_FAILED):
         pytest.skip(f"{harness.name} declares no rerun")
     pull = await open_pull(harness, "factory/rerun")
-    harness.report_checks(pull.head_sha, {"unit": CheckState.FAILURE})
+    harness.report_checks(pull.head_sha, {"unit": CheckState.FAILURE, "lint": CheckState.SUCCESS})
+    code_host, repository = harness.code_host, harness.repository
+    jobs = failed_native_jobs((await code_host.observe_ci(repository, pull.head_sha)).checks)
+    assert [job.name.lower() for job in jobs] == ["unit"]
     before = harness.write_count()
 
-    assert await harness.code_host.rerun_failed(harness.repository, pull.head_sha) == 1
+    record = await code_host.rerun_failed(repository, jobs)
+
+    assert [attempt.outcome for attempt in record.attempts] == [RerunOutcome.ACCEPTED]
+    assert record.stopped is None
+    assert [job.unit for job in record.jobs] == [record.attempts[0].unit]
     assert harness.write_count() == before + 1
-    rollup = await harness.code_host.observe_ci(harness.repository, pull.head_sha)
+    rollup = await code_host.observe_ci(repository, pull.head_sha)
     assert rollup.state is RollupState.PENDING
+    # A unit the caller recorded as settled is never asked again.
+    again = await code_host.rerun_failed(
+        repository, record.jobs, settled={attempt.unit for attempt in record.attempts}
+    )
+    assert again.attempts == ()
+    assert harness.write_count() == before + 1
+
+
+@pytest.mark.anyio
+async def test_the_rerun_observer_sees_each_answer_and_can_stop_the_next(
+    harness: AdapterHarness,
+) -> None:
+    if not supports(harness.code_host.capabilities, Operation.RERUN_FAILED):
+        pytest.skip(f"{harness.name} declares no rerun")
+    pull = await open_pull(harness, "factory/rerun-stop")
+    harness.report_checks(pull.head_sha, {"unit": CheckState.FAILURE, "e2e": CheckState.FAILURE})
+    code_host, repository = harness.code_host, harness.repository
+    jobs = failed_native_jobs((await code_host.observe_ci(repository, pull.head_sha)).checks)
+    seen: list[RerunRecord] = []
+
+    async def stop_after_the_first(record: RerunRecord) -> bool:
+        seen.append(record)
+        return False
+
+    before = harness.write_count()
+    record = await code_host.rerun_failed(repository, jobs, on_attempt=stop_after_the_first)
+
+    assert seen == [record]
+    assert len(record.attempts) == 1
+    assert harness.write_count() == before + 1
 
 
 @pytest.mark.anyio
