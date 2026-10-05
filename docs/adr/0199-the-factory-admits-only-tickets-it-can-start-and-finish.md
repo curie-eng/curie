@@ -2,14 +2,15 @@
 
 Date: 2026-10-05
 
-Status: Draft
+Status: Accepted
 
-This draft proposes a viability gate at dark factory admission. It does not
-authorize implementation. Acceptance is the maintainer's decision.
+Accepted 2026-10-05 with explicit maintainer approval from Brian Conn
+(TheConnMan), given after the Draft merged in
+[#4020](https://github.com/curie-eng/curie/pull/4020).
 
-It proposes partial amendments to two Accepted ADRs, to be back-linked under
-[ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md) on
-acceptance:
+This ADR decides a viability gate at dark factory admission. It partially
+amends two Accepted ADRs, back-linked on each under
+[ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md):
 
 1. [ADR 0187](0187-the-factory-polls-github-and-the-platform-reads-the-issue.md),
    "The platform reads the issue for the bundle", item 3: the platform reads
@@ -19,12 +20,12 @@ acceptance:
    a selection label requests admission, and only a passing viability verdict
    permits it.
 
-It also conflicts with two positions in Draft
-[ADR 0165](0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md),
-the visible `curie:blocked` waiting state with automatic admission when
-blockers clear, and stacking a dependent on an unmerged prerequisite PR. ADR
-0165 should be revised to match before either ADR is accepted (decisions 2 and 6,
-and consequence 6). It composes with
+Draft
+[ADR 0165](0165-the-tracker-owns-dependencies-and-curie-admits-ready-work.md)
+was revised in the same change to conform: it drops the visible
+`curie:blocked` waiting state, automatic admission when blockers clear, and
+stacking a dependent on an unmerged prerequisite PR, and becomes the
+dependency read behind decision 2's first start check. It composes with
 [ADR 0186](0186-a-factory-ticket-declares-its-base-and-keeps-it.md) (base
 resolution runs first) and
 [ADR 0197](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md)
@@ -271,7 +272,7 @@ run can do. Anything not in it is absent.
    threshold raises an operator alert. It never reads as waiting on a person
    on the issue.
 4. ADR 0165's unknown assessment maps to this state; its blocked assessment
-   maps to a start rejection.
+   is a start rejection.
 
 ### 7. The ticket shape the gate expects
 
@@ -332,9 +333,9 @@ A factory ticket has these sections, as headings in the issue body:
 5. The API reads the issue body at admission, which ADR 0187 did not allow.
    The sandbox read stays verbatim and unparsed.
 6. Dependent work no longer stacks on an unmerged prerequisite PR, and a
-   blocked ticket no longer waits and auto-admits. ADR 0165's `curie:blocked`
-   state, automatic admission when blockers clear, and stacked publication
-   need revision, or a superseding ADR, to match. A dependency graph now lands
+   blocked ticket no longer waits and auto-admits. Draft ADR 0165 is revised
+   to match: no `curie:blocked` state, no automatic admission when blockers
+   clear, and no stacked publication. A dependency graph now lands
    in merge order, and a person relabels each dependent once its blockers
    merge. That is slower for deep graphs. It is the cost of having no factory
    owned waiting stage.
@@ -455,7 +456,5 @@ implementable-ticket shape it describes:
    miss metric, and the issue template.
 9. Operator surface: the admission read in the CLI showing the verdict,
    reasons and unknown state, and the operator alert threshold.
-10. Revise ADR 0165 to drop the blocked waiting state and unmerged stacking,
-    or supersede it.
-11. A labelled admit and reject corpus to measure gate accuracy before and
+10. A labelled admit and reject corpus to measure gate accuracy before and
     after release.
