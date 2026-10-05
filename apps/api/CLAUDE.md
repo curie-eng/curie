@@ -102,8 +102,10 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   (`curie_internal.channel_read_ledger`), so revocation holds while the API is
   down and a dead worker's capability lapses within one lease. Every read
   repeats the generation, the grant (read locally from the agent's active
-  stored bundle manifest, cached by digest), the binding and Slack membership,
-  and Slack reads live only in `channel_read/slack_reads.py`. A turn may spend
+  stored bundle manifest, cached by digest), the binding and provider membership.
+  Authorization is surface neutral; a kind is readable only through a
+  `channel_read/readers.py` reader that advertises `history-read`, and Slack
+  reads live only in `channel_read/slack_reads.py`. A turn may spend
   8 pages, a window is at most 7 days, and `limit` defaults to 50 with a 100
   maximum. Refusals are named `channel_read.*` codes; a 429 carries
   `Retry-After`. It stores no message body. State, issue read

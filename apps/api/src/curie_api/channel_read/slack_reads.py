@@ -16,14 +16,16 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
+from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, slack_speaking_identity
+from channel_protocol import ChannelCapability
 
 from .errors import ChannelReadRefused
-from .window import ResolvedWindow, epoch_micros, from_epoch_micros
+from .readers import BindingRoute, ChannelMessage, ProviderPage
+from .window import Operation, ResolvedWindow, epoch_micros, from_epoch_micros
 
 SLACK_API = "https://slack.com/api/"
 TEXT_LIMIT = 4000
@@ -36,36 +38,8 @@ _NOT_MEMBER = frozenset({"not_in_channel", "channel_not_found"})
 _PERMALINK_BASES: dict[str, str] = {}
 
 
-@dataclass(frozen=True)
-class ChannelMessage:
-    id: str
-    thread_id: str | None
-    timestamp: str
-    author: str
-    text: str
-    truncated: bool
-    provenance: str
-    reply_count: int | None
-
-
 HISTORY_METHOD = "conversations.history"
 REPLIES_METHOD = "conversations.replies"
-
-
-@dataclass(frozen=True)
-class ProviderPage:
-    """One page, and how to continue it: Slack's own cursor, or, when Slack
-    says there is more but offers none, the ``boundary`` timestamp (epoch
-    microseconds) the next page stops before (history) or starts after (thread).
-    """
-
-    messages: list[ChannelMessage]
-    next_cursor: str | None = None
-    boundary: int | None = None
-
-    @property
-    def has_more(self) -> bool:
-        return self.next_cursor is not None or self.boundary is not None
 
 
 def provider_method(op: str, message_id: str | None) -> str:
@@ -125,9 +99,26 @@ def _retry_after(response: httpx.Response) -> int | None:
 
 
 class SlackChannelReader:
+    capabilities = frozenset({ChannelCapability.HISTORY_READ})
+
     def __init__(self, http: httpx.AsyncClient, tokens: Mapping[str, str]) -> None:
         self._http = http
         self._tokens = tokens
+
+    def identity(self, routes: list[BindingRoute]) -> str:
+        identities = sorted(
+            slack_speaking_identity(SLACK_KIND, r.adapter, r.endpoint) for r in routes
+        )
+        return DEFAULT_IDENTITY if DEFAULT_IDENTITY in identities else identities[0]
+
+    def rate_limit_key(self, op: Operation, message_id: str | None) -> str:
+        return provider_method(op, message_id)
+
+    def valid_thread_id(self, value: str) -> bool:
+        return valid_slack_ts(value)
+
+    def valid_message_id(self, value: str) -> bool:
+        return parse_message_id(value) is not None
 
     def has_identity(self, identity: str) -> bool:
         return bool(self._tokens.get(identity))
@@ -340,13 +331,14 @@ class SlackChannelReader:
         *,
         identity: str,
         channel: str,
-        thread_ts: str,
+        thread_id: str,
         window: ResolvedWindow,
         limit: int,
         cursor: str | None,
         boundary: int | None = None,
     ) -> ProviderPage:
         token = self._token(identity)
+        thread_ts = thread_id
         if boundary is not None:
             window = ResolvedWindow(from_epoch_micros(boundary), window.latest)
         # Slack counts the parent, always the first element, toward the
@@ -365,9 +357,7 @@ class SlackChannelReader:
                 scope="thread",
             )
             replies, seen = self._replies(body, thread_ts, window)
-            next_cursor, next_boundary = self._continuation(
-                body, seen, window, backwards=False
-            )
+            next_cursor, next_boundary = self._continuation(body, seen, window, backwards=False)
             stuck = (
                 not replies
                 and body.get("has_more") is True

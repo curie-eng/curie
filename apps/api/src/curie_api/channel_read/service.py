@@ -2,8 +2,10 @@
 
 The read repeats every authorization on every request, in a fixed order, and
 refuses with a named ``channel_read.*`` code before any provider call. The one
-refusal Slack decides is membership. Nothing here logs or stores a message
-body or the capability.
+refusal the provider decides is membership. Nothing here is specific to a
+surface: each readable kind is a ``readers.ChannelReader`` registered in
+``channel_readers``. Nothing here logs or stores a message body or the
+capability.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
-from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, slack_speaking_identity
+from aci_protocol.turn import SLACK_KIND
 from curie_internal.channel_read_ledger import turn_key
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +27,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .. import bundles
 from ..config import Settings
+from ..identities import slack_bot_tokens
 from ..models import AgentChannel, AgentVersion, Approval, Deployment
 from ..resumequeue import parse_resume_event_id
 from ..schemas.channel_read import (
@@ -39,13 +42,8 @@ from . import token as capability
 from .errors import ChannelReadRefused
 from .ledger import ChannelReadLedger
 from .provider_guard import ProviderGuard
-from .slack_reads import (
-    ProviderPage,
-    SlackChannelReader,
-    parse_message_id,
-    provider_method,
-    valid_slack_ts,
-)
+from .readers import BindingRoute, ChannelReader, ProviderPage, reader_for
+from .slack_reads import SlackChannelReader
 from .token import ChannelPair, ChannelReadClaims
 from .window import (
     CursorState,
@@ -59,6 +57,13 @@ from .window import (
 )
 
 MAX_RESUME_HOPS = 8
+
+
+def channel_readers(settings: Settings, http: httpx.AsyncClient) -> Mapping[str, ChannelReader]:
+    """Every readable surface, keyed by binding kind."""
+
+    return {SLACK_KIND: SlackChannelReader(http, slack_bot_tokens(settings))}
+
 
 # Whether a stored bundle grants channel read, keyed by its digest. The stored
 # object is write once, so the answer for a digest never changes.
@@ -203,7 +208,7 @@ async def mint_context(
 class _Binding:
     kind: str
     address: str
-    identity: str
+    routes: list[BindingRoute]
 
 
 async def _authorized_binding(
@@ -230,23 +235,24 @@ async def _authorized_binding(
     ).all()
     if not rows:
         raise ChannelReadRefused(403, "not_bound", "the agent is not bound to that channel")
-    identities = sorted(slack_speaking_identity(r.kind, r.adapter, r.endpoint) for r in rows)
-    identity = DEFAULT_IDENTITY if DEFAULT_IDENTITY in identities else identities[0]
-    return _Binding(kind=kind, address=address, identity=identity)
+    routes = [BindingRoute(adapter=r.adapter, endpoint=r.endpoint) for r in rows]
+    return _Binding(kind=kind, address=address, routes=routes)
 
 
 def _invalid_identifier(message: str) -> ChannelReadRefused:
     return ChannelReadRefused(422, "invalid_identifier", message)
 
 
-def _check_identifiers(op: Operation, thread_id: str | None, message_id: str | None) -> None:
+def _check_identifiers(
+    reader: ChannelReader, op: Operation, thread_id: str | None, message_id: str | None
+) -> None:
     if op == "thread":
-        if thread_id is None or not valid_slack_ts(thread_id):
-            raise _invalid_identifier("a thread read needs a thread_id timestamp")
+        if thread_id is None or not reader.valid_thread_id(thread_id):
+            raise _invalid_identifier("a thread read needs a thread_id")
     elif thread_id is not None:
         raise _invalid_identifier("thread_id belongs to a thread read only")
     if op == "message":
-        if message_id is None or parse_message_id(message_id) is None:
+        if message_id is None or not reader.valid_message_id(message_id):
             raise _invalid_identifier("a message read needs a message id")
     elif message_id is not None:
         raise _invalid_identifier("message_id belongs to a message read only")
@@ -264,6 +270,7 @@ class _Plan:
 
 
 def _plan(
+    reader: ChannelReader,
     body: ChannelReadRequest,
     claims: ChannelReadClaims,
     binding: _Binding,
@@ -289,7 +296,7 @@ def _plan(
             message_id=body.message_id,
         )
         limit = resolve_limit(state.op, body.limit) if body.limit is not None else state.limit
-        _check_identifiers(state.op, state.thread_id, None)
+        _check_identifiers(reader, state.op, state.thread_id, None)
         return _Plan(
             state.op,
             state.window,
@@ -306,17 +313,17 @@ def _plan(
     op = body.operation
     window = resolve_window(op, body.oldest, body.latest, now)
     limit = resolve_limit(op, body.limit)
-    _check_identifiers(op, body.thread_id, body.message_id)
+    _check_identifiers(reader, op, body.thread_id, body.message_id)
     return _Plan(op, window, limit, body.thread_id, body.message_id, None)
 
 
 async def _provider_read(
-    reader: SlackChannelReader, binding: _Binding, plan: _Plan
+    reader: ChannelReader, identity: str, binding: _Binding, plan: _Plan
 ) -> ProviderPage:
     if plan.op == "message":
         assert plan.message_id is not None
         found = await reader.message(
-            identity=binding.identity, channel=binding.address, message_id=plan.message_id
+            identity=identity, channel=binding.address, message_id=plan.message_id
         )
         if found is None:
             raise ChannelReadRefused(404, "message_not_found", "no such message in this channel")
@@ -325,16 +332,16 @@ async def _provider_read(
     if plan.op == "thread":
         assert plan.thread_id is not None
         return await reader.thread(
-            identity=binding.identity,
+            identity=identity,
             channel=binding.address,
-            thread_ts=plan.thread_id,
+            thread_id=plan.thread_id,
             window=plan.window,
             limit=plan.limit,
             cursor=plan.provider_cursor,
             boundary=plan.boundary,
         )
     return await reader.history(
-        identity=binding.identity,
+        identity=identity,
         channel=binding.address,
         window=plan.window,
         limit=plan.limit,
@@ -344,30 +351,31 @@ async def _provider_read(
 
 
 async def _guarded_provider_read(
-    reader: SlackChannelReader,
+    reader: ChannelReader,
     guard: ProviderGuard,
+    identity: str,
     binding: _Binding,
     plan: _Plan,
     claims: ChannelReadClaims,
 ) -> ProviderPage:
-    """Refuse a cooled down method or a spent attempt budget, then call Slack once."""
+    """Refuse a cooled down method or a spent attempt budget, then call the provider once."""
 
-    identity_key = reader.identity_key(binding.identity)
-    method = provider_method(plan.op, plan.message_id)
+    identity_key = reader.identity_key(identity)
+    method = reader.rate_limit_key(plan.op, plan.message_id)
     remaining = await guard.cooldown_remaining(identity_key, method)
     if remaining is not None:
         raise ChannelReadRefused(
             429,
             "provider_rate_limited",
-            "Slack is rate limiting reads; retry later",
+            "the provider is rate limiting reads; retry later",
             retry_after=remaining,
         )
     if not await guard.charge_attempt(claims.agent, claims.turn):
         raise ChannelReadRefused(
-            429, "attempt_budget_exhausted", "this turn has used its Slack read attempts"
+            429, "attempt_budget_exhausted", "this turn has used its provider read attempts"
         )
     try:
-        return await _provider_read(reader, binding, plan)
+        return await _provider_read(reader, identity, binding, plan)
     except ChannelReadRefused as refused:
         if refused.code == "channel_read.provider_rate_limited":
             await guard.cool_down(identity_key, method, refused.retry_after)
@@ -389,8 +397,7 @@ async def authorize_and_read(
     ledger: ChannelReadLedger,
     guard: ProviderGuard,
     settings: Settings,
-    http: httpx.AsyncClient,
-    tokens: Mapping[str, str],
+    readers: Mapping[str, ChannelReader],
     now: datetime,
 ) -> ChannelReadPage:
     if not await ledger.is_current(claims.agent, claims.turn, claims.gen):
@@ -399,22 +406,23 @@ async def authorize_and_read(
     if version is None or version.bundle_sha256 != claims.grant:
         raise ChannelReadRefused(409, "grant_revoked", "the deployment no longer grants this read")
     binding = await _authorized_binding(session, claims, body)
-    if binding.kind != SLACK_KIND:
+    reader = reader_for(readers, binding.kind)
+    if reader is None:
         raise ChannelReadRefused(
             409, "capability_unsupported", f"{binding.kind} channels cannot be read"
         )
-    reader = SlackChannelReader(http, tokens)
-    plan = _plan(body, claims, binding, api_key=settings.api_key, now=now)
-    if not reader.has_identity(binding.identity):
+    plan = _plan(reader, body, claims, binding, api_key=settings.api_key, now=now)
+    identity = reader.identity(binding.routes)
+    if not reader.has_identity(identity):
         raise ChannelReadRefused(
-            503, "provider_unconfigured", "no Slack credential serves this binding"
+            503, "provider_unconfigured", "no provider credential serves this binding"
         )
     reservation = await ledger.reserve(claims.agent, claims.turn, claims.gen)
     if reservation != "reserved":
         status, code, message = _RESERVE_REFUSALS[reservation]
         raise ChannelReadRefused(status, code, message)
     try:
-        page = await _guarded_provider_read(reader, guard, binding, plan, claims)
+        page = await _guarded_provider_read(reader, guard, identity, binding, plan, claims)
     except BaseException:
         await ledger.release(claims.agent, claims.turn)
         raise

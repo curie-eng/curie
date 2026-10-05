@@ -1,15 +1,15 @@
-"""Limits on calls to Slack itself, apart from the page budget (ADR 0100).
+"""Limits on calls to the provider itself, apart from the page budget (ADR 0100).
 
 Two pieces of API owned Valkey state, beside the shared ledger but in their
 own ``api`` namespace:
 
-1. A per logical turn attempt count. Every read that reaches Slack spends one,
-   whether it succeeds or not, so a turn that keeps failing (a missing
-   message, a refused channel) cannot call Slack without bound even though
+1. A per logical turn attempt count. Every read that reaches the provider
+   spends one, whether it succeeds or not, so a turn that keeps failing (a
+   missing message, a refused channel) cannot call it without bound even though
    failures give their page back.
-2. A cooldown per bot credential and Slack method, set from ``Retry-After``.
+2. A cooldown per credential and provider method, set from ``Retry-After``.
    It is shared by every agent the credential serves, so one turn's 429 stops
-   all of them from calling that method until Slack's window passes.
+   all of them from calling that method until the provider's window passes.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from redis.exceptions import RedisError
 from .ledger import LedgerUnavailable
 
 MAX_PROVIDER_ATTEMPTS_PER_TURN: Final[int] = 24
-# Applied when Slack rate limits without saying for how long.
+# Applied when the provider rate limits without saying for how long.
 DEFAULT_COOLDOWN_S: Final[int] = 30
 
 # KEYS: attempts. ARGV: cap, ttl. Returns 1 when an attempt was taken.

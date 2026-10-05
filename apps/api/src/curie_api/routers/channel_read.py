@@ -21,11 +21,10 @@ from ..auth import require_internal_worker_token
 from ..channel_read.errors import ChannelReadRefused
 from ..channel_read.ledger import ChannelReadLedger, LedgerUnavailable
 from ..channel_read.provider_guard import ProviderGuard
-from ..channel_read.service import authorize_and_read, mint_context
+from ..channel_read.service import authorize_and_read, channel_readers, mint_context
 from ..channel_read.token import ChannelReadClaims, verify_claims
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
-from ..identities import slack_bot_tokens
 
 _LOG = logging.getLogger(__name__)
 
@@ -85,13 +84,13 @@ _REFUSALS: dict[int | str, dict[str, Any]] = {
     for status, description in (
         (400, "No channel named and no default channel"),
         (401, "Missing or invalid channel read capability"),
-        (403, "Channel not bound, or the Slack app is not a member"),
+        (403, "Channel not bound, or the app is not a member"),
         (404, "Message or thread not found in the channel"),
         (409, "Turn inactive or expired, grant revoked, or kind unsupported"),
         (422, "Invalid window, limit, identifier, cursor or body"),
-        (429, "Page or attempt budget exhausted, or Slack rate limited"),
-        (502, "Slack returned an error"),
-        (503, "Ledger unavailable or no Slack credential"),
+        (429, "Page or attempt budget exhausted, or the provider rate limited"),
+        (502, "The provider returned an error"),
+        (503, "Ledger unavailable or no provider credential"),
     )
 }
 
@@ -157,8 +156,7 @@ async def read_channel(
             ledger=_ledger(request),
             guard=ProviderGuard(request.app.state.valkey, settings.worker_key_prefix),
             settings=settings,
-            http=request.app.state.http_client,
-            tokens=slack_bot_tokens(settings),
+            readers=channel_readers(settings, request.app.state.http_client),
             now=datetime.now(UTC),
         )
     except ChannelReadRefused as refused:
