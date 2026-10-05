@@ -88,7 +88,7 @@ from .tool_access import (
     TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
     TurnToolAccess,
 )
-from .tool_names import CHANNEL_READ_TOOL_NAMES
+from .tool_names import PLATFORM_SLACK_TOOL_NAMES
 from .translate import TurnState, translate_message
 from .turn_progress import ProgressCapability, TurnProgress
 from .usage_report import UsageSink
@@ -157,9 +157,9 @@ PUBLICATION_UNRECORDED_CLASSIFICATION = "publication-unrecorded"
 # Exact membership, as ``is_platform_owned_tool`` decides it (#2286), but over
 # the maximal set: a telemetry label grants nothing, so a ``curie-state`` name
 # counts as platform whether or not this session mounted that server.
-# The channel read tools (ADR 0100) join this label set only: they are
-# governed by toolPolicy and never exempt, and this label grants nothing.
-_PLATFORM_TOOL_NAMES = platform_tool_names(state_server_mounted=True) | CHANNEL_READ_TOOL_NAMES
+# The curie-slack tools (ADR 0100, ADR 0200) join this label set only: they
+# are governed by toolPolicy and never exempt, and this label grants nothing.
+_PLATFORM_TOOL_NAMES = platform_tool_names(state_server_mounted=True) | PLATFORM_SLACK_TOOL_NAMES
 
 
 def _tool_result_origin(tool_name: str) -> str:
@@ -1481,14 +1481,14 @@ class SessionRunner:
     def _retain_no_channel_bodies(
         message: ConversationMessage, state: TurnState
     ) -> ConversationMessage:
-        """Stub channel read results in the portable record (ADR 0100 section 7)."""
+        """Stub channel read and canvas results in the portable record (ADR 0100 section 7)."""
 
         if message.role == "assistant" and isinstance(message.content, list):
             state.channel_read_call_ids.update(
                 str(block["id"])
                 for block in message.content
                 if block.get("type") == "tool_use"
-                and block.get("name") in CHANNEL_READ_TOOL_NAMES
+                and block.get("name") in PLATFORM_SLACK_TOOL_NAMES
                 and isinstance(block.get("id"), str)
             )
             return message

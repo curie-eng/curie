@@ -21,6 +21,7 @@ from plugin_format import (
     DEFAULT_MAX_MEMBERS,
     DEFAULT_MAX_UNCOMPRESSED_BYTES,
     MANIFEST_LOCATIONS,
+    PLATFORM_SLACK_GRANT_FIELDS,
     TOOL_POLICY_ENFORCEMENT,
     ApprovalPolicy,
     PluginManifest,
@@ -334,10 +335,14 @@ def _manifest_object(root: Path) -> dict[str, Any]:
     return {}
 
 
-def declared_channel_read(root: Path) -> bool:
-    """Whether the bundle grants channel read (ADR 0100); only a literal true does."""
+def declared_platform_slack_grants(root: Path) -> frozenset[str]:
+    """The platform Slack grants the bundle declares (ADR 0100, ADR 0200).
 
-    return _manifest_object(root).get("channelRead") is True
+    Only a literal true grants.
+    """
+
+    manifest = _manifest_object(root)
+    return frozenset(name for name in PLATFORM_SLACK_GRANT_FIELDS if manifest.get(name) is True)
 
 
 def approval_tool_patterns(root: Path, agent_tools: list[str] | None) -> tuple[str, ...]:

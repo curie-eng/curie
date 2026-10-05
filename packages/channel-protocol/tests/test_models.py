@@ -60,3 +60,26 @@ def test_history_read_capability_round_trips() -> None:
     assert ChannelCapabilities.model_validate_json(
         '{"version": "1.0", "capabilities": ["history-read", "threading"]}'
     ).capabilities == [ChannelCapability.HISTORY_READ, ChannelCapability.THREADING]
+
+
+@pytest.mark.parametrize(
+    ("wire", "member"),
+    [
+        ("canvas-read", ChannelCapability.CANVAS_READ),
+        ("canvas-edit", ChannelCapability.CANVAS_EDIT),
+    ],
+)
+def test_canvas_capabilities_round_trip(wire: str, member: ChannelCapability) -> None:
+    # ADR 0200: an adapter that can list and read canvases advertises
+    # canvas-read, one that can replace a cell advertises canvas-edit, and an
+    # adapter without canvases advertises neither.
+    advertised = ChannelCapabilities(version="1.0", capabilities=[ChannelCapability(wire)])
+    decoded = ChannelCapabilities.model_validate_json(advertised.model_dump_json())
+    assert decoded.capabilities == [member]
+    assert member.value == wire
+    assert ChannelCapabilities.model_validate_json(
+        f'{{"version": "1.0", "capabilities": ["history-read", "{wire}"]}}'
+    ).capabilities == [ChannelCapability.HISTORY_READ, member]
+    assert ChannelCapabilities.model_validate_json(
+        '{"version": "1.0", "capabilities": ["history-read"]}'
+    ).capabilities == [ChannelCapability.HISTORY_READ]

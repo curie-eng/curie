@@ -54,7 +54,9 @@
         "rich-cards",
         "threading",
         "file-attachments",
-        "history-read"
+        "history-read",
+        "canvas-read",
+        "canvas-edit"
       ],
       "title": "ChannelCapability",
       "type": "string"

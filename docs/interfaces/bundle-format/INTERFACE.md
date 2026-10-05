@@ -432,7 +432,12 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   sees, among them `channel_read.not_bound`, `channel_read.grant_revoked`,
   `channel_read.turn_inactive`, `channel_read.window_too_wide`,
   `channel_read.limit_invalid`, `channel_read.page_budget_exhausted` and
-  `channel_read.provider_rate_limited`. A granted turn on a runner that cannot
+  `channel_read.provider_rate_limited`. Three canvas tools share the server, each
+  present only with its own grant: `list_channel_canvases` (`canvasList`),
+  `read_canvas` (`canvasRead`) and `edit_canvas_cell` (`canvasEdit`). Each costs
+  one of the 8 pages, an edit is limited to one existing table cell whose section
+  id a read returned in the same logical turn, and every edit is audited
+  (ADR 0200). A granted turn on a runner that cannot
   enforce the grant is refused with `channel-read-unenforced`. The runtime exempts
   only exact platform tool names published by the existing two servers through
   `runner/src/curie_runner/approval.py::is_platform_owned_tool` before

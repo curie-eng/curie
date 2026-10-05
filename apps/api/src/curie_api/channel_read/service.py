@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import httpx
 from aci_protocol.turn import SLACK_KIND
@@ -36,6 +37,7 @@ from ..schemas.channel_read import (
     ChannelReadMessage,
     ChannelReadPage,
     ChannelReadRequest,
+    ChannelSelector,
 )
 from ..storage import ObjectStore
 from . import token as capability
@@ -44,7 +46,7 @@ from .ledger import ChannelReadLedger
 from .provider_guard import ProviderGuard
 from .readers import BindingRoute, ChannelReader, ProviderPage, reader_for
 from .slack_reads import SlackChannelReader
-from .token import ChannelPair, ChannelReadClaims
+from .token import ChannelPair, ChannelReadClaims, GrantName
 from .window import (
     CursorState,
     Operation,
@@ -57,6 +59,7 @@ from .window import (
 )
 
 MAX_RESUME_HOPS = 8
+_NO_GRANT = "the bundle grants no channel read or canvas operation"
 
 
 def channel_readers(settings: Settings, http: httpx.AsyncClient) -> Mapping[str, ChannelReader]:
@@ -65,9 +68,9 @@ def channel_readers(settings: Settings, http: httpx.AsyncClient) -> Mapping[str,
     return {SLACK_KIND: SlackChannelReader(http, slack_bot_tokens(settings))}
 
 
-# Whether a stored bundle grants channel read, keyed by its digest. The stored
-# object is write once, so the answer for a digest never changes.
-_GRANTS: dict[str, bool] = {}
+# The platform Slack grants a stored bundle declares, keyed by its digest. The
+# stored object is write once, so the answer for a digest never changes.
+_GRANTS: dict[str, frozenset[str]] = {}
 
 
 @dataclass(frozen=True)
@@ -98,7 +101,7 @@ async def resolve_logical_turn(
     return LogicalTurn(turn=turn, hops=hops)
 
 
-def _declares_grant(data: bytes, settings: Settings) -> bool:
+def _declares_grant(data: bytes, settings: Settings) -> frozenset[str]:
     with tempfile.TemporaryDirectory() as tmp:
         dest = Path(tmp)
         bundles.extract_stored_bundle(
@@ -108,7 +111,7 @@ def _declares_grant(data: bytes, settings: Settings) -> bool:
             max_compression_ratio=settings.bundle_max_compression_ratio,
             max_members=settings.bundle_max_members,
         )
-        return bundles.declared_channel_read(dest)
+        return bundles.declared_platform_slack_grants(dest)
 
 
 async def _active_version(
@@ -127,8 +130,10 @@ async def read_grant(
     *,
     agent_id: uuid.UUID,
     deployment_id: uuid.UUID,
-) -> str:
-    """The granted bundle's digest for the agent's active deployment."""
+) -> tuple[str, frozenset[str]]:
+    """The granted bundle's digest for the agent's active deployment, and the
+    platform Slack grants it declares (ADR 0100, ADR 0200). A bundle that
+    declares none of them gets no capability."""
 
     version = await _active_version(session, agent_id=agent_id, deployment_id=deployment_id)
     if version is None:
@@ -137,15 +142,15 @@ async def read_grant(
         )
     digest = version.bundle_sha256
     if digest is None or version.bundle_ref is None:
-        raise ChannelReadRefused(409, "grant_absent", "the bundle does not grant channel read")
+        raise ChannelReadRefused(409, "grant_absent", _NO_GRANT)
     granted = _GRANTS.get(digest)
     if granted is None:
         data = await store.get(version.bundle_ref)
         granted = await run_in_threadpool(_declares_grant, data, settings)
         _GRANTS[digest] = granted
     if not granted:
-        raise ChannelReadRefused(409, "grant_absent", "the bundle does not grant channel read")
-    return digest
+        raise ChannelReadRefused(409, "grant_absent", _NO_GRANT)
+    return digest, granted
 
 
 async def mint_context(
@@ -156,7 +161,7 @@ async def mint_context(
     store: ObjectStore,
     settings: Settings,
 ) -> ChannelReadContext:
-    grant = await read_grant(
+    grant, grants = await read_grant(
         session, store, settings, agent_id=data.agent_id, deployment_id=data.deployment_id
     )
     logical = await resolve_logical_turn(session, data.agent_id, data.event_id)
@@ -190,6 +195,7 @@ async def mint_context(
         agent=data.agent_id,
         deployment=data.deployment_id,
         grant=grant,
+        grants=tuple(cast("list[GrantName]", sorted(grants))),
         turn=logical.turn,
         gen=gen,
         default=default,
@@ -205,19 +211,21 @@ async def mint_context(
 
 
 @dataclass(frozen=True)
-class _Binding:
+class AuthorizedBinding:
     kind: str
     address: str
     routes: list[BindingRoute]
 
 
-async def _authorized_binding(
-    session: AsyncSession, claims: ChannelReadClaims, body: ChannelReadRequest
-) -> _Binding:
-    if body.channel is not None:
-        if body.channel.kind is None:
+async def authorized_binding(
+    session: AsyncSession, claims: ChannelReadClaims, channel: ChannelSelector | None
+) -> AuthorizedBinding:
+    """The named channel, else the turn's default, as one of the agent's bindings."""
+
+    if channel is not None:
+        if channel.kind is None:
             raise ChannelReadRefused(400, "channel_required", "name a channel by kind and address")
-        kind, address = body.channel.kind, body.channel.address
+        kind, address = channel.kind, channel.address
     elif claims.default is not None:
         kind, address = claims.default.kind, claims.default.address
     else:
@@ -236,7 +244,7 @@ async def _authorized_binding(
     if not rows:
         raise ChannelReadRefused(403, "not_bound", "the agent is not bound to that channel")
     routes = [BindingRoute(adapter=r.adapter, endpoint=r.endpoint) for r in rows]
-    return _Binding(kind=kind, address=address, routes=routes)
+    return AuthorizedBinding(kind=kind, address=address, routes=routes)
 
 
 def _invalid_identifier(message: str) -> ChannelReadRefused:
@@ -273,7 +281,7 @@ def _plan(
     reader: ChannelReader,
     body: ChannelReadRequest,
     claims: ChannelReadClaims,
-    binding: _Binding,
+    binding: AuthorizedBinding,
     *,
     api_key: str,
     now: datetime,
@@ -318,7 +326,7 @@ def _plan(
 
 
 async def _provider_read(
-    reader: ChannelReader, identity: str, binding: _Binding, plan: _Plan
+    reader: ChannelReader, identity: str, binding: AuthorizedBinding, plan: _Plan
 ) -> ProviderPage:
     if plan.op == "message":
         assert plan.message_id is not None
@@ -354,7 +362,7 @@ async def _guarded_provider_read(
     reader: ChannelReader,
     guard: ProviderGuard,
     identity: str,
-    binding: _Binding,
+    binding: AuthorizedBinding,
     plan: _Plan,
     claims: ChannelReadClaims,
 ) -> ProviderPage:
@@ -389,6 +397,28 @@ _RESERVE_REFUSALS: Mapping[str, tuple[int, str, str]] = {
 }
 
 
+async def check_authority(
+    session: AsyncSession, ledger: ChannelReadLedger, claims: ChannelReadClaims
+) -> None:
+    """The turn's generation is current and the active deployment still grants
+    the digest the capability names."""
+
+    if not await ledger.is_current(claims.agent, claims.turn, claims.gen):
+        raise ChannelReadRefused(409, "turn_inactive", "the turn's capability is no longer current")
+    version = await _active_version(session, agent_id=claims.agent, deployment_id=claims.deployment)
+    if version is None or version.bundle_sha256 != claims.grant:
+        raise ChannelReadRefused(409, "grant_revoked", "the deployment no longer grants this read")
+
+
+async def reserve_page(ledger: ChannelReadLedger, claims: ChannelReadClaims) -> None:
+    """Reserve one of the turn's pages, or refuse by the ledger's reason."""
+
+    reservation = await ledger.reserve(claims.agent, claims.turn, claims.gen)
+    if reservation != "reserved":
+        status, code, message = _RESERVE_REFUSALS[reservation]
+        raise ChannelReadRefused(status, code, message)
+
+
 async def authorize_and_read(
     *,
     claims: ChannelReadClaims,
@@ -400,12 +430,12 @@ async def authorize_and_read(
     readers: Mapping[str, ChannelReader],
     now: datetime,
 ) -> ChannelReadPage:
-    if not await ledger.is_current(claims.agent, claims.turn, claims.gen):
-        raise ChannelReadRefused(409, "turn_inactive", "the turn's capability is no longer current")
-    version = await _active_version(session, agent_id=claims.agent, deployment_id=claims.deployment)
-    if version is None or version.bundle_sha256 != claims.grant:
-        raise ChannelReadRefused(409, "grant_revoked", "the deployment no longer grants this read")
-    binding = await _authorized_binding(session, claims, body)
+    await check_authority(session, ledger, claims)
+    if "channelRead" not in claims.grants:
+        raise ChannelReadRefused(
+            403, "history_not_granted", "the bundle does not grant channel history reads"
+        )
+    binding = await authorized_binding(session, claims, body.channel)
     reader = reader_for(readers, binding.kind)
     if reader is None:
         raise ChannelReadRefused(
@@ -417,10 +447,7 @@ async def authorize_and_read(
         raise ChannelReadRefused(
             503, "provider_unconfigured", "no provider credential serves this binding"
         )
-    reservation = await ledger.reserve(claims.agent, claims.turn, claims.gen)
-    if reservation != "reserved":
-        status, code, message = _RESERVE_REFUSALS[reservation]
-        raise ChannelReadRefused(status, code, message)
+    await reserve_page(ledger, claims)
     try:
         page = await _guarded_provider_read(reader, guard, identity, binding, plan, claims)
     except BaseException:

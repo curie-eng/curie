@@ -96,6 +96,8 @@ _TURN_EPOCH_HEADER = "X-Curie-Turn-Epoch"
 _EVENT_FRAME = {"kind": "event", "type": "message", "text": "hi", "user": "U0EXAMPLE1", "ts": "1"}
 _STEER_FRAME = {**_EVENT_FRAME, "text": "and then", "ts": "2"}
 _OMIT = object()
+# The history-only grant: its catalogue is unchanged by the canvas tools (ADR 0200).
+_HISTORY_ONLY = frozenset({"channelRead"})
 
 
 # --- Capabilities, the platform route double, and the tool call the SDK makes ---
@@ -205,7 +207,7 @@ async def _served(
         turn = ChannelReadTurn(trusted_origin=_origin(server))
         if capability:
             turn.begin(_event({"url": _url(server), "token": token or _token()}))
-        yield server, turn, build_channel_read_server(turn)["instance"]
+        yield server, turn, build_channel_read_server(turn, _HISTORY_ONLY)["instance"]
 
 
 def _read_once(api: _ChannelApi, case: Any = TOOL_CASES[0], token: Any = None) -> dict[str, Any]:
@@ -568,7 +570,9 @@ def test_reads_are_not_side_effects_and_take_no_credential_argument() -> None:
     assert not any(classifier.is_side_effecting(name) for name in LIVE_NAMES)
 
     async def listed() -> list[dict[str, Any]]:
-        server = build_channel_read_server(ChannelReadTurn(trusted_origin=("http", "h", 8080)))
+        server = build_channel_read_server(
+            ChannelReadTurn(trusted_origin=("http", "h", 8080)), _HISTORY_ONLY
+        )
         entry = server["instance"].get_request_handler("tools/list")
         assert entry is not None
         result = await entry.handler(None, mcp_types.PaginatedRequestParams())
@@ -735,7 +739,9 @@ def test_the_token_stays_out_of_repr_and_logs(caplog: pytest.LogCaptureFixture) 
         turn = ChannelReadTurn(trusted_origin=("http", "127.0.0.1", port))
         turn.begin(_event({"url": f"http://127.0.0.1:{port}/channel-read", "token": _token()}))
         failed = await _call_server(
-            build_channel_read_server(turn)["instance"], "read_channel_history", HISTORY_ARGS
+            build_channel_read_server(turn, _HISTORY_ONLY)["instance"],
+            "read_channel_history",
+            HISTORY_ARGS,
         )
         _assert_refused(failed, "channel_read.unavailable")
         assert str(port) not in failed["text"]  # the endpoint is not disclosed either

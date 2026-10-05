@@ -35,15 +35,15 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     catalog = json.loads((ROOT / "cli/src/application_schema_windows.json").read_text())
     released = {"schema_min": "0070", "schema_head": "0073"}
     stable = {"schema_min": "0076", "schema_head": "0076"}
-    # The candidate keeps moving as later migrations land (#2909 added 0078);
+    # The candidate keeps moving as later migrations land (#2909 added 0078, #3819 added 0079);
     # the point of this test is that `released`/`stable` above never do.
-    candidate = {"schema_min": "0077", "schema_head": "0078"}
+    candidate = {"schema_min": "0077", "schema_head": "0079"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == candidate
-    assert catalog["revisions"][-4:] == ["0075", "0076", "0077", "0078"]
+    assert catalog["revisions"][-4:] == ["0076", "0077", "0078", "0079"]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(
         (Path(__file__).parent / "fixtures/source_schema_prior_windows.json").read_text()

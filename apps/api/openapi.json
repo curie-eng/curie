@@ -3010,6 +3010,119 @@
         "title": "CancelBody",
         "type": "object"
       },
+      "CanvasCell": {
+        "description": "One table cell. ``section_id`` is set only when the cell is editable.",
+        "properties": {
+          "section_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Section Id"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "section_id",
+          "text",
+          "truncated"
+        ],
+        "title": "CanvasCell",
+        "type": "object"
+      },
+      "CanvasParagraph": {
+        "description": "Text outside any table; its ``section_id`` is informational, never editable.",
+        "properties": {
+          "section_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Section Id"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "section_id",
+          "text",
+          "truncated"
+        ],
+        "title": "CanvasParagraph",
+        "type": "object"
+      },
+      "CanvasSummary": {
+        "properties": {
+          "created": {
+            "title": "Created",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "created"
+        ],
+        "title": "CanvasSummary",
+        "type": "object"
+      },
+      "CanvasTable": {
+        "description": "A table by position: the first row is the header, the rest are rows.",
+        "properties": {
+          "header": {
+            "items": {
+              "$ref": "#/components/schemas/CanvasCell"
+            },
+            "title": "Header",
+            "type": "array"
+          },
+          "rows": {
+            "items": {
+              "items": {
+                "$ref": "#/components/schemas/CanvasCell"
+              },
+              "type": "array"
+            },
+            "title": "Rows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "header",
+          "rows"
+        ],
+        "title": "CanvasTable",
+        "type": "object"
+      },
       "ChannelAddress": {
         "additionalProperties": false,
         "properties": {
@@ -3185,6 +3298,200 @@
           "allowed_callers"
         ],
         "title": "ChannelCallersWrite",
+        "type": "object"
+      },
+      "ChannelCanvasRequest": {
+        "additionalProperties": false,
+        "description": "One canvas list, read or cell edit on a bound surface (ADR 0200).\n\nWhich fields an operation takes is checked by the service, so a misplaced\none is refused by name: ``channel`` for a list; ``kind`` and ``canvas_id``\nfor a read; those plus ``section_id`` and ``text`` for an edit.",
+        "properties": {
+          "canvas_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canvas Id"
+          },
+          "channel": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChannelSelector"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "operation": {
+            "enum": [
+              "list",
+              "read",
+              "edit"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "section_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Section Id"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "title": "ChannelCanvasRequest",
+        "type": "object"
+      },
+      "ChannelCanvasResult": {
+        "properties": {
+          "canvas_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canvas Id"
+          },
+          "canvases": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CanvasSummary"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canvases"
+          },
+          "edited": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Edited"
+          },
+          "has_more": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Has More"
+          },
+          "operation": {
+            "enum": [
+              "list",
+              "read",
+              "edit"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "paragraphs": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CanvasParagraph"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Paragraphs"
+          },
+          "section_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Section Id"
+          },
+          "tables": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CanvasTable"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tables"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "title": "ChannelCanvasResult",
         "type": "object"
       },
       "ChannelIdentityCreate": {
@@ -14531,6 +14838,82 @@
         "summary": "Resolve Approval",
         "tags": [
           "approvals"
+        ]
+      }
+    },
+    "/channel-canvas": {
+      "post": {
+        "operationId": "channel_canvas_channel_canvas_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Channel-Read",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Channel-Read"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelCanvasRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelCanvasResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "No channel or kind named and no default channel"
+          },
+          "401": {
+            "description": "Missing or invalid channel read capability"
+          },
+          "403": {
+            "description": "Operation not granted, channel or kind not bound, canvas not shared into a bound channel, the app is not a member, or the provider refused the edit"
+          },
+          "404": {
+            "description": "Canvas not found"
+          },
+          "409": {
+            "description": "Turn inactive or expired, grant revoked, kind unsupported, section not read this turn or no longer editable, or the canvas is too large"
+          },
+          "422": {
+            "description": "Invalid identifier, cell text, misplaced field, body, or not a canvas"
+          },
+          "429": {
+            "description": "Page or attempt budget exhausted, or the provider rate limited"
+          },
+          "502": {
+            "description": "The provider returned an error, the canvas was unreadable, or the edit outcome is unknown"
+          },
+          "503": {
+            "description": "Ledger unavailable, no provider credential, or a provider scope missing"
+          }
+        },
+        "summary": "Channel Canvas",
+        "tags": [
+          "channel-read"
         ]
       }
     },

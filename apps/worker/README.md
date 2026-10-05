@@ -103,8 +103,9 @@ queued turn whose `tool_access` is set (a canary sets `read-only`):
   classes: a turn the runner refuses escalates under its class, never as
   `unclassified`.
 
-The worker's half of channel read (ADR 0100, `kernel/channel_read.py`), for a
-bundle whose manifest grants `channelRead: true`. The worker is the only issuer
+The worker's half of channel read (ADR 0100, ADR 0200, `kernel/channel_read.py`),
+for a bundle whose manifest grants any of `channelRead`, `canvasList`,
+`canvasRead` or `canvasEdit`. The worker is the only issuer
 of the capability the runner's `curie-slack` tools use:
 
 - **WORKER-CHANNEL-READ-1:** At turn open, on every path that opens a turn (a

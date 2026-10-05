@@ -45,11 +45,18 @@ PostgreSQL 16:
 - **Migrations**: the target DB must apply the **whole Alembic chain in `apps/api/alembic/versions/`**, in revision order, ending at `alembic heads`. The chain grows with the product, so it is deliberately not enumerated here: `ls apps/api/alembic/versions/` is the list, and `alembic heads` is the tip a conforming DB must reach. A single head is the invariant — a fork means two branches each added a migration (rebase and merge the heads before swapping anything). Two recent expand revisions make authenticated review feedback part of this schema contract: `0042_review_lineage_authority.py` adds immutable App-observed authority to publication lineages and the `publication_review_reservations` concurrency table; `0043_github_review_feedback.py` adds the `github_review_deliveries` audit table and the `github_review_feedback` durable feedback/outbox table. The latter stores normalized feedback and a credential-free queued turn, never a raw webhook body or GitHub credential.
 
 The application schema window keeps minimum `0077` and advances its head to
-`0078`, as recorded in `apps/api/src/curie_api/schema_compat.json`. The
+`0079`, as recorded in `apps/api/src/curie_api/schema_compat.json`. The
 v0.12.1 release raised the minimum to `0077` (`0077_agent_deploy_notifications.py`,
 following hook source policy/operation expansions `0075`/`0076`, which in turn
 follow polling cursor migration `0073`). Provider installations and channel
-identities migration `0078` follows it.
+identities migration `0078` follows it, and channel canvas edits migration
+`0079` follows that.
+
+The `channel_canvas_edits` table (`apps/api/src/curie_api/models.py::ChannelCanvasEdit`,
+migration `0079_channel_canvas_edits.py`, ADR 0200) holds one audit row per canvas cell
+edit. Each row records the agent, deployment, logical turn, edit kind, channel address,
+canvas id, section id, the before and after text, a status of `attempted`, `applied` or
+`failed`, an error code, and timestamps, and is indexed on (`canvas_id`, `created_at`).
 
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,

@@ -383,6 +383,7 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channel-canvas",
           "/channel-read",
           "/channels/admission",
           "/channels/token",
@@ -482,7 +483,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 992,
+      "cardinality_bound": 1000,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -534,6 +535,7 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channel-canvas",
           "/channel-read",
           "/channels/admission",
           "/channels/token",
@@ -640,7 +642,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 4960,
+      "cardinality_bound": 5000,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -692,6 +694,7 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channel-canvas",
           "/channel-read",
           "/channels/admission",
           "/channels/token",
@@ -798,7 +801,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 4960,
+      "cardinality_bound": 5000,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

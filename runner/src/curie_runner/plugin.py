@@ -144,25 +144,26 @@ def load_bundle_web_search_enabled(plugin_dir: str | None) -> bool:
     return enabled
 
 
-def load_bundle_channel_read(plugin_dir: str | None) -> bool:
-    """Whether the bundle manifest grants channel read (ADR 0100, #2877).
+def load_bundle_platform_slack_grants(plugin_dir: str | None) -> frozenset[str]:
+    """The platform Slack grants the bundle manifest holds (ADR 0100, ADR 0200).
 
-    The grant is ``channelRead: true`` and defaults off. Any manifest this
-    reader cannot parse grants nothing; ``load_plugins`` is the gate that
-    refuses such a bundle at startup.
+    The grants are ``channelRead``, ``canvasList``, ``canvasRead`` and
+    ``canvasEdit``; each is held only as a literal ``true`` and defaults off.
+    Any manifest this reader cannot parse grants nothing; ``load_plugins`` is
+    the gate that refuses such a bundle at startup.
     """
 
     if not plugin_dir:
-        return False
+        return frozenset()
     manifest_path = resolve_manifest(plugin_dir)
     if manifest_path is None:
-        return False
+        return frozenset()
     try:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest = PluginManifest.model_validate(data)
     except (json.JSONDecodeError, ValueError, OSError):
-        return False
-    return manifest.channelRead is True
+        return frozenset()
+    return manifest.platform_slack_grants()
 
 
 def load_bundle_system_prompt(plugin_dir: str | None) -> str | None:

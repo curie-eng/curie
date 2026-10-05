@@ -18,6 +18,10 @@ class ChannelCapability(StrEnum):
     THREADING = "threading"
     FILE_ATTACHMENTS = "file-attachments"
     HISTORY_READ = "history-read"
+    # ADR 0200: list and read canvases shared into a bound channel.
+    CANVAS_READ = "canvas-read"
+    # ADR 0200: replace the text of one existing canvas table cell.
+    CANVAS_EDIT = "canvas-edit"
 
 
 class ChannelCapabilities(BaseModel):
