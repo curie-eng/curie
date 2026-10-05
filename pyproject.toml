@@ -220,6 +220,7 @@ testpaths = [
     "packages/protected-hooks/tests",
     "tools/wire-tolerance-gate/tests",
     "tools/ci-retry-gate/tests",
+    "tools/dependency-audit-paths/tests",
     "tools/ci-workflow-paths/tests",
     "tools/e2e-ci-selection/tests",
     "tools/helm-ci-gate/tests",
