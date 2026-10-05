@@ -1597,7 +1597,7 @@ def test_hook_run_reason_budget_exhausted(sync_redis: redis.Redis, names: dict[s
 def test_hook_run_reason_target_unbound(sync_redis: redis.Redis, names: dict[str, str]) -> None:
     async def body() -> None:
         async with _seed() as seed:
-            unbound = "C0NOTBOUND1"
+            unbound = "C0EXAMPLE9"
             await _pass_once(seed, names["stream"], _trigger(seed, target=unbound))
             assert await _hook_run_reason(seed, seed.slot) == ("failed", "target_unbound")
 

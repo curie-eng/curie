@@ -394,7 +394,7 @@ def test_spent_budget_records_blocked_budget_exhausted(
 def test_unbound_target_records_failed_target_unbound(
     tmp_path: Any, client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    root = _bundle(tmp_path, [{**_cron("nightly-cleanup", "0 9 * * *"), "target": "C0NOTBOUND1"}])
+    root = _bundle(tmp_path, [{**_cron("nightly-cleanup", "0 9 * * *"), "target": "C0EXAMPLE9"}])
     agent_id, version_id = _publish(
         client, auth_headers, _archive(root), "acme-fire-unbound", channel="C0EXAMPLE1"
     )
