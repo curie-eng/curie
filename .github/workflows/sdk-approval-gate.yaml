@@ -168,7 +168,7 @@ jobs:
       # this job runs sealed and green forever while proving nothing about
       # #1852/#2068.
       - name: Record a build failure
-        if: ${{ steps.cli-build.outcome == 'failure' || steps.build-runner.outcome == 'failure' }}
+        if: ${{ failure() && (steps.cli-build.outcome == 'failure' || steps.build-runner.outcome == 'failure') }}
         run: echo build-failed >> "$GITHUB_STEP_SUMMARY"
       - name: Live approval-gate ladder case (skill rung)
         id: ladder
@@ -181,5 +181,5 @@ jobs:
           CURIE_MODEL: z-ai/glm-5.2
         run: bash cli/scripts/e2e-ladder.sh
       - name: Record a test failure
-        if: steps.ladder.outcome == 'failure'
+        if: ${{ failure() && steps.ladder.outcome == 'failure' }}
         run: echo test-failed >> "$GITHUB_STEP_SUMMARY"

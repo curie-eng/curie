@@ -55,7 +55,7 @@ jobs:
         id: cli-build
         run: cargo build --release --locked
       - name: Record a build failure
-        if: steps.cli-build.outcome == 'failure'
+        if: ${{ failure() && steps.cli-build.outcome == 'failure' }}
         run: echo build-failed >> "$GITHUB_STEP_SUMMARY"
       - name: Upload curie binary
         uses: actions/upload-artifact@v7
@@ -185,7 +185,7 @@ jobs:
       # No CURIE_E2E_CONNECTOR_REGISTRY: these two rungs deliver into the local
       # Docker daemon by design, which only the cluster rung refuses.
       - name: Record a build failure
-        if: ${{ steps.build-runner.outcome == 'failure' || steps.build-api.outcome == 'failure' || steps.build-worker.outcome == 'failure' }}
+        if: ${{ failure() && (steps.build-runner.outcome == 'failure' || steps.build-api.outcome == 'failure' || steps.build-worker.outcome == 'failure') }}
         run: echo build-failed >> "$GITHUB_STEP_SUMMARY"
       - name: Graded parity ladder (skill + local rungs)
         id: ladder
@@ -201,7 +201,7 @@ jobs:
           CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
         run: bash cli/scripts/e2e-ladder.sh
       - name: Record a test failure
-        if: steps.ladder.outcome == 'failure'
+        if: ${{ failure() && steps.ladder.outcome == 'failure' }}
         run: echo test-failed >> "$GITHUB_STEP_SUMMARY"
 
   # Graded sibling of ci.yaml's e2e-ladder-release (#947): the same
@@ -347,7 +347,7 @@ jobs:
       # this rung runs against the generated release compose, whose image refs are
       # the `:latest` tags built above, not a base-tag override.
       - name: Record a build failure
-        if: ${{ steps.build-runner.outcome == 'failure' || steps.build-api.outcome == 'failure' || steps.build-worker.outcome == 'failure' || steps.build-dispatcher.outcome == 'failure' || steps.build-ui.outcome == 'failure' || steps.build-worker-local.outcome == 'failure' || steps.ensure-release-images.outcome == 'failure' }}
+        if: ${{ failure() && (steps.build-runner.outcome == 'failure' || steps.build-api.outcome == 'failure' || steps.build-worker.outcome == 'failure' || steps.build-dispatcher.outcome == 'failure' || steps.build-ui.outcome == 'failure' || steps.build-worker-local.outcome == 'failure' || steps.ensure-release-images.outcome == 'failure') }}
         run: echo build-failed >> "$GITHUB_STEP_SUMMARY"
       - name: Graded parity ladder (local-release rung against generated compose.release.yaml, live model)
         id: ladder
@@ -359,7 +359,7 @@ jobs:
           CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
         run: bash cli/scripts/e2e-ladder.sh
       - name: Record a test failure
-        if: steps.ladder.outcome == 'failure'
+        if: ${{ failure() && steps.ladder.outcome == 'failure' }}
         run: echo test-failed >> "$GITHUB_STEP_SUMMARY"
 
   # Graded sibling of ci.yaml's e2e-ladder-cluster: same kind substrate and
@@ -583,7 +583,7 @@ jobs:
       # cluster through `kind load`, with no registry auth anywhere in the
       # workflow -- so the cluster connector rung stays unwired until one exists.
       - name: Record a build failure
-        if: ${{ steps.build-api.outcome == 'failure' || steps.build-worker.outcome == 'failure' || steps.build-ui.outcome == 'failure' || steps.build-runner.outcome == 'failure' }}
+        if: ${{ failure() && (steps.build-api.outcome == 'failure' || steps.build-worker.outcome == 'failure' || steps.build-ui.outcome == 'failure' || steps.build-runner.outcome == 'failure') }}
         run: echo build-failed >> "$GITHUB_STEP_SUMMARY"
       - name: Graded parity ladder (cluster rung, live model)
         id: ladder
@@ -595,7 +595,7 @@ jobs:
           CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
         run: bash cli/scripts/e2e-ladder.sh
       - name: Record a test failure
-        if: steps.ladder.outcome == 'failure'
+        if: ${{ failure() && steps.ladder.outcome == 'failure' }}
         run: echo test-failed >> "$GITHUB_STEP_SUMMARY"
       # Surface why on any failure above: pod states, recent events, and the
       # worker/runner logs are what localize a reachability or scheduling break.

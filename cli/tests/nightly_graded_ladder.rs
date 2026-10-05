@@ -1320,6 +1320,21 @@ fn assert_ladder_failure_markers(job: &str, label: &str) {
         id_at < test_at,
         "{label}: test-failed must follow the ladder step id"
     );
+    // GitHub Actions treats an `if` without failure(), always(), or
+    // success() as success(). After a failed build or ladder that default
+    // skips the summary step, so the class line never lands.
+    for marker in [build_failed, test_failed] {
+        let at = job
+            .find(marker)
+            .unwrap_or_else(|| panic!("{label} must contain {marker}"));
+        let step_start = job[..at].rfind("\n      - ").unwrap_or(0);
+        let step = &job[step_start..at];
+        assert!(
+            step.contains("failure()"),
+            "{label}: the step that writes {marker} must be conditioned on \
+             failure() so it still runs after the failed step:\n{step}"
+        );
+    }
 }
 
 fn line_offset(text: &str, trimmed: &str) -> Option<usize> {
@@ -6169,6 +6184,50 @@ fn oracle_writes_expected_span_and_query_before_teardown() {
     assert!(
         leftover.is_empty(),
         "exact-trace temp files must be gone: {leftover:?}"
+    );
+}
+
+#[test]
+fn oracle_cluster_query_includes_the_selected_namespace_and_release() {
+    let trace_id = "abcdef0123456789abcdef0123456789";
+    let harness = tempfile::tempdir().expect("cluster oracle harness");
+    let workdir = harness.path().join("work");
+    fs::create_dir(&workdir).expect("oracle workdir");
+    let summary_path = harness.path().join("github-step-summary.txt");
+    fs::write(&summary_path, "").expect("create step summary");
+    let bin_path = harness.path().join("observability-bin");
+    test_executable::install(&bin_path, "#!/bin/sh\nexit 1\n");
+    let mut script = format!(
+        "set -u\n\
+         export WORKDIR={workdir}\n\
+         export OBSERVABILITY_POLL_ATTEMPTS=1\n\
+         export OBSERVABILITY_POLL_INTERVAL_SECONDS=0\n\
+         export GITHUB_STEP_SUMMARY={summary}\n\
+         export BIN={bin}\n\
+         ns_rel=(--namespace acme --release acme-dev)\n",
+        workdir = sh_single_quote(&workdir),
+        summary = sh_single_quote(&summary_path),
+        bin = sh_single_quote(&bin_path),
+    );
+    script.push_str(&ladder_function("query_exact_seed_trace"));
+    script.push_str(&format!(
+        "query_exact_seed_trace cluster {trace_id} curie.turn.process '' present\nexit $?\n",
+        trace_id = sh_single_quote(Path::new(trace_id)),
+    ));
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("run the cluster oracle");
+    let summary = fs::read_to_string(&summary_path).expect("read step summary");
+    assert!(!output.status.success(), "{}", transcript(&output));
+    assert!(
+        summary.lines().any(|line| {
+            line == format!(
+                "query: curie --json cluster observability --namespace acme --release acme-dev run {trace_id}"
+            )
+        }),
+        "summary must name the cluster query that was actually issued:\n{summary}"
     );
 }
 

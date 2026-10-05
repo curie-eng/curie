@@ -1201,10 +1201,17 @@ query_exact_seed_trace() {
     # before the temp files are removed.
     record_exact_trace_oracle_miss() {
         local expected_csv="$1" tier="$2" trace_id="$3"
+        local query="curie --json ${tier} observability run ${trace_id}"
+        # A cluster read also carries the selected namespace and release.
+        # ${ns_rel[*]+x} stays unset-safe under `set -u` when this function
+        # is sourced alone for a local query.
+        if [[ "$tier" == "cluster" && -n "${ns_rel[*]+x}" ]]; then
+            query="curie --json cluster observability ${ns_rel[*]} run ${trace_id}"
+        fi
         [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
         {
             printf 'expected span: %s\n' "$expected_csv"
-            printf 'query: curie --json %s observability run %s\n' "$tier" "$trace_id"
+            printf 'query: %s\n' "$query"
         } >> "$GITHUB_STEP_SUMMARY"
     }
     local tier="$1" trace_id="$2" expected_csv="${3:-}" expected_decision="${4:-}" expected_state="${5:-present}" expected_tool="${6:-}"

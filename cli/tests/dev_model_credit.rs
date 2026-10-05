@@ -181,6 +181,70 @@ fn exactly_five_usd_is_credit_sufficient() {
 }
 
 #[test]
+fn an_unlimited_key_with_account_credit_is_sufficient() {
+    // limit and limit_remaining null is the recorded unlimited-key shape.
+    // The account balance is 800 - 599.85, which is above 5 USD, so the
+    // missing key limit must not be reported as credit-unknown.
+    let key = key_body(Value::Null, Value::Null).to_string();
+    let credits = credits_body(800.0, 599.85).to_string();
+    let server = serve(move |req| {
+        let path = req.path.split('?').next().unwrap();
+        if req.method == "GET" && path.ends_with("/key") {
+            Response::json(200, &key)
+        } else if req.method == "GET" && path.ends_with("/credits") {
+            Response::json(200, &credits)
+        } else {
+            Response::json(404, r#"{"error":{"message":"Not Found","code":404}}"#)
+        }
+    });
+    let output = run_model_credit(Some(KEY), None, false, Some(&server.base_url));
+    assert_human(&output, "credit-sufficient", 0);
+}
+
+#[test]
+fn a_refused_credits_read_keeps_a_sufficient_key_limit() {
+    // A key that may not read the account balance gets a non-2xx /credits.
+    // The recorded module comment says that leaves the account unknown and
+    // the key limit stands. 73.49 is above 5 USD, so this is not exhausted.
+    let key = key_body(json!(300), json!(73.49)).to_string();
+    let server = serve(move |req| {
+        let path = req.path.split('?').next().unwrap();
+        if req.method == "GET" && path.ends_with("/key") {
+            Response::json(200, &key)
+        } else if req.method == "GET" && path.ends_with("/credits") {
+            Response::json(403, r#"{"error":{"message":"Forbidden","code":403}}"#)
+        } else {
+            Response::json(404, r#"{"error":{"message":"Not Found","code":404}}"#)
+        }
+    });
+    let output = run_model_credit(Some(KEY), None, false, Some(&server.base_url));
+    assert_human(&output, "credit-sufficient", 0);
+}
+
+#[test]
+fn an_unlimited_key_with_no_account_balance_is_credit_unknown() {
+    let key = key_body(Value::Null, Value::Null).to_string();
+    let server = serve(move |req| {
+        let path = req.path.split('?').next().unwrap();
+        if req.method == "GET" && path.ends_with("/key") {
+            Response::json(200, &key)
+        } else {
+            Response::json(403, r#"{"error":{"message":"Forbidden","code":403}}"#)
+        }
+    });
+    let output = run_model_credit(Some(KEY), None, false, Some(&server.base_url));
+    assert_human(&output, "credit-unknown", 1);
+}
+
+#[test]
+fn a_non_401_key_error_is_credit_unavailable() {
+    let server =
+        serve(|_| Response::json(500, r#"{"error":{"message":"unavailable","code":500}}"#));
+    let output = run_model_credit(Some(KEY), None, false, Some(&server.base_url));
+    assert_human(&output, "credit-unavailable", 1);
+}
+
+#[test]
 fn json_empty_key_is_one_class_object() {
     let output = run_model_credit(Some(""), None, true, None);
     assert_key_hidden(&output);
