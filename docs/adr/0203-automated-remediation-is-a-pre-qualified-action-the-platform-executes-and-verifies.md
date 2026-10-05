@@ -2,15 +2,19 @@
 
 Date: 2026-10-05
 
-Status: Draft
+Status: Accepted
 
-This draft frames whether, and how, a turn started by an automated alert
+Maintainer jw3329 explicitly approved acceptance on 2026-10-05, with the
+rulings recorded below, together with
+[ADR 0121](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md)
+and [ADR 0124](0124-a-snapshot-is-sealed-to-the-connector-that-wrote-it.md).
+
+This decision settles whether, and how, a turn started by an automated alert
 source may change a system without a person approving each change. It weighs
-five options and recommends one, but it decides nothing and authorizes no
-implementation. If accepted, it would partially supersede
+five options and selects option D. It partially supersedes
 [ADR 0190](0190-automated-hook-sources-cannot-widen-their-tool-access.md)
 for hooks an administrator binds a remediation policy to, as described under
-"Relationship to existing decisions". It would leave
+"Relationship to existing decisions". It leaves
 [ADR 0191](0191-protected-hook-delivery-authority.md) and every
 HOOK-SOURCE-POLICY invariant standing for the model turn itself.
 
@@ -91,7 +95,7 @@ records each side-effecting call as an action with its prior state, target
 and outcome, rules on undo, and refuses an undo when the world has moved.
 Nothing can perform the undo yet: the executor is
 [ADR 0121](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md),
-still a Draft, blocked under #1867. A ledger row
+a Draft blocked under #1867 until it was accepted together with this decision. A ledger row
 (`apps/api/src/curie_api/models.py::AgentAction`) can name the approval that
 gated it and nothing else; there is no field for an authority that is not a
 person's approval.
@@ -297,9 +301,9 @@ Whichever option acts automatically (B, C or D) must also supply:
 * **Authority over the policy.** The source cannot write it, exactly as ADR
   0191 keeps source policy out of the delivery body. Whether the ordinary
   administrative key suffices or the policy needs ADR 0191's independent
-  provisioning authority is an open question below.
+  provisioning authority is settled by REMEDIATION-13.
 
-## Recommendation
+## Decision
 
 **Option D**, with option A as its fallback path and option E remaining
 available per installation.
@@ -317,11 +321,11 @@ an action that cannot be put back cannot be executed without a person.
 
 The honest cost is that strict reversibility excludes some of the most common
 remediations. A rolling restart, for instance, is reported as not undoable
-under ADR 0117. Whether an action that is idempotent and harmless to repeat,
-but not reversible, may qualify is the first question a maintainer must rule
-on, because it decides how useful D is in practice.
+under ADR 0117. Ruling 1 below admits a bounded class of actions that are
+idempotent and harmless to repeat but not reversible, because without it D
+would exclude the remediations operators reach for first.
 
-### Proposed clauses, if accepted
+### Clauses
 
 * **REMEDIATION-1.** Only platform administrative authority can bind a
   remediation policy to a named hook. The source, its credential and the
@@ -333,8 +337,7 @@ on, because it decides how useful D is in practice.
   evaluates them, after the turn, against the policy generation that was active
   when the delivery was admitted.
 * **REMEDIATION-4.** An action qualifies for automatic execution only if it is
-  reversible under ADR 0117 (or under an exception that open question 1 may
-  admit), its arguments and target are within the policy's bounds, and it
+  reversible under ADR 0117 or admitted by REMEDIATION-11, its arguments and target are within the policy's bounds, and it
   declares a precondition read and a verifier.
 * **REMEDIATION-5.** The platform executes a qualified or approved action
   through the connector's own verb under that connector's binding, with no
@@ -351,13 +354,30 @@ on, because it decides how useful D is in practice.
   fail closed.
 * **REMEDIATION-10.** Receipts and telemetry distinguish nomination,
   admission refusal, execution, verification outcome, undo and escalation.
+* **REMEDIATION-11.** An action that is not reversible qualifies only if it is
+  idempotent, its effect is bounded to the policy's declared target, and it
+  declares a verifier. It runs at most once per incident per target without a
+  person; any outcome other than `verified` escalates to a person immediately.
+* **REMEDIATION-12.** A nomination leaves the turn only as a closed structured
+  block in the turn's final output, parsed and validated by the platform after
+  the turn ends. It is data: no ACI, plugin-format or `ToolAccess` change, and
+  no tool the turn calls.
+* **REMEDIATION-13.** The existing platform administrative authority binds a
+  remediation policy, under the same trust model as ADR 0190 source policy;
+  compromise of that key stays outside this decision's guarantee.
+* **REMEDIATION-14.** On any outcome other than `verified`, the platform reports
+  and escalates and does not undo automatically. Undo of a policy-executed
+  action is an approval-gated decision by an approver on the policy's route.
+* **REMEDIATION-15.** A verifier is a deterministic predicate over a declared
+  read through a connector and credential distinct from the acting ones. No
+  model turn judges recovery.
 
 ## Relationship to existing decisions
 
-* **ADR 0190.** Accepted, so immutable. D would not change its invariants for
-  the model turn. It would partially supersede its premise that an automated
-  source changes no system, only for hooks bound to a remediation policy. On
-  acceptance, ADR 0190 gains a back link under
+* **ADR 0190.** Accepted, so immutable. This decision does not change its
+  invariants for the model turn. It partially supersedes its premise that an automated
+  source changes no system, only for hooks bound to a remediation policy. ADR
+  0190 carries a back link under
   [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md);
   its body is untouched. B or C would instead supersede HOOK-SOURCE-POLICY-7
   outright.
@@ -366,48 +386,48 @@ on, because it decides how useful D is in practice.
   qualification would need a successor.
 * **ADR 0099.** Unchanged. Unrestricted hooks keep ordinary tools and
   approval gates; a remediation policy applies only to restricted hooks.
-* **ADR 0117.** D would amend decision 3 (an ungated action's undo is
+* **ADR 0117.** This decision amends decision 3 (an ungated action's undo is
   ungated) for policy-authorized actions, whose undo authority must be stated
-  explicitly. Its conflict check is reused unchanged.
-* **ADR 0121.** A prerequisite. D cannot be accepted for implementation before
-  ADR 0121, or a successor that names an executor, is accepted.
+  explicitly (REMEDIATION-14). Its conflict check is reused unchanged.
+* **ADR 0121 and ADR 0124.** Accepted together with this decision. They supply
+  the executor and the sealed snapshot; REMEDIATION-5 extends that executor from
+  restores to forward actions. No automatic execution ships before it.
 * **ADR 0035.** Its tool-name grant remains for ordinary human turns. D's
   approved proposals bind arguments and run without a model, so they do not
   use it.
 * **TOOL-ACCESS.** Unchanged under D. B and C need a second value, a breaking
   change under TOOL-ACCESS-2.
 
-## Open questions for maintainers
+## Rulings
 
-1. May an action that is idempotent and bounded, but not reversible (a rolling
-   restart), qualify for automatic execution, and on what evidence?
-2. Is the partial supersession of ADR 0190 described above the right form,
-   or should this be a new ADR that supersedes ADR 0190 whole and restates its
-   invariants?
-3. How does a nomination leave the read-only turn: parsed from the turn's final
-   structured output, a platform tool classified read-only (which reads
-   against TOOL-ACCESS-3's no-approval rule), or a new optional ACI frame
-   (a frozen-contract review)?
-4. Which authority binds a remediation policy: the ordinary administrative
-   key, ADR 0191's independent provisioning authority, or two principals?
-5. What qualification evidence admits an action to a policy: a restore
-   round trip with the conflict check, worst-case behavior under every
-   in-bound argument, and a verifier observed failing as well as passing?
-6. Who may undo an automatically executed action, given ADR 0117 decision 3?
-7. On `not-recovered`, does the platform undo automatically or only report and
-   escalate?
-8. Is a verifier always a deterministic predicate over a declared read, or may
-   a read-only model turn evaluate it? Which sources count as independent of
-   the actor?
-9. What are the default rate, concurrency and per-incident limits, and who may
-   close a circuit breaker?
-10. Which release train carries this: `next` as a feature, given that ADR 0121
-    and #1861 also target it?
+The maintainer ruled on the questions this decision raised as a Draft:
+
+1. **Non-reversible actions.** Admitted in a bounded class (REMEDIATION-11).
+2. **Form of the change to ADR 0190.** Partial supersession of its premise, with
+   a back link on ADR 0190 under ADR 0045; its invariants stand.
+3. **How a nomination leaves the turn.** As a structured block in the final
+   output (REMEDIATION-12), so no frozen contract changes.
+4. **Who binds a remediation policy.** The existing administrative authority
+   (REMEDIATION-13).
+5. **Qualification evidence.** A reversible action needs an observed restore
+   round trip including the conflict refusal; a REMEDIATION-11 action needs an
+   observed repeat with no additional effect; every action needs its verifier
+   observed both passing and failing, and its worst case within bounds recorded.
+6. **Undo of an automatic action.** Approval gated on the policy's route
+   (REMEDIATION-14).
+7. **On `not-recovered`.** Report and escalate; no automatic undo
+   (REMEDIATION-14).
+8. **Verifier.** Deterministic and independent of the actor (REMEDIATION-15).
+9. **Default limits.** One automatic action per incident per target, at most
+   three automatic actions per policy per hour, and a circuit breaker that only
+   an administrator with policy authority closes. A policy may tighten these,
+   never loosen them.
+10. **Release train.** The realizing feature work targets `next`; this record
+    lands on `main` with the decisions it amends.
 
 ## Realizing work
 
-Follow-up issues to create after acceptance (titles only; none is created by
-this draft):
+Follow-up issues to create (titles only):
 
 | Issue title | Clauses |
 |---|---|
@@ -450,15 +470,15 @@ this draft):
 
 ## Consequences
 
-If accepted as recommended, an administrator can let an automated source fix a
+With this decision, an administrator can let an automated source fix a
 bounded class of problems without a person in the loop, and every such fix is
 recorded, reversible, verified by an independent signal and stoppable. The
 model turn keeps the guarantees ADR 0190 and ADR 0191 established.
 
 The work is gated on ADR 0121's executor, which is itself blocked, so no
 automatic remediation is available until that lands. Remediations that are not
-reversible, or that need several dependent steps, still go to a person unless
-open question 1 or a composite action admits them. The platform takes on a
+reversible and outside REMEDIATION-11, or that need several dependent steps,
+still go to a person unless a qualified composite action admits them. The platform takes on a
 policy store, an admission evaluator, a verifier, and new ledger and receipt
 fields, each of which needs its own reviewed contract; any change to the frozen
 ACI or plugin format follows the frozen-contract procedure before dependent
