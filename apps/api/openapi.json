@@ -14045,7 +14045,7 @@
             "description": "Missing or invalid channel read capability"
           },
           "403": {
-            "description": "Channel not bound, or the Slack app is not a member"
+            "description": "Channel not bound, or the app is not a member"
           },
           "404": {
             "description": "Message or thread not found in the channel"
@@ -14057,13 +14057,13 @@
             "description": "Invalid window, limit, identifier, cursor or body"
           },
           "429": {
-            "description": "Page or attempt budget exhausted, or Slack rate limited"
+            "description": "Page or attempt budget exhausted, or the provider rate limited"
           },
           "502": {
-            "description": "Slack returned an error"
+            "description": "The provider returned an error"
           },
           "503": {
-            "description": "Ledger unavailable or no Slack credential"
+            "description": "Ledger unavailable or no provider credential"
           }
         },
         "summary": "Read Channel",

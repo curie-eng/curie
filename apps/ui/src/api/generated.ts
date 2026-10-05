@@ -8935,7 +8935,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Channel not bound, or the Slack app is not a member */
+            /** @description Channel not bound, or the app is not a member */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -8963,21 +8963,21 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Page or attempt budget exhausted, or Slack rate limited */
+            /** @description Page or attempt budget exhausted, or the provider rate limited */
             429: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description Slack returned an error */
+            /** @description The provider returned an error */
             502: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description Ledger unavailable or no Slack credential */
+            /** @description Ledger unavailable or no provider credential */
             503: {
                 headers: {
                     [name: string]: unknown;
