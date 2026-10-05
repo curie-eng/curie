@@ -36,6 +36,21 @@ _CERTIFICATES = re.compile(
 )
 
 
+def trusted_ca_pem(ca_pem: str) -> str:
+    """Validated broker CA certificates or the single safe refusal.
+
+    @spec PROTECTED-HOOK-LANE-2/3 @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    try:
+        if not isinstance(ca_pem, str) or _CERTIFICATES.fullmatch(ca_pem) is None:
+            raise BrokerMetadataUnavailable()
+        if not x509.load_pem_x509_certificates(ca_pem.encode("ascii")):
+            raise BrokerMetadataUnavailable()
+    except Exception:
+        raise BrokerMetadataUnavailable() from None
+    return ca_pem
+
+
 @dataclass(frozen=True, slots=True)
 class MetadataReaderCredential:
     """Explicit provisioning credential, @spec PROTECTED-HOOK-LANE-2/3."""
@@ -154,10 +169,7 @@ class AuthenticatedMetadataReader:
             identity = Manifest(manifest.canonical_bytes).as_dict()["broker_identity"]
             if identity["endpoint"]["host"] != identity["tls_server_name"]:
                 raise BrokerMetadataUnavailable()
-            if not isinstance(ca_pem, str) or _CERTIFICATES.fullmatch(ca_pem) is None:
-                raise BrokerMetadataUnavailable()
-            if not x509.load_pem_x509_certificates(ca_pem.encode("ascii")):
-                raise BrokerMetadataUnavailable()
+            trusted_ca_pem(ca_pem)
             connection = _PinnedConnection(identity, credential, ca_pem)
             connection.connect()  # type: ignore[no-untyped-call]
             reader = object.__new__(cls)

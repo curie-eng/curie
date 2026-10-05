@@ -173,8 +173,8 @@ def _policy_target(policy: SourcePolicySnapshot) -> DesiredSourceTarget:
     )
 
 
-def _fingerprint(policy: SourcePolicySnapshot) -> str:
-    """@spec PROTECTED-HOOK-SOURCE-6."""
+def committed_policy_fingerprint(policy: SourcePolicySnapshot) -> str:
+    """The SOURCE-6 fingerprint a committed row publishes, @spec PROTECTED-HOOK-SOURCE-6/9."""
     return policy_fingerprint(
         {
             **_policy_target(policy).as_dict(),
@@ -457,7 +457,7 @@ class SourceMutationCoordinator:
                 published = await session.writer.publish_ordinary(
                     generation=committed.generation,
                     operation_id=str(committed.operation_id),
-                    fingerprint=_fingerprint(committed),
+                    fingerprint=committed_policy_fingerprint(committed),
                 )
                 if published is not True:
                     raise _unavailable(committed)

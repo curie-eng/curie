@@ -94,6 +94,7 @@ from ..hook_partition import (
     PartitionError,
     derive_partition,
 )
+from ..hook_source_admin import SourceAdminError
 from ..hook_source_auth import (
     MISSING_DELIVERY_DETAIL,
     authenticated_source,
@@ -102,6 +103,7 @@ from ..hook_source_auth import (
 from ..hook_source_policy_schemas import HookSupportIn, HookSupportOut, HookSupportReason
 from ..identities import refuse_undeclared
 from ..models import Agent, AgentChannel
+from ..protected_support import RuntimeMembers, evaluate_protected_support
 from ..source_binding import MappingOutcome, resolve_source_binding
 from ..wirebody import read_bounded_body
 
@@ -749,16 +751,21 @@ def _parse_support(raw: bytes) -> HookSupportIn:
         ) from exc
 
 
-def _resolve_support(snapshot: SourceSnapshot, requested: ToolAccess | None) -> HookSupportOut:
-    """The spec's resolution table over a gate-held snapshot.
+async def _resolve_support(
+    snapshot: SourceSnapshot, requested: ToolAccess | None, runtime_dir: str | None
+) -> HookSupportOut:
+    """The spec's resolution table over a snapshot captured under the gate.
 
-    Runtime members stay null: the API holds no protected broker reader yet.
+    Called after the source gate is released: only a committed protected row
+    runs the observational broker evaluation, and only it can carry runtime
+    members. Nothing from the bootstrap or the row's references is echoed.
     @spec PROTECTED-HOOK-SOURCE-9.
     """
     policy = snapshot.policy
     effective: ToolAccess | None = requested
     generation: str | None = None
     reason: HookSupportReason = "source_unconfigured"
+    runtime: RuntimeMembers | None = None
     if policy is None:
         if snapshot.attempt_history_present:
             effective, reason = ToolAccess.READ_ONLY, "source_closed"
@@ -766,16 +773,22 @@ def _resolve_support(snapshot: SourceSnapshot, requested: ToolAccess | None) -> 
         generation, reason = str(policy.generation), "source_closed"
     elif policy.mode == "protected":
         effective, generation = ToolAccess.READ_ONLY, str(policy.generation)
-        reason = "broker_unavailable"
+        try:
+            evaluation = await evaluate_protected_support(policy, runtime_dir)
+        except SourceAdminError:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable"
+            ) from None
+        reason, runtime = evaluation.reason, evaluation.runtime
     else:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable")
     return HookSupportOut(
         requested_tool_access=requested,
         effective_tool_access=effective,
         source_generation=generation,
-        runtime_id=None,
-        runtime_generation=None,
-        qualification_id=None,
+        runtime_id=runtime.runtime_id if runtime is not None else None,
+        runtime_generation=runtime.runtime_generation if runtime is not None else None,
+        qualification_id=runtime.qualification_id if runtime is not None else None,
         supported=False,
         reason=reason,
     )
@@ -825,7 +838,8 @@ async def probe_hook_support(
 
     The JSON body is ``HookSupportIn``, read raw because its exact bytes are
     signed. Order follows the spec: hook name, bounded body, strict parse,
-    ungated support signature, delivery id, gate-held reauthentication, snapshot.
+    ungated support signature, delivery id, gate-held reauthentication, snapshot,
+    gate release, then broker evaluation of a protected row only.
     The delivery id is signed context only and reserves nothing.
     \f
     @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-SOURCE-2/4.
@@ -845,8 +859,11 @@ async def probe_hook_support(
         timestamp=x_curie_timestamp,
         delivery_id=x_curie_delivery_id,
         signature=x_curie_signature_256,
-    ) as snapshot:
-        resolution = _resolve_support(snapshot, requested)
+    ) as gated:
+        snapshot = gated
+    # The gate is released here: broker evaluation is observational and every
+    # delivery repeats it, so no broker I/O ever holds the source gate.
+    resolution = await _resolve_support(snapshot, requested, settings.protected_runtime_dir)
     return JSONResponse(
         status_code=(
             status.HTTP_200_OK if resolution.supported else status.HTTP_503_SERVICE_UNAVAILABLE
