@@ -63,6 +63,7 @@ from aci_protocol import (
 )
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from channel_protocol import hook_conversation_id
+from curie_protected_hooks.source_policy_sql import SourceSnapshot
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     inject_trace_context,
@@ -70,10 +71,12 @@ from curie_telemetry import (
     record_metric,
 )
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from opentelemetry.trace import SpanKind, StatusCode
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from .. import crud, hook_signing
+from .. import crud
 from ..config import get_settings
 from ..delivery import (
     backlog_reservation,
@@ -91,7 +94,12 @@ from ..hook_partition import (
     PartitionError,
     derive_partition,
 )
-from ..hook_source_auth import authenticated_source
+from ..hook_source_auth import (
+    MISSING_DELIVERY_DETAIL,
+    authenticated_source,
+    authenticated_support,
+)
+from ..hook_source_policy_schemas import HookSupportIn, HookSupportOut, HookSupportReason
 from ..identities import refuse_undeclared
 from ..models import Agent, AgentChannel
 from ..source_binding import MappingOutcome, resolve_source_binding
@@ -106,6 +114,7 @@ router = APIRouter(prefix="/hooks", tags=["hooks"])
 # different id spaces under one prefix could collide and swallow each other's
 # turns.
 _CLAIM_PREFIX = "curie:hook"
+
 
 class HookAccepted(BaseModel):
     """The hook receipt. ``duplicate`` says whether THIS request enqueued.
@@ -320,6 +329,20 @@ def _mint_turn(
     )
 
 
+def _require_hook_name(hook: str) -> None:
+    """Refuse a hook name before it reaches any key or signed context.
+
+    ``fullmatch``, since the pattern's ``$`` matches before a trailing newline.
+    @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    if not HOOK_NAME.fullmatch(hook):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "hook name must be 1-63 characters of lowercase letters, digits, dot, "
+            "dash or underscore",
+        )
+
+
 @router.post("/{agent_id}/{hook}", response_model=HookAccepted)
 async def ingest_hook(
     request: Request,
@@ -371,12 +394,7 @@ async def ingest_hook(
     @spec PROTECTED-HOOK-SOURCE-2/4/10.
     """
 
-    if not HOOK_NAME.fullmatch(hook):
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "hook name must be 1-63 characters of lowercase letters, digits, dot, "
-            "dash or underscore",
-        )
+    _require_hook_name(hook)
 
     settings = get_settings()
     raw = await read_bounded_body(request, settings.hook_max_body_bytes, subject="hook body")
@@ -394,12 +412,7 @@ async def ingest_hook(
     ) as source:
         agent = source.agent
         if not x_curie_delivery_id:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                f"{hook_signing.DELIVERY_HEADER} is required: this ingress is at-least-once, so a "
-                "stable upstream id is what keeps a retried delivery from running the "
-                "agent twice",
-            )
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, MISSING_DELIVERY_DETAIL)
 
         target_supplied = conversation_id is not None or placeholder is not None
         if target_supplied and (not conversation_id or not placeholder):
@@ -716,3 +729,127 @@ async def ingest_hook(
             duplicate=True,
             conversation_id=None,
         )
+
+
+def _parse_support(raw: bytes) -> HookSupportIn:
+    """Strict ``HookSupportIn`` from the raw signed bytes, as FastAPI's ordinary 422.
+
+    @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    try:
+        return HookSupportIn.model_validate_json(raw)
+    except ValidationError as exc:
+        raise RequestValidationError(
+            [
+                {**error, "loc": ("body", *error.get("loc", ()))}
+                for error in exc.errors(
+                    include_url=False, include_context=False, include_input=False
+                )
+            ]
+        ) from exc
+
+
+def _resolve_support(snapshot: SourceSnapshot, requested: ToolAccess | None) -> HookSupportOut:
+    """The spec's resolution table over a gate-held snapshot.
+
+    Runtime members stay null: the API holds no protected broker reader yet.
+    @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    policy = snapshot.policy
+    effective: ToolAccess | None = requested
+    generation: str | None = None
+    reason: HookSupportReason = "source_unconfigured"
+    if policy is None:
+        if snapshot.attempt_history_present:
+            effective, reason = ToolAccess.READ_ONLY, "source_closed"
+    elif policy.mode == "ordinary":
+        generation, reason = str(policy.generation), "source_closed"
+    elif policy.mode == "protected":
+        effective, generation = ToolAccess.READ_ONLY, str(policy.generation)
+        reason = "broker_unavailable"
+    else:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable")
+    return HookSupportOut(
+        requested_tool_access=requested,
+        effective_tool_access=effective,
+        source_generation=generation,
+        runtime_id=None,
+        runtime_generation=None,
+        qualification_id=None,
+        supported=False,
+        reason=reason,
+    )
+
+
+# Documented, not bound: the handler parses the exact signed bytes itself. The
+# enum reference resolves to the shared ToolAccess component.
+_SUPPORT_BODY = {
+    key: value
+    for key, value in HookSupportIn.model_json_schema(
+        ref_template="#/components/schemas/{model}"
+    ).items()
+    if key != "$defs"
+}
+
+
+@router.post(
+    "/{agent_id}/{hook}/support",
+    response_model=HookSupportOut,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": _SUPPORT_BODY}},
+        }
+    },
+    responses={
+        503: {
+            "model": HookSupportOut,
+            "description": (
+                "Authenticated, protected support unavailable (supported=false). "
+                'Without this DTO, {"detail": "authority_unavailable"} when no '
+                "current server resolution could be read."
+            ),
+        }
+    },
+)
+async def probe_hook_support(
+    request: Request,
+    session: SessionDep,
+    agent_id: uuid.UUID,
+    hook: str,
+    x_curie_signature_256: Annotated[str | None, Header()] = None,
+    x_curie_delivery_id: Annotated[str | None, Header()] = None,
+    x_curie_timestamp: Annotated[str | None, Header()] = None,
+) -> JSONResponse:
+    """Report the current protected support resolution for one hook; write nothing.
+
+    The JSON body is ``HookSupportIn``, read raw because its exact bytes are
+    signed. Order follows the spec: hook name, bounded body, strict parse,
+    ungated support signature, delivery id, gate-held reauthentication, snapshot.
+    The delivery id is signed context only and reserves nothing.
+    \f
+    @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-SOURCE-2/4.
+    """
+    _require_hook_name(hook)
+    settings = get_settings()
+    raw = await read_bounded_body(request, settings.hook_max_body_bytes, subject="hook body")
+    requested = _parse_support(raw).tool_access
+
+    async with authenticated_support(
+        request,
+        session,
+        agent_id=agent_id,
+        hook=hook,
+        raw=raw,
+        tool_access=requested.value if requested is not None else None,
+        timestamp=x_curie_timestamp,
+        delivery_id=x_curie_delivery_id,
+        signature=x_curie_signature_256,
+    ) as snapshot:
+        resolution = _resolve_support(snapshot, requested)
+    return JSONResponse(
+        status_code=(
+            status.HTTP_200_OK if resolution.supported else status.HTTP_503_SERVICE_UNAVAILABLE
+        ),
+        content=resolution.model_dump(mode="json"),
+    )
