@@ -29,11 +29,15 @@ Admission and terminal comment plumbing reuse test_factory_terminus.py.
 
 from __future__ import annotations
 
+import json
 import sys
+import threading
 import time
 import uuid
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +53,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from curie_api import sandbox_token
 from curie_api.config import get_settings
 from curie_api.factory_notices import FINAL_MARKER
-from curie_api.factory_usage import Price, get_price_book
+from curie_api.factory_usage import OpenRouterPriceBook, Price, get_price_book, match_price
 from test_factory_status_comment import _admit, _execute, _finish_failed, _marked
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     _reconcile,
@@ -185,8 +189,10 @@ def test_a_report_is_stored_per_model_with_role_and_price(priced: Any) -> None:
     response = _usage(
         client,
         request_id,
-        [_entry(IMPLEMENTER, 1_000_000, 500_000, cached=100_000, write=10_000),
-         _entry(REVIEWER, 200_000, 100_000)],
+        [
+            _entry(IMPLEMENTER, 1_000_000, 500_000, cached=100_000, write=10_000),
+            _entry(REVIEWER, 200_000, 100_000),
+        ],
     )
 
     assert response.status_code == 201, response.text
@@ -274,9 +280,7 @@ def _second_request(work_item_id: uuid.UUID, first: uuid.UUID) -> uuid.UUID:
         "FROM curie.execution_requests WHERE id = :first",
         {"id": second, "first": first},
     )
-    _execute(
-        "UPDATE curie.work_items SET next_sequence = 3 WHERE id = :id", {"id": work_item_id}
-    )
+    _execute("UPDATE curie.work_items SET next_sequence = 3 WHERE id = :id", {"id": work_item_id})
     return second
 
 
@@ -579,7 +583,8 @@ def test_the_terminal_line_names_runs_that_reported_no_usage(priced: Any) -> Non
 
 @pytest.mark.parametrize("include_reviewer_totals", [True, False])
 def test_a_follow_up_turn_stores_only_its_increment_and_keeps_the_reviewer_role(
-    priced: Any, include_reviewer_totals: bool,
+    priced: Any,
+    include_reviewer_totals: bool,
 ) -> None:
     """Two turns of one request store the running model_usage once.
 
@@ -707,3 +712,171 @@ def test_a_follow_up_turn_stores_only_its_increment_and_keeps_the_reviewer_role(
         "Usage: implementer 2,200,000 tokens ($2.90), reviewers 300,000 tokens ($0.40), "
         f"total $3.30 (estimated from {SOURCE} prices as of 2026-09-01)"
     )
+
+
+# --- a context-window suffix on the model id (#3992) --------------------------------
+#
+# Recorded from https://openrouter.ai/api/v1/models on 2026-10-05, trimmed to the
+# entries near the Opus id. Its rates reproduce the reviewer cost a factory run
+# stored for the base id (0.155917 for 16 input, 45,517 cache read, 29,094 cache
+# write and 64 output tokens).
+
+MODELS_PAYLOAD = json.loads(
+    (Path(__file__).resolve().parent / "fixtures" / "openrouter_models_2026-10-05.json").read_text()
+)
+FAST = "z-ai/glm-5.3-flash"
+OPUS = "anthropic/claude-opus-5.5"
+OPUS_1M = f"{OPUS}[1m]"
+
+
+def test_a_context_window_suffix_is_priced_at_the_base_models_rates() -> None:
+    assert match_price(MODELS_PAYLOAD, OPUS_1M) == {
+        "prompt": Decimal("0.000004"),
+        "completion": Decimal("0.00002"),
+        "cache_read": Decimal("0.0000002"),
+        "cache_write": Decimal("0.000005"),
+    }
+    assert match_price(MODELS_PAYLOAD, "claude-opus-5-5[1m]") == match_price(MODELS_PAYLOAD, OPUS)
+    assert match_price(MODELS_PAYLOAD, "anthropic/claude-opus-5.6[1m]") is None
+    batch = match_price(MODELS_PAYLOAD, f"{OPUS}:batch")
+    assert batch is not None
+    assert batch["prompt"] == Decimal("0.000002")
+
+
+@pytest.fixture
+def recorded_prices(admitted: Any) -> Iterator[Any]:  # noqa: F811
+    """The real price book, reading the recorded payload over HTTP."""
+
+    payload = json.dumps(MODELS_PAYLOAD).encode()
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args: Any) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client, github, sink = admitted
+    book = OpenRouterPriceBook(f"http://127.0.0.1:{server.server_port}/api/v1/models")
+    client.app.dependency_overrides[get_price_book] = lambda: book
+    try:
+        yield client, github, sink
+    finally:
+        client.app.dependency_overrides.pop(get_price_book, None)
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_suffixed_opus_run_is_priced_in_full_and_counted_once(recorded_prices: Any) -> None:
+    """The runner's report for a run keyed ``[1m]`` prices every row.
+
+    The SDK keys ``model_usage`` with the configured id and
+    ``AssistantMessage.model`` with the base id (installed claude_agent_sdk/types.py).
+    """
+
+    captured: list[dict[str, Any]] = []
+
+    def _sdk_usage(inp: int, out: int, cached: int = 0, write: int = 0) -> dict[str, int]:
+        return {
+            "input_tokens": inp,
+            "output_tokens": out,
+            "cache_read_input_tokens": cached,
+            "cache_creation_input_tokens": write,
+        }
+
+    def _model_usage(inp: int, out: int, cached: int = 0, write: int = 0) -> dict[str, int]:
+        return {
+            "inputTokens": inp,
+            "outputTokens": out,
+            "cacheReadInputTokens": cached,
+            "cacheCreationInputTokens": write,
+        }
+
+    async def drive() -> None:
+        app = web.Application()
+
+        async def usage(request: web.Request) -> web.Response:
+            captured.append(await request.json())
+            return web.json_response({"recorded": True}, status=201)
+
+        app.router.add_post("/v1/work-item-progress/{request_id}/usage", usage)
+        async with TestServer(app) as server:
+            url = str(server.make_url("/v1/work-item-progress/example-request/usage"))
+            reporter = UsageReporter(url, "sbx.example-usage-token.signature")
+            reporter.observe(
+                AssistantMessage(
+                    content=[TextBlock(text="x")],
+                    model=OPUS,
+                    usage=_sdk_usage(16, 64, cached=45517, write=29094),
+                    parent_tool_use_id="toolu_example",
+                    message_id="msg_reviewer_example",
+                )
+            )
+            await reporter.report(
+                ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="sdk-session-PLACEHOLDER",
+                    result="done",
+                    uuid="turn-suffixed",
+                    model_usage={
+                        FAST: _model_usage(35696, 9279, cached=750720),
+                        OPUS_1M: _model_usage(16, 4498, cached=45517, write=29094),
+                    },
+                ),
+                OPUS_1M,
+            )
+
+    anyio.run(drive)
+    assert len(captured) == 1
+
+    client, github, sink = recorded_prices
+    request_id = _admit(client, github, sink, 9650)
+    work_item_id = _request(9650)["work_item_id"]
+    _reconcile()
+    epoch = _start_running(request_id)
+    response = client.post(
+        f"/v1/work-item-progress/{request_id}/usage",
+        headers={"X-API-Key": _token(request_id)},
+        json=captured[0],
+    )
+    assert response.status_code == 201, response.text
+
+    rows = {(row["role"], row["model"]): row for row in _stored(request_id)}
+    assert set(rows) == {
+        ("implementer", FAST),
+        ("implementer", OPUS_1M),
+        ("reviewer", OPUS_1M),
+    }
+    assert all(row["estimated_cost_usd"] is not None for row in rows.values())
+    assert rows[("reviewer", OPUS_1M)]["estimated_cost_usd"] == Decimal("0.155917")
+    assert rows[("implementer", OPUS_1M)]["estimated_cost_usd"] == Decimal("0.088680")
+    assert rows[("implementer", FAST)]["estimated_cost_usd"] == Decimal("0.032516")
+
+    headers = {"X-API-Key": get_settings().api_key}
+    body = client.get(f"/work-items/{work_item_id}/usage", headers=headers).json()
+    assert body["cost_complete"] is True
+    assert _money(body["estimated_cost_usd"]) == sum(
+        (_money(entry["estimated_cost_usd"]) for entry in body["models"]), Decimal(0)
+    )
+    assert _money(body["estimated_cost_usd"]) == Decimal("0.277113")
+
+    _finish_failed(client, request_id, epoch, "runner_escalated")
+    _reconcile()
+    (comment,) = _marked(sink, request_id)
+    (usage,) = [line for line in comment["body"].splitlines() if line.startswith("Usage:")]
+    assert "cost unknown" not in usage
+    assert usage.startswith(
+        "Usage: implementer 800,129 tokens ($0.12), reviewers 74,691 tokens ($0.16), "
+        "total $0.28 (estimated from http://127.0.0.1:"
+    ), usage
