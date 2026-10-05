@@ -240,6 +240,13 @@ seat. Attachments, actions, card resolution and state checks remain
 `BLOCKED: slice 2`, even on a marked installation. A missing or malformed suite,
 UNCLEAR, incomplete repeats or blocked steps cannot become PASS or full GO.
 
+The ship verdict comes from the bundle's gate, [`gate/mean_tester_gate.py`](gate/mean_tester_gate.py),
+which the runner layer installs as `mean-tester-gate`. It validates the suite,
+records each judged probe and computes the verdict; the report quotes it. A
+suite with no action-bearing case can receive `GO (read-only scope)` when
+every case, repeat, scenario step and other recorded or planned probe passes. A suite with actions,
+attachments, card actions or state checks stays NO-GO until slice 2.
+
 See [the validator design](docs/VALIDATOR.md) for the separate suite format,
 configuration comparison, smoke, snapshot/restore and fault-injection contracts,
 and [phase 0 evidence](docs/PHASE-0.md) for approval and attachment limitations.
