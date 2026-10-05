@@ -30,6 +30,7 @@ async def _optional_calls(harness: AdapterHarness) -> dict[Operation, Call]:
     return {
         Operation.LINK_PULL_REQUEST: lambda: tracker.link_pull_request(issue, pull),
         Operation.DEPENDENCIES: lambda: tracker.dependencies(issue),
+        Operation.GROUP_MEMBERSHIP: lambda: tracker.in_group(harness.writer, "starters"),
         Operation.CI_DIAGNOSTICS: lambda: code_host.ci_diagnostics(repository, pull.head_sha),
         Operation.RERUN_FAILED: lambda: code_host.rerun_failed(repository, pull.head_sha),
         Operation.USER_CAN_WRITE: lambda: code_host.user_can_write(repository, harness.writer),

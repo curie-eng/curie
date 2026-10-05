@@ -31,10 +31,10 @@ OLD = "a" * 40
 
 
 def test_a_moved_jira_issue_keeps_its_identity() -> None:
-    before = TrackerIssueRef("jira", "acme.atlassian.example", "site-1", "10042", "PROJ-7")
-    after = TrackerIssueRef("jira", "acme.atlassian.example", "site-1", "10042", "OTHER-3")
+    before = TrackerIssueRef("jira_cloud", "acme.atlassian.example", "site-1", "10042", "PROJ-7")
+    after = TrackerIssueRef("jira_cloud", "acme.atlassian.example", "site-1", "10042", "OTHER-3")
     assert before == after and hash(before) == hash(after)
-    assert before != TrackerIssueRef("jira", "acme.atlassian.example", "site-1", "10043")
+    assert before != TrackerIssueRef("jira_cloud", "acme.atlassian.example", "site-1", "10043")
 
 
 def test_a_renamed_repository_keeps_its_identity() -> None:

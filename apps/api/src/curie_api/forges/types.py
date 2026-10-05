@@ -18,9 +18,9 @@ from typing import Literal
 # the pairing rules in `capabilities` can be stated before their adapters land.
 GITHUB = "github"
 GITLAB = "gitlab"
-JIRA = "jira"
-BITBUCKET_CLOUD = "bitbucket-cloud"
-BITBUCKET_DATA_CENTER = "bitbucket-data-center"
+JIRA_CLOUD = "jira_cloud"
+BITBUCKET_CLOUD = "bitbucket_cloud"
+BITBUCKET_DC = "bitbucket_dc"
 # The in-memory adapters in `curie_api.forges.memory`. `MEMORY` is a native
 # forge (both ports); `MEMORY_TRACKER_ONLY` is a tracker-only kind that pairs
 # with any code host, the shape Jira has.

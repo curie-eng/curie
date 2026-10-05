@@ -22,7 +22,7 @@ from curie_api.forges.memory import InMemoryCodeHost, InMemoryTracker, all_suppo
         (types.GITHUB, types.GITLAB),
         (types.GITLAB, types.GITHUB),
         (types.GITHUB, types.BITBUCKET_CLOUD),
-        (types.GITLAB, types.BITBUCKET_DATA_CENTER),
+        (types.GITLAB, types.BITBUCKET_DC),
     ],
 )
 def test_a_native_tracker_is_refused_with_another_forge(tracker: str, code_host: str) -> None:
@@ -35,10 +35,10 @@ def test_a_native_tracker_is_refused_with_another_forge(tracker: str, code_host:
     [
         (types.GITHUB, types.GITHUB),
         (types.GITLAB, types.GITLAB),
-        (types.JIRA, types.GITHUB),
-        (types.JIRA, types.GITLAB),
-        (types.JIRA, types.BITBUCKET_CLOUD),
-        (types.JIRA, types.BITBUCKET_DATA_CENTER),
+        (types.JIRA_CLOUD, types.GITHUB),
+        (types.JIRA_CLOUD, types.GITLAB),
+        (types.JIRA_CLOUD, types.BITBUCKET_CLOUD),
+        (types.JIRA_CLOUD, types.BITBUCKET_DC),
     ],
 )
 def test_allowed_pairings_are_accepted(tracker: str, code_host: str) -> None:
@@ -51,7 +51,7 @@ def test_allowed_pairings_are_accepted(tracker: str, code_host: str) -> None:
     ("tracker", "code_host"),
     [
         (types.BITBUCKET_CLOUD, types.BITBUCKET_CLOUD),
-        (types.JIRA, types.JIRA),
+        (types.JIRA_CLOUD, types.JIRA_CLOUD),
         ("svn", types.GITHUB),
     ],
 )
@@ -62,7 +62,7 @@ def test_a_kind_on_the_wrong_side_is_refused(tracker: str, code_host: str) -> No
 
 def test_write_access_is_mandatory_only_on_a_native_pairing() -> None:
     assert Operation.USER_CAN_WRITE in mandatory_capabilities(types.GITHUB, types.GITHUB).code_host
-    jira = mandatory_capabilities(types.JIRA, types.BITBUCKET_CLOUD)
+    jira = mandatory_capabilities(types.JIRA_CLOUD, types.BITBUCKET_CLOUD)
     assert Operation.USER_CAN_WRITE not in jira.code_host
     assert Operation.LINK_PULL_REQUEST not in jira.tracker
 

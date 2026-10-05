@@ -259,6 +259,7 @@ class InMemoryTracker(_Declared):
         self._issues: dict[TrackerIssueRef, _Issue] = {}
         self._timeline: list[_TimelineEvent] = []
         self._authorized: set[str] = set()
+        self._groups: dict[str, set[str]] = {}
         self._ids = itertools.count(9001)
         self._comments = InMemoryMarkedComments(
             kind=kind,
@@ -291,6 +292,9 @@ class InMemoryTracker(_Declared):
 
     def grant(self, actor: Actor, allowed: bool = True) -> None:
         (self._authorized.add if allowed else self._authorized.discard)(actor.id)
+
+    def add_to_group(self, group_id: str, actor: Actor) -> None:
+        self._groups.setdefault(group_id, set()).add(actor.id)
 
     def _record(
         self, issue: TrackerIssueRef, disposition: Disposition, marker: str, actor: Actor
@@ -454,6 +458,10 @@ class InMemoryTracker(_Declared):
         if not self._gate(Operation.DEPENDENCIES):
             return ()
         return self._issue(issue).dependencies
+
+    async def in_group(self, actor: Actor, group_id: str) -> bool:
+        self._gate(Operation.GROUP_MEMBERSHIP)
+        return actor.id in self._groups.get(group_id, set())
 
 
 @dataclass
