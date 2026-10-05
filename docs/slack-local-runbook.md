@@ -40,7 +40,8 @@ subscriptions are correct from the start.
    - Socket Mode on
    - the bot scopes (`app_mentions:read`, `chat:write`, `channels:read`,
      `channels:history`, `groups:history`, `im:history`, `im:read`,
-     `assistant:write`, and `files:read`)
+     `assistant:write`, `files:read`, `canvases:read`, `canvases:write` and
+     `groups:read`)
    - the `app_mention` and `message.im` event subscriptions
    - interactivity on (so button and block-action clicks arrive over Socket
      Mode)
@@ -49,11 +50,13 @@ subscriptions are correct from the start.
    `SLACK_APP_TOKEN`, used for the Socket Mode connection.
 3. **Install to Workspace** (Install App), then copy the **Bot User OAuth
    Token**. This `xoxb-...` value is your `SLACK_BOT_TOKEN`, used by the Web API
-   to post replies. If this app was installed before `channels:read` or
-   `files:read` was added, reinstall it to the workspace so the existing
-   bot-token grant is refreshed. A stale `channels:read` grant is what the boot
-   preflight below refuses on; a stale `files:read` grant costs you attachments
-   and a warning, not the boot.
+   to post replies. If this app was installed before `channels:read`,
+   `files:read`, `canvases:read`, `canvases:write` or `groups:read` was added,
+   reinstall it to the workspace so the existing bot-token grant is refreshed.
+   A stale `channels:read` grant is what the boot preflight below refuses on; a
+   stale `files:read` grant costs you attachments and a warning, not the boot;
+   a stale canvas or `groups:read` grant refuses the canvas tools by name
+   (`channel_read.provider_scope_missing`), not the boot.
 4. `SLACK_SIGNING_SECRET` is optional and unused in Socket Mode (kept only for
    Bolt app construction); leave it empty.
 

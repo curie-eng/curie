@@ -109,8 +109,20 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   8 pages, a window is at most 7 days, and `limit` defaults to 50 with a 100
   maximum. Refusals are named `channel_read.*` codes; a 429 carries
   `Retry-After`. It stores no message body. State, issue read
-  and other scoped credentials do not authorize it, and `chr` authorizes no
-  other route.
+  and other scoped credentials do not authorize it, and `chr` authorizes only
+  `/channel-read` and its canvas sibling `/channel-canvas` (ADR 0200). The
+  history read also requires the `channelRead` grant carried in the claims, so
+  a canvas only bundle never reads history. `/channel-canvas` repeats the same
+  generation and digest checks, requires the operation's own grant carried in
+  the claims (`canvasList`, `canvasRead`, `canvasEdit`), checks that the canvas
+  is shared into one of the agent's bindings with the bot a member before any
+  download or edit, charges one page per successful operation, and edits only
+  a table cell a read recorded in the same logical turn
+  (`channel_read/canvas_sections.py`). Slack canvas calls live only in
+  `channel_read/slack_canvas.py`. Each edit is written to
+  `channel_canvas_edits` (attempted, then applied or failed; an unconfirmed
+  outcome stays attempted) before and after the Slack call. Retrieved canvas
+  content is not stored.
 - **Git-flow never calls the GitHub API.** `gitflow.py` builds the bundle by
   archiving the pushed sha directly from the repo over the git protocol (bare
   repos in tests, the real remote in production). This keeps the flow

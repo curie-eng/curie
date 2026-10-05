@@ -5,7 +5,8 @@ one logical turn through the API's internal context route, under an owner id
 unique to the attempt and against the deployment the sandbox actually runs,
 records the live logical turn in Valkey so a steer on any worker can renew it,
 refuses the turn when the runner does not advertise ``channel_read: true``,
-and attaches the capability to the runner ``Event``.
+and attaches the capability to the runner ``Event``. A canvas grant (ADR 0200)
+counts as a grant here: the same capability serves the canvas tools.
 
 The grant is read from the stored bundle's manifest, cached by bundle ref,
 so an ungranted turn makes no mint call and a granted turn on a runner that
@@ -277,7 +278,9 @@ class _ManifestUnreadable(Exception):
 
 
 def _read_grant(reader: BundleReader, bundle_ref: str, limits: tuple[int, float, int]) -> bool:
-    """Whether a stored bundle's manifest grants channel read (literal true).
+    """Whether a stored bundle's manifest grants any platform Slack capability.
+
+    That is channel read or a canvas operation, each a literal true.
 
     Only a manifest that parses establishes an answer; a missing or malformed
     one raises ``_ManifestUnreadable`` so it is never taken as no grant."""
@@ -301,7 +304,7 @@ def _read_grant(reader: BundleReader, bundle_ref: str, limits: tuple[int, float,
             )
         except (ValidationError, ValueError) as exc:
             raise _ManifestUnreadable("the bundle manifest does not parse") from exc
-    return manifest.channelRead is True
+    return bool(manifest.platform_slack_grants())
 
 
 async def _bundle_grant(self: Kernel, bundle_ref: str | None) -> bool | None:

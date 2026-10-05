@@ -1734,6 +1734,44 @@ class ActionAuditEntry(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+class ChannelCanvasEdit(Base):
+    """One agent edit of one canvas cell (ADR 0200), append and settle.
+
+    The row is committed ``attempted`` before Slack is called, then settled
+    ``applied`` or ``failed`` only when Slack's answer is definite. A row left
+    ``attempted`` means the edit may have applied. ``before_text`` and
+    ``after_text`` are never logged or rendered.
+    """
+
+    __tablename__ = "channel_canvas_edits"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('attempted', 'applied', 'failed')",
+            name="channel_canvas_edits_status_ck",
+        ),
+        Index("ix_channel_canvas_edits_canvas_created", "canvas_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
+    )
+    deployment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    turn: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(Text)
+    channel_address: Mapped[str] = mapped_column(Text)
+    canvas_id: Mapped[str] = mapped_column(Text)
+    section_id: Mapped[str] = mapped_column(Text)
+    before_text: Mapped[str] = mapped_column(Text)
+    after_text: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
 class WorkflowStateEntry(Base):
     """Durable, agent-scoped key/value state (#23, first slice).
 

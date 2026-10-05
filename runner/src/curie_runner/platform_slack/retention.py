@@ -2,8 +2,10 @@
 
 A successful ``curie-slack`` read result is replaced, in the portable record
 only, by a provenance stub: message ids, thread ids, timestamps and permalinks,
-never text or authors. Error results carry no body and are kept verbatim. The
-model's in-session context is unchanged; it is request lifetime cache.
+never text or authors. A canvas result (ADR 0200, ``source: "canvas"``) keeps
+only canvas ids, section ids and creation times, never titles or cell or
+paragraph text. Error results carry no body and are kept verbatim. The model's
+in-session context is unchanged; it is request lifetime cache.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from typing import Any, Final
 from ..history import ConversationMessage
 
 STUB_NOTE: Final = "Channel message bodies are not retained after the turn."
+CANVAS_STUB_NOTE: Final = "Canvas text is not retained after the turn."
 _KEPT_FIELDS: Final = ("id", "thread_id", "timestamp", "provenance")
 
 
@@ -30,6 +33,23 @@ def _result_text(content: Any) -> str:
     return ""
 
 
+def _canvas_stub(page: Mapping[str, Any]) -> str:
+    stub: dict[str, Any] = {"bodies_retained": False, "note": CANVAS_STUB_NOTE}
+    if isinstance(page.get("operation"), str):
+        stub["operation"] = page["operation"]
+    for field in ("canvas_id", "section_id"):
+        if isinstance(page.get(field), str):
+            stub[field] = page[field]
+    raw = page.get("canvases")
+    if isinstance(raw, list):
+        stub["canvases"] = [
+            {field: item[field] for field in ("id", "created") if isinstance(item.get(field), str)}
+            for item in raw
+            if isinstance(item, Mapping)
+        ]
+    return json.dumps(stub)
+
+
 def _stub(content: Any) -> str:
     try:
         page: Any = json.loads(_result_text(content))
@@ -37,6 +57,8 @@ def _stub(content: Any) -> str:
         page = None
     if not isinstance(page, dict):
         page = {}
+    if page.get("source") == "canvas":
+        return _canvas_stub(page)
     raw = page.get("messages")
     messages = [
         {field: item[field] for field in _KEPT_FIELDS if isinstance(item.get(field), str)}

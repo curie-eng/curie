@@ -315,6 +315,7 @@ _HTTP_OPERATIONS = [
     # Break-glass recovery (#2753).
     "/approvals/identity-report",
     "/approvals/{approval_id}/recover",
+    "/channel-canvas",
     "/channel-read",
     "/channels/admission",
     "/channels/token",

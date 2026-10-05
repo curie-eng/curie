@@ -1,4 +1,5 @@
-"""The agent's bounded channel read and its worker mint route (ADR 0100, #2877)."""
+"""The agent's bounded channel read and its worker mint route (ADR 0100, #2877),
+and its canvas sibling (ADR 0200, #3819)."""
 
 import logging
 from collections.abc import Callable, Coroutine
@@ -11,6 +12,8 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
 from curie_api.schemas.channel_read import (
+    ChannelCanvasRequest,
+    ChannelCanvasResult,
     ChannelReadContext,
     ChannelReadContextMint,
     ChannelReadPage,
@@ -18,6 +21,8 @@ from curie_api.schemas.channel_read import (
 )
 
 from ..auth import require_internal_worker_token
+from ..channel_read.canvas import authorize_and_canvas, canvas_readers
+from ..channel_read.canvas_sections import CanvasSections
 from ..channel_read.errors import ChannelReadRefused
 from ..channel_read.ledger import ChannelReadLedger, LedgerUnavailable
 from ..channel_read.provider_guard import ProviderGuard
@@ -163,4 +168,61 @@ async def read_channel(
         raise _refusal(refused) from None
     except LedgerUnavailable:
         _LOG.warning("channel read refused: the ledger is unavailable")
+        raise _unavailable() from None
+
+
+_CANVAS_REFUSALS: dict[int | str, dict[str, Any]] = {
+    status: {"description": description}
+    for status, description in (
+        (400, "No channel or kind named and no default channel"),
+        (401, "Missing or invalid channel read capability"),
+        (
+            403,
+            "Operation not granted, channel or kind not bound, canvas not shared into a "
+            "bound channel, the app is not a member, or the provider refused the edit",
+        ),
+        (404, "Canvas not found"),
+        (
+            409,
+            "Turn inactive or expired, grant revoked, kind unsupported, section not read "
+            "this turn or no longer editable, or the canvas is too large",
+        ),
+        (422, "Invalid identifier, cell text, misplaced field, body, or not a canvas"),
+        (429, "Page or attempt budget exhausted, or the provider rate limited"),
+        (
+            502,
+            "The provider returned an error, the canvas was unreadable, or the edit "
+            "outcome is unknown",
+        ),
+        (503, "Ledger unavailable, no provider credential, or a provider scope missing"),
+    )
+}
+
+
+@router.post("/channel-canvas", response_model=ChannelCanvasResult, responses=_CANVAS_REFUSALS)
+async def channel_canvas(
+    data: ChannelCanvasRequest,
+    request: Request,
+    response: Response,
+    session: SessionDep,
+    claims: Annotated[ChannelReadClaims, Depends(require_channel_read)],
+) -> ChannelCanvasResult:
+    response.headers["Cache-Control"] = "no-store"
+    settings = get_settings()
+    valkey = request.app.state.valkey
+    try:
+        return await authorize_and_canvas(
+            claims=claims,
+            body=data,
+            session=session,
+            ledger=_ledger(request),
+            guard=ProviderGuard(valkey, settings.worker_key_prefix),
+            sections=CanvasSections(valkey, settings.worker_key_prefix),
+            settings=settings,
+            readers=canvas_readers(settings, request.app.state.http_client),
+        )
+    except ChannelReadRefused as refused:
+        raise _refusal(refused) from None
+    except LedgerUnavailable:
+        _LOG.warning("channel canvas refused: the ledger is unavailable")
         raise _unavailable() from None

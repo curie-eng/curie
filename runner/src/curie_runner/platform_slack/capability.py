@@ -16,7 +16,9 @@ turn. The platform route is the authority on every read.
 Nothing here renders the token or the URL: not ``repr``, not ``str``, not a log
 line. A capability whose URL is not the trusted platform origin, or whose path
 is not the read route, is refused and cleared, so a token is only ever
-presented to the platform that minted it.
+presented to the platform that minted it. The canvas tools (ADR 0200) derive
+their route from that admitted read route (``canvas_url``); no second URL is
+ever accepted.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from aci_protocol import ChannelReadCapability, Event
 
@@ -35,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 TOKEN_PREFIX = "chr"
 READ_PATH_SUFFIX = "/channel-read"
+CANVAS_PATH_SUFFIX = "/channel-canvas"
 _MAX_TOKEN_LENGTH = 4096
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -70,6 +73,20 @@ def url_origin(url: str | None) -> Origin | None:
     if scheme not in _DEFAULT_PORTS or not host:
         return None
     return (scheme, host, port if port is not None else _DEFAULT_PORTS[scheme])
+
+
+def canvas_url(capability: ChannelReadCapability) -> str:
+    """The sibling canvas route on the capability's own origin (ADR 0200).
+
+    Derived from a capability the holder already admitted, so its origin and
+    its ``/channel-read`` path were checked; no second URL is ever accepted.
+    """
+
+    parts = urlsplit(capability.url.strip())
+    if not parts.path.endswith(READ_PATH_SUFFIX):
+        raise ValueError("not an admitted channel read route")
+    path = parts.path[: -len(READ_PATH_SUFFIX)] + CANVAS_PATH_SUFFIX
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 
 def _decode_claims(token: str) -> _Claims | None:

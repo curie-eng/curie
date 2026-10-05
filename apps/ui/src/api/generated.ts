@@ -1023,6 +1023,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/channel-canvas": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Channel Canvas */
+        post: operations["channel_canvas_channel_canvas_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/channel-identities": {
         parameters: {
             query?: never;
@@ -3744,6 +3761,49 @@ export interface components {
             /** Expected Version */
             expected_version: number;
         };
+        /**
+         * CanvasCell
+         * @description One table cell. ``section_id`` is set only when the cell is editable.
+         */
+        CanvasCell: {
+            /** Section Id */
+            section_id: string | null;
+            /** Text */
+            text: string;
+            /** Truncated */
+            truncated: boolean;
+        };
+        /**
+         * CanvasParagraph
+         * @description Text outside any table; its ``section_id`` is informational, never editable.
+         */
+        CanvasParagraph: {
+            /** Section Id */
+            section_id: string | null;
+            /** Text */
+            text: string;
+            /** Truncated */
+            truncated: boolean;
+        };
+        /** CanvasSummary */
+        CanvasSummary: {
+            /** Created */
+            created: string;
+            /** Id */
+            id: string;
+            /** Title */
+            title: string;
+        };
+        /**
+         * CanvasTable
+         * @description A table by position: the first row is the header, the rest are rows.
+         */
+        CanvasTable: {
+            /** Header */
+            header: components["schemas"]["CanvasCell"][];
+            /** Rows */
+            rows: components["schemas"]["CanvasCell"][][];
+        };
         /** ChannelAddress */
         ChannelAddress: {
             /** Address */
@@ -3879,6 +3939,54 @@ export interface components {
         ChannelCallersWrite: {
             /** Allowed Callers */
             allowed_callers: string[] | null;
+        };
+        /**
+         * ChannelCanvasRequest
+         * @description One canvas list, read or cell edit on a bound surface (ADR 0200).
+         *
+         *     Which fields an operation takes is checked by the service, so a misplaced
+         *     one is refused by name: ``channel`` for a list; ``kind`` and ``canvas_id``
+         *     for a read; those plus ``section_id`` and ``text`` for an edit.
+         */
+        ChannelCanvasRequest: {
+            /** Canvas Id */
+            canvas_id?: string | null;
+            channel?: components["schemas"]["ChannelSelector"] | null;
+            /** Kind */
+            kind?: string | null;
+            /**
+             * Operation
+             * @enum {string}
+             */
+            operation: "list" | "read" | "edit";
+            /** Section Id */
+            section_id?: string | null;
+            /** Text */
+            text?: string | null;
+        };
+        /** ChannelCanvasResult */
+        ChannelCanvasResult: {
+            /** Canvas Id */
+            canvas_id?: string | null;
+            /** Canvases */
+            canvases?: components["schemas"]["CanvasSummary"][] | null;
+            /** Edited */
+            edited?: boolean | null;
+            /** Has More */
+            has_more?: boolean | null;
+            /**
+             * Operation
+             * @enum {string}
+             */
+            operation: "list" | "read" | "edit";
+            /** Paragraphs */
+            paragraphs?: components["schemas"]["CanvasParagraph"][] | null;
+            /** Section Id */
+            section_id?: string | null;
+            /** Tables */
+            tables?: components["schemas"]["CanvasTable"][] | null;
+            /** Title */
+            title?: string | null;
         };
         /**
          * ChannelIdentityCreate
@@ -9162,6 +9270,95 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
+            };
+        };
+    };
+    channel_canvas_channel_canvas_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Channel-Read"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChannelCanvasRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelCanvasResult"];
+                };
+            };
+            /** @description No channel or kind named and no default channel */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid channel read capability */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation not granted, channel or kind not bound, canvas not shared into a bound channel, the app is not a member, or the provider refused the edit */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Canvas not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Turn inactive or expired, grant revoked, kind unsupported, section not read this turn or no longer editable, or the canvas is too large */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid identifier, cell text, misplaced field, body, or not a canvas */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Page or attempt budget exhausted, or the provider rate limited */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The provider returned an error, the canvas was unreadable, or the edit outcome is unknown */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Ledger unavailable, no provider credential, or a provider scope missing */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

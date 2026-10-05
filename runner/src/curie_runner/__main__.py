@@ -105,7 +105,7 @@ from .platform_slack.capability import ChannelReadTurn, url_origin
 from .plugin import (
     bundle_mcp_servers,
     bundle_skill_names,
-    load_bundle_channel_read,
+    load_bundle_platform_slack_grants,
     load_bundle_web_search_enabled,
 )
 from .progress import (
@@ -128,7 +128,7 @@ from .state import (
 )
 from .subprocess_env import lock_process_environ
 from .tool_access import TurnToolAccess, front_can_use_tool, front_pre_tool_use_hooks
-from .tool_names import CHANNEL_READ_TOOL_NAMES, STATE_SERVER_NAME
+from .tool_names import STATE_SERVER_NAME, platform_slack_tool_names
 from .turn_progress import (
     PROGRESS_PREAMBLE,
     TurnProgress,
@@ -760,10 +760,15 @@ def build_runner(
     # build_approval_gate refuses a bundle gate that would redefine the route
     # of a tool the operator already gated. Either raises before the first
     # turn, so a misdeclared policy never boots ungated.
-    # Channel read (ADR 0100, #2877): a granted, real-model boot mounts the
-    # platform curie-slack server. The fake tier mounts no platform server and
-    # makes no network call, so it never mounts or advertises it.
-    channel_read_mounted = load_bundle_channel_read(config.session.plugin_dir) and not fake_model
+    # Channel read (ADR 0100, #2877) and canvases (ADR 0200, #3819): a
+    # real-model boot with any platform Slack grant mounts the platform
+    # curie-slack server, and each tool on it still needs its own grant. The
+    # fake tier mounts no platform server and makes no network call, so it
+    # never mounts or advertises it.
+    platform_slack_grants = (
+        frozenset() if fake_model else load_bundle_platform_slack_grants(config.session.plugin_dir)
+    )
+    channel_read_mounted = bool(platform_slack_grants)
     try:
         resolution = resolve_approval_policy(config.session.plugin_dir)
         approval_gate = build_approval_gate(
@@ -965,9 +970,13 @@ def build_runner(
             policy_disallowed_tools(
                 approval_gate,
                 # The probe never sees an in-process server, so the mounted
-                # read tools join the projection by their published names.
+                # curie-slack tools join the projection by their published names.
                 capability.observed_tools
-                | (CHANNEL_READ_TOOL_NAMES if channel_read_turn is not None else frozenset()),
+                | (
+                    platform_slack_tool_names(platform_slack_grants)
+                    if channel_read_turn is not None
+                    else frozenset()
+                ),
             )
             if approval_gate is not None
             else ()
@@ -1028,7 +1037,11 @@ def build_runner(
                 else {}
             ),
             **(
-                {CHANNEL_READ_SERVER_NAME: build_channel_read_server(channel_read_turn)}
+                {
+                    CHANNEL_READ_SERVER_NAME: build_channel_read_server(
+                        channel_read_turn, platform_slack_grants
+                    )
+                }
                 if channel_read_turn is not None
                 else {}
             ),
