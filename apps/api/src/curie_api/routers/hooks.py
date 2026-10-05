@@ -763,7 +763,7 @@ def _resolve_support(snapshot: SourceSnapshot, requested: ToolAccess | None) -> 
         if snapshot.attempt_history_present:
             effective, reason = ToolAccess.READ_ONLY, "source_closed"
     elif policy.mode == "ordinary":
-        generation = str(policy.generation)
+        generation, reason = str(policy.generation), "source_closed"
     elif policy.mode == "protected":
         effective, generation = ToolAccess.READ_ONLY, str(policy.generation)
         reason = "broker_unavailable"
@@ -848,6 +848,8 @@ async def probe_hook_support(
     ) as snapshot:
         resolution = _resolve_support(snapshot, requested)
     return JSONResponse(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        status_code=(
+            status.HTTP_200_OK if resolution.supported else status.HTTP_503_SERVICE_UNAVAILABLE
+        ),
         content=resolution.model_dump(mode="json"),
     )
