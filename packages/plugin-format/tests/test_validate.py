@@ -2199,6 +2199,131 @@ def test_channel_read_policy_without_grant_reports_capability_requirement(
     assert "declare the server" not in issue.message
 
 
+_SLACK_GRANTS = ("channelRead", "canvasList", "canvasRead", "canvasEdit")
+
+
+@pytest.mark.parametrize("collection", ["allow", "approvalRequired", "deny"])
+@pytest.mark.parametrize("grant", _SLACK_GRANTS)
+def test_each_single_platform_slack_grant_is_a_recognized_policy_server(
+    tmp_path: Path, grant: str, collection: str
+) -> None:
+    bundle = _bundle(
+        tmp_path,
+        json.dumps(
+            {
+                "name": "acme-bot",
+                grant: True,
+                "toolPolicy": {
+                    "enforcement": TOOL_POLICY_ENFORCEMENT,
+                    collection: ["curie-slack/read_canvas"],
+                },
+            }
+        ),
+    )
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert result.valid, result.errors
+    assert not (bundle / ".mcp.json").exists()
+    assert not (bundle / "connectors.yaml").exists()
+
+
+def test_all_platform_slack_grants_true_validates_cleanly(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        json.dumps(
+            {
+                "name": "acme-bot",
+                **{grant: True for grant in _SLACK_GRANTS},
+                "toolPolicy": {
+                    "enforcement": TOOL_POLICY_ENFORCEMENT,
+                    "allow": [
+                        "curie-slack/history",
+                        "curie-slack/list_channel_canvases",
+                        "curie-slack/read_canvas",
+                        "curie-slack/edit_canvas_cell",
+                    ],
+                },
+            }
+        ),
+    )
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert result.valid, result.errors
+
+
+@pytest.mark.parametrize("grant", ["canvasList", "canvasRead", "canvasEdit"])
+@pytest.mark.parametrize("value", [False, True])
+def test_bundle_canvas_grants_accept_boolean_values(
+    tmp_path: Path, grant: str, value: bool
+) -> None:
+    bundle = _bundle(tmp_path, json.dumps({"name": "acme-bot", grant: value}))
+    result = validate_bundle(bundle)
+    assert result.valid, result.errors
+
+
+@pytest.mark.parametrize("grant", ["canvasList", "canvasRead", "canvasEdit"])
+@pytest.mark.parametrize("value", [None, 0, 1, "true", "false", [], {}, {"channels": []}])
+def test_bundle_canvas_grants_refuse_non_boolean_values(
+    tmp_path: Path, grant: str, value: object
+) -> None:
+    bundle = _bundle(tmp_path, json.dumps({"name": "acme-bot", grant: value}))
+    result = validate_bundle(bundle)
+    assert not result.valid
+    issue = next(issue for issue in result.errors if issue.code == "manifest.invalid")
+    assert grant in issue.message
+
+
+@pytest.mark.parametrize("grant", [None, False], ids=["absent", "false"])
+def test_slack_policy_with_only_non_literal_canvas_grants_requires_a_real_grant(
+    tmp_path: Path, grant: object
+) -> None:
+    manifest: dict[str, object] = {
+        "name": "acme-bot",
+        "toolPolicy": {
+            "enforcement": TOOL_POLICY_ENFORCEMENT,
+            "allow": ["curie-slack/read_canvas"],
+        },
+    }
+    if grant is not None:
+        manifest["canvasRead"] = grant
+    bundle = _bundle(tmp_path, json.dumps(manifest))
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    assert "channel_read.grant_required" in {issue.code for issue in result.errors}
+
+
+def test_grant_required_message_names_all_four_grants(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        json.dumps(
+            {
+                "name": "acme-bot",
+                "toolPolicy": {
+                    "enforcement": TOOL_POLICY_ENFORCEMENT,
+                    "allow": ["curie-slack/edit_canvas_cell"],
+                },
+            }
+        ),
+    )
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    issue = next(issue for issue in result.errors if issue.code == "channel_read.grant_required")
+    for grant in _SLACK_GRANTS:
+        assert grant in issue.message
+    assert "curie-slack" in issue.message
+
+
+@pytest.mark.parametrize("grant", _SLACK_GRANTS)
+def test_reserved_name_error_names_all_four_grants(tmp_path: Path, grant: str) -> None:
+    servers = {"curie-slack": {"command": "example-mcp-server"}}
+    bundle = _bundle(
+        tmp_path,
+        json.dumps({"name": "acme-bot", grant: True, "mcpServers": servers}),
+    )
+    result = validate_bundle(bundle)
+    assert not result.valid
+    issue = next(issue for issue in result.errors if issue.code == "mcp.reserved_name")
+    for name in _SLACK_GRANTS:
+        assert name in issue.message
+
+
 def test_granted_channel_read_policy_still_requires_policy_enforcement(tmp_path: Path) -> None:
     bundle = _bundle(
         tmp_path,

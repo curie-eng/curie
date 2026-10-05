@@ -873,8 +873,9 @@ def _validate_mcp_object(obj: object, location: str, c: _Collector) -> set[str] 
             c.error(
                 "mcp.reserved_name",
                 f"mcp server {name!r} is reserved for the platform owned channel read "
-                "capability. A bundle cannot declare it; use channelRead: true to "
-                "grant the capability and toolPolicy to restrict its tools.",
+                "capability. A bundle cannot declare it; grant it with channelRead, "
+                "canvasList, canvasRead or canvasEdit set to true, and restrict its "
+                "tools with toolPolicy.",
                 location,
             )
         if server.command is None and server.url is None:
@@ -1465,18 +1466,20 @@ def _validate_tool_policy(
         if mcp_servers is not None and connector_servers is not None
         else None
     )
-    if expected_servers is not None and manifest.channelRead:
+    slack_granted = bool(manifest.platform_slack_grants())
+    if expected_servers is not None and slack_granted:
         expected_servers.add(CHANNEL_READ_SERVER_NAME)
     if expected_servers is not None:
         for collection, i, pattern in policy_patterns(policy):
             server = literal_server_segment(pattern)
-            if server == CHANNEL_READ_SERVER_NAME and not manifest.channelRead:
+            if server == CHANNEL_READ_SERVER_NAME and not slack_granted:
                 c.error(
                     "channel_read.grant_required",
                     f"tool pattern {pattern!r} names {CHANNEL_READ_SERVER_NAME!r}, but "
-                    "channelRead is not true. Grant the capability with channelRead: true "
-                    "before declaring a policy for its tools. Its server name is reserved "
-                    "and cannot be declared by the bundle.",
+                    "none of channelRead, canvasList, canvasRead or canvasEdit is true. "
+                    "Grant one of them with a literal true before declaring a policy for "
+                    "its tools. Its server name is reserved and cannot be declared by "
+                    "the bundle.",
                     f"plugin.json (toolPolicy.{collection}[{i}])",
                 )
                 continue

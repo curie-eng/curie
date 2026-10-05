@@ -325,7 +325,7 @@ CHANNEL_READ_SERVER_NAME: Final = "curie-slack"
 _RESERVED_CONNECTOR_DISPLACES: dict[str, str] = {
     "curie": "`request_approval`",
     "curie-state": "the durable-state tools",
-    CHANNEL_READ_SERVER_NAME: "the granted channel read capability",
+    CHANNEL_READ_SERVER_NAME: "the granted platform Slack capability (channel read and canvases)",
 }
 RESERVED_CONNECTOR_NAMES: frozenset[str] = frozenset(_RESERVED_CONNECTOR_DISPLACES)
 

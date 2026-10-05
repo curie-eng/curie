@@ -35,7 +35,10 @@
         { "field": "secrets", "why": "declared secret NAMES are surfaced by other verbs (skill up --secret), not skill approvals." },
         { "field": "triggers", "why": "no approvals-verb output surfaces the manifest's trigger declarations." },
         { "field": "toolPolicy", "why": "the vanilla MCP tool-policy declaration is a runtime-enforcement contract with no runtime enforcing it yet and no output surface on skill approvals; when a verb surfaces it, this omission becomes a carried field." },
-        { "field": "channelRead", "why": "skill approvals reads the bundle name and approval gate and route declarations; the separate channel read grant has no output surface on this verb." }
+        { "field": "channelRead", "why": "skill approvals reads the bundle name and approval gate and route declarations; the separate channel read grant has no output surface on this verb." },
+        { "field": "canvasList", "why": "skill approvals reads the bundle name and approval gate and route declarations; the separate canvas list grant has no output surface on this verb." },
+        { "field": "canvasRead", "why": "skill approvals reads the bundle name and approval gate and route declarations; the separate canvas read grant has no output surface on this verb." },
+        { "field": "canvasEdit", "why": "skill approvals reads the bundle name and approval gate and route declarations; the separate canvas edit grant has no output surface on this verb." }
       ]
     },
     {

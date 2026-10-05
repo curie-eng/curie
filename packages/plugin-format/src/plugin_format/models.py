@@ -13,9 +13,13 @@ Shapes covered:
     .mcp.json                    McpConfig / McpServer
 """
 
-from typing import Any
+from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict, Field
+
+# The platform Slack grants a manifest may carry (ADR 0100, #3819). Only a
+# literal true grants; this tuple is the one vocabulary every reader uses.
+PLATFORM_SLACK_GRANT_FIELDS: Final = ("channelRead", "canvasList", "canvasRead", "canvasEdit")
 
 # Forward compatible: accept and keep unknown keys rather than failing a real
 # bundle that carries fields we do not model yet.
@@ -91,6 +95,18 @@ class PluginManifest(BaseModel):
     # Permission for a platform owned channel read capability under ADR 0100.
     # Only literal true grants it; the value carries no selectors or credentials.
     channelRead: bool = Field(default=False, strict=True)
+    # Permissions for the platform owned canvas tools (#3819). Three
+    # separate grants so a read-only bundle cannot gain write; none implies
+    # another, and only literal true grants.
+    canvasList: bool = Field(default=False, strict=True)
+    canvasRead: bool = Field(default=False, strict=True)
+    canvasEdit: bool = Field(default=False, strict=True)
+
+    def platform_slack_grants(self) -> frozenset[str]:
+        """The platform Slack grants this manifest holds as a literal true."""
+        return frozenset(
+            name for name in PLATFORM_SLACK_GRANT_FIELDS if getattr(self, name) is True
+        )
 
 
 # Trigger types the manifest may declare beyond inbound chat (epic #29).
