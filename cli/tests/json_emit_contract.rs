@@ -1138,6 +1138,8 @@ fn deploy_output_json_shape_is_pinned() {
             deployment_id: "dep_1".to_string(),
             deployment_environment: "dev".to_string(),
             deployment_status: "active".to_string(),
+            cron_triggers: Vec::new(),
+            warnings: Vec::new(),
         }
         .to_json(),
         expected
@@ -1467,6 +1469,8 @@ enum DeployTargetChannels {
 struct ClusterDeployFixture {
     all_targets: bool,
     cron_trigger: bool,
+    cron_target: Option<&'static str>,
+    json_output: bool,
     deploy_failure: DeployFixtureFailure,
     connectors: ConnectorFixture,
     kubectl_failure: KubectlFixtureFailure,
@@ -1479,6 +1483,8 @@ impl Default for ClusterDeployFixture {
         Self {
             all_targets: true,
             cron_trigger: false,
+            cron_target: None,
+            json_output: true,
             deploy_failure: DeployFixtureFailure::None,
             connectors: ConnectorFixture::Empty,
             kubectl_failure: KubectlFixtureFailure::None,
@@ -1762,7 +1768,7 @@ fn stub_path(bin_dir: &Path) -> std::ffi::OsString {
     std::env::join_paths(paths).expect("join stub PATH")
 }
 
-fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<support::Request>) {
+fn run_cluster_deploy(fixture: ClusterDeployFixture) -> (Output, Vec<support::Request>) {
     let plugin = tempfile::tempdir().expect("plugin tempdir");
     curie::scaffold::scaffold(plugin.path(), "acme-bundle").expect("scaffold test bundle");
     if fixture.cron_trigger {
@@ -1774,8 +1780,22 @@ fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<suppor
         manifest["triggers"] = json!([{
             "type": "cron",
             "name": "acme-nightly",
-            "schedule": "0 2 * * *"
+            "schedule": "0 2 * * *",
+            "timezone": "Europe/London",
+            "prompt": "Report the scheduled result."
         }]);
+        if let Some(target) = fixture.cron_target {
+            manifest["triggers"][0]["target"] = json!(target);
+            manifest["triggers"]
+                .as_array_mut()
+                .expect("cron declaration array")
+                .push(json!({
+                    "type": "cron",
+                    "name": "acme-maintenance",
+                    "schedule": "30 3 * * *",
+                    "prompt": "Perform the scheduled maintenance."
+                }));
+        }
         fs::write(
             manifest_path,
             serde_json::to_string_pretty(&manifest).expect("serialize cron manifest"),
@@ -1824,9 +1844,13 @@ fn run_cluster_deploy_json(fixture: ClusterDeployFixture) -> (Output, Vec<suppor
     } else {
         command.args(["--target", "dev"]);
     }
+    if fixture.json_output {
+        command.arg("--json");
+    }
     command
-        .arg("--json")
         .env("PATH", stub_path(tools.path()))
+        .env("CURIE_CONFIG_DIR", empty_config_dir.path())
+        .env("NO_COLOR", "1")
         .env_remove("CURIE_API_URL")
         .env_remove("CURIE_API_KEY")
         .env_remove("DEV_TOKEN")
@@ -1907,13 +1931,15 @@ fn expected_deploy(target: &str) -> serde_json::Value {
             "id": format!("deployment-{target}"),
             "environment": environment,
             "status": "active"
-        }
+        },
+        "cron_triggers": [],
+        "warnings": []
     })
 }
 
 #[test]
 fn cluster_deploy_target_refuses_documentation_placeholder_before_mutation() {
-    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
         all_targets: false,
         target_channels: DeployTargetChannels::DocumentationPlaceholders,
         ..ClusterDeployFixture::default()
@@ -1944,7 +1970,7 @@ fn cluster_deploy_target_refuses_documentation_placeholder_before_mutation() {
 
 #[test]
 fn cluster_deploy_target_preserves_actionable_api_placeholder_refusal() {
-    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
         all_targets: false,
         target_channels: DeployTargetChannels::ApiRejectsDocumentationPlaceholder,
         ..ClusterDeployFixture::default()
@@ -1997,7 +2023,7 @@ fn assert_failure_keys(value: &serde_json::Value, includes_failed_result: bool) 
 
 #[test]
 fn cluster_deploy_json_all_targets_emits_one_ordered_complete_object() {
-    let (output, _) = run_cluster_deploy_json(ClusterDeployFixture::default());
+    let (output, _) = run_cluster_deploy(ClusterDeployFixture::default());
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -2020,11 +2046,11 @@ fn cluster_deploy_json_all_targets_emits_one_ordered_complete_object() {
 }
 
 #[test]
-fn cluster_deploy_with_cron_trigger_emits_no_cron_warning() {
-    // The worker scheduler fires cron triggers on cluster installs (#268), so
-    // deploy has nothing to warn about for single or all target invocations.
+fn cluster_deploy_with_targetless_cron_emits_no_cron_warning() {
+    // The worker scheduler fires cron triggers on cluster installs (#268).
+    // Targetless cron has no channel address to resolve or warn about (#4009).
     for all_targets in [false, true] {
-        let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
+        let (output, _) = run_cluster_deploy(ClusterDeployFixture {
             all_targets,
             cron_trigger: true,
             ..ClusterDeployFixture::default()
@@ -2043,9 +2069,142 @@ fn cluster_deploy_with_cron_trigger_emits_no_cron_warning() {
     }
 }
 
+fn all_targets_cron_warning() -> &'static str {
+    "cron trigger `acme-nightly` targets `C000000A02`, which matches no single channel bound to `acme-dev`; every slot records failed until that address is bound."
+}
+
+fn expected_deploy_with_cron(target: &str) -> serde_json::Value {
+    let mut value = expected_deploy(target);
+    value["cron_triggers"] = json!([
+        {"name": "acme-nightly", "schedule": "0 2 * * *", "zone": "Europe/London", "target": "C000000A02"},
+        {"name": "acme-maintenance", "schedule": "30 3 * * *", "zone": "UTC", "target": null}
+    ]);
+    value["warnings"] = if target == "dev" {
+        json!([all_targets_cron_warning()])
+    } else {
+        json!([])
+    };
+    value
+}
+
+#[test]
+fn cluster_deploy_human_all_targets_keeps_every_cron_receipt_and_the_first_warning() {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
+        cron_trigger: true,
+        cron_target: Some("C000000A02"),
+        json_output: false,
+        ..ClusterDeployFixture::default()
+    });
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "all targets must deploy: {stderr}"
+    );
+    assert_eq!(deployment_request_count(&requests), 2);
+    let nightly: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.contains("acme-nightly") && line.contains("0 2 * * *"))
+        .collect();
+    assert_eq!(
+        nightly.len(),
+        2,
+        "both successful targets must retain their cron receipt: {stdout}"
+    );
+    assert!(
+        nightly
+            .iter()
+            .all(|line| { line.contains("Europe/London") && line.contains("C000000A02") }),
+        "each receipt must show its zone and target: {stdout}"
+    );
+    let maintenance: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.contains("acme-maintenance") && line.contains("30 3 * * *"))
+        .collect();
+    assert_eq!(
+        maintenance.len(),
+        2,
+        "targetless cron appears for each target: {stdout}"
+    );
+    assert!(
+        maintenance
+            .iter()
+            .all(|line| { line.contains("UTC") && line.contains("targetless") }),
+        "targetless cron must retain its zone and target label: {stdout}"
+    );
+    assert_eq!(
+        stderr.matches(all_targets_cron_warning()).count(),
+        1,
+        "the earlier target's exact warning must remain visible once: {stderr}"
+    );
+    assert!(
+        !stderr.contains("which matches no single channel bound to `acme-prod`"),
+        "the last target binds the cron address and must not warn: {stderr}"
+    );
+}
+
+#[test]
+fn cluster_deploy_json_all_targets_keeps_cron_receipts_and_per_target_warnings() {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
+        cron_trigger: true,
+        cron_target: Some("C000000A02"),
+        ..ClusterDeployFixture::default()
+    });
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "all targets must deploy: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(deployment_request_count(&requests), 2);
+    assert_eq!(
+        one_stdout_object(&output),
+        json!({
+            "results": [
+                {"target": "dev", "result": expected_deploy_with_cron("dev")},
+                {"target": "prod", "result": expected_deploy_with_cron("prod")}
+            ]
+        })
+    );
+}
+
+#[test]
+fn cluster_deploy_json_cron_receipts_survive_later_deploy_and_connector_failures() {
+    let (output, _) = run_cluster_deploy(ClusterDeployFixture {
+        cron_trigger: true,
+        cron_target: Some("C000000A02"),
+        deploy_failure: DeployFixtureFailure::Deploy("prod"),
+        ..ClusterDeployFixture::default()
+    });
+    assert_eq!(output.status.code(), Some(1));
+    let value = one_stdout_object(&output);
+    assert_eq!(value["stage"], json!("deploy"));
+    assert_eq!(value["failed_target"], json!("prod"));
+    assert_eq!(
+        value["completed"],
+        json!([
+            {"target": "dev", "result": expected_deploy_with_cron("dev")}
+        ])
+    );
+
+    let (output, _) = run_cluster_deploy(ClusterDeployFixture {
+        cron_trigger: true,
+        cron_target: Some("C000000A02"),
+        connectors: ConnectorFixture::Manifest,
+        kubectl_failure: KubectlFixtureFailure::Apply,
+        ..ClusterDeployFixture::default()
+    });
+    assert_eq!(output.status.code(), Some(1));
+    let value = one_stdout_object(&output);
+    assert_eq!(value["stage"], json!("connector_sync"));
+    assert_eq!(value["failed_result"], expected_deploy_with_cron("dev"));
+    assert_eq!(value["completed"], json!([]));
+}
+
 #[test]
 fn cluster_deploy_json_later_failure_names_target_and_completed_results() {
-    let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, _) = run_cluster_deploy(ClusterDeployFixture {
         deploy_failure: DeployFixtureFailure::Deploy("prod"),
         ..ClusterDeployFixture::default()
     });
@@ -2068,7 +2227,7 @@ fn cluster_deploy_json_later_failure_names_target_and_completed_results() {
 
 #[test]
 fn cluster_deploy_json_first_failure_has_empty_completed_results() {
-    let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, _) = run_cluster_deploy(ClusterDeployFixture {
         deploy_failure: DeployFixtureFailure::Deploy("dev"),
         ..ClusterDeployFixture::default()
     });
@@ -2088,7 +2247,7 @@ fn cluster_deploy_json_first_failure_has_empty_completed_results() {
 
 #[test]
 fn cluster_deploy_json_all_targets_env_credentials_ignore_unset_home() {
-    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
         connectors: ConnectorFixture::CredentialKeys,
         credentials: CredentialEnvironment::BothWithoutHome,
         ..ClusterDeployFixture::default()
@@ -2117,7 +2276,7 @@ fn cluster_deploy_json_all_targets_env_credentials_ignore_unset_home() {
 
 #[test]
 fn cluster_deploy_json_later_connector_credential_failure_deploys_zero_targets() {
-    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
         connectors: ConnectorFixture::CredentialKeys,
         credentials: CredentialEnvironment::DevOnlyWithEmptyVault,
         ..ClusterDeployFixture::default()
@@ -2143,7 +2302,7 @@ fn cluster_deploy_json_later_connector_credential_failure_deploys_zero_targets()
 
 #[test]
 fn cluster_deploy_json_app_discovery_failure_is_precondition_with_zero_deployments() {
-    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
         kubectl_failure: KubectlFixtureFailure::Discovery,
         ..ClusterDeployFixture::default()
     });
@@ -2176,7 +2335,7 @@ fn cluster_deploy_json_app_discovery_failure_is_precondition_with_zero_deploymen
 
 #[test]
 fn cluster_deploy_json_connector_apply_failure_carries_failed_result_after_activation() {
-    let (output, requests) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, requests) = run_cluster_deploy(ClusterDeployFixture {
         connectors: ConnectorFixture::Manifest,
         kubectl_failure: KubectlFixtureFailure::Apply,
         ..ClusterDeployFixture::default()
@@ -2203,7 +2362,7 @@ fn cluster_deploy_json_connector_apply_failure_carries_failed_result_after_activ
 
 #[test]
 fn cluster_deploy_json_single_target_shape_is_unchanged() {
-    let (output, _) = run_cluster_deploy_json(ClusterDeployFixture {
+    let (output, _) = run_cluster_deploy(ClusterDeployFixture {
         all_targets: false,
         ..ClusterDeployFixture::default()
     });

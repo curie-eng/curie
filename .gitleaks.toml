@@ -226,6 +226,8 @@ stopwords = [
   "C0LOCALDEV",
   "C0MALFORMED",
   "C0MANAGERS",
+  # Issue #4009 uses this invented word fixture for an explicitly unbound target.
+  "C0NOTBOUND1",
   "C0OLDROOM0",
   "C0REQ0001",
   "C0TRIAGE01",
