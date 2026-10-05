@@ -28,8 +28,6 @@ ALLOWLIST: frozenset[str] = frozenset(
     {
         "apps/api/src/curie_api/commitpoller.py",
         "apps/api/src/curie_api/config.py",
-        "apps/api/src/curie_api/factory_base.py",
-        "apps/api/src/curie_api/factory_ci.py",
         "apps/api/src/curie_api/factory_label_reconcile.py",
         "apps/api/src/curie_api/factory_notices.py",
         "apps/api/src/curie_api/factory_poll_intake.py",
@@ -43,8 +41,6 @@ ALLOWLIST: frozenset[str] = frozenset(
         "apps/api/src/curie_api/issue_read.py",
         "apps/api/src/curie_api/publication_authority.py",
         "apps/api/src/curie_api/publication_truth.py",
-        "apps/api/src/curie_api/routers/publications.py",
-        "apps/api/src/curie_api/routers/work_item_outcomes.py",
         "apps/api/src/curie_api/workitems/lifecycle.py",
     }
 )

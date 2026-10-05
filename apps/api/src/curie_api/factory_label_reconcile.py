@@ -13,9 +13,8 @@ only once the label is older than a grace period, so a delivery that is merely
 in flight lands first. Its request id derives from GitHub's labeled event id,
 so replicas and repeated passes converge on one request.
 
-Endpoints follow GitHub's REST reference:
-https://docs.github.com/en/rest/issues/issues#list-repository-issues
-https://docs.github.com/en/rest/issues/events#list-issue-events
+The GitHub tracker adapter (`curie_api.forges.github.tracker`) makes the
+reads: the open labeled issues and each issue's events.
 """
 
 from __future__ import annotations
@@ -31,14 +30,16 @@ from starlette.concurrency import run_in_threadpool
 
 from . import github_factory
 from .config import Settings
+from .forges.errors import Unavailable
 from .forges.github.binding import GITHUB_CHANNEL_KIND
-from .forges.github.identity import label_event_delivery_id
-from .forges.github.transport import Unavailable, get_all, get_github_json
+from .forges.github.comments import static_token
+from .forges.github.tracker import GitHubTracker, last_label_event, read_repository
+from .forges.identity import reconcile_delivery_id
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_factory_events import FactoryNotice
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable, human_sender
 from .models import Agent, AgentChannel
-from .repo_full_name import InvalidRepoFullName, normalize_repo_full_name, repo_url_path
+from .repo_full_name import InvalidRepoFullName, normalize_repo_full_name
 from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
@@ -52,21 +53,6 @@ def parse_time(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else None
-
-
-def last_label_event(events: list[Any], label: str) -> dict[str, Any] | None:
-    """The newest ``labeled`` event for this label, or None."""
-
-    found: dict[str, Any] | None = None
-    for event in events:
-        if (
-            isinstance(event, dict)
-            and event.get("event") == "labeled"
-            and isinstance(event.get("label"), dict)
-            and event["label"].get("name") == label
-        ):
-            found = event
-    return found
 
 
 async def bound_repositories(session: AsyncSession) -> list[str]:
@@ -121,24 +107,23 @@ async def _reconcile_repository(
     installation_id, token = await run_in_threadpool(
         credentials_for(settings).fresh_installation_token, repo, None
     )
-    api = settings.github_api_url.rstrip("/")
-    repo_path = f"/repos/{repo_url_path(repo)}"
-    repository = await get_github_json(
-        client, api=api, token=token, path=repo_path, refusal="repository_unavailable"
+    repository = await read_repository(
+        client, api=settings.github_api_url, repo_full_name=repo, token=token
     )
     repository_id = repository.get("id")
     if type(repository_id) is not int or repository_id <= 0:
-        raise Unavailable(repo_path)
-    issues = await get_all(
+        raise Unavailable(f"/repos/{repo}")
+    tracker = GitHubTracker.from_settings(
+        settings,
         client,
-        api=api,
-        token=token,
-        path=f"{repo_path}/issues",
-        params={"state": "open", "labels": label},
+        repo_full_name=repo,
+        repository_id=repository_id,
+        token=static_token(token),
     )
+    issues, _etag = await tracker.labeled_open_issues(None)
     numbers = [
         issue["number"]
-        for issue in issues
+        for issue in issues or []
         if isinstance(issue, dict)
         and "pull_request" not in issue
         and type(issue.get("number")) is int
@@ -156,13 +141,7 @@ async def _reconcile_repository(
     admitted = 0
     for number in missing:
         try:
-            events = await get_all(
-                client,
-                api=api,
-                token=token,
-                path=f"{repo_path}/issues/{number}/events",
-                params={},
-            )
+            events = await tracker.issue_events(number)
         except Unavailable:
             # One unreadable issue must not hold up the rest of the repository.
             continue
@@ -183,7 +162,7 @@ async def _reconcile_repository(
         except FeedbackIgnored:
             continue
         notice = FactoryNotice(
-            label_event_delivery_id(repository_id, number, event["id"]),
+            reconcile_delivery_id(tracker.issue(number), str(event["id"])),
             "issues",
             "labeled",
             "admit",
@@ -218,12 +197,8 @@ async def _admit(
             ):
                 await session.rollback()
                 return False
-            verified = await github_factory.verify_current(
-                notice, settings=settings, client=client
-            )
-            outcome = await github_factory.admit_notice(
-                session, notice, settings, verified, client
-            )
+            verified = await github_factory.verify_current(notice, settings=settings, client=client)
+            outcome = await github_factory.admit_notice(session, notice, settings, verified)
         except (FeedbackUnavailable, FeedbackIgnored) as exc:
             await session.rollback()
             logger.info(

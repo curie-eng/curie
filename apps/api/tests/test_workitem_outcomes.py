@@ -23,12 +23,21 @@ import channel_protocol
 import httpx
 import pytest
 from aci_protocol import ApprovalRequest
-from curie_api import approval_principal, factory_ci
+from curie_api import approval_principal, factory_ci, workitem_outcomes
 from curie_api.config import get_settings
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import lineages as crud_lineages
+from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
 from curie_api.forges.github.ci import CiDetail
-from curie_api.forges.types import GITHUB, PullRequestRef, ReplyTarget, RepositoryRef
+from curie_api.forges.types import (
+    GITHUB,
+    CheckState,
+    CiRollup,
+    NormalizedCheck,
+    PullRequestRef,
+    ReplyTarget,
+    RepositoryRef,
+)
 from curie_api.github_app import (
     _RESOLVERS,
     GitHubAppError,
@@ -53,6 +62,7 @@ from curie_api.workitem_outcomes import derive_outcome
 from curie_api.workitems import lifecycle as workitems
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
+from forge_fakes.github import ci_view
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -2159,111 +2169,6 @@ def test_ci_detail_reads_check_runs_statuses_and_failing_annotations(
         assert request.headers["authorization"].lower() == f"bearer {SECRET_SENTINEL}".lower()
 
 
-def test_ci_detail_reads_pull_mergeability_with_the_check_run_bearer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Provider response types, including nullable mergeable, are documented at:
-    # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
-    head = _detail_handler()
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        if request.url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}":
-            return httpx.Response(
-                200, json={"mergeable": False, "mergeable_state": "dirty", "merged": False}
-            )
-        return head(request)
-
-    detail, seen = _observe_detail(monkeypatch, handle)
-
-    assert detail.state == "observed"
-    assert detail.reason is None
-    assert detail.mergeable is False
-    assert detail.mergeable_state == "dirty"
-    assert detail.merged is False
-    pulls = [r for r in seen if r.url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}"]
-    assert len(pulls) == 1
-    checks = next(r for r in seen if r.url.path.endswith(f"/commits/{HEAD_SHA}/check-runs"))
-    assert pulls[0].method == "GET"
-    assert pulls[0].headers["authorization"] == checks.headers["authorization"]
-    assert pulls[0].headers["authorization"] == f"Bearer {SECRET_SENTINEL}"
-    paths = [r.url.path for r in seen]
-    status_at = paths.index(f"/repos/{REPO}/commits/{HEAD_SHA}/status")
-    assert paths[status_at + 1] == f"/repos/{REPO}/pulls/{PR_NUMBER}"
-    assert {run["name"] for run in detail.check_runs} == {"unit-tests", "build"}
-
-
-@pytest.mark.parametrize("failure", ["404", "500", "timeout", "malformed", "non_object"])
-def test_ci_detail_unreadable_pull_keeps_the_readable_ci(
-    monkeypatch: pytest.MonkeyPatch, failure: str,
-) -> None:
-    head = _detail_handler()
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        if request.url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}":
-            if failure == "timeout":
-                raise httpx.ReadTimeout("pull read timed out", request=request)
-            if failure == "malformed":
-                return httpx.Response(200, content=b"not json")
-            if failure == "non_object":
-                return httpx.Response(200, json=[])
-            return httpx.Response(int(failure), json={"message": "fixture refusal"})
-        return head(request)
-
-    detail, seen = _observe_detail(monkeypatch, handle)
-
-    assert detail.state == "observed"
-    assert detail.reason is None
-    assert detail.mergeable is None
-    assert detail.mergeable_state is None
-    assert detail.merged is None
-    assert {run["name"] for run in detail.check_runs} == {"unit-tests", "build"}
-    assert _annotation_messages(detail.annotations) == ["AssertionError: expected 2, got 1"]
-    assert len([r for r in seen if r.url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}"]) == 1
-
-
-def test_ci_detail_without_a_pull_number_keeps_the_readable_ci(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    detail, seen = _observe_detail(monkeypatch, _detail_handler(), pr_number=None)
-
-    assert detail.state == "observed"
-    assert detail.reason is None
-    assert detail.mergeable is None
-    assert detail.mergeable_state is None
-    assert detail.merged is None
-    assert {run["name"] for run in detail.check_runs} == {"unit-tests", "build"}
-    assert not any("/pulls/" in request.url.path for request in seen)
-
-
-@pytest.mark.parametrize(
-    ("payload", "expected"),
-    [
-        ({"mergeable": 0, "mergeable_state": False, "merged": "false"}, (None, None, None)),
-        ({"mergeable": "true", "mergeable_state": 1, "merged": 1}, (None, None, None)),
-        (
-            {"mergeable": None, "mergeable_state": "unknown", "merged": False},
-            (None, "unknown", False),
-        ),
-        ({"mergeable": True, "mergeable_state": "clean", "merged": True}, (True, "clean", True)),
-    ],
-)
-def test_ci_detail_copies_only_json_typed_pull_fields(
-    monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any], expected: tuple[Any, Any, Any],
-) -> None:
-    head = _detail_handler()
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        if request.url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}":
-            return httpx.Response(200, json=payload)
-        return head(request)
-
-    detail, _seen = _observe_detail(monkeypatch, handle)
-
-    assert detail.state == "observed"
-    assert detail.reason is None
-    assert (detail.mergeable, detail.mergeable_state, detail.merged) == expected
-
-
 BASE_SHA = "b" * 40
 
 
@@ -2419,7 +2324,7 @@ def _decide_factory_ci(
     changed_path: str,
 ) -> Any:
     return factory_ci.decide(
-        detail,
+        ci_view(detail),
         now=datetime(2026, 9, 24, 12, 5, tzinfo=UTC),
         published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
@@ -2595,14 +2500,15 @@ def test_ci_gate_applies_the_python_preflight_verdict_to_python_changes(
         {"id": uuid.UUID(publication["id"])},
     )
 
-    async def green_ci(*args: Any, **kwargs: Any) -> SimpleNamespace:
+    async def green_ci(*args: Any, **kwargs: Any) -> CiDetail:
         return _factory_ci_detail(
             runs=[]
             if python_check is None
             else [_actions_check_run(7002, PYTHON_CI_CHECK, python_check)]
         )
 
-    monkeypatch.setattr(ci, "observe_ci_detail", green_ci)
+    # The gate reads CI through the code host, which reads it here.
+    monkeypatch.setattr(ci, "read_ci_detail", green_ci)
 
     async def settlement(session: AsyncSession) -> Any:
         return await workitems.claim_publication_settlement(
@@ -2730,7 +2636,7 @@ def test_ci_detail_adds_a_failing_actions_log_to_the_fix_report(
     assert len(excerpt.splitlines()) <= 80
     assert token not in excerpt
     assert factory_ci.decide(
-        detail,
+        ci_view(detail),
         python_ci=None,
         metadata_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
@@ -2740,7 +2646,12 @@ def test_ci_detail_adds_a_failing_actions_log_to_the_fix_report(
         changed_paths=[],
     ).kind == "failing"
     prompt = factory_ci.continuation_text(
-        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+        f"https://github.com/{REPO}/issues/9101",
+        PR_URL,
+        HEAD_SHA,
+        2,
+        ci_view(detail),
+        diagnostics=True,
     )
     lines = prompt.splitlines()
     assert len(lines) == 4
@@ -2817,7 +2728,12 @@ def test_actions_log_failure_keeps_the_failing_ci_observation(
     assert detail.job_logs == {}
     assert detail.job_log_unavailable == {FAILING_RUN_ID}
     prompt = factory_ci.continuation_text(
-        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+        f"https://github.com/{REPO}/issues/9101",
+        PR_URL,
+        HEAD_SHA,
+        2,
+        ci_view(detail),
+        diagnostics=True,
     )
     report = json.loads(prompt.splitlines()[3])
     assert report["failing_checks"] == [
@@ -2876,7 +2792,7 @@ def test_large_actions_log_preserves_a_bounded_diagnostic_tail(
     assert "early failure context" not in excerpt
     assert token not in excerpt
     assert factory_ci.decide(
-        detail,
+        ci_view(detail),
         python_ci=None,
         metadata_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
@@ -2886,7 +2802,12 @@ def test_large_actions_log_preserves_a_bounded_diagnostic_tail(
         changed_paths=[],
     ).kind == "failing"
     prompt = factory_ci.continuation_text(
-        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+        f"https://github.com/{REPO}/issues/9101",
+        PR_URL,
+        HEAD_SHA,
+        2,
+        ci_view(detail),
+        diagnostics=True,
     )
     entry = json.loads(prompt.splitlines()[3])["failing_checks"][0]
     assert diagnostic in entry["job_log"]
@@ -2923,7 +2844,12 @@ def test_actions_log_redacts_generic_key_assignments_in_observation_and_prompt(
     assert (detail.state, detail.reason) == ("observed", None)
     excerpt = detail.job_logs[FAILING_RUN_ID]
     prompt = factory_ci.continuation_text(
-        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+        f"https://github.com/{REPO}/issues/9101",
+        PR_URL,
+        HEAD_SHA,
+        2,
+        ci_view(detail),
+        diagnostics=True,
     )
     entry = json.loads(prompt.splitlines()[3])["failing_checks"][0]
     assert diagnostic in excerpt
@@ -2961,7 +2887,7 @@ def test_actions_log_over_eight_mib_is_optional_enrichment_failure(
     assert detail.job_logs == {}
     assert detail.job_log_unavailable == {FAILING_RUN_ID}
     assert factory_ci.decide(
-        detail,
+        ci_view(detail),
         python_ci=None,
         metadata_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
@@ -2971,7 +2897,12 @@ def test_actions_log_over_eight_mib_is_optional_enrichment_failure(
         changed_paths=[],
     ).kind == "failing"
     prompt = factory_ci.continuation_text(
-        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+        f"https://github.com/{REPO}/issues/9101",
+        PR_URL,
+        HEAD_SHA,
+        2,
+        ci_view(detail),
+        diagnostics=True,
     )
     entry = json.loads(prompt.splitlines()[3])["failing_checks"][0]
     assert entry["name"] == "unit-tests"
@@ -3009,7 +2940,12 @@ def test_ci_detail_notes_every_failing_actions_job_when_downloads_are_capped(
     job_requests = [request for request in seen if "/actions/jobs/" in request.url.path]
     assert len(job_requests) == 5
     prompt = factory_ci.continuation_text(
-        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+        f"https://github.com/{REPO}/issues/9101",
+        PR_URL,
+        HEAD_SHA,
+        2,
+        ci_view(detail),
+        diagnostics=True,
     )
     checks = json.loads(prompt.splitlines()[3])["failing_checks"]
     assert [entry["name"] for entry in checks] == [f"job-{i}" for i in range(6)]
@@ -3091,3 +3027,88 @@ def test_ci_detail_shares_the_bounded_credential_slots(
         assert failed.reason != "observation_busy"
     healthy, _ = _observe_detail(monkeypatch, _detail_handler())
     assert healthy.reason is None
+
+
+# --- the CI view reads through the code host port (#3831) ---------------------
+
+
+class _RollupHost:
+    def __init__(self, answer: Any) -> None:
+        self.answer = answer
+        self.calls: list[tuple[RepositoryRef, str]] = []
+
+    async def observe_ci(self, repository: RepositoryRef, head_sha: str) -> Any:
+        self.calls.append((repository, head_sha))
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return CiRollup.on_head(head_sha, self.answer)
+
+
+def _check(key: str, state: CheckState) -> NormalizedCheck:
+    return NormalizedCheck(key=key, state=state, head_sha=HEAD_SHA, name=key)
+
+
+def _ci_view(host: _RollupHost, **lineage: Any) -> Any:
+    values: dict[str, Any] = {
+        "pr_number": PR_NUMBER,
+        "head_sha": HEAD_SHA,
+        "repo_full_name": REPO,
+        "github_repository_id": None,
+    }
+    values.update(lineage)
+    return asyncio.run(
+        workitem_outcomes.observe_ci(
+            host,  # type: ignore[arg-type]
+            get_settings(),
+            SimpleNamespace(**values),  # type: ignore[arg-type]
+            SimpleNamespace(github_repository_id=101),  # type: ignore[arg-type]
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("checks", "state"),
+    [
+        ((), "none"),
+        ((_check("unit", CheckState.PENDING),), "pending"),
+        (
+            (_check("unit", CheckState.SUCCESS), _check("status:lint", CheckState.SUCCESS)),
+            "passing",
+        ),
+        (
+            (_check("unit", CheckState.SUCCESS), _check("status:lint", CheckState.FAILURE)),
+            "failing",
+        ),
+    ],
+)
+def test_ci_view_maps_the_code_host_rollup(checks: tuple[NormalizedCheck, ...], state: str) -> None:
+    host = _RollupHost(checks)
+
+    view = _ci_view(host)
+
+    assert (view.state, view.reason, view.head_sha) == (state, None, HEAD_SHA)
+    [(repository, head)] = host.calls
+    assert (repository.project_id, repository.path, head) == ("101", REPO, HEAD_SHA)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        Unauthorized("app_not_configured"),
+        Unavailable("github_rate_limited"),
+        NotFound("github_not_found"),
+    ],
+)
+def test_ci_view_failures_are_unavailable_with_the_fixed_reason(error: Exception) -> None:
+    view = _ci_view(_RollupHost(error))
+
+    assert (view.state, view.reason, view.head_sha) == ("unavailable", str(error), HEAD_SHA)
+
+
+def test_ci_view_without_a_pull_request_or_head_reads_nothing() -> None:
+    host = _RollupHost(())
+
+    assert _ci_view(host, pr_number=None).state == "not_applicable"
+    unread = _ci_view(host, head_sha=None)
+    assert (unread.state, unread.reason) == ("unavailable", "no_head_sha")
+    assert host.calls == []

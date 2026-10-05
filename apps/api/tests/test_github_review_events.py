@@ -718,8 +718,8 @@ def publish_through_worker(
 
     from apps.worker.tests.test_publication_loop import (
         _Cluster,
+        _CodeHost,
         _Credentials,
-        _GitHub,
         _Replies,
     )
 
@@ -751,7 +751,7 @@ def publish_through_worker(
                 store=store,
                 credentials=_Credentials(module),
                 cluster=cluster,
-                github=_GitHub(),
+                code_host=_CodeHost(),
                 replies=_Replies(),
                 lineage=PublicationLineageClient(
                     api_base_url="http://api",

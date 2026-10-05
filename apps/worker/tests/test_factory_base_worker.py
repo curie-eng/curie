@@ -23,9 +23,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import httpx
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from test_publication_k8s import (
@@ -340,64 +337,6 @@ def test_a_stored_pull_on_the_recorded_base_validates_before_push(tmp_path: Path
     assert completed.returncode == 0, completed.stderr
     facts = json.loads((tmp_path / "pr-facts.json").read_text())
     assert facts["base"] == "next"
-
-
-# --- Deterministic-head recovery ------------------------------------------------------------
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("anyio_backend", ["asyncio"])
-async def test_recovery_posts_with_the_given_base_and_never_reads_the_repository(
-    anyio_backend: str,
-) -> None:
-    from curie_worker.publication_clients import GitHubPublicationLookup
-
-    requests: list[httpx.Request] = []
-    posted: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        assert request.url.path != f"/repos/{REPO}", "repository default branch was read"
-        if request.url.raw_path.decode().endswith("/git/ref/heads/curie%2Fthread-lineage-example"):
-            return httpx.Response(200, json={"object": {"sha": REVISION_HEAD}})
-        assert request.url.path == f"/repos/{REPO}/pulls"
-        if request.method == "POST":
-            body = json.loads(request.content)
-            posted.append(body)
-            return httpx.Response(
-                201,
-                json={
-                    "number": 123,
-                    "html_url": f"https://github.com/{REPO}/pull/123",
-                    "state": "open",
-                    "merged_at": None,
-                    "title": body["title"],
-                    "body": body["body"],
-                    "head": {
-                        "ref": LINEAGE_BRANCH,
-                        "sha": REVISION_HEAD,
-                        "repo": {"full_name": REPO},
-                    },
-                    "base": {"ref": body["base"], "repo": {"full_name": REPO}},
-                },
-            )
-        return httpx.Response(200, json=[])
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        recovered = await GitHubPublicationLookup(client).recover_pr_by_head(
-            REPO,
-            LINEAGE_BRANCH,
-            "Update repository",
-            "Approved platform publication.",
-            expected_head_sha=REVISION_HEAD,
-            authorization_header="Bearer rotated-installation-token",
-            base="next",
-        )
-
-    assert recovered is not None
-    assert recovered.number == 123
-    assert [body["base"] for body in posted] == ["next"]
-    assert all(request.url.path != f"/repos/{REPO}" for request in requests)
 
 
 # --- Real git: the recorded commit, not the advanced branch tip -------------------------------

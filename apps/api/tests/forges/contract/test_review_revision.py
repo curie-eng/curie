@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from curie_api.forges.authority import feedback_actionable
-from curie_api.forges.types import FeedbackKind
+from curie_api.forges.types import FeedbackKind, PullRequestState
 from forge_fakes.contract_harness import AdapterHarness, open_pull
 
 
@@ -58,3 +58,21 @@ async def test_listing_from_the_returned_cursor_yields_only_newer_feedback(
 
     later = await harness.code_host.list_review_feedback(pull.ref, first.cursor)
     assert [item.body for item in later.items] == ["second"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("merged", [False, True], ids=["closed", "merged"])
+async def test_feedback_on_a_pull_request_no_longer_open_is_not_current(
+    harness: AdapterHarness, merged: bool
+) -> None:
+    harness.set_write_access(harness.writer, True)
+    pull = await open_pull(harness, "factory/review")
+    harness.add_review_feedback(pull.ref, harness.writer, "Please rename it.", FeedbackKind.COMMENT)
+    (feedback,) = (await harness.code_host.list_review_feedback(pull.ref, None)).items
+    assert await harness.code_host.verify_feedback(feedback) is True
+
+    harness.close_pull_request(pull.ref, merged=merged)
+
+    assert await harness.code_host.verify_feedback(feedback) is False
+    current = await harness.code_host.read_pull_request(pull.ref)
+    assert current.state is (PullRequestState.MERGED if merged else PullRequestState.CLOSED)

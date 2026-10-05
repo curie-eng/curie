@@ -200,6 +200,7 @@ def _patch_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
         "curie_api.github_review_truth",
         "curie_api.github_factory_review",
         "curie_api.factory_notices",
+        "curie_api.repository_auth",
     ):
         try:
             module = importlib.import_module(name)

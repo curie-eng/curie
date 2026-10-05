@@ -23,12 +23,18 @@ import re
 import uuid
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from curie_api.forges.errors import ForgeError
+from curie_api.forges.hosts import repository_ref
+from curie_api.forges.ports import CodeHost
+from curie_api.forges.types import RollupState
 from curie_api.schemas.workitems import (
+    WorkItemCiOut,
+    WorkItemCiState,
     WorkItemCorrectnessOut,
     WorkItemOutcomeOut,
     WorkItemOutcomeState,
@@ -53,20 +59,13 @@ from .models import (
 )
 
 OBJECTIVE_LIMIT = 512
-# One overall bound on a live CI observation: credential acquisition (lock,
-# discovery, token mint) and the check-runs request together.
-# How many credential mints a live CI observation may have in flight across all
-# callers. A caller abandoned at the deadline cannot cancel the mint thread, so
-# the slot is released by the thread itself when the mint actually finishes;
-# until then further callers are refused ``observation_busy`` without spawning
-# work, which is what keeps repeated timeouts from accumulating threads and
-# lock contention.
-# One overall bound on the CI gate's detail observation (#3097): the credential
-# mint, check runs, commit statuses and failing-run annotations together.
-# Annotations are read for at most this many failing check runs per observation.
-# Bound on reading the PR base branch head's checks for pre-existing failures (#4105).
-# The base read runs last and only spends what the log deadline leaves.
-# GitHub's job log redirect has also been observed on Azure Blob storage.
+_SHA = re.compile(r"[0-9a-fA-F]{7,64}")
+_CI_STATES: dict[RollupState, WorkItemCiState] = {
+    RollupState.NONE: "none",
+    RollupState.PENDING: "pending",
+    RollupState.SUCCESS: "passing",
+    RollupState.FAILURE: "failing",
+}
 
 _PUBLISHING = frozenset({"approved", "launching", "running"})
 _ACTIVE_REQUEST_STATUSES = frozenset({"waiting", "running", "cancellation_requested"})
@@ -628,40 +627,41 @@ async def load_outcome(
     return view, item, lineage
 
 
-# --- live CI observation -------------------------------------------------------
+async def observe_ci(
+    code_host: CodeHost,
+    settings: Settings,
+    lineage: ThreadPublicationLineage | None,
+    work_item: WorkItem,
+) -> WorkItemCiOut:
+    """CI on the lineage's published head, live and never persisted.
+
+    Every failure is ``unavailable`` with the code host's fixed reason code,
+    which never carries a response body, header, URL or token.
+    """
+
+    if lineage is None or lineage.pr_number is None:
+        return WorkItemCiOut(state="not_applicable", reason="no_pull_request")
+    head_sha = lineage.head_sha
+    if not isinstance(head_sha, str) or not _SHA.fullmatch(head_sha):
+        return WorkItemCiOut(state="unavailable", reason="no_head_sha", observed_at=_now())
+    repository = repository_ref(
+        settings,
+        path=lineage.repo_full_name,
+        project_id=lineage.github_repository_id or work_item.github_repository_id,
+    )
+    try:
+        rollup = await code_host.observe_ci(repository, head_sha)
+    except ForgeError as exc:
+        return WorkItemCiOut(
+            state="unavailable",
+            reason=str(exc) or "unavailable",
+            head_sha=head_sha,
+            observed_at=_now(),
+        )
+    return WorkItemCiOut(
+        state=_CI_STATES[rollup.state], reason=None, head_sha=head_sha, observed_at=_now()
+    )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+def _now() -> datetime:
+    return datetime.now(UTC)

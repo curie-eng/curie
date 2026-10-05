@@ -29,6 +29,11 @@ class NotFound(ForgeError):
     """The issue, repository, pull request or commit does not exist."""
 
 
+class Ambiguous(ForgeError):
+    """More than one item matched where the port answers at most one, so the
+    caller must not pick one."""
+
+
 class Unsupported(ForgeError):
     """The adapter declared ``operation`` unsupported; the caller must fall back."""
 

@@ -7,6 +7,7 @@ import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlsplit
 
 from channel_protocol.reply import ReplyTarget
 from sqlalchemy import text
@@ -536,15 +537,17 @@ class PostgresPublicationStore:
             raise ValueError("publication lineage expected head is invalid")
         if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
             raise ValueError("publication lineage pull request number is invalid")
+        # The URL and number come from the API's code host read; they are
+        # stored, not parsed, so any forge's pull request URL shape is valid.
+        parsed_url = urlsplit(pr_url) if isinstance(pr_url, str) else None
         if (
-            not isinstance(pr_url, str)
-            or re.fullmatch(
-                r"https://github\.com/[^/\s]+/[^/\s]+/pull/[1-9][0-9]*",
-                pr_url,
-                re.IGNORECASE,
-            )
-            is None
-            or not pr_url.casefold().endswith(f"/pull/{pr_number}".casefold())
+            parsed_url is None
+            or parsed_url.scheme != "https"
+            or not parsed_url.hostname
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or len(pr_url) > 2048
+            or any(char.isspace() for char in pr_url)
         ):
             raise ValueError("publication lineage pull request URL is invalid")
         if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40,64}", head_sha) is None:

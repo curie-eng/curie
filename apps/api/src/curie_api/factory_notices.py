@@ -19,10 +19,7 @@ Pull request review comments:
 https://docs.github.com/en/rest/pulls/comments#create-a-reply-for-a-review-comment
 https://docs.github.com/en/rest/pulls/comments#list-review-comments-on-a-pull-request
 https://docs.github.com/en/rest/pulls/comments#update-a-review-comment-for-a-pull-request
-Labels:
-https://docs.github.com/en/rest/issues/labels#add-labels-to-an-issue
-https://docs.github.com/en/rest/issues/labels#list-labels-for-an-issue
-https://docs.github.com/en/rest/issues/labels#remove-a-label-from-an-issue
+State labels move through the tracker port's ``set_state_label``.
 """
 
 from __future__ import annotations
@@ -36,7 +33,6 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
-from urllib.parse import quote
 
 import httpx
 from sqlalchemy import and_, case, exists, func, literal, or_, select, update
@@ -45,21 +41,24 @@ from sqlalchemy.orm import aliased
 from starlette.concurrency import run_in_threadpool
 
 from .config import Settings
-from .factory_comment_text import _redact_factory_comment, marker_for
+from .factory_comment_text import marker_for, redact_factory_comment
 from .factory_progress import PhaseView, phase_view, pill_for
 from .factory_reply_target import github_host, stored_reply_target
 from .factory_usage import usage_line, work_item_usage
+from .forges.errors import ForgeError
+from .forges.github.comments import static_token
 from .forges.github.marked_comments import (
-    _REFUSED_STATUSES,
-    _deliver,
-    _GitHub,
+    GitHubCommentClient,
     _github_calls,
-    _github_request,
     _GitHubCalls,
-    _patch,
-    _subject_title,
+    deliver,
+    patch_comment,
+    subject_title,
 )
-from .forges.types import ReplyTarget
+from .forges.github.tracker import GitHubTracker
+from .forges.github.transport import github_headers
+from .forges.ports import Tracker
+from .forges.types import ReplyTarget, TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .models import (
     ExecutionRequest,
@@ -77,12 +76,6 @@ from .workitems.lifecycle import (
 )
 
 logger = logging.getLogger(__name__)
-
-# A thread target scans two lists with one stored page. Pages of the review
-# comment list are stored as-is; once that list is exhausted, the conversation
-# list page is stored above this offset.
-
-
 
 
 # The operator-facing sentence for each terminus cause (#3073). The raw code
@@ -548,7 +541,7 @@ def status_body(
     if result is not None:
         parts.append(FINAL_MARKER)
     parts.append(marker_for(request_id))
-    return _redact_factory_comment("\n\n".join(parts) + "\n")
+    return redact_factory_comment("\n\n".join(parts) + "\n")
 
 
 def _digest(body: str) -> str:
@@ -621,6 +614,7 @@ class _StatusClaim:
     row: FactoryStatusComment
     repo_full_name: str
     github_installation_id: int
+    github_repository_id: int
     github_issue_number: int
     work_item_id: uuid.UUID
     status: str
@@ -722,6 +716,7 @@ async def _claim_next(
         row=row,
         repo_full_name=work_item.repo_full_name,
         github_installation_id=work_item.github_installation_id,
+        github_repository_id=work_item.github_repository_id,
         github_issue_number=work_item.github_issue_number,
         work_item_id=work_item.id,
         status=request.status,
@@ -784,35 +779,38 @@ async def _sync_one(
         )
     except (GitHubInstallationRefused, GitHubAppError, ValueError):
         return 0
-    github = _GitHub(
+    github = GitHubCommentClient(
         client=client,
         api=settings.github_api_url.rstrip("/"),
         repo_path=f"/repos/{repo_url_path(claim.repo_full_name)}",
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
+        headers=github_headers(token),
     )
     writes = 0
     if row.finalized_at is None:
         writes += await _sync_comment(github, claim)
     if claim.latest and row.refused_at is None:
-        writes += await _sync_labels(github, claim)
+        tracker = GitHubTracker.from_settings(
+            settings,
+            client,
+            repo_full_name=claim.repo_full_name,
+            repository_id=claim.github_repository_id,
+            token=static_token(token),
+        )
+        writes += await _sync_labels(tracker, claim)
     return writes
 
 
 async def _sync_comment(
-    github: _GitHub,
+    github: GitHubCommentClient,
     claim: _StatusClaim,
 ) -> int:
     row, target, body, now = claim.row, claim.target, claim.body, claim.now
     if row.subject_title is None:
-        row.subject_title = await _subject_title(github, claim.github_issue_number, target)
+        row.subject_title = await subject_title(github, claim.github_issue_number, target)
     terminal = FINAL_MARKER in body
     writes = 0
     if row.comment_id is None:
-        outcome = await _deliver(github, claim.github_issue_number, row, target, body)
+        outcome = await deliver(github, claim.github_issue_number, row, target, body)
         if outcome is None:
             return 0
         if outcome[0] == "refused":
@@ -827,7 +825,7 @@ async def _sync_comment(
         row.rendered_digest = _digest(body) if created else None
         writes += int(created)
     if row.rendered_digest != _digest(body):
-        edited = await _patch(github, row, body)
+        edited = await patch_comment(github, row, body)
         if edited == "edited":
             row.rendered_digest = _digest(body)
             writes += 1
@@ -970,11 +968,13 @@ async def _superseded(
 
 
 
-async def _sync_labels(github: _GitHub, claim: _StatusClaim) -> int:
+async def _sync_labels(tracker: Tracker, claim: _StatusClaim) -> int:
     """Add the desired state label and remove the others, on the issue.
 
-    Only the four state labels are ever written. A refused write is logged and
-    given up; any other failure is retried next pass.
+    Only the four state labels are ever written. Legacy deletes stay
+    unconditional: a new request starts with applied_label NULL, and the issue
+    may still carry a legacy name. A refused write is logged and given up; any
+    other failure is retried next pass.
     """
 
     row = claim.row
@@ -983,107 +983,19 @@ async def _sync_labels(github: _GitHub, claim: _StatusClaim) -> int:
     desired = desired_label(claim.status)
     if row.applied_label == desired:
         return 0
-    labels_path = f"{github.api}{github.repo_path}/issues/{claim.github_issue_number}/labels"
-    template = "/repos/{owner}/{repo}/issues/{issue_number}/labels"
-    resource = httpx.URL(labels_path)
-    url = labels_path
-    params: dict[str, int] | None = {"per_page": 100}
-    present: set[str] = set()
-    seen: set[str] = set()
-    # GitHub labels are paginated. Read every page before changing anything:
-    # https://docs.github.com/en/rest/issues/labels#list-labels-for-an-issue
-    while True:
-        try:
-            listed = await _github_request(
-                github.client,
-                "GET",
-                url,
-                path_template=template,
-                headers=github.headers,
-                params=params,
-                follow_redirects=False,
-            )
-            if listed.status_code != 200:
-                return 0
-            payload = listed.json()
-        except (httpx.HTTPError, ValueError):
-            return 0
-        if not isinstance(payload, list) or any(
-            not isinstance(label, dict) or not isinstance(label.get("name"), str)
-            for label in payload
-        ):
-            return 0
-        present.update(label["name"] for label in payload)
-        seen.add(str(listed.request.url))
-        next_link = listed.links.get("next")
-        if next_link is None:
-            break
-        next_url = next_link.get("url")
-        if not isinstance(next_url, str):
-            return 0
-        try:
-            next_resource = httpx.URL(next_url)
-        except httpx.InvalidURL:
-            return 0
-        if (next_resource.scheme, next_resource.host, next_resource.port, next_resource.path) != (
-            resource.scheme,
-            resource.host,
-            resource.port,
-            resource.path,
-        ) or str(next_resource) in seen:
-            return 0
-        url = str(next_resource)
-        params = None
-    writes = 0
-    complete = True
-    if desired and desired not in present:
-        try:
-            added = await _github_request(
-                github.client,
-                "POST",
-                labels_path,
-                path_template=template,
-                headers=github.headers,
-                json={"labels": [desired]},
-                follow_redirects=False,
-            )
-        except httpx.HTTPError:
-            return writes
-        writes += 1
-        if added.status_code in _REFUSED_STATUSES:
-            logger.info(
-                "factory state label refused",
-                extra={"work_item_id": str(claim.work_item_id), "status": added.status_code},
-            )
-        elif added.status_code not in {200, 201}:
-            return writes
-    for name in (*STATE_LABELS, *LEGACY_STATE_LABELS):
-        if name == desired or name not in present:
-            continue
-        try:
-            removed = await _github_request(
-                github.client,
-                "DELETE",
-                f"{labels_path}/{quote(name, safe=':')}",
-                path_template=template + "/{label}",
-                headers=github.headers,
-                follow_redirects=False,
-            )
-        except httpx.HTTPError:
-            complete = False
-            continue
-        writes += 1
-        # 404: the label was not on the issue, which is the goal.
-        if removed.status_code in {401, 403}:
-            logger.info(
-                "factory state label removal refused",
-                extra={"work_item_id": str(claim.work_item_id), "status": removed.status_code},
-            )
-        elif removed.status_code not in {200, 204, 404}:
-            complete = False
-    if complete:
-        row.applied_label = desired
-    return writes
+    issue = TrackerIssueRef(
+        tracker.kind,
+        tracker.host,
+        str(claim.github_repository_id),
+        str(claim.github_issue_number),
+    )
+    remove = [name for name in (*STATE_LABELS, *LEGACY_STATE_LABELS) if name != desired]
+    try:
+        await tracker.set_state_label(issue, add=desired or None, remove=remove)
+    except ForgeError:
+        return 0
+    row.applied_label = desired
+    return 1
 
 
 async def _clock(session: AsyncSession) -> Any:

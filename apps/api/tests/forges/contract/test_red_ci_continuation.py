@@ -39,3 +39,17 @@ async def test_a_pending_check_beside_a_failure_is_still_failure(
     harness.report_checks(pull.head_sha, {"unit": CheckState.FAILURE, "e2e": CheckState.PENDING})
     rollup = await harness.code_host.observe_ci(harness.repository, pull.head_sha)
     assert rollup.state is RollupState.FAILURE
+
+
+@pytest.mark.anyio
+async def test_a_commit_status_is_a_check_under_its_status_key(harness: AdapterHarness) -> None:
+    pull = await open_pull(harness, "factory/status")
+    harness.report_checks(
+        pull.head_sha, {"unit": CheckState.SUCCESS, "status:docs": CheckState.FAILURE}
+    )
+    rollup = await harness.code_host.observe_ci(harness.repository, pull.head_sha)
+    assert {c.key: c.state for c in rollup.checks} == {
+        "unit": CheckState.SUCCESS,
+        "status:docs": CheckState.FAILURE,
+    }
+    assert rollup.state is RollupState.FAILURE

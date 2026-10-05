@@ -14,7 +14,7 @@ from typing import Protocol
 from curie_api.forges.capabilities import Operation, Support
 from curie_api.forges.types import (
     Actor,
-    CiDiagnostic,
+    CiReport,
     CiRollup,
     Commit,
     Credential,
@@ -27,6 +27,9 @@ from curie_api.forges.types import (
     PullRequestRef,
     ReplyTarget,
     RepositoryRef,
+    RerunJob,
+    RerunObserver,
+    RerunRecord,
     ReviewFeedback,
     TrackerIssueRef,
     UpsertResult,
@@ -174,7 +177,11 @@ class CodeHost(Protocol):
     async def find_pull_request(
         self, repository: RepositoryRef, *, head_ref: str
     ) -> PullRequest | None:
-        """The newest pull request from ``head_ref`` in any state, or None."""
+        """The one pull request from ``head_ref`` in any state, or None.
+
+        Raises `Ambiguous` when more than one is listed: the caller adopts one
+        pull request per branch and never chooses between several.
+        """
         ...
 
     async def open_pull_request(
@@ -185,6 +192,7 @@ class CodeHost(Protocol):
         base_ref: str,
         title: str,
         body: str,
+        draft: bool = False,
     ) -> PullRequest: ...
 
     async def update_pull_request(
@@ -210,13 +218,30 @@ class CodeHost(Protocol):
         ...
 
     async def ci_diagnostics(
-        self, repository: RepositoryRef, head_sha: str
-    ) -> tuple[CiDiagnostic, ...]:
-        """Optional: log excerpts for the failing checks on ``head_sha``."""
+        self, repository: RepositoryRef, head_sha: str, *, base_ref: str | None
+    ) -> CiReport:
+        """Optional: the checks on exactly ``head_sha``, as `observe_ci` reads
+        them, with what each failing check said, from one read. When a head
+        check fails and ``base_ref`` is named, ``CiReport.base`` also holds the
+        checks on that branch's current head, so a failure the change did not
+        cause can be told apart (#4105)."""
         ...
 
-    async def rerun_failed(self, repository: RepositoryRef, head_sha: str) -> int:
-        """Optional: rerun failed jobs on ``head_sha``; the number rerun."""
+    async def rerun_failed(
+        self,
+        repository: RepositoryRef,
+        jobs: Sequence[RerunJob],
+        *,
+        settled: Collection[str] = (),
+        on_attempt: RerunObserver | None = None,
+    ) -> RerunRecord:
+        """Optional: rerun the failed ``jobs`` (see `types.failed_native_jobs`).
+
+        Each rerun unit is asked once per call, skipping the units in
+        ``settled`` (already accepted or refused). ``on_attempt`` sees the
+        record after every answer, so a caller can store it before the next
+        request is sent; returning False ends the call there.
+        """
         ...
 
     async def user_can_write(self, repository: RepositoryRef, actor: Actor) -> bool:

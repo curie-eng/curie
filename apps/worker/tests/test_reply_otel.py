@@ -218,11 +218,11 @@ def test_publication_slack_egress_is_observed_exactly_once(
         github_api_url = "https://github.example.com/forge/api/v3"
         platform_api_url = "https://api.example.com"
         worker_token = "fixture-publication-worker-token"
-        lookup_calls: list[tuple[Any, str]] = []
+        code_host_calls: list[tuple[str, str, Any]] = []
         credential_calls: list[tuple[str, str, str, Any]] = []
 
-        def publication_lookup(client: Any, *, api_base_url: str) -> object:
-            lookup_calls.append((client, api_base_url))
+        def publication_code_host(*, api_base_url: str, worker_token: str, client: Any) -> object:
+            code_host_calls.append((api_base_url, worker_token, client))
             return object()
 
         def publication_credentials(
@@ -231,7 +231,7 @@ def test_publication_slack_egress_is_observed_exactly_once(
             credential_calls.append((api_base_url, github_html_base, worker_token, client))
             return object()
 
-        monkeypatch.setattr(run_module, "GitHubPublicationLookup", publication_lookup)
+        monkeypatch.setattr(run_module, "PublicationCodeHostClient", publication_code_host)
         monkeypatch.setattr(run_module, "PublicationCredentialClient", publication_credentials)
         loop = run_module._build_publication_loop(
             WorkerConfig(
@@ -246,7 +246,7 @@ def test_publication_slack_egress_is_observed_exactly_once(
             card_store_dependency,
         )
         assert loop is not None
-        assert lookup_calls == [(http_dependency, github_api_url)]
+        assert code_host_calls == [(platform_api_url, worker_token, http_dependency)]
         assert credential_calls == [
             (platform_api_url, "https://github.example.com/forge", worker_token, http_dependency)
         ]

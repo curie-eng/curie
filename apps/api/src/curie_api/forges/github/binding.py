@@ -25,7 +25,7 @@ def github_reply_route(repo_full_name: str, issue_number: int) -> tuple[str, str
 _CHANNEL_KIND = GITHUB_CHANNEL_KIND
 
 
-async def _binding(session: AsyncSession, notice: FactoryNotice) -> AgentChannel:
+async def resolve_binding(session: AsyncSession, notice: FactoryNotice) -> AgentChannel:
     # `agent_channels_route_key` (migration 0070) lets one repository pair
     # hold several routes, so the query can return more than one row. The
     # `Agent.repo_full_name` join is a CORRECTNESS check (the pair's row
