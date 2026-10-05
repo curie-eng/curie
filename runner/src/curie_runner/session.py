@@ -1549,7 +1549,7 @@ class SessionRunner:
                     )
                     self._resume_cache_metric_recorded = True
             else:
-                tracker.add_increment(usage)
+                tracker.add_increment(usage, message_id=getattr(message, "message_id", None))
             budget_hit = tracker.exceeded
             events = translate_message(
                 message, state, self._classifier, gen, activity=self._progress_activity
