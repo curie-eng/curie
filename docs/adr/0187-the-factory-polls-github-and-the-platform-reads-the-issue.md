@@ -4,6 +4,12 @@ Date: 2026-10-01
 
 Status: Accepted
 
+**Partially amended by [ADR 0197](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+the clause that reading the ticket is the bundle's job for the GitHub
+factory only, and consequence 6: the platform reads the ticket for every
+tracker. Everything else in this ADR stands.
+
 Accepted with explicit maintainer approval on 2026-10-01 (Brian Conn),
 alongside implementation under ADR 0102.
 

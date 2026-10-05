@@ -4,6 +4,11 @@ Date: 2026-09-22
 
 Status: Accepted
 
+**Partially amended by [ADR 0197](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+only where it names GitHub as the sole source of a notice; notices come
+from any Tracker adapter. Everything else in this ADR stands.
+
 Partially amends
 [ADR 0145](0145-a-labelled-issue-is-a-backlog-item-and-the-stream-is-its-queue.md).
 The tracker remains the backlog. Curie still does not copy issue bodies.
