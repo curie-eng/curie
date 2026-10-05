@@ -411,9 +411,18 @@ class Runtime:
         identity = self.manifest["broker_identity"]
         host, port = identity["endpoint"]["host"], identity["endpoint"]["port"]
         ca_lines = [line for line in self.ca_pem.splitlines() if "CERTIFICATE" not in line]
+        # A case may delete or corrupt a credential field; every present,
+        # nonempty string credential is still forbidden.
+        reader = self.bootstrap.get("control_reader")
+        credentials = [
+            value
+            for value in (
+                (reader.get("username"), reader.get("password")) if isinstance(reader, dict) else ()
+            )
+            if isinstance(value, str) and value
+        ]
         return [
-            self.bootstrap["control_reader"]["username"],
-            self.bootstrap["control_reader"]["password"],
+            *credentials,
             self.ca_pem,
             ca_lines[0],
             host,
