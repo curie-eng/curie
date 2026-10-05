@@ -60,12 +60,8 @@ from curie_api.schemas.console import (
 )
 
 from .. import oidc
-from ..approval_auth import (
-    CONSOLE_SESSION_COOKIE,
-    enforce_console_cookie_origin,
-    set_console_session_cookie,
-)
-from ..auth import require_platform_key, require_principal_session
+from ..approval_auth import enforce_console_cookie_origin, set_console_session_cookie
+from ..auth import CONSOLE_SESSION_COOKIE, require_platform_key, require_principal_session
 from ..config import get_settings
 from ..deps import SessionDep
 from ..models import Principal

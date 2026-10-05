@@ -376,7 +376,7 @@ class TestIdP:
                 self._token(req)
             else:
                 _send_json(req, 404, {"error": "not_found"})
-        except Exception as exc:  # pragma: no cover - surfaced to the test
+        except Exception as exc:  # noqa: BLE001 - surfaced to the test as a 500, pragma: no cover
             _send_json(req, 500, {"error": "server_error", "detail": repr(exc)})
 
     def _authorize(self, req: BaseHTTPRequestHandler, params: dict[str, str]) -> None:

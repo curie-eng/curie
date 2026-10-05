@@ -1018,11 +1018,13 @@ def test_login_code_session_has_no_principal(
 
 
 @pytest.mark.parametrize("login", ["oidc", "login_code"])
-def test_a_console_session_is_not_a_machine_credential(
+def test_a_console_session_never_opens_the_immutable_platform_boundary(
     oidc_client: TestClient, auth_headers: dict[str, str], login: str
 ) -> None:
-    """Neither kind of console session opens a route guarded by the platform key:
-    logging a person in must not widen any machine-credential dependency."""
+    """Neither kind of console session opens the one boundary that must never
+    widen (#1045: `require_api_key` itself now falls through to a live console
+    session on a GET, by design -- the boundary that stays platform-key-only is
+    `require_platform_key`, which administers principal and login-code issuance)."""
 
     if login == "oidc":
         token = _session_token(_login(oidc_client))
@@ -1034,14 +1036,17 @@ def test_a_console_session_is_not_a_machine_credential(
         token = str(_set_cookies(exchanged)[SESSION_COOKIE].value)
         oidc_client.cookies.clear()
 
-    # require_api_key (/agents) and the immutable require_platform_key boundary
-    # (minting a console login code). Each control shows the route answers the
-    # platform key, so the 401 is about the credential, not a missing route.
+    # require_api_key (#1045): a console session now answers a GET here, same
+    # as the platform key. Not a regression -- the control proves the route
+    # itself works, so the refusal below is about require_platform_key
+    # specifically, not a missing or broken route.
     session = _cookie(SESSION_COOKIE, token)
-    refused = oidc_client.get("/agents", headers=session)
-    assert refused.status_code == 401, refused.text
+    widened = oidc_client.get("/agents", headers=session)
+    assert widened.status_code == 200, widened.text
     assert oidc_client.get("/agents", headers=auth_headers).status_code == 200
 
+    # require_platform_key: administers principal/login-code issuance and must
+    # never grow support for a console session (auth.py's own module contract).
     mint = {"subject": "U0EXAMPLE9"}
     refused = oidc_client.post("/console/login-codes", json=mint, headers=session)
     assert refused.status_code == 401, refused.text
