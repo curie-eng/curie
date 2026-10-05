@@ -22,7 +22,6 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from .. import transcripts
 from ..config import get_settings
-from ..factory_reply_target import parse_reply_target
 from ..forges.github.binding import github_reply_route
 from ..models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
@@ -646,7 +645,7 @@ async def create_revision_request(
     request_id: uuid.UUID,
     wait_deadline: datetime,
     expected_work_item_version: int,
-    snapshot: Mapping[str, str],
+    snapshot: Mapping[str, str | None],
 ) -> WorkItemResult:
     """Store a mention in sequence without interrupting the live request."""
 
@@ -723,28 +722,26 @@ async def create_revision_request(
 
 
 async def _lineage_closed_for(
-    session: AsyncSession, work_item: WorkItem, objective: str | None
+    session: AsyncSession, work_item: WorkItem, reply_target_pr_number: str | None
 ) -> bool:
-    """Whether ``objective`` targets a pull request the WorkItem no longer has open.
+    """Whether a revision's pull request is no longer the WorkItem's open lineage.
 
-    The lineage must exist, be open, and carry that pull request's number.
+    A revision answers on its pull request, so it runs only while the lineage
+    exists, is open, and carries that pull request's number.
     """
 
-    if objective is None:
-        return False
-    target = parse_reply_target(
-        objective,
-        repo_full_name=work_item.repo_full_name,
-        clone_base=get_settings().github_clone_base,
-    )
-    if target.pr_number is None:
+    if reply_target_pr_number is None:
         return False
     lineage = (
         await session.get(ThreadPublicationLineage, work_item.publication_lineage_id)
         if work_item.publication_lineage_id is not None
         else None
     )
-    return lineage is None or lineage.status != "open" or lineage.pr_number != target.pr_number
+    return (
+        lineage is None
+        or lineage.status != "open"
+        or str(lineage.pr_number) != reply_target_pr_number
+    )
 
 
 async def admit_next_revision(
@@ -780,7 +777,7 @@ async def admit_next_revision(
     cause: str | None = None
     if work_item.cancelled_at is not None:
         cause = "issue_cancelled"
-    elif await _lineage_closed_for(session, work_item, request.objective):
+    elif await _lineage_closed_for(session, work_item, request.reply_target_pr_number):
         cause = "lineage_closed"
     if cause is not None:
         status = "cancelled"
@@ -2211,7 +2208,7 @@ async def _admit_owner_lost_successor(
         or work_item.cancelled_at is not None
         or work_item.readmit_request_id is not None
         or await _publication_owns_terminus(session, work_item, lost)
-        or await _lineage_closed_for(session, work_item, lost.objective)
+        or await _lineage_closed_for(session, work_item, lost.reply_target_pr_number)
         or await owner_lost_streak(session, work_item.id) >= OWNER_LOST_RETRY_LIMIT
     ):
         return False
@@ -2229,6 +2226,10 @@ async def _admit_owner_lost_successor(
             "reply_kind": lost.reply_kind,
             "reply_address": lost.reply_address,
             "reply_conversation_id": lost.reply_conversation_id,
+            "reply_target_kind": lost.reply_target_kind,
+            "reply_target_pr_number": lost.reply_target_pr_number,
+            "reply_target_comment_id": lost.reply_target_comment_id,
+            "reply_target_url": lost.reply_target_url,
         },
     )
     # The WorkItem is locked and was checked above, so its version holds.

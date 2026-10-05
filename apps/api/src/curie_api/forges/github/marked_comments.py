@@ -11,7 +11,7 @@ from typing import Any, Literal
 import httpx
 
 from curie_api.factory_comment_text import _redact_factory_comment, marker_for
-from curie_api.factory_reply_target import ReplyTarget
+from curie_api.forges.types import ReplyTarget
 from curie_api.models import FactoryStatusComment
 
 logger = logging.getLogger(__name__)
@@ -88,11 +88,11 @@ class _GitHub:
 async def _subject_title(github: _GitHub, issue_number: int, target: ReplyTarget) -> str | None:
     """The issue or PR title for the card, read once. A failed read stays NULL."""
 
-    if target.pr_number is None:
+    if target.pull_request is None:
         path = f"{github.repo_path}/issues/{issue_number}"
         template = "/repos/{owner}/{repo}/issues/{issue_number}"
     else:
-        path = f"{github.repo_path}/pulls/{target.pr_number}"
+        path = f"{github.repo_path}/pulls/{target.pull_request.number}"
         template = "/repos/{owner}/{repo}/pulls/{pull_number}"
     try:
         found = await _github_request(
@@ -128,13 +128,13 @@ async def _deliver(
     """
 
     api, repo_path, headers, client = github.api, github.repo_path, github.headers, github.client
-    number = issue_number if target.pr_number is None else target.pr_number
+    number = issue_number if target.pull_request is None else int(target.pull_request.number)
     comments_path = f"{repo_path}/issues/{number}/comments"
     marker = marker_for(row.execution_request_id)
     stored = max(1, row.scan_page)
     # (path, first page, offset stored for this list's next page, list)
     scans: list[tuple[str, int, int, CommentList]] = [(comments_path, stored, 0, "issue")]
-    if target.kind == "thread":
+    if target.kind == "review_thread":
         # A thread reply lands on the review comment list; its 422 fallback on
         # the conversation list. The marker may sit on either.
         review_path = f"{repo_path}/pulls/{number}/comments"
@@ -163,9 +163,9 @@ async def _deliver(
         if existing.next_page is not None:
             row.scan_page = existing.next_page + offset
             return None
-    if target.kind == "thread":
-        assert target.comment_id is not None
-        root = await _thread_root(client, api, repo_path, headers, target.comment_id)
+    if target.kind == "review_thread":
+        assert target.thread_id is not None
+        root = await _thread_root(client, api, repo_path, headers, int(target.thread_id))
         replied = await _post(
             client,
             f"{api}{repo_path}/pulls/{number}/comments/{root}/replies",

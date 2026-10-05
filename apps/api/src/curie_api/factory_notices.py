@@ -47,7 +47,7 @@ from starlette.concurrency import run_in_threadpool
 from .config import Settings
 from .factory_comment_text import _redact_factory_comment, marker_for
 from .factory_progress import PhaseView, phase_view, pill_for
-from .factory_reply_target import ReplyTarget, parse_reply_target
+from .factory_reply_target import github_host, stored_reply_target
 from .factory_usage import usage_line, work_item_usage
 from .forges.github.marked_comments import (
     _REFUSED_STATUSES,
@@ -59,6 +59,7 @@ from .forges.github.marked_comments import (
     _patch,
     _subject_title,
 )
+from .forges.types import ReplyTarget
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .models import (
     ExecutionRequest,
@@ -695,7 +696,6 @@ async def _claim_next(
     if selected is None:
         return None
     row, work_item, request, pr_url, latest = selected
-    assert request.objective is not None
     now = await _clock(session)
     await session.execute(
         update(FactoryStatusComment)
@@ -707,11 +707,7 @@ async def _claim_next(
         )
         .execution_options(synchronize_session=False)
     )
-    target = parse_reply_target(
-        request.objective,
-        repo_full_name=work_item.repo_full_name,
-        clone_base=settings.github_clone_base,
-    )
+    target = stored_reply_target(request, work_item, github_host(settings.github_html_base))
     body = await _render(
         session,
         settings,
@@ -894,7 +890,7 @@ async def _render(
             result = result_section(
                 cause,
                 pr_url=pr_url,
-                feedback_url=target.url,
+                feedback_url=request.reply_target_url,
                 detail=row.detail,
                 superseded=cause == "issue_cancelled"
                 and await _superseded(session, work_item, request),

@@ -25,7 +25,8 @@ from curie_api.schemas.deployments import WebhookResult
 
 from . import workitem_dispatch
 from .config import Settings
-from .factory_reply_target import feedback_url
+from .factory_reply_target import feedback_url, github_host
+from .forges.types import GITHUB, PullRequestRef, ReplyTarget, RepositoryRef
 from .github_factory import lock_issue
 from .github_factory_events import mentions_login
 from .github_review_audit import claim_review_delivery, settle_review_delivery
@@ -115,9 +116,34 @@ def is_actionable_feedback(
     return True
 
 
-def _objective(feedback: UnverifiedFeedback, settings: Settings, repo_full_name: str) -> str:
+def _feedback_url(feedback: UnverifiedFeedback, settings: Settings, repo_full_name: str) -> str:
     fragment = feedback.url.split("#", 1)[1]
-    url = feedback_url(settings.github_html_base, repo_full_name, feedback.pr_number, fragment)
+    return feedback_url(settings.github_html_base, repo_full_name, feedback.pr_number, fragment)
+
+
+def _reply_target(
+    feedback: UnverifiedFeedback, settings: Settings, work_item: WorkItem
+) -> ReplyTarget:
+    """An inline review comment is answered in its thread; a PR comment or a
+    submitted review in the pull request conversation."""
+
+    pull_request = PullRequestRef(
+        RepositoryRef(
+            GITHUB,
+            github_host(settings.github_html_base),
+            str(work_item.github_repository_id),
+            work_item.repo_full_name,
+        ),
+        str(feedback.pr_number),
+    )
+    if feedback.event == "pull_request_review_comment":
+        return ReplyTarget.on_thread(pull_request, str(feedback.feedback_id))
+    return ReplyTarget.on_pull_request(pull_request)
+
+
+def _objective(feedback: UnverifiedFeedback, url: str) -> str:
+    # The feedback URL opens the objective for the agent's benefit only; the
+    # reply target is stored typed on the request.
     provenance = feedback_provenance(feedback)
     return (
         f"{url}\n\n"
@@ -210,7 +236,8 @@ async def admit_parsed_feedback(
     if current_item.cancelled_at is not None:
         raise FeedbackIgnored("work_item_cancelled")
     work_item = current_item
-    objective = _objective(feedback, settings, work_item.repo_full_name)
+    url = _feedback_url(feedback, settings, work_item.repo_full_name)
+    objective = _objective(feedback, url)
     if len(objective) > _MAX_OBJECTIVE:
         raise FeedbackIgnored("feedback_too_large")
     facts = Facts(
@@ -225,6 +252,8 @@ async def admit_parsed_feedback(
         objective=objective,
         requester=f"github:{feedback.sender_id}:{feedback.sender_login}",
         request_id=uuid.uuid5(uuid.NAMESPACE_URL, feedback.event_id),
+        reply_target=_reply_target(feedback, settings, work_item),
+        reply_url=url,
     )
     result = await workitem_dispatch.admit_revision(session, facts)
     return admission_result(result, facts.request_id)
