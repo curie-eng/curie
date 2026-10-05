@@ -13,7 +13,8 @@ Four phases run over the linted root (``docs/`` excluding ``docs/adr/``):
    ``cli/command-manifest.json``, so those docs cannot name a command that no
    longer exists (#1041, #2247, see ``commands.py``).
 4. Lint: walk every citation, assert no line coordinates, every path exists,
-   every Python symbol resolves.
+   every Python symbol resolves, and every cited ADR number has a file in
+   ``docs/adr/`` (#3844, see ``adr_citations.py``).
 
 ``main`` is a pure check by default (drift is a finding, nothing is written);
 ``main --write`` rewrites the generated regions so ``scripts/check-docs.sh`` can
@@ -26,6 +27,7 @@ import argparse
 import subprocess
 from pathlib import Path
 
+from .adr_citations import scan_adr_citations
 from .citation import (
     SOURCE_EXTENSIONS,
     Classification,
@@ -366,11 +368,14 @@ def _check_index_region(repo_root: Path, rows: list[tuple[str, SeamMeta]]) -> li
 def _check_docs(repo_root: Path, cache: SymbolCache) -> tuple[list[Finding], int]:
     docs, findings = _linted_docs(repo_root)
     ignored = 0
+    adr_numbers = frozenset(
+        number for doc in iter_adr_docs(repo_root) if (number := adr_number(doc)) is not None
+    )
 
     for md in docs:
         rel = md.relative_to(repo_root).as_posix()
         text = md.read_text(encoding="utf-8")
-        doc_findings, doc_ignored = _lint_doc(repo_root, rel, text, cache)
+        doc_findings, doc_ignored = _lint_doc(repo_root, rel, text, cache, adr_numbers)
         findings.extend(doc_findings)
         ignored += doc_ignored
 
@@ -408,11 +413,11 @@ def _linted_docs(repo_root: Path) -> tuple[list[Path], list[Finding]]:
 
 
 def _lint_doc(
-    repo_root: Path, rel: str, text: str, cache: SymbolCache
+    repo_root: Path, rel: str, text: str, cache: SymbolCache, adr_numbers: frozenset[str]
 ) -> tuple[list[Finding], int]:
     """Lint one doc, then apply the per-line escape hatch uniformly.
 
-    Every finding type (line-ban, path, symbol, shorthand) is produced first,
+    Every finding type (line-ban, path, symbol, shorthand, ADR number) is produced first,
     then a finding whose line is silenced by ``<!-- doclint:ignore-line -->``
     (on the preceding line, or inline at the end of that same line) is dropped.
     The count is of distinct suppressed physical lines, so the summary reflects
@@ -430,6 +435,18 @@ def _lint_doc(
                 line=hit.line,
             )
         )
+
+    for cited in scan_adr_citations(text):
+        if cited.number not in adr_numbers:
+            raw.append(
+                Finding(
+                    rel,
+                    cited.label,
+                    f"cited ADR does not exist; no file in {_ADR_REL}/ is numbered "
+                    f"{cited.number}. Cite an existing ADR or add this one",
+                    line=cited.line,
+                )
+            )
 
     for span in find_code_spans(text):
         raw.extend(_check_span(repo_root, rel, span, cache))

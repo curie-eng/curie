@@ -41,6 +41,10 @@ detail, and documentation drift on one version-selectable system diagram.
   - [Handling approvals (human in the loop)](#handling-approvals-human-in-the-loop)
   - [Deliberate progress (ADR 0130)](#deliberate-progress-adr-0130)
 - [Pushing agent versions with git (deploy flow)](#pushing-agent-versions-with-git-deploy-flow)
+- [Factory work items and publication](#factory-work-items-and-publication)
+  - [Factory component map](#factory-component-map)
+  - [One factory run, end to end](#one-factory-run-end-to-end)
+  - [Factory clause status](#factory-clause-status)
 - [One worker, two hidden seams: substrate and transport](#one-worker-two-hidden-seams-substrate-and-transport)
   - [Substrate seam — `SandboxClient`](#substrate-seam--sandboxclient)
   - [Slack seam — a per-turn reply endpoint and the CLI stub](#slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub)
@@ -145,6 +149,7 @@ focused diagram docs, each a single clean picture:
 - **[How a message comes in and a reply goes out](docs/diagrams/message-flow.md)** — the core loop.
 - **[Kubernetes architecture](docs/diagrams/kubernetes.md)** — the cluster and how a sandbox pod is built.
 - **[The ACI](docs/diagrams/aci.md)** — the ACI, short for Agent Container Interface: the frozen contract between the worker and the agent in the box.
+- **[Factory work items and publication](#factory-work-items-and-publication)**: how a labelled GitHub issue becomes a pull request.
 
 ```mermaid
 flowchart TB
@@ -249,13 +254,18 @@ AgentMail inbound message with `authentication_unverifiable` before starting a
 turn or resolving an approval. Replies for historical accepted deliveries remain
 deliverable. See [inbound security](apps/mail-adapter/README.md#inbound-security).
 
-Curie builds **seven** things around that spine: the API, the dispatcher, the mail
-adapter, the worker+runner glue, the UI, the CLI, and the umbrella Helm chart ([Deployment, CI, and release](#deployment-ci-and-release)). The
+ADR-0007's Decision names **six** things Curie builds around that spine: the
+web UI, the API server, the Slack dispatcher, the worker+runner glue, the CLI,
+and the umbrella Helm chart ([Deployment, CI, and release](#deployment-ci-and-release)).
+Its title says five, but an Accepted ADR's title is frozen (ADR-0045). Later
+work added the [mail adapter](apps/mail-adapter), the
+[Discord adapter](adapters/discord), and the factory's
+[end to end connector](apps/e2e-connector). The
 chart is a built thing, not a packaging afterthought. The security rails are
 chart defaults, so the chart is where a rail either ships or does not.
 
 The per-package directory listing — path, language, and what each package owns
-— lives in the [README Component map](README.md#component-map), not duplicated
+— lives in the [AGENTS.md directory map](AGENTS.md#directory-map), not duplicated
 here so the two cannot drift apart. The Python packages are one **uv workspace**
 (root [`pyproject.toml`](pyproject.toml)); see [`CLAUDE.md`](CLAUDE.md) for
 verify commands.
@@ -512,6 +522,217 @@ sequenceDiagram
 - **Eval stream** (default `curie:evals`, overridable with `CURIE_EVAL_STREAM`, which the worker consumer reads too) is produced by the API ([`apps/api/src/curie_api/evalqueue.py::EvalQueue`](apps/api/src/curie_api/evalqueue.py)), whose stream name comes from [`apps/api/src/curie_api/config.py::Settings`](apps/api/src/curie_api/config.py), and consumed by the worker's eval consumer, which is a **separate** consumer group from the runs kernel ([`apps/worker/src/curie_worker/eval/stream.py::EvalStreamConsumer`](apps/worker/src/curie_worker/eval/stream.py)). It POSTs results to `/evals/report` ([`apps/worker/src/curie_worker/eval/stream.py::EvalReporter`](apps/worker/src/curie_worker/eval/stream.py)).
 - **The eval matrix endpoint** `GET /evals/matrix` reads pass/fail from Langfuse trace tags/metadata, not a scores join ([`apps/api/src/curie_api/routers/evals.py::eval_matrix`](apps/api/src/curie_api/routers/evals.py)).
 - **The manual path** (`GET /agents`, `/agents/{id}/versions`, `/agents/{id}/versions/{vid}/bundle`) and the webhook path terminate at the same `Version`/`Deployment` tables and the same `plugin_format.validate_bundle`. As a result, a plugin authored in the browser, pushed by `curie local deploy`, or promoted by a git push all go through one pipeline. Bundle store/fetch at [`apps/api/src/curie_api/storage.py::BundleStore`](apps/api/src/curie_api/storage.py) and [`apps/api/src/curie_api/routers/bundles.py::download_bundle`](apps/api/src/curie_api/routers/bundles.py).
+
+## Factory work items and publication
+
+The factory turns a labelled GitHub issue into a pull request. It is API and
+worker code on the same `curie:runs` stream, sandbox, and approval plane as a
+Slack turn, not a separate service. The tracker stays the backlog; Curie stores
+one `WorkItem` per repository and issue and one bounded `ExecutionRequest` per
+attempt
+([`apps/api/src/curie_api/models.py::WorkItem`](apps/api/src/curie_api/models.py),
+[`apps/api/src/curie_api/models.py::ExecutionRequest`](apps/api/src/curie_api/models.py)).
+Intake is off unless `GITHUB_FACTORY_INGRESS_ENABLED` is set. The reference
+bundle is [`examples/dark-factory`](examples/dark-factory).
+
+The governing decisions are
+[ADR 0145](docs/adr/0145-a-labelled-issue-is-a-backlog-item-and-the-stream-is-its-queue.md),
+[ADR 0157](docs/adr/0157-factory-work-dispatches-from-sql-over-the-runs-stream.md),
+[ADR 0161](docs/adr/0161-signed-github-issue-events-admit-one-work-item.md),
+[ADR 0162](docs/adr/0162-work-items-own-durable-execution-identity.md),
+[ADR 0171](docs/adr/0171-a-factory-run-may-take-three-hours-and-is-bounded-by-time-not-turns.md),
+[ADR 0174](docs/adr/0174-publication-prechecks-use-an-execution-scoped-capability.md),
+[ADR 0186](docs/adr/0186-a-factory-ticket-declares-its-base-and-keeps-it.md) (Draft), and
+[ADR 0187](docs/adr/0187-the-factory-polls-github-and-the-platform-reads-the-issue.md).
+
+### Factory component map
+
+```mermaid
+flowchart LR
+    GH["GitHub<br/>issues · comments · reviews · pull requests"]
+
+    subgraph api["apps/api"]
+        Intake["factory intake<br/>poller (default) or signed webhook"]
+        WIS["WorkItem service<br/>admit · dispatch · settle"]
+        Rec["WorkItemReconciler<br/>wakes · deadlines · CI gate · status comment"]
+        Scoped["scoped sandbox routes<br/>issue read · progress · precheck"]
+        PubAPI["publication rows<br/>approval · credential · lineage"]
+    end
+
+    PG[("Postgres<br/>work_items · execution_requests · publications")]
+    Runs["Valkey<br/>curie:runs"]
+
+    subgraph worker["apps/worker"]
+        Kernel["kernel<br/>acquire · start · heartbeat · finish"]
+        PubLoop["publication loop"]
+    end
+
+    Sandbox["runner sandbox<br/>factory bundle"]
+    Job["publication Job<br/>push branch · open or update PR"]
+
+    GH -- labels, mentions, review feedback --> Intake
+    Intake --> WIS
+    WIS --> PG
+    Rec -- claim due rows --> PG
+    Rec -- execute, CI fix, terminate wakes --> Runs
+    Runs --> Kernel
+    Kernel -- internal worker token --> WIS
+    Kernel --> Sandbox
+    Sandbox -- get_issue, report_progress, precheck --> Scoped
+    Scoped -- App installation token --> GH
+    Kernel -- publication request --> PubAPI
+    PubAPI --> PG
+    PubLoop -- claim approved publication --> PG
+    PubLoop --> Job
+    Job --> GH
+    PubLoop -- advance lineage --> PubAPI
+    Rec -- CI checks, status comment, labels --> GH
+```
+
+- **Factory intake.** The poller
+  ([`apps/api/src/curie_api/factory_poll_intake.py::poll_once`](apps/api/src/curie_api/factory_poll_intake.py))
+  is the default; the signed webhook
+  ([`apps/api/src/curie_api/github_factory.py::handle_factory_delivery`](apps/api/src/curie_api/github_factory.py))
+  is opt-in. Both check the installation, allowlist, and sender permission
+  ([`apps/api/src/curie_api/github_factory.py::verify_current`](apps/api/src/curie_api/github_factory.py))
+  and resolve the base branch
+  ([`apps/api/src/curie_api/factory_base.py::resolve_base`](apps/api/src/curie_api/factory_base.py)).
+- **WorkItem service.** Version fenced lifecycle in
+  [`apps/api/src/curie_api/workitems.py`](apps/api/src/curie_api/workitems.py)
+  and dispatch in
+  [`apps/api/src/curie_api/workitem_dispatch.py`](apps/api/src/curie_api/workitem_dispatch.py);
+  the worker calls it over `/v1/internal/work-items`
+  ([`apps/api/src/curie_api/routers/work_items.py`](apps/api/src/curie_api/routers/work_items.py)).
+- **WorkItemReconciler**
+  ([`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler`](apps/api/src/curie_api/workitem_reconciler.py)).
+  An API lifespan loop that publishes wakes, enforces deadlines, runs intake
+  and the CI gate, and syncs status comments.
+- **Scoped sandbox routes.** The sandbox holds no GitHub credential. The
+  runner's `get_issue` tool presents a `wir` capability to
+  [`apps/api/src/curie_api/routers/work_item_issue.py::read_work_item_issue`](apps/api/src/curie_api/routers/work_item_issue.py);
+  a `ppc` capability authorizes only
+  [`apps/api/src/curie_api/routers/publication_precheck.py::compare_publication_metadata`](apps/api/src/curie_api/routers/publication_precheck.py).
+- **Publication.**
+  [`apps/api/src/curie_api/crud/publications.py::create_publication`](apps/api/src/curie_api/crud/publications.py)
+  writes the approval and publication together, under the per-agent policy of
+  [ADR 0147](docs/adr/0147-publication-approval-is-a-per-agent-operator-policy.md).
+  [`apps/worker/src/curie_worker/publication_loop.py::PublicationReconcileLoop`](apps/worker/src/curie_worker/publication_loop.py)
+  runs a Kubernetes Job that pushes the branch and opens or updates the pull
+  request
+  ([`apps/worker/src/curie_worker/publication_k8s.py::KubernetesPublicationCluster`](apps/worker/src/curie_worker/publication_k8s.py)),
+  then advances the lineage, which links it to the WorkItem
+  ([`apps/api/src/curie_api/crud/lineages.py::advance_publication_lineage`](apps/api/src/curie_api/crud/lineages.py)).
+
+### One factory run, end to end
+
+```mermaid
+sequenceDiagram
+    participant GH as GitHub
+    participant I as Factory intake (api)
+    participant DB as Postgres
+    participant R as WorkItemReconciler (api)
+    participant V as Valkey curie:runs
+    participant W as Worker kernel
+    participant S as Runner sandbox
+    participant P as Publication loop (worker)
+
+    I->>GH: poll labelled issues (or receive a signed webhook)
+    I->>GH: re-read issue, installation, allowlist, sender permission
+    I->>GH: resolve base (base: label or deployment default)
+    alt base missing, not allowed, or two base: labels
+        I->>GH: refusal comment, no WorkItem
+    else admitted
+        I->>DB: WorkItem + ExecutionRequest (waiting, wait deadline)
+    end
+    R->>DB: claim due request under a lease
+    R->>V: XADD work-item-{id}-execute-{generation}
+    R->>DB: fence published generation
+    W->>V: XREADGROUP
+    W->>DB: acquire (internal worker route)
+    alt no sandbox capacity
+        W->>DB: defer (same request, generation + 1), then ACK
+    else claimed
+        W->>DB: start (runtime epoch, execution deadline)
+        W->>S: boot with turn budget, issue read and progress capabilities
+        S->>GH: get_issue through the API, never directly
+        S-->>W: turn ends awaiting a publication approval
+        W->>DB: publication + approval (fenced to the running request)
+    end
+    P->>DB: claim approved publication
+    P->>GH: Job pushes branch, opens or updates the PR
+    P->>DB: advance lineage, link it to the WorkItem
+    R->>DB: claim publication settlement
+    R->>GH: observe checks on the published head
+    alt green
+        R->>DB: complete the request
+    else failing, rounds left
+        R->>V: XADD work-item-{id}-ci-{round}
+    else last round, timeout, or unreadable CI
+        R->>DB: fail the request
+    end
+    R->>GH: edit the one status comment, move curie-factory labels
+```
+
+Not shown above:
+
+- **Settlement.** An approval holds the request until its deadline. A turn
+  without a publication fails as `no_pull_request` or `early_stop`. A turn with
+  one leaves the terminus to the CI gate
+  ([`apps/api/src/curie_api/factory_ci.py::gate`](apps/api/src/curie_api/factory_ci.py)),
+  which reruns failed GitHub Actions jobs once and never treats unreadable CI
+  as success.
+- **Stopping.** Unlabel, close, relabel of running work, the deadline, and a
+  lost owner move a running request to `cancellation_requested`; a
+  `work-item-{id}-terminate` wake tears the sandbox down, and the request
+  settles after a termination observation
+  ([`apps/worker/src/curie_worker/workitem_orphans.py::WorkItemOrphanSweeper`](apps/worker/src/curie_worker/workitem_orphans.py)).
+- **Visibility.** Operators read outcomes at `GET /work-items`
+  ([`apps/api/src/curie_api/routers/work_item_outcomes.py::list_work_items`](apps/api/src/curie_api/routers/work_item_outcomes.py)),
+  from the CLI `work-items` verbs and the console.
+
+### Factory clause status
+
+Status words follow [Clause status](#clause-status), plus two used only here:
+`AMENDED` means a later ADR replaced the clause and the code follows it;
+`DIVERGED` means the code differs and no ADR records the change. A Draft ADR
+row describes existing code; it does not accept the ADR. This evidence
+snapshot is `next` commit `bac88c6ea`, read on 2026-10-02.
+
+| ADR | Clause | Status | Evidence and limit |
+| --- | --- | --- | --- |
+| 0145 | Curie stores no issue content | ENFORCED | `WorkItem` has no content column; the request objective is the issue URL (`_facts` in [`apps/api/src/curie_api/github_factory.py`](apps/api/src/curie_api/github_factory.py)). |
+| 0145 | Issues enter through the generic hook ingress | AMENDED | By ADR 0161: the GitHub route and the poller, never `POST /hooks`. |
+| 0145 | No task table and no polling loop | AMENDED | By ADR 0162 (`WorkItem` rows) and ADR 0187 (polling is the default). |
+| 0145 | The bundle reads the ticket | AMENDED | By ADR 0187 for GitHub: the platform serves `get_issue`. The bundle declares no connector ([`examples/dark-factory/connectors.yaml`](examples/dark-factory/connectors.yaml)). |
+| 0157 | PostgreSQL owns the wait; the stream only wakes | ENFORCED | Claim, `XADD`, then fence `published_generation`. A capacity refusal calls `defer`, keeping the request and wait deadline, and ACKs. |
+| 0157 | Execute wake ids are per generation; terminate is stable | ENFORCED | [`packages/channel-protocol/src/channel_protocol/work_item_events.py`](packages/channel-protocol/src/channel_protocol/work_item_events.py). |
+| 0157 | `owner_lost` failure requires a termination observation | ENFORCED | `execution_requests_state_shape_ck`. |
+| 0157 | No publication for a cancelled WorkItem or stale runtime epoch | ENFORCED | `_refuse_fenced_work_item` in `crud.create_publication`. |
+| 0157 | D5: `delivered` and `awaiting-approval` record `completed` | DIVERGED | Approval holds the request; delivered without a publication fails (#3128); a publication completes only through the CI gate (#3097). |
+| 0161 | Factory intake is off by default | ENFORCED | `Settings.github_factory_ingress_enabled` defaults to false. |
+| 0161 | Admission requires installation, allowlist, and write or admin permission | ENFORCED | `github_factory.verify_current`, on webhook and poll paths. |
+| 0161 | App and bot senders never admit work | ENFORCED | Both paths drop `Bot` actors. |
+| 0161 | Reply binding is one `github` channel, no Slack | ENFORCED | Refused when no or several `github` bindings match the repository. |
+| 0161 | A second labelling creates no request | DIVERGED | Each label event is its own request, so a relabel starts a new run (#3072, PR #3096). |
+| 0161, 0162 | Cancellation is sticky | DIVERGED | `workitems.readmit` clears `cancelled_at` on relabel (#3072, PR #3096). |
+| 0162 | One WorkItem per issue; at most one active request | ENFORCED | `work_items_github_issue_key` and `uq_execution_requests_active_work_item`. |
+| 0162 | Transitions compare and advance a row version | ENFORCED | Lifecycle operations in [`apps/api/src/curie_api/workitems.py`](apps/api/src/curie_api/workitems.py) return `WorkItemConflict` on a version mismatch. |
+| 0162 | One publication lineage per WorkItem, linked once | ENFORCED | `work_items_publication_lineage_key`; bound only while unset and the request is running. |
+| 0162 | Execution deadline is exactly 1800 seconds | AMENDED | By ADR 0171. |
+| 0171 | Deadline is per agent, 60 to 10800 seconds, default 1800 | ENFORCED | `agents_execution_deadline_seconds_ck`, `execution_requests_deadline_ck`. |
+| 0171 | Time, not turns, bounds a run | ENFORCED | `WorkerConfig.work_item_max_turns` (default 1000) sets the turn budget; `max-turns` is not retried. |
+| 0174 | `ppc` authorizes only the metadata comparison | ENFORCED | `require_publication_precheck`; no other route accepts it. |
+| 0174 | Precheck limits: 10 s and 5 per turn; 20 per lineage per 5 minutes | ENFORCED | [`runner/src/curie_runner/publication_precheck.py`](runner/src/curie_runner/publication_precheck.py) and [`apps/api/src/curie_api/routers/publication_precheck.py`](apps/api/src/curie_api/routers/publication_precheck.py). |
+| 0174 | An empty snapshot is refused without pending approval | ENFORCED | Runner refusals `body_required`, `stale_context`, `rate_limited`, `no_change`. |
+| 0186 (Draft) | Base is one `base:` label or the default, from an allowlist | ENFORCED | `GITHUB_FACTORY_BASES` and `factory_base.resolve_base`. |
+| 0186 (Draft) | A bad base is refused with a comment, never substituted | ENFORCED | `factory_base.comment_refusal` before any WorkItem is written. |
+| 0186 (Draft) | The base is frozen on the WorkItem | ENFORCED | `work_items_base_ck`; a later `base:` label is recorded in `base_label_ignored`, not followed. |
+| 0187 | Polling is the default, one replica, conditional reads | ENFORCED | `poll_once` holds `pg_try_advisory_lock` and stores ETags and cursors. |
+| 0187 | Polling mode needs no webhook secret | ENFORCED | The factory settings validator requires a secret only in webhook mode. |
+| 0187 | The sandbox holds no GitHub credential | ENFORCED | The `wir` capability is scoped to one request and its issue. |
+
+Each `DIVERGED` row needs an ADR recording the change, or a code change back to
+the ADR.
 
 ## One worker, two hidden seams: substrate and transport
 
