@@ -29,22 +29,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from curie_api.config import Settings, get_settings
 from curie_api.main import create_app
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
-from test_github_factory_ingress import (
+from forge_fakes.github import (
     _ENV,
     INSTALLATION_ID,
     LABEL,
     REPO,
     REPO_ID,
     GitHubAPI,
-    _code,
     _Credentials,
     _issue_event,
     _post,
-    _rows,
 )
+from pydantic import ValidationError
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from test_github_factory_ingress import _code, _rows
 
 MARKER = "<!-- curie-factory-base-refusal -->"
 MAIN_SHA = "1" * 40

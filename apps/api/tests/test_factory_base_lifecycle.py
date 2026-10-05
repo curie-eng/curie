@@ -25,6 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
 from curie_api.factory_notices import FINAL_MARKER
+from forge_fakes.github import LABEL, REPO_ID, _issue_event, _post, _signature
+from forge_fakes.github_comments import _rows, admitted, comments  # noqa: F401  (fixtures)
 from test_factory_status_comment import _blocked_status_sync, _marked
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     _LABELS,
@@ -37,19 +39,9 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     _published_issue,
     _reconcile,
     _request,
-    _rows,
     _start_running,
-    admitted,
-    comments,
 )
-from test_github_factory_ingress import (
-    LABEL,
-    REPO_ID,
-    _code,
-    _issue_event,
-    _post,
-    _signature,
-)
+from test_github_factory_ingress import _code
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 

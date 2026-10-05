@@ -30,7 +30,7 @@ import pytest
 import yaml
 from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND
 from curie_api import factory_ci
-from curie_api.workitem_outcomes import CiDetail
+from curie_api.forges.github.ci import CiDetail
 from curie_runner.__main__ import _format_check_data, format_workspace_preamble
 from curie_runner.verification import (
     load_verification_declaration,

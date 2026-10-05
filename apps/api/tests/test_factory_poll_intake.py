@@ -48,7 +48,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_github_factory_ingress import (  # noqa: E402
+from forge_fakes.github import (  # noqa: E402
     _ENV,
     INSTALLATION_ID,
     LABEL,
@@ -60,8 +60,8 @@ from test_github_factory_ingress import (  # noqa: E402
     _comment_event,
     _issue_event,
     _post,
-    _rows,
 )
+from test_github_factory_ingress import _rows  # noqa: E402
 from test_github_factory_review import (  # noqa: E402
     BASE_REF,
     HEAD,

@@ -21,7 +21,6 @@ https://docs.github.com/en/rest/issues/events#list-issue-events
 from __future__ import annotations
 
 import logging
-import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -30,58 +29,19 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.concurrency import run_in_threadpool
 
-from curie_api.workitems.lifecycle import GITHUB_CHANNEL_KIND
-
 from . import github_factory
 from .config import Settings
+from .forges.github.binding import GITHUB_CHANNEL_KIND
+from .forges.github.identity import label_event_delivery_id
+from .forges.github.transport import Unavailable, get_all, get_github_json
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_factory_events import FactoryNotice
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable, human_sender
-from .github_review_truth import get_github_json, github_headers
 from .models import Agent, AgentChannel
 from .repo_full_name import InvalidRepoFullName, normalize_repo_full_name, repo_url_path
 from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
-
-_PER_PAGE = 100
-# Listings longer than this many pages are not trusted to be complete.
-_MAX_PAGES = 50
-
-
-class Unavailable(Exception):
-    """GitHub could not answer; try the repository again next pass."""
-
-
-async def get_all(
-    client: httpx.AsyncClient, *, api: str, token: str, path: str, params: dict[str, Any]
-) -> list[Any]:
-    """Every page of one listing, in GitHub's order, or Unavailable."""
-
-    items: list[Any] = []
-    for page in range(1, _MAX_PAGES + 1):
-        try:
-            response = await client.get(
-                f"{api}{path}",
-                params={**params, "per_page": _PER_PAGE, "page": page},
-                headers=github_headers(token),
-                follow_redirects=False,
-            )
-        except httpx.HTTPError:
-            raise Unavailable(path) from None
-        if response.status_code != 200:
-            raise Unavailable(path)
-        try:
-            result = response.json()
-        except ValueError:
-            raise Unavailable(path) from None
-        if not isinstance(result, list):
-            raise Unavailable(path)
-        items.extend(result)
-        if len(result) < _PER_PAGE:
-            return items
-    # A partial listing could hide the newest label event; decide nothing.
-    raise Unavailable(path)
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -107,19 +67,6 @@ def last_label_event(events: list[Any], label: str) -> dict[str, Any] | None:
         ):
             found = event
     return found
-
-
-def label_event_delivery_id(repository_id: int, issue_number: int, event_id: int) -> uuid.UUID:
-    """A stable stand-in delivery id for one labeled event.
-
-    It never collides with a real X-GitHub-Delivery, and the same event always
-    yields the same request id.
-    """
-
-    return uuid.uuid5(
-        uuid.NAMESPACE_URL,
-        f"https://github.com/factory/reconcile/{repository_id}/{issue_number}/{event_id}",
-    )
 
 
 async def bound_repositories(session: AsyncSession) -> list[str]:

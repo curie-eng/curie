@@ -6,7 +6,6 @@ verifier, then calls the generic WorkItem service. It does not read issue
 bodies into the platform and it does not bind Slack.
 """
 
-import hashlib
 import logging
 import uuid
 from dataclasses import dataclass, replace
@@ -18,19 +17,16 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from curie_api.crud import channels as crud_channels
 from curie_api.schemas.deployments import WebhookResult
-from curie_api.workitems.lifecycle import (
-    GITHUB_CHANNEL_KIND,
-    WorkItemConflict,
-    WorkItemOutcome,
-    github_reply_route,
-)
+from curie_api.workitems.lifecycle import WorkItemConflict, WorkItemOutcome
 
 from . import factory_base, workitem_dispatch
 from .config import Settings
 from .factory_base import BaseRefusal
 from .factory_notices import mark_status_comment_stale
+from .forges.github.binding import _binding, github_reply_route
+from .forges.github.identity import _issue_lock_keys, delivery_uuid
+from .forges.github.transport import get_github_json, repository_identity_matches
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_factory_events import (
     FactoryNotice,
@@ -40,13 +36,8 @@ from .github_factory_events import (
 )
 from .github_review_audit import claim_review_delivery, settle_review_delivery
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
-from .github_review_truth import (
-    get_github_json,
-    repository_identity_matches,
-    verify_sender_write_permission,
-)
+from .github_review_truth import verify_sender_write_permission
 from .models import (
-    Agent,
     AgentChannel,
     ThreadPublicationLineage,
     WorkItem,
@@ -57,7 +48,6 @@ from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
 
-_CHANNEL_KIND = GITHUB_CHANNEL_KIND
 IGNORED = {
     "unsupported_action",
     "unsupported_event",
@@ -114,16 +104,6 @@ class VerifiedIssue:
     default_branch: str | None
     token: str
     repo_path: str
-
-
-def delivery_uuid(delivery_id: str) -> uuid.UUID:
-    try:
-        delivery = uuid.UUID(delivery_id)
-    except (ValueError, TypeError, AttributeError):
-        raise HTTPException(400, {"code": "invalid_delivery"}) from None
-    if str(delivery) != delivery_id.lower():
-        raise HTTPException(400, {"code": "invalid_delivery"}) from None
-    return delivery
 
 
 def ignored(code: str) -> WebhookResult:
@@ -245,14 +225,6 @@ async def verify_current(
     )
 
 
-def _issue_lock_keys(repository_id: int, issue_number: int) -> tuple[int, int]:
-    digest = hashlib.sha256(f"curie-factory:{repository_id}:{issue_number}".encode()).digest()
-    return (
-        int.from_bytes(digest[:4], "big", signed=True),
-        int.from_bytes(digest[4:8], "big", signed=True),
-    )
-
-
 async def _lock_issue(session: AsyncSession, notice: FactoryNotice) -> None:
     await lock_issue(session, notice.repository_id, notice.issue_number)
 
@@ -271,40 +243,6 @@ async def lock_issue(session: AsyncSession, repository_id: int, issue_number: in
         text("SELECT pg_advisory_xact_lock(CAST(:classid AS integer), CAST(:objid AS integer))"),
         {"classid": classid, "objid": objid},
     )
-
-
-async def _binding(session: AsyncSession, notice: FactoryNotice) -> AgentChannel:
-    # `agent_channels_route_key` (migration 0070) lets one repository pair
-    # hold several routes, so the query can return more than one row. The
-    # `Agent.repo_full_name` join is a CORRECTNESS check (the pair's row
-    # belongs to some OTHER agent's repo, e.g. a stale rename), not what
-    # narrows multiplicity. `_CHANNEL_KIND` is `GITHUB_CHANNEL_KIND`, never
-    # Slack, and this notice names no adapter, so `crud.channels.matching_bindings`
-    # with `adapter=None` keeps every row -- shared with every other reader
-    # of a route rather than a fourth copy of the same rule.
-    rows = list(
-        await session.scalars(
-            select(AgentChannel)
-            .join(Agent, Agent.id == AgentChannel.agent_id)
-            .where(
-                AgentChannel.kind == _CHANNEL_KIND,
-                AgentChannel.address == notice.repo_full_name,
-                Agent.repo_full_name == notice.repo_full_name,
-            )
-        )
-    )
-    matches = crud_channels.matching_bindings(rows, _CHANNEL_KIND, notice.repo_full_name, None)
-    if not matches:
-        raise FactoryRefused("binding_missing")
-    if len(matches) > 1:
-        # Two routes on one repository under this repo's agents: never pick one.
-        logger.warning(
-            "github factory refused %s: %d routes are bound to it",
-            notice.repo_full_name,
-            len(matches),
-        )
-        raise FactoryRefused("binding_missing")
-    return matches[0]
 
 
 def _facts(notice: FactoryNotice, binding: AgentChannel, settings: Settings) -> Facts:
@@ -528,7 +466,8 @@ async def _with_label_event(
     webhook header.
     """
 
-    from curie_api.factory_label_reconcile import Unavailable, get_all, last_label_event
+    from curie_api.factory_label_reconcile import last_label_event
+    from curie_api.forges.github.transport import Unavailable, get_all
 
     try:
         token = await run_in_threadpool(

@@ -19,13 +19,8 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from curie_api.github_factory import (
-    IGNORED,
-    Facts,
-    admission_result,
-    delivery_uuid,
-    ignored,
-)
+from curie_api.forges.github.identity import delivery_uuid
+from curie_api.github_factory import IGNORED, Facts, admission_result, ignored
 from curie_api.schemas.deployments import WebhookResult
 
 from . import workitem_dispatch
@@ -56,7 +51,6 @@ _REVIEW_IGNORED = IGNORED | {
     "edited_feedback",
     "not_pull_request",
 }
-
 
 
 def _payload_pull_request(event: str, payload: Any) -> tuple[int, int] | None:
