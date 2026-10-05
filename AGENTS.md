@@ -293,6 +293,23 @@ or older worktree does not automatically acquire newer instructions; read this
 section from the updated base when resuming. Do not edit a live claimed Bonus
 Drain task or launch a second copy to apply the guidance.
 
+### Fast push checks
+
+After committing and before pushing, run `curie dev preflight --fast` from the
+source checkout. It selects the cheap PR gates for the committed change and
+runs their CI commands. The default base is `main`; use `--base <branch>`
+to compare against another fetched `origin/<branch>`. Use `--dry-run` to inspect
+the selected commands and `--json` for one structured report. A failing gate
+includes its output tail. This fast tier does not replace any required
+verification below.
+
+`curie install`, `curie update`, and `curie dev hooks install` configure the
+shared relative `core.hooksPath=.githooks`. Each linked worktree runs its own
+tracked hook. A differing existing path is preserved with a warning; use
+`git config --local core.hooksPath .githooks` to select the Curie hooks
+explicitly. The tracked pre-push hook runs fast preflight. The explicit escape
+hatch is `git push --no-verify`.
+
 **Rust CLI:**
 ```bash
 cd cli

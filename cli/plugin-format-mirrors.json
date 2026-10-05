@@ -94,6 +94,26 @@
   ],
   "non_mirrors": [
     {
+      "struct": "PreflightCheck",
+      "file": "cli/src/commands.rs",
+      "reason": "A selected CI command from the source-owned fast preflight planner, unrelated to plugin_format."
+    },
+    {
+      "struct": "PreflightFailure",
+      "file": "cli/src/commands.rs",
+      "reason": "A failed gate result from the source-owned fast preflight planner, unrelated to plugin_format."
+    },
+    {
+      "struct": "PreflightOutput",
+      "file": "cli/src/commands.rs",
+      "reason": "The source-owned fast preflight report contract, unrelated to plugin_format."
+    },
+    {
+      "struct": "PreflightSetupError",
+      "file": "cli/src/commands.rs",
+      "reason": "A fast preflight setup error with recovery instructions, unrelated to plugin_format."
+    },
+    {
       "struct": "CheckReport",
       "file": "cli/src/commands.rs",
       "reason": "Mirrors the frozen curie_runner.check report contract (parse_check_report), a different local contract entirely -- unrelated to plugin_format and out of scope for #701."

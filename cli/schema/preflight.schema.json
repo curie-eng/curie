@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/preflight/v1.json",
+  "title": "curie dev preflight --fast --json",
+  "description": "The selected cheap pull request gates and their results, or the same command plan without execution under --dry-run.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "workflow": {
+            "type": "string"
+          },
+          "job": {
+            "type": "string"
+          },
+          "step": {
+            "type": "string"
+          },
+          "command": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workflow",
+          "job",
+          "step",
+          "command",
+          "cwd",
+          "group"
+        ]
+      }
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "check": {
+            "type": "string"
+          },
+          "output_tail": {
+            "type": "string"
+          },
+          "exit_code": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "check",
+          "output_tail",
+          "exit_code"
+        ]
+      }
+    },
+    "passed": {
+      "type": "boolean"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "base": {
+      "type": "string"
+    },
+    "head": {
+      "type": "string"
+    },
+    "error": {
+      "type": "string"
+    },
+    "fix": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "checks",
+    "failures",
+    "passed",
+    "dry_run",
+    "base",
+    "head"
+  ]
+}

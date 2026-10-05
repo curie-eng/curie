@@ -7903,6 +7903,48 @@
       "name": "dev",
       "subcommands": [
         {
+          "about": "Run the cheap pull request gates selected for the committed change",
+          "args": [
+            {
+              "global": false,
+              "help": "Run the fast tier. Required; no full tier is provided",
+              "id": "fast",
+              "long": "fast",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "main"
+              ],
+              "global": false,
+              "help": "Origin branch to compare against (for example, main or next)",
+              "id": "base",
+              "long": "base",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the selected CI commands without running them",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "preflight"
+        },
+        {
           "about": "Manage hooks for this source checkout",
           "hidden": false,
           "name": "hooks",
