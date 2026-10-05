@@ -304,6 +304,155 @@ fn write_otlp_fixture(root: &Path, name: &str, documents: &[serde_json::Value]) 
     fs::write(root.join(format!("{name}.json")), rendered).expect("write OTLP fixture");
 }
 
+// Collector v0.119.0's exportMessageAsLine writes the JSON buffer and its
+// terminating newline separately, so a concurrent query can see either a
+// partial JSON buffer or valid JSON whose newline has not been written yet.
+// https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.119.0/exporter/fileexporter/file_writer.go
+#[test]
+fn local_otel_query_reads_terminated_records_before_a_partial_export() {
+    use serde_json::json;
+
+    let harness = tempfile::tempdir().expect("create local OTel fixture directory");
+    let root = harness.path();
+    write_otlp_fixture(
+        root,
+        "traces",
+        &[
+            json!({"resourceSpans": [{"scopeSpans": [{"spans": [{"traceId": "committed-trace"}]}]}]}),
+        ],
+    );
+    write_otlp_fixture(root, "logs", &[json!({"resourceLogs": []})]);
+    write_otlp_fixture(
+        root,
+        "metrics",
+        &[
+            json!({"resourceMetrics": [{"scopeMetrics": [{"metrics": [{"name": "committed.metric", "sum": {"dataPoints": [{"asInt": 2}]}}]}]}]}),
+        ],
+    );
+    for name in ["traces", "logs", "metrics"] {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(format!("{name}.json")))
+            .expect("open live OTLP fixture")
+            .write_all(b"{\"resource")
+            .expect("append in-progress export");
+    }
+
+    let result = run_local_otel_query(
+        &local_otel_query_python(),
+        "snapshot",
+        root,
+        &root.join("unused-baseline.json"),
+    );
+    assert!(
+        result.status.success(),
+        "terminated records must remain readable while the next export is partial: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&result.stdout).expect("parse committed snapshot");
+    assert_eq!(snapshot["trace_ids"], json!(["committed-trace"]));
+    assert_eq!(snapshot["metrics"].as_array().expect("metrics").len(), 1);
+    assert_eq!(snapshot["metrics"][0]["name"], "committed.metric");
+    assert_eq!(snapshot["metrics"][0]["value"], 2.0);
+}
+
+#[test]
+fn local_otel_query_defers_valid_exports_until_their_newline() {
+    use serde_json::json;
+
+    let harness = tempfile::tempdir().expect("create local OTel fixture directory");
+    let root = harness.path();
+    let script = local_otel_query_python();
+    for (name, document) in [
+        (
+            "traces",
+            json!({"resourceSpans": [{"scopeSpans": [{"spans": [{"traceId": "pending-trace"}]}]}]}),
+        ),
+        ("logs", json!({"resourceLogs": []})),
+        (
+            "metrics",
+            json!({"resourceMetrics": [{"scopeMetrics": [{"metrics": [{"name": "pending.metric", "sum": {"dataPoints": [{"asInt": 7}]}}]}]}]}),
+        ),
+    ] {
+        fs::write(
+            root.join(format!("{name}.json")),
+            serde_json::to_vec(&document).expect("serialize pending export"),
+        )
+        .expect("write export before its newline");
+    }
+
+    let before = run_local_otel_query(
+        &script,
+        "snapshot",
+        root,
+        &root.join("unused-baseline.json"),
+    );
+    assert!(
+        before.status.success(),
+        "a pending newline must not fail the query: {}",
+        String::from_utf8_lossy(&before.stderr)
+    );
+    let before_snapshot: serde_json::Value =
+        serde_json::from_slice(&before.stdout).expect("parse snapshot before commit");
+    assert_eq!(before_snapshot, json!({"trace_ids": [], "metrics": []}));
+
+    for name in ["traces", "logs", "metrics"] {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(format!("{name}.json")))
+            .expect("open pending export")
+            .write_all(b"\n")
+            .expect("commit export newline");
+    }
+    let after = run_local_otel_query(
+        &script,
+        "snapshot",
+        root,
+        &root.join("unused-baseline.json"),
+    );
+    assert!(
+        after.status.success(),
+        "the newline must make the export readable: {}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    let after_snapshot: serde_json::Value =
+        serde_json::from_slice(&after.stdout).expect("parse snapshot after commit");
+    assert_eq!(after_snapshot["trace_ids"], json!(["pending-trace"]));
+    assert_eq!(
+        after_snapshot["metrics"].as_array().expect("metrics").len(),
+        1
+    );
+    assert_eq!(after_snapshot["metrics"][0]["name"], "pending.metric");
+    assert_eq!(after_snapshot["metrics"][0]["value"], 7.0);
+}
+
+#[test]
+fn local_otel_query_rejects_malformed_terminated_exports() {
+    let script = local_otel_query_python();
+    for name in ["traces", "logs", "metrics"] {
+        let harness = tempfile::tempdir().expect("create local OTel fixture directory");
+        let root = harness.path();
+        fs::write(root.join(format!("{name}.json")), b"{\"resource\":}\n")
+            .expect("write malformed terminated export");
+        let result = run_local_otel_query(
+            &script,
+            "snapshot",
+            root,
+            &root.join("unused-baseline.json"),
+        );
+        assert!(
+            !result.status.success(),
+            "malformed terminated {name} records must fail the query"
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("JSONDecodeError"),
+            "{name} corruption must remain a JSON decoding error: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
 #[test]
 fn local_otel_failure_recovery_scopes_classified_metrics_to_the_traces_worker_instance() {
     use serde_json::json;
