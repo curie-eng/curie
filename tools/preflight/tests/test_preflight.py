@@ -127,9 +127,7 @@ def test_selection_follows_changed_path_rules(repo: Path, path: str, expected: s
         assert "cargo test" not in check["command"]
         # The gitleaks mount can include pytest's temporary-directory name.
         # Match executable tokens, including an absolute pytest executable.
-        assert not re.search(
-            r"(?:^|[\s;&|])(?:[^\s;&|]*/)?pytest(?:$|[\s;&|])", check["command"]
-        )
+        assert not re.search(r"(?:^|[\s;&|])(?:[^\s;&|]*/)?pytest(?:$|[\s;&|])", check["command"])
     scan = next(check for check in plan["checks"] if check["job"] == "gitleaks")
     workflow = yaml.safe_load((ROOT / ".github/workflows/gitleaks.yaml").read_text())
     assert workflow["jobs"]["gitleaks"]["env"]["GITLEAKS_IMAGE"] in scan["command"]
@@ -235,6 +233,70 @@ def prepare_hook(repo: Path, tmp_path: Path) -> tuple[Path, Path]:
     return side, remote
 
 
+@pytest.fixture
+def ui_hook_repo(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path]:
+    # Copy the real authored sources and toolchain inputs, never an existing
+    # dependency installation. Detached push verification owns its own setup.
+    suffixes = {".js", ".mjs", ".ts", ".tsx", ".json", ".yaml", ".yml"}
+    for relative in git(ROOT, "ls-files", "apps/ui").splitlines():
+        path = Path(relative)
+        if path.suffix not in suffixes:
+            continue
+        destination = repo / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / path, destination)
+    assert not (repo / "apps/ui/node_modules").exists()
+    if shutil.which("pnpm") is None:
+        if shutil.which("npm") is None:
+            pytest.fail("npm is required to acquire the real pnpm toolchain for this hook test")
+        toolchain = tmp_path / "pnpm-toolchain"
+        run(
+            tmp_path,
+            "npm",
+            "install",
+            "--prefix",
+            str(toolchain),
+            "--no-audit",
+            "--no-fund",
+            "pnpm@9.15.9",
+        )
+        private_bin = toolchain / "node_modules/.bin"
+        monkeypatch.setenv("PATH", f"{private_bin}{os.pathsep}{os.environ['PATH']}")
+    return prepare_hook(repo, tmp_path)
+
+
+def test_tracked_hook_installs_ui_dependencies_and_runs_real_lint(
+    ui_hook_repo: tuple[Path, Path],
+) -> None:
+    side, remote = ui_hook_repo
+    path = side / "apps/ui/src/preflight-hook-fixture.js"
+    path.write_text("// A harmless comment exercises a clean UI-only push.\n")
+    git(side, "add", "apps/ui/src/preflight-hook-fixture.js")
+    git(side, "commit", "-qm", "Add example UI notes")
+    clean_head = git(side, "rev-parse", "HEAD")
+    accepted = run(side, "git", "push", "origin", "topic", check=False)
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert git(remote, "rev-parse", "refs/heads/topic") == clean_head
+    worktrees = git(side, "worktree", "list", "--porcelain")
+    assert len(re.findall(r"^worktree ", worktrees, re.M)) == 2
+
+    # The real recommended JavaScript lint rule rejects an undefined symbol.
+    # TypeScript's override disables no-undef, so use an authored JavaScript file.
+    path.write_text("curiePreflightHookFixtureUndefined();\n")
+    git(side, "add", "apps/ui/src/preflight-hook-fixture.js")
+    git(side, "commit", "-qm", "Exercise UI lint refusal")
+    rejected = run(side, "git", "push", "origin", "topic", check=False)
+    assert rejected.returncode != 0
+    output = rejected.stdout + rejected.stderr
+    assert "ci.yaml:ui: Lint" in output
+    assert "no-undef" in output
+    assert git(remote, "rev-parse", "refs/heads/topic") == clean_head
+    worktrees = git(side, "worktree", "list", "--porcelain")
+    assert len(re.findall(r"^worktree ", worktrees, re.M)) == 2
+
+
 def test_tracked_hook_rejects_bad_real_push_then_accepts_clean_push(
     repo: Path, tmp_path: Path
 ) -> None:
@@ -307,9 +369,7 @@ def test_tracked_hook_chooses_nearer_next_base(repo: Path, tmp_path: Path) -> No
     assert git(remote, "for-each-ref", "refs/heads/topic") == ""
 
 
-def test_tracked_hook_breaks_equal_commit_count_tie_toward_main(
-    repo: Path, tmp_path: Path
-) -> None:
+def test_tracked_hook_breaks_equal_commit_count_tie_toward_main(repo: Path, tmp_path: Path) -> None:
     side, remote = prepare_hook(repo, tmp_path)
     git(repo, "branch", "next")
     main_head = commit(

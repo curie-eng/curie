@@ -1,7 +1,7 @@
 ---
 seam: CLI output (agent-facing `--json`)
 kind: CLEAN
-impls: 66 outputs behind one trait
+impls: 67 outputs behind one trait
 grade: not separately graded
 epics:
   - "#456"
@@ -13,7 +13,7 @@ order: 18
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 66 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 67 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -66,7 +66,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 
 ## Implementations today
 
-66 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
+67 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 - **`DryRunPlan`** (`cli/src/ui.rs`) — the generic `--dry-run` plan; JSON is
   `{"dry_run":true,"plan":[lines]}` and the human render is the same lines verbatim,
