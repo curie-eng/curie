@@ -658,8 +658,14 @@ decides the reason:
     the policy row's references: `configuration_unsupported`.
 11. The selection has `admission_open: false`: `runtime_unavailable`.
 
-Runtime members are reported only once steps 4 through 9 have validated the
-selected tuple. A row that passes every step still reports
+A control record that is present but malformed counts as absent at its own
+step: selection or manifest at step 4, qualification at step 6, readiness at
+step 7. Manifest comparisons use canonical bytes, so a parseable but
+non-canonical `manifest.json` matches its canonical control record. Extra files
+in the bootstrap directory are ignored. A `default` control reader username,
+like any credential the reader refuses before connecting, makes the bootstrap
+invalid. Runtime members are reported only once steps 4 through 9 have
+validated the selected tuple. A row that passes every step still reports
 `configuration_unsupported`, HTTP 503, until delivery ingress admits protected
 deliveries under LANE-4; the probe must not claim support that ingress cannot
 honor. Unconfigured, tombstoned and pending-history rows never open a reader.
