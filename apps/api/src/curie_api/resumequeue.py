@@ -10,8 +10,17 @@ platform-authored resolution text becomes the turn that continues the run.
 Wire encoding mirrors the dispatcher's seam exactly (a single ``payload`` field
 holding the model's JSON). The turn's ``event_id`` is deterministic per
 approval, so the worker's done-marker dedupes any double-enqueue.
+
+The queue also remembers, in process, every resume turn whose XADD raised
+(#4016). Every inline wake (resolve, the resolve-path expiry branch, the expiry
+sweeper, administrative recovery) passes through ``enqueue``, so this is the
+one seam that observes a wake that did not land. The resume reconciler reads
+that record and re-enqueues those approvals on its next pass instead of waiting
+out its grace horizon, which exists to protect wakes that may have landed. The
+record is lost on a process restart; the grace backstop still covers those.
 """
 
+import logging
 import re
 import uuid
 from datetime import UTC, datetime
@@ -33,6 +42,15 @@ from redis.typing import EncodableT
 
 from .config import get_settings
 from .models import Approval, ApprovalStatus
+
+logger = logging.getLogger(__name__)
+
+# Bound on the in-process record of undelivered resumes (#4016). A long Valkey
+# outage during a burst of resolutions must not grow it without limit. Past the
+# cap new failures are refused rather than evicting recorded ones: every id
+# already held stays owed, and a refused id is still a NULL ``resumed_at`` row
+# that the reconciler's grace backstop recovers, just later.
+_UNDELIVERED_RESUMES_MAX = 10_000
 
 
 def approval_trace_context(approval: Approval) -> Context:
@@ -263,6 +281,37 @@ class ResumeQueue:
         # must set the API's override to match, or the backstop reads the wrong
         # graveyard.
         self._dead_letter_stream = dead_letter_stream or f"{self._stream}:dead"
+        # Approval ids whose resume XADD raised in this process and has not since
+        # succeeded (#4016).
+        self._undelivered: set[uuid.UUID] = set()
+
+    def undelivered_resumes(self) -> frozenset[uuid.UUID]:
+        """Approval ids whose resume enqueue failed here and is still owed.
+
+        A snapshot, so the reconciler can forget ids while it walks it. Every id
+        is retried on each pass, so the order they are walked in does not matter.
+        """
+
+        return frozenset(self._undelivered)
+
+    def forget_undelivered(self, approval_id: uuid.UUID) -> None:
+        """Drop an id the caller has established owes no expedited retry."""
+
+        self._undelivered.discard(approval_id)
+
+    def _record_undelivered(self, approval_id: uuid.UUID) -> None:
+        if approval_id in self._undelivered:
+            return
+        if len(self._undelivered) >= _UNDELIVERED_RESUMES_MAX:
+            logger.warning(
+                "approval %s resume enqueue failed but the undelivered-resume "
+                "record is full (%d); the reconciler's grace backstop will "
+                "recover it instead of the next pass",
+                approval_id,
+                _UNDELIVERED_RESUMES_MAX,
+            )
+            return
+        self._undelivered.add(approval_id)
 
     async def enqueue(
         self, turn: QueuedTurn, *, parent: Context | None = None
@@ -296,8 +345,19 @@ class ResumeQueue:
                 "outcome": outcome,
             },
         )
+        # Only a resume turn owes an approval wake; a hook-fire turn or anything
+        # else whose id merely resembles the key parses to None and is skipped.
+        resume_approval_id = parse_resume_event_id(turn.event_id)
         if error is not None:
+            # An ambiguous failure (a timeout after the server applied the XADD)
+            # may still have landed. Recording it anyway costs at most one
+            # redundant wake, which the worker's deterministic event-id claim and
+            # done marker absorb; not recording it strands the session.
+            if resume_approval_id is not None:
+                self._record_undelivered(resume_approval_id)
             raise error
+        if resume_approval_id is not None:
+            self.forget_undelivered(resume_approval_id)
         record_metric(
             "curie.turn.accepted",
             attributes={

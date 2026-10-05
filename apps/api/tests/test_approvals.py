@@ -467,6 +467,78 @@ def test_failed_inline_enqueue_then_reconciler_keeps_the_stored_parent(
     assert _read_resumed_at(created["id"]) is not None
 
 
+def test_resolve_during_valkey_restart_is_resumed_by_the_next_reconciler_pass(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#4016: the resolve that hit a just-restarted Valkey is resumed on the next
+    reconciler pass, not three hours later.
+
+    The fault is the app's own Valkey client raising ``ConnectionError`` on its
+    first ``xadd`` to the runs stream (the first command after the store
+    restarted), BELOW ``ResumeQueue.enqueue``, so the queue's failure handling
+    runs exactly as in production. The resolve still returns 200 with nothing
+    on the stream. A reconciler built on the SAME app resume queue, with the
+    production grace (10860 s, from the chart), then delivers the resume even
+    though the approval was resolved seconds ago.
+    """
+
+    created = approvals_client.post(
+        "/approvals", json=_payload(), headers=auth_headers
+    ).json()
+    app_state = approvals_client.app.state
+    app_valkey = app_state.valkey
+    real_xadd = app_valkey.xadd
+    failed: list[str] = []
+
+    async def _xadd_after_restart(
+        name: Any, fields: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        if name == runs_stream and not failed:
+            failed.append(json.loads(fields["payload"])["event_id"])
+            raise redis.exceptions.ConnectionError(
+                "Error -3 connecting to valkey:6379. Temporary failure in name resolution."
+            )
+        return await real_xadd(name, fields, *args, **kwargs)
+
+    monkeypatch.setattr(app_valkey, "xadd", _xadd_after_restart)
+
+    resolved = approvals_client.post(
+        f"/approvals/{created['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U9", "C1", base=auth_headers),
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["status"] == "approved"
+    event_id = f"approval-{created['id']}-resolved"
+    assert failed == [event_id]  # the inline resume hit the fault
+    assert valkey.xrange(runs_stream) == []
+    assert _read_resumed_at(created["id"]) is None
+
+    reconciler = ResumeReconciler(
+        app_state.sessionmaker,
+        app_state.resume_queue,
+        interval_seconds=30,
+        grace_seconds=10860,
+        batch_limit=100,
+    )
+    # The app's engine and Valkey pool are bound to the TestClient's loop.
+    portal = approvals_client.portal
+    assert portal is not None
+    count = portal.call(reconciler.reconcile_once)
+
+    assert count == 1
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    turn = QueuedTurn.model_validate(json.loads(entries[0][1]["payload"]))
+    assert turn.event_id == event_id
+    assert _read_resumed_at(created["id"]) is not None
+
+
 @pytest.fixture
 def reconciler_disabled_client(
     _disposable_db: Any, runs_stream: str

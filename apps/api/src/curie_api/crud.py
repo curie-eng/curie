@@ -2994,6 +2994,19 @@ _RESUMABLE_STATUSES = (
 )
 
 
+def _owes_resume(approval_id: uuid.UUID) -> tuple[ColumnElement[bool], ...]:
+    """The owed-wake predicate for one row, shared by ``claim_resume_row`` and
+    ``approval_owes_resume`` so the locked claim and the unlocked check never
+    drift apart."""
+
+    return (
+        Approval.id == approval_id,
+        Approval.purpose != "publication",
+        Approval.resumed_at.is_(None),
+        Approval.status.in_(_RESUMABLE_STATUSES),
+    )
+
+
 async def claim_resume_row(session: AsyncSession, approval_id: uuid.UUID) -> Approval | None:
     """Atomically claim one owed-wake row for this reconcile pass (#411).
 
@@ -3008,16 +3021,22 @@ async def claim_resume_row(session: AsyncSession, approval_id: uuid.UUID) -> App
     """
 
     approval: Approval | None = await session.scalar(
-        select(Approval)
-        .where(
-            Approval.id == approval_id,
-            Approval.purpose != "publication",
-            Approval.resumed_at.is_(None),
-            Approval.status.in_(_RESUMABLE_STATUSES),
-        )
-        .with_for_update(skip_locked=True)
+        select(Approval).where(*_owes_resume(approval_id)).with_for_update(skip_locked=True)
     )
     return approval
+
+
+async def approval_owes_resume(session: AsyncSession, approval_id: uuid.UUID) -> bool:
+    """Whether this row still owes a wake, read WITHOUT a row lock.
+
+    Same predicate as ``claim_resume_row``. A plain read is not blocked by a
+    peer's ``FOR UPDATE``, so it tells "already resumed, gone, or no longer
+    resumable" apart from "merely locked by another transaction", which
+    ``SKIP LOCKED`` alone reports identically as None.
+    """
+
+    found = await session.scalar(select(Approval.id).where(*_owes_resume(approval_id)))
+    return found is not None
 
 
 async def list_resolved_unresumed(

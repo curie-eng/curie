@@ -3242,6 +3242,7 @@ class ConsoleSessionOut(BaseModel):
     expires_at: datetime
 
 
+HookRunSource = Literal["schedule", "manual"]
 ScheduleOutcome = Literal["ran", "deferred", "skipped", "blocked", "reclaimed", "failed"]
 # Closed set pinned by tests/vectors/hook-run-reasons.json. The worker Literal
 # is the other side. NULL means ran, in flight, or a row from before the column.
@@ -3265,7 +3266,7 @@ HookRunReason = Literal[
 
 
 class ScheduleHookOut(BaseModel):
-    """One cron hook on the in-force bundle, with its newest slot."""
+    """One cron hook with its newest scheduled and manual run histories."""
 
     name: str
     trigger: str
@@ -3274,6 +3275,9 @@ class ScheduleHookOut(BaseModel):
     last_fire_at: datetime | None
     last_outcome: ScheduleOutcome | None
     last_reason: HookRunReason | None = None
+    last_manual_fire_at: datetime | None
+    last_manual_outcome: ScheduleOutcome | None
+    last_manual_reason: HookRunReason | None
     paused: bool
 
 
@@ -3308,6 +3312,7 @@ class HookFireOut(BaseModel):
     agent: str
     name: str
     trigger: str
+    source: HookRunSource
     slot_utc: datetime
     outcome: ScheduleOutcome | None
     reason: HookRunReason | None = None

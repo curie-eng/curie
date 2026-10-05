@@ -87,22 +87,23 @@ LIMIT 1
 
 _INSERT_SQL = """
 INSERT INTO {schema}.hook_runs
-       (id, agent_id, name, slot_utc, version_id, outcome, reason, started_at, ended_at)
-VALUES (:id, :agent_id, :name, :slot, :version_id, CAST(:outcome AS text),
+       (id, agent_id, name, slot_utc, version_id, source, outcome, reason, started_at, ended_at)
+VALUES (:id, :agent_id, :name, :slot, :version_id, 'manual', CAST(:outcome AS text),
         CASE WHEN :terminal THEN :reason ELSE NULL END, now(),
         CASE WHEN :terminal THEN now() END)
-RETURNING id, slot_utc, outcome, reason, started_at, ended_at
+RETURNING id, source, slot_utc, outcome, reason, started_at, ended_at
 """
 
 _FAIL_SQL = """
 UPDATE {schema}.hook_runs
 SET outcome = 'failed', reason = 'enqueue_failed', ended_at = now()
 WHERE id = :id AND outcome IS NULL
-RETURNING id, slot_utc, outcome, reason, started_at, ended_at
+RETURNING id, source, slot_utc, outcome, reason, started_at, ended_at
 """
 
 _GET_SQL = """
-SELECT r.id, r.slot_utc, r.outcome, r.reason, r.started_at, r.ended_at, a.name AS agent_name
+SELECT r.id, r.source, r.slot_utc, r.outcome, r.reason, r.started_at, r.ended_at,
+       a.name AS agent_name
 FROM {schema}.hook_runs r
 JOIN {schema}.agents a ON a.id = r.agent_id
 WHERE r.id = :id AND r.agent_id = :agent_id AND r.name = :name
@@ -151,6 +152,7 @@ def _record(
         agent=agent,
         name=name,
         trigger="cron",
+        source=row["source"],
         slot_utc=row["slot_utc"],
         outcome=None if outcome is None else _OUTCOMES[str(outcome)],
         reason=_reason(row["reason"]),

@@ -257,6 +257,9 @@ fn locked_schedule_list() -> serde_json::Value {
                         "last_fire_at": "2026-09-25T02:30:00Z",
                         "last_outcome": "failed",
                         "last_reason": null,
+                        "last_manual_fire_at": null,
+                        "last_manual_outcome": null,
+                        "last_manual_reason": null,
                         "paused": false
                     }
                 ]
@@ -533,6 +536,8 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                     "agent": "acme-bot",
                     "name": "nightly-cleanup",
                     "trigger": "cron",
+                    "source": "manual",
+                    "reason": null,
                     "slot_utc": "2026-09-26T12:00:00Z",
                     "outcome": "ran",
                     "started_at": "2026-09-26T12:00:00Z",

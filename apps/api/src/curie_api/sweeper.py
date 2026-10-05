@@ -21,7 +21,8 @@ ever enqueues.
 A successful enqueue is recorded with ``crud.mark_approval_resumed`` (#418), the
 same enqueue-first-then-mark ordering the resolve path uses: a NULL
 ``resumed_at`` on a flipped record means the wake never reached the stream, and
-the resume reconciler (#411) re-enqueues it past its grace horizon. That is the
+the resume reconciler (#411) re-enqueues it: on its next pass when this
+process saw the enqueue fail (#4016), otherwise past its grace horizon. That is the
 only recovery path for an expiry wake, because a flipped record is no longer
 ``pending`` and so is never re-selected by a later sweep. Marking before the
 enqueue would write the wake off as delivered and strand the session for good.
@@ -35,7 +36,8 @@ The shared ``resume_event_id`` (see ``resumequeue.build_expiry_resume_turn``)
 prevents a redelivery of an already-finished turn from re-running; it does not
 make a re-enqueue free, so do not rely on it as a mid-turn dedupe. What keeps
 the reconciler's re-enqueue safe is its grace horizon (longer than the worker's
-maximum turn), not the shared key.
+maximum turn), not the shared key; the one wake it retries sooner is one whose
+XADD was observed failing (#4016), where no turn is in flight to collide with.
 """
 
 from __future__ import annotations
@@ -174,7 +176,8 @@ async def sweep_expired_approvals(
             # rollback-after-DB-error convention in the routers. If the flip
             # already committed, this record is left expired with ``resumed_at``
             # NULL, which is exactly the owed-wake shape the resume reconciler
-            # (#411) re-enqueues past its grace horizon -- so the wakeup is
+            # (#411) re-enqueues (next pass for a failed enqueue, #4016; past
+            # its grace horizon for a failed mark) -- so the wakeup is
             # retried rather than dropped, provided that backstop is enabled.
             await session.rollback()
             # The log must not name the enqueue as the failure: this except also

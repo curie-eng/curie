@@ -733,6 +733,7 @@ pub async fn install(update: bool) -> Result<()> {
         "runner/Dockerfile not found here or in any parent directory. Run `curie install` \
          from a curie source checkout -- a release binary has nothing to install.",
     )?;
+    configure_source_hooks(&root)?;
 
     // 1. Local config is user-owned. It is gitignored and only created once,
     // so pulling newer Curie sources and rerunning install cannot replace it.
@@ -810,6 +811,7 @@ pub async fn update(image: bool) -> Result<()> {
              released binary from the latest release is not built yet).",
         )
     })?;
+    configure_source_hooks(&root)?;
     require_tool("cargo", "cargo is not installed - https://rustup.rs/")?;
     run_step(
         &root,
@@ -845,14 +847,19 @@ fn seed_env_if_missing(root: &Path) -> Result<EnvSeed> {
     Ok(EnvSeed::Created)
 }
 
-/// Install the primary checkout's tracked Git hooks for every linked worktree.
+/// Install this checkout's tracked Git hooks through the relative shared path.
 pub fn dev_hooks_install() -> Result<()> {
     let root = find_repo_root().ok_or_else(|| {
         crate::exit::usage("Run `curie dev hooks install` from a Curie source checkout.")
     })?;
+    configure_source_hooks(&root)
+}
+
+/// A relative hooks path lets every linked worktree run its own tracked hook.
+fn configure_source_hooks(root: &Path) -> Result<()> {
     let git_root = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
-        .current_dir(&root)
+        .current_dir(root)
         .output()
         .context("Git is required to install hooks")?;
     if !git_root.status.success() {
@@ -864,58 +871,35 @@ pub fn dev_hooks_install() -> Result<()> {
         bail!("Run `curie dev hooks install` from the root Git checkout.");
     }
 
-    let worktrees = std::process::Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(&root)
-        .output()
-        .context("Could not find the primary Git checkout")?;
-    if !worktrees.status.success() {
-        bail!("Could not find the primary Git checkout.");
-    }
-    let listing = String::from_utf8(worktrees.stdout).context("Git returned an invalid path")?;
-    let primary = listing
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("worktree "))
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("Could not find the primary Git checkout."))?;
-    let hooks_dir = primary.join("hooks").canonicalize().map_err(|_| {
-        anyhow::anyhow!(
-            "The primary checkout has no tracked hooks directory. Update it to a revision containing hooks/pre-push, then retry."
-        )
-    })?;
-    let hook = hooks_dir.join("pre-push");
+    let hook = root.join(".githooks/pre-push");
     if !hook.is_file() {
         bail!(
-            "The tracked hook is missing from the primary checkout: {}",
+            "The tracked hook is missing from this source checkout: {}",
             hook.display()
         );
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if hook.metadata()?.permissions().mode() & 0o111 == 0 {
-            bail!(
-                "The primary checkout hook is not executable: {}",
-                hook.display()
-            );
-        }
+    if !is_executable(&hook) {
+        bail!(
+            "The tracked source checkout hook is not executable: {}",
+            hook.display()
+        );
     }
 
     let current = std::process::Command::new("git")
         .args(["config", "--get", "core.hooksPath"])
-        .current_dir(&root)
+        .current_dir(root)
         .output()
         .context("Could not read the local Git hook configuration")?;
     match current.status.code() {
         Some(0) => {
             let value = String::from_utf8(current.stdout)
                 .context("The local Git hook path is not valid UTF8")?;
-            if value.trim() != hooks_dir.to_string_lossy() {
-                bail!(
-                    "core.hooksPath is already set to `{}`. Keep that hook directory or clear the setting before installing Curie hooks.",
+            if value.trim() != ".githooks" {
+                crate::ui::ui().warn(&format!(
+                    "Warning: core.hooksPath is already set to `{}`; preserving it. To use the tracked Curie hooks, run `git config --local core.hooksPath .githooks`.",
                     value.trim()
-                );
+                ));
+                return Ok(());
             }
         }
         Some(1) if current.stdout.is_empty() => {}
@@ -923,17 +907,156 @@ pub fn dev_hooks_install() -> Result<()> {
     }
 
     let status = std::process::Command::new("git")
-        .args(["config", "--local", "core.hooksPath"])
-        .arg(&hooks_dir)
-        .current_dir(&root)
+        .args(["config", "--local", "core.hooksPath", ".githooks"])
+        .current_dir(root)
         .status()
         .context("Could not set the repository Git hook path")?;
     if !status.success() {
         bail!("Could not set the repository Git hook path.");
     }
 
-    crate::ui::ui().success("Git hooks installed for this checkout and its linked worktrees.");
+    crate::ui::ui().success("Git hooks configured with core.hooksPath=.githooks.");
     Ok(())
+}
+
+/// One cheap workflow step selected by the preflight planner.
+#[derive(Deserialize, Serialize)]
+pub struct PreflightCheck {
+    pub workflow: String,
+    pub job: String,
+    pub step: String,
+    pub command: String,
+    pub cwd: String,
+    pub group: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct PreflightFailure {
+    pub check: String,
+    pub output_tail: String,
+    pub exit_code: i32,
+}
+
+/// The planner's report is shared by dry runs and executed fast checks.
+#[derive(Deserialize, Serialize)]
+pub struct PreflightOutput {
+    pub checks: Vec<PreflightCheck>,
+    pub failures: Vec<PreflightFailure>,
+    pub passed: bool,
+    pub dry_run: bool,
+    pub base: String,
+    pub head: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PreflightSetupError {
+    error: String,
+    fix: String,
+}
+
+impl crate::ui::CliOutput for PreflightOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("preflight report contains only serializable fields")
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        for check in &self.checks {
+            ui.payload_plain(&format!(
+                "{} / {} / {} ({}): {}",
+                check.workflow, check.job, check.step, check.cwd, check.command
+            ));
+        }
+        for failure in &self.failures {
+            ui.payload_plain(&format!(
+                "{} failed (exit {}):\n{}",
+                failure.check, failure.exit_code, failure.output_tail
+            ));
+        }
+        if self.dry_run {
+            ui.note(&format!(
+                "Fast preflight plan: {} checks.",
+                self.checks.len()
+            ));
+        } else if self.passed {
+            ui.success(&format!(
+                "Fast preflight passed: {} checks.",
+                self.checks.len()
+            ));
+        }
+    }
+}
+
+/// Run the source-owned fast planner and preserve its single structured result.
+pub async fn dev_preflight(fast: bool, base: &str, dry_run: bool) -> Result<PreflightOutput> {
+    if !fast {
+        return Err(
+            crate::exit::CliError::usage("The preflight command requires --fast.")
+                .with_fix("Run `curie dev preflight --fast`.")
+                .into(),
+        );
+    }
+    let root = find_repo_root().ok_or_else(|| {
+        crate::exit::CliError::usage("Fast preflight requires a Curie source checkout.")
+            .with_fix("Run `curie dev preflight --fast` from a Curie source checkout.")
+    })?;
+    if !root.join("tools/preflight/preflight.py").is_file() {
+        return Err(crate::exit::CliError::usage(
+            "The source checkout has no fast preflight tool.",
+        )
+        .with_fix("Update this Curie source checkout to a revision containing the preflight tool.")
+        .into());
+    }
+    let mut command = tokio::process::Command::new("uv");
+    command
+        .args([
+            "run",
+            "--no-project",
+            "--with",
+            "pyyaml==6.0.3",
+            "python3",
+            "tools/preflight/preflight.py",
+            "--fast",
+            "--base",
+            base,
+            "--json",
+        ])
+        .current_dir(&root)
+        .stderr(std::process::Stdio::inherit());
+    if dry_run {
+        command.arg("--dry-run");
+    }
+    let output = command.output().await.map_err(|error| {
+        crate::exit::CliError::usage(format!("Could not run the fast preflight tool: {error}"))
+            .with_fix("Install uv, then run `curie install` from this source checkout and retry.")
+    })?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("The fast preflight tool did not return one JSON object")?;
+    if output.status.code() == Some(2) {
+        let error: PreflightSetupError = serde_json::from_value(payload)
+            .context("The fast preflight tool returned an invalid setup error")?;
+        return Err(crate::exit::CliError::usage(error.error)
+            .with_fix(error.fix)
+            .into());
+    }
+    let report: PreflightOutput = serde_json::from_value(payload)
+        .context("The fast preflight tool returned an invalid report")?;
+    if !output.status.success() {
+        let message = report
+            .error
+            .as_deref()
+            .context("The failed preflight report omitted its error")?;
+        let fix = report
+            .fix
+            .as_deref()
+            .context("The failed preflight report omitted its fix")?;
+        let error = crate::exit::CliError::failure(message).with_fix(fix);
+        return Err(crate::ui::ui().failed_report(&report, error.into()));
+    }
+    Ok(report)
 }
 
 /// `curie dev <script>`: run a repo dev script by relative path. Thin wrapper
@@ -9856,11 +9979,16 @@ pub const HOOK_RECORD_REASON: &str =
     "the skill tier runs one bundle against a local runner and has no platform API or hook run record";
 /// Where a durable hook record lives instead.
 pub const HOOK_RECORD_ALT: &str =
-    "use `curie local hook fire` or `curie cluster hook fire`, which print the run record";
+    "use `curie local hook record <agent> <name> <id>` or `curie cluster hook record <agent> <name> <id>` to read the run record";
 
 /// `skill hook schedule` and `skill hook record` (ADR-0099, #2932).
 pub fn skill_hook_record_unavailable(verb: &str) -> anyhow::Error {
-    crate::exit::unsupported(verb, HOOK_RECORD_REASON, HOOK_RECORD_ALT)
+    let alternative = if verb == "record" {
+        HOOK_RECORD_ALT
+    } else {
+        "use `curie local hook fire` or `curie cluster hook fire`, which print the run record"
+    };
+    crate::exit::unsupported(verb, HOOK_RECORD_REASON, alternative)
 }
 
 /// The prompt of one cron hook declared in `.claude-plugin/plugin.json`.
@@ -9909,9 +10037,20 @@ pub struct HookFireOpts {
     pub name: String,
     pub dry_run: bool,
     pub wait_secs: u64,
+    pub tier: &'static str,
 }
 
-/// Output of `<tier> hook fire`.
+/// Inputs for `<tier> hook record`.
+pub struct HookRecordOpts {
+    pub api_url: String,
+    pub api_key: String,
+    pub agent: String,
+    pub name: String,
+    pub run_id: String,
+    pub dry_run: bool,
+}
+
+/// Output of `<tier> hook fire` and `<tier> hook record`.
 pub enum HookFireOutput {
     DryRun(crate::ui::DryRunPlan),
     Record(Box<crate::api::HookFireRecord>),
@@ -9967,8 +10106,8 @@ pub async fn hook_fire(opts: HookFireOpts) -> Result<HookFireOutput> {
     while matches!(record.outcome.as_deref(), None | Some("deferred")) {
         if Instant::now() >= deadline {
             return Err(crate::exit::transient(format!(
-                "hook {} did not settle within {}s; run {}",
-                opts.name, opts.wait_secs, record.id
+                "hook {} did not settle within {}s; inspect with `curie {} hook record {} {} {}`",
+                opts.name, opts.wait_secs, opts.tier, opts.agent, opts.name, record.id
             )));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -9990,6 +10129,21 @@ pub async fn hook_fire(opts: HookFireOpts) -> Result<HookFireOutput> {
             crate::ui::ui().failed_report(&output, crate::exit::CliError::failure(message).into())
         );
     }
+    Ok(HookFireOutput::Record(Box::new(record)))
+}
+
+/// `<tier> hook record`: read and print a durable run without waiting for settlement.
+pub async fn hook_record(opts: HookRecordOpts) -> Result<HookFireOutput> {
+    if opts.dry_run {
+        let path = crate::api::hook_run_path(&opts.agent, &opts.name, &opts.run_id);
+        return Ok(HookFireOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!("GET {}{path}", opts.api_url.trim_end_matches('/'))],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let record = client
+        .get_hook_run(&opts.agent, &opts.name, &opts.run_id)
+        .await?;
     Ok(HookFireOutput::Record(Box::new(record)))
 }
 
@@ -10042,20 +10196,24 @@ impl crate::ui::CliOutput for SchedulesOutput {
                         let fire = hook.last_fire_at.as_deref().unwrap_or("-");
                         let outcome = hook.last_outcome.as_deref().unwrap_or("-");
                         let reason = hook.last_reason.as_deref().unwrap_or("");
+                        let manual_fire = hook.last_manual_fire_at.as_deref().unwrap_or("-");
+                        let manual_outcome = hook.last_manual_outcome.as_deref().unwrap_or("-");
                         if reason.is_empty() {
                             ui.payload(&format!(
-                                "{} {} {} {} {} {} {}",
+                                "{} {} {} {} {} {} {} {} {}",
                                 hook.name,
                                 hook.trigger,
                                 hook.schedule,
                                 hook.zone,
                                 fire,
                                 outcome,
-                                if hook.paused { "paused" } else { "active" }
+                                if hook.paused { "paused" } else { "active" },
+                                manual_fire,
+                                manual_outcome
                             ));
                         } else {
                             ui.payload(&format!(
-                                "{} {} {} {} {} {} {} {}",
+                                "{} {} {} {} {} {} {} {} {} {}",
                                 hook.name,
                                 hook.trigger,
                                 hook.schedule,
@@ -10063,7 +10221,9 @@ impl crate::ui::CliOutput for SchedulesOutput {
                                 fire,
                                 outcome,
                                 reason,
-                                if hook.paused { "paused" } else { "active" }
+                                if hook.paused { "paused" } else { "active" },
+                                manual_fire,
+                                manual_outcome
                             ));
                         }
                     }
@@ -10073,7 +10233,7 @@ impl crate::ui::CliOutput for SchedulesOutput {
     }
 }
 
-/// `<tier> schedules`: list cron hooks and the newest recorded slot (`GET /schedules`).
+/// `<tier> schedules`: list cron hooks and their scheduled and manual history (`GET /schedules`).
 pub async fn schedules(opts: SchedulesOpts) -> Result<SchedulesOutput> {
     let action = match (opts.pause.as_deref(), opts.resume.as_deref()) {
         (Some(name), None) => Some((name, true)),

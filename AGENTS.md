@@ -293,6 +293,23 @@ or older worktree does not automatically acquire newer instructions; read this
 section from the updated base when resuming. Do not edit a live claimed Bonus
 Drain task or launch a second copy to apply the guidance.
 
+### Fast push checks
+
+After committing and before pushing, run `curie dev preflight --fast` from the
+source checkout. It selects the cheap PR gates for the committed change and
+runs their CI commands. The default base is `main`; use `--base <branch>`
+to compare against another fetched `origin/<branch>`. Use `--dry-run` to inspect
+the selected commands and `--json` for one structured report. A failing gate
+includes its output tail. This fast tier does not replace any required
+verification below.
+
+`curie install`, `curie update`, and `curie dev hooks install` configure the
+shared relative `core.hooksPath=.githooks`. Each linked worktree runs its own
+tracked hook. A differing existing path is preserved with a warning; use
+`git config --local core.hooksPath .githooks` to select the Curie hooks
+explicitly. The tracked pre-push hook runs fast preflight. The explicit escape
+hatch is `git push --no-verify`.
+
 **Rust CLI:**
 ```bash
 cd cli
@@ -1075,6 +1092,15 @@ the work in a linked GitHub issue and pull request. Follow
   it is deletable and does not change the architecture, so it is a feature, not an
   architectural decision. The issue carries the what and the why; the *how* lives in
   the PR. An issue may cite an ADR.
+- **An example bundle or agent is never the subject of an ADR.** What a bundle
+  under `examples/` does (its skill text, prompts, tool policy, test or verdict
+  rules, safety rules, operator guidance) is that bundle's design, even when it
+  is safety relevant. Record it in the bundle's README or `docs/`, and track
+  changes in issues. When a bundle needs the platform itself to change shape,
+  the ADR covers only that platform contract, seam or invariant, stated so that
+  it holds for every bundle, not the bundle's own rules. The mean tester ADRs
+  (0169, 0172, 0181) are the counterexample: they record one example bundle's
+  behavior.
 - **When in doubt, write the issue.** Promote to an ADR only when the same decision
   gets re-explained across a third issue or PR.
 

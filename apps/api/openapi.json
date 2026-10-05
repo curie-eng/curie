@@ -4390,6 +4390,14 @@
             "title": "Slot Utc",
             "type": "string"
           },
+          "source": {
+            "enum": [
+              "schedule",
+              "manual"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
           "started_at": {
             "format": "date-time",
             "title": "Started At",
@@ -4406,6 +4414,7 @@
           "agent",
           "name",
           "trigger",
+          "source",
           "slot_utc",
           "outcome",
           "started_at",
@@ -4464,6 +4473,108 @@
           "secret"
         ],
         "title": "HookSecretOut",
+        "type": "object"
+      },
+      "HookSupportOut": {
+        "additionalProperties": false,
+        "description": "Safe support resolution. @spec PROTECTED-HOOK-SOURCE-9.",
+        "properties": {
+          "effective_tool_access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolAccess"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "qualification_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qualification Id"
+          },
+          "reason": {
+            "enum": [
+              "supported",
+              "source_unconfigured",
+              "source_closed",
+              "runtime_unavailable",
+              "qualification_unavailable",
+              "evidence_missing",
+              "evidence_expired",
+              "broker_unavailable",
+              "broker_identity_mismatch",
+              "configuration_unsupported"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "requested_tool_access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolAccess"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "runtime_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Generation"
+          },
+          "runtime_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Id"
+          },
+          "source_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Generation"
+          },
+          "supported": {
+            "title": "Supported",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "requested_tool_access",
+          "effective_tool_access",
+          "source_generation",
+          "runtime_id",
+          "runtime_generation",
+          "qualification_id",
+          "supported",
+          "reason"
+        ],
+        "title": "HookSupportOut",
         "type": "object"
       },
       "IssueReadComment": {
@@ -7086,7 +7197,7 @@
         "type": "object"
       },
       "ScheduleHookOut": {
-        "description": "One cron hook on the in-force bundle, with its newest slot.",
+        "description": "One cron hook with its newest scheduled and manual run histories.",
         "properties": {
           "last_fire_at": {
             "anyOf": [
@@ -7099,6 +7210,65 @@
               }
             ],
             "title": "Last Fire At"
+          },
+          "last_manual_fire_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Manual Fire At"
+          },
+          "last_manual_outcome": {
+            "anyOf": [
+              {
+                "enum": [
+                  "ran",
+                  "deferred",
+                  "skipped",
+                  "blocked",
+                  "reclaimed",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Manual Outcome"
+          },
+          "last_manual_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "turn_error",
+                  "target_unbound",
+                  "approval_gate_targetless",
+                  "agent_killed",
+                  "budget_exhausted",
+                  "run_in_flight",
+                  "catch_up_expired",
+                  "deferred_expired",
+                  "reply_undeliverable",
+                  "prior_side_effect",
+                  "deployment_missing",
+                  "hook_paused",
+                  "live_session",
+                  "enqueue_failed",
+                  "claim_expired"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Manual Reason"
           },
           "last_outcome": {
             "anyOf": [
@@ -7175,6 +7345,9 @@
           "zone",
           "last_fire_at",
           "last_outcome",
+          "last_manual_fire_at",
+          "last_manual_outcome",
+          "last_manual_reason",
           "paused"
         ],
         "title": "ScheduleHookOut",
@@ -15006,6 +15179,142 @@
         ]
       }
     },
+    "/hooks/{agent_id}/{hook}/support": {
+      "post": {
+        "description": "Report the current protected support resolution for one hook; write nothing.\n\nThe JSON body is ``HookSupportIn``, read raw because its exact bytes are\nsigned. Order follows the spec: hook name, bounded body, strict parse,\nungated support signature, delivery id, gate-held reauthentication, snapshot.\nThe delivery id is signed context only and reserves nothing.",
+        "operationId": "probe_hook_support_hooks__agent_id___hook__support_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-curie-signature-256",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Signature-256"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-curie-delivery-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Delivery-Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-curie-timestamp",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Timestamp"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Signed requested policy, not configuration. @spec PROTECTED-HOOK-SOURCE-9.",
+                "properties": {
+                  "tool_access": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ToolAccess"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "title": "HookSupportIn",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSupportOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSupportOut"
+                }
+              }
+            },
+            "description": "Authenticated, protected support unavailable (supported=false). Without this DTO, {\"detail\": \"authority_unavailable\"} when no current server resolution could be read."
+          }
+        },
+        "summary": "Probe Hook Support",
+        "tags": [
+          "hooks"
+        ]
+      }
+    },
     "/langfuse/traces": {
       "get": {
         "operationId": "list_traces_langfuse_traces_get",
@@ -15833,7 +16142,7 @@
     },
     "/schedules": {
       "get": {
-        "description": "Cron hooks on each in-force deployment, newest slot first in the record.",
+        "description": "Cron hooks on each in-force deployment, with separate latest run histories.",
         "operationId": "list_schedules_schedules_get",
         "parameters": [
           {
