@@ -12,6 +12,7 @@ from aci_protocol import (
 from curie_telemetry.redact import redact_text
 
 from ..runner_client import (
+    RunnerError,
     RunnerWorkspaceSnapshot,
 )
 from ..sandbox.types import (
@@ -269,6 +270,39 @@ class ToolAccessUnenforced(Exception):
             f"This agent cannot start: its runner cannot enforce {access.value} tool "
             "access for this turn, so the turn was not run."
         )
+
+
+class ChannelReadUnenforced(Exception):
+    """A granted turn's runner does not advertise channel read enforcement.
+
+    ADR 0100 (#2877): a runner that does not answer ``channel_read: true`` on
+    its status would ignore the capability or cannot honor its revocation, so
+    the turn is refused once under ``channel-read-unenforced`` and never
+    retried against the same boot. The capability already minted is revoked
+    by the attempt's settlement.
+    """
+
+    public_detail = (
+        "This agent cannot start: its runner cannot enforce channel read for this "
+        "turn, so the turn was not run."
+    )
+
+    def __init__(self) -> None:
+        super().__init__("the runner does not advertise channel read enforcement")
+
+
+class ChannelReadUnavailable(RunnerError):
+    """A turn's channel read grant could not be confirmed either way.
+
+    ADR 0100 review round 2: the bundle manifest was unreadable and the mint
+    failed, so the kernel cannot tell whether this turn must be enforced. Not
+    run, and retried like any turn the runner did not accept (it is a
+    ``RunnerError``, so it classifies as the retryable ``runner-error``; the
+    retry metric domain is closed, so it gets no class of its own).
+    """
+
+    def __init__(self) -> None:
+        super().__init__("channel read grant unknown: bundle unreadable and mint failed")
 
 
 class LiveSessionBusy(ThreadBusyError):

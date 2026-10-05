@@ -89,6 +89,7 @@ from ..workspace import (
     validate_workspace_archive,
 )
 from .types import (
+    BUNDLE_REF_LABEL,
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     ClaimView,
@@ -419,6 +420,9 @@ class DockerSandboxClient:
             )
         for key, value in (labels or {}).items():
             args += ["--label", f"{key}={value}"]
+        bundle_ref = env.get(BUNDLE_REF_ENV)
+        if bundle_ref:
+            args += ["--label", f"{BUNDLE_REF_LABEL}={bundle_ref}"]
         if self._network:
             args += ["--network", self._network]
 
@@ -533,7 +537,7 @@ class DockerSandboxClient:
         inspected = self._inspect(name, deadline=deadline)
         if inspected is None:
             return None
-        status, _labels, created = inspected
+        status, labels, created = inspected
         ready = status == "running" and self._healthz_ok(name, deadline=deadline)
         return ClaimView(
             name=name,
@@ -548,6 +552,7 @@ class DockerSandboxClient:
             quota_rejection=None,
             ready_reason=None,
             ready_message=None,
+            bundle_ref=labels.get(BUNDLE_REF_LABEL) or None,
         )
 
     def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:

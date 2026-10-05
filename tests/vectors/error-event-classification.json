@@ -122,6 +122,11 @@
       "name": "sdk_error_max_turns_subtype_is_not_vocabulary",
       "input": "error_max_turns",
       "expected": "unclassified"
+    },
+    {
+      "name": "worker_local_channel_read_unenforced_is_not_vocabulary",
+      "input": "channel-read-unenforced",
+      "expected": "unclassified"
     }
   ]
 }

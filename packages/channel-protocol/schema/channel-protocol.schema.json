@@ -53,7 +53,8 @@
         "streaming",
         "rich-cards",
         "threading",
-        "file-attachments"
+        "file-attachments",
+        "history-read"
       ],
       "title": "ChannelCapability",
       "type": "string"

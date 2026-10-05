@@ -49,6 +49,7 @@ from .routers import (
     approval_recovery,
     approvals,
     bundles,
+    channel_read,
     channels,
     cluster_message_replies,
     config,
@@ -459,6 +460,8 @@ def create_app() -> FastAPI:
     app.include_router(publications.internal_router)
     app.include_router(work_item_issue.router)
     app.include_router(work_item_issue.internal_router)
+    app.include_router(channel_read.router)
+    app.include_router(channel_read.internal_router)
     app.include_router(work_items.router)
     app.include_router(factory_status.router)
     app.include_router(turn_progress.router)

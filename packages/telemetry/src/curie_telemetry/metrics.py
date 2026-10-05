@@ -315,6 +315,7 @@ _HTTP_OPERATIONS = [
     # Break-glass recovery (#2753).
     "/approvals/identity-report",
     "/approvals/{approval_id}/recover",
+    "/channel-read",
     "/channels/admission",
     "/channels/token",
     "/channels/turns",
@@ -377,6 +378,7 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/termination/claim",
     "/v1/internal/work-items/requests/{request_id}/termination",
     "/v1/internal/work-items/issue-read/context",
+    "/v1/internal/channel-read/context",
     "/v1/work-item-progress/{request_id}",
     "/v1/work-item-progress/{request_id}/usage",
     "/v1/work-item-progress/{request_id}/verification",

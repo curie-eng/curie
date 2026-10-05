@@ -36,6 +36,7 @@ from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
 
 from ..binding import (
+    BUNDLE_REF_ENV,
     CONNECTOR_CALLER_TOKEN_ENV,
     HISTORY_TOKEN_ENV,
     MAX_TURNS_ENV,
@@ -1090,6 +1091,14 @@ class SandboxSubstrate:
             )
             return False
 
+    def claim_bundle_ref(self, claim_name: str) -> str | None:
+        """The ``CURIE_BUNDLE_REF`` a claim was created with, or None (ADR 0100).
+
+        Sync control plane read, like the rest of this seam."""
+
+        view = self._k8s.get_claim(claim_name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S)
+        return None if view is None else view.bundle_ref
+
     def reap_orphans(self) -> list[str]:
         """Measure orphan cleanup at the substrate seam for every backend."""
 
@@ -1346,6 +1355,7 @@ class SandboxSubstrate:
             state_credential_agent=credential_agent,
             state_credential_id=credential_id,
             state_token_exp=credential_exp,
+            bundle_ref=(env or {}).get(BUNDLE_REF_ENV),
         )
         if not publish:
             return handle

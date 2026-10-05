@@ -83,6 +83,7 @@ FAKE_CHANNEL_TOKEN = "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "FAKEFAKEFAKESIG
 # See curie_internal.sandbox_token.mint and curie_worker.caller_token.mint.
 FAKE_SANDBOX_TOKEN = "sbx." + "ZXhhbXBsZXNhbmRib3hwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
 FAKE_CONNECTOR_CALLER_TOKEN = "cct." + "ZXhhbXBsZWNhbGxlcnBheWxvYWQ." + "FAKEFAKEFAKESIG0000"
+FAKE_CHANNEL_READ_TOKEN = "chr." + "ZXhhbXBsZWNoYW5uZWxyZWFkcGF5bG9hZA." + "FAKEFAKEFAKESIG0000"
 FAKE_X_API_KEY_HEADER = "X-API-Key: " + "FAKEFAKEFAKEHEADERVALUE0000"
 _FAKE_DISCORD_BOT_TOKEN = (
     "FAKEFAKEFAKEFAKEFAKE0000." + "FAKE00." + "FAKEFAKEFAKEFAKEFAKEFAKE000"
@@ -122,6 +123,7 @@ SECRET_LITERALS: dict[str, str] = {
     "channel_token": FAKE_CHANNEL_TOKEN,
     "sandbox_token": FAKE_SANDBOX_TOKEN,
     "connector_caller_token": FAKE_CONNECTOR_CALLER_TOKEN,
+    "channel_read_token": FAKE_CHANNEL_READ_TOKEN,
     "x_api_key": FAKE_X_API_KEY_HEADER,
     "discord_bot_authorization": FAKE_DISCORD_BOT_AUTHORIZATION,
     "discord_bot_token_assignment": FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT,

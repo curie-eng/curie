@@ -197,6 +197,10 @@ async def _start_turn_under_hook_control(
     mint = constants._MEMORY_MINT.get()
     if mint is not None:
         event = self._with_memory_token(event, mint.qevent, mint.grant, remaining_s)
+    # ADR 0100: the channel read capability is minted here too, for the same
+    # reason, and only after the runner advertises enforcement does it ride
+    # the event. Every open, the attachment handoff included, comes through.
+    event = await self._with_channel_read(event, handle, remaining_s)
     carry = constants._HOOK_RUN_CARRY.get()
     if carry is not None and carry.recorder is not None and carry.ref is not None:
         async with carry.recorder.start_guard(carry.ref) as allowed:

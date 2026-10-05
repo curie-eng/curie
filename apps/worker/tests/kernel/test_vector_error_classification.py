@@ -8,10 +8,7 @@ from pathlib import Path
 from curie_worker.kernel.failures import map_error_classification
 
 _VECTOR = (
-    Path(__file__).resolve().parents[4]
-    / "tests"
-    / "vectors"
-    / "error-event-classification.json"
+    Path(__file__).resolve().parents[4] / "tests" / "vectors" / "error-event-classification.json"
 )
 _TOP_LEVEL_KEYS = frozenset({"comment", "unclassified", "platform", "vectors"})
 _VECTOR_KEYS = frozenset({"name", "input", "expected"})
@@ -102,3 +99,18 @@ def test_worker_local_timeout_uncertainty_is_not_error_event_vocabulary() -> Non
     payload = _load_payload()
     assert "runner-timeout-unconfirmed" not in payload["platform"]
     assert map_error_classification("runner-timeout-unconfirmed") == "unclassified"
+
+
+def test_worker_local_channel_read_refusal_is_not_error_event_vocabulary() -> None:
+    # The kernel records its own refusal under this class (a worker local
+    # display class); a runner ErrorEvent naming it is not trusted.
+    from curie_worker.kernel.constants import CHANNEL_READ_UNENFORCED_CLASSIFICATION
+    from curie_worker.kernel.failures import _display_error_classification
+
+    payload = _load_payload()
+    assert CHANNEL_READ_UNENFORCED_CLASSIFICATION not in payload["platform"]
+    assert map_error_classification(CHANNEL_READ_UNENFORCED_CLASSIFICATION) == "unclassified"
+    assert (
+        _display_error_classification(CHANNEL_READ_UNENFORCED_CLASSIFICATION)
+        == CHANNEL_READ_UNENFORCED_CLASSIFICATION
+    )

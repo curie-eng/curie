@@ -79,6 +79,7 @@ if TYPE_CHECKING:
 
 from . import (
     approval,
+    channel_read,
     clock,
     constants,
     delivery,
@@ -108,6 +109,7 @@ async def _attempt(
     pressure_retried: bool,
     workspace_inference: workspace._WorkspaceInferenceCarry,
     memory_grant: memory.TurnMemoryGrant | None = None,
+    channel_read_grant: channel_read.TurnChannelReadGrant | None = None,
 ) -> failures.TurnOutcome:
     """One attempt at a turn, then close its memory write credentials (#3776).
 
@@ -117,10 +119,16 @@ async def _attempt(
     writing then rather than at its expiry. A steered attempt hands its
     claim to the live turn it joined instead (``_close_memory_turns``).
     The closes run in the background, so the attempt's end never waits on
-    the API (``_settle_memory_turns``)."""
+    the API (``_settle_memory_turns``).
+
+    ADR 0100: the channel read logical turns the attempt opened are revoked
+    the same way, under an owner id unique to this attempt, by the owner
+    checked delete in Valkey (``_settle_channel_read``)."""
 
     record = memory._AttemptMemoryTurns(agent_id=agent_id)
     reset = constants._MEMORY_TURNS.set(record)
+    cr_record = channel_read._AttemptChannelRead()
+    cr_reset = constants._CHANNEL_READ_TURNS.set(cr_record)
     try:
         return await self._attempt_turn(
             qevent,
@@ -137,11 +145,19 @@ async def _attempt(
             pressure_retried=pressure_retried,
             workspace_inference=workspace_inference,
             memory_grant=memory_grant,
+            channel_read_grant=channel_read_grant,
         )
     finally:
         constants._MEMORY_TURNS.reset(reset)
+        constants._CHANNEL_READ_TURNS.reset(cr_reset)
+        # The lease heartbeat is a child of this attempt: it stops here, so a
+        # lease nothing renews lapses even if the settlement below cannot run.
+        if cr_record.heartbeat is not None:
+            cr_record.heartbeat.cancel()
         if record.minted or record.live_turns:
             self._settle_memory_turns(record)
+        if cr_record.pending():
+            self._settle_channel_read(cr_record)
 
 
 async def _attempt_turn(
@@ -161,6 +177,7 @@ async def _attempt_turn(
     pressure_retried: bool,
     workspace_inference: workspace._WorkspaceInferenceCarry,
     memory_grant: memory.TurnMemoryGrant | None = None,
+    channel_read_grant: channel_read.TurnChannelReadGrant | None = None,
 ) -> failures.TurnOutcome:
     handle = qevent.reply_handle
     thread_key = routing._thread_key_for(qevent)
@@ -201,6 +218,13 @@ async def _attempt_turn(
     # from the same carry, so a steering sender writes under their own name.
     memory_mint = constants._MEMORY_MINT.set(
         None if memory_grant is None else memory._MemoryMint(qevent=qevent, grant=memory_grant)
+    )
+    # ADR 0100: the channel read capability is minted the same way, where the
+    # turn opens; a steer renews the live turn's instead.
+    cr_mint = constants._CHANNEL_READ_MINT.set(
+        None
+        if channel_read_grant is None
+        else channel_read._ChannelReadMint(qevent=qevent, grant=channel_read_grant)
     )
 
     attachment_intent = self._attachments is not None and bool(qevent.attachments)
@@ -316,6 +340,7 @@ async def _attempt_turn(
             raise
         finally:
             constants._MEMORY_MINT.reset(memory_mint)
+            constants._CHANNEL_READ_MINT.reset(cr_mint)
     except CapacityExhaustedError as exc:
         rejection = exc.rejection
         logger.warning(
@@ -399,6 +424,7 @@ async def _attempt_turn(
             pressure_retried=True,
             workspace_inference=workspace_inference,
             memory_grant=memory_grant,
+            channel_read_grant=channel_read_grant,
         )
     except failures.PendingPublicationError as exc:
         record_reclaimed_retry()
@@ -484,6 +510,19 @@ async def _attempt_turn(
         return failures.TurnOutcome(
             terminal_ok=False,
             classification=constants.TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+            error_message=exc.public_detail,
+        )
+    except failures.ChannelReadUnenforced as exc:
+        # ADR 0100: a granted turn whose runner does not advertise channel
+        # read enforcement fails under its own class and is never retried;
+        # the model was not asked. The attempt's settlement revokes the
+        # capability already minted.
+        record_reclaimed_retry()
+        release_order()
+        logger.warning("turn start refused for %s: %s", qevent.event_id, exc)
+        return failures.TurnOutcome(
+            terminal_ok=False,
+            classification=constants.CHANNEL_READ_UNENFORCED_CLASSIFICATION,
             error_message=exc.public_detail,
         )
     except MissingAgentPoolError as exc:
@@ -659,6 +698,7 @@ async def _attempt_turn(
                     else remaining_s - (clock.time.monotonic() - attempt_started)
                 ),
                 memory_grant=memory_grant,
+                channel_read_grant=channel_read_grant,
             )
         outcome.workspace_inferred_repo = inferred
         if verified_review is not None:

@@ -421,9 +421,19 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   The reserved `curie-slack` capability is fully governed by policy when the
   manifest grants `channelRead: true`, and a bundle cannot declare it in any MCP
   map or in `connectors.yaml`. Without the grant a literal policy pattern gets
-  `channel_read.grant_required`. This prerequisite defines the grant and
-  reservation but mounts no server. The runtime exempts only exact platform
-  tool names published by the existing two servers through
+  `channel_read.grant_required`. A granted, real-model boot mounts it (#2877);
+  its tools are governed by policy like a connector's. The server carries three
+  read only tools, `read_channel_history`, `read_thread_replies` and
+  `read_channel_message`, over the agent's own bound Slack channels (a
+  `{kind, address}` selector such as `C0EXAMPLE1`, defaulting to the turn's
+  channel). Reads are bounded to a 7 day window, `limit` 50 by default and 100
+  at most, and 8 pages per logical turn. A refusal is a named code the model
+  sees, among them `channel_read.not_bound`, `channel_read.grant_revoked`,
+  `channel_read.turn_inactive`, `channel_read.window_too_wide`,
+  `channel_read.limit_invalid`, `channel_read.page_budget_exhausted` and
+  `channel_read.provider_rate_limited`. A granted turn on a runner that cannot
+  enforce the grant is refused with `channel-read-unenforced`. The runtime exempts
+  only exact platform tool names published by the existing two servers through
   `runner/src/curie_runner/approval.py::is_platform_owned_tool` before
   `classify_tool` is ever consulted. The exemption is exact live tool names, not the
   `mcp__<server>__` prefix: `strict_mcp_config` is off, so the CLI also loads ambient project

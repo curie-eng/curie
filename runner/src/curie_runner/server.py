@@ -36,7 +36,13 @@ from collections.abc import Awaitable, Callable, Mapping
 from types import MappingProxyType
 from typing import TypedDict, cast
 
-from aci_protocol import TOOL_ACCESS_STATUS_FIELD, Event, Interrupt, parse_inbound
+from aci_protocol import (
+    CHANNEL_READ_STATUS_FIELD,
+    TOOL_ACCESS_STATUS_FIELD,
+    Event,
+    Interrupt,
+    parse_inbound,
+)
 from aiohttp import web
 from aiohttp.typedefs import Handler, Middleware
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
@@ -203,6 +209,11 @@ async def _status(request: web.Request) -> web.Response:
         # @spec RUNNER-TOOL-ACCESS-5: credential-free, so on both status routes.
         TOOL_ACCESS_STATUS_FIELD: list(runner.enforced_tool_access),
     }
+    if runner.enforces_channel_read:
+        # Literal true only when curie-slack is mounted and the holder is live
+        # (ADR 0100); credential free, so on both status routes. An absent key
+        # tells the kernel to refuse a granted turn.
+        body[CHANNEL_READ_STATUS_FIELD] = True
     if request.path == "/v1/status":
         body["turn_epoch"] = runner.active_turn_epoch
         body["capacity_admission"] = True
