@@ -217,5 +217,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0192 | [The model sees the platform sender](0192-the-model-sees-the-platform-sender.md) | Accepted |
 | 0193 | [Identity links live in provider identity namespaces](0193-identity-links-live-in-provider-identity-namespaces.md) | Accepted |
 | 0194 | [The plugin-format contract is the frozen schema plus a parity gate](0194-plugin-format-contract-is-the-frozen-schema-plus-a-parity-gate.md) | Accepted |
-| 0197 | [The factory reaches code hosts and trackers through two ports](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md) | Draft |
+| 0197 | [The factory reaches code hosts and trackers through two ports](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md) | Accepted |
 <!-- END GENERATED: adr-index -->

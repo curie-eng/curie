@@ -2,7 +2,13 @@
 
 Date: 2026-10-04
 
-Status: Draft
+Status: Accepted
+
+Accepted 2026-10-05 with explicit maintainer approval from Brian Conn
+(TheConnMan), given after review of the publishing pull request
+([#3980](https://github.com/curie-eng/curie/pull/3980)), including its
+Jira repository binding, review-feedback allowlist fallback, native-tracker
+pairing and push-only publication Job decisions.
 
 Amends [ADR-0162](0162-work-items-own-durable-execution-identity.md): the WorkItem
 identity stops being a GitHub repository id and issue number and becomes a
