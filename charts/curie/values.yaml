@@ -2446,15 +2446,17 @@ preflights:
   # runs a CLUSTER-scope NetworkPolicy informer; if its RBAC cannot satisfy that
   # cluster LIST the manager crash-loops and no SandboxClaim ever binds (issue
   # #350). This post-install/upgrade hook Job fails the Helm operation unless the
-  # controller reaches "Starting workers" (all informer caches synced), so an RBAC
-  # regression fails at install, not at first turn. Gated also on
-  # agentSandbox.controller.deploy.
+  # controller logs "Starting workers" or its current Running pod has positive
+  # successful-reconcile metrics (all informer caches synced). Failure logs and
+  # pod restarts take precedence over either signal. The metrics counter survives
+  # startup-log rotation. Gated also on agentSandbox.controller.deploy.
   controllerReady:
     enabled: true
     image: alpine/k8s:1.31.2
-    # Max seconds to wait for the controller to become Available and log
-    # "Starting workers". Sized for a fresh install; an upgrade over a
-    # crash-looping controller may need a manual pod delete + `helm test`.
+    # Max seconds to wait for "Starting workers" or positive successful-reconcile
+    # metrics after checking for controller failures. Sized for a fresh install;
+    # an upgrade over a crash-looping controller may need a manual pod delete
+    # + `helm test`.
     timeoutSeconds: 180
     resources:
       requests: { cpu: 50m, memory: 64Mi }
