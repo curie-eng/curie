@@ -301,16 +301,16 @@ stopwords = [
 # the values remain readable in the public log and should be treated as
 # disclosed.
 commits = [
-  "30c81f1d27ace4fb8dda2e284eddbd8834fed79f",  # plugin-format: deploy.yaml (mine -- ADR-0089 tests + docstring)
-  "46f694f4a9c7d90a94a32909ac05403623183344",  # ADR-0089 Draft (mine -- the worked example)
-  "5d8df34bdfd96fe531142ec81a37b3d52cf278bf",  # approval plane docs (predates this work)
-  "c958a3b90b87fe0c87019097e5086b5d8f7b7746",  # validate_slack_channel test (predates this work)
-  "ddd2cd8402ffc6da1e96eddbfa90e487385b68e2",  # approval note dialog (predates this work)
+  "2db6cc1807c0f3b7e564f91b90faefb043cc9138",  # plugin-format: deploy.yaml (mine -- ADR-0089 tests + docstring)
+  "bae794ce8c90878855cc0d084a95f360c17f69e0",  # ADR-0089 Draft (mine -- the worked example)
+  "63e9b091c74520cde2e009cf6cc68dacc14b5c3b",  # approval plane docs (predates this work)
+  "22dbc0317bef8ba6d2bdad6dd80380aeea7d1b3f",  # validate_slack_channel test (predates this work)
+  "5613528c97f5dc84c0fad3f655bbebab75fa288c",  # approval note dialog (predates this work)
   # The downstream-repo slug, scrubbed from HEAD alongside the agent names it
   # travelled with. Same disclosure posture as the Slack ids above: the slug
   # stays readable in the public log until history is rewritten, so treat the
   # repository's existence and name as disclosed.
-  "39b0bd3990b2e0ea816e4e0a99d1f4159efcefe5",  # ADR-0091 impl: the slug as a test fixture
-  "cde1ac43c284b17eb2253af02b50345b808d6711",  # ADR-0090 Draft: the slug + its issue, cited as evidence
+  "953fd9dd5310d6483f1af65449f7b2e41d5ba83d",  # ADR-0091 impl: the slug as a test fixture
+  "170825501825f630c16b26737abb4185aa59c1d8",  # ADR-0090 Draft: the slug + its issue, cited as evidence
   "33505bd401c915ed7254ab6172a4f337eeeb5f77",  # object store role examples, scrubbed from HEAD
 ]
