@@ -99,6 +99,12 @@ may borrow the gate context, and detected gate loss still authorizes no cleanup.
 A lock waiter must not retain a work/claim connection. Pass an acquired gate
 context to inner helpers; never reacquire the same agent lock on another
 connection. Close the outer transaction on every error or cancellation path.
+Any failure to acquire the gate connection closes the gate as unavailable,
+whether or not SQLAlchemy wraps it. Observed on 2026-10-05 with SQLAlchemy
+2.0.52 and asyncpg, by opening `SourceGate.hold` against a missing database, a
+wrong password and a refused port: asyncpg `InvalidCatalogNameError`,
+`InvalidPasswordError` and a builtin `OSError` escaped unwrapped. Exceptions
+raised by the caller while the gate is held keep their existing mapping.
 
 A scheduled producer's explicit context belongs to exactly its provided guard,
 agent, exact raw hook name, current task and active outer scope. Validate that
