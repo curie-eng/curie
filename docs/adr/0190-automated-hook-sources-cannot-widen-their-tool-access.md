@@ -4,6 +4,12 @@ Date: 2026-10-02
 
 Status: Accepted
 
+**Partially superseded by [ADR 0203](0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+its premise that an automated source changes no system no longer holds for a
+hook an administrator binds a remediation policy to. The model turn keeps
+every HOOK-SOURCE-POLICY invariant.
+
 Tracked in [#3603](https://github.com/curie-eng/curie/issues/3603).
 This acceptance establishes the source authority and fail-closed invariants
 below. It does not claim that they are implemented. Concrete configuration
