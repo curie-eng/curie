@@ -6869,12 +6869,20 @@ def test_factory_publication_adds_unavailable_and_pending_proof_to_python_pr_bod
     )[0]["body"]
     assert payload["body"] in body
     assert "In-sandbox verification was unavailable." in body
-    assert "Unit conversion suite is pending proof." in body
+    assert (
+        "Unit conversion suite had not reported when this pull request was opened; "
+        "the issue status comment reports its result."
+    ) in body
+    assert "pending proof" not in body
+    assert "No in-sandbox Python verification check was declared." not in body
     assert "verification passed" not in body.casefold()
 
 
-_NOT_DECLARED_STAMP = "No in-sandbox Python verification check was declared."
-_PENDING_PROOF_STAMP = "Unit conversion suite is pending proof."
+_NOT_DECLARED_STAMP = "The repository declares no in-sandbox verification check with id `python`."
+_PENDING_PROOF_STAMP = (
+    "Unit conversion suite had not reported when this pull request was opened; "
+    "the issue status comment reports its result."
+)
 
 
 def _factory_publication_body(publication_id: str) -> str:
@@ -6902,6 +6910,8 @@ def test_factory_python_publication_with_no_declared_check_states_it_was_not_dec
     assert _NOT_DECLARED_STAMP in body
     assert _PENDING_PROOF_STAMP in body
     assert "In-sandbox verification was unavailable." not in body
+    assert "pending proof" not in body
+    assert "No in-sandbox Python verification check was declared." not in body
     assert "verification passed" not in body.casefold()
 
 
@@ -7031,6 +7041,8 @@ def test_factory_python_publication_stamps_an_unavailable_check_under_any_id(
     assert "In-sandbox verification was unavailable." in body
     assert _PENDING_PROOF_STAMP in body
     assert _NOT_DECLARED_STAMP not in body
+    assert "pending proof" not in body
+    assert "No in-sandbox Python verification check was declared." not in body
 
 
 def test_factory_python_publication_refuses_a_missing_preflight_observation(
@@ -7121,12 +7133,15 @@ def test_later_non_python_publication_keeps_prior_python_proof_pending(
 
     assert created.status_code == 201, created.text
     assert "In-sandbox verification was unavailable." in created.json()["body"]
-    assert "Unit conversion suite is pending proof." in created.json()["body"]
+    assert _PENDING_PROOF_STAMP in created.json()["body"]
 
 
 # --- per-repository Python CI policy (#3617) ------------------------------------------
 
-_REPOSITORY_PENDING_PROOF = "Repository CI is pending proof."
+_REPOSITORY_PENDING_PROOF = (
+    "Repository CI had not reported when this pull request was opened; "
+    "the issue status comment reports its result."
+)
 
 
 def test_outside_python_layout_without_a_policy_is_published_with_repository_ci_pending(
@@ -7146,6 +7161,8 @@ def test_outside_python_layout_without_a_policy_is_published_with_repository_ci_
     assert _NOT_DECLARED_STAMP in body
     assert _REPOSITORY_PENDING_PROOF in body
     assert CONVERSION_PYTHON_CI_CHECK not in body
+    assert "pending proof" not in body
+    assert "No in-sandbox Python verification check was declared." not in body
 
 
 def test_outside_python_layout_without_a_policy_accepts_any_python_path(
@@ -7197,9 +7214,14 @@ def test_custom_policy_names_its_check_in_the_pending_proof_stamp(
 
     assert created.status_code == 201, created.text
     body = _factory_publication_body(created.json()["id"])
-    assert "Unit tests is pending proof." in body
+    assert (
+        "Unit tests had not reported when this pull request was opened; "
+        "the issue status comment reports its result."
+    ) in body
     assert CONVERSION_PYTHON_CI_CHECK not in body
     assert _REPOSITORY_PENDING_PROOF not in body
+    assert "pending proof" not in body
+    assert "No in-sandbox Python verification check was declared." not in body
 
 
 def test_custom_policy_refuses_a_path_outside_its_selection(

@@ -445,9 +445,13 @@ async def create_publication(
                     },
                 )
             pending_proof = (
-                f"{python_ci.check} is pending proof."
+                f"{python_ci.check} had not reported when this pull request was opened; "
+                "the issue status comment reports its result."
                 if python_ci is not None
-                else "Repository CI is pending proof."
+                else (
+                    "Repository CI had not reported when this pull request was opened; "
+                    "the issue status comment reports its result."
+                )
             )
             statements: tuple[str, ...] = ()
             if any(observation.outcome == "unavailable" for observation in observations):
@@ -457,7 +461,7 @@ async def create_publication(
                 )
             elif factory_progress.python_verification(observations) is None:
                 statements = (
-                    "No in-sandbox Python verification check was declared.",
+                    "The repository declares no in-sandbox verification check with id `python`.",
                     pending_proof,
                 )
             body = data.body or ""
