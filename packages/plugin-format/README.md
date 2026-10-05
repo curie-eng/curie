@@ -35,6 +35,12 @@ Pydantic models mirroring the Claude Code shapes:
   the platform must check current agent bindings and adapter membership on each
   read. This prerequisite defines and validates the grant but implements no
   read operation, server mounting or credential issuance.
+
+  The optional grants `canvasList`, `canvasRead` and `canvasEdit` follow the same
+  strict boolean rule (#3819). Each enables one canvas tool on `curie-slack`,
+  and none implies another. `PluginManifest.platform_slack_grants()` and
+  `PLATFORM_SLACK_GRANT_FIELDS` are the one reader of the four platform Slack
+  grants.
 - `SkillFrontmatter` (`skills/**/SKILL.md` YAML frontmatter): `name` and
   `description` required; `allowed-tools` optional, accepted as either the
   space- or comma-separated string the Agent Skills specification calls
@@ -148,8 +154,9 @@ Pydantic models mirroring the Claude Code shapes:
     `connectors.yaml`.
 
     The canonical `CHANNEL_READ_SERVER_NAME` is `curie-slack`, reserved against
-    `connectors.yaml`, inline manifest `mcpServers` and `.mcp.json`. With a
-    `channelRead: true` grant it is recognized for policy validation and fully
+    `connectors.yaml`, inline manifest `mcpServers` and `.mcp.json`. With any
+    platform Slack grant (`channelRead`, `canvasList`, `canvasRead`, `canvasEdit`)
+    it is recognized for policy validation and fully
     governed by `toolPolicy`, with no platform exemption. Deny, approval and
     unmatched deny retain their usual precedence. Without the grant a literal
     pattern gets `channel_read.grant_required`, and wildcard policy cannot
