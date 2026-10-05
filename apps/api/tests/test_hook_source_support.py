@@ -17,7 +17,8 @@ from _migration_support import IsolatedMigrationDb, sql_dicts
 from curie_api import hook_signing, hook_source_signing
 from curie_api.config import get_settings
 from curie_api.main import create_app
-from sqlalchemy import text
+from curie_protected_hooks.source_policy_sql import SourceGate
+from sqlalchemy import make_url, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -344,10 +345,13 @@ def test_never_configured_hook_reports_requested_policy_unconfigured(
 
 
 @pytest.mark.parametrize("requested", [None, "read-only"])
-def test_ordinary_tombstone_reports_row_generation_unconfigured(
+def test_ordinary_tombstone_reports_row_generation_closed(
     support_db: None, requested: str | None
 ) -> None:
-    """Ordinary tombstone row: legacy key, effective == requested, row generation.
+    """Ordinary tombstone row: legacy key, effective == requested, row generation, closed.
+
+    A tombstone admits nothing at delivery ingress until broker confirmation of
+    its ordinary publication is available, so it reports ``source_closed``.
 
     @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-SOURCE-2.
     """
@@ -364,7 +368,7 @@ def test_ordinary_tombstone_reports_row_generation_unconfigured(
             )
             assert response.status_code == 503, response.text
             assert response.json() == expected(
-                requested, requested, str(GENERATION), "source_unconfigured"
+                requested, requested, str(GENERATION), "source_closed"
             )
             assert key not in response.text
             assert await effects(app, agent) == before
@@ -807,5 +811,59 @@ def test_waiting_probe_reauthenticates_after_rotation(support_db: None, protecte
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
                 await observer.dispose()
+
+    asyncio.run(asyncio.wait_for(scenario(), 20))
+
+
+@pytest.mark.parametrize("failure", ["gate_missing", "gate_database_unusable"])
+def test_gate_or_database_failure_is_bare_authority_unavailable(
+    support_db: None, failure: str
+) -> None:
+    """Preauthentication passes, then no gate-held resolution can be read: bare 503.
+
+    The body is exactly ``{"detail": "authority_unavailable"}`` with none of the
+    HookSupportOut keys, and the probe makes no Valkey or SQL effect.
+    @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-SOURCE-2.
+    """
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-9/2."""
+        async with probe_app() as (app, client, agent):
+            body = BODIES["read-only"]
+            key = legacy_secret(agent)
+            # Precondition: the same signed probe resolves while the gate is live.
+            live = await post_support(
+                client, agent, body, support_headers(key, requested="read-only", body=body)
+            )
+            assert live.status_code == 503, live.text
+            assert live.json() == expected("read-only", "read-only", None, "source_unconfigured")
+            before = await effects(app, agent)
+            original = app.state.source_gate
+            unusable = None
+            try:
+                if failure == "gate_missing":
+                    app.state.source_gate = None
+                else:
+                    # A real gate whose database does not exist: every connect fails.
+                    missing = make_url(get_settings().database_url).set(
+                        database="curie_missing_" + uuid.uuid4().hex
+                    )
+                    unusable = create_async_engine(missing, poolclass=NullPool)
+                    app.state.source_gate = SourceGate(unusable)
+                response = await post_support(
+                    client,
+                    agent,
+                    body,
+                    support_headers(key, requested="read-only", body=body, delivery="lost-gate"),
+                )
+            finally:
+                app.state.source_gate = original
+                if unusable is not None:
+                    await unusable.dispose()
+            assert response.status_code == 503, response.text
+            assert response.json() == {"detail": "authority_unavailable"}
+            assert not DTO_KEYS & set(response.json())
+            assert key not in response.text
+            assert await effects(app, agent) == before
 
     asyncio.run(asyncio.wait_for(scenario(), 20))
