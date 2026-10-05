@@ -2315,7 +2315,8 @@ enum LocalAction {
         #[command(flatten)]
         target: AgentTarget<LocalTier>,
     },
-    /// Manage an agent's hook configuration and signing secret.
+    /// Manage an agent's webhook partitions and source bindings. Not cron triggers: see
+    /// `schedules` and `hook fire`.
     Hooks {
         #[command(subcommand)]
         action: LocalHooksAction,
@@ -3757,7 +3758,8 @@ enum ClusterAction {
         #[command(flatten)]
         target: ClusterAgentTarget,
     },
-    /// Manage an agent's hook configuration and signing secret.
+    /// Manage an agent's webhook partitions and source bindings. Not cron triggers: see
+    /// `schedules` and `hook fire`.
     Hooks {
         #[command(subcommand)]
         action: ClusterHooksAction,

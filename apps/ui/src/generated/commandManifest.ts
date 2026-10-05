@@ -1814,7 +1814,7 @@ export const commandManifest = {
           "name": "versions"
         },
         {
-          "about": "Manage an agent's hook configuration and signing secret",
+          "about": "Manage an agent's webhook partitions and source bindings. Not cron triggers: see `schedules` and `hook fire`",
           "hidden": false,
           "name": "hooks",
           "subcommands": [
@@ -6437,7 +6437,7 @@ export const commandManifest = {
           "name": "versions"
         },
         {
-          "about": "Manage an agent's hook configuration and signing secret",
+          "about": "Manage an agent's webhook partitions and source bindings. Not cron triggers: see `schedules` and `hook fire`",
           "hidden": false,
           "name": "hooks",
           "subcommands": [

@@ -317,6 +317,28 @@ fn process_skill_help_distinguishes_tier_from_bundle_artifact() {
     );
 }
 
+/// `hooks` manages webhook partitions and source bindings, which its old help
+/// ("hook configuration") let a reader mistake for cron hooks (#4012). The help
+/// must disown cron triggers and point at the verbs that do read them.
+#[test]
+fn hooks_help_says_not_cron_triggers() {
+    for tier in ["local", "cluster"] {
+        let output = run_help(&[tier, "hooks"]);
+        assert!(
+            output.status.success(),
+            "expected success for {tier} hooks help\n{}",
+            output_text(&output)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        for needle in ["Not cron triggers", "schedules", "hook fire"] {
+            assert!(
+                text.contains(needle),
+                "{tier} hooks help missing `{needle}`\n{text}"
+            );
+        }
+    }
+}
+
 /// `curie dev plugin-compat` is the operator-facing name of the outbound
 /// Claude-Code-compatibility gate (see the bundle-format seam doc). If the verb
 /// stops being reachable, the gate is still in CI but nobody can run it locally
