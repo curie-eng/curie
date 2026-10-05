@@ -6,8 +6,10 @@ those rows on an interval and re-enqueues the resume turn onto the runs stream,
 setting ``resumed_at`` only AFTER a successful enqueue (enqueue-first-then-mark),
 so a failed enqueue is retried on the next pass rather than lost.
 
-Real Postgres + real Valkey from the compose dev stack -- never mocked; the only
-injected failure is a wrapped ``enqueue`` that raises for a chosen record. Every
+Real Postgres + real Valkey from the compose dev stack -- never mocked; the
+injected failures are a wrapped ``enqueue`` that raises for a chosen record and,
+for #4016, the real client's ``xadd`` raising BELOW ``ResumeQueue.enqueue`` so
+the queue's own failure handling stays under test. Every
 assertion is on a real outcome: the deterministic ``event_id`` present/absent on
 the actual stream, the ``resumed_at`` NULL<->set transition read back from the
 DB, and ``reconcile_once()``'s return count.
@@ -25,14 +27,15 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 import redis
 import redis.asyncio as aioredis
-from aci_protocol import QueuedTurn
+from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle
 from curie_api.config import get_settings
 from curie_api.models import Approval, ApprovalStatus
-from curie_api.resumequeue import ResumeQueue
+from curie_api.resumequeue import ResumeQueue, approval_trace_context, resume_turn_for
 from curie_api.resumereconciler import ResumeReconciler
 from curie_telemetry import extract_trace_context
 from curie_telemetry.tracing import configure_tracer_provider
@@ -1067,6 +1070,610 @@ def test_reconciler_skips_row_locked_by_concurrent_claim(
     turn = QueuedTurn.model_validate(json.loads(entries[0][1]["payload"]))
     assert turn.event_id == f"approval-{approval_id}-resolved"
     assert resumed_at is not None
+
+
+# --- #4016: a resume whose XADD raised is owed on the next pass ----------------
+#
+# The grace window keeps the reconciler from racing an inline resume that landed
+# and is still running. Helm sizes it from the worker delivery budget (10860 s),
+# so a resume whose inline XADD raised (Valkey just restarted) used to sit
+# stranded for three hours. When the XADD raises the producer KNOWS the wake did
+# not land, so the queue records that approval id and the next reconciler pass
+# re-enqueues it regardless of the grace. Every test below uses the production
+# grace, so it proves the grace is bypassed only for a failed enqueue.
+
+_PRODUCTION_GRACE_SECONDS = 10860
+
+
+class _XaddFaults:
+    """Make a real async Valkey client's ``xadd`` raise for chosen event ids.
+
+    The fault sits BELOW ``ResumeQueue.enqueue`` on purpose: the queue's own
+    failure handling (recording the undelivered resume) is the code under test,
+    and wrapping ``enqueue`` would bypass it. Every other call, and every call
+    after an event id's failures are spent, goes to the real client, so a
+    successful enqueue lands on the real stream. ``attempts`` lists each
+    ``xadd`` by event id, so a test can tell "retried and failed" from "skipped".
+    """
+
+    def __init__(self, client: aioredis.Redis) -> None:
+        self.client = client
+        self.attempts: list[str] = []
+        self._remaining: dict[str, int] = {}
+        self._real_xadd = client.xadd
+        client.xadd = self._xadd  # type: ignore[method-assign]
+
+    def fail(self, event_id: str, *, times: int = 1) -> None:
+        self._remaining[event_id] = times
+
+    async def _xadd(self, name: Any, fields: Any, *args: Any, **kwargs: Any) -> Any:
+        event_id = json.loads(fields[STREAM_PAYLOAD_FIELD])["event_id"]
+        self.attempts.append(event_id)
+        if self._remaining.get(event_id, 0) > 0:
+            self._remaining[event_id] -= 1
+            # The exact class the API logged on the cluster after a Valkey restart.
+            raise redis.exceptions.ConnectionError(
+                "Error -3 connecting to valkey:6379. Temporary failure in name resolution."
+            )
+        return await self._real_xadd(name, fields, *args, **kwargs)
+
+
+def _run_async_with_xadd_faults[T](
+    steps: Callable[
+        [async_sessionmaker[AsyncSession], ResumeQueue, _XaddFaults], Awaitable[T]
+    ],
+    stream: str,
+) -> T:
+    """``_run_async`` with an ``_XaddFaults`` installed on the queue's client.
+
+    The queue under test is a real ``ResumeQueue`` on a real client; only that
+    client's ``xadd`` is intercepted, and only for the event ids a test names.
+    """
+
+    async def _main() -> T:
+        engine = create_async_engine(get_settings().database_url)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        client = aioredis.Redis(
+            host=_VALKEY_HOST, port=_VALKEY_PORT, password=_VALKEY_PW or None
+        )
+        faults = _XaddFaults(client)
+        queue = ResumeQueue(client, stream=stream)
+        try:
+            return await steps(sessionmaker, queue, faults)
+        finally:
+            await client.aclose()
+            await engine.dispose()
+
+    return asyncio.run(_main())
+
+
+async def _inline_resume(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    queue: ResumeQueue,
+    approval_id: uuid.UUID,
+) -> None:
+    """Enqueue an approval's resume turn the way the resolve endpoint does inline:
+    build it from the stored row and call the real ``ResumeQueue.enqueue``. The
+    enqueue's exception propagates, exactly as the router sees it."""
+
+    async with sessionmaker() as session:
+        approval = await session.get(Approval, approval_id)
+        assert approval is not None
+    await queue.enqueue(
+        resume_turn_for(approval), parent=approval_trace_context(approval)
+    )
+
+
+def _stream_event_ids(valkey: redis.Redis, runs_stream: str) -> list[str]:
+    return [
+        QueuedTurn.model_validate(json.loads(fields["payload"])).event_id
+        for _, fields in valkey.xrange(runs_stream)
+    ]
+
+
+def test_failed_inline_enqueue_inside_grace_is_reenqueued_on_the_next_pass(
+    clean_db: None, valkey: redis.Redis, runs_stream: str
+) -> None:
+    """#4016 AC4, the regression test.
+
+    The approval was resolved just now, well inside the production grace, and
+    its inline resume enqueue failed at the Valkey client. The very next
+    ``reconcile_once()`` must put the deterministic resume event on the real
+    stream exactly once and mark ``resumed_at``. Before the fix the pass only
+    looked past the grace horizon, returned 0, and left the session stranded
+    for three hours.
+    """
+
+    async def steps(
+        sessionmaker: async_sessionmaker[AsyncSession],
+        queue: ResumeQueue,
+        faults: _XaddFaults,
+    ) -> tuple[uuid.UUID, int, int, datetime | None]:
+        approval_id = await _insert_approval(
+            sessionmaker,
+            status=ApprovalStatus.approved,
+            resolved_at=_naive(0),
+            resumed_at=None,
+        )
+        faults.fail(f"approval-{approval_id}-resolved")
+        with pytest.raises(redis.exceptions.ConnectionError):
+            await _inline_resume(sessionmaker, queue, approval_id)
+        stranded_len = await faults.client.xlen(runs_stream)
+
+        reconciler = ResumeReconciler(
+            sessionmaker,
+            queue,
+            interval_seconds=30,
+            grace_seconds=_PRODUCTION_GRACE_SECONDS,
+            batch_limit=100,
+        )
+        count = await reconciler.reconcile_once()
+        return approval_id, stranded_len, count, await _resumed_at(sessionmaker, approval_id)
+
+    approval_id, stranded_len, count, resumed_at = _run_async_with_xadd_faults(
+        steps, runs_stream
+    )
+
+    assert stranded_len == 0  # the inline enqueue really did not land
+    assert count == 1
+    assert _stream_event_ids(valkey, runs_stream) == [f"approval-{approval_id}-resolved"]
+    assert resumed_at is not None
+
+
+def test_grace_still_protects_resumes_whose_enqueue_did_not_fail(
+    clean_db: None, valkey: redis.Redis, runs_stream: str
+) -> None:
+    """Liveness of the grace: in the same pass that expedites a failed enqueue,
+    approvals resolved inside the grace whose enqueue did not fail are left
+    alone.
+
+    ``landed`` had its inline enqueue succeed while ``resumed_at`` is still
+    NULL: the window between XADD and mark that the grace exists for. ``untried``
+    was resolved and no enqueue has happened yet. Re-enqueueing either would
+    hand the worker a duplicate of a turn that may be running. An
+    implementation that simply dropped the grace would expedite all three.
+    """
+
+    async def steps(
+        sessionmaker: async_sessionmaker[AsyncSession],
+        queue: ResumeQueue,
+        faults: _XaddFaults,
+    ) -> tuple[
+        uuid.UUID,
+        uuid.UUID,
+        uuid.UUID,
+        int,
+        datetime | None,
+        datetime | None,
+        datetime | None,
+    ]:
+        ids = [
+            await _insert_approval(
+                sessionmaker,
+                status=ApprovalStatus.approved,
+                resolved_at=_naive(0),
+                resumed_at=None,
+            )
+            for _ in range(3)
+        ]
+        failed_id, landed_id, untried_id = ids
+        faults.fail(f"approval-{failed_id}-resolved")
+        with pytest.raises(redis.exceptions.ConnectionError):
+            await _inline_resume(sessionmaker, queue, failed_id)
+        await _inline_resume(sessionmaker, queue, landed_id)
+
+        reconciler = ResumeReconciler(
+            sessionmaker,
+            queue,
+            interval_seconds=30,
+            grace_seconds=_PRODUCTION_GRACE_SECONDS,
+            batch_limit=100,
+        )
+        count = await reconciler.reconcile_once()
+        return (
+            failed_id,
+            landed_id,
+            untried_id,
+            count,
+            await _resumed_at(sessionmaker, failed_id),
+            await _resumed_at(sessionmaker, landed_id),
+            await _resumed_at(sessionmaker, untried_id),
+        )
+
+    (
+        failed_id,
+        landed_id,
+        untried_id,
+        count,
+        resumed_failed,
+        resumed_landed,
+        resumed_untried,
+    ) = _run_async_with_xadd_faults(steps, runs_stream)
+
+    assert count == 1
+    # The landed resume appears once (its own inline XADD), never twice; the
+    # untried one not at all.
+    assert sorted(_stream_event_ids(valkey, runs_stream)) == sorted(
+        [f"approval-{failed_id}-resolved", f"approval-{landed_id}-resolved"]
+    )
+    assert f"approval-{untried_id}-resolved" not in _stream_event_ids(
+        valkey, runs_stream
+    )
+    assert resumed_failed is not None
+    assert resumed_landed is None
+    assert resumed_untried is None
+
+
+def test_undelivered_resume_already_marked_resumed_is_forgotten_not_reenqueued(
+    clean_db: None, valkey: redis.Redis, runs_stream: str
+) -> None:
+    """A recorded undelivered resume whose row another path already resumed
+    (``resumed_at`` set before the pass, e.g. administrative recovery) owes no
+    wake: the claim returns nothing, so the pass enqueues nothing and drops the
+    id rather than carrying it forever."""
+
+    async def steps(
+        sessionmaker: async_sessionmaker[AsyncSession],
+        queue: ResumeQueue,
+        faults: _XaddFaults,
+    ) -> tuple[
+        uuid.UUID, frozenset[uuid.UUID], datetime, int, frozenset[uuid.UUID], datetime | None
+    ]:
+        approval_id = await _insert_approval(
+            sessionmaker,
+            status=ApprovalStatus.approved,
+            resolved_at=_naive(0),
+            resumed_at=None,
+        )
+        faults.fail(f"approval-{approval_id}-resolved")
+        with pytest.raises(redis.exceptions.ConnectionError):
+            await _inline_resume(sessionmaker, queue, approval_id)
+        owed_before = queue.undelivered_resumes()
+
+        marked = _naive(0)
+        async with sessionmaker() as session:
+            await session.execute(
+                update(Approval)
+                .where(Approval.id == approval_id)
+                .values(resumed_at=marked)
+            )
+            await session.commit()
+
+        reconciler = ResumeReconciler(
+            sessionmaker,
+            queue,
+            interval_seconds=30,
+            grace_seconds=_PRODUCTION_GRACE_SECONDS,
+            batch_limit=100,
+        )
+        count = await reconciler.reconcile_once()
+        return (
+            approval_id,
+            owed_before,
+            marked,
+            count,
+            queue.undelivered_resumes(),
+            await _resumed_at(sessionmaker, approval_id),
+        )
+
+    approval_id, owed_before, marked, count, owed_after, resumed_at = (
+        _run_async_with_xadd_faults(steps, runs_stream)
+    )
+
+    assert approval_id in owed_before
+    assert count == 0
+    assert approval_id not in owed_after
+    assert valkey.xrange(runs_stream) == []
+    assert resumed_at == marked  # the other path's mark is untouched
+
+
+def test_expedited_retry_survives_a_row_lock_that_rolls_back(
+    clean_db: None, valkey: redis.Redis, runs_stream: str
+) -> None:
+    """A recorded undelivered resume whose row is merely LOCKED during a pass is
+    still owed: ``claim_resume_row``'s ``SKIP LOCKED`` returns nothing for a row
+    another transaction holds, which is not the same as "already resumed". If
+    that transaction rolls back, ``resumed_at`` stays NULL, so dropping the id
+    would leave the wake to the full production grace (three hours) again.
+
+    The locked pass must enqueue nothing and keep the id recorded; once the
+    lock holder rolls back, the next pass (still at the production grace, with
+    the row resolved just now) delivers the wake exactly once and forgets it.
+
+    Same two-engine interleave as
+    ``test_reconciler_skips_row_locked_by_concurrent_claim``: two real Postgres
+    connections that genuinely contend, with a ``statement_timeout`` on the
+    reconciler's engine so a regression that blocks on the held lock fails
+    instead of hanging. The queue's client carries ``_XaddFaults`` so the inline
+    enqueue fails below ``ResumeQueue.enqueue`` and is recorded by the real
+    queue.
+    """
+
+    async def coro() -> tuple[
+        uuid.UUID,
+        frozenset[uuid.UUID],
+        int,
+        frozenset[uuid.UUID],
+        int,
+        list[str],
+        int,
+        frozenset[uuid.UUID],
+        datetime | None,
+        list[str],
+    ]:
+        engine = create_async_engine(
+            get_settings().database_url,
+            connect_args={"server_settings": {"statement_timeout": "3000"}},
+        )
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        lock_engine = create_async_engine(get_settings().database_url)
+        lock_sessionmaker = async_sessionmaker(lock_engine, expire_on_commit=False)
+        client = aioredis.Redis(
+            host=_VALKEY_HOST, port=_VALKEY_PORT, password=_VALKEY_PW or None
+        )
+        faults = _XaddFaults(client)
+        queue = ResumeQueue(client, stream=runs_stream)
+        try:
+            approval_id = await _insert_approval(
+                sessionmaker,
+                status=ApprovalStatus.approved,
+                resolved_at=_naive(0),
+                resumed_at=None,
+            )
+            faults.fail(f"approval-{approval_id}-resolved")
+            with pytest.raises(redis.exceptions.ConnectionError):
+                await _inline_resume(sessionmaker, queue, approval_id)
+            owed_before = queue.undelivered_resumes()
+
+            reconciler = ResumeReconciler(
+                sessionmaker,
+                queue,
+                interval_seconds=30,
+                grace_seconds=_PRODUCTION_GRACE_SECONDS,
+                batch_limit=100,
+            )
+
+            # A concurrent transaction holds the row under FOR UPDATE, uncommitted.
+            async with lock_sessionmaker() as holder:
+                await holder.execute(
+                    select(Approval)
+                    .where(Approval.id == approval_id)
+                    .with_for_update()
+                )
+                try:
+                    count_locked = await reconciler.reconcile_once()
+                except Exception:  # noqa: BLE001
+                    # A regression that blocks on the held lock surfaces here via
+                    # statement_timeout instead of hanging the suite.
+                    count_locked = -1
+                owed_locked = queue.undelivered_resumes()
+                locked_len = await client.xlen(runs_stream)
+                attempts_locked = list(faults.attempts)
+                # The holder never marks the row: it rolls back, resumed_at NULL.
+                await holder.rollback()
+
+            # Lock released: the next pass at the production grace delivers it.
+            count_free = await reconciler.reconcile_once()
+            return (
+                approval_id,
+                owed_before,
+                count_locked,
+                owed_locked,
+                locked_len,
+                attempts_locked,
+                count_free,
+                queue.undelivered_resumes(),
+                await _resumed_at(sessionmaker, approval_id),
+                list(faults.attempts),
+            )
+        finally:
+            await client.aclose()
+            await engine.dispose()
+            await lock_engine.dispose()
+
+    (
+        approval_id,
+        owed_before,
+        count_locked,
+        owed_locked,
+        locked_len,
+        attempts_locked,
+        count_free,
+        owed_after,
+        resumed_at,
+        attempts,
+    ) = asyncio.run(coro())
+
+    event_id = f"approval-{approval_id}-resolved"
+    assert approval_id in owed_before  # the failed inline enqueue was recorded
+
+    # While locked: no work, nothing on the stream, no XADD beyond the inline one,
+    # and the recorded failure is NOT dropped.
+    assert count_locked == 0
+    assert locked_len == 0
+    assert attempts_locked == [event_id]
+    assert approval_id in owed_locked
+
+    # After the holder rolled back: delivered exactly once, marked, forgotten.
+    assert count_free == 1
+    assert _stream_event_ids(valkey, runs_stream) == [event_id]
+    assert resumed_at is not None
+    assert approval_id not in owed_after
+    assert attempts == [event_id, event_id]
+
+
+def test_undelivered_resume_whose_reenqueue_fails_again_stays_owed_until_delivered(
+    clean_db: None, valkey: redis.Redis, runs_stream: str
+) -> None:
+    """Valkey is still down on the first pass: the re-enqueue raises again, so
+    the id stays owed and ``resumed_at`` stays NULL (enqueue-first-then-mark).
+    The following pass, with Valkey back, delivers it exactly once.
+
+    ``attempts`` proves the first pass really tried (inline, pass 1, pass 2),
+    so "stays owed" cannot be satisfied by a pass that skipped the id.
+    """
+
+    async def steps(
+        sessionmaker: async_sessionmaker[AsyncSession],
+        queue: ResumeQueue,
+        faults: _XaddFaults,
+    ) -> tuple[
+        uuid.UUID,
+        int,
+        frozenset[uuid.UUID],
+        datetime | None,
+        int,
+        int,
+        frozenset[uuid.UUID],
+        datetime | None,
+        list[str],
+    ]:
+        approval_id = await _insert_approval(
+            sessionmaker,
+            status=ApprovalStatus.approved,
+            resolved_at=_naive(0),
+            resumed_at=None,
+        )
+        faults.fail(f"approval-{approval_id}-resolved", times=2)
+        with pytest.raises(redis.exceptions.ConnectionError):
+            await _inline_resume(sessionmaker, queue, approval_id)
+
+        reconciler = ResumeReconciler(
+            sessionmaker,
+            queue,
+            interval_seconds=30,
+            grace_seconds=_PRODUCTION_GRACE_SECONDS,
+            batch_limit=100,
+        )
+        first = await reconciler.reconcile_once()
+        owed_first = queue.undelivered_resumes()
+        resumed_first = await _resumed_at(sessionmaker, approval_id)
+        len_first = await faults.client.xlen(runs_stream)
+
+        second = await reconciler.reconcile_once()
+        return (
+            approval_id,
+            first,
+            owed_first,
+            resumed_first,
+            len_first,
+            second,
+            queue.undelivered_resumes(),
+            await _resumed_at(sessionmaker, approval_id),
+            list(faults.attempts),
+        )
+
+    (
+        approval_id,
+        first,
+        owed_first,
+        resumed_first,
+        len_first,
+        second,
+        owed_second,
+        resumed_second,
+        attempts,
+    ) = _run_async_with_xadd_faults(steps, runs_stream)
+
+    event_id = f"approval-{approval_id}-resolved"
+    assert first == 0
+    assert approval_id in owed_first
+    assert resumed_first is None
+    assert len_first == 0
+
+    assert second == 1
+    assert approval_id not in owed_second
+    assert resumed_second is not None
+    assert _stream_event_ids(valkey, runs_stream) == [event_id]
+    assert attempts == [event_id, event_id, event_id]
+
+
+def test_successful_resume_enqueue_clears_a_recorded_undelivered_id(
+    clean_db: None, valkey: redis.Redis, runs_stream: str
+) -> None:
+    """A later successful enqueue of the same resume (a sweeper or recovery
+    retry) clears the record, so the next pass does not expedite a wake that
+    already landed. With the row still inside the grace, the pass then has
+    nothing to do and the stream holds the one delivered turn."""
+
+    async def steps(
+        sessionmaker: async_sessionmaker[AsyncSession],
+        queue: ResumeQueue,
+        faults: _XaddFaults,
+    ) -> tuple[uuid.UUID, frozenset[uuid.UUID], frozenset[uuid.UUID], int]:
+        approval_id = await _insert_approval(
+            sessionmaker,
+            status=ApprovalStatus.approved,
+            resolved_at=_naive(0),
+            resumed_at=None,
+        )
+        faults.fail(f"approval-{approval_id}-resolved")
+        with pytest.raises(redis.exceptions.ConnectionError):
+            await _inline_resume(sessionmaker, queue, approval_id)
+        owed_after_failure = queue.undelivered_resumes()
+        await _inline_resume(sessionmaker, queue, approval_id)
+        owed_after_success = queue.undelivered_resumes()
+
+        reconciler = ResumeReconciler(
+            sessionmaker,
+            queue,
+            interval_seconds=30,
+            grace_seconds=_PRODUCTION_GRACE_SECONDS,
+            batch_limit=100,
+        )
+        count = await reconciler.reconcile_once()
+        return approval_id, owed_after_failure, owed_after_success, count
+
+    approval_id, owed_after_failure, owed_after_success, count = (
+        _run_async_with_xadd_faults(steps, runs_stream)
+    )
+
+    assert approval_id in owed_after_failure
+    assert approval_id not in owed_after_success
+    assert count == 0
+    assert _stream_event_ids(valkey, runs_stream) == [f"approval-{approval_id}-resolved"]
+
+
+def test_failed_enqueue_of_a_non_resume_turn_records_nothing(
+    clean_db: None, valkey: redis.Redis, runs_stream: str
+) -> None:
+    """Hook-fire and other non-resume turns share ``ResumeQueue.enqueue`` but owe
+    no approval wake. Their failures are never recorded, including an id that
+    only looks like a resume key, so the reconciler never tries to claim a row
+    that is not an approval."""
+
+    def _turn(event_id: str) -> QueuedTurn:
+        return QueuedTurn(
+            event_id=event_id,
+            conversation_id="th-hook",
+            author="system",
+            text="not a resume turn",
+            reply_handle=ReplyHandle(
+                kind="slack", channel="C1", placeholder="p-1", endpoint=None
+            ),
+            received_at=datetime.now(UTC).isoformat(),
+        )
+
+    async def steps(
+        sessionmaker: async_sessionmaker[AsyncSession],
+        queue: ResumeQueue,
+        faults: _XaddFaults,
+    ) -> tuple[frozenset[uuid.UUID], list[str]]:
+        turns = [
+            _turn(f"hook-{uuid.uuid4().hex}"),
+            _turn("approval-not-a-uuid-resolved"),
+        ]
+        for turn in turns:
+            faults.fail(turn.event_id)
+            with pytest.raises(redis.exceptions.ConnectionError):
+                await queue.enqueue(turn)
+        return queue.undelivered_resumes(), list(faults.attempts)
+
+    owed, attempts = _run_async_with_xadd_faults(steps, runs_stream)
+
+    assert len(attempts) == 2  # both reached the faulted client
+    assert owed == frozenset()
+    assert valkey.xrange(runs_stream) == []
 
 
 # --- #532: dead-lettered resume backstop ---------------------------------------
