@@ -1448,6 +1448,183 @@ fn product_observability_requires_four_valid_seeds_and_count_only_mcp_receipt() 
     );
 }
 
+fn run_plain_reply_seed(
+    function_name: &str,
+    finalized: bool,
+) -> (Output, Vec<Vec<String>>, String) {
+    let harness = tempfile::tempdir().expect("create plain reply seed harness");
+    let argv_log = harness.path().join("message-argv.log");
+    let phase_log = harness.path().join("seed-phases.log");
+    fs::write(&argv_log, b"").expect("initialize message argv log");
+    fs::write(&phase_log, b"").expect("initialize seed phase log");
+    let script = format!(
+        r#"set -euo pipefail
+WORKDIR="$TEST_WORKDIR"
+BIN=capture_message
+LIVE=1
+FAKE_SENTINEL=fake-reply
+LAST_ORDINARY_TRACE_ID=22222222222222222222222222222222
+capture_message() {{
+    printf '%s\0' "$@" >> "$TEST_MESSAGE_ARGV"
+    printf '\0' >> "$TEST_MESSAGE_ARGV"
+    printf '%s\n' "$TEST_MESSAGE_REPLY"
+    return "$TEST_MESSAGE_EXIT"
+}}
+capture_stream_cursor() {{ printf '%s-0\n' "$(wc -c < "$TEST_MESSAGE_ARGV" | tr -d ' ')"; }}
+assert_product_runner_endpoints() {{ echo endpoints >> "$TEST_PHASE_LOG"; }}
+discover_trace_id_for_seed() {{
+    printf 'discover %s\n' "$*" >> "$TEST_PHASE_LOG"
+    if [[ "$2" == curie-seed-invalid-auth-* ]]; then
+        echo 11111111111111111111111111111111
+    else
+        echo 22222222222222222222222222222222
+    fi
+}}
+query_exact_seed_trace() {{
+    printf 'query %s\n' "$*" >> "$TEST_PHASE_LOG"
+    LAST_QUERY_MEMBERSHIP=true
+}}
+ladder_compose() {{
+    case "$*" in
+        '--profile full ps -q langfuse-web') echo fixture-langfuse ;;
+        '--profile full ps -q otel-collector') echo fixture-collector ;;
+        *) return 97 ;;
+    esac
+}}
+restart_local_product_collector() {{ echo restart >> "$TEST_PHASE_LOG"; }}
+wait_product_collector_ready() {{ :; }}
+product_collector_metric_value() {{
+    if [[ "$1" == otelcol_exporter_queue_size || ! -s "$TEST_MESSAGE_ARGV" ]]; then
+        echo 0
+    else
+        echo 1
+    fi
+}}
+docker() {{
+    [[ "$*" == 'logs fixture-collector' ]] || return 97
+    echo 'HTTP Status Code 401 Permanent error not retryable error'
+}}
+restore_local_langfuse_auth() {{ echo restored >> "$TEST_PHASE_LOG"; }}
+{}
+{}
+{}
+{}
+if [[ "$TEST_SEED_FUNCTION" == seed_ordinary_turn ]]; then
+    seed_ordinary_turn local fixture-agent present
+else
+    case_local_langfuse_invalid_auth fixture-agent
+fi
+"#,
+        ladder_function("assert_finalized_reply"),
+        ladder_function("assert_product_collector_permanent_auth_rejection"),
+        ladder_function("seed_ordinary_turn"),
+        ladder_function("case_local_langfuse_invalid_auth"),
+    );
+    let output = Command::new("bash")
+        .args(["-c", &script])
+        .env("TEST_WORKDIR", harness.path())
+        .env("TEST_MESSAGE_ARGV", &argv_log)
+        .env("TEST_PHASE_LOG", &phase_log)
+        .env("TEST_SEED_FUNCTION", function_name)
+        .env(
+            "TEST_MESSAGE_REPLY",
+            serde_json::json!({"finalized": finalized, "reply": "seed complete"}).to_string(),
+        )
+        .env("TEST_MESSAGE_EXIT", if finalized { "0" } else { "7" })
+        .env_remove("STUB_STATE")
+        .env_remove("LANGFUSE_OTLP_AUTH_HEADER")
+        .output()
+        .expect("run extracted plain reply seed functions");
+    let invocations = fs::read_to_string(argv_log)
+        .expect("read captured message argv")
+        .split("\0\0")
+        .filter(|invocation| !invocation.is_empty())
+        .map(|invocation| invocation.split('\0').map(str::to_owned).collect())
+        .collect();
+    let phases = fs::read_to_string(phase_log).expect("read seed phases");
+    (output, invocations, phases)
+}
+
+#[test]
+fn plain_reply_observability_seeds_send_an_exact_marker_task() {
+    for function_name in ["seed_ordinary_turn", "case_local_langfuse_invalid_auth"] {
+        let (output, invocations, phases) = run_plain_reply_seed(function_name, true);
+        assert!(
+            output.status.success(),
+            "{function_name} must complete with a finalized reply: {}",
+            transcript(&output)
+        );
+        assert_eq!(
+            invocations.len(),
+            if function_name == "seed_ordinary_turn" {
+                1
+            } else {
+                2
+            },
+            "invalid-auth recovery must send a fresh ordinary seed"
+        );
+        for (index, argv) in invocations.iter().enumerate() {
+            assert_eq!(argv.len(), 6, "the prompt must be one argument: {argv:?}");
+            assert_eq!(
+                &argv[..5],
+                ["--json", "local", "message", "--channel", "C0LOCALDEV"]
+            );
+            let marker = argv[5]
+                .strip_prefix("Reply with exactly: ")
+                .and_then(|prompt| {
+                    prompt.strip_suffix(". Do not call tools or investigate anything.")
+                })
+                .unwrap_or_else(|| {
+                    panic!("{function_name} must send a bounded reply task: {argv:?}")
+                });
+            let prefix = if function_name == "case_local_langfuse_invalid_auth" && index == 0 {
+                "curie-seed-invalid-auth-"
+            } else {
+                "curie-seed-ordinary-"
+            };
+            assert!(
+                marker.starts_with(prefix),
+                "retain the seed marker: {marker}"
+            );
+            assert!(
+                phases.contains(marker),
+                "the exact trace receipt must use the same marker as the task: {phases}"
+            );
+        }
+    }
+}
+
+#[test]
+fn plain_reply_observability_seeds_reject_nonfinal_replies_and_restore_auth() {
+    for function_name in ["seed_ordinary_turn", "case_local_langfuse_invalid_auth"] {
+        let (output, invocations, phases) = run_plain_reply_seed(function_name, false);
+        assert!(
+            !output.status.success(),
+            "{function_name} must propagate a nonfinal CLI refusal: {}",
+            transcript(&output)
+        );
+        assert!(transcript(&output).contains("status=not_finalized"));
+        assert_eq!(
+            invocations.len(),
+            1,
+            "a refused seed must not start recovery"
+        );
+        assert!(
+            !phases.contains("discover "),
+            "a refused seed has no receipt: {phases}"
+        );
+        assert!(
+            !phases.contains("endpoints"),
+            "a refused seed must stop: {phases}"
+        );
+        assert_eq!(
+            phases.lines().filter(|line| *line == "restored").count(),
+            usize::from(function_name == "case_local_langfuse_invalid_auth"),
+            "invalid-auth failure must restore auth exactly once: {phases}"
+        );
+    }
+}
+
 #[test]
 fn coding_tool_seed_drives_a_builtin_tool_and_asserts_execute_tool_in_its_exact_trace() {
     let coding = ladder_function("seed_coding_tool_turn");
