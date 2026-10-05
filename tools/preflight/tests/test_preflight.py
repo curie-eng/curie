@@ -4,6 +4,7 @@ import dataclasses
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -124,7 +125,11 @@ def test_selection_follows_changed_path_rules(repo: Path, path: str, expected: s
         assert check["cwd"]
         assert check["group"]
         assert "cargo test" not in check["command"]
-        assert "pytest" not in check["command"]
+        # The gitleaks mount can include pytest's temporary-directory name.
+        # Match executable tokens, including an absolute pytest executable.
+        assert not re.search(
+            r"(?:^|[\s;&|])(?:[^\s;&|]*/)?pytest(?:$|[\s;&|])", check["command"]
+        )
     scan = next(check for check in plan["checks"] if check["job"] == "gitleaks")
     workflow = yaml.safe_load((ROOT / ".github/workflows/gitleaks.yaml").read_text())
     assert workflow["jobs"]["gitleaks"]["env"]["GITLEAKS_IMAGE"] in scan["command"]
@@ -245,16 +250,45 @@ def test_tracked_hook_rejects_bad_real_push_then_accepts_clean_push(
     assert git(remote, "rev-parse", "refs/heads/topic") == git(side, "rev-parse", "HEAD")
 
 
-def test_tracked_hook_checks_pushed_ref_instead_of_unrelated_head(
+def test_tracked_hook_checks_pushed_refs_own_tool_instead_of_unrelated_head(
     repo: Path, tmp_path: Path
 ) -> None:
     side, remote = prepare_hook(repo, tmp_path)
     docs = commit(side, "docs/topic.md")
     git(side, "branch", "docs", docs)
-    commit(side, "docs/later.md", "Add later notes\n\nCo-Authored-By: Codex <test@example.com>")
+    # The current branch has different, broken tool code. Checking out the
+    # pushed docs ref must use that ref's valid committed preflight instead.
+    commit(
+        side,
+        "tools/preflight/preflight.py",
+        "Add later tool notes\n\nCo-Authored-By: Codex <test@example.com>",
+    )
     accepted = run(side, "git", "push", "origin", "docs:docs", check=False)
     assert accepted.returncode == 0, accepted.stdout + accepted.stderr
     assert git(remote, "rev-parse", "refs/heads/docs") == docs
+
+
+def test_tracked_hook_uses_committed_head_tool_and_preserves_dirty_copy(
+    repo: Path, tmp_path: Path
+) -> None:
+    side, remote = prepare_hook(repo, tmp_path)
+    commit(side, "docs/topic.md", "Add notes\n\nCo-Authored-By: Codex <test@example.com>")
+    local_tool = side / "tools/preflight/preflight.py"
+    dirty_source = "This is deliberately invalid Python in the local working tree.\n"
+    local_tool.write_text(dirty_source)
+    assert git(side, "diff", "--name-only") == "tools/preflight/preflight.py"
+    rejected = run(side, "git", "push", "origin", "topic", check=False)
+    assert rejected.returncode != 0
+    assert COMMIT_STEP in rejected.stdout + rejected.stderr
+    assert git(remote, "for-each-ref", "refs/heads/topic") == ""
+    assert local_tool.read_text() == dirty_source
+
+    # The same dirty local source must not reject a valid committed tree.
+    git(side, "commit", "--amend", "-qm", "Add clean notes")
+    accepted = run(side, "git", "push", "origin", "topic", check=False)
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert git(remote, "rev-parse", "refs/heads/topic") == git(side, "rev-parse", "HEAD")
+    assert local_tool.read_text() == dirty_source
 
 
 def test_tracked_hook_chooses_nearer_next_base(repo: Path, tmp_path: Path) -> None:
@@ -271,3 +305,28 @@ def test_tracked_hook_chooses_nearer_next_base(repo: Path, tmp_path: Path) -> No
     deleted = run(side, "git", "push", "origin", ":topic", check=False)
     assert deleted.returncode == 0, deleted.stdout + deleted.stderr
     assert git(remote, "for-each-ref", "refs/heads/topic") == ""
+
+
+def test_tracked_hook_breaks_equal_commit_count_tie_toward_main(
+    repo: Path, tmp_path: Path
+) -> None:
+    side, remote = prepare_hook(repo, tmp_path)
+    git(repo, "branch", "next")
+    main_head = commit(
+        repo, "docs/main.md", "Add main notes\n\nCo-Authored-By: Codex <test@example.com>"
+    )
+    git(repo, "checkout", "-q", "next")
+    next_head = commit(repo, "docs/next.md")
+    git(repo, "update-ref", "refs/remotes/origin/main", main_head)
+    git(repo, "update-ref", "refs/remotes/origin/next", next_head)
+    git(side, "reset", "--hard", main_head)
+    git(side, "merge", "-q", "--no-edit", next_head)
+    head = commit(side, "docs/topic.md")
+    assert git(side, "rev-list", "--count", f"origin/main..{head}") == git(
+        side, "rev-list", "--count", f"origin/next..{head}"
+    )
+    # Choosing main excludes its historical attribution; choosing next includes
+    # that same bad commit and must reject the otherwise clean topic push.
+    accepted = run(side, "git", "push", "origin", "topic", check=False)
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert git(remote, "rev-parse", "refs/heads/topic") == head

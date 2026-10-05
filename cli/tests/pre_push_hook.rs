@@ -1,13 +1,13 @@
 use std::env;
 use std::fs;
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
-const HOOK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../hooks/pre-push");
+const HOOK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../.githooks/pre-push");
+const REPO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -32,273 +32,268 @@ fn executable(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 struct Fixture {
     temp: TempDir,
-    base: String,
+    root: PathBuf,
     bin: PathBuf,
-    log: PathBuf,
 }
 
 impl Fixture {
     fn new() -> Self {
         let temp = TempDir::new().unwrap();
-        let dir = temp.path();
-        git(dir, &["init", "-q"]);
-        git(dir, &["config", "core.hooksPath", "/dev/null"]);
-        git(dir, &["config", "user.email", "test@example.com"]);
-        git(dir, &["config", "user.name", "Example"]);
-        fs::create_dir(dir.join("cli")).unwrap();
-        fs::write(dir.join("untouched.py"), "pass\n").unwrap();
-        git(dir, &["add", "."]);
-        git(dir, &["commit", "-qm", "base"]);
-        let base = git(dir, &["rev-parse", "HEAD"]);
-        git(dir, &["update-ref", "refs/remotes/origin/main", &base]);
+        let root = temp.path().join("checkout");
+        fs::create_dir_all(root.join("runner")).unwrap();
+        fs::create_dir_all(root.join("apps/ui")).unwrap();
+        fs::create_dir(root.join(".githooks")).unwrap();
+        fs::write(root.join("runner/Dockerfile"), "FROM scratch\n").unwrap();
+        fs::copy(HOOK, root.join(".githooks/pre-push")).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "user.name", "Example"]);
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "Add source checkout fixture"]);
 
-        let bin = dir.join("bin");
+        let bin = temp.path().join("bin");
         fs::create_dir(&bin).unwrap();
-        executable(
-            &bin.join("cargo"),
-            "#!/bin/sh\nprintf 'cargo|%s|%s\n' \"$PWD\" \"$*\" >> \"$HOOK_LOG\"\n[ \"$HOOK_FAIL\" != cargo ]\n",
-        );
-        executable(
-            &bin.join("uv"),
-            "#!/bin/sh\nprintf 'uv|%s|%s\n' \"$PWD\" \"$*\" >> \"$HOOK_LOG\"\nif [ \"$HOOK_FAIL\" = format ] && [ \"$3\" = format ]; then exit 1; fi\nexit 0\n",
-        );
-        let log = dir.join("calls.log");
-        Self {
-            temp,
-            base,
-            bin,
-            log,
+        // Packaging and dependency acquisition are external to the Git config
+        // change. Keep those tools offline while running the real CLI handler
+        // and the real Git configuration command.
+        for tool in ["cargo", "uv", "pnpm", "docker"] {
+            executable(&bin.join(tool), "#!/bin/sh\nexit 0\n");
         }
+        Self { temp, root, bin }
     }
 
-    fn dir(&self) -> &Path {
-        self.temp.path()
-    }
-
-    fn commit(&self, path: &str) -> String {
-        let destination = self.dir().join(path);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(destination, "pass\n").unwrap();
-        git(self.dir(), &["add", path]);
-        git(self.dir(), &["commit", "-qm", "change"]);
-        git(self.dir(), &["rev-parse", "HEAD"])
-    }
-
-    fn push(&self, lines: &str, fail: &str) -> Output {
-        let path = format!("{}:{}", self.bin.display(), env::var("PATH").unwrap());
-        let mut child = Command::new("python3")
-            .arg(HOOK)
-            .arg("origin")
-            .arg("unused-url")
-            .current_dir(self.dir())
+    fn run(&self, dir: &Path, args: &[&str]) -> Output {
+        let path = env::join_paths(
+            std::iter::once(self.bin.clone()).chain(env::split_paths(&env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        Command::new(env!("CARGO_BIN_EXE_curie"))
+            .args(args)
+            .current_dir(dir)
             .env("PATH", path)
-            .env("HOOK_LOG", &self.log)
-            .env("HOOK_FAIL", fail)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
+            .output()
             .unwrap()
-            .write_all(lines.as_bytes())
-            .unwrap();
-        child.wait_with_output().unwrap()
     }
 
-    fn calls(&self) -> String {
-        fs::read_to_string(&self.log).unwrap_or_default()
+    fn worktree(&self) -> PathBuf {
+        let side = self.temp.path().join("side");
+        git(
+            &self.root,
+            &["worktree", "add", "-qb", "side", side.to_str().unwrap()],
+        );
+        side
+    }
+
+    fn prepare_preflight(&self) {
+        let source = Path::new(REPO);
+        copy_tree(
+            &source.join(".github/workflows"),
+            &self.root.join(".github/workflows"),
+        );
+        fs::create_dir(self.root.join("scripts")).unwrap();
+        fs::copy(
+            source.join("scripts/check-commit-messages.sh"),
+            self.root.join("scripts/check-commit-messages.sh"),
+        )
+        .unwrap();
+        fs::copy(source.join(".gitleaks.toml"), self.root.join(".gitleaks.toml")).unwrap();
+        fs::create_dir_all(self.root.join("tools/preflight")).unwrap();
+        fs::copy(
+            source.join("tools/preflight/preflight.py"),
+            self.root.join("tools/preflight/preflight.py"),
+        )
+        .unwrap();
+        git(&self.root, &["add", "."]);
+        git(&self.root, &["commit", "-qm", "Add real preflight inputs"]);
+        git(&self.root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        fs::create_dir(self.root.join("docs")).unwrap();
+        fs::write(self.root.join("docs/example.md"), "Example notes\n").unwrap();
+        git(&self.root, &["add", "docs/example.md"]);
+        git(&self.root, &["commit", "-qm", "Add example notes"]);
+    }
+
+    fn real_cli(&self, args: &[&str]) -> Output {
+        // Unlike install's external acquisition tools, preflight's checks use
+        // the real uv executable and pinned gitleaks image end to end.
+        Command::new(env!("CARGO_BIN_EXE_curie"))
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
     }
 }
 
-#[test]
-fn new_branch_checks_only_python_and_cli_rust_touched_by_pushed_commits() {
-    let fixture = Fixture::new();
-    fixture.commit("space name.py");
-    let head = fixture.commit("cli/new.rs");
-    let lines = format!(
-        "refs/heads/topic {head} refs/heads/topic {zero}\nrefs/heads/topic2 {head} refs/heads/topic2 {zero}\n",
-        zero = "0".repeat(40)
-    );
-    let output = fixture.push(&lines, "");
-    assert!(
-        output.status.success(),
-        "{}",
+fn visible(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    );
-    let calls = fixture.calls();
-    // Git and child PWD report the physical directory; TempDir may use a
-    // symlink alias such as /var on macOS. Keep directory and argv exact.
-    let physical_root = fixture
-        .dir()
-        .canonicalize()
-        .expect("physical fixture directory");
-    let expected = format!("cargo|{}/cli|fmt --check", physical_root.display());
-    assert!(
-        calls.contains(&expected),
-        "expected {expected}; observed calls:\n{calls}"
-    );
-    assert!(calls.contains("uv|"));
-    assert!(calls.contains("run ruff format --force-exclude --check ./space name.py"));
-    assert!(calls.contains("run ruff check --force-exclude ./space name.py"));
-    assert!(!calls.contains("untouched.py"));
+    )
 }
 
 #[test]
-fn existing_remote_ref_selects_commits_after_its_exact_sha_and_reports_fix() {
+fn install_sets_relative_hook_path_for_existing_and_future_worktrees() {
     let fixture = Fixture::new();
-    let head = fixture.commit("new.py");
-    let lines = format!(
-        "refs/heads/topic {head} refs/heads/topic {}\n",
-        fixture.base
-    );
-    let output = fixture.push(&lines, "format");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("Fix: uv run ruff format --force-exclude ./new.py"),
-        "{stderr}"
-    );
-    assert!(fixture
-        .calls()
-        .contains("run ruff check --force-exclude ./new.py"));
-}
-
-#[test]
-fn deletion_and_unknown_remote_commit_do_not_silently_pass() {
-    let fixture = Fixture::new();
-    let zeros = "0".repeat(40);
-    let deletion = format!("(delete) {zeros} refs/heads/topic {}\n", fixture.base);
-    assert!(fixture.push(&deletion, "").status.success());
-    assert!(fixture.calls().is_empty());
-
-    let head = fixture.commit("new.py");
-    let lines = format!(
-        "refs/heads/topic {head} refs/heads/topic {}\n",
-        "1".repeat(40)
-    );
-    let output = fixture.push(&lines, "");
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("fetch the remote ref first"));
-    assert!(fixture.calls().is_empty());
-}
-
-#[test]
-fn uncommitted_fix_cannot_hide_bad_pushed_content() {
-    let fixture = Fixture::new();
-    let head = fixture.commit("new.py");
-    fs::write(fixture.dir().join("new.py"), "formatted locally\n").unwrap();
-    let lines = format!(
-        "refs/heads/topic {head} refs/heads/topic {}\n",
-        fixture.base
-    );
-    let output = fixture.push(&lines, "");
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("commit or restore those changes"));
-    assert!(fixture.calls().is_empty());
-}
-
-#[test]
-fn another_ref_is_rejected_with_a_clear_head_requirement() {
-    let fixture = Fixture::new();
-    let older = fixture.commit("old.py");
-    fixture.commit("new.py");
-    let lines = format!(
-        "refs/heads/older {older} refs/heads/older {}\n",
-        fixture.base
-    );
-    let output = fixture.push(&lines, "");
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("push the checked out HEAD"));
-    assert!(fixture.calls().is_empty());
-}
-
-#[test]
-fn docs_only_ref_does_not_require_checked_out_head() {
-    let fixture = Fixture::new();
-    let older = fixture.commit("notes.md");
-    fixture.commit("new.py");
-    let lines = format!("refs/heads/docs {older} refs/heads/docs {}\n", fixture.base);
-    let output = fixture.push(&lines, "");
-    assert!(output.status.success());
-    assert!(fixture.calls().is_empty());
-}
-
-#[test]
-fn annotated_tag_at_head_checks_its_commit() {
-    let fixture = Fixture::new();
-    fixture.commit("tagged.py");
-    git(fixture.dir(), &["tag", "-am", "release", "v1"]);
-    let tag = git(fixture.dir(), &["rev-parse", "refs/tags/v1"]);
-    let lines = format!("refs/tags/v1 {tag} refs/tags/v1 {}\n", "0".repeat(40));
-    let output = fixture.push(&lines, "");
-    assert!(output.status.success());
-    assert!(fixture
-        .calls()
-        .contains("run ruff check --force-exclude ./tagged.py"));
-}
-
-#[test]
-fn installer_applies_to_worktrees_created_later() {
-    let temp = TempDir::new().unwrap();
-    let main = temp.path().join("main");
-    let side = temp.path().join("side");
-    fs::create_dir_all(main.join("runner")).unwrap();
-    fs::create_dir(main.join("hooks")).unwrap();
-    fs::write(main.join("runner/Dockerfile"), "FROM scratch\n").unwrap();
-    fs::copy(HOOK, main.join("hooks/pre-push")).unwrap();
-    git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "test@example.com"]);
-    git(&main, &["config", "user.name", "Example"]);
-    git(&main, &["add", "."]);
-    git(&main, &["commit", "-qm", "base"]);
-
-    git(&main, &["config", "core.hooksPath", "/dev/null"]);
-    let custom = Command::new(env!("CARGO_BIN_EXE_curie"))
-        .args(["dev", "hooks", "install"])
-        .current_dir(&main)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap();
-    assert!(!custom.status.success());
+    let output = fixture.run(&fixture.root, &["install"]);
+    assert!(output.status.success(), "{}", visible(&output));
     assert_eq!(
-        git(&main, &["config", "--get", "core.hooksPath"]),
-        "/dev/null"
+        git(&fixture.root, &["config", "--local", "--get", "core.hooksPath"]),
+        ".githooks"
     );
-    git(&main, &["config", "--unset", "core.hooksPath"]);
+    let side = fixture.worktree();
+    assert_eq!(git(&side, &["config", "--get", "core.hooksPath"]), ".githooks");
 
-    let install = Command::new(env!("CARGO_BIN_EXE_curie"))
-        .args(["dev", "hooks", "install"])
-        .current_dir(&main)
+    let rerun = fixture.run(&side, &["install", "--update"]);
+    assert!(rerun.status.success(), "{}", visible(&rerun));
+    assert!(!visible(&rerun).to_lowercase().contains("warning"));
+}
+
+#[test]
+fn update_from_linked_worktree_sets_repository_relative_hook_path() {
+    let fixture = Fixture::new();
+    let side = fixture.worktree();
+    let output = fixture.run(&side, &["update"]);
+    assert!(output.status.success(), "{}", visible(&output));
+    assert_eq!(git(&side, &["config", "--get", "core.hooksPath"]), ".githooks");
+    assert_eq!(
+        git(&fixture.root, &["config", "--get", "core.hooksPath"]),
+        ".githooks"
+    );
+    let rerun = fixture.run(&side, &["update"]);
+    assert!(rerun.status.success(), "{}", visible(&rerun));
+    assert!(!visible(&rerun).to_lowercase().contains("warning"));
+}
+
+#[test]
+fn install_and_update_keep_custom_hook_path_and_print_one_warning() {
+    for command in ["install", "update"] {
+        let fixture = Fixture::new();
+        git(&fixture.root, &["config", "core.hooksPath", "custom-hooks"]);
+        let side = fixture.worktree();
+        let output = fixture.run(&side, &[command]);
+        let text = visible(&output);
+        assert!(output.status.success(), "{command}: {text}");
+        assert_eq!(
+            git(&fixture.root, &["config", "--get", "core.hooksPath"]),
+            "custom-hooks"
+        );
+        assert_eq!(
+            git(&side, &["config", "--get", "core.hooksPath"]),
+            "custom-hooks"
+        );
+        let warnings: Vec<_> = text
+            .lines()
+            .filter(|line| {
+                line.to_lowercase().contains("warning") && line.contains("core.hooksPath")
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1, "{command}: {text}");
+        assert!(warnings[0].contains("custom-hooks"), "{command}: {text}");
+    }
+}
+
+#[test]
+fn explicit_hooks_installer_uses_the_same_relative_path() {
+    let fixture = Fixture::new();
+    let side = fixture.worktree();
+    let output = fixture.run(&side, &["dev", "hooks", "install"]);
+    assert!(output.status.success(), "{}", visible(&output));
+    assert_eq!(git(&side, &["config", "--get", "core.hooksPath"]), ".githooks");
+    assert_eq!(
+        git(&fixture.root, &["config", "--get", "core.hooksPath"]),
+        ".githooks"
+    );
+}
+
+#[test]
+fn cli_preflight_json_dry_run_matches_the_real_python_tool() {
+    let fixture = Fixture::new();
+    fixture.prepare_preflight();
+    let cli = fixture.real_cli(&["dev", "preflight", "--fast", "--dry-run", "--json"]);
+    assert!(cli.status.success(), "{}", visible(&cli));
+    let python = Command::new("uv")
+        .args([
+            "run",
+            "--no-project",
+            "--with",
+            "pyyaml==6.0.3",
+            "python3",
+            "tools/preflight/preflight.py",
+            "--fast",
+            "--dry-run",
+            "--json",
+        ])
+        .current_dir(&fixture.root)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .unwrap();
-    assert!(
-        install.status.success(),
-        "{}",
-        String::from_utf8_lossy(&install.stderr)
-    );
+    assert!(python.status.success(), "{}", visible(&python));
+    let cli_report: serde_json::Value = serde_json::from_slice(&cli.stdout).unwrap();
+    let python_report: serde_json::Value = serde_json::from_slice(&python.stdout).unwrap();
+    assert_eq!(cli_report["checks"], python_report["checks"]);
+    assert_eq!(cli_report["dry_run"], true);
+    assert_eq!(cli_report["checks"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn cli_preflight_missing_fast_is_usage_error_with_actionable_json() {
+    let fixture = Fixture::new();
+    fixture.prepare_preflight();
+    let output = fixture.real_cli(&["dev", "preflight", "--json"]);
+    assert_eq!(output.status.code(), Some(2), "{}", visible(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["error"].as_str().is_some_and(|value| !value.is_empty()));
+    assert!(report["fix"].as_str().is_some_and(|value| value.contains("--fast")));
+}
+
+#[test]
+fn cli_preflight_propagates_failing_check_exit_and_json_report() {
+    let fixture = Fixture::new();
+    fixture.prepare_preflight();
     git(
-        &main,
-        &["worktree", "add", "-qb", "side", side.to_str().unwrap()],
+        &fixture.root,
+        &[
+            "commit",
+            "--amend",
+            "-qm",
+            "Add example notes\n\nCo-Authored-By: Codex <test@example.com>",
+        ],
     );
-    let expected = main.join("hooks").canonicalize().unwrap();
-    assert_eq!(
-        git(&main, &["config", "--get", "core.hooksPath"]),
-        expected.display().to_string()
-    );
-    assert_eq!(
-        git(&side, &["config", "--get", "core.hooksPath"]),
-        expected.display().to_string()
-    );
+    let output = fixture.real_cli(&["dev", "preflight", "--fast", "--json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["passed"], false);
+    let failures = report["failures"].as_array().unwrap();
+    let attribution = failures
+        .iter()
+        .find(|failure| {
+            failure["check"]
+                .as_str()
+                .is_some_and(|check| check.contains("Check the PR's commit messages"))
+        })
+        .expect("the CLI must name the commit messages check");
+    assert!(attribution["output_tail"]
+        .as_str()
+        .unwrap()
+        .contains("AI Co-Authored-By trailer"));
 }
