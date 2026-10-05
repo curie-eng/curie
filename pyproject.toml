@@ -232,6 +232,7 @@ testpaths = [
     "tools/sre-contract/tests",
     "tools/factory-e2e/tests",
     "tools/github-stub/tests",
+    "tools/model-script/tests",
     "tools/runtime-assertion-gate/tests",
     # Repo-level tests that pin a seam between two apps which may not import
     # each other, such as the runner/API default memory guidance (#1461).

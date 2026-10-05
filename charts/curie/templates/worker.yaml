@@ -548,6 +548,14 @@ spec:
             {{- end }}
             - name: BUNDLE_BUCKET
               value: {{ .Values.agentSandbox.runner.bundleFetch.bucket | quote }}
+            {{- if .Values.api.githubStubCaConfigMap }}
+            - name: SSL_CERT_FILE
+              value: /etc/curie/github-stub/ca.pem
+            - name: GIT_SSL_CAINFO
+              value: /etc/curie/github-stub/ca.pem
+            - name: REQUESTS_CA_BUNDLE
+              value: /etc/curie/github-stub/ca.pem
+            {{- end }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.worker.extraEnv) | nindent 12 }}
             {{- include "curie.extraEnv" (dict "root" . "workload" "worker" "env" .Values.worker.extraEnv "additionalReserved" (include "curie.slack.reservedEnv" (dict "root" . "workload" "worker") | fromJson)) | nindent 12 }}
           # No HTTP port on the worker, so an exec probe checks a heartbeat file
@@ -559,8 +567,18 @@ spec:
           volumeMounts:
             - name: workspace-clone
               mountPath: {{ .Values.worker.workspace.mountPath | quote }}
+            {{- if .Values.api.githubStubCaConfigMap }}
+            - name: github-stub-ca
+              mountPath: /etc/curie/github-stub
+              readOnly: true
+            {{- end }}
       volumes:
         - name: workspace-clone
           emptyDir:
             sizeLimit: {{ .Values.worker.workspace.cloneVolumeSize | quote }}
+        {{- if .Values.api.githubStubCaConfigMap }}
+        - name: github-stub-ca
+          configMap:
+            name: {{ .Values.api.githubStubCaConfigMap }}
+        {{- end }}
 {{- end }}

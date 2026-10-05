@@ -144,6 +144,7 @@ def _expected_output(
     cli_release_needed: bool = False,
     released_upgrade_full: bool = False,
     version_only: bool = False,
+    factory: bool = False,
 ) -> str:
     selected_tiers = set(selected)
     lines = [
@@ -159,6 +160,7 @@ def _expected_output(
         f"released_upgrade_full={'true' if released_upgrade_full else 'false'}"
     )
     lines.append(f"version_only={'true' if version_only else 'false'}")
+    lines.append(f"factory={'true' if factory else 'false'}")
     return "\n".join(lines) + "\n"
 
 
@@ -938,6 +940,7 @@ def test_push_selects_every_tier_without_a_repository(tmp_path: Path) -> None:
         images_needed=True,
         cli_release_needed=True,
         released_upgrade_full=True,
+        factory=True,
     )
 
 
@@ -1391,6 +1394,7 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         # #3858: python-pytest and rust-select read these two.
         "pytest": "${{ steps.filter.outputs.pytest }}",
         "version_only": "${{ steps.filter.outputs.version_only }}",
+        "factory": "${{ steps.filter.outputs.factory }}",
         "runtime_assertions": "${{ steps.runtime.outputs.runtime_assertions }}",
     }
 

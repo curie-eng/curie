@@ -7784,6 +7784,24 @@ export const commandManifest = {
           "name": "factory-e2e"
         },
         {
+          "about": "Serve or record a scripted Anthropic Messages endpoint (#3814). `serve` replays a transcript and fails on an unexpected request. `record` proxies to a provider and writes the transcript",
+          "args": [
+            {
+              "global": false,
+              "help": "`serve` or `record`, followed by endpoint flags",
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709552000,
+                "min": 1
+              },
+              "positional": true,
+              "required": true
+            }
+          ],
+          "hidden": false,
+          "name": "model-script"
+        },
+        {
           "about": "Serve a TLS GitHub fixture or capture public check lifecycle recordings",
           "args": [
             {

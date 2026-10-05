@@ -2026,6 +2026,7 @@ jobs:
       cli_release: ${{ steps.filter.outputs.cli_release }}
       pytest: ${{ steps.filter.outputs.pytest }}
       version_only: ${{ steps.filter.outputs.version_only }}
+      factory: ${{ steps.filter.outputs.factory }}
       runtime_assertions: ${{ steps.runtime.outputs.runtime_assertions }}
     steps:
       - uses: actions/checkout@v7
@@ -2393,6 +2394,18 @@ jobs:
         env:
           CURIE_BIN: cli/target/release/curie
         run: bash cli/scripts/credential-free-redeploy-cluster.sh
+      # #3814: the dark factory on this kind cluster, only when a factory path
+      # changed. The GitHub stub and the scripted model replace github.com and
+      # the live provider. The ladder release above is left in place.
+      - name: Scripted factory scenario
+        if: needs.changes.outputs.factory == 'true'
+        env:
+          CURIE_BIN: cli/target/release/curie
+        run: |
+          set -euo pipefail
+          CURIE_FACTORY_SCRIPTED_PLAN=1 python3 tools/factory-e2e/factory_e2e.py scripted \
+            --context kind-curie-e2e \
+            --model-base-url http://10.1.2.3:8080
       # Surface why on any failure above: pod states, recent events, and the
       # worker/runner logs are what localize a reachability or scheduling break.
       - name: Dump cluster diagnostics on failure
