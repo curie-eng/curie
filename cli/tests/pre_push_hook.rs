@@ -59,6 +59,7 @@ impl Fixture {
         fs::create_dir_all(root.join("apps/ui")).unwrap();
         fs::create_dir(root.join(".githooks")).unwrap();
         fs::write(root.join("runner/Dockerfile"), "FROM scratch\n").unwrap();
+        fs::write(root.join("apps/ui/package.json"), "{}\n").unwrap();
         fs::copy(HOOK, root.join(".githooks/pre-push")).unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.email", "test@example.com"]);
@@ -79,7 +80,8 @@ impl Fixture {
 
     fn run(&self, dir: &Path, args: &[&str]) -> Output {
         let path = env::join_paths(
-            std::iter::once(self.bin.clone()).chain(env::split_paths(&env::var_os("PATH").unwrap())),
+            std::iter::once(self.bin.clone())
+                .chain(env::split_paths(&env::var_os("PATH").unwrap())),
         )
         .unwrap();
         Command::new(env!("CARGO_BIN_EXE_curie"))
@@ -113,7 +115,11 @@ impl Fixture {
             self.root.join("scripts/check-commit-messages.sh"),
         )
         .unwrap();
-        fs::copy(source.join(".gitleaks.toml"), self.root.join(".gitleaks.toml")).unwrap();
+        fs::copy(
+            source.join(".gitleaks.toml"),
+            self.root.join(".gitleaks.toml"),
+        )
+        .unwrap();
         fs::create_dir_all(self.root.join("tools/preflight")).unwrap();
         fs::copy(
             source.join("tools/preflight/preflight.py"),
@@ -122,7 +128,10 @@ impl Fixture {
         .unwrap();
         git(&self.root, &["add", "."]);
         git(&self.root, &["commit", "-qm", "Add real preflight inputs"]);
-        git(&self.root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(
+            &self.root,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
         fs::create_dir(self.root.join("docs")).unwrap();
         fs::write(self.root.join("docs/example.md"), "Example notes\n").unwrap();
         git(&self.root, &["add", "docs/example.md"]);
@@ -150,17 +159,57 @@ fn visible(output: &Output) -> String {
     )
 }
 
+fn assert_preflight_schema(report: &serde_json::Value) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("schema/preflight.schema.json");
+    let schema: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("committed schema {} must exist: {error}", path.display())),
+    )
+    .expect("preflight schema must be JSON");
+    let validator = jsonschema::validator_for(&schema).expect("preflight schema must compile");
+    assert!(
+        validator.is_valid(report),
+        "actual CLI output must validate against {}: {report}",
+        path.display()
+    );
+    for required in ["checks", "failures"] {
+        let mut malformed = report.clone();
+        malformed.as_object_mut().unwrap().remove(required);
+        assert!(
+            !validator.is_valid(&malformed),
+            "preflight schema must reject a result missing {required}"
+        );
+    }
+    if !report["failures"].as_array().unwrap().is_empty() {
+        let mut malformed = report.clone();
+        malformed["failures"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("output_tail");
+        assert!(
+            !validator.is_valid(&malformed),
+            "preflight schema must require the failing check's output tail"
+        );
+    }
+}
+
 #[test]
 fn install_sets_relative_hook_path_for_existing_and_future_worktrees() {
     let fixture = Fixture::new();
     let output = fixture.run(&fixture.root, &["install"]);
     assert!(output.status.success(), "{}", visible(&output));
     assert_eq!(
-        git(&fixture.root, &["config", "--local", "--get", "core.hooksPath"]),
+        git(
+            &fixture.root,
+            &["config", "--local", "--get", "core.hooksPath"]
+        ),
         ".githooks"
     );
     let side = fixture.worktree();
-    assert_eq!(git(&side, &["config", "--get", "core.hooksPath"]), ".githooks");
+    assert_eq!(
+        git(&side, &["config", "--get", "core.hooksPath"]),
+        ".githooks"
+    );
 
     let rerun = fixture.run(&side, &["install", "--update"]);
     assert!(rerun.status.success(), "{}", visible(&rerun));
@@ -173,7 +222,10 @@ fn update_from_linked_worktree_sets_repository_relative_hook_path() {
     let side = fixture.worktree();
     let output = fixture.run(&side, &["update"]);
     assert!(output.status.success(), "{}", visible(&output));
-    assert_eq!(git(&side, &["config", "--get", "core.hooksPath"]), ".githooks");
+    assert_eq!(
+        git(&side, &["config", "--get", "core.hooksPath"]),
+        ".githooks"
+    );
     assert_eq!(
         git(&fixture.root, &["config", "--get", "core.hooksPath"]),
         ".githooks"
@@ -217,7 +269,10 @@ fn explicit_hooks_installer_uses_the_same_relative_path() {
     let side = fixture.worktree();
     let output = fixture.run(&side, &["dev", "hooks", "install"]);
     assert!(output.status.success(), "{}", visible(&output));
-    assert_eq!(git(&side, &["config", "--get", "core.hooksPath"]), ".githooks");
+    assert_eq!(
+        git(&side, &["config", "--get", "core.hooksPath"]),
+        ".githooks"
+    );
     assert_eq!(
         git(&fixture.root, &["config", "--get", "core.hooksPath"]),
         ".githooks"
@@ -250,6 +305,7 @@ fn cli_preflight_json_dry_run_matches_the_real_python_tool() {
     assert!(python.status.success(), "{}", visible(&python));
     let cli_report: serde_json::Value = serde_json::from_slice(&cli.stdout).unwrap();
     let python_report: serde_json::Value = serde_json::from_slice(&python.stdout).unwrap();
+    assert_preflight_schema(&cli_report);
     assert_eq!(cli_report["checks"], python_report["checks"]);
     assert_eq!(cli_report["dry_run"], true);
     assert_eq!(cli_report["checks"].as_array().unwrap().len(), 3);
@@ -262,8 +318,12 @@ fn cli_preflight_missing_fast_is_usage_error_with_actionable_json() {
     let output = fixture.real_cli(&["dev", "preflight", "--json"]);
     assert_eq!(output.status.code(), Some(2), "{}", visible(&output));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(report["error"].as_str().is_some_and(|value| !value.is_empty()));
-    assert!(report["fix"].as_str().is_some_and(|value| value.contains("--fast")));
+    assert!(report["error"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert!(report["fix"]
+        .as_str()
+        .is_some_and(|value| value.contains("--fast")));
 }
 
 #[test]
@@ -283,6 +343,7 @@ fn cli_preflight_propagates_failing_check_exit_and_json_report() {
     assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["passed"], false);
+    assert_preflight_schema(&report);
     let failures = report["failures"].as_array().unwrap();
     let attribution = failures
         .iter()
