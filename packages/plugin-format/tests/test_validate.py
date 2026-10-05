@@ -274,6 +274,114 @@ def test_unparsed_cron_schedule_is_rejected(tmp_path: Path, schedule: str) -> No
     assert "triggers.cron_invalid_schedule" in _codes(bundle)
 
 
+_CRON_PREFIX = "a 'cron' trigger 'schedule'"
+_CRON_CODE = "triggers.cron_invalid_schedule"
+
+
+def _cron_schedule_issues(tmp_path: Path, schedule: str) -> list[tuple[str, str]]:
+    """(code, message) for each cron schedule error on a trigger with name and prompt set."""
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": schedule,
+                "prompt": "Post the daily plan.",
+            }
+        ],
+    )
+    return [
+        (issue.code, issue.message)
+        for issue in validate_bundle(bundle).errors
+        if issue.code == _CRON_CODE
+    ]
+
+
+def test_cron_minute_out_of_range_names_the_field(tmp_path: Path) -> None:
+    assert _cron_schedule_issues(tmp_path, "61 * * * *") == [
+        (_CRON_CODE, f"{_CRON_PREFIX} field minute `61` is outside 0-59")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("schedule", "count"),
+    [("*/5 * * *", 4), ("0 0 9 * * 1-5", 6)],
+    ids=["four-fields", "six-fields"],
+)
+def test_cron_wrong_field_count_reports_the_count(
+    tmp_path: Path, schedule: str, count: int
+) -> None:
+    assert _cron_schedule_issues(tmp_path, schedule) == [
+        (
+            _CRON_CODE,
+            f"{_CRON_PREFIX} must have five fields "
+            f"(minute hour day-of-month month day-of-week); got {count}",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("schedule", "field", "text", "bounds"),
+    [
+        ("60 * * * *", "minute", "60", "0-59"),
+        ("* 24 * * *", "hour", "24", "0-23"),
+        ("* 1-25 * * *", "hour", "1-25", "0-23"),
+        ("* * 0 * *", "day-of-month", "0", "1-31"),
+        ("* * 32 * *", "day-of-month", "32", "1-31"),
+        ("* * * 13 *", "month", "13", "1-12"),
+        ("* * * * 8", "day-of-week", "8", "0-7"),
+    ],
+    ids=["minute", "hour", "hour-range", "dom-low", "dom-high", "month", "dow"],
+)
+def test_cron_out_of_range_field_is_named_with_its_range(
+    tmp_path: Path, schedule: str, field: str, text: str, bounds: str
+) -> None:
+    assert _cron_schedule_issues(tmp_path, schedule) == [
+        (_CRON_CODE, f"{_CRON_PREFIX} field {field} `{text}` is outside {bounds}")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("schedule", "field", "text"),
+    [
+        ("abc * * * *", "minute", "abc"),
+        ("* * * foo *", "month", "foo"),
+        ("* * * * 1,,2", "day-of-week", "1,,2"),
+        ("* 5-1 * * *", "hour", "5-1"),
+        ("*/0 * * * *", "minute", "*/0"),
+        ("* * * * 99999", "day-of-week", "99999"),
+    ],
+    ids=["unknown-text", "unknown-month", "empty-part", "reversed", "zero-step", "oversized"],
+)
+def test_cron_malformed_field_is_named(
+    tmp_path: Path, schedule: str, field: str, text: str
+) -> None:
+    assert _cron_schedule_issues(tmp_path, schedule) == [
+        (_CRON_CODE, f"{_CRON_PREFIX} field {field} `{text}` is not a valid cron field")
+    ]
+
+
+def test_cron_reports_the_first_failing_field(tmp_path: Path) -> None:
+    assert _cron_schedule_issues(tmp_path, "abc 99 * * *") == [
+        (_CRON_CODE, f"{_CRON_PREFIX} field minute `abc` is not a valid cron field")
+    ]
+
+
+def test_cron_malformed_part_beats_out_of_range_part_in_one_field(tmp_path: Path) -> None:
+    assert _cron_schedule_issues(tmp_path, "70,abc * * * *") == [
+        (_CRON_CODE, f"{_CRON_PREFIX} field minute `70,abc` is not a valid cron field")
+    ]
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    ["*/5 * * * *", "0 9 * * mon-fri", "0 0 1 jan,jul 7"],
+)
+def test_valid_cron_schedules_raise_no_schedule_error(tmp_path: Path, schedule: str) -> None:
+    assert _cron_schedule_issues(tmp_path, schedule) == []
+
+
 @pytest.mark.parametrize(
     "timezone",
     ["Not/AZone", "", None, "localtime", "posixrules", " America/New_York "],
