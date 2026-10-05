@@ -2,7 +2,7 @@
 
 A succeeded publication does not end the request. The reconciler hands each
 ``completed`` settlement to ``gate``, which observes the checks and commit
-statuses on the published head (``workitem_outcomes.observe_ci_detail``) and
+statuses on the published head (``forges.github.ci.observe_ci_detail``) and
 decides with the pure ``decide``:
 
 - green, or no checks after the grace period when no required check applies,
@@ -61,11 +61,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from curie_api.workitems import lifecycle
 
-from . import factory_progress, workitem_outcomes
+from . import factory_progress
 from .config import Settings
+from .forges.github import ci
+from .forges.github.ci import CiDetail
 from .models import ExecutionRequest, Publication, ThreadPublicationLineage, WorkItem
 from .repo_full_name import entry_for_repo, repo_url_path
-from .workitem_outcomes import CiDetail
 
 CI_GRACE_SECONDS = 120
 CI_POLL_SECONDS = 20
@@ -659,8 +660,8 @@ def _clean(value: Any, limit: int) -> str | None:
 
 def _job_log_tail(value: str) -> str:
     redacted = redact_text(value)
-    lines = redacted.splitlines()[-workitem_outcomes.CI_JOB_LOG_MAX_LINES :]
-    return "\n".join(lines)[-workitem_outcomes.CI_JOB_LOG_MAX_CHARS :]
+    lines = redacted.splitlines()[-ci.CI_JOB_LOG_MAX_LINES :]
+    return "\n".join(lines)[-ci.CI_JOB_LOG_MAX_CHARS :]
 
 
 def continuation_text(
@@ -1000,7 +1001,7 @@ async def gate(
     else:
         if not may_observe(request.id):
             return "waiting"
-        detail = await workitem_outcomes.observe_ci_detail(lineage, work_item, settings, client)
+        detail = await ci.observe_ci_detail(lineage, work_item, settings, client)
         metadata_only = not latest.changed_paths and latest.base_sha == observed_sha
         fresh_after = latest.metadata_updated_at if metadata_only else None
         async with sessionmaker() as session:
@@ -1366,9 +1367,9 @@ async def _post_missing_runs(
     """
 
     head_sha = lineage.head_sha
-    if not isinstance(head_sha, str) or not workitem_outcomes.SHA_RE.fullmatch(head_sha):
+    if not isinstance(head_sha, str) or not ci.SHA_RE.fullmatch(head_sha):
         return _ActionsRerun("refused", "no_head_sha")
-    minted, refused = await workitem_outcomes.mint_ci_token(
+    minted, refused = await ci.mint_ci_token(
         lineage, work_item, settings, head_sha
     )
     if refused is not None:
@@ -1545,7 +1546,7 @@ async def _consider_flake_rerun(
                     record=record,
                     ttl=ttl,
                 ),
-                timeout=workitem_outcomes.CI_DETAIL_DEADLINE_SECONDS,
+                timeout=ci.CI_DETAIL_DEADLINE_SECONDS,
             )
         except TimeoutError:
             latest = _rerun_record(await valkey.get(key)) or record

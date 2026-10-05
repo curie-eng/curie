@@ -27,6 +27,7 @@ from curie_api import approval_principal, factory_ci
 from curie_api.config import get_settings
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import lineages as crud_lineages
+from curie_api.forges.github.ci import CiDetail
 from curie_api.github_app import (
     _RESOLVERS,
     GitHubAppError,
@@ -47,7 +48,7 @@ from curie_api.workitem_dispatch import (
     record_termination,
     start,
 )
-from curie_api.workitem_outcomes import CiDetail, derive_outcome
+from curie_api.workitem_outcomes import derive_outcome
 from curie_api.workitems import lifecycle as workitems
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
@@ -1370,10 +1371,10 @@ def _observe(
     pr: bool = True,
     head_sha: str | None = HEAD_SHA,
 ) -> tuple[Any, list[httpx.Request]]:
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
     fake = creds or _FakeCreds()
-    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: fake)
+    monkeypatch.setattr(ci, "credentials_for", lambda _s: fake)
     seen: list[httpx.Request] = []
 
     def record(request: httpx.Request) -> httpx.Response:
@@ -1384,7 +1385,7 @@ def _observe(
 
     async def run() -> Any:
         async with httpx.AsyncClient(transport=httpx.MockTransport(record)) as client:
-            return await workitem_outcomes.observe_ci(
+            return await ci.observe_ci(
                 lineage, work_item, get_settings(), client
             )
 
@@ -1657,7 +1658,7 @@ def test_hung_credential_acquisition_still_answers_the_detail_promptly(
 ) -> None:
     import threading
 
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
     agent = _agent(stack, auth_headers)
     seeded = _completed(stack, agent)
@@ -1668,10 +1669,10 @@ def test_hung_credential_acquisition_still_answers_the_detail_promptly(
 
     release = threading.Event()
     hanging = _HangingCreds(release, hang_seconds=8.0)
-    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: hanging)
+    monkeypatch.setattr(ci, "credentials_for", lambda _s: hanging)
     # One overall deadline bounds credential acquisition and the check request.
     monkeypatch.setattr(
-        workitem_outcomes, "CI_OBSERVATION_DEADLINE_SECONDS", 0.5, raising=False
+        ci, "CI_OBSERVATION_DEADLINE_SECONDS", 0.5, raising=False
     )
     try:
         started = time.monotonic()
@@ -1705,7 +1706,7 @@ def test_repeated_timeouts_do_not_accumulate_credential_work(
 
     import threading
 
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
     agent = _agent(stack, auth_headers)
     seeded = _completed(stack, agent)
@@ -1716,11 +1717,11 @@ def test_repeated_timeouts_do_not_accumulate_credential_work(
 
     release = threading.Event()
     hanging = _HangingCreds(release, hang_seconds=20.0)
-    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: hanging)
+    monkeypatch.setattr(ci, "credentials_for", lambda _s: hanging)
     monkeypatch.setattr(
-        workitem_outcomes, "CI_OBSERVATION_DEADLINE_SECONDS", 0.5, raising=False
+        ci, "CI_OBSERVATION_DEADLINE_SECONDS", 0.5, raising=False
     )
-    bound = workitem_outcomes.CI_CREDENTIAL_SLOTS
+    bound = ci.CI_CREDENTIAL_SLOTS
     try:
         started = time.monotonic()
         for _ in range(bound + 3):
@@ -1787,15 +1788,15 @@ def test_second_publication_revision_after_a_pr_does_not_deny_the_pr(
 def _observe_once(monkeypatch: pytest.MonkeyPatch, creds: Any) -> Any:
     """One live observation against ``creds`` and an always-passing CI."""
 
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: creds)
+    monkeypatch.setattr(ci, "credentials_for", lambda _s: creds)
     lineage, work_item = _ci_inputs()
 
     async def run() -> Any:
         transport = httpx.MockTransport(lambda r: _runs(("completed", "success")))
         async with httpx.AsyncClient(transport=transport) as client:
-            return await workitem_outcomes.observe_ci(
+            return await ci.observe_ci(
                 lineage, work_item, get_settings(), client
             )
 
@@ -1814,10 +1815,10 @@ def test_ci_cancellation_before_the_mint_starts_releases_the_permit(
     """
 
     import anyio.to_thread
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
     monkeypatch.setattr(
-        workitem_outcomes, "CI_OBSERVATION_DEADLINE_SECONDS", 0.2, raising=False
+        ci, "CI_OBSERVATION_DEADLINE_SECONDS", 0.2, raising=False
     )
 
     async def never_starts(func: Any, *args: Any, **kwargs: Any) -> Any:
@@ -1825,7 +1826,7 @@ def test_ci_cancellation_before_the_mint_starts_releases_the_permit(
         raise AssertionError("the worker must never run in this test")
 
     monkeypatch.setattr(anyio.to_thread, "run_sync", never_starts)
-    for _ in range(workitem_outcomes.CI_CREDENTIAL_SLOTS):
+    for _ in range(ci.CI_CREDENTIAL_SLOTS):
         observation = _observe_once(monkeypatch, _FakeCreds())
         assert (observation.state, observation.reason) == ("unavailable", "timeout")
 
@@ -1836,9 +1837,9 @@ def test_ci_cancellation_before_the_mint_starts_releases_the_permit(
 
 
 def test_ci_mint_exception_releases_its_permit(monkeypatch: pytest.MonkeyPatch) -> None:
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    for _ in range(workitem_outcomes.CI_CREDENTIAL_SLOTS + 1):
+    for _ in range(ci.CI_CREDENTIAL_SLOTS + 1):
         failed = _observe_once(monkeypatch, _FakeCreds(error=GitHubAppError("boom")))
         assert failed.state == "unavailable"
         assert failed.reason != "observation_busy"
@@ -1997,10 +1998,10 @@ def _observe_detail(
     creds: Any = None,
     client_options: dict[str, Any] | None = None,
 ) -> tuple[Any, list[httpx.Request]]:
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
     fake = creds or _FakeCreds()
-    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: fake)
+    monkeypatch.setattr(ci, "credentials_for", lambda _s: fake)
     seen: list[httpx.Request] = []
 
     def record(request: httpx.Request) -> httpx.Response:
@@ -2013,7 +2014,7 @@ def _observe_detail(
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(record), **(client_options or {})
         ) as client:
-            return await workitem_outcomes.observe_ci_detail(
+            return await ci.observe_ci_detail(
                 lineage, work_item, get_settings(), client
             )
 
@@ -2061,9 +2062,9 @@ def _observe_detail_with_base(
     base_branch: Callable[[], Awaitable[httpx.Response]],
     base_runs: list[dict[str, Any]],
 ) -> tuple[Any, list[str]]:
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: _FakeCreds())
+    monkeypatch.setattr(ci, "credentials_for", lambda _s: _FakeCreds())
     head = _detail_handler()
     paths: list[str] = []
 
@@ -2087,7 +2088,7 @@ def _observe_detail_with_base(
 
     async def run() -> Any:
         async with httpx.AsyncClient(transport=httpx.MockTransport(record)) as client:
-            return await workitem_outcomes.observe_ci_detail(
+            return await ci.observe_ci_detail(
                 lineage, work_item, get_settings(), client
             )
 
@@ -2097,9 +2098,9 @@ def _observe_detail_with_base(
 def test_ci_detail_slow_base_read_keeps_the_observed_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    monkeypatch.setattr(workitem_outcomes, "CI_BASE_READ_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(ci, "CI_BASE_READ_TIMEOUT_SECONDS", 0.2)
 
     async def never_answers() -> httpx.Response:
         await asyncio.Event().wait()
@@ -2346,8 +2347,8 @@ def test_ci_gate_applies_the_python_preflight_verdict_to_python_changes(
     expected: tuple[str, str],
     reason: str | None,
 ) -> None:
-    from curie_api import workitem_outcomes
     from curie_api.factory_progress import record_verification
+    from curie_api.forges.github import ci
 
     monkeypatch.setenv("GITHUB_FACTORY_PYTHON_CI", CONVERSION_PYTHON_CI_ENV)
     get_settings.cache_clear()
@@ -2391,7 +2392,7 @@ def test_ci_gate_applies_the_python_preflight_verdict_to_python_changes(
             else [_actions_check_run(7002, PYTHON_CI_CHECK, python_check)]
         )
 
-    monkeypatch.setattr(workitem_outcomes, "observe_ci_detail", green_ci)
+    monkeypatch.setattr(ci, "observe_ci_detail", green_ci)
 
     async def settlement(session: AsyncSession) -> Any:
         return await workitems.claim_publication_settlement(
@@ -2849,9 +2850,9 @@ def test_ci_detail_stalled_mint_releases_the_caller_with_timeout(
 
     import anyio
     import anyio.to_thread
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    monkeypatch.setattr(workitem_outcomes, "CI_DETAIL_DEADLINE_SECONDS", 0.05)
+    monkeypatch.setattr(ci, "CI_DETAIL_DEADLINE_SECONDS", 0.05)
 
     async def never_returns(func: Any, *args: Any, **kwargs: Any) -> Any:
         await anyio.Event().wait()
@@ -2869,10 +2870,10 @@ def test_ci_detail_shares_the_bounded_credential_slots(
 ) -> None:
     """The detail observer mints through the same guard as observe_ci."""
 
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    assert workitem_outcomes.mint_ci_token is not None
-    for _ in range(workitem_outcomes.CI_CREDENTIAL_SLOTS + 1):
+    assert ci.mint_ci_token is not None
+    for _ in range(ci.CI_CREDENTIAL_SLOTS + 1):
         failed, _ = _observe_detail(
             monkeypatch, _detail_handler(), creds=_FakeCreds(error=GitHubAppError("boom"))
         )

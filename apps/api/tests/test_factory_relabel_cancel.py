@@ -25,20 +25,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api.config import get_settings
-from curie_api.factory_notices import FINAL_MARKER, marker_for, result_section
+from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import FINAL_MARKER, result_section
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
+from forge_fakes.github import LABEL, REPO_ID, SENDER, SENDER_ID, _issue_event, _post
+from forge_fakes.github_comments import _rows, admitted, comments  # noqa: F401  (fixtures)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     _notices,
     _observe_termination,
     _reconcile,
-    _rows,
     _start_running,
-    admitted,
-    comments,
 )
-from test_github_factory_ingress import LABEL, REPO_ID, SENDER, SENDER_ID, _issue_event, _post
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 

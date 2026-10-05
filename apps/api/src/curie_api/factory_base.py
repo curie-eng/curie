@@ -20,10 +20,11 @@ from urllib.parse import quote
 import httpx
 
 from .config import Settings
-from .factory_notices import code_span, upsert_issue_notice
+from .factory_notices import code_span
+from .forges.github.marked_comments import upsert_issue_notice
+from .forges.github.transport import github_headers
 from .github_factory_events import BASE_LABEL_PREFIX
 from .github_review_events import FeedbackUnavailable
-from .github_review_truth import github_headers
 from .repo_full_name import entry_for_repo
 
 REFUSAL_MARKER = "<!-- curie-factory-base-refusal -->"

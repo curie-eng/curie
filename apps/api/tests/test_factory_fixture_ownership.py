@@ -15,14 +15,13 @@ from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_factory_terminus import (  # noqa: E402
+from forge_fakes.github import REPO, GitHubAPI  # noqa: E402
+from forge_fakes.github_comments import (  # noqa: E402
     _clear_ci_keys,
-    _label,
-    _request,
     admitted,  # noqa: F401
     comments,  # noqa: F401
 )
-from test_github_factory_ingress import REPO, GitHubAPI  # noqa: E402
+from test_factory_terminus import _label, _request  # noqa: E402
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 

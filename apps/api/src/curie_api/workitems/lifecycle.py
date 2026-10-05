@@ -23,6 +23,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from .. import transcripts
 from ..config import get_settings
 from ..factory_reply_target import parse_reply_target
+from ..forges.github.binding import github_reply_route
 from ..models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
     Agent,
@@ -224,15 +225,6 @@ async def _conflict(
     )
     await session.commit()
     return result
-
-
-GITHUB_CHANNEL_KIND = "github"
-
-
-def github_reply_route(repo_full_name: str, issue_number: int) -> tuple[str, str, str]:
-    """The reply kind, address, and conversation id a GitHub issue replies on."""
-
-    return GITHUB_CHANNEL_KIND, repo_full_name, f"issue-{issue_number}"
 
 
 async def database_now(session: AsyncSession) -> datetime:

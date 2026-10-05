@@ -45,26 +45,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api.config import get_settings
-from curie_api.factory_notices import FINAL_MARKER, marker_for
+from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import FINAL_MARKER
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from test_factory_terminus import (  # noqa: F401  (fixtures)
+from forge_fakes.github import LABEL, REPO, REPO_ID, _issue_event, _post
+from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     HEAD_A,
     HEAD_B,
     HEAD_C,
-    _attach_publication,
     _CommentServer,
-    _label,
-    _notices,
-    _observe_termination,
-    _reconcile,
-    _reconcile_later,
-    _request,
     _rows,
-    _set_base_ref,
-    _start_running,
     admitted,
     check_run,
     ci_empty,
@@ -74,7 +65,19 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     ci_pending,
     comments,
 )
-from test_github_factory_ingress import LABEL, REPO, REPO_ID, _issue_event, _post
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from test_factory_terminus import (  # noqa: F401  (fixtures)
+    _attach_publication,
+    _label,
+    _notices,
+    _observe_termination,
+    _reconcile,
+    _reconcile_later,
+    _request,
+    _set_base_ref,
+    _start_running,
+)
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -1007,9 +1010,9 @@ def _push_during_observation(
 ) -> list[str]:
     """Land a fix push (head B) while the gate is observing head A."""
 
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    original = workitem_outcomes.observe_ci_detail
+    original = ci.observe_ci_detail
     pushed: list[str] = []
 
     async def racing(*args: Any, **kwargs: Any) -> Any:
@@ -1026,7 +1029,7 @@ def _push_during_observation(
             )
         return detail
 
-    monkeypatch.setattr(workitem_outcomes, "observe_ci_detail", racing)
+    monkeypatch.setattr(ci, "observe_ci_detail", racing)
     return pushed
 
 
@@ -1509,7 +1512,8 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
     """Each CI read takes a full poll interval, so older requests are due every pass."""
 
     import curie_api.workitems.lifecycle as workitems
-    from curie_api import factory_ci, workitem_outcomes
+    from curie_api import factory_ci
+    from curie_api.forges.github import ci
 
     client, github, sink = admitted
     assert get_settings().work_item_batch_limit >= 5
@@ -1523,7 +1527,7 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
 
     elapsed = [0.0]
     original_now = workitems.database_now
-    original_observe = workitem_outcomes.observe_ci_detail
+    original_observe = ci.observe_ci_detail
 
     async def now(session: AsyncSession) -> Any:
         return await original_now(session) + timedelta(seconds=elapsed[0])
@@ -1534,7 +1538,7 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
         return detail
 
     monkeypatch.setattr(workitems, "database_now", now)
-    monkeypatch.setattr(workitem_outcomes, "observe_ci_detail", slow_observe)
+    monkeypatch.setattr(ci, "observe_ci_detail", slow_observe)
 
     _passes_on_one_reconciler(3)
 
@@ -1931,7 +1935,7 @@ def recorded_github(
 
     from curie_api.main import create_app
     from fastapi.testclient import TestClient
-    from test_factory_terminus import _clear_ci_keys
+    from forge_fakes.github_comments import _clear_ci_keys
 
     stub_root = Path(__file__).resolve().parents[3] / "tools" / "github-stub"
     recording = json.loads((stub_root / "recordings" / "curie-pr-3400.json").read_text())

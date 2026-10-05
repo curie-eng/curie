@@ -22,8 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from .config import Settings
+from .forges.github.transport import github_headers
 from .github_app import GitHubAppError, GitHubCredentials
-from .github_review_truth import github_headers
 from .models import MAX_EXECUTION_DEADLINE_SECONDS, ExecutionRequest, WorkItem
 
 ISSUE_READ_TIMEOUT_SECONDS = 20.0

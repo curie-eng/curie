@@ -28,12 +28,13 @@ from starlette.concurrency import run_in_threadpool
 
 from curie_api.crud import errors as crud_errors
 from curie_api.crud import lineages as crud_lineages
-from curie_api.factory_notices import find_marker
+from curie_api.forges.github.marked_comments import find_marker
 from curie_api.schemas.channels import BUILTIN_CLUSTER_MESSAGE_ADAPTER
 from curie_api.schemas.publications import ReviewRevisionReserve
 
 from .config import Settings
 from .delivery import backlog_reservation, enqueue_owned, take_backlog_slot
+from .forges.github.transport import github_headers
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_review_audit import settle_review_delivery
 from .github_review_events import (
@@ -43,7 +44,7 @@ from .github_review_events import (
     UnverifiedFeedback,
 )
 from .github_review_terminal import read_review_dead_letter, worker_event_terminal_outcome
-from .github_review_truth import BoundReviewLineage, github_headers, verify_feedback_truth
+from .github_review_truth import BoundReviewLineage, verify_feedback_truth
 from .models import (
     AgentChannel,
     Deployment,

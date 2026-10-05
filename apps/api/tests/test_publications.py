@@ -64,6 +64,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from forge_fakes.github import REPO as FACTORY_REPO
+from forge_fakes.github_comments import _rows as _factory_rows
+from forge_fakes.github_comments import admitted, comments  # noqa: F401
 from test_factory_terminus import (  # noqa: F401
     _label as _factory_label,
 )
@@ -71,13 +74,8 @@ from test_factory_terminus import (
     _request as _factory_request,
 )
 from test_factory_terminus import (
-    _rows as _factory_rows,
-)
-from test_factory_terminus import (
     _start_running as _start_factory_request,
 )
-from test_factory_terminus import admitted, comments  # noqa: F401
-from test_github_factory_ingress import REPO as FACTORY_REPO
 
 REPO = "acme-corp/acme-bot"
 WORKER_TOKEN = "remote-dev-publication-worker-token"
@@ -2104,8 +2102,10 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
             sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
             async with sessionmaker() as session:
                 data = PublicationCreate.model_validate(request.to_json())
+
                 async def metadata_check() -> None:
                     return
+
                 publication, _ = await crud_publications.create_publication(
                     session, data, patch=data.decoded_patch(), metadata_check=metadata_check
                 )

@@ -26,13 +26,22 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
-from curie_api.factory_notices import FINAL_MARKER, marker_for
+from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import FINAL_MARKER
+from forge_fakes.github import LABEL, _issue_event, _post
+from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
+    _LABELS,
+    HEAD_A,
+    _rows,
+    admitted,
+    check_run,
+    ci_entry,
+    comments,
+)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from test_factory_progress import DECLARATION, STAGED_DECLARATION, report
 from test_factory_terminus import (  # noqa: F401  (fixtures)
-    _LABELS,
-    HEAD_A,
     REPO,
     _attach_publication,
     _attach_revision_publication,
@@ -44,15 +53,9 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     _reconcile,
     _request,
     _revision_objective,
-    _rows,
     _set_base_ref,
     _start_running,
-    admitted,
-    check_run,
-    ci_entry,
-    comments,
 )
-from test_github_factory_ingress import LABEL, _issue_event, _post
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 

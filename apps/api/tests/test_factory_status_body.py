@@ -8,18 +8,11 @@ import uuid
 
 import httpx
 import pytest
-from curie_api.factory_notices import (
-    FINAL_MARKER,
-    _deliver,
-    _GitHub,
-    _patch,
-    marker_for,
-    result_section,
-    status_body,
-    upsert_issue_notice,
-)
+from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import FINAL_MARKER, result_section, status_body
 from curie_api.factory_progress import PhaseSlot, PhaseView, StageSlot
 from curie_api.factory_reply_target import ReplyTarget
+from curie_api.forges.github.marked_comments import _deliver, _GitHub, _patch, upsert_issue_notice
 from curie_api.models import FactoryStatusComment, WorkItem
 
 REQUEST = uuid.UUID("00000000-0000-0000-0000-000000003125")

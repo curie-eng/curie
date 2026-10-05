@@ -18,8 +18,8 @@ from starlette.concurrency import run_in_threadpool
 from curie_api.crud import lineages as crud_lineages
 
 from .config import Settings
+from .forges.github.transport import github_headers, repository_identity_matches
 from .github_app import GitHubAppError, GitHubCredentials
-from .github_review_truth import github_headers, repository_identity_matches
 from .models import Deployment, ExecutionRequest, ThreadPublicationLineage, WorkItem
 from .repo_full_name import repo_url_path
 

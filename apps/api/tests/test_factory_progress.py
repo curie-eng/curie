@@ -27,15 +27,13 @@ from curie_api.config import get_settings
 from curie_api.factory_progress import phase_view, pill_for
 from curie_api.models import ExecutionRequestPhaseReport
 from curie_internal import sandbox_token
-from test_factory_terminus import (  # noqa: F401  (fixtures)
-    _label,
-    _request,
+from forge_fakes.github import LABEL, _issue_event, _post
+from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     _rows,
-    _start_running,
     admitted,
     comments,
 )
-from test_github_factory_ingress import LABEL, _issue_event, _post
+from test_factory_terminus import _label, _request, _start_running  # noqa: F401  (fixtures)
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 

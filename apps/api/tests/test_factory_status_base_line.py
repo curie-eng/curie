@@ -11,13 +11,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from curie_api.factory_notices import FINAL_MARKER, marker_for, status_body
+from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import FINAL_MARKER, status_body
+from forge_fakes.github_comments import admitted, comments  # noqa: F401  (fixtures)
 from test_factory_status_comment import _admit, _execute, _marked
-from test_factory_terminus import (  # noqa: F401  (fixtures)
-    _reconcile,
-    admitted,
-    comments,
-)
+from test_factory_terminus import _reconcile  # noqa: F401  (fixtures)
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 

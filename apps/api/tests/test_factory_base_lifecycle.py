@@ -21,18 +21,17 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
+from forge_fakes.github import LABEL, REPO_ID, _issue_event, _post
+from forge_fakes.github_comments import _rows, admitted, comments  # noqa: F401  (fixtures)
 from test_factory_status_comment import _marked
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     REPO,
     _observe_termination,
     _published_issue,
     _reconcile,
-    _rows,
     _start_running,
-    admitted,
-    comments,
 )
-from test_github_factory_ingress import LABEL, REPO_ID, _code, _issue_event, _post
+from test_github_factory_ingress import _code
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 

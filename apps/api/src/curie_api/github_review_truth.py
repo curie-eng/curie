@@ -11,6 +11,7 @@ import httpx
 from starlette.concurrency import run_in_threadpool
 
 from .config import Settings
+from .forges.github.transport import get_github_json, repository_identity_matches
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_review_events import (
     FeedbackIgnored,
@@ -33,57 +34,6 @@ class BoundReviewLineage:
     installation_id: int
     pr_node_id: str
     base_ref: str
-
-
-def github_headers(token: str) -> dict[str, str]:
-    return {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-
-async def get_github_json(
-    client: httpx.AsyncClient,
-    *,
-    api: str,
-    token: str,
-    path: str,
-    refusal: str,
-) -> dict[str, Any]:
-    """Read one GitHub JSON object. Claimed webhook URLs are never fetched."""
-
-    try:
-        response = await client.get(
-            f"{api}{path}",
-            headers=github_headers(token),
-            follow_redirects=False,
-        )
-    except httpx.HTTPError:
-        raise FeedbackUnavailable(refusal) from None
-    # A 404 can conceal missing App permissions; it cannot distinguish a
-    # deleted resource from a temporary inability to prove current authority.
-    if response.status_code in {401, 403, 404, 429} or response.status_code >= 500:
-        raise FeedbackUnavailable(refusal)
-    if response.status_code != 200:
-        raise FeedbackIgnored(refusal)
-    try:
-        result = response.json()
-    except ValueError:
-        raise FeedbackIgnored(refusal) from None
-    if not isinstance(result, dict):
-        raise FeedbackIgnored(refusal)
-    return result
-
-
-def repository_identity_matches(value: Any, *, repository_id: int, repo_full_name: str) -> bool:
-    return (
-        isinstance(value, dict)
-        and type(value.get("id")) is int
-        and value["id"] == repository_id
-        and isinstance(value.get("full_name"), str)
-        and value["full_name"].casefold() == repo_full_name.casefold()
-    )
 
 
 async def verify_sender_write_permission(
