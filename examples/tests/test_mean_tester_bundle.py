@@ -518,7 +518,11 @@ def test_campaign_reads_spec_and_suite_at_the_commit_resolved_first():
     commit = start.index("list_commits")
     read = start.index("get_file_contents")
     assert commit < read
-    assert "exact SHA as `ref`" in start
+    # @modelcontextprotocol/server-github@2025.4.8 get_file_contents takes the
+    # revision as `branch`; its zod schema strips an unknown `ref`, so a read
+    # passing `ref` silently returns the default branch's file.
+    assert "exact SHA as `branch`" in start
+    assert "as `ref`" not in start
     assert "never the moving branch" in start
 
 
@@ -554,3 +558,44 @@ def test_recorded_timeout_and_uncertain_receipt_controls_have_explicit_evidence(
     assert "Recorded connector outcome: timeout" in receipt
     assert "could not be confirmed" in receipt
     assert "File attachment failed" not in receipt
+
+
+def _doc_section(path: Path, title: str) -> str:
+    found = re.search(rf"^## {re.escape(title)}\n(.*?)(?=^## |\Z)", path.read_text(), re.M | re.S)
+    assert found, f"{path.name} must keep a '## {title}' section"
+    return " ".join(found.group(1).split())
+
+
+def test_the_runner_layer_installs_the_gate_as_an_executable():
+    layer = (BUNDLE / "runner.Dockerfile").read_text()
+    lines = [line for line in layer.splitlines() if line.startswith("COPY")]
+    assert lines, "runner.Dockerfile must COPY the ship gate"
+    assert any(
+        "--chmod=0755" in line.split()
+        and "gate/mean_tester_gate.py" in line.split()
+        and line.split()[-1] == "/usr/local/bin/mean-tester-gate"
+        for line in lines
+    ), lines
+
+
+def test_the_ship_verdict_is_the_gates_and_copied_verbatim():
+    result = _section("Validation result")
+    for phrase in ("mean-tester-gate verdict", "`Ship:`", "`Ledger:`", "verbatim",
+                   "GO (read-only scope)", "never full GO"):
+        assert phrase in result, phrase
+    assert re.search(r"never writes? (a|the|any) ship verdict", result, re.I), result
+
+
+def test_the_skill_drives_every_gate_subcommand():
+    fixed = _section("Fixed acceptance suite")
+    assert "mean-tester-gate intake" in fixed and "--blob-sha" in fixed
+    recording = _section("Running a campaign") + " " + _section("Verdicts")
+    assert "mean-tester-gate record" in recording
+    assert "mean-tester-gate import" in _section('"continue"')
+
+
+def test_the_validator_doc_allows_only_a_read_only_scope_go():
+    ship = _doc_section(BUNDLE / "docs" / "VALIDATOR.md", "Ship verdict")
+    assert "GO (read-only scope)" in ship
+    # Full GO for an action-bearing suite still needs slice 2.
+    assert "slice 2" in ship and "full GO" in ship and "action" in ship

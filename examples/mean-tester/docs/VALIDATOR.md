@@ -62,8 +62,10 @@ blocked actions do not cover a criterion. Report missing suite criteria as gaps.
 Before sending any probe, plan 2–4 sessions from the actual users' roles,
 specification and system prompt. Include full realistic documents or long
 paragraphs; edits deep inside a line; changed numbers; forgotten attachments,
-re-attachment, vague categories and follow-ups depending on earlier answers.
-Plan the whole ask/file/approve-or-reject/check flow. Mark action, attachment,
+re-attachment, vague categories and follow-ups depending on earlier answers,
+as far as the target's users would do them. Plan the whole
+ask/file/approve-or-reject/check flow for every target that can perform one; a
+target that only reads and answers has no such flow to plan. Mark action, attachment,
 card and state-check steps `BLOCKED: slice 2`; run only independent read-or-ask
 steps. Do not grade a downstream check as PASS when its prerequisite was blocked.
 If threaded bot follow-ups are unavailable, report that conversation coverage
@@ -118,15 +120,43 @@ report margin. Pending slice 2 steps do not become `Next:` live action requests.
 ## Ship verdict
 
 <!-- @spec VALIDATOR-4 -->
-Full GO requires: every fixed case and required P0 repeat passes; scenario
-campaigns have no P0 finding and every required step is complete; no UNCLEAR,
-BLOCKED, NOT RUN, missing criterion, cleanup failure or unresolved client
-decision remains; an explained configuration diff between marked and production
-installs; and a post-deploy read-only production smoke. The pre-deploy report
-cannot claim that later smoke occurred. If any required condition is absent,
-report NO-GO with the missing evidence. Passing read-or-ask cases is a slice 1
-result only, never full GO. Report criteria, repeats and scenario coverage even
-when no tests can run.
+The ship verdict is computed, not judged. The tester's model judges each probe
+and records it; the bundle's gate, `gate/mean_tester_gate.py` (installed in the
+runner layer as `mean-tester-gate`), validates the suite against
+`acceptance/schema.json`, decides which cases are eligible, keeps the ledger of
+recorded verdicts and aggregates it. The report carries the gate's `Ship:`,
+`Coverage:` and `Ledger:` lines unedited.
+
+**GO (read-only scope)** is the one GO slice 1 can issue. It requires: a READY
+suite, its copy matching the Git blob it was read from when it came from Git; no
+action-bearing case (mode `action`, attachments, a card action, an expected
+state, or a probe the tester flags as asking for an action); every case passing
+every repeat; every criterion named by a case; 2–4 declared scenario sessions
+passing every step; every other probe the campaign planned or recorded
+passing; and no gap the tester names, such as a specification criterion the
+suite does not test, an unresolved client decision or an approval card left
+pending. The probes
+reach the deployed target itself, so this verdict is its own post-deploy
+smoke, and no marked installation is involved, so no configuration diff
+applies. It covers the installation the probes reached and only what a person
+can do there by reading and asking.
+
+An action-bearing suite needs slice 2: slice 1 never issues full GO for it.
+Full GO requires all of the above for every case, verified restoration with no
+cleanup failure, an explained configuration diff between marked and production
+installations, and a post-deploy read-only production smoke; the pre-deploy
+report cannot claim that later smoke occurred.
+
+Any absent condition is NO-GO with the missing evidence named: MISSING or
+MALFORMED suite, FAIL, UNCLEAR, BLOCKED, NOT RUN, scenario count, gap, or slice 2.
+Report criteria, repeats and scenario coverage even when no tests can run.
+
+The ledger persists across turns as the report's `Ledger:` token: a compressed,
+checksummed record bound to the suite's content and the campaign id, carrying
+every case the tester flagged as asking for an action. A ledger from another
+campaign or suite is refused, never reused. A fresh sandbox restores it
+with `mean-tester-gate import`. The checksum catches a token that was not copied
+exactly; it is not a security boundary against the tester itself.
 
 ## Next decisions before slice 2
 
