@@ -1200,7 +1200,11 @@ def test_sigterm_stops_the_deploy_notice_consumer(
         )
         await asyncio.wait_for(run._run(WorkerConfig(), {}), timeout=1)
 
-    monkeypatch.setattr(run, "build", lambda config, env: runtime)
+    def fake_build(config: WorkerConfig, env: Any, *, resources: Any) -> _FakeRuntime:
+        _register_legacy_fake_transports(runtime, resources)
+        return runtime
+
+    monkeypatch.setattr(run, "build", fake_build)
     monkeypatch.setattr(run, "run_heartbeat", stopping_heartbeat)
     asyncio.run(exercise())
     assert notice.started.is_set()

@@ -171,13 +171,17 @@ async def _check_credential_current(request: Request, agent_id: uuid.UUID, cred:
     try:
         released = await client.exists(_released_credential_key(agent_id, cred))
     except (redis.RedisError, OSError) as exc:
-        logger.warning("state: could not check sandbox credential %s: %r", cred, exc)
+        logger.warning(
+            "state: could not check sandbox credential for agent %s (%s)",
+            agent_id,
+            type(exc).__name__,
+        )
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "could not check this sandbox credential",
         ) from exc
     if released:
-        logger.warning("state: refused released sandbox credential %s for agent %s", cred, agent_id)
+        logger.warning("state: refused released sandbox credential for agent %s", agent_id)
         raise HTTPException(status.HTTP_403_FORBIDDEN, CREDENTIAL_RELEASED)
 
 

@@ -49,6 +49,7 @@ from _support import (
     IngressState,
     MailHandler,
     MailState,
+    seed_historical_reply,
     serve,
 )
 from aiohttp import web
@@ -506,7 +507,8 @@ async def open_discord(tmp: Path) -> AsyncIterator[ChannelAdapterSubject]:
 MAIL_CAPABILITIES = Capabilities(
     kind="email",
     streaming=Streaming.BUFFERED,
-    ingress=True,
+    # Current AgentMail intake cannot verify a positive authentication verdict.
+    ingress=False,
     authenticates=True,
     refuses_foreign_targets=True,
     serves_attachments=False,
@@ -524,6 +526,9 @@ class MailSubject(_KernelEgressSubject):
     One generation is the adapter process and its egress server; ``restart``
     closes it and opens a replacement on the same SQLite state, exactly as
     ``restarted_adapter`` in the mail suite does.
+
+    Egress targets come from historical accepted turns. Fresh provider mail
+    remains subject to the real adapter's authentication refusal.
     """
 
     capabilities = MAIL_CAPABILITIES
@@ -567,33 +572,29 @@ class MailSubject(_KernelEgressSubject):
         await self.start()
 
     async def open_conversation(self, message: Upstream) -> list[IngressTurn]:
+        """Prepare an egress target from a turn accepted before the authentication gate."""
         assert self._adapter is not None
-        self._mail.add_inbound(
+        conversation_id = f"thr-{message.id}"
+        seed_historical_reply(
+            self._mail,
+            self._adapter.state,
             message.id,
-            f"thr-{message.id}",
+            conversation_id,
             sender=ALLOWED_SENDER,
             subject="Conformance",
             text=message.text,
         )
-        if message.attachments:
-            # Served the way AgentMail's Get Message lists a message's files.
-            self._mail.bodies[message.id]["attachments"] = [
-                {
-                    "attachment_id": f"att-{index}",
-                    "filename": attachment.name,
-                    "size": len(attachment.content),
-                }
-                for index, attachment in enumerate(message.attachments)
-            ]
-        mark = len(self._ingress.requests)
-        # The platform answers the first attempt with a transient 503, which the
-        # adapter keeps pending under its stable id; the next poll retries it.
-        # Both bodies reach the fake, so the stability check sees the retry.
-        self._ingress.responses.append((503, {"detail": "transient"}, {}))
-        adapter = self._adapter
-        await asyncio.to_thread(adapter.poll_once)
-        await asyncio.to_thread(adapter.poll_once)
-        return [_turn_from_body(body) for _headers, body in self._ingress.requests[mark:]]
+        # The non-ingress subject returns a stand-in, never a posted channel turn.
+        return [
+            IngressTurn(
+                kind=MAIL_CAPABILITIES.kind,
+                address=INBOX,
+                delivery_id=message.id,
+                conversation_id=conversation_id,
+                reply_ref=message.id,
+                body=None,
+            )
+        ]
 
     async def fetch_attachment(self, attachment_id: str) -> bytes:
         raise AssertionError(

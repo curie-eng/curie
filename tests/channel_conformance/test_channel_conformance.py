@@ -14,12 +14,14 @@ accepts" are the same claim.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _support import ALLOWED_SENDER, STRANGER
 from channel_protocol.conformance import (
     CHECKS,
     Check,
@@ -28,7 +30,8 @@ from channel_protocol.conformance import (
     applicable_checks,
 )
 from curie_api.routers.channels import TurnIn
-from subjects import REGISTRY, REGISTRY_CAPABILITIES
+from curie_mail_adapter.adapter import MailAdapter
+from subjects import REGISTRY, REGISTRY_CAPABILITIES, MailSubject
 
 # The four adapters #3830 names. A registry that loses one would silently shrink
 # the matrix, so the floor is pinned rather than read off the registry itself.
@@ -108,3 +111,122 @@ def test_declared_capabilities_match_the_running_subject(subject_name: str, tmp_
     if declared.ingress:
         assert kinds, "an ingress adapter turned an upstream message into no turn"
         assert set(kinds) == {declared.kind}
+
+
+@pytest.mark.parametrize("thread_surface", ["fresh_thread", "historical_thread"])
+@pytest.mark.parametrize(
+    ("sender", "labels", "headers"),
+    [
+        (STRANGER, [], None),
+        (ALLOWED_SENDER, [], None),
+        (ALLOWED_SENDER, ["authenticated", "dmarc_pass", "dkim_pass"], None),
+        (
+            ALLOWED_SENDER,
+            [],
+            {
+                "Authentication-Results": (
+                    "mx.example.com; spf=pass smtp.mailfrom=example.com; "
+                    "dkim=pass header.d=example.com; dmarc=pass header.from=example.com"
+                ),
+                "Received-SPF": "pass",
+                "X-AgentMail-Authenticated": "true",
+            },
+        ),
+    ],
+    ids=["unlabelled_spoof", "allowlisted_no_verdict", "positive_labels", "forged_headers"],
+)
+def test_fresh_mail_is_refused_on_retry_and_restart_without_reply_ownership(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    thread_surface: str,
+    sender: str,
+    labels: list[str],
+    headers: dict[str, str] | None,
+) -> None:
+    # AgentMail exposes arbitrary labels and headers without a trusted aligned
+    # authentication verdict or a header provenance guarantee. See:
+    # https://docs.agentmail.to/api-reference/inboxes/messages/list
+    # https://docs.agentmail.to/api-reference/inboxes/messages/get
+    # https://docs.agentmail.to/knowledge-base/inbound-emails-missing
+    async def run() -> None:
+        async with REGISTRY["mail"](tmp_path) as subject:
+            assert isinstance(subject, MailSubject)
+            historical_turns = await subject.open_conversation(
+                Upstream(id=str(uuid.uuid4()), text="Historical reply still owed")
+            )
+            assert len(historical_turns) == 1
+            historical = historical_turns[0]
+            assert historical.body is None
+            historical_reply_ref = historical.reply_ref
+            assert historical_reply_ref is not None
+            adapter = subject._adapter
+            assert adapter is not None
+            assert adapter.config.ingress_enabled
+            historical_delivery = adapter.state.delivery(historical.delivery_id)
+            assert historical_delivery is not None
+            assert historical_delivery["state"] == "accepted"
+            historical_reply = adapter.state.reply_text(
+                historical.conversation_id, historical_reply_ref
+            )
+            assert historical_reply[0]
+
+            message_id = str(uuid.uuid4())
+            thread_id = (
+                f"thr-{message_id}"
+                if thread_surface == "fresh_thread"
+                else historical.conversation_id
+            )
+            summary = subject._mail.add_inbound(
+                message_id,
+                thread_id,
+                sender=sender,
+                labels=labels,
+                headers=headers,
+                text="Fresh mail must not acquire a reply target",
+            )
+            if headers is not None:
+                summary["headers"] = dict(headers)
+            assert adapter.state.delivery(message_id) is None
+            listing_count = subject._mail.list_calls
+
+            def assert_refused(candidate: MailAdapter) -> None:
+                assert candidate.state.delivery(message_id) == {"state": "rejected", "turn": None}
+                assert candidate.state.reply_text(thread_id, message_id) == (False, None)
+                expected_refs = [] if thread_surface == "fresh_thread" else [historical_reply_ref]
+                assert candidate.state.live_reply_refs(thread_id) == expected_refs
+                assert candidate.state.live_reply_refs(historical.conversation_id) == [
+                    historical_reply_ref
+                ]
+                assert candidate.state.reply_text(
+                    historical.conversation_id, historical_reply_ref
+                ) == historical_reply
+                assert candidate.state.delivery(historical.delivery_id) == historical_delivery
+                assert candidate.state.pending() == []
+                assert subject._ingress.requests == []
+                assert subject._ingress.resolves == []
+                assert subject._mail.body_calls == {}
+                assert subject._mail.replies == []
+                assert subject.effects() == []
+
+            for _ in range(2):
+                assert await asyncio.to_thread(adapter.poll_once) == 200
+                assert_refused(adapter)
+
+            await subject.restart()
+            replacement = subject._adapter
+            assert replacement is not None and replacement is not adapter
+            assert_refused(replacement)
+            assert await asyncio.to_thread(replacement.poll_once) == 200
+            assert_refused(replacement)
+            assert subject._mail.list_calls == listing_count + 3
+
+    with caplog.at_level(logging.WARNING, logger="curie_mail_adapter"):
+        asyncio.run(run())
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name.startswith("curie_mail_adapter") and record.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "authentication_unverifiable" in warnings[0]
+    assert sender not in warnings[0]

@@ -85,6 +85,23 @@ def _strings(node: ast.expr, environment: _Environment) -> _Values:
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "replace"
+    ):
+        if len(node.args) != 2 or node.keywords:
+            raise ValueError("unsupported SQL replace arguments")
+        return _unique(
+            [
+                value.replace(old, new)
+                for value, old, new in itertools.product(
+                    _strings(node.func.value, environment),
+                    _strings(node.args[0], environment),
+                    _strings(node.args[1], environment),
+                )
+            ]
+        )
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
         and node.func.attr == "format"
     ):
         templates = _strings(node.func.value, environment)

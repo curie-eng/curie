@@ -135,6 +135,7 @@ def test_process_boot_refuses_non_claude_before_opening_the_listener(tmp_path: P
                 "CURIE_BUDGET": '{"max_output_tokens_per_run":10000,"max_usd_per_day":1.0}',
                 "CURIE_FAKE_MODEL": "1",
                 "CURIE_HARNESS": "rival",
+                "CURIE_RUNNER_TOKEN": "boundary-control-placeholder-token",
                 "CURIE_RUNNER_PORT": str(occupied_port.getsockname()[1]),
                 "OTEL_SDK_DISABLED": "true",
             }

@@ -75,6 +75,14 @@
     "cli/src/queue.rs:xadd:1": {
       "language": "rust",
       "purpose": "Runs capable generic CLI publisher also used for eval streams"
+    },
+    "packages/protected-hooks/src/curie_protected_hooks/admission_scripts.py:module:1": {
+      "language": "lua",
+      "purpose": "Runs enqueue of a newly admitted protected hook with its reserved stream ID and protected envelope"
+    },
+    "packages/protected-hooks/src/curie_protected_hooks/admission_scripts.py:module:2": {
+      "language": "lua",
+      "purpose": "Runs enqueue recovering a protected hook at its reserved stream ID when its entry is absent"
     }
   },
   "key_literals": {
@@ -257,6 +265,14 @@
     "packages/curie-internal/src/curie_internal/wire_inventory.py:module:1": {
       "value": "curie:",
       "reason": "Literal matching prefix for the inventory scanner, not a Valkey key"
+    },
+    "packages/protected-hooks/src/curie_protected_hooks/atomic_admission.py:AtomicAdmission._operate:1": {
+      "value": "curie:runs",
+      "reason": "Protected admission broker transaction uses the runs stream for initial and recovered enqueue"
+    },
+    "packages/protected-hooks/src/curie_protected_hooks/atomic_admission.py:AtomicAdmission._operate:2": {
+      "value": "curie:runs",
+      "reason": "Protected admission recovery verifies the reserved runs stream entry and envelope with an exact XRANGE"
     }
   }
 }

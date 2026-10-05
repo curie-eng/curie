@@ -147,6 +147,73 @@ def test_publication_result_sql_discovers_filtered_and_unfiltered_branches() -> 
     assert any("AND id = :requested_id" not in sql for sql in update_variants)
 
 
+def test_cron_target_sql_discovers_filtered_and_unfiltered_branches() -> None:
+    statements = [
+        sql
+        for site, sql in discover_statements(ROOT, "curie")
+        if "curie_worker/cron_loop.py" in site and "SELECT DISTINCT ON (a.id)" in sql
+    ]
+    assert len(statements) == 2
+    assert any("WHERE a.id=:agent_id\nORDER BY a.id" in sql for sql in statements)
+    assert any("WHERE a.id=:agent_id" not in sql for sql in statements)
+
+
+@pytest.mark.parametrize(
+    "replace_arguments",
+    [
+        '"ORDER BY name", "WHERE id = CAST(:id AS uuid) ORDER BY name"',
+        "old, new",
+    ],
+    ids=["literal_arguments", "known_variable_arguments"],
+)
+def test_sql_discovery_retains_static_replace_filter_and_unfiltered_branch(
+    tmp_path: Path, replace_arguments: str
+) -> None:
+    relative = _write_worker(
+        tmp_path,
+        "from sqlalchemy import text\n"
+        '_TARGETS_SQL = "SELECT name FROM {schema}.agents ORDER BY name"\n'
+        'old = "ORDER BY name"\n'
+        'new = "WHERE id = CAST(:id AS uuid) ORDER BY name"\n'
+        "def statement(schema, filtered):\n"
+        "    sql = _TARGETS_SQL\n"
+        "    if filtered:\n"
+        f"        sql = sql.replace({replace_arguments})\n"
+        "    return text(sql.format(schema=schema))\n",
+    )
+
+    statements = discover_statements(tmp_path, "curie")
+    assert len(statements) == 2
+    assert all(relative in site for site, _ in statements)
+    assert {sql for _, sql in statements} == {
+        "SELECT name FROM curie.agents ORDER BY name",
+        "SELECT name FROM curie.agents WHERE id = CAST(:id AS uuid) ORDER BY name",
+    }
+
+
+@pytest.mark.parametrize(
+    "replace_arguments",
+    [
+        'unknown, "WHERE id = CAST(:id AS uuid) ORDER BY name"',
+        '"ORDER BY name", unknown',
+    ],
+    ids=["unknown_old", "unknown_new"],
+)
+def test_sql_discovery_rejects_unknown_replace_arguments(
+    tmp_path: Path, replace_arguments: str
+) -> None:
+    relative = _write_worker(
+        tmp_path,
+        "from sqlalchemy import text\n"
+        "def statement(unknown):\n"
+        '    sql = "SELECT name FROM curie.agents ORDER BY name"\n'
+        f"    return text(sql.replace({replace_arguments}))\n",
+    )
+
+    with pytest.raises(ValueError, match=relative):
+        discover_statements(tmp_path, "curie")
+
+
 @pytest.mark.parametrize(
     ("import_source", "constructor"),
     [

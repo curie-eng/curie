@@ -664,6 +664,10 @@ def test_queued_continuation_finding_its_row_terminal_posts_nothing(
 
 async def _reclaim_pass_after_shift(c: SweepCase, shift_s: float) -> tuple[int, Any]:
     """Hold a cron delivery, age its lease by ``shift_s``, run a real reclaim pass."""
+    from curie_protected_hooks.source_policy_sql import SourceGate
+    from curie_worker.hook_source_guard import CronHookSourceGuard
+    from sqlalchemy.ext.asyncio import create_async_engine
+
     h, run = c.h, c.run
     first = await enqueue(h, cron_event(run))
     hold = asyncio.Event()
@@ -672,7 +676,11 @@ async def _reclaim_pass_after_shift(c: SweepCase, shift_s: float) -> tuple[int, 
     h.runner.tail = [Final(text="done", status=DONE)]
     started = arm_started(h.kernel)
     task = asyncio.create_task(h.kernel.process_event(first.event, lease=first.lease))
+    gate_engine = create_async_engine(
+        run.engine.url, pool_size=4, max_overflow=0, pool_timeout=30
+    )
     try:
+        guard = CronHookSourceGuard(SourceGate(gate_engine), run.engine)
         await asyncio.wait_for(started.wait(), timeout=5.0)
         async with run.engine.begin() as conn:
             await conn.execute(
@@ -687,6 +695,7 @@ async def _reclaim_pass_after_shift(c: SweepCase, shift_s: float) -> tuple[int, 
             return False
 
         loop = CronSchedulerLoop(
+            source_guard=guard,
             engine=run.engine,
             redis=h.async_redis,
             source=c.triggers,
@@ -707,14 +716,23 @@ async def _reclaim_pass_after_shift(c: SweepCase, shift_s: float) -> tuple[int, 
             max_usd_per_day=None,
             max_output_tokens_per_run=None,
         )
-        async with run.engine.begin() as conn:
-            reclaimed = await loop._lock_and_reclaim(
-                conn, target, run.ref.name, _SLOT + timedelta(days=1), CronPassSummary()
-            )
+        async with guard.locked_snapshot(run.agent_id, run.ref.name) as context:
+            async with run.engine.begin() as conn:
+                reclaimed = await loop._lock_and_reclaim(
+                    conn,
+                    target,
+                    run.ref.name,
+                    _SLOT + timedelta(days=1),
+                    CronPassSummary(),
+                    source_context=context,
+                )
         state = await run.state()
     finally:
         hold.set()
-        await asyncio.gather(task, return_exceptions=True)
+        try:
+            await asyncio.gather(task, return_exceptions=True)
+        finally:
+            await gate_engine.dispose()
     return reclaimed, state
 
 

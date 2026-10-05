@@ -901,6 +901,7 @@ def test_a_rejected_webhook_deploy_warns_from_the_router(
             content=body,
             headers={
                 "X-GitHub-Event": "push",
+                "X-GitHub-Delivery": "00000000-0000-4000-8000-000000000001",
                 "X-Hub-Signature-256": signature,
                 "Content-Type": "application/json",
             },

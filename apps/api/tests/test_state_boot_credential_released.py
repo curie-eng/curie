@@ -8,16 +8,22 @@ A second credential that was not released still works.
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
+import pytest
 from curie_api.config import get_settings
 from curie_internal.sandbox_token import mint
+from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 CHANNEL = "C0EXAMPLE1"
 RELEASE_URL = "/v1/internal/state/released-credentials"
 RELEASED = "this sandbox credential has been released"
+STATE_LOGGER = "curie_api.routers.state"
 
 
 def _worker_headers() -> dict[str, str]:
@@ -78,7 +84,10 @@ def test_release_requires_the_worker_token(
 
 
 def test_released_boot_token_is_refused_before_expiry(
-    client: Any, auth_headers: dict[str, str], clean_db: None
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     aid = _agent(client, auth_headers)
     cred = _cred()
@@ -90,16 +99,79 @@ def test_released_boot_token_is_refused_before_expiry(
     released = _release(client, aid, cred)
     assert released.status_code == 204, released.text
 
-    for headers, path in (
-        (broad, f"/agents/{aid}/state/memory"),
-        (narrow, f"/agents/{aid}/state/notes"),
-    ):
-        resp = client.get(path, headers=headers)
-        assert resp.status_code == 403, resp.text
-        assert RELEASED in str(resp.json().get("detail", ""))
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=STATE_LOGGER):
+        for headers, path in (
+            (broad, f"/agents/{aid}/state/memory"),
+            (narrow, f"/agents/{aid}/state/notes"),
+        ):
+            resp = client.get(path, headers=headers)
+            assert resp.status_code == 403, resp.text
+            assert RELEASED in str(resp.json().get("detail", ""))
+
+    refusals = [record for record in caplog.records if record.name == STATE_LOGGER]
+    assert len(refusals) == 2
+    for record in refusals:
+        assert record.levelno == logging.WARNING
+        assert record.getMessage() == f"state: refused released sandbox credential for agent {aid}"
+    assert cred not in caplog.text
+    assert broad["X-API-Key"] not in caplog.text
+    assert narrow["X-API-Key"] not in caplog.text
 
     # The platform key is not a sandbox credential.
     assert client.get(f"/agents/{aid}/state/memory", headers=auth_headers).status_code == 200
+
+
+@pytest.mark.parametrize(("scope", "namespace"), [("state", "memory"), ("state.app", "notes")])
+def test_unavailable_credential_check_refuses_without_logging_secrets(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    scope: str,
+    namespace: str,
+) -> None:
+    aid = _agent(client, auth_headers)
+    cred = _cred()
+    headers = _token(aid, scope, cred)
+    path = f"/agents/{aid}/state/{namespace}"
+    assert client.get(path, headers=headers).status_code == 200
+
+    # The real ping below observes Redis including this nonexistent socket path
+    # in its connection error. Its generated credential id proves that exception
+    # text is also excluded without changing the shared Valkey server.
+    socket_path = tmp_path / f"{cred}.sock"
+    unavailable = Redis(
+        unix_socket_path=str(socket_path), socket_connect_timeout=1, socket_timeout=1
+    )
+    original_valkey = client.app.state.valkey
+    try:
+        assert client.portal is not None
+        with pytest.raises(RedisConnectionError) as connection_error:
+            client.portal.call(unavailable.ping)
+        assert cred in str(connection_error.value)
+        client.app.state.valkey = unavailable
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=STATE_LOGGER):
+            resp = client.get(path, headers=headers)
+    finally:
+        client.app.state.valkey = original_valkey
+        assert client.portal is not None
+        client.portal.call(unavailable.aclose)
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["detail"] == "could not check this sandbox credential"
+    failures = [record for record in caplog.records if record.name == STATE_LOGGER]
+    assert len(failures) == 1
+    assert failures[0].levelno == logging.WARNING
+    assert failures[0].getMessage() == (
+        f"state: could not check sandbox credential for agent {aid} (ConnectionError)"
+    )
+    assert cred not in caplog.text
+    assert headers["X-API-Key"] not in caplog.text
+    assert str(socket_path) not in caplog.text
+    assert client.get(path, headers=headers).status_code == 200
 
 
 def test_an_unreleased_credential_still_reads(
