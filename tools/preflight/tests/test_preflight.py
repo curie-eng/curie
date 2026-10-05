@@ -216,6 +216,105 @@ def test_fast_accepts_legitimate_assistant_identifier_in_commit_message(repo: Pa
     assert report["failures"] == []
 
 
+@pytest.fixture
+def manual_repo(repo: Path) -> Path:
+    (repo / "tools/preflight").mkdir(parents=True)
+    shutil.copy2(TOOL, repo / "tools/preflight/preflight.py")
+    workflow = repo / ".github/workflows/preflight-identity.yaml"
+    workflow.write_text(
+        "name: Example action pin\n"
+        "on: workflow_dispatch\n"
+        "jobs:\n"
+        "  example:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        f"      - uses: acme-corp/acme-bot@{'a' * 40} # v1\n"
+    )
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "Add committed manual verification inputs")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    return repo
+
+
+def test_manual_execution_dirty_tree_cannot_hide_committed_action_pin_failure(
+    manual_repo: Path,
+) -> None:
+    repo = manual_repo
+    workflow = repo / ".github/workflows/preflight-identity.yaml"
+    clean_source = workflow.read_text()
+    workflow.write_text(clean_source.replace("a" * 40, "v1"))
+    git(repo, "add", ".github/workflows/preflight-identity.yaml")
+    git(repo, "commit", "-qm", "Exercise committed action pin refusal")
+    # Restoring valid bytes without committing them must not certify the bad tip.
+    workflow.write_text(clean_source)
+    worktrees = git(repo, "worktree", "list", "--porcelain")
+    result = preflight(repo, "--json")
+    assert result.returncode == 1, result.stdout + result.stderr
+    report = json.loads(result.stdout)
+    assert report["passed"] is False
+    failure = next(item for item in report["failures"] if "action-pins" in item["check"])
+    assert "third party action requires a full 40 hex commit SHA" in failure["output_tail"]
+    assert workflow.read_text() == clean_source
+    assert git(repo, "diff", "--name-only") == ".github/workflows/preflight-identity.yaml"
+    assert git(repo, "worktree", "list", "--porcelain") == worktrees
+
+
+def test_manual_execution_dirty_files_cannot_fail_a_clean_committed_head(
+    manual_repo: Path,
+) -> None:
+    repo = manual_repo
+    commit(repo, "docs/example.md")
+    workflow = repo / ".github/workflows/preflight-identity.yaml"
+    dirty_source = workflow.read_text().replace("a" * 40, "v1")
+    workflow.write_text(dirty_source)
+    worktrees = git(repo, "worktree", "list", "--porcelain")
+    result = preflight(repo, "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads(result.stdout)
+    assert report["passed"] is True
+    assert report["failures"] == []
+    assert workflow.read_text() == dirty_source
+    assert git(repo, "diff", "--name-only") == ".github/workflows/preflight-identity.yaml"
+    assert git(repo, "worktree", "list", "--porcelain") == worktrees
+
+
+def test_manual_execution_runs_checks_from_the_explicit_head(manual_repo: Path) -> None:
+    repo = manual_repo
+    workflow = repo / ".github/workflows/preflight-identity.yaml"
+    clean_source = workflow.read_text()
+    bad_source = clean_source.replace("a" * 40, "v1")
+    workflow.write_text(bad_source)
+    git(repo, "add", ".github/workflows/preflight-identity.yaml")
+    git(repo, "commit", "-qm", "Exercise older action pin refusal")
+    bad_head = git(repo, "rev-parse", "HEAD")
+    workflow.write_text(clean_source)
+    git(repo, "add", ".github/workflows/preflight-identity.yaml")
+    git(repo, "commit", "-qm", "Repair example action pin")
+    clean_head = git(repo, "rev-parse", "HEAD")
+    worktrees = git(repo, "worktree", "list", "--porcelain")
+    rejected = preflight(repo, "--head", bad_head, "--json")
+    assert rejected.returncode == 1, rejected.stdout + rejected.stderr
+    report = json.loads(rejected.stdout)
+    assert any("action-pins" in item["check"] for item in report["failures"])
+    assert git(repo, "worktree", "list", "--porcelain") == worktrees
+
+    # Now the checked-out tip is bad again. Selecting the intervening clean
+    # commit must succeed, proving --head governs execution in both directions.
+    workflow.write_text(bad_source)
+    git(repo, "add", ".github/workflows/preflight-identity.yaml")
+    git(repo, "commit", "-qm", "Exercise newer action pin refusal")
+    current_head = git(repo, "rev-parse", "HEAD")
+    worktrees = git(repo, "worktree", "list", "--porcelain")
+    accepted = preflight(repo, "--head", clean_head, "--json")
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    report = json.loads(accepted.stdout)
+    assert report["passed"] is True
+    assert report["failures"] == []
+    assert git(repo, "rev-parse", "HEAD") == current_head
+    assert workflow.read_text() == bad_source
+    assert git(repo, "worktree", "list", "--porcelain") == worktrees
+
+
 def prepare_hook(repo: Path, tmp_path: Path) -> tuple[Path, Path]:
     (repo / ".githooks").mkdir()
     shutil.copy2(ROOT / ".githooks/pre-push", repo / ".githooks/pre-push")
@@ -234,9 +333,7 @@ def prepare_hook(repo: Path, tmp_path: Path) -> tuple[Path, Path]:
 
 
 @pytest.fixture
-def ui_hook_repo(
-    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[Path, Path]:
+def ui_hook_repo(repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
     # Copy the real authored sources and toolchain inputs, never an existing
     # dependency installation. Detached push verification owns its own setup.
     suffixes = {".js", ".mjs", ".ts", ".tsx", ".json", ".yaml", ".yml"}
