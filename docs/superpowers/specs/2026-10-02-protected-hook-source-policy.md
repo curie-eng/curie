@@ -575,15 +575,16 @@ Its response is observational and is not an admission reservation. Existing
 ordinary delivery and optional restriction behavior is unchanged; the new
 endpoint makes no claim that an ordinary hook has protected-lane support.
 
-Request handling follows the delivery route's order where they share a step.
-The hook name is validated first (400), then the bounded raw body (413). The
-strict `HookSupportIn` parse follows, because its requested policy is part of
-the signed material; malformed input returns 422 before any database read. The
-purpose-prefixed signature is verified against the current key read without
-the gate, a missing delivery ID is reported (400) only after that succeeds,
-and the gate-held reload and reauthentication precede the snapshot read.
-Database or gate failure returns 503 `authority_unavailable` without this DTO,
-because no current server resolution could be read.
+The hook name is validated first (400), then the bounded raw body (413), as
+on the delivery route. The strict `HookSupportIn` parse follows, because its
+requested policy is part of the signed material; malformed input returns 422
+before any database read. The purpose-prefixed signature is verified against
+the current key read without the gate. Unlike the delivery route, a missing
+delivery ID is reported (400) before the gate rather than under it, since the
+probe has no admission step that needs the gate first; it is still reported only
+after the signature succeeds. The gate-held reload and reauthentication precede
+the snapshot read. Database or gate failure returns 503 `authority_unavailable`
+without this DTO, because no current server resolution could be read.
 
 `source_generation` and `runtime_generation` serialize as canonical decimal
 strings, as the source administrative DTOs do. The gate-held snapshot resolves
@@ -592,18 +593,23 @@ the remaining members as follows:
 | Snapshot | `effective_tool_access` | `source_generation` | `reason` |
 | --- | --- | --- | --- |
 | No row, no attempt history | requested | null | `source_unconfigured` |
-| Ordinary tombstone row | requested | row generation | `source_unconfigured` |
+| Ordinary tombstone row | requested | row generation | `source_closed` |
 | No row, attempt history present | `read-only` | null | `source_closed` |
 | Protected row | `read-only` | row generation | broker evaluation |
 
-Pending history without a committed row can only come from an incomplete
-first activation, whose only possible target is mandatory read-only, and its
-ingress admits nothing. Runtime members stay null until an authenticated broker
+`source_closed` marks every state whose delivery ingress currently admits
+nothing. A tombstone stays closed until broker confirmation of its ordinary
+publication is available to ingress, per SOURCE-6 and SOURCE-8; its effective
+member reports the ordinary resolution the row records. Pending history without
+a committed row reports `read-only`, the most restrictive policy any pending
+operation could commit, rather than inferring an ordinary resolution from
+incomplete history. Runtime members stay null until an authenticated broker
 evaluation supplies them; the policy row's own runtime, qualification and bundle
 references are writable configuration and are never echoed. While the API holds
 no protected broker metadata reader, broker evaluation of a protected row
 returns `broker_unavailable`. All four rows return HTTP 503 with
-`supported=false`.
+`supported=false`; the status always follows `supported`.
+
 Local/cluster CLI `hook policy support` serializes this exact request and
 verifies this DTO rather than inspecting OpenAPI. It reads the scoped key from
 an explicitly supplied secret file (never a literal secret flag), signs with
