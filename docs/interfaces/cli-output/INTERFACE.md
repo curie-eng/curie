@@ -76,7 +76,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   duplicated: the outputs whose verbs take `--dry-run` are enums carrying a `DryRun`
   variant that delegates to it instead of re-rendering the plan.
 - **`cli/src/commands.rs`**, the largest group, covering the skill and agent verbs
-  and the shared lifecycle results: `InitOutput`, `CheckOutput`, `ChartCheckOutput`,
+  and the shared lifecycle results: `InitOutput`, `CheckOutput`, `ChartCheckOutput`, `PreflightOutput`,
   `ListAgentsOutput`, `BumpVersionOutput`, `StatusOutput`, `SkillMessageOutput`,
   `EvalOutput`, `DeployOutput`, `AllTargetsDeployOutput`, `KillOutput`, `ResumeOutput`,
   `BudgetOutput`, `ResetThreadOutput`,
@@ -131,7 +131,7 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   syntactic call-site inventory, not a type-level proof that *every* verb returns
   a `CliOutput`.
 - **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
-  longer schema-free: there are 64 committed schemas under `cli/schema/` with an
+  longer schema-free: there are 65 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
   against real `to_json()` output across 82 tests in `cli/tests/json_contract.rs`.
