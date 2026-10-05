@@ -1391,7 +1391,7 @@ seed_ordinary_turn() {
             return 1
         fi
         stream_start="$(capture_stream_cursor "$tier")" || return 1
-        out="$("$BIN" --json local message --channel C0LOCALDEV "ordinary correlation $marker" || true)"
+        out="$("$BIN" --json local message --channel C0LOCALDEV "Reply with exactly: $marker. Do not call tools or investigate anything." || true)"
         assert_finalized_reply "$tier ordinary correlation" "$out" || return 1
         assert_product_runner_endpoints || return 1
         stream_end="$(capture_stream_cursor "$tier")" || return 1
@@ -4539,7 +4539,7 @@ case_local_langfuse_invalid_auth() {
         marker="curie-seed-invalid-auth-$$-$RANDOM"
         stream_start="$(capture_stream_cursor local)" || exit 1
         out="$("$BIN" --json local message --channel C0LOCALDEV \
-            "observable exporter rejection $marker" || true)"
+            "Reply with exactly: $marker. Do not call tools or investigate anything." || true)"
         assert_finalized_reply "local invalid-auth seed" "$out" || exit 1
         stream_end="$(capture_stream_cursor local)" || exit 1
         failed_trace_id="$(discover_trace_id_for_seed local "$marker" "$stream_start" "$stream_end")" || exit 1

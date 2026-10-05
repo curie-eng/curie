@@ -4,8 +4,8 @@
   "repository": {
     "name": "curie-eng/curie",
     "branch": "main",
-    "commit": "44b0d82ede3f60b23e7b9b7782eccb2da7dfe781",
-    "shortCommit": "44b0d82ed",
+    "commit": "30c92418c889ef634a93b621994ac3450c17de50",
+    "shortCommit": "30c92418c",
     "release": "v0.12.1"
   },
   "title": "Curie architecture atlas",
@@ -2080,441 +2080,441 @@
       "type": "code",
       "title": "Platform key and live Console session authentication",
       "path": "apps/api/src/curie_api/auth.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/api/src/curie_api/auth.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/api/src/curie_api/auth.py"
     },
     {
       "id": "console-origin-v0121",
       "type": "code",
       "title": "Console cookie origin and approval principal checks",
       "path": "apps/api/src/curie_api/approval_auth.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/api/src/curie_api/approval_auth.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/api/src/curie_api/approval_auth.py"
     },
     {
       "id": "console-ui-session-v0121",
       "type": "code",
       "title": "Console session gate",
       "path": "apps/ui/src/state/session.tsx",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/ui/src/state/session.tsx"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/ui/src/state/session.tsx"
     },
     {
       "id": "console-ui-client-v0121",
       "type": "code",
       "title": "Cookie-only Console requests and login exchange",
       "path": "apps/ui/src/api/client.ts",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/ui/src/api/client.ts"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/ui/src/api/client.ts"
     },
     {
       "id": "console-ui-config-v0121",
       "type": "code",
       "title": "Console same-origin configuration",
       "path": "apps/ui/src/api/config.ts",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/ui/src/api/config.ts"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/ui/src/api/config.ts"
     },
     {
       "id": "console-login-cli-v0121",
       "type": "code",
       "title": "CLI Console login code minting",
       "path": "cli/src/commands.rs",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/cli/src/commands.rs"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/cli/src/commands.rs"
     },
     {
       "id": "mail-auth-v0121",
       "type": "code",
       "title": "Unverifiable sender authentication refusal",
       "path": "apps/mail-adapter/src/curie_mail_adapter/adapter.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/mail-adapter/src/curie_mail_adapter/adapter.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/mail-adapter/src/curie_mail_adapter/adapter.py"
     },
     {
       "id": "mail-security-v0121",
       "type": "doc",
       "title": "Mail inbound security and historical reply delivery",
       "path": "apps/mail-adapter/README.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/mail-adapter/README.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/mail-adapter/README.md"
     },
     {
       "id": "hook-source-auth-v0121",
       "type": "code",
       "title": "Fresh signed hook authentication under source authority",
       "path": "apps/api/src/curie_api/hook_source_auth.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/api/src/curie_api/hook_source_auth.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/api/src/curie_api/hook_source_auth.py"
     },
     {
       "id": "hook-source-admin-v0121",
       "type": "code",
       "title": "Closed source administration records",
       "path": "apps/api/src/curie_api/hook_source_admin.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/api/src/curie_api/hook_source_admin.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/api/src/curie_api/hook_source_admin.py"
     },
     {
       "id": "hook-source-mutation-v0121",
       "type": "code",
       "title": "Durable source operations and broker generation fencing",
       "path": "apps/api/src/curie_api/hook_source_mutation.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/api/src/curie_api/hook_source_mutation.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/api/src/curie_api/hook_source_mutation.py"
     },
     {
       "id": "hook-source-fire-v0121",
       "type": "code",
       "title": "Manual cron fire under ordinary source authority",
       "path": "apps/api/src/curie_api/routers/hook_fire.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/api/src/curie_api/routers/hook_fire.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/api/src/curie_api/routers/hook_fire.py"
     },
     {
       "id": "hook-source-cron-v0121",
       "type": "code",
       "title": "Task-owned scheduled source admission guard",
       "path": "apps/worker/src/curie_worker/hook_source_guard.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/worker/src/curie_worker/hook_source_guard.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/worker/src/curie_worker/hook_source_guard.py"
     },
     {
       "id": "worker-cron-v0121",
       "type": "code",
       "title": "Scheduled source liveness before admission effects",
       "path": "apps/worker/src/curie_worker/cron_loop.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/worker/src/curie_worker/cron_loop.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/worker/src/curie_worker/cron_loop.py"
     },
     {
       "id": "protected-authority-v0121",
       "type": "code",
       "title": "Immutable protected runtime authority records",
       "path": "packages/protected-hooks/src/curie_protected_hooks/authority_records.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/packages/protected-hooks/src/curie_protected_hooks/authority_records.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/packages/protected-hooks/src/curie_protected_hooks/authority_records.py"
     },
     {
       "id": "protected-fence-v0121",
       "type": "code",
       "title": "Protected source generation reservation and publication",
       "path": "packages/protected-hooks/src/curie_protected_hooks/source_fence.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/packages/protected-hooks/src/curie_protected_hooks/source_fence.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/packages/protected-hooks/src/curie_protected_hooks/source_fence.py"
     },
     {
       "id": "protected-metadata-v0121",
       "type": "code",
       "title": "Protected broker metadata roles",
       "path": "packages/protected-hooks/src/curie_protected_hooks/broker_metadata.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/packages/protected-hooks/src/curie_protected_hooks/broker_metadata.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/packages/protected-hooks/src/curie_protected_hooks/broker_metadata.py"
     },
     {
       "id": "protected-transport-v0121",
       "type": "code",
       "title": "Authenticated protected broker metadata transport",
       "path": "packages/protected-hooks/src/curie_protected_hooks/broker_transport.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/packages/protected-hooks/src/curie_protected_hooks/broker_transport.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/packages/protected-hooks/src/curie_protected_hooks/broker_transport.py"
     },
     {
       "id": "protected-admission-v0121",
       "type": "code",
       "title": "Atomic protected admission and bounded recovery primitives",
       "path": "packages/protected-hooks/src/curie_protected_hooks/atomic_admission.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/packages/protected-hooks/src/curie_protected_hooks/atomic_admission.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/packages/protected-hooks/src/curie_protected_hooks/atomic_admission.py"
     },
     {
       "id": "protected-acl-v0121",
       "type": "code",
       "title": "Protected admission broker permission boundaries",
       "path": "packages/protected-hooks/src/curie_protected_hooks/admission_acl.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/packages/protected-hooks/src/curie_protected_hooks/admission_acl.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/packages/protected-hooks/src/curie_protected_hooks/admission_acl.py"
     },
     {
       "id": "candidate-serving-v0121",
       "type": "code",
       "title": "Candidate application serving window and ancestry",
       "path": "packages/protected-hooks/src/curie_protected_hooks/schema_serving.json",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/packages/protected-hooks/src/curie_protected_hooks/schema_serving.json"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/packages/protected-hooks/src/curie_protected_hooks/schema_serving.json"
     },
     {
       "id": "candidate-serving-probe-v0121",
       "type": "code",
       "title": "Shared serving decision and read-only startup probe",
       "path": "packages/protected-hooks/src/curie_protected_hooks/schema_serving.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/packages/protected-hooks/src/curie_protected_hooks/schema_serving.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/packages/protected-hooks/src/curie_protected_hooks/schema_serving.py"
     },
     {
       "id": "api-source-startup-v0121",
       "type": "code",
       "title": "API source resource composition and startup",
       "path": "apps/api/src/curie_api/main.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/api/src/curie_api/main.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/api/src/curie_api/main.py"
     },
     {
       "id": "worker-source-startup-v0121",
       "type": "code",
       "title": "Worker source resource composition and supervised retention",
       "path": "apps/worker/src/curie_worker/run.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/worker/src/curie_worker/run.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/worker/src/curie_worker/run.py"
     },
     {
       "id": "migration-0075-v0121",
       "type": "code",
       "title": "Durable hook source policies",
       "path": "apps/api/alembic/versions/0075_hook_source_policies.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/api/alembic/versions/0075_hook_source_policies.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/api/alembic/versions/0075_hook_source_policies.py"
     },
     {
       "id": "migration-0076-v0121",
       "type": "code",
       "title": "Immutable hook source operation history",
       "path": "apps/api/alembic/versions/0076_hook_source_operations.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/api/alembic/versions/0076_hook_source_operations.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/api/alembic/versions/0076_hook_source_operations.py"
     },
     {
       "id": "boot-credential-v0121",
       "type": "code",
       "title": "Claim-scoped boot credentials and per-turn memory expiry",
       "path": "apps/worker/src/curie_worker/binding.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/worker/src/curie_worker/binding.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/worker/src/curie_worker/binding.py"
     },
     {
       "id": "boot-credential-release-v0121",
       "type": "code",
       "title": "Released boot credential reporting and retry",
       "path": "apps/worker/src/curie_worker/sandbox/substrate.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/worker/src/curie_worker/sandbox/substrate.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/worker/src/curie_worker/sandbox/substrate.py"
     },
     {
       "id": "state-credential-refusal-v0121",
       "type": "code",
       "title": "Released boot and closed turn credential refusal",
       "path": "apps/api/src/curie_api/routers/state.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/api/src/curie_api/routers/state.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/api/src/curie_api/routers/state.py"
     },
     {
       "id": "runner-serving-v0121",
       "type": "code",
       "title": "Runner bearer requirement and channel-hidden tools",
       "path": "runner/src/curie_runner/config.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/runner/src/curie_runner/config.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/runner/src/curie_runner/config.py"
     },
     {
       "id": "runner-preflight-v0121",
       "type": "code",
       "title": "Declared verification before model session selection",
       "path": "runner/src/curie_runner/__main__.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/runner/src/curie_runner/__main__.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/runner/src/curie_runner/__main__.py"
     },
     {
       "id": "blocked-session-v0121",
       "type": "code",
       "title": "Offline blocked verification session",
       "path": "runner/src/curie_runner/preflight_blocked.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/runner/src/curie_runner/preflight_blocked.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/runner/src/curie_runner/preflight_blocked.py"
     },
     {
       "id": "factory-verification-v0121",
       "type": "code",
       "title": "Declared verification and explicit CI delegation",
       "path": "runner/src/curie_runner/verification.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/runner/src/curie_runner/verification.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/runner/src/curie_runner/verification.py"
     },
     {
       "id": "factory-review-gate-v0121",
       "type": "code",
       "title": "Workflow and approved plan before repository edits",
       "path": "examples/dark-factory/hooks/review_gate.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/examples/dark-factory/hooks/review_gate.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/examples/dark-factory/hooks/review_gate.py"
     },
     {
       "id": "factory-delegated-ci-v0121",
       "type": "code",
       "title": "Exact delegated CI check completion before settlement",
       "path": "apps/api/src/curie_api/factory_ci.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/api/src/curie_api/factory_ci.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/api/src/curie_api/factory_ci.py"
     },
     {
       "id": "factory-credit-v0121",
       "type": "code",
       "title": "Terminal reviewer credit exhaustion classification",
       "path": "runner/src/curie_runner/translate.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/runner/src/curie_runner/translate.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/runner/src/curie_runner/translate.py"
     },
     {
       "id": "factory-usage-runner-v0121",
       "type": "code",
       "title": "Implementer and reviewer usage reporting",
       "path": "runner/src/curie_runner/usage_report.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/runner/src/curie_runner/usage_report.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/runner/src/curie_runner/usage_report.py"
     },
     {
       "id": "factory-usage-api-v0121",
       "type": "code",
       "title": "Usage roles and unknown reporting",
       "path": "apps/api/src/curie_api/factory_usage.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/api/src/curie_api/factory_usage.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/api/src/curie_api/factory_usage.py"
     },
     {
       "id": "cluster-up-v0121",
       "type": "code",
       "title": "Retained runner settings and pre-install RuntimeClass lookup",
       "path": "cli/src/ops/up.rs",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/cli/src/ops/up.rs"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/cli/src/ops/up.rs"
     },
     {
       "id": "cluster-install-v0121",
       "type": "code",
       "title": "Observed controller reuse and installation settings",
       "path": "cli/src/installation.rs",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/cli/src/installation.rs"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/cli/src/installation.rs"
     },
     {
       "id": "cluster-layer-clear-v0121",
       "type": "code",
       "title": "Installed runner layer and credential handling",
       "path": "cli/src/cluster_secrets.rs",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/cli/src/cluster_secrets.rs"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/cli/src/cluster_secrets.rs"
     },
     {
       "id": "release-authorize-v0121",
       "type": "code",
       "title": "First-parent version-only release check proof",
       "path": "release/authorize.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/release/authorize.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/release/authorize.py"
     },
     {
       "id": "release-atlas-v0121",
       "type": "code",
       "title": "Shared version-only release path boundary",
       "path": "release/atlas.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/release/atlas.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/release/atlas.py"
     },
     {
       "id": "channel-interaction-interface-v0121",
       "type": "doc",
       "title": "Four semantic interaction renderers",
       "path": "docs/interfaces/channel-interaction/INTERFACE.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/interfaces/channel-interaction/INTERFACE.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/interfaces/channel-interaction/INTERFACE.md"
     },
     {
       "id": "approval-interface-v0121",
       "type": "doc",
       "title": "Five approver sets and argument-bound permission grants",
       "path": "docs/interfaces/approval/INTERFACE.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/interfaces/approval/INTERFACE.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/interfaces/approval/INTERFACE.md"
     },
     {
       "id": "approval-sets-v0121",
       "type": "code",
       "title": "Concrete approver sets",
       "path": "apps/api/src/curie_api/approvers.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/api/src/curie_api/approvers.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/api/src/curie_api/approvers.py"
     },
     {
       "id": "channel-ingress-interface-v0121",
       "type": "doc",
       "title": "Hook tool access and reply capability leakage",
       "path": "docs/interfaces/channel-ingress/INTERFACE.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/interfaces/channel-ingress/INTERFACE.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/interfaces/channel-ingress/INTERFACE.md"
     },
     {
       "id": "queue-interface-v0121",
       "type": "doc",
       "title": "Off-port retention and delivery lease operations",
       "path": "docs/interfaces/queue-stream/INTERFACE.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/interfaces/queue-stream/INTERFACE.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/interfaces/queue-stream/INTERFACE.md"
     },
     {
       "id": "substrate-interface-v0121",
       "type": "doc",
       "title": "Concrete pool selection outside the substrate port",
       "path": "docs/interfaces/substrate/INTERFACE.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/interfaces/substrate/INTERFACE.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/interfaces/substrate/INTERFACE.md"
     },
     {
       "id": "harness-interface-v0121",
       "type": "doc",
       "title": "Blocked session and read-only enforcement boundary",
       "path": "docs/interfaces/harness-modelsession/INTERFACE.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/interfaces/harness-modelsession/INTERFACE.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/interfaces/harness-modelsession/INTERFACE.md"
     },
     {
       "id": "memory-interface-v0121",
       "type": "doc",
       "title": "Boot release and per-turn memory authority",
       "path": "docs/interfaces/memory/INTERFACE.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/interfaces/memory/INTERFACE.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/interfaces/memory/INTERFACE.md"
     },
     {
       "id": "db-interface-v0121",
       "type": "doc",
       "title": "Source serving metadata and Postgres-specific operations",
       "path": "docs/interfaces/relational-db/INTERFACE.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/interfaces/relational-db/INTERFACE.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/interfaces/relational-db/INTERFACE.md"
     },
     {
       "id": "aci-interface-v0121",
       "type": "doc",
       "title": "In-sandbox runner receipt of per-turn credentials",
       "path": "docs/interfaces/aci-producer/INTERFACE.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/interfaces/aci-producer/INTERFACE.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/interfaces/aci-producer/INTERFACE.md"
     },
     {
       "id": "workflow-interface-v0121",
       "type": "doc",
       "title": "Credential identity and fenced route TTL extension",
       "path": "docs/interfaces/workflow-state/INTERFACE.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/interfaces/workflow-state/INTERFACE.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/interfaces/workflow-state/INTERFACE.md"
     },
     {
       "id": "bundle-interface-v0121",
       "type": "doc",
       "title": "Published runner digest lock trust boundary",
       "path": "docs/interfaces/bundle-format/INTERFACE.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/interfaces/bundle-format/INTERFACE.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/interfaces/bundle-format/INTERFACE.md"
     },
     {
       "id": "cli-layer-clear-v0121",
       "type": "code",
       "title": "Removed runner layers in retained upgrade values",
       "path": "cli/src/ops/upgrade.rs",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/cli/src/ops/upgrade.rs"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/cli/src/ops/upgrade.rs"
     },
     {
       "id": "stream-retention-v0121",
       "type": "code",
       "title": "Supervised settled stream trimming",
       "path": "apps/worker/src/curie_worker/stream_retention.py",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/apps/worker/src/curie_worker/stream_retention.py"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/apps/worker/src/curie_worker/stream_retention.py"
     },
     {
       "id": "adr-0184-v0121",
       "type": "adr",
       "title": "Draft retention decision and pre-implementation context",
       "path": "docs/adr/0184-settled-stream-entries-are-trimmed-receipts-live-in-postgres-backlog-is-counted.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/adr/0184-settled-stream-entries-are-trimmed-receipts-live-in-postgres-backlog-is-counted.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/adr/0184-settled-stream-entries-are-trimmed-receipts-live-in-postgres-backlog-is-counted.md"
     },
     {
       "id": "adr-0190-v0121",
       "type": "adr",
       "title": "Automated hook sources cannot widen their tool access",
       "path": "docs/adr/0190-automated-hook-sources-cannot-widen-their-tool-access.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/adr/0190-automated-hook-sources-cannot-widen-their-tool-access.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/adr/0190-automated-hook-sources-cannot-widen-their-tool-access.md"
     },
     {
       "id": "adr-0191-v0121",
       "type": "adr",
       "title": "Protected hooks use a separately authorized delivery lane",
       "path": "docs/adr/0191-protected-hook-delivery-authority.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/adr/0191-protected-hook-delivery-authority.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/adr/0191-protected-hook-delivery-authority.md"
     },
     {
       "id": "adr-0193-v0121",
       "type": "adr",
       "title": "Cluster up reads a missing RuntimeClass before install",
       "path": "docs/adr/0193-cluster-up-reads-a-missing-runtimeclass-before-install.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/adr/0193-cluster-up-reads-a-missing-runtimeclass-before-install.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/adr/0193-cluster-up-reads-a-missing-runtimeclass-before-install.md"
     },
     {
       "id": "adr-0195-v0121",
       "type": "adr",
       "title": "A version-only delta reuses its parent's checks",
       "path": "docs/adr/0195-a-version-only-delta-reuses-its-parents-checks.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/adr/0195-a-version-only-delta-reuses-its-parents-checks.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/adr/0195-a-version-only-delta-reuses-its-parents-checks.md"
     },
     {
       "id": "adr-0196-v0121",
       "type": "adr",
       "title": "Combined preparation PR checks can prove an unchanged release merge",
       "path": "docs/adr/0196-combined-preparation-pr-checks.md",
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/adr/0196-combined-preparation-pr-checks.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/adr/0196-combined-preparation-pr-checks.md"
     }
   ],
   "documentationDrift": [
@@ -7653,7 +7653,7 @@
         "triggers",
         "aci"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/adr/0190-automated-hook-sources-cannot-widen-their-tool-access.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/adr/0190-automated-hook-sources-cannot-widen-their-tool-access.md"
     },
     {
       "id": "ADR-0191",
@@ -7674,7 +7674,7 @@
         "queue-stream",
         "aci"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/adr/0191-protected-hook-delivery-authority.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/adr/0191-protected-hook-delivery-authority.md"
     },
     {
       "id": "ADR-0193",
@@ -7690,7 +7690,7 @@
       "seamIds": [
         "cluster-lifecycle"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/adr/0193-cluster-up-reads-a-missing-runtimeclass-before-install.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/adr/0193-cluster-up-reads-a-missing-runtimeclass-before-install.md"
     },
     {
       "id": "ADR-0195",
@@ -7705,7 +7705,7 @@
       "seamIds": [
         "cluster-lifecycle"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/adr/0195-a-version-only-delta-reuses-its-parents-checks.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/adr/0195-a-version-only-delta-reuses-its-parents-checks.md"
     },
     {
       "id": "ADR-0196",
@@ -7720,7 +7720,7 @@
       "seamIds": [
         "cluster-lifecycle"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/44b0d82ede3f60b23e7b9b7782eccb2da7dfe781/docs/adr/0196-combined-preparation-pr-checks.md"
+      "href": "https://github.com/curie-eng/curie/blob/30c92418c889ef634a93b621994ac3450c17de50/docs/adr/0196-combined-preparation-pr-checks.md"
     }
   ],
   "investments": [
