@@ -124,8 +124,10 @@ ordinary turns on the same install are untouched.
 ### Per-turn memory credential (MEMORY-TOKEN)
 
 The worker mints a short-lived write credential for each turn and carries it to
-the runner on the `Event`, so the runner's memory tools can present it without
-the credential ever entering the sandbox.
+the runner on the `Event`, so the runner's memory tools can present it. The
+credential stays out of the sandbox env, `BootEnv`, and hook or subprocess
+input, but the ACI server that receives the `Event` runs inside the sandbox, so
+it does reach the in-sandbox runner process (ADR-0188 decision 5).
 
 - **MEMORY-TOKEN-1:** `Event` carries an optional `memory_token`, a string or
   null, defaulting to null. Null means the turn carries no memory write

@@ -4,13 +4,14 @@ Two layers live here:
 
 - **Pure helpers** (``thread_hash``, ``unique_marker``, ``final_frame``,
   ``collected_text``, ``detect_cross_talk``, ``pod_identity_gone``,
-  ``pod_ready``) have no cluster or subprocess dependency and are unit-tested offline in
-  ``test_resilience_harness_unit.py``.
+  ``pod_ready``, ``runner_token_secret_ref``) have no cluster or subprocess
+  dependency and are unit-tested offline in ``test_resilience_harness_unit.py``.
 - **Cluster helpers** (``kubectl``, ``pod_of_sandbox``, ``pod_uid``,
   ``read_pod``, ``wait_pod_identity_gone``, ``wait_pod_ready``,
-  ``port_forward``, ``get_json``, ``post_event``, ``final_frame`` consumers,
-  ``live_sandboxclaims``) mirror ``apps/worker/tests/sandbox/test_e2e_k8scratch.py``
-  and only run when a real cluster is configured.
+  ``port_forward``, ``get_json``, ``post_event``, ``runner_bearer``,
+  ``final_frame`` consumers, ``live_sandboxclaims``) mirror
+  ``apps/worker/tests/sandbox/test_e2e_k8scratch.py`` and only run when a real
+  cluster is configured.
 
 The substrate seam is synchronous, so the scenario drives concurrency with a
 ``ThreadPoolExecutor``; nothing here is async.
@@ -18,6 +19,7 @@ The substrate seam is synchronous, so the scenario drives concurrency with a
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import json
@@ -162,6 +164,39 @@ def pod_identity_gone(pod: dict[str, object] | None, original_uid: str) -> bool:
     return pod_uid(pod) != original_uid
 
 
+def runner_token_secret_ref(pod: dict[str, object]) -> tuple[str, str] | None:
+    """The ``(secret name, key)`` the pod's runner reads ``CURIE_RUNNER_TOKEN`` from.
+
+    A warm pod carries the chart-owned token through a ``secretKeyRef`` (#3821);
+    a bound claim's per-claim injection replaces it with a plain value. Only the
+    container named ``runner`` counts: an init container or a sidecar carrying a
+    same-named entry is not the bearer the runner enforces. ``None`` when the
+    runner's entry is a plain value or there is no entry at all.
+    """
+
+    spec = pod.get("spec")
+    if not isinstance(spec, dict):
+        return None
+    containers = spec.get("containers")
+    if not isinstance(containers, list):
+        return None
+    for container in containers:
+        if not isinstance(container, dict) or container.get("name") != "runner":
+            continue
+        for entry in container.get("env") or []:
+            if not isinstance(entry, dict) or entry.get("name") != "CURIE_RUNNER_TOKEN":
+                continue
+            value_from = entry.get("valueFrom")
+            ref = value_from.get("secretKeyRef") if isinstance(value_from, dict) else None
+            if not isinstance(ref, dict):
+                return None
+            name, key = ref.get("name"), ref.get("key")
+            if isinstance(name, str) and name and isinstance(key, str) and key:
+                return name, key
+            return None
+    return None
+
+
 def detect_cross_talk(marker: str, other_markers: Sequence[str], text: str) -> bool:
     """True if any foreign marker (a marker other than this thread's) is in ``text``.
 
@@ -248,11 +283,10 @@ def post_event(
 ) -> list[dict[str, object]]:
     """POST an ACI ``message`` event and return the parsed NDJSON frames.
 
-    ``token`` is the claim's per-claim runner token. The runner enforces a
-    bearer on its POST routes exactly when the claim minted one and is a
-    pass-through when it did not (``runner/src/curie_runner/server.py``,
-    ``create_app``), so an empty token means "this claim carries no bearer",
-    not "skip authentication".
+    ``token`` is the bearer the claimed runner enforces. A cluster runner always
+    enforces one (#3821): the per-claim minted token on a bound claim, the
+    chart's warm-pod token otherwise, so callers resolve it with
+    ``runner_bearer`` rather than passing the claim's token straight through.
     """
 
     body = json.dumps(
@@ -264,6 +298,27 @@ def post_event(
     request = urllib.request.Request(f"{base}/v1/event", data=body, headers=headers)
     with urllib.request.urlopen(request, timeout=90) as resp:
         return [json.loads(line) for line in resp.read().splitlines() if line.strip()]
+
+
+def runner_bearer(cfg: ResilienceConfig, token: str, pod: dict[str, object]) -> str:
+    """The bearer to present to a claimed runner.
+
+    ``token`` (the claim's per-claim token) wins when set. A warm claim carries
+    none, so the runner enforces the chart-owned warm-pod token its pod reads
+    from a Secret; read that Secret the same way the pod does.
+    """
+
+    if token.strip():
+        return token
+    ref = runner_token_secret_ref(pod)
+    if ref is None:
+        raise AssertionError(
+            "the claimed runner carries no CURIE_RUNNER_TOKEN at all; a cluster "
+            "runner must always enforce a bearer (#3821)"
+        )
+    name, key = ref
+    encoded = kubectl(cfg, "get", "secret", name, "-o", f"jsonpath={{.data.{key}}}")
+    return base64.b64decode(encoded).decode("utf-8")
 
 
 def live_sandboxclaims(

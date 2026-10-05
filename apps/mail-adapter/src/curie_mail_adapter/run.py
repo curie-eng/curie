@@ -1,11 +1,9 @@
 """Process entrypoint: read config, refuse to run half-configured, then serve.
 
-The boot gates are the point of this module. The adapter's inbox is a public
-mailbox by construction, so an install that comes up with ingress enabled and no
-allow-list is an open trigger for agent turns available to anyone who learns the
-address. Crashing at boot naming the variable is the same shape the dispatcher
-already uses for its own unconfigurable-to-run state, and in Kubernetes
-`CrashLoopBackOff` is the operator signal.
+The boot gates require a deliberate sender filter, including explicit consent
+to a wildcard. That filter never authenticates a sender. Current AgentMail
+ingress is refused because Curie cannot verify a positive authentication
+verdict. In Kubernetes `CrashLoopBackOff` is the configuration error signal.
 
 Run it with ``python -m curie_mail_adapter``.
 """
@@ -59,8 +57,13 @@ def boot_problems(config: MailAdapterConfig) -> list[str]:
     if config.ingress_enabled and not config.allowed_senders:
         problems.append(
             "CURIE_MAIL_ALLOWED_SENDERS is required while ADAPTER_INGRESS_ENABLED is true: "
-            "an empty list means deny everything, and it is refused rather than served "
-            "as deny-all. Write '*' to accept mail from anyone."
+            "configure explicit sender addresses or domains; an empty list is refused"
+        )
+    if "*" in config.allowed_senders and not config.allow_all_senders:
+        problems.append(
+            "CURIE_MAIL_ALLOWED_SENDERS contains a wildcard: "
+            "CURIE_MAIL_ALLOW_ALL_SENDERS must be explicitly true to permit it; "
+            "the sender filter never replaces verifiable authentication"
         )
     return problems
 

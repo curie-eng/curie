@@ -1,17 +1,8 @@
-"""Approvals answered by email (ADR-0177), through the adapter's real surfaces.
+"""Approval ingress refuses unverifiable mail; historical egress remains deliverable.
 
-The worker's approval card arrives on the adapter's own egress server, the
-request email leaves through the fake AgentMail, the requester's reply comes in
-through the real poll path, and the answer leaves as a resolve call to the fake
-platform. Nothing inside the adapter is patched.
-
-Each rule the ADR sets for accepting a reply is pinned by a refusal: a sender
-the inbound gate did not verify, a sender the mailbox does not admit, an
-auto-reply, a reply without headers, a decision only in the quote, a spent
-reference, and a reply naming no reference. None of them resolves, and none of
-them starts a turn. Who may answer is the platform's decision (ADR-0177 amendment): the
-adapter carries the verified sender's bare address, and the fake platform's
-refusals pin what the adapter then tells the sender.
+Turns accepted before upgrade and answered references are persisted in real SQLite
+for independent egress coverage. New answers always cross the real provider
+HTTP and shared authentication gate, and cannot resolve an approval.
 """
 
 from __future__ import annotations
@@ -30,6 +21,7 @@ from _support import (
     completed,
     post_event,
     reply_post,
+    seed_historical_reply,
     settled_card,
     update,
 )
@@ -37,16 +29,27 @@ from curie_mail_adapter.adapter import (
     APPROVAL_CARD_REF_PREFIX,
     APPROVAL_INSTRUCTIONS,
     APPROVAL_REF_PATTERN,
-    NOT_AN_APPROVER,
     MailAdapter,
 )
 
 PRINCIPAL = "adp.test-payload.test-signature"
+
+
 COPIED = "copied@example.com"
+
+
 REQUESTER = ALLOWED_SENDER
+
+
 APPROVER = "approver@example.com"
+
+
 SECOND_APPROVER = "second.approver@example.com"
+
+
 HUMAN_HEADERS = {"From": ALLOWED_SENDER, "Message-ID": "<reply@example.com>"}
+
+
 CARD_REF = f"{APPROVAL_CARD_REF_PREFIX}appr-1"
 
 
@@ -66,10 +69,9 @@ def url(approvals_adapter: MailAdapter, serve_egress: Callable[[MailAdapter], st
 
 
 def _ask(mail: MailState, adapter: MailAdapter, url: str) -> str:
-    """Run one turn to the approval pause and return the reference it mailed."""
+    """Render an approval request for an asking turn persisted before upgrade."""
 
-    mail.add_inbound("msg-1", "thr-1", text="Please send the quote")
-    adapter.poll_once()
+    seed_historical_reply(mail, adapter.state, "msg-1", "thr-1", text="Please send the quote")
     assert post_event(url, update("Awaiting approval (appr-1): Send the quote"))[0] == 200
     status, ack = post_event(url, approval_card("appr-1"))
     assert (status, ack) == (200, {"ref": CARD_REF})
@@ -104,59 +106,6 @@ def _notices(mail: MailState, message_id: str) -> list[str]:
     return mail.replies_to(message_id)
 
 
-# --- the whole loop ------------------------------------------------------------
-
-
-def test_an_answer_by_reply_is_carried_and_the_thread_gets_one_follow_up(
-    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
-) -> None:
-    reference = _ask(mail, approvals_adapter, url)
-
-    _reply(
-        mail, approvals_adapter, "msg-2", "Approve.\nThe numbers look right.", reference=reference
-    )
-
-    # One resolve, carried by the adapter's credential with the sender as actor.
-    (resolve,) = ingress.resolves
-    path, headers, body = resolve
-    assert path == "/approvals/appr-1/resolve"
-    assert headers["X-Curie-Adapter-Principal"] == PRINCIPAL
-    assert headers["X-Curie-Approval-Actor"] == ALLOWED_SENDER
-    assert body == {"decision": "approved", "note": "The numbers look right."}
-    # The answer never became a turn, and nobody was mailed yet.
-    assert ingress.delivery_ids() == ["msg-1"]
-    assert _notices(mail, "msg-2") == []
-
-    # A second answer before the card settles is not carried: first answer wins.
-    _reply(mail, approvals_adapter, "msg-2b", "REJECT", reference=reference)
-    assert len(ingress.resolves) == 1
-    assert _notices(mail, "msg-2b") == ["This approval has already been answered."]
-
-    # The worker settles the card: one short follow-up, a reply all to the
-    # winning answer, which the requester sent.
-    assert post_event(
-        url, settled_card(CARD_REF, decision="approved", resolver=ALLOWED_SENDER, note="ok")
-    )[0] == 200
-    (follow_up,) = mail.replies_to("msg-2")
-    assert follow_up.startswith(f"This request was approved by {ALLOWED_SENDER}.")
-    assert mail.received_by(ALLOWED_SENDER)[-1] == follow_up
-    # A redelivered settle sends nothing more.
-    assert post_event(url, settled_card(CARD_REF, decision="approved"))[0] == 200
-    assert len(mail.replies_to("msg-2")) == 1
-    assert len(mail.replies_to("msg-1")) == 1
-
-    # The resumed turn answers on the asking message.
-    assert post_event(url, update("Sent the quote.", reply_ref="msg-1"))[0] == 200
-    assert post_event(url, completed("ev-2"))[0] == 200
-    assert mail.replies_to("msg-1")[-1].startswith("Sent the quote.")
-
-    # The reference is spent: a replayed answer decides nothing.
-    _reply(mail, approvals_adapter, "msg-3", "APPROVE", reference=reference)
-    assert len(ingress.resolves) == 1
-    assert _notices(mail, "msg-3") == ["This approval has already been answered."]
-    assert ingress.delivery_ids() == ["msg-1"]
-
-
 def test_expiry_sends_the_expired_follow_up_and_spends_the_reference(
     mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
 ) -> None:
@@ -167,49 +116,7 @@ def test_expiry_sends_the_expired_follow_up_and_spends_the_reference(
 
     _reply(mail, approvals_adapter, "msg-2", "APPROVE", reference=reference)
     assert ingress.resolves == []
-    assert _notices(mail, "msg-2") == ["This approval has already been answered."]
-
-
-# --- each acceptance rule, refused ---------------------------------------------
-
-
-def test_any_admitted_sender_is_carried_and_the_platform_decides(
-    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
-) -> None:
-    """The adapter no longer keeps the answer to the person who asked: a listed
-    approver is often someone else on the thread. It carries the sender, and a
-    platform refusal is told plainly."""
-
-    reference = _ask(mail, approvals_adapter, url)
-    ingress.resolve_responses = [
-        (403, {"detail": "you are not an approver: this approval's route is bound to "
-               "an explicit list of approver email addresses"})
-    ]
-
-    _reply(mail, approvals_adapter, "msg-2", "APPROVE", reference=reference, sender=COPIED)
-
-    (resolve,) = ingress.resolves
-    assert resolve[1]["X-Curie-Approval-Actor"] == COPIED
-    assert _notices(mail, "msg-2") == ["You are not an approver for this request."]
-    assert ingress.delivery_ids() == ["msg-1"]
-
-
-def test_the_actor_is_the_verified_bare_address_never_the_display_name(
-    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
-) -> None:
-    reference = _ask(mail, approvals_adapter, url)
-
-    _reply(
-        mail,
-        approvals_adapter,
-        "msg-2",
-        "APPROVE",
-        reference=reference,
-        sender="Approver Person <Copied@Example.COM>",
-    )
-
-    (resolve,) = ingress.resolves
-    assert resolve[1]["X-Curie-Approval-Actor"] == COPIED
+    assert _notices(mail, "msg-2") == []
 
 
 @pytest.mark.parametrize("label", ["unauthenticated", "spam", "blocked"])
@@ -220,11 +127,9 @@ def test_a_listed_address_the_inbound_gate_did_not_verify_is_never_carried(
     url: str,
     label: str,
 ) -> None:
-    """ADR-0177 amendment A2, step 1: the provider's SPF, DKIM and DMARC verdict
-    comes first. A forged message from an address the route lists never reaches
-    the approval logic, gets nothing back, and is never a turn. The fake serves
-    the labeled message, as a provider whose default filtering widened would, so
-    the adapter's own label gate is what refuses it."""
+    """A listed From address and provider labels cannot establish authentication.
+    The shared gate refuses the message before fetching or resolving anything.
+    """
 
     reference = _ask(mail, approvals_adapter, url)
     mail.leak_labeled = True
@@ -242,7 +147,7 @@ def test_a_listed_address_the_inbound_gate_did_not_verify_is_never_carried(
 
     assert ingress.resolves == []
     assert _notices(mail, "msg-2") == []
-    assert ingress.delivery_ids() == ["msg-1"]
+    assert ingress.delivery_ids() == []
 
 
 def test_a_sender_the_mailbox_does_not_admit_is_refused_before_any_approval_logic(
@@ -254,30 +159,17 @@ def test_a_sender_the_mailbox_does_not_admit_is_refused_before_any_approval_logi
     reference = _ask(mail, approvals_adapter, url)
 
     _reply(
-        mail, approvals_adapter, "msg-2", "APPROVE", reference=reference,
+        mail,
+        approvals_adapter,
+        "msg-2",
+        "APPROVE",
+        reference=reference,
         sender="stranger@example.net",
     )
 
     assert ingress.resolves == []
     assert _notices(mail, "msg-2") == []
-    assert ingress.delivery_ids() == ["msg-1"]
-
-
-def test_a_platform_caller_refusal_gets_nothing_back(
-    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
-) -> None:
-    """The binding's allowed_callers refused the sender (ADR 0175): as on a turn,
-    a refused caller is told nothing, and the answer is not retried."""
-
-    reference = _ask(mail, approvals_adapter, url)
-    ingress.resolve_responses = [(403, {"detail": "caller_not_allowed"})]
-
-    _reply(mail, approvals_adapter, "msg-2", "APPROVE", reference=reference, sender=COPIED)
-    approvals_adapter.poll_once()
-
-    assert len(ingress.resolves) == 1
-    assert _notices(mail, "msg-2") == []
-    assert ingress.delivery_ids() == ["msg-1"]
+    assert ingress.delivery_ids() == []
 
 
 @pytest.mark.parametrize(
@@ -307,155 +199,7 @@ def test_an_automatic_reply_is_ignored_without_a_response(
     assert ingress.resolves == []
     # No answer back either: responding to software invites a mail loop.
     assert _notices(mail, "msg-2") == []
-    assert ingress.delivery_ids() == ["msg-1"]
-
-
-def test_auto_submitted_no_is_a_person(
-    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
-) -> None:
-    """RFC 3834 section 5: "no" is the value a person's message carries."""
-
-    reference = _ask(mail, approvals_adapter, url)
-    _reply(
-        mail,
-        approvals_adapter,
-        "msg-2",
-        "REJECT",
-        reference=reference,
-        headers={**HUMAN_HEADERS, "Auto-Submitted": "no"},
-    )
-    assert [body["decision"] for _path, _headers, body in ingress.resolves] == ["rejected"]
-
-
-def test_a_decision_only_in_the_quote_is_not_an_answer(
-    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
-) -> None:
-    reference = _ask(mail, approvals_adapter, url)
-
-    _reply(
-        mail,
-        approvals_adapter,
-        "msg-2",
-        "Let me check with the team first.",
-        reference=reference,
-        quoted="APPROVE",
-    )
-
-    assert ingress.resolves == []
-    assert _notices(mail, "msg-2") == [APPROVAL_INSTRUCTIONS]
-    assert ingress.delivery_ids() == ["msg-1"]
-
-
-def test_a_decision_outside_the_extracted_new_text_is_not_an_answer(
-    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
-) -> None:
-    """A forward, or any message the provider extracted no new text from, is
-    read only by its full body, which cannot separate the sender's words from
-    what they quoted (https://www.agentmail.to/docs/messages)."""
-
-    reference = _ask(mail, approvals_adapter, url)
-    mail.add_inbound(
-        "msg-2",
-        "thr-1",
-        text=None,
-        full_text=f"APPROVE\n---------- Forwarded message ----------\n{reference}",
-        headers=HUMAN_HEADERS,
-    )
-    approvals_adapter.poll_once()
-    assert ingress.resolves == []
-    assert _notices(mail, "msg-2") == [APPROVAL_INSTRUCTIONS]
-
-
-def test_a_reply_without_new_text_is_not_an_answer(
-    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
-) -> None:
-    reference = _ask(mail, approvals_adapter, url)
-    _reply(mail, approvals_adapter, "msg-2", None, reference=reference)
-    assert ingress.resolves == []
-    assert _notices(mail, "msg-2") == [APPROVAL_INSTRUCTIONS]
-
-
-def test_a_reply_in_a_pending_thread_naming_no_reference_gets_the_instructions(
-    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
-) -> None:
-    _ask(mail, approvals_adapter, url)
-
-    mail.add_inbound("msg-2", "thr-1", text="APPROVE", full_text="APPROVE", headers=HUMAN_HEADERS)
-    approvals_adapter.poll_once()
-
-    assert ingress.resolves == []
-    assert _notices(mail, "msg-2") == [APPROVAL_INSTRUCTIONS]
-    assert ingress.delivery_ids() == ["msg-1"]
-
-
-def test_a_reference_from_another_thread_does_not_answer_this_one(
-    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
-) -> None:
-    reference = _ask(mail, approvals_adapter, url)
-
-    # The same words in a thread with no approval of this adapter's: an
-    # ordinary turn, and nothing is resolved.
-    mail.add_inbound(
-        "msg-9",
-        "thr-2",
-        text="APPROVE",
-        full_text=f"APPROVE\n> Approval reference: {reference}",
-        headers=HUMAN_HEADERS,
-    )
-    approvals_adapter.poll_once()
-
-    assert ingress.resolves == []
-    assert ingress.delivery_ids() == ["msg-1", "msg-9"]
-
-
-# --- what the platform answers --------------------------------------------------
-
-
-def test_a_platform_outage_keeps_the_answer_pending_and_a_later_pass_carries_it(
-    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
-) -> None:
-    reference = _ask(mail, approvals_adapter, url)
-    ingress.resolve_responses = [(503, {"detail": "unavailable"})]
-
-    _reply(mail, approvals_adapter, "msg-2", "APPROVE", reference=reference)
-    assert len(ingress.resolves) == 1
-    approvals_adapter.poll_once()
-
-    assert [body["decision"] for _path, _headers, body in ingress.resolves] == [
-        "approved",
-        "approved",
-    ]
-    assert _notices(mail, "msg-2") == []
-    assert ingress.delivery_ids() == ["msg-1"]
-
-
-@pytest.mark.parametrize(
-    ("status", "notice"),
-    [
-        (409, "This approval has already been answered."),
-        (410, "This approval expired before it was answered."),
-        (403, "You are not an approver for this request."),
-        (422, "Your answer could not be accepted for this approval."),
-    ],
-)
-def test_a_refused_answer_is_told_why(
-    mail: MailState,
-    ingress: IngressState,
-    approvals_adapter: MailAdapter,
-    url: str,
-    status: int,
-    notice: str,
-) -> None:
-    reference = _ask(mail, approvals_adapter, url)
-    ingress.resolve_responses = [(status, {"detail": "refused"})]
-
-    _reply(mail, approvals_adapter, "msg-2", "APPROVE", reference=reference)
-
-    assert len(ingress.resolves) == 1
-    assert _notices(mail, "msg-2") == [notice]
-
-
-# --- without a credential nothing changes ----------------------------------------
+    assert ingress.delivery_ids() == []
 
 
 def test_without_an_adapter_principal_a_card_is_plain_text_as_before(
@@ -464,8 +208,7 @@ def test_without_an_adapter_principal_a_card_is_plain_text_as_before(
     adapter: MailAdapter,
     egress_url: str,
 ) -> None:
-    mail.add_inbound("msg-1", "thr-1", text="Please send the quote")
-    adapter.poll_once()
+    seed_historical_reply(mail, adapter.state, "msg-1", "thr-1", text="Please send the quote")
     status, ack = post_event(egress_url, approval_card("appr-1"))
     assert (status, ack) == (200, {"ref": None})
     assert post_event(egress_url, completed("ev-1", outcome="awaiting-approval"))[0] == 200
@@ -476,22 +219,20 @@ def test_without_an_adapter_principal_a_card_is_plain_text_as_before(
     mail.add_inbound("msg-2", "thr-1", text="APPROVE", full_text="APPROVE", headers=HUMAN_HEADERS)
     adapter.poll_once()
     assert ingress.resolves == []
-    assert ingress.delivery_ids() == ["msg-1", "msg-2"]
+    assert ingress.delivery_ids() == []
 
 
 def test_a_redelivered_card_keeps_its_one_reference(
     mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
 ) -> None:
-    mail.add_inbound("msg-1", "thr-1", text="Please send the quote")
-    approvals_adapter.poll_once()
+    seed_historical_reply(
+        mail, approvals_adapter.state, "msg-1", "thr-1", text="Please send the quote"
+    )
     assert post_event(url, approval_card("appr-1"))[0] == 200
     assert post_event(url, approval_card("appr-1"))[0] == 200
     assert post_event(url, completed("ev-1", outcome="awaiting-approval"))[0] == 200
     (request_email,) = mail.replies_to("msg-1")
     assert len(set(APPROVAL_REF_PATTERN.findall(request_email))) == 1
-
-
-# --- settlement is sent once, and never skipped ---------------------------------
 
 
 def test_a_lost_answer_response_still_gets_its_follow_up_and_the_resumed_reply(
@@ -502,8 +243,9 @@ def test_a_lost_answer_response_still_gets_its_follow_up_and_the_resumed_reply(
     the asking reply, or the resumed turn has nowhere to answer."""
 
     reference = _ask(mail, approvals_adapter, url)
-    ingress.resolve_responses = [(409, {"detail": f"already resolved by {ALLOWED_SENDER}"})]
-    _reply(mail, approvals_adapter, "msg-2", "APPROVE", reference=reference)
+    _historical_answer(
+        mail, approvals_adapter, "msg-2", "APPROVE", reference=reference, sender=ALLOWED_SENDER
+    )
 
     assert post_event(url, settled_card(CARD_REF, decision="approved"))[0] == 200
     assert mail.received_by(ALLOWED_SENDER)[-1].startswith("This request was approved")
@@ -519,8 +261,7 @@ def test_a_resumed_turn_that_posts_after_the_card_answers_the_asking_message(
     its first delivery names no ref. The ack names the asking message, the
     worker keeps the turn there, and the answer is mailed in the same thread."""
 
-    reference = _ask(mail, approvals_adapter, url)
-    _reply(mail, approvals_adapter, "msg-2", "APPROVE", reference=reference)
+    _ask(mail, approvals_adapter, url)
     assert post_event(url, settled_card(CARD_REF, decision="approved"))[0] == 200
 
     status, ack = post_event(url, update("Sent the", reply_ref=None))
@@ -533,8 +274,9 @@ def test_a_resumed_turn_that_posts_after_the_card_answers_the_asking_message(
 def test_a_ref_less_post_is_acked_with_the_reply_owner_it_landed_on(
     mail: MailState, approvals_adapter: MailAdapter, url: str
 ) -> None:
-    mail.add_inbound("msg-1", "thr-1", text="Please send the quote")
-    approvals_adapter.poll_once()
+    seed_historical_reply(
+        mail, approvals_adapter.state, "msg-1", "thr-1", text="Please send the quote"
+    )
     assert post_event(url, reply_post("A note from the platform."))[1] == {"ref": "msg-1"}
 
 
@@ -570,13 +312,6 @@ def test_a_failed_follow_up_is_retried_by_the_next_settlement(
     assert mail.replies_to("msg-1")[-1] == "This approval expired before anyone answered it."
 
 
-# --- who can approve, and who hears the outcome (ADR-0177 amendment A5) ------
-#
-# The fake provider addresses each reply as AgentMail documents: to the sender
-# of the message replied to, or with reply_all to everyone on it but this inbox.
-# So every assertion below is about whose inbox a message reached.
-
-
 def _ask_listed(
     mail: MailState,
     adapter: MailAdapter,
@@ -590,8 +325,9 @@ def _ask_listed(
     Returns the reference and the request email.
     """
 
-    mail.add_inbound("msg-1", "thr-1", text="Please send the quote", cc=cc)
-    adapter.poll_once()
+    seed_historical_reply(
+        mail, adapter.state, "msg-1", "thr-1", text="Please send the quote", cc=cc
+    )
     assert post_event(url, update("Awaiting approval (appr-1): Send the quote"))[0] == 200
     card = approval_card("appr-1", requested_by=REQUESTER, approvers=approvers)
     assert post_event(url, card) == (200, {"ref": CARD_REF})
@@ -601,7 +337,7 @@ def _ask_listed(
     return reference, request_email
 
 
-def _answer(
+def _historical_answer(
     mail: MailState,
     adapter: MailAdapter,
     message_id: str,
@@ -611,7 +347,7 @@ def _answer(
     sender: str,
     cc: list[str] | None = None,
 ) -> None:
-    """A reply in the thread from ``sender``, quoting the request."""
+    """Persist a winning answer from before upgrade for settlement tests."""
 
     full = f"{new_text}\n\n> Approval reference: {reference}"
     mail.add_inbound(
@@ -623,7 +359,8 @@ def _answer(
         headers={"From": sender, "Message-ID": f"<{message_id}@example.com>"},
         cc=cc,
     )
-    adapter.poll_once()
+    adapter.state.record_approval_answer(reference, message_id, [sender, *(cc or [])])
+    adapter.state.set_approval_ref_state(reference, "answered")
 
 
 def _follow_ups(mail: MailState, address: str) -> list[str]:
@@ -662,29 +399,16 @@ def test_one_listed_approver_is_named_on_its_own(
     )
 
 
-def test_several_approvers_copied_in_can_each_answer_and_the_first_wins(
+def test_historical_first_answer_keeps_its_settlement_recipients(
     mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
 ) -> None:
-    """The requester replies all with two approvers copied in. That message is
-    not an answer and gets nothing back. Either approver may answer; the first
-    answer is carried, the second is told it was already answered, and the
-    outcome reaches the requester and both approvers once each."""
+    """Stored historical answer participants receive the platform settlement once."""
 
     reference, _request = _ask_listed(mail, approvals_adapter, url, [APPROVER, SECOND_APPROVER])
 
-    _answer(
-        mail,
-        approvals_adapter,
-        "msg-2",
-        "Adding the approvers for this one.",
-        reference=reference,
-        sender=REQUESTER,
-        cc=[APPROVER, SECOND_APPROVER],
-    )
-    assert ingress.resolves == []
     assert mail.replies_to("msg-2") == []
 
-    _answer(
+    _historical_answer(
         mail,
         approvals_adapter,
         "msg-3",
@@ -693,7 +417,7 @@ def test_several_approvers_copied_in_can_each_answer_and_the_first_wins(
         sender=SECOND_APPROVER,
         cc=[REQUESTER, APPROVER],
     )
-    _answer(
+    _historical_answer(
         mail,
         approvals_adapter,
         "msg-4",
@@ -703,45 +427,40 @@ def test_several_approvers_copied_in_can_each_answer_and_the_first_wins(
         cc=[REQUESTER, SECOND_APPROVER],
     )
 
-    (resolve,) = ingress.resolves
-    assert resolve[1]["X-Curie-Approval-Actor"] == SECOND_APPROVER
-    assert resolve[2] == {"decision": "rejected", "note": "Not this quarter."}
-    assert mail.replies_to("msg-4") == ["This approval has already been answered."]
+    assert mail.replies_to("msg-4") == []
     assert "This approval has already been answered." not in mail.received_by(REQUESTER)
 
-    assert post_event(
-        url,
-        settled_card(CARD_REF, decision="rejected", resolver=SECOND_APPROVER, note="Not now"),
-    )[0] == 200
+    assert (
+        post_event(
+            url,
+            settled_card(CARD_REF, decision="rejected", resolver=SECOND_APPROVER, note="Not now"),
+        )[0]
+        == 200
+    )
     for person in (REQUESTER, APPROVER, SECOND_APPROVER):
         assert _follow_ups(mail, person) == [
             f"This request was rejected by {SECOND_APPROVER}.\n\nNote: Not now"
         ], person
-    assert ingress.delivery_ids() == ["msg-1"]
+    assert ingress.delivery_ids() == []
 
 
-def test_an_approver_copied_in_by_reply_all_can_answer_and_everyone_hears_once(
+def test_historical_reply_all_answer_settlement_and_resume(
     mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
 ) -> None:
-    """The approver was not on the asking message; the requester's reply all
-    copied them in. Their answer, from a different message than the asking
-    one, is carried, and the outcome reaches them and the requester once."""
+    """Stored historical answer participants receive the platform settlement once."""
 
     reference, _request = _ask_listed(mail, approvals_adapter, url, [APPROVER])
-    _answer(
-        mail, approvals_adapter, "msg-2", "Please take a look.", reference=reference,
-        sender=REQUESTER, cc=[APPROVER],
-    )
-    _answer(
-        mail, approvals_adapter, "msg-3", "APPROVE", reference=reference,
-        sender=APPROVER, cc=[REQUESTER],
+    _historical_answer(
+        mail,
+        approvals_adapter,
+        "msg-3",
+        "APPROVE",
+        reference=reference,
+        sender=APPROVER,
+        cc=[REQUESTER],
     )
 
-    (resolve,) = ingress.resolves
-    assert resolve[1]["X-Curie-Approval-Actor"] == APPROVER
-    assert post_event(
-        url, settled_card(CARD_REF, decision="approved", resolver=APPROVER)
-    )[0] == 200
+    assert post_event(url, settled_card(CARD_REF, decision="approved", resolver=APPROVER))[0] == 200
     assert _follow_ups(mail, REQUESTER) == [f"This request was approved by {APPROVER}."]
     assert _follow_ups(mail, APPROVER) == [f"This request was approved by {APPROVER}."]
 
@@ -750,21 +469,15 @@ def test_an_approver_copied_in_by_reply_all_can_answer_and_everyone_hears_once(
     assert mail.received_by(REQUESTER)[-1].startswith("Sent the quote.")
 
 
-def test_the_outcome_reaches_the_requester_when_the_approver_replied_to_the_bot_alone(
+def test_historical_sender_only_answer_still_settles_to_the_requester(
     mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
 ) -> None:
-    """The approver answered without reply all, so the requester is not on the
-    winning message. The requester still gets the outcome, as a direct reply to
-    the asking message, and the resumed answer. A send that fails part way is
-    retried without sending the part that went out again."""
+    """Stored historical answer participants receive the platform settlement once."""
 
     reference, _request = _ask_listed(mail, approvals_adapter, url, [APPROVER])
-    _answer(
-        mail, approvals_adapter, "msg-2", "Please take a look.", reference=reference,
-        sender=REQUESTER, cc=[APPROVER],
+    _historical_answer(
+        mail, approvals_adapter, "msg-3", "APPROVE", reference=reference, sender=APPROVER
     )
-    _answer(mail, approvals_adapter, "msg-3", "APPROVE", reference=reference, sender=APPROVER)
-    assert [r[1]["X-Curie-Approval-Actor"] for r in ingress.resolves] == [APPROVER]
 
     settle = settled_card(CARD_REF, decision="approved", resolver=APPROVER)
     mail.fail_next_reply_to = "msg-1"
@@ -781,33 +494,30 @@ def test_the_outcome_reaches_the_requester_when_the_approver_replied_to_the_bot_
     assert not mail.received_by(APPROVER)[-1].startswith("Sent the quote.")
 
 
-def test_a_requester_on_the_list_is_told_they_can_answer_and_may_approve_their_own(
+def test_historical_requester_answer_settlement(
     mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
 ) -> None:
-    """As on Slack (ADR-0106), asking neither grants nor blocks: a listed
-    requester is told they can answer, and their answer is carried."""
+    """Stored historical answer participants receive the platform settlement once."""
 
     reference, request_email = _ask_listed(mail, approvals_adapter, url, [REQUESTER, APPROVER])
     assert f"Who can approve: {REQUESTER}, {APPROVER}." in request_email
     assert f"Already on this thread and able to answer: {REQUESTER}." in request_email
     assert "Nobody on this thread" not in request_email
 
-    _answer(mail, approvals_adapter, "msg-2", "APPROVE", reference=reference, sender=REQUESTER)
-    (resolve,) = ingress.resolves
-    assert resolve[1]["X-Curie-Approval-Actor"] == REQUESTER
-    assert post_event(
-        url, settled_card(CARD_REF, decision="approved", resolver=REQUESTER)
-    )[0] == 200
+    _historical_answer(
+        mail, approvals_adapter, "msg-2", "APPROVE", reference=reference, sender=REQUESTER
+    )
+    assert (
+        post_event(url, settled_card(CARD_REF, decision="approved", resolver=REQUESTER))[0] == 200
+    )
     assert _follow_ups(mail, REQUESTER) == [f"This request was approved by {REQUESTER}."]
     assert mail.received_by(APPROVER) == []
 
 
-def test_a_listed_approver_copied_on_the_asking_message_receives_the_request(
+def test_historical_copied_approver_gets_request_and_settlement_only(
     mail: MailState, approvals_adapter: MailAdapter, url: str
 ) -> None:
-    """The request email goes reply all, so an approver already copied sees it
-    and is named as able to answer. The resumed answer still goes to the
-    requester alone, as every ordinary reply does."""
+    """Stored historical answer participants receive the platform settlement once."""
 
     reference, request_email = _ask_listed(
         mail, approvals_adapter, url, [APPROVER, SECOND_APPROVER], cc=[APPROVER]
@@ -817,29 +527,20 @@ def test_a_listed_approver_copied_on_the_asking_message_receives_the_request(
     assert mail.received_by(REQUESTER) == [request_email]
     assert mail.received_by(SECOND_APPROVER) == []
 
-    _answer(
-        mail, approvals_adapter, "msg-2", "APPROVE", reference=reference,
-        sender=APPROVER, cc=[REQUESTER],
+    _historical_answer(
+        mail,
+        approvals_adapter,
+        "msg-2",
+        "APPROVE",
+        reference=reference,
+        sender=APPROVER,
+        cc=[REQUESTER],
     )
     assert post_event(url, settled_card(CARD_REF, decision="approved", resolver=APPROVER))[0] == 200
     assert post_event(url, update("Sent the quote.", reply_ref="msg-1"))[0] == 200
     assert post_event(url, completed("ev-2"))[0] == 200
     assert mail.received_by(REQUESTER)[-1].startswith("Sent the quote.")
     assert not any(text.startswith("Sent the quote.") for text in mail.received_by(APPROVER))
-
-
-def test_an_unlisted_answer_is_told_who_can_approve(
-    mail: MailState, ingress: IngressState, approvals_adapter: MailAdapter, url: str
-) -> None:
-    reference, _request = _ask_listed(mail, approvals_adapter, url, [APPROVER])
-    ingress.resolve_responses = [(403, {"detail": "you are not an approver"})]
-
-    _answer(mail, approvals_adapter, "msg-2", "APPROVE", reference=reference, sender=COPIED)
-
-    assert mail.replies_to("msg-2") == [
-        f"{NOT_AN_APPROVER} Only {APPROVER} can approve it. "
-        f"Reply all to this email and add {APPROVER}."
-    ]
 
 
 def test_when_the_asking_message_cannot_be_read_the_request_holds_either_way(
@@ -849,8 +550,9 @@ def test_when_the_asking_message_cannot_be_read_the_request_holds_either_way(
     If the provider will not serve it, the request does not claim that nobody
     on the thread can approve."""
 
-    mail.add_inbound("msg-1", "thr-1", text="Please send the quote", cc=[APPROVER])
-    approvals_adapter.poll_once()
+    seed_historical_reply(
+        mail, approvals_adapter.state, "msg-1", "thr-1", text="Please send the quote", cc=[APPROVER]
+    )
     assert post_event(url, update("Awaiting approval (appr-1): Send the quote"))[0] == 200
     mail.fail_next_body = 500
     card = approval_card("appr-1", requested_by=REQUESTER, approvers=[APPROVER])
@@ -860,3 +562,47 @@ def test_when_the_asking_message_cannot_be_read_the_request_holds_either_way(
     assert "If none of the people who can approve is on this thread yet:" in request_email
     assert "Nobody on this thread" not in request_email
     assert mail.received_by(APPROVER) == [request_email]
+
+
+@pytest.mark.parametrize(
+    ("sender", "text", "headers", "thread_id", "has_reference"),
+    [
+        (ALLOWED_SENDER, "APPROVE", HUMAN_HEADERS, "thr-1", True),
+        (COPIED, "REJECT\nPlease wait", HUMAN_HEADERS, "thr-1", True),
+        ("Person <Copied@Example.COM>", "APPROVE", HUMAN_HEADERS, "thr-1", True),
+        (ALLOWED_SENDER, "APPROVE", {**HUMAN_HEADERS, "Auto-Submitted": "no"}, "thr-1", True),
+        (ALLOWED_SENDER, "Let me check", HUMAN_HEADERS, "thr-1", True),
+        (ALLOWED_SENDER, None, HUMAN_HEADERS, "thr-1", True),
+        (ALLOWED_SENDER, "APPROVE", HUMAN_HEADERS, "thr-1", False),
+        (ALLOWED_SENDER, "APPROVE", HUMAN_HEADERS, "thr-other", True),
+    ],
+)
+def test_every_new_approval_answer_shape_is_refused_before_resolution(
+    mail: MailState,
+    ingress: IngressState,
+    approvals_adapter: MailAdapter,
+    url: str,
+    sender: str,
+    text: str | None,
+    headers: dict[str, str],
+    thread_id: str,
+    has_reference: bool,
+) -> None:
+    reference = _ask(mail, approvals_adapter, url)
+    mail.add_inbound(
+        "msg-answer",
+        thread_id,
+        sender=sender,
+        text=text,
+        headers=headers,
+        full_text=f"APPROVE\nApproval reference: {reference}" if has_reference else "APPROVE",
+    )
+    approvals_adapter.poll_once()
+    approvals_adapter.poll_once()
+    assert ingress.resolves == []
+    assert ingress.delivery_ids() == []
+    assert mail.replies_to("msg-answer") == []
+    assert mail.body_calls.get("msg-answer", 0) == 0
+    assert approvals_adapter.state.delivery("msg-answer") == {"state": "rejected", "turn": None}
+    stored = approvals_adapter.state.approval_ref_for("appr-1")
+    assert stored is not None and stored["state"] == "live"

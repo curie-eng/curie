@@ -3229,6 +3229,177 @@ fn retained_connector_caller_secret_and_inline_pair_survive_upgrade_unchanged() 
     }
 }
 
+const LAYER_BOT: &str = "ghcr.io/acme/acme-bot-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const LAYER_OTHER: &str = "ghcr.io/acme/acme-other-runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// #3849: a retained layered digest is removed from the values Helm applies.
+/// Sibling settings and credentials stay. Convergence and the canary still pass.
+/// The null override that the chart renders as `<nil>` is not passed.
+#[test]
+fn upgrade_omits_stale_runner_layers_and_keeps_credentials() {
+    let values = serde_json::json!({
+        "agentSandbox": {
+            "runnerImages": {
+                "acme-bot": LAYER_BOT,
+                "acme-other": LAYER_OTHER
+            },
+            "connectorSecrets": {"acme-bot": {"API_TOKEN": "acme-secret-name"}}
+        },
+        "api": {"existingSecret": "acme-api-credentials"}
+    });
+    let fixture = Fixture::new(Some(&values.to_string()));
+    let output = fixture.local("healthy");
+    assert!(output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["convergence"]["exact"], true, "{body}");
+    assert_eq!(body["canary"]["passed"], true, "{body}");
+    let applied = values_doc(&fixture.values(1));
+    assert!(
+        applied
+            .pointer("/agentSandbox/runnerImages/acme-bot")
+            .is_none(),
+        "stale acme-bot layer must be removed: {applied}"
+    );
+    assert!(
+        applied
+            .pointer("/agentSandbox/runnerImages/acme-other")
+            .is_none(),
+        "every layer stops matching when the runner cannot be proved: {applied}"
+    );
+    let images = applied.pointer("/agentSandbox/runnerImages");
+    assert!(
+        images.is_none()
+            || images.is_some_and(|node| node.as_object().is_some_and(|map| map.is_empty())),
+        "runnerImages must not keep a null or stale entry: {images:?}"
+    );
+    assert_eq!(
+        applied
+            .pointer("/agentSandbox/connectorSecrets/acme-bot/API_TOKEN")
+            .and_then(Value::as_str),
+        Some("acme-secret-name"),
+        "{applied}"
+    );
+    assert_eq!(
+        applied
+            .pointer("/api/existingSecret")
+            .and_then(Value::as_str),
+        Some("acme-api-credentials"),
+        "{applied}"
+    );
+    let upgrades = fixture.helm_upgrades();
+    assert_eq!(upgrades.len(), 1, "{:?}", fixture.argv());
+    assert!(
+        upgrades[0].iter().all(|arg| !arg.contains("=null")),
+        "helm argv must not set a null digest: {:?}",
+        upgrades[0]
+    );
+    let deletes: Vec<Vec<String>> = fixture
+        .argv()
+        .into_iter()
+        .filter(|call| call.iter().any(|arg| arg == "sandboxclaim"))
+        .collect();
+    assert!(
+        deletes
+            .iter()
+            .any(|call| call.iter().any(|arg| arg.contains("acme-bot"))),
+        "cleared claims are retired: {deletes:?}"
+    );
+    assert!(
+        deletes
+            .iter()
+            .any(|call| call.iter().any(|arg| arg.contains("acme-other"))),
+        "cleared claims are retired: {deletes:?}"
+    );
+}
+
+/// #3849: a Helm upgrade that exits before a revision still stores a failed
+/// apply checkpoint and releases ownership. The previous known-good version stays.
+#[test]
+fn helm_upgrade_failure_is_a_terminal_checkpoint_and_releases_ownership() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("helm-upgrade-fails");
+    assert!(
+        !output.status.success(),
+        "a failed apply must not report process success: {}",
+        visible(&output)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], true, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    assert!(
+        body["fail_forward"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("<nil>"),
+        "{body}"
+    );
+    let record = fixture.last_record();
+    assert_eq!(record["status"], "failed", "{record}");
+    assert_eq!(record["failed_phase"], "apply", "{record}");
+    assert!(
+        record["completed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|phase| phase == "migrate"),
+        "{record}"
+    );
+    let annotations = &fixture.config_map_state()["metadata"]["annotations"];
+    assert!(
+        annotations.get(HOLDER_ANNOTATION).is_none(),
+        "ownership holder must be released: {annotations}"
+    );
+    assert!(
+        annotations.get(ACTION_ANNOTATION).is_none(),
+        "ownership action must be released: {annotations}"
+    );
+}
+
+/// #3849: after a failed apply, previous_serving follows the revision Helm
+/// still marks deployed, not the version cached before Helm ran.
+#[test]
+fn failed_apply_reports_the_revision_helm_still_has_deployed() {
+    let previous = Fixture::new(None);
+    let output = previous.local("upgrade-fails-previous-deployed");
+    assert!(!output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], true, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    assert!(
+        body["fail_forward"]["command"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cluster rollback"),
+        "{body}"
+    );
+
+    let moved = Fixture::new(None);
+    let output = moved.local("upgrade-fails-target-deployed");
+    assert!(!output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["previous_serving"], false, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    assert!(
+        body["fail_forward"]["command"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cluster upgrade"),
+        "{body}"
+    );
+    assert!(
+        !body["fail_forward"]["command"]
+            .as_str()
+            .unwrap_or("")
+            .contains("rollback"),
+        "{body}"
+    );
+}
+
 /// #2588 -- the same pending contract proceeds once `--forward-only` is set.
 /// Clap does not accept the flag on `cluster upgrade` yet, so this fails today.
 #[test]

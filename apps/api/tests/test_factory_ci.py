@@ -46,24 +46,20 @@ PERMANENT = [
 TRANSIENT = ["timeout", "observation_busy", "github_rate_limited", "github_error"]
 
 
-# Curie's own layout, configured per repository since #3617. Defined here rather
-# than imported so the tests pin the operator-facing values. Built per test, not
-# at import, so this module still collects against a tree without the policy
-# and the fix pin attributes that failure to the pinned test.
-def curie_python_ci() -> factory_ci.PythonCiPolicy:
+# A foreign unit conversion repository has its own layout and CI job names.
+# Build policies per test so missing product policy types do not stop collection.
+def conversion_python_ci() -> factory_ci.PythonCiPolicy:
     return factory_ci.PythonCiPolicy(
-        check="Python (ruff + mypy + pytest)",
-        paths=(
-            "apps",
-            "runner",
-            "cli",
-            "adapters",
-            "packages",
-            "examples/tests",
-            "tools",
-            "release",
-        ),
-        pending_check_prefix="Python pytest (shard ",
+        check="Unit conversion suite",
+        paths=("unitconv", "tests"),
+        pending_check_prefix="Conversion batch ",
+    )
+
+
+def conversion_metadata_ci() -> factory_ci.MetadataCiPolicy:
+    return factory_ci.MetadataCiPolicy(
+        checks=("Publication description guard",),
+        statuses=(),
     )
 
 
@@ -110,6 +106,7 @@ def _decide(detail: CiDetail, seconds: float, **kwargs: Any) -> Any:
     kwargs.setdefault("ci_wait_seconds", 1200)
     kwargs.setdefault("changed_paths", [])
     kwargs.setdefault("python_ci", None)
+    kwargs.setdefault("metadata_ci", None)
     return factory_ci.decide(
         detail,
         now=PUBLISHED + timedelta(seconds=seconds),
@@ -132,15 +129,15 @@ def _names(items: Any) -> set[str]:
 
 def test_later_non_python_fix_cannot_drop_prior_python_ci_requirement() -> None:
     publications = [
-        SimpleNamespace(changed_paths=["apps/api/src/example.py"]),
+        SimpleNamespace(changed_paths=["unitconv/convert.py"]),
         SimpleNamespace(changed_paths=["README.md"]),
     ]
     changed_paths = factory_ci._publication_changed_paths(publications)
-    skipped = _run("Python (ruff + mypy + pytest)", conclusion="skipped")
+    skipped = _run("Unit conversion suite", conclusion="skipped")
     skipped["app"] = {"slug": "github-actions"}
 
     verdict = _decide(
-        _detail(skipped), 130, changed_paths=changed_paths, python_ci=curie_python_ci()
+        _detail(skipped), 130, changed_paths=changed_paths, python_ci=conversion_python_ci()
     )
 
     assert verdict.kind == "unverified"
@@ -251,7 +248,7 @@ def test_a_failure_fails_fast_while_other_checks_are_pending() -> None:
 
 
 def test_metadata_revision_waits_for_each_stale_nonpassing_check() -> None:
-    old_failure = _run("PR body (real newlines)", conclusion="failure")
+    old_failure = _run("Publication description guard", conclusion="failure")
     old_failure["started_at"] = "2026-09-24T11:00:00Z"
     old_pending = _run("security", status="in_progress", run_id=2)
     old_pending["started_at"] = "2026-09-24T11:00:00Z"
@@ -262,22 +259,27 @@ def test_metadata_revision_waits_for_each_stale_nonpassing_check() -> None:
         _detail(old_failure, old_pending, unrelated),
         10,
         fresh_after=PUBLISHED,
+        metadata_ci=conversion_metadata_ci(),
     )
     assert verdict.kind == "pending"
     assert verdict.reason == "checks_awaiting_metadata_rerun"
 
     detail = _detail(old_failure, old_pending, unrelated)
     for seconds in (120, 1199):
-        verdict = _decide(detail, seconds, fresh_after=PUBLISHED)
+        verdict = _decide(
+            detail, seconds,
+            fresh_after=PUBLISHED,
+            metadata_ci=conversion_metadata_ci(),
+        )
         assert verdict.kind == "pending"
         assert verdict.reason == "checks_awaiting_metadata_rerun"
         assert verdict.failing == []
-    verdict = _decide(detail, 1200, fresh_after=PUBLISHED)
+    verdict = _decide(detail, 1200, fresh_after=PUBLISHED, metadata_ci=conversion_metadata_ci())
     assert verdict.kind == "unverified"
     assert verdict.reason == "checks_not_rerun"
     assert verdict.failing == []
 
-    refreshed_failure = _run("PR body (real newlines)", run_id=4)
+    refreshed_failure = _run("Publication description guard", run_id=4)
     refreshed_failure["started_at"] = "2026-09-24T12:00:02Z"
     refreshed_pending = _run("security", run_id=5)
     refreshed_pending["started_at"] = "2026-09-24T12:00:03Z"
@@ -285,6 +287,7 @@ def test_metadata_revision_waits_for_each_stale_nonpassing_check() -> None:
         _detail(old_failure, old_pending, unrelated, refreshed_failure),
         120,
         fresh_after=PUBLISHED,
+        metadata_ci=conversion_metadata_ci(),
     )
     assert verdict.kind == "pending"
     assert verdict.pending == [{"name": "security", "status": "in_progress"}]
@@ -292,52 +295,59 @@ def test_metadata_revision_waits_for_each_stale_nonpassing_check() -> None:
         _detail(old_failure, old_pending, unrelated, refreshed_failure, refreshed_pending),
         10,
         fresh_after=PUBLISHED,
+        metadata_ci=conversion_metadata_ci(),
     )
     assert verdict.kind == "green"
 
 
 def test_metadata_revision_retains_a_stale_failing_commit_status() -> None:
-    unrelated = _run("unrelated")
+    unrelated = _run("Publication description guard")
     unrelated["started_at"] = "2026-09-24T12:00:01Z"
     old_status = _status("ci/jenkins", "failure")
     old_status["created_at"] = "2026-09-24T11:00:00Z"
     detail = _detail(unrelated, statuses=(old_status,))
-    verdict = _decide(detail, 10, fresh_after=PUBLISHED)
+    verdict = _decide(detail, 10, fresh_after=PUBLISHED, metadata_ci=conversion_metadata_ci())
     assert verdict.kind == "failing"
     assert _names(verdict.failing) == {"ci/jenkins"}
 
     fresh_status = _status("ci/jenkins", "success")
     fresh_status["created_at"] = "2026-09-24T12:00:02Z"
     detail = _detail(unrelated, statuses=(old_status, fresh_status))
-    verdict = _decide(detail, 10, fresh_after=PUBLISHED)
+    verdict = _decide(detail, 10, fresh_after=PUBLISHED, metadata_ci=conversion_metadata_ci())
     assert verdict.kind == "green"
 
 
 def test_metadata_revision_retains_unedited_passing_checks() -> None:
-    suite = _run("Python suite")
+    suite = _run("Conversion suite")
     suite["started_at"] = "2026-09-24T11:00:00Z"
-    body_before = _run("PR body (real newlines)", conclusion="failure", run_id=2)
+    body_before = _run("Publication description guard", conclusion="failure", run_id=2)
     body_before["started_at"] = "2026-09-24T11:00:00Z"
-    body_after = _run("PR body (real newlines)", run_id=3)
+    body_after = _run("Publication description guard", run_id=3)
     body_after["started_at"] = "2026-09-24T12:00:02Z"
 
     verdict = _decide(
-        _detail(suite, body_before, body_after), 30, fresh_after=PUBLISHED
+        _detail(suite, body_before, body_after),
+        30,
+        fresh_after=PUBLISHED,
+        metadata_ci=conversion_metadata_ci(),
     )
 
     assert verdict.kind == "green"
 
 
 def test_metadata_revision_waits_for_body_guard_even_when_it_was_green() -> None:
-    suite = _run("Python suite")
+    suite = _run("Conversion suite")
     suite["started_at"] = "2026-09-24T11:00:00Z"
-    body_before = _run("PR body (real newlines)", run_id=2)
+    body_before = _run("Publication description guard", run_id=2)
     body_before["started_at"] = "2026-09-24T11:00:00Z"
     unrelated = _run("unrelated", run_id=3)
     unrelated["started_at"] = "2026-09-24T12:00:02Z"
 
     verdict = _decide(
-        _detail(suite, body_before, unrelated), 30, fresh_after=PUBLISHED
+        _detail(suite, body_before, unrelated),
+        30,
+        fresh_after=PUBLISHED,
+        metadata_ci=conversion_metadata_ci(),
     )
 
     assert verdict.kind == "pending"
@@ -345,38 +355,49 @@ def test_metadata_revision_waits_for_body_guard_even_when_it_was_green() -> None
 
 
 def test_metadata_revision_keeps_a_red_commit_check_for_next_fix_round() -> None:
-    python = _run("Python suite", conclusion="failure")
+    python = _run("Conversion suite", conclusion="failure")
     python["started_at"] = "2026-09-24T11:00:00Z"
-    body_before = _run("PR body (real newlines)", conclusion="failure", run_id=2)
+    body_before = _run("Publication description guard", conclusion="failure", run_id=2)
     body_before["started_at"] = "2026-09-24T11:00:00Z"
-    body_after = _run("PR body (real newlines)", run_id=3)
+    body_after = _run("Publication description guard", run_id=3)
     body_after["started_at"] = "2026-09-24T12:00:02Z"
 
     verdict = _decide(
-        _detail(python, body_before, body_after), 30, fresh_after=PUBLISHED
+        _detail(python, body_before, body_after),
+        30,
+        fresh_after=PUBLISHED,
+        metadata_ci=conversion_metadata_ci(),
     )
 
     assert verdict.kind == "failing"
-    assert _names(verdict.failing) == {"Python suite"}
+    assert _names(verdict.failing) == {"Conversion suite"}
     effective = factory_ci._metadata_revision_detail(
-        _detail(python, body_before, body_after), PUBLISHED
+        _detail(python, body_before, body_after), PUBLISHED, conversion_metadata_ci()
     )
-    assert _names(effective.check_runs) == {"Python suite", "PR body (real newlines)"}
+    assert _names(effective.check_runs) == {"Conversion suite", "Publication description guard"}
     assert len(effective.check_runs) == 2
     failing_names = [
         run.get("name") for run in effective.check_runs
         if run.get("conclusion") == "failure"
     ]
-    assert failing_names == ["Python suite"]
+    assert failing_names == ["Conversion suite"]
 
 
 def test_metadata_revision_needs_fresh_green_evidence_after_grace() -> None:
     existing = _run("build")
     existing["started_at"] = "2026-09-24T11:00:00Z"
     detail = _detail(existing)
-    assert _decide(detail, 119, fresh_after=PUBLISHED).kind == "pending"
-    assert _decide(detail, 120, fresh_after=PUBLISHED).kind == "pending"
-    verdict = _decide(detail, 1200, fresh_after=PUBLISHED)
+    assert _decide(
+        detail, 119,
+        fresh_after=PUBLISHED,
+        metadata_ci=conversion_metadata_ci(),
+    ).kind == "pending"
+    assert _decide(
+        detail, 120,
+        fresh_after=PUBLISHED,
+        metadata_ci=conversion_metadata_ci(),
+    ).kind == "pending"
+    verdict = _decide(detail, 1200, fresh_after=PUBLISHED, metadata_ci=conversion_metadata_ci())
     assert verdict.kind == "unverified"
     assert verdict.reason == "checks_not_rerun"
 
@@ -387,28 +408,40 @@ def test_metadata_revision_does_not_accept_same_second_checks() -> None:
     status = _status("ci/jenkins", "success")
     status["created_at"] = "2026-09-24T12:00:00Z"
 
-    verdict = _decide(_detail(run, statuses=(status,)), 1200, fresh_after=PUBLISHED)
+    verdict = _decide(
+        _detail(run, statuses=(status,)), 1200,
+        fresh_after=PUBLISHED,
+        metadata_ci=conversion_metadata_ci(),
+    )
 
     assert verdict.kind == "unverified"
     assert verdict.reason == "checks_not_rerun"
 
 
 def test_fresh_unrelated_failure_does_not_revive_stale_red() -> None:
-    stale = _run("PR body (real newlines)", conclusion="failure", summary="old body failure")
+    stale = _run("Publication description guard", conclusion="failure", summary="old body failure")
     stale["started_at"] = "2026-09-24T11:00:00Z"
     fresh = _run("unit-tests", conclusion="failure", run_id=2)
     fresh["started_at"] = "2026-09-24T12:00:01Z"
 
-    verdict = _decide(_detail(stale, fresh), 120, fresh_after=PUBLISHED)
+    verdict = _decide(
+        _detail(stale, fresh), 120,
+        fresh_after=PUBLISHED,
+        metadata_ci=conversion_metadata_ci(),
+    )
 
     assert verdict.kind == "failing"
     assert _names(verdict.failing) == {"unit-tests"}
 
 
 def test_fresh_failure_after_metadata_revision_fails_without_grace() -> None:
-    failed = _run("PR body (real newlines)", conclusion="failure")
+    failed = _run("Publication description guard", conclusion="failure")
     failed["started_at"] = "2026-09-24T12:00:01Z"
-    verdict = _decide(_detail(failed), 10, fresh_after=PUBLISHED)
+    verdict = _decide(
+        _detail(failed), 10,
+        fresh_after=PUBLISHED,
+        metadata_ci=conversion_metadata_ci(),
+    )
     assert verdict.kind == "failing"
 
 
@@ -470,14 +503,14 @@ def _actions_run(
     return run
 
 
-_PYTHON_PATH = "apps/api/src/curie_api/factory_ci.py"
-_PYTHON_AGGREGATE = "Python (ruff + mypy + pytest)"
+_PYTHON_PATH = "unitconv/convert.py"
+_PYTHON_AGGREGATE = "Unit conversion suite"
 
 
 def _pytest_shards(status: str = "in_progress") -> list[dict[str, Any]]:
     return [
         _actions_run(
-            f"Python pytest (shard {shard}/3)",
+            f"Conversion batch {shard}/3)",
             status=status,
             conclusion="success" if status == "completed" else None,
             run_id=shard,
@@ -490,15 +523,15 @@ def test_in_progress_pytest_shards_keep_waiting_for_the_aggregate() -> None:
     """The aggregate job does not exist until the shards finish (#3400, #3520)."""
 
     verdict = _decide(
-        _detail(*_pytest_shards(), _actions_run("PR body (real newlines)", run_id=4)),
+        _detail(*_pytest_shards(), _actions_run("Publication description guard", run_id=4)),
         180,
         changed_paths=[_PYTHON_PATH],
-        python_ci=curie_python_ci(),
+        python_ci=conversion_python_ci(),
     )
 
     assert verdict.kind == "pending"
     assert verdict.reason == "required_python_ci_missing"
-    assert "Python pytest (shard 1/3)" in _names(verdict.pending)
+    assert "Conversion batch 1/3)" in _names(verdict.pending)
     assert verdict.kind != "unverified"
 
 
@@ -507,7 +540,7 @@ def test_a_later_round_still_waits_while_pytest_shards_are_in_progress() -> None
         _detail(*_pytest_shards()),
         30,
         changed_paths=[_PYTHON_PATH],
-        python_ci=curie_python_ci(),
+        python_ci=conversion_python_ci(),
         prior_round_had_checks=True,
     )
 
@@ -518,12 +551,12 @@ def test_a_later_round_still_waits_while_pytest_shards_are_in_progress() -> None
 def test_a_pending_status_keeps_the_missing_python_aggregate_waiting() -> None:
     verdict = _decide(
         _detail(
-            _actions_run("gitleaks (full history)"),
-            statuses=(_status("ci/pr-body", "pending"),),
+            _actions_run("Conversion secret scan"),
+            statuses=(_status("ci/conversion-notes", "pending"),),
         ),
         180,
         changed_paths=[_PYTHON_PATH],
-        python_ci=curie_python_ci(),
+        python_ci=conversion_python_ci(),
     )
 
     assert verdict.kind == "pending"
@@ -534,15 +567,15 @@ def test_a_visible_failure_still_fails_fast_while_pytest_shards_run() -> None:
     verdict = _decide(
         _detail(
             *_pytest_shards(),
-            _actions_run("Fix pin verification", conclusion="failure", run_id=8),
+            _actions_run("Release notes guard", conclusion="failure", run_id=8),
         ),
         180,
         changed_paths=[_PYTHON_PATH],
-        python_ci=curie_python_ci(),
+        python_ci=conversion_python_ci(),
     )
 
     assert verdict.kind == "failing"
-    assert "Fix pin verification" in _names(verdict.failing)
+    assert "Release notes guard" in _names(verdict.failing)
 
 
 def test_completed_pytest_shards_keep_waiting_for_the_aggregate_to_appear() -> None:
@@ -552,7 +585,7 @@ def test_completed_pytest_shards_keep_waiting_for_the_aggregate_to_appear() -> N
         _detail(*_pytest_shards(status="completed")),
         180,
         changed_paths=[_PYTHON_PATH],
-        python_ci=curie_python_ci(),
+        python_ci=conversion_python_ci(),
     )
 
     assert verdict.kind == "pending"
@@ -561,7 +594,7 @@ def test_completed_pytest_shards_keep_waiting_for_the_aggregate_to_appear() -> N
         _detail(*_pytest_shards(status="completed")),
         1200,
         changed_paths=[_PYTHON_PATH],
-        python_ci=curie_python_ci(),
+        python_ci=conversion_python_ci(),
     )
     assert expired.kind == "unverified"
     assert expired.reason == "required_python_ci_unrelated"
@@ -569,10 +602,13 @@ def test_completed_pytest_shards_keep_waiting_for_the_aggregate_to_appear() -> N
 
 def test_settled_non_shard_checks_without_the_python_aggregate_are_unverified() -> None:
     verdict = _decide(
-        _detail(_actions_run("gitleaks (full history)"), _actions_run("cargo audit", run_id=2)),
+        _detail(
+            _actions_run("Conversion secret scan"),
+            _actions_run("Conversion dependency audit", run_id=2),
+        ),
         180,
         changed_paths=[_PYTHON_PATH],
-        python_ci=curie_python_ci(),
+        python_ci=conversion_python_ci(),
     )
 
     assert verdict.kind == "unverified"
@@ -584,12 +620,12 @@ def test_a_missing_python_aggregate_is_unverified_at_the_ci_deadline() -> None:
         _detail(*_pytest_shards()),
         1200,
         changed_paths=[_PYTHON_PATH],
-        python_ci=curie_python_ci(),
+        python_ci=conversion_python_ci(),
     )
 
     assert verdict.kind == "unverified"
     assert verdict.reason == "required_python_ci_unrelated"
-    assert "Python pytest (shard 1/3)" in _names(verdict.pending)
+    assert "Conversion batch 1/3)" in _names(verdict.pending)
 
 
 def test_the_execution_deadline_ends_a_missing_python_aggregate() -> None:
@@ -598,7 +634,7 @@ def test_the_execution_deadline_ends_a_missing_python_aggregate() -> None:
         _detail(*_pytest_shards()),
         200,
         changed_paths=[_PYTHON_PATH],
-        python_ci=curie_python_ci(),
+        python_ci=conversion_python_ci(),
         execution_deadline=early,
     )
 
@@ -607,17 +643,21 @@ def test_the_execution_deadline_ends_a_missing_python_aggregate() -> None:
 
 
 def test_python_changes_with_no_checks_follow_the_grace_window() -> None:
-    waiting = _decide(_detail(), 119, changed_paths=[_PYTHON_PATH], python_ci=curie_python_ci())
+    waiting = _decide(
+        _detail(), 119, changed_paths=[_PYTHON_PATH], python_ci=conversion_python_ci()
+    )
     assert waiting.kind == "pending"
     assert waiting.reason == "required_python_ci_missing"
-    missing = _decide(_detail(), 180, changed_paths=[_PYTHON_PATH], python_ci=curie_python_ci())
+    missing = _decide(
+        _detail(), 180, changed_paths=[_PYTHON_PATH], python_ci=conversion_python_ci()
+    )
     assert missing.kind == "unverified"
     assert missing.reason == "required_python_ci_missing"
 
 
 def test_the_python_aggregate_is_judged_once_it_appears() -> None:
     shards = _pytest_shards(status="completed")
-    paths = {"changed_paths": [_PYTHON_PATH], "python_ci": curie_python_ci()}
+    paths = {"changed_paths": [_PYTHON_PATH], "python_ci": conversion_python_ci()}
     running = _actions_run(_PYTHON_AGGREGATE, status="in_progress", run_id=9)
     pending = _decide(_detail(*shards, running), 600, **paths)
     assert pending.kind == "pending"
@@ -634,13 +674,181 @@ def test_the_python_aggregate_is_judged_once_it_appears() -> None:
 
 # --- decide: per-repository Python CI policy (#3617) -----------------------------------
 
-_OUTSIDE_PATH = "unitconv/convert.py"
+_OUTSIDE_PATH = "foreignpkg/entrypoint.py"
 
 
 def test_decide_requires_the_python_ci_policy_keyword() -> None:
     parameter = inspect.signature(factory_ci.decide).parameters["python_ci"]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default is inspect.Parameter.empty
+
+
+def test_decide_requires_the_metadata_ci_policy_keyword() -> None:
+    parameter = inspect.signature(factory_ci.decide).parameters["metadata_ci"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+
+
+@pytest.mark.parametrize("seconds", [30, 180, 1200])
+def test_metadata_revision_without_a_policy_is_unverified(seconds: float) -> None:
+    fresh = _run("Unit conversion suite")
+    fresh["started_at"] = "2026-09-24T12:00:01Z"
+
+    verdict = _decide(_detail(fresh), seconds, fresh_after=PUBLISHED, metadata_ci=None)
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "metadata_ci_not_configured"
+
+
+def test_a_metadata_policy_does_not_change_an_ordinary_commit_verdict() -> None:
+    verdict = _decide(
+        _detail(_run("Unit conversion suite")),
+        180,
+        metadata_ci=conversion_metadata_ci(),
+    )
+
+    assert verdict.kind == "green"
+    assert verdict.reason is None
+
+
+@pytest.mark.parametrize("prior_guards", [True, False])
+def test_metadata_revision_requires_each_configured_check_and_status_to_refresh(
+    prior_guards: bool,
+) -> None:
+    old_guard = _run("Publication description guard")
+    old_guard["started_at"] = "2026-09-24T11:00:00Z"
+    old_status = _status("ci/publication-description", "success")
+    old_status["created_at"] = "2026-09-24T11:00:00Z"
+    fresh_suite = _run("Unit conversion suite", run_id=2)
+    fresh_suite["started_at"] = "2026-09-24T12:00:01Z"
+    policy = factory_ci.MetadataCiPolicy(
+        checks=("Publication description guard",),
+        statuses=("ci/publication-description",),
+    )
+    guards = (old_guard,) if prior_guards else ()
+    statuses = (old_status,) if prior_guards else ()
+
+    verdict = _decide(
+        _detail(*guards, fresh_suite, statuses=statuses),
+        180,
+        fresh_after=PUBLISHED,
+        metadata_ci=policy,
+    )
+    assert verdict.kind == "pending"
+    assert verdict.reason == "checks_awaiting_metadata_rerun"
+
+    fresh_guard = _run("Publication description guard", run_id=3)
+    fresh_guard["started_at"] = "2026-09-24T12:00:02Z"
+    verdict = _decide(
+        _detail(*guards, fresh_suite, fresh_guard, statuses=statuses),
+        180,
+        fresh_after=PUBLISHED,
+        metadata_ci=policy,
+    )
+    assert verdict.kind == "pending"
+    assert verdict.reason == "checks_awaiting_metadata_rerun"
+
+    fresh_status = _status("ci/publication-description", "success")
+    fresh_status["created_at"] = "2026-09-24T12:00:03Z"
+    verdict = _decide(
+        _detail(*guards, fresh_suite, fresh_guard, statuses=(*statuses, fresh_status)),
+        180,
+        fresh_after=PUBLISHED,
+        metadata_ci=policy,
+    )
+    assert verdict.kind == "green"
+
+
+def test_the_metadata_ci_policy_setting_defaults_to_empty() -> None:
+    settings = Settings()
+    assert settings.github_factory_metadata_ci == {}
+    assert factory_ci.metadata_ci_policy(settings, "acme-corp/unit-converter") is None
+
+
+def test_the_metadata_ci_policy_setting_parses_and_matches_case_insensitively() -> None:
+    settings = Settings(
+        GITHUB_FACTORY_METADATA_CI=json.dumps(
+            {
+                "Acme-Corp/Unit-Converter": {
+                    "checks": ["Publication description guard"],
+                    "statuses": ["ci/publication-description"],
+                },
+                "acme-corp/another-repository": {"checks": ["Release notes guard"]},
+            }
+        )
+    )
+
+    assert factory_ci.metadata_ci_policy(
+        settings, "acme-corp/unit-converter"
+    ) == factory_ci.MetadataCiPolicy(
+        checks=("Publication description guard",),
+        statuses=("ci/publication-description",),
+    )
+    assert factory_ci.metadata_ci_policy(
+        settings, "ACME-CORP/ANOTHER-REPOSITORY"
+    ) == factory_ci.MetadataCiPolicy(checks=("Release notes guard",), statuses=())
+    assert factory_ci.metadata_ci_policy(settings, "acme-corp/acme-fixture") is None
+
+
+@pytest.mark.parametrize(
+    ("entry", "checks", "statuses"),
+    [
+        ({"checks": ["Publication description guard"]}, ("Publication description guard",), ()),
+        ({"statuses": ["ci/publication-description"]}, (), ("ci/publication-description",)),
+        (
+            {"checks": [], "statuses": ["ci/publication-description"]},
+            (),
+            ("ci/publication-description",),
+        ),
+        (
+            {"checks": ["Publication description guard"], "statuses": []},
+            ("Publication description guard",),
+            (),
+        ),
+    ],
+)
+def test_a_metadata_ci_policy_may_configure_only_one_surface(
+    entry: dict[str, Any], checks: tuple[str, ...], statuses: tuple[str, ...]
+) -> None:
+    settings = Settings(
+        GITHUB_FACTORY_METADATA_CI=json.dumps({"acme-corp/unit-converter": entry})
+    )
+
+    assert factory_ci.metadata_ci_policy(
+        settings, "acme-corp/unit-converter"
+    ) == factory_ci.MetadataCiPolicy(checks=checks, statuses=statuses)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        [],
+        {"acme-corp/unit-converter": {}},
+        {"acme-corp/unit-converter": {"checks": [], "statuses": []}},
+        {"acme-corp/unit-converter": {"checks": "Publication description guard"}},
+        {"acme-corp/unit-converter": {"checks": [""]}},
+        {"acme-corp/unit-converter": {"checks": ["   "]}},
+        {"acme-corp/unit-converter": {"checks": [42]}},
+        {"acme-corp/unit-converter": {"checks": [True]}},
+        {"acme-corp/unit-converter": {"checks": None, "statuses": ["ci/publication-description"]}},
+        {"acme-corp/unit-converter": {"statuses": "ci/publication-description"}},
+        {"acme-corp/unit-converter": {"statuses": [""]}},
+        {"acme-corp/unit-converter": {"statuses": ["   "]}},
+        {"acme-corp/unit-converter": {"statuses": [42]}},
+        {"acme-corp/unit-converter": {"checks": ["guard"], "unknown": []}},
+        {"unit-converter": {"checks": ["guard"]}},
+        {"acme-corp/unit-converter/extra": {"checks": ["guard"]}},
+    ],
+)
+def test_an_invalid_metadata_ci_policy_is_rejected_at_boot(value: Any) -> None:
+    with pytest.raises(ValidationError):
+        Settings(GITHUB_FACTORY_METADATA_CI=json.dumps(value))
+
+
+def test_metadata_ci_policy_is_frozen() -> None:
+    policy = conversion_metadata_ci()
+    with pytest.raises(AttributeError):
+        policy.checks = ("other",)  # type: ignore[misc]
 
 
 def test_an_outside_python_layout_without_a_policy_is_judged_on_its_own_checks() -> None:
@@ -677,23 +885,23 @@ def test_an_outside_python_layout_never_reports_a_required_python_ci_reason(
 
 def test_without_a_policy_no_python_path_is_unselected() -> None:
     assert factory_ci.unselected_python_path([_OUTSIDE_PATH], None) is None
-    assert factory_ci.unselected_python_path(["examples/coder/foo.py"], None) is None
+    assert factory_ci.unselected_python_path(["scripts/convert.py"], None) is None
 
 
-def test_the_curie_policy_still_refuses_an_unselected_path() -> None:
+def test_the_conversion_policy_still_refuses_an_unselected_path() -> None:
     assert (
-        factory_ci.unselected_python_path(["examples/coder/foo.py"], curie_python_ci())
-        == "examples/coder/foo.py"
+        factory_ci.unselected_python_path(["scripts/convert.py"], conversion_python_ci())
+        == "scripts/convert.py"
     )
-    assert factory_ci.unselected_python_path([_PYTHON_PATH], curie_python_ci()) is None
+    assert factory_ci.unselected_python_path([_PYTHON_PATH], conversion_python_ci()) is None
     verdict = _decide(
         _detail(_actions_run(_PYTHON_AGGREGATE)),
         180,
-        changed_paths=["examples/coder/foo.py"],
-        python_ci=curie_python_ci(),
+        changed_paths=["scripts/convert.py"],
+        python_ci=conversion_python_ci(),
     )
     assert verdict.kind == "unverified"
-    assert verdict.reason == "required_python_ci_unselected: examples/coder/foo.py"
+    assert verdict.reason == "required_python_ci_unselected: scripts/convert.py"
 
 
 def custom_python_ci() -> factory_ci.PythonCiPolicy:
@@ -713,7 +921,7 @@ def test_a_custom_policy_requires_its_own_check_name() -> None:
     green = _decide(_detail(_actions_run("Unit tests")), 180, **paths)
     assert green.kind == "green"
 
-    # Curie's aggregate name means nothing to this repository.
+    # The other repository's aggregate name means nothing to this repository.
     other = _decide(_detail(_actions_run(_PYTHON_AGGREGATE)), 180, **paths)
     assert other.kind == "unverified"
     assert other.reason == "required_python_ci_unrelated"
@@ -746,25 +954,25 @@ def test_a_custom_pending_prefix_keeps_waiting_for_its_aggregate() -> None:
 
 def test_python_ci_policy_is_frozen() -> None:
     with pytest.raises(AttributeError):
-        curie_python_ci().check = "other"  # type: ignore[misc]
-    assert curie_python_ci().pending_check_prefix == "Python pytest (shard "
+        conversion_python_ci().check = "other"  # type: ignore[misc]
+    assert conversion_python_ci().pending_check_prefix == "Conversion batch "
     assert factory_ci.PythonCiPolicy(check="c", paths=("p",)).pending_check_prefix is None
 
 
 def test_the_python_ci_policy_setting_defaults_to_empty() -> None:
     settings = Settings()
     assert settings.github_factory_python_ci == {}
-    assert factory_ci.python_ci_policy(settings, "curie-eng/curie") is None
+    assert factory_ci.python_ci_policy(settings, "acme-corp/unit-converter") is None
 
 
 def test_the_python_ci_policy_setting_parses_and_matches_case_insensitively() -> None:
     settings = Settings(
         GITHUB_FACTORY_PYTHON_CI=json.dumps(
             {
-                "curie-eng/curie": {
-                    "check": "Python (ruff + mypy + pytest)",
-                    "paths": list(curie_python_ci().paths),
-                    "pendingCheckPrefix": "Python pytest (shard ",
+                "acme-corp/unit-converter": {
+                    "check": "Unit conversion suite",
+                    "paths": list(conversion_python_ci().paths),
+                    "pendingCheckPrefix": "Conversion batch ",
                 },
                 "Acme/Widgets": {
                     "check": "Unit tests",
@@ -774,7 +982,10 @@ def test_the_python_ci_policy_setting_parses_and_matches_case_insensitively() ->
             }
         )
     )
-    assert factory_ci.python_ci_policy(settings, "Curie-Eng/Curie") == curie_python_ci()
+    assert (
+        factory_ci.python_ci_policy(settings, "Acme-Corp/Unit-Converter")
+        == conversion_python_ci()
+    )
     assert factory_ci.python_ci_policy(settings, "acme/widgets") == custom_python_ci()
     assert factory_ci.python_ci_policy(settings, "acme-corp/acme-fixture") is None
 
@@ -782,12 +993,12 @@ def test_the_python_ci_policy_setting_parses_and_matches_case_insensitively() ->
 @pytest.mark.parametrize(
     "value",
     [
-        {"curie-eng/curie": {"check": "", "paths": ["apps"]}},
-        {"curie-eng/curie": {"check": "Python", "paths": []}},
-        {"curie-eng/curie": {"check": "Python", "paths": ["/apps"]}},
-        {"curie-eng/curie": {"check": "Python", "paths": ["apps/"]}},
-        {"curie": {"check": "Python", "paths": ["apps"]}},
-        {"curie-eng/curie/extra": {"check": "Python", "paths": ["apps"]}},
+        {"acme-corp/unit-converter": {"check": "", "paths": ["unitconv"]}},
+        {"acme-corp/unit-converter": {"check": "Python", "paths": []}},
+        {"acme-corp/unit-converter": {"check": "Python", "paths": ["/unitconv"]}},
+        {"acme-corp/unit-converter": {"check": "Python", "paths": ["unitconv/"]}},
+        {"unit-converter": {"check": "Python", "paths": ["unitconv"]}},
+        {"acme-corp/unit-converter/extra": {"check": "Python", "paths": ["unitconv"]}},
     ],
     ids=["empty-check", "empty-paths", "leading-slash", "trailing-slash", "no-owner", "3-parts"],
 )
@@ -1123,3 +1334,120 @@ def test_tried_summary_clips_a_long_title() -> None:
     summary = factory_ci.tried_summary(publications, verdict, PR_URL)
     assert "t" * 100 in summary
     assert "t" * 101 not in summary
+
+
+# --- decide: delegated required CI (#3873) ---------------------------------------------
+#
+# A declared check that could not run in the sandbox may delegate its proof to a
+# named required pull request check. ``delegated_checks`` names those checks; the
+# request must not complete until each one actually ran and passed.
+
+DELEGATED = "integration-tests"
+
+
+def _delegated_run(conclusion: str | None = "success", status: str = "completed") -> dict[str, Any]:
+    # Any app may own the delegated check; match is by name alone.
+    run = _run(DELEGATED, status=status, conclusion=conclusion, run_id=50)
+    run["app"] = {"slug": "buildkite"}
+    return run
+
+
+def test_a_missing_delegated_check_waits_before_the_ci_deadline() -> None:
+    detail = _detail(_run("lint"), _run("unit", run_id=2))
+    for seconds in (30, 130, 1199):
+        verdict = _decide(detail, seconds, delegated_checks=(DELEGATED,))
+        assert verdict.kind == "pending"
+        assert verdict.reason == "delegated_ci_missing"
+
+
+def test_a_missing_delegated_check_is_unverified_at_the_ci_deadline() -> None:
+    detail = _detail(_run("lint"), _run("unit", run_id=2))
+    verdict = _decide(detail, 1200, delegated_checks=(DELEGATED,))
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "delegated_ci_missing"
+    # The execution deadline caps the CI wait the same way.
+    early = PUBLISHED + timedelta(seconds=600)
+    verdict = _decide(detail, 600, execution_deadline=early, delegated_checks=(DELEGATED,))
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "delegated_ci_missing"
+
+
+def test_no_checks_at_all_is_never_no_ci_when_a_check_is_delegated() -> None:
+    empty = _detail()
+    assert _decide(empty, 130).kind == "no_ci"  # control: today's verdict without delegation
+
+    after_grace = _decide(empty, 130, delegated_checks=(DELEGATED,))
+    assert after_grace.kind == "pending"
+    assert after_grace.reason == "delegated_ci_missing"
+
+    expired = _decide(empty, 1200, delegated_checks=(DELEGATED,))
+    assert expired.kind == "unverified"
+    assert expired.reason == "delegated_ci_missing"
+
+
+@pytest.mark.parametrize("conclusion", ["skipped", "neutral"])
+def test_a_skipped_or_neutral_delegated_check_is_unverified(conclusion: str) -> None:
+    detail = _detail(_run("lint"), _delegated_run(conclusion))
+    # Without delegation the same conclusions read as passing.
+    assert _decide(detail, 30).kind == "green"
+
+    verdict = _decide(detail, 30, delegated_checks=(DELEGATED,))
+    assert verdict.kind == "unverified"
+    assert verdict.reason == f"delegated_ci_{conclusion}"
+
+
+def test_a_failing_delegated_check_goes_to_the_failing_path() -> None:
+    detail = _detail(_run("lint"), _delegated_run("failure"))
+    verdict = _decide(detail, 30, delegated_checks=(DELEGATED,))
+    assert verdict.kind == "failing"
+    assert DELEGATED in _names(verdict.failing)
+
+
+def test_a_pending_delegated_check_keeps_waiting() -> None:
+    detail = _detail(_run("lint"), _delegated_run(status="in_progress", conclusion=None))
+    verdict = _decide(detail, 30, delegated_checks=(DELEGATED,))
+    assert verdict.kind == "pending"
+
+
+def test_a_delegated_commit_status_context_satisfies_the_delegation() -> None:
+    detail = _detail(_run("lint"), statuses=(_status(DELEGATED, "success"),))
+    verdict = _decide(detail, 30, delegated_checks=(DELEGATED,))
+    assert verdict.kind == "green"
+
+
+def test_a_passing_delegated_check_with_unrelated_green_checks_is_green() -> None:
+    detail = _detail(
+        _run("lint"),
+        _run("docs", conclusion="skipped", run_id=2),
+        _delegated_run(),
+        statuses=(_status("ci/jenkins", "success"),),
+    )
+    verdict = _decide(detail, 30, delegated_checks=(DELEGATED,))
+    assert verdict.kind == "green"
+
+
+def test_every_delegated_check_must_be_present() -> None:
+    detail = _detail(_run("lint"), _delegated_run())
+    verdict = _decide(detail, 1200, delegated_checks=(DELEGATED, "e2e"))
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "delegated_ci_missing"
+
+
+@pytest.mark.parametrize(
+    ("detail", "seconds"),
+    [
+        (_detail(_run("build")), 30),
+        (_detail(_run("docs", conclusion="skipped")), 30),
+        (_detail(), 30),
+        (_detail(), 130),
+        (_detail(), 1200),
+        (_detail(_run("build", status="in_progress")), 30),
+        (_detail(_run("build", status="in_progress")), 1200),
+        (_detail(_run("lint", conclusion="failure")), 30),
+        (_detail(statuses=(_status("ci/jenkins", "pending"),)), 30),
+        (_detail(reason="timeout"), 30),
+        (_detail(reason="github_forbidden"), 30),
+    ],
+)
+def test_no_delegated_checks_keeps_todays_verdicts(detail: CiDetail, seconds: float) -> None:
+    assert _decide(detail, seconds, delegated_checks=()) == _decide(detail, seconds)

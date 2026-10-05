@@ -21,7 +21,34 @@ pub(crate) enum ClusterHookAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum ClusterConsoleAction {
+    /// Mint a Console login code using the selected release credential.
+    Login {
+        /// Subject bound to the Console session created from this code.
+        #[arg(long, value_name = "SUBJECT", value_parser = parse_console_subject)]
+        subject: String,
+        /// Platform API base URL. Omit to reach the release API over loopback.
+        #[arg(long, env = "CURIE_API_URL")]
+        api_url: Option<String>,
+        /// Kubernetes namespace of the release. Default: curie.
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        namespace: String,
+        /// Helm release name. Default: curie.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Print the request plan without minting a code.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum ClusterAction {
+    /// Bootstrap access to the Curie Console.
+    Console {
+        #[command(subcommand)]
+        action: ClusterConsoleAction,
+    },
     /// Report value paths that differ between a release and pending Helm files.
     /// A nonempty report is advisory and exits successfully.
     LintValues {
@@ -44,10 +71,14 @@ pub(crate) enum ClusterAction {
     /// recorded model configuration. Use --fake-model to explicitly downgrade
     /// to fake mode. An sk-ant- or sk-or- credential infers its provider egress
     /// when --allow-egress-host is absent. Other credential shapes remain sealed
-    /// until their provider or a raw range is explicit. Existing singleton
-    /// resources are reused only from complete Helm ownership metadata. An exact
-    /// admission result that the gvisor RuntimeClass is absent applies
-    /// security.gvisor.mode=off and retries once. Every inferred value is printed.
+    /// until their provider or a raw range is explicit. A controller owned by
+    /// another Helm release is reused. A healthy unowned controller whose image
+    /// matches the chart is reused. An unhealthy or different unowned controller
+    /// stops the install and names the kubectl repair. A direct GET that
+    /// returns NotFound applies security.gvisor.mode=off before the first
+    /// install and prints the inference. A forbidden lookup still applies that
+    /// override from the exact admission result and retries once. Every
+    /// inferred value is printed.
     Up {
         /// Kubernetes namespace.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
@@ -470,6 +501,11 @@ pub(crate) enum ClusterAction {
         /// 900. A factory install with a 10800s budget needs about 21900s.
         #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
+        /// Bind this digest-pinned runner image in the same helm upgrade as
+        /// the intake settings (`AGENT=ghcr.io/example/runner@sha256:<digest>`).
+        /// The chart is still `--chart`. The values mode stays `--reuse-values`.
+        #[arg(long, value_name = "AGENT=IMAGE")]
+        runner_image: Option<String>,
         /// Kubernetes namespace.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,

@@ -7044,6 +7044,27 @@
         "title": "RunningWorkItemRequest",
         "type": "object"
       },
+      "SandboxCredentialReleasedIn": {
+        "description": "The worker reporting that a sandbox claim released its boot credential\n(#3823). ``credential`` is the ``cred`` claim shared by that claim's\n``state`` and ``state.app`` tokens.",
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "credential": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Credential",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "credential"
+        ],
+        "title": "SandboxCredentialReleasedIn",
+        "type": "object"
+      },
       "ScheduleControlOut": {
         "description": "Current operator pause state for a named cron hook.",
         "properties": {
@@ -7765,7 +7786,7 @@
       },
       "VerificationObservation": {
         "additionalProperties": false,
-        "description": "One declared check's sandbox result recorded before the model starts.\n\n``check`` is the declared check id and ``command`` the exact command the\nrunner ran for it. ``not_declared`` records that neither the bundle nor the\nrepository declared a check, so no command ran: its check, command and\nexit_status are null and it carries no blockers.",
+        "description": "One declared check's sandbox result recorded before the model starts.\n\n``check`` is the declared check id and ``command`` the exact command the\nrunner ran for it. ``not_declared`` records that neither the bundle nor the\nrepository declared a check, so no command ran: its check, command and\nexit_status are null and it carries no blockers. ``delegated_to`` optionally\nnames the required CI check that stands in for a declared check; it is\nnever valid on ``not_declared``.",
         "properties": {
           "blocked_services": {
             "items": {
@@ -7799,6 +7820,19 @@
               }
             ],
             "title": "Command"
+          },
+          "delegated_to": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delegated To"
           },
           "exit_status": {
             "anyOf": [
@@ -16723,6 +16757,59 @@
         "summary": "Advance Publication Lineage",
         "tags": [
           "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/state/released-credentials": {
+      "post": {
+        "description": "Record that a sandbox claim released its boot credential. Idempotent.\n\nThe record expires once no token carrying that id could still be valid\n(``SANDBOX_CREDENTIAL_RELEASED_TTL_S``).",
+        "operationId": "release_sandbox_credential_v1_internal_state_released_credentials_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SandboxCredentialReleasedIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Release Sandbox Credential",
+        "tags": [
+          "internal-state"
         ]
       }
     },

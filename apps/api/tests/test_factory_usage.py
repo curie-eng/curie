@@ -326,6 +326,76 @@ def test_usage_with_an_unpriced_model_is_not_cost_complete(priced: Any) -> None:
     assert body["total_tokens"] == 1020
 
 
+def test_a_zero_token_row_for_an_unpriced_model_is_stored_unpriced_and_costs_zero(
+    priced: Any,
+) -> None:
+    client, github, sink, _book = priced
+    request_id = _admit(client, github, sink, 9640)
+    work_item_id = _request(9640)["work_item_id"]
+    _start_running(request_id)
+
+    response = _usage(client, request_id, [_entry(UNPRICED, 0, 0)], primary=UNPRICED)
+
+    assert response.status_code == 201, response.text
+    (row,) = _stored(request_id)
+    assert row["role"] == "implementer"
+    assert (row["input_tokens"], row["output_tokens"]) == (0, 0)
+    assert row["estimated_cost_usd"] is None
+    assert row["price_source"] is None
+    assert row["price_as_of"] is None
+    headers = {"X-API-Key": get_settings().api_key}
+    body = client.get(f"/work-items/{work_item_id}/usage", headers=headers).json()
+    assert body["total_tokens"] == 0
+    assert body["requests_without_usage"] == 0
+    assert body["cost_complete"] is True
+    assert _money(body["estimated_cost_usd"]) == Decimal(0)
+
+
+def test_a_nonzero_unpriced_row_stays_incomplete_beside_a_zero_unpriced_row(
+    priced: Any,
+) -> None:
+    client, github, sink, _book = priced
+    request_id = _admit(client, github, sink, 9641)
+    work_item_id = _request(9641)["work_item_id"]
+    _start_running(request_id)
+    assert _usage(client, request_id, [_entry(UNPRICED, 0, 0)], primary=UNPRICED).status_code == 201
+    assert (
+        _usage(
+            client, request_id, [_entry(UNPRICED, 5, 5)], turn_id="turn-2", primary=UNPRICED
+        ).status_code
+        == 201
+    )
+
+    headers = {"X-API-Key": get_settings().api_key}
+    body = client.get(f"/work-items/{work_item_id}/usage", headers=headers).json()
+    assert body["total_tokens"] == 10
+    assert body["cost_complete"] is False
+
+
+def test_the_blocked_run_comment_shows_the_explanation_and_a_complete_zero_usage_line(
+    priced: Any,
+) -> None:
+    explanation = (
+        "Could not complete: in-sandbox verification is unavailable before "
+        "implementation, so no model round ran. Check units_rs: package_registry."
+    )
+    client, github, sink, _book = priced
+    request_id = _admit(client, github, sink, 9642)
+    _reconcile()
+    epoch = _start_running(request_id)
+    assert _usage(client, request_id, [_entry(UNPRICED, 0, 0)], primary=UNPRICED).status_code == 201
+    _finish_failed(client, request_id, epoch, "early_stop", detail=explanation)
+    _reconcile()
+
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"]
+    assert explanation in body
+    assert "Cause: early_stop" in body
+    lines = body.splitlines()
+    assert "Usage: implementer 0 tokens ($0.00), total $0.00" in lines
+    assert body.index("Usage: implementer 0 tokens") < body.index(FINAL_MARKER)
+
+
 def test_the_read_route_needs_the_platform_key_and_404s_unknown_items(priced: Any) -> None:
     client, github, sink, _book = priced
     _admit(client, github, sink, 9610)
@@ -507,8 +577,9 @@ def test_the_terminal_line_names_runs_that_reported_no_usage(priced: Any) -> Non
     assert "total at least $2.40" in usage
 
 
+@pytest.mark.parametrize("include_reviewer_totals", [True, False])
 def test_a_follow_up_turn_stores_only_its_increment_and_keeps_the_reviewer_role(
-    priced: Any,
+    priced: Any, include_reviewer_totals: bool,
 ) -> None:
     """Two turns of one request store the running model_usage once.
 
@@ -575,11 +646,14 @@ def test_a_follow_up_turn_stores_only_its_increment_and_keeps_the_reviewer_role(
             reporter.observe(
                 _assistant(REVIEWER, _sdk_usage(200_000, 100_000), parent="toolu_example")
             )
+            reviewer_totals = (
+                {REVIEWER: _model_usage(200_000, 100_000)} if include_reviewer_totals else {}
+            )
             await reporter.report(
                 _result(
                     model_usage={
                         IMPLEMENTER: _model_usage(1_000_000, 500_000),
-                        REVIEWER: _model_usage(200_000, 100_000),
+                        **reviewer_totals,
                     },
                     uuid="turn-a",
                 ),
@@ -590,7 +664,7 @@ def test_a_follow_up_turn_stores_only_its_increment_and_keeps_the_reviewer_role(
                 _result(
                     model_usage={
                         IMPLEMENTER: _model_usage(1_500_000, 700_000),
-                        REVIEWER: _model_usage(200_000, 100_000),
+                        **reviewer_totals,
                     },
                     uuid="turn-b",
                 ),

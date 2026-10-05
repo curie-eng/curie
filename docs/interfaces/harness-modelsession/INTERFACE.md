@@ -35,12 +35,14 @@ The approval policy gate at `runner/src/curie_runner/approval.py` contains no
 SDK imports. Its Claude permission callback and hook adapter live at
 `runner/src/curie_runner/harness/claude/approval.py`.
 
-16 runner modules import `claude_agent_sdk` today (`check.py`, `session.py`,
-`hooks.py`, `adapter.py`, `mcp_argv.py`, `fake.py`, `approval.py`, `translate.py`,
+17 runner modules import `claude_agent_sdk` today (`check.py`, `session.py`,
+`hooks.py`, `adapter.py`, `mcp_argv.py`, `fake.py`, `preflight_blocked.py`,
+`approval.py`, `translate.py`,
 `plugin.py`, `state.py`, `progress.py`, `turn_progress.py`, `issue_read.py`,
 `usage_report.py`, `tool_access.py`, `__main__.py`). In that inventory,
 `approval.py` means `runner/src/curie_runner/harness/claude/approval.py`;
-the core `runner/src/curie_runner/approval.py` has no SDK import. The import
+the core `runner/src/curie_runner/approval.py` has no SDK import.
+`preflight_blocked.py` also lives inside the Claude harness package. The import
 rules in `pyproject.toml` forbid SDK dependencies in the gate and ratchet the
 legacy edges outside the Claude harness package. Only that package is exempt.
 
@@ -123,6 +125,10 @@ Two, both in `runner/src/curie_runner/`:
   harness: `conformance_producer` (`runner/src/curie_runner/conformance.py::conformance_producer`) drives
   a real `SessionRunner` over the fake (`runner/src/curie_runner/conformance.py::_build_runner`), so the ACI conformance gate
   validates the actual translation/final plumbing, not a canned stream.
+- **Blocked preflight:** `PreflightBlockedSession`
+  (`runner/src/curie_runner/harness/claude/preflight_blocked.py::PreflightBlockedSession`) stands in for
+  the model session when a declared verification check is blocked (#3873). It answers
+  every turn offline with one `Could not complete:` message and a zero-token result.
 
 At the package layer there is one supported contribution, Claude
 (`runner/src/curie_runner/harness/claude/__init__.py::CLAUDE_CONTRIBUTION`). It
@@ -153,6 +159,16 @@ walled off, called out in vision-doc Job 1:
    (`runner/src/curie_runner/session.py::SessionRunner`), unlike the declared
    `McpServerReconnector` optional protocol. A session can omit a checkpoint
    capability without a protocol conformance failure.
+4. **Read-only enforcement is not a `ModelSession` operation.** A read-only turn is
+   refused tool by tool only through the SDK fronts that wrap the session's callbacks,
+   `front_pre_tool_use_hooks` (a `HookMatcher` front) and `front_can_use_tool`
+   (`runner/src/curie_runner/tool_access.py`), plus the fake's own check against the
+   shared `TurnToolAccess`. `SessionRunner.enforced_tool_access`
+   (`runner/src/curie_runner/session.py::SessionRunner`) reports read-only as enforced on
+   `/status` whenever the runner holds a `TurnToolAccess` and has not yet sent an
+   unrestricted prompt, without asking the session. A
+   second harness must itself refuse every tool outside the read-only set, or `/status`
+   claims enforcement that is not happening.
 
 ## Cross links
 

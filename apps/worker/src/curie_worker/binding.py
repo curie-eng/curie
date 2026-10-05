@@ -58,12 +58,15 @@ predicate closes.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import math
 import re
 import secrets
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections.abc import Sequence
 from typing import Any
@@ -179,8 +182,14 @@ DECISION_ENV = BootEnv.env_key("approval_decision")
 # Operator scope, like API_BACKEND_ENV/MODEL_ENV_KEY_ENV: forwarded from
 # WorkerConfig.false_completion_check, never per-agent.
 FALSE_COMPLETION_CHECK_ENV = "CURIE_FALSE_COMPLETION_CHECK"
-# the worker re-mints every turn; this only bounds a leaked-token window (ADR-0033)
+# Cap on a sandbox state token (ADR-0033). The boot-env token no longer uses
+# this as its lifetime (#3823); the per-turn memory credential and the
+# connector caller token still do.
 SANDBOX_TOKEN_TTL_SECONDS = 24 * 60 * 60
+# #3823: the boot-env state token outlives the turn by this many seconds, so
+# the runner can finish the state calls already in flight when the turn's
+# stream deadline lands. It is not a second lifetime.
+BOOT_TOKEN_GRACE_SECONDS = 60
 # NULL agents.execution_deadline_seconds means this span. The API stamps the
 # same number at start (curie_api.models.DEFAULT_EXECUTION_DEADLINE_SECONDS).
 DEFAULT_EXECUTION_DEADLINE_SECONDS = 1800
@@ -189,6 +198,9 @@ DEFAULT_EXECUTION_DEADLINE_SECONDS = 1800
 # credential to expire as it did before.
 CLOSED_TURNS_PATH = "/v1/internal/memory/closed-turns"
 _CLOSE_TURN_TIMEOUT = aiohttp.ClientTimeout(total=5)
+# #3823: the worker reports a sandbox claim's boot credential released.
+RELEASED_CREDENTIALS_PATH = "/v1/internal/state/released-credentials"
+_RELEASE_CREDENTIAL_TIMEOUT_S = 5
 # ADR-0188: the ``sender`` claim of a turn with no person behind it (a job, an
 # eval). The runner renders the same string as "no author"
 # (``memory_facts.NO_PERSON``); ``tests/test_memory_fact_key_parity.py`` pins
@@ -1015,6 +1027,7 @@ class BindingResolver:
         caller_run: str | None = None,
         caller_work_item: str | None = None,
         caller_exp_ceiling: int | None = None,
+        token_ttl_s: float | None = None,
     ) -> dict[str, str]:
         """The env injected into the sandbox claim for a bound run.
 
@@ -1117,28 +1130,40 @@ class BindingResolver:
         # and none is set -- preserving the pre-#410 no-key path.
         state_token: str | None = None
         app_state_token: str | None = None
-        exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
+        # #3823: both boot-env state tokens share one credential id and the
+        # turn deadline plus a short grace. The caller token keeps its own
+        # lifetime (ADR 0178): the 24 hour cap, or the run deadline when one
+        # was supplied.
+        state_exp = _boot_state_token_exp(token_ttl_s)
+        credential_id = uuid.uuid4().hex
         if self._config.api_key:
             state_token = sandbox_token.mint(
                 self._config.api_key,
                 agent=str(resolved.agent_id),
                 scope="state",
-                exp=exp,
-                claims={"binding": _binding_claim(kind, address), "memory": "read"},
+                exp=state_exp,
+                claims={
+                    "binding": _binding_claim(kind, address),
+                    "memory": "read",
+                    "cred": credential_id,
+                },
             )
             app_state_token = sandbox_token.mint(
                 self._config.api_key,
                 agent=str(resolved.agent_id),
                 scope="state.app",
-                exp=exp,
+                exp=state_exp,
+                claims={"cred": credential_id},
             )
-        # The caller token (ADR-0168 decision 7): this sandbox's agent, signed
-        # for its hosted connectors, with the state tokens' expiry. No key mints
-        # none, which is the stock install. render_worker emits it only with
-        # the connector scope.
+        # The caller token (ADR-0168 decision 7, ADR 0178): this sandbox's
+        # agent, signed for its hosted connectors. Its expiry stays the 24 hour
+        # cap, or the run's execution deadline when the kernel passed one. It
+        # does not follow the boot state token (#3823). No key mints none,
+        # which is the stock install. render_worker emits it only with the
+        # connector scope.
         connector_caller_token: str | None = None
         if self._config.connector_caller_signing_key.strip():
-            caller_exp = exp
+            caller_exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
             if caller_exp_ceiling is not None:
                 caller_exp = min(caller_exp, int(caller_exp_ceiling))
             connector_caller_token = caller_token.mint(
@@ -1321,6 +1346,99 @@ class BindingResolver:
         if not 200 <= status < 300:
             logger.warning("the API refused to end memory turn %s: HTTP %s", turn, status)
 
+    def release_boot_credential_sync(self, agent_id: str, credential: str) -> bool:
+        """Tell the API this sandbox's boot credential is released (#3823).
+
+        Called from the substrate when the claim that holds the token is
+        deleted. Never raises: a failed report leaves the token to expire at
+        the turn deadline plus grace. An older API without the route answers
+        404, logged once.
+        """
+
+        url = f"{self._config.api_base_url.rstrip('/')}{RELEASED_CREDENTIALS_PATH}"
+        body = json.dumps({"agent_id": agent_id, "credential": credential}).encode()
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Curie-Worker-Token": self._config.internal_worker_token,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=_RELEASE_CREDENTIAL_TIMEOUT_S) as response:
+                status = response.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            logger.warning(
+                "could not report sandbox credential %s as released: %s",
+                credential,
+                type(exc).__name__,
+            )
+            return False
+        if status == 404:
+            if not getattr(self, "_released_credentials_route_missing", False):
+                self._released_credentials_route_missing = True
+                logger.info(
+                    "the API has no released-credentials route (404); boot "
+                    "tokens stay usable until they expire"
+                )
+            return False
+        if not 200 <= status < 300:
+            logger.warning(
+                "the API refused to release sandbox credential %s: HTTP %s",
+                credential,
+                status,
+            )
+            return False
+        return True
+
+
+def boot_token_facts(token: str | None) -> tuple[str | None, str | None, int | None]:
+    """``(agent, cred, exp)`` from a boot state token this worker minted.
+
+    An unsigned read of the payload. The signature is checked by the API.
+    Returns three Nones when the token is absent or does not carry the
+    #3823 credential id.
+    """
+
+    if not token or token.count(".") != 2:
+        return None, None, None
+    try:
+        segment = token.split(".")[1]
+        padded = segment + "=" * (-len(segment) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+    except (ValueError, json.JSONDecodeError):
+        return None, None, None
+    if not isinstance(payload, dict):
+        return None, None, None
+    agent = payload.get("agent")
+    cred = payload.get("cred")
+    exp = payload.get("exp")
+    if not isinstance(agent, str) or not isinstance(cred, str) or type(exp) is not int:
+        return None, None, None
+    return agent, cred, exp
+
+
+def _boot_state_token_exp(token_ttl_s: float | None) -> int:
+    """Absolute expiry of a boot-env state token (#3823).
+
+    ``token_ttl_s`` is the turn's stream deadline. The token ends that many
+    seconds later, plus ``BOOT_TOKEN_GRACE_SECONDS``, and never later than
+    ``SANDBOX_TOKEN_TTL_SECONDS``. Omitted means the default execution
+    deadline, so a caller that forgets the budget does not mint a day-long
+    token.
+    """
+
+    if token_ttl_s is None:
+        lifetime = DEFAULT_EXECUTION_DEADLINE_SECONDS
+    else:
+        lifetime = math.ceil(max(0.0, token_ttl_s))
+    bounded = min(lifetime + BOOT_TOKEN_GRACE_SECONDS, SANDBOX_TOKEN_TTL_SECONDS)
+    return int(time.time()) + bounded
+
 
 def _binding_claim(kind: str | None, address: str | None) -> str | None:
     """The ADR-0188 ``binding`` claim: ``"<kind>:<address>"``, unquoted, the same
@@ -1418,8 +1536,7 @@ def inject_connector_secrets(
             # ADR 0176 decision 2. The marker must not name it either, or the
             # k8s substrate would look for a sandbox secretKeyRef.
             logger.warning(
-                "Dropping connector secret withheld from the sandbox "
-                "(never injected, never marked)"
+                "Dropping connector secret withheld from the sandbox (never injected, never marked)"
             )
             continue
         if is_reserved_boot_env_name(name):

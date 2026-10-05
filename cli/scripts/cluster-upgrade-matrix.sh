@@ -506,6 +506,243 @@ raise SystemExit(0 if ok else 1)
     rm -rf "$timing_dir"
     EVIDENCE_DIR="$saved_evidence"
     GITHUB_STEP_SUMMARY="$saved_summary"
+    if awk '/^cluster_upgrade\(\)/,/^}/' "$script_path" | awk '
+        /settle_helm_operation/ { if (!upgrade) settled=1 }
+        /cluster upgrade --yes/ { upgrade=1 }
+        END { exit (settled && upgrade) ? 0 : 1 }
+    '; then
+        log "cluster_upgrade settles helm before the next upgrade"
+    else
+        log "self-test: cluster_upgrade must settle a pending helm operation before the next upgrade"
+        failed=1
+    fi
+    if ! declare -F settle_helm_operation >/dev/null 2>&1; then
+        log "self-test: settle_helm_operation is missing"
+        failed=1
+    else
+        local probe bindir state logf saved_ns saved_kube saved_wait
+        probe="$(mktemp -d)"
+        bindir="$probe/bin"
+        state="$probe/state"
+        logf="$probe/log"
+        mkdir -p "$bindir" "$state"
+        cat >"$bindir/kubectl" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >>"$CURIE_SETTLE_LOG"
+if [[ "$1" == "--kubeconfig" ]]; then
+    shift 2
+fi
+if [[ "$1" == "get" && "$2" == "namespace" ]]; then
+    if [[ -f "$CURIE_SETTLE_STATE/lookup_fail" ]]; then
+        echo "The connection to the server was refused" >&2
+        exit 1
+    fi
+    if [[ -s "$CURIE_SETTLE_STATE/phases" ]]; then
+        phase="$(head -n 1 "$CURIE_SETTLE_STATE/phases")"
+        tail -n +2 "$CURIE_SETTLE_STATE/phases" >"$CURIE_SETTLE_STATE/phases.next"
+        mv "$CURIE_SETTLE_STATE/phases.next" "$CURIE_SETTLE_STATE/phases"
+        if [[ "$phase" == "absent" ]]; then
+            echo 'Error from server (NotFound): namespaces "acme-2590" not found' >&2
+            exit 1
+        fi
+        printf '%s' "$phase"
+        exit 0
+    fi
+    if [[ -f "$CURIE_SETTLE_STATE/phase" ]]; then
+        cat "$CURIE_SETTLE_STATE/phase"
+        exit 0
+    fi
+    echo 'Error from server (NotFound): namespaces "acme-2590" not found' >&2
+    exit 1
+fi
+if [[ "$1" == "create" && "$2" == "namespace" ]]; then
+    if [[ -f "$CURIE_SETTLE_STATE/create_fail" ]]; then
+        echo "namespace create refused" >&2
+        exit 1
+    fi
+    printf 'Active' >"$CURIE_SETTLE_STATE/phase"
+    exit 0
+fi
+exit 0
+EOF
+        cat >"$bindir/helm" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >>"$CURIE_SETTLE_LOG"
+cmd=""
+for arg in "$@"; do
+    if [[ "$arg" == "status" || "$arg" == "rollback" ]]; then
+        cmd="$arg"
+    fi
+done
+if [[ "$cmd" == "status" ]]; then
+    if [[ -f "$CURIE_SETTLE_STATE/rolled" ]]; then
+        printf '%s\n' '{"info":{"status":"deployed"}}'
+        exit 0
+    fi
+    if [[ -f "$CURIE_SETTLE_STATE/status_fail" ]]; then
+        echo "The connection to the server was refused" >&2
+        exit 1
+    fi
+    if [[ -s "$CURIE_SETTLE_STATE/statuses" ]]; then
+        status="$(head -n 1 "$CURIE_SETTLE_STATE/statuses")"
+        tail -n +2 "$CURIE_SETTLE_STATE/statuses" >"$CURIE_SETTLE_STATE/statuses.next"
+        if [[ "$status" == "pending-upgrade" && ! -s "$CURIE_SETTLE_STATE/statuses.next" ]]; then
+            rm -f "$CURIE_SETTLE_STATE/statuses.next"
+            printf '%s\n' '{"info":{"status":"pending-upgrade"}}'
+            exit 0
+        fi
+        mv "$CURIE_SETTLE_STATE/statuses.next" "$CURIE_SETTLE_STATE/statuses"
+        if [[ "$status" == "missing" ]]; then
+            echo "Error: release: not found" >&2
+            exit 1
+        fi
+        printf '{"info":{"status":"%s"}}\n' "$status"
+        exit 0
+    fi
+    printf '%s\n' '{"info":{"status":"deployed"}}'
+    exit 0
+fi
+if [[ "$cmd" == "rollback" ]]; then
+    printf '1' >"$CURIE_SETTLE_STATE/rolled"
+    exit 0
+fi
+exit 0
+EOF
+        chmod +x "$bindir/kubectl" "$bindir/helm"
+        saved_ns="$NAMESPACE"
+        saved_kube="$KUBECONFIG_FILE"
+        saved_path="$PATH"
+        saved_wait="${CURIE_HELM_SETTLE_WAIT_SECONDS-}"
+        saved_poll="${CURIE_HELM_SETTLE_POLL_SECONDS-}"
+        NAMESPACE="acme-2590"
+        KUBECONFIG_FILE="$probe/kubeconfig"
+        export CURIE_SETTLE_STATE="$state" CURIE_SETTLE_LOG="$logf"
+        export PATH="$bindir:$PATH"
+        export CURIE_HELM_SETTLE_WAIT_SECONDS=0 CURIE_HELM_SETTLE_POLL_SECONDS=0
+        printf 'pending-upgrade\n' >"$state/statuses"
+        if ! settle_helm_operation; then
+            log "self-test: pending helm with a missing namespace did not settle"
+            failed=1
+        elif [[ "$(cat "$state/phase" 2>/dev/null)" != "Active" || ! -f "$state/rolled" ]]; then
+            log "self-test: pending helm must create the namespace and roll back"
+            failed=1
+        elif ! grep -q 'create namespace acme-2590' "$logf"; then
+            log "self-test: namespace create was not issued"
+            failed=1
+        else
+            log "pending helm created the namespace and rolled back"
+        fi
+        rm -f "$state/rolled" "$state/phase" "$state/lookup_fail" "$state/status_fail" \
+            "$state/create_fail" "$logf" "$state/phases" "$state/statuses"
+        printf 'Active' >"$state/phase"
+        printf 'deployed\n' >"$state/statuses"
+        if ! settle_helm_operation; then
+            log "self-test: a deployed release in an Active namespace was refused"
+            failed=1
+        elif [[ -f "$state/rolled" ]] || grep -q 'create namespace' "$logf"; then
+            log "self-test: a healthy release must not create a namespace or roll back"
+            failed=1
+        else
+            log "healthy release left the namespace and helm release alone"
+        fi
+        rm -f "$state/rolled" "$state/phase" "$logf" "$state/statuses"
+        printf 'Terminating\nabsent\n' >"$state/phases"
+        printf 'missing\n' >"$state/statuses"
+        export CURIE_HELM_SETTLE_WAIT_SECONDS=5 CURIE_HELM_SETTLE_POLL_SECONDS=0
+        if ! settle_helm_operation; then
+            log "self-test: a terminating namespace that disappeared was refused"
+            failed=1
+        elif [[ -f "$state/rolled" || "$(cat "$state/phase" 2>/dev/null)" != "Active" ]]; then
+            log "self-test: a finished terminating namespace must be created without a rollback"
+            failed=1
+        else
+            log "terminating namespace was created after it disappeared"
+        fi
+        rm -f "$state/rolled" "$state/phase" "$logf" "$state/phases" "$state/statuses"
+        printf 'Active' >"$state/phase"
+        printf 'pending-upgrade\ndeployed\n' >"$state/statuses"
+        if ! settle_helm_operation; then
+            log "self-test: a pending upgrade that finished was refused"
+            failed=1
+        elif [[ -f "$state/rolled" ]]; then
+            log "self-test: a pending upgrade that finished inside the wait was rolled back"
+            failed=1
+        else
+            log "pending upgrade that finished inside the wait was left in place"
+        fi
+        rm -f "$state/rolled" "$logf" "$state/statuses"
+        printf 'Active' >"$state/phase"
+        touch "$state/lookup_fail"
+        if settle_helm_operation; then
+            log "self-test: a failed namespace lookup was treated as settled"
+            failed=1
+        elif grep -q 'create namespace' "$logf"; then
+            log "self-test: a failed namespace lookup created a namespace"
+            failed=1
+        else
+            log "failed namespace lookup stopped the next upgrade"
+        fi
+        rm -f "$state/lookup_fail" "$state/rolled" "$logf"
+        touch "$state/status_fail"
+        if settle_helm_operation; then
+            log "self-test: a failed helm status was treated as settled"
+            failed=1
+        elif [[ -f "$state/rolled" ]]; then
+            log "self-test: a failed helm status rolled the release back"
+            failed=1
+        else
+            log "failed helm status stopped the next upgrade"
+        fi
+        rm -f "$state/status_fail" "$state/rolled" "$logf" "$state/statuses"
+        printf 'Active' >"$state/phase"
+        printf 'deployed\n' >"$state/statuses"
+        local errexit_out
+        errexit_out="$probe/errexit.out"
+        (
+            set +e
+            settle_helm_operation
+            false
+            printf 'continued:%s\n' "$?"
+        ) >"$errexit_out"
+        if [[ "$(cat "$errexit_out")" != "continued:1" ]]; then
+            log "self-test: settlement turned errexit back on before the expected upgrade failure"
+            failed=1
+        else
+            log "settlement left a disabled errexit disabled"
+        fi
+        rm -f "$state/lookup_fail" "$logf"
+        touch "$state/lookup_fail"
+        errexit_out="$probe/errexit-on.out"
+        set +e
+        (
+            set -e
+            settle_helm_operation
+            echo "next:$-:$?" >&2
+            printf 'continued\n'
+        ) >"$errexit_out"
+        set -e
+        if grep -q continued "$errexit_out"; then
+            log "self-test: a settle failure did not stop a caller that has errexit on"
+            failed=1
+        else
+            log "a settle failure still stops a caller that has errexit on"
+        fi
+        NAMESPACE="$saved_ns"
+        KUBECONFIG_FILE="$saved_kube"
+        export PATH="$saved_path"
+        if [[ -n "$saved_wait" ]]; then
+            export CURIE_HELM_SETTLE_WAIT_SECONDS="$saved_wait"
+        else
+            unset CURIE_HELM_SETTLE_WAIT_SECONDS
+        fi
+        if [[ -n "$saved_poll" ]]; then
+            export CURIE_HELM_SETTLE_POLL_SECONDS="$saved_poll"
+        else
+            unset CURIE_HELM_SETTLE_POLL_SECONDS
+        fi
+        unset CURIE_SETTLE_STATE CURIE_SETTLE_LOG
+        rm -rf "$probe"
+    fi
     (( failed == 0 )) || die "self-test failed"
     log "self-test passed"
     if (( JSON )); then
@@ -538,6 +775,141 @@ kubectl_ns() {
 
 helm_ns() {
     helm --kubeconfig "$KUBECONFIG_FILE" -n "$NAMESPACE" "$@"
+}
+
+# Prints the phase and returns 0 when the namespace exists, 2 when it is
+# absent, and 1 when kubectl itself fails. Absence is NotFound only. A
+# connection error must not look like a missing namespace. Status is captured
+# in an AND/OR list so this does not change the caller's errexit setting.
+lookup_namespace() {
+    local err rc out
+    err="$(mktemp)"
+    out="$(kubectl --kubeconfig "$KUBECONFIG_FILE" get namespace "$NAMESPACE" \
+        -o jsonpath='{.status.phase}' 2>"$err")" && rc=0 || rc=$?
+    if (( rc == 0 )); then
+        printf '%s' "$out"
+        rm -f "$err"
+        return 0
+    fi
+    if grep -qi 'NotFound' "$err"; then
+        rm -f "$err"
+        return 2
+    fi
+    log "namespace lookup failed: $(tr '\n' ' ' <"$err")"
+    rm -f "$err"
+    return 1
+}
+
+# Prints the Helm status. Returns 0 and an empty string when the release is
+# absent. Returns 1 when helm itself fails, including a missing namespace.
+read_helm_settle_status() {
+    local err rc raw
+    err="$(mktemp)"
+    raw="$(helm_ns status "$RELEASE" -o json 2>"$err")" && rc=0 || rc=$?
+    if (( rc != 0 )); then
+        if grep -qi 'release: not found' "$err"; then
+            rm -f "$err"
+            return 0
+        fi
+        log "helm status failed: $(tr '\n' ' ' <"$err")"
+        rm -f "$err"
+        return 1
+    fi
+    rm -f "$err"
+    printf '%s' "$raw" | python3 -c 'import json,sys
+try:
+    print((json.load(sys.stdin).get("info") or {}).get("status") or "")
+except Exception:
+    raise SystemExit(1)'
+}
+
+# Helm upgrade does not create the release namespace. A shard that assumes
+# acme-2590 still exists fails the next step when the previous operation
+# removed it. A Terminating namespace that finishes inside the wait is created
+# again. A lookup or create failure is returned to the caller.
+ensure_namespace() {
+    local phase rc wait_s deadline poll err
+    wait_s="${CURIE_HELM_SETTLE_WAIT_SECONDS:-30}"
+    poll="${CURIE_HELM_SETTLE_POLL_SECONDS:-1}"
+    deadline=$((SECONDS + wait_s))
+    while true; do
+        phase="$(lookup_namespace)" && rc=0 || rc=$?
+        if (( rc == 1 )); then
+            return 1
+        fi
+        if (( rc == 0 )) && [[ "$phase" == "Active" ]]; then
+            return 0
+        fi
+        if (( rc == 2 )); then
+            break
+        fi
+        if (( SECONDS >= deadline )); then
+            log "namespace $NAMESPACE is ${phase:-unknown}; refusing to use it"
+            return 1
+        fi
+        sleep "$poll"
+    done
+    log "creating namespace $NAMESPACE"
+    err="$(mktemp)"
+    kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace "$NAMESPACE" 2>"$err" && rc=0 || rc=$?
+    if (( rc != 0 )); then
+        log "namespace create failed: $(tr '\n' ' ' <"$err")"
+        rm -f "$err"
+        return 1
+    fi
+    rm -f "$err"
+}
+
+# A killed `helm upgrade` leaves the release pending, and the next upgrade
+# then fails with "another operation is in progress" (run 36125059536, s14).
+# Poll while a live operation can finish, then roll back a stuck pending
+# release. A deployed release returns without a rollback. Helm and kubectl
+# failures return to the caller instead of looking like a settled release.
+settle_helm_operation() {
+    local wait_s deadline poll st rc
+    ensure_namespace || return $?
+    wait_s="${CURIE_HELM_SETTLE_WAIT_SECONDS:-30}"
+    poll="${CURIE_HELM_SETTLE_POLL_SECONDS:-1}"
+    deadline=$((SECONDS + wait_s))
+    st=""
+    while true; do
+        st="$(read_helm_settle_status)" && rc=0 || rc=$?
+        if (( rc != 0 )); then
+            return "$rc"
+        fi
+        case "$st" in
+            pending-upgrade|pending-rollback|pending-install|uninstalling)
+                if (( SECONDS >= deadline )); then
+                    break
+                fi
+                sleep "$poll"
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    done
+    log "helm status stayed ${st:-unknown}; rolling back so the next upgrade can start"
+    recover_helm_lock
+    deadline=$((SECONDS + wait_s))
+    while true; do
+        st="$(read_helm_settle_status)" && rc=0 || rc=$?
+        if (( rc != 0 )); then
+            return "$rc"
+        fi
+        case "$st" in
+            pending-upgrade|pending-rollback|pending-install|uninstalling)
+                if (( SECONDS >= deadline )); then
+                    log "helm status stayed $st after rollback"
+                    return 1
+                fi
+                sleep "$poll"
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    done
 }
 
 fullname() {
@@ -618,7 +990,9 @@ download_pin() {
         rm -f "$dest"
     fi
     log "downloading $(basename "$dest")"
-    curl -fsSL --retry 3 -o "$dest" "$url"
+    # --retry alone does not retry a connection reset (curl exit 35). That
+    # reset dropped the 0.8.9 binary on upgrade shard s03.
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$dest" "$url"
     verify_sha256 "$sha" "$dest"
 }
 
@@ -1028,6 +1402,7 @@ cluster_upgrade() {
     shift 2
     local extra=("$@")
     refuse_soak "$NAMESPACE" "$RELEASE"
+    settle_helm_operation || return $?
     if [[ "$to" == "0.10.0" || "$to" == "0.10.1" ]]; then
         exclusive_kind_tag "$to"
     fi

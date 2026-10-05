@@ -1,3 +1,4 @@
+import ast
 import json
 import subprocess
 import sys
@@ -112,6 +113,33 @@ def _write_linear_migrations(repo_root: Path) -> None:
 
 
 def _run_gate(repo_root: Path | None = None) -> subprocess.CompletedProcess[str]:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+    if repo_root is not None:
+        catalog_path = repo_root / "cli/src/application_schema_windows.json"
+        if catalog_path.exists():
+            candidate = json.loads(catalog_path.read_text())["candidate"]
+            graph = {}
+            for path in (repo_root / "apps/api/alembic/versions").glob("*.py"):
+                fields = {}
+                for node in ast.parse(path.read_text()).body:
+                    if isinstance(node, ast.Assign):
+                        for target in node.targets:
+                            if isinstance(target, ast.Name) and target.id in (
+                                "revision", "down_revision"
+                            ):
+                                fields[target.id] = ast.literal_eval(node.value)
+                if "revision" in fields:
+                    parent = fields.get("down_revision")
+                    graph[fields["revision"]] = (
+                        list(parent) if isinstance(parent, (tuple, list))
+                        else [parent] if parent else []
+                    )
+            owner = repo_root / (
+                "packages/protected-hooks/src/curie_protected_hooks/schema_serving.json"
+            )
+            owner.parent.mkdir(parents=True, exist_ok=True)
+            owner.write_text(json.dumps(dict(**candidate, revision_parents=graph),
+                                        indent=2, sort_keys=True) + "\n")
     args = [] if repo_root is None else ["--repo-root", str(repo_root)]
     return run_script(CHECKER, *args)
 

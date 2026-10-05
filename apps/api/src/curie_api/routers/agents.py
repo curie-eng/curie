@@ -9,13 +9,19 @@ from pathlib import Path
 from typing import NoReturn
 
 from aci_protocol.turn import route_identity
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from curie_protected_hooks.source_policy_sql import (
+    SourceGate,
+    SourceGateInvalid,
+    SourceSnapshotUnavailable,
+    ensure_source_gate_live,
+)
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from plugin_format import connector_lock
 from plugin_format.connector_render import AmbiguousObjectName
 from plugin_format.deploy_targets import connectors_for_agent, restrict_connectors
 from pydantic import BaseModel
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -179,19 +185,31 @@ async def get_agent(agent_id: uuid.UUID, session: SessionDep) -> AgentOut:
 
 @router.get("/{agent_id}/hook-secret", response_model=HookSecretOut)
 async def get_hook_secret(
-    agent_id: uuid.UUID, session: SessionDep, response: Response
+    agent_id: uuid.UUID, session: SessionDep, response: Response, request: Request
 ) -> HookSecretOut:
-    agent = await crud_agents.get_agent(session, agent_id)
-    if agent is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
-    response.headers["Cache-Control"] = "no-store"
-    return HookSecretOut(
-        secret=hook_signing.derive(
-            get_settings().api_key,
-            agent_id=str(agent.id),
-            generation=agent.hook_generation,
-        )
-    )
+    # @spec PROTECTED-HOOK-SOURCE-2/5.
+    try:
+        gate = getattr(request.app.state, "source_gate", None)
+        if not isinstance(gate, SourceGate):
+            raise SourceSnapshotUnavailable("source_gate_unavailable")
+        async with gate.hold(agent_id) as held:
+            agent = await crud_agents.get_agent(session, agent_id)
+            if agent is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+            counter = agent.hook_generation
+            if type(counter) is not int or not 0 <= counter <= 2**31 - 1:
+                raise SourceSnapshotUnavailable("invalid_source_state")
+            await ensure_source_gate_live(held)
+            response.headers["Cache-Control"] = "no-store"
+            return HookSecretOut(
+                secret=hook_signing.derive(
+                    get_settings().api_key,
+                    agent_id=str(agent.id),
+                    generation=counter,
+                )
+            )
+    except (SourceGateInvalid, SourceSnapshotUnavailable, SQLAlchemyError):
+        raise HTTPException(503, "authority_unavailable") from None
 
 
 @router.patch("/{agent_id}", response_model=AgentOut)

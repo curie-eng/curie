@@ -46,7 +46,8 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 - **One decision point.** `Ui::emit(&dyn CliOutput)` (`cli/src/ui.rs`) is the only
   success-path branch: under `--json` it writes `to_json()` as one compact line via
   `emit_json`; otherwise it calls `render(self)`. Handlers must not call a stdout
-  emitter directly. The binary's `emit<T: CliOutput>` helper (`cli/src/dispatch/mod.rs`) is the
+  emitter directly, apart from the pinned sites listed under `raw_emit_sites` in
+  `cli/schema/index.json`. The binary's `emit<T: CliOutput>` helper (`cli/src/dispatch/mod.rs`) is the
   dispatch-side funnel that routes every read verb's return value through it.
 - **One JSON object per invocation.** `to_json` returns a single
   `serde_json::Value`, emitted as one line. A multi-line or streamed stdout payload
@@ -122,7 +123,10 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   were converted. `schema_inventory.rs` pins the per-file `.emit_json(` call-site
   count and raises `UnexpectedRawEmitter` when a new direct emitter appears, so a
   handler that bypasses the seam and prints to stdout directly breaks CI rather
-  than sliding through on convention alone. The residual is that this is a
+  than sliding through on convention alone. Three accepted raw sites are pinned:
+  `Ui::emit` itself in `cli/src/ui.rs`, the error path in `main` in `cli/src/main.rs`,
+  and `report_sweep` in `cli/src/commands/eval.rs`, which emits the sweep payload through
+  `Ui::emit_json` directly. The residual is that this is a
   syntactic call-site inventory, not a type-level proof that *every* verb returns
   a `CliOutput`.
 - **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no

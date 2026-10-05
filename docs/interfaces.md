@@ -16,7 +16,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Harness in-proc / ModelSession | CLEAN | 1 + fake | A- | (folds into #25) | [Harness in-proc / ModelSession](interfaces/harness-modelsession/INTERFACE.md) |
 | ACI producer (frozen protocol) | CLEAN, frozen | 1 + reference | A- | #25, #47 | [ACI producer (frozen protocol)](interfaces/aci-producer/INTERFACE.md) |
 | Channel / ingress | CLEAN | 4 reply adapters behind the `ReplySink` port (Slack, HTTP, built-in cluster-message relay, acknowledge-only GitHub) + a second wire ingress producer (Rust CLI) | B- | #7, #19, #27, #38, #1515 | [Channel / ingress](interfaces/channel-ingress/INTERFACE.md) |
-| Channel interaction message | CLEAN | 2 renderers (Slack, terminal) | not separately graded | ADR-0020 | [Channel interaction message](interfaces/channel-interaction/INTERFACE.md) |
+| Channel interaction message | CLEAN | 4 renderers (Slack, terminal, mail, Discord) | not separately graded | ADR-0020 | [Channel interaction message](interfaces/channel-interaction/INTERFACE.md) |
 | Model provider / credentials | SOFT | 2 prefix-routed (Anthropic, OpenRouter) + base-URL-selected provider-native endpoints (Zhipu, Moonshot, DeepSeek, Ollama) | not separately graded | #24, #46 | [Model provider / credentials](interfaces/model-provider/INTERFACE.md) |
 | Telemetry / OTEL | SOFT | 1 | B+ | #47, #1817, #1818, #1819 | [Telemetry / OTEL](interfaces/telemetry-otel/INTERFACE.md) |
 | Evals (case + scorer) | SOFT | 2 scorers (grader family + trajectory matcher) | B | #8, #26 | [Evals (case + scorer)](interfaces/evals/INTERFACE.md) |
@@ -24,11 +24,11 @@ is documentation of where the code already draws the line, not a new abstraction
 | Relational DB (Postgres) | SOFT | 1 | A- | #84 | [Relational DB (Postgres)](interfaces/relational-db/INTERFACE.md) |
 | Queue / stream (Valkey) | CLEAN | 1 (redis-py) behind the broker port | not separately graded | #85, #7 | [Queue / stream (Valkey)](interfaces/queue-stream/INTERFACE.md) |
 | Bundle format | CLEAN, frozen | 1 | not separately graded | #30 | [Bundle format](interfaces/bundle-format/INTERFACE.md) |
-| Approval / authorizer | CLEAN | 3 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list) | not separately graded | #22 | [Approval / authorizer](interfaces/approval/INTERFACE.md) |
+| Approval / authorizer | CLEAN | 5 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list, email list, no verifiable approvers) | not separately graded | #22 | [Approval / authorizer](interfaces/approval/INTERFACE.md) |
 | Workflow state store | SOFT | 1 (API state router) | not separately graded | #23, #248 | [Workflow state store](interfaces/workflow-state/INTERFACE.md) |
 | Memory | CLEAN | 1 loader (StateApiMemoryStore) + facts store (MemoryFactsStore) | not separately graded | #28 | [Memory](interfaces/memory/INTERFACE.md) |
 | Conversation history | CLEAN | 1 loader (StateApiTranscriptStore) | not separately graded | #20 | [Conversation history](interfaces/conversation-history/INTERFACE.md) |
-| Triggers | SOFT | 7 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook, GH factory issue intake, factory missed-label reconcile) + per-agent cron scheduler (worker cron_loop) | not separately graded | #29 | [Triggers](interfaces/triggers/INTERFACE.md) |
+| Triggers | SOFT | 8 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook, GH factory issue intake, GH factory poll intake, factory missed-label reconcile) + per-agent cron scheduler (worker cron_loop) | not separately graded | #29 | [Triggers](interfaces/triggers/INTERFACE.md) |
 | CLI output (agent-facing `--json`) | CLEAN | 65 outputs behind one trait | not separately graded | #456 | [CLI output (agent-facing `--json`)](interfaces/cli-output/INTERFACE.md) |
 | Harness package (declared contribution) | CLEAN | 1 supported built in Claude contribution | not separately graded | #3828 | [Harness package (declared contribution)](interfaces/harness-package/INTERFACE.md) |
 | Connector host (bundle-declared MCP servers) | CLEAN | 1 (Kubernetes) + in-memory fake | not separately graded | #1063, #1184 | [Connector host (bundle-declared MCP servers)](interfaces/connector-host/INTERFACE.md) |

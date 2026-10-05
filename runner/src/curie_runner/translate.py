@@ -60,23 +60,25 @@ RESULT_MAX_BYTES = 64_000
 # Platform ErrorEvent.classification vocabulary. Allowlist-constrain only: do
 # not synonym-map SDK ``rate_limit`` onto platform ``rate-limit``, which would
 # make a currently non-retryable token retryable.
-PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
-    "rate-limit",
-    "runner-error",
-    "runner-timeout",
-    "workspace-error",
-    "budget-exceeded",
-    "server-error",
-    "ledger-error",
-    "model-credential-rejected",
-    "model-credit-exhausted",
-    "approval-not-acted",
-    "false-completion",
-    "publication-unrecorded",
-    "history-persistence-error",
-    # #3071: the turn budget ran out (SDK result subtype ``error_max_turns``).
-    "max-turns",
-})
+PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
+    {
+        "rate-limit",
+        "runner-error",
+        "runner-timeout",
+        "workspace-error",
+        "budget-exceeded",
+        "server-error",
+        "ledger-error",
+        "model-credential-rejected",
+        "model-credit-exhausted",
+        "approval-not-acted",
+        "false-completion",
+        "publication-unrecorded",
+        "history-persistence-error",
+        # #3071: the turn budget ran out (SDK result subtype ``error_max_turns``).
+        "max-turns",
+    }
+)
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 
 # SDK ResultMessage subtypes that name a known platform failure (#3071). Only
@@ -121,10 +123,34 @@ def _provider_error_text(message: AssistantMessage) -> str:
         for block in message.content
         if isinstance(block, TextBlock) and block.text.strip()
     )
+    return _redact_and_clip(text)
+
+
+def _redact_and_clip(text: str) -> str:
     text = redact_text(text)
     if len(text) > _PROVIDER_TEXT_MAX:
         text = text[: _PROVIDER_TEXT_MAX - 3].rstrip() + "..."
     return text
+
+
+# Tools that run a subagent. Its model errors never reach the runner as an
+# errored AssistantMessage (forward_subagent_text is off); they surface only as
+# this call's error result (#3935).
+_SUBAGENT_TOOLS = frozenset({"Agent", "Task"})
+
+
+def _result_text(content: object) -> str:
+    """The text of a tool result: a string, or the text parts of a block list."""
+
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return " ".join(
+            part["text"].strip()
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"].strip()
+        )
+    return ""
 
 
 def _is_credit_exhausted(error: str, provider_text: str) -> bool:
@@ -141,6 +167,9 @@ class TurnState:
     tool_access: ToolAccess | None = None
     side_effect_emitted: bool = False
     error_classification: str | None = None
+    # Runner-internal latch, not a wire field (#3935): set once credit
+    # exhaustion is classified so a later recoverable error cannot mask it.
+    credit_exhausted: bool = False
     # The summary passed to the approval-request tool (ADR-0010), captured off
     # the ToolUseBlock so the session can end the turn awaiting-approval. None
     # when no approval was requested this turn.
@@ -282,6 +311,7 @@ def _translate_assistant(
     activity: ProgressActivity | None = None,
 ) -> list[OutboundEvent]:
     events: list[OutboundEvent] = []
+    nested = message.parent_tool_use_id is not None
 
     # Assistant usage is per-message. ResultMessage usage is a turn total and
     # must never be copied onto the last generation, where it would double-count
@@ -297,6 +327,7 @@ def _translate_assistant(
         provider_text = _provider_error_text(message)
         if _is_credit_exhausted(error, provider_text):
             mapped = CREDIT_EXHAUSTED_CLASSIFICATION
+            state.credit_exhausted = True
         else:
             mapped = map_error_classification(error)
         state.error_classification = mapped
@@ -312,13 +343,13 @@ def _translate_assistant(
         # below closes the generation, so a later block in a parallel tool
         # response would otherwise be dropped. Tool names only, never arguments.
         for block in message.content:
-            if isinstance(block, TextBlock) and block.text:
+            if isinstance(block, TextBlock) and block.text and not nested:
                 gen.observe_output(block.text)
             elif isinstance(block, ToolUseBlock):
                 gen.observe_output(f"[tool_use {block.name}]")
     for block in message.content:
         if isinstance(block, TextBlock):
-            if block.text:
+            if block.text and not nested:
                 state.assistant_text += block.text
                 events.append(TextDelta(text=block.text))
         elif isinstance(block, ToolUseBlock):
@@ -430,6 +461,22 @@ def _translate_user(
             state.tool_results.append(
                 (block.tool_use_id, called, block.is_error is True, unknown_marker)
             )
+            if called in _SUBAGENT_TOOLS and block.is_error is True:
+                # A subagent's provider 402 is terminal for the turn even when
+                # the parent recovers from it (#3935). It overrides an earlier
+                # recoverable classification, but a second credit result emits
+                # no duplicate ErrorEvent.
+                sub_text = _result_text(block.content)
+                if _CREDIT_EXHAUSTED_TEXT.search(sub_text):
+                    state.credit_exhausted = True
+                    if state.error_classification != CREDIT_EXHAUSTED_CLASSIFICATION:
+                        state.error_classification = CREDIT_EXHAUSTED_CLASSIFICATION
+                        events.append(
+                            ErrorEvent(
+                                message=f"subagent model error: {_redact_and_clip(sub_text)}",
+                                classification=CREDIT_EXHAUSTED_CLASSIFICATION,
+                            )
+                        )
         tool = state.pending_actions.pop(block.tool_use_id, None)
         if tool is None:
             # Read-only, or a result for a call this turn never saw, or a second
@@ -490,6 +537,24 @@ def _loads_object(raw: object) -> tuple[dict[str, object] | None, bool]:
     return (parsed if isinstance(parsed, dict) else None), False
 
 
+def _restore_credit_error(state: TurnState) -> list[OutboundEvent]:
+    """Re-emit the credit classification when a later error replaced it (#3935).
+
+    The worker keeps the classification of the last ErrorEvent, so a latched
+    credit refusal must be the last one before the Final.
+    """
+
+    if not state.credit_exhausted or state.error_classification == CREDIT_EXHAUSTED_CLASSIFICATION:
+        return []
+    state.error_classification = CREDIT_EXHAUSTED_CLASSIFICATION
+    return [
+        ErrorEvent(
+            message="model credit exhausted earlier in the turn",
+            classification=CREDIT_EXHAUSTED_CLASSIFICATION,
+        )
+    ]
+
+
 def _translate_result(
     message: ResultMessage,
     state: TurnState,
@@ -510,8 +575,21 @@ def _translate_result(
                     classification=mapped,
                 )
             )
+        events.extend(_restore_credit_error(state))
         events.append(Final(text=text, status=SessionStatus.CLASSIFIED_FAILURE))
         return events
+
+    if state.credit_exhausted:
+        # #3935: a credit refusal anywhere in the turn, including a reviewer
+        # subagent the parent recovered from, is terminal. The worker maps
+        # the last ErrorEvent to model_credit_exhausted.
+        return [
+            *_restore_credit_error(state),
+            Final(
+                text=message.result or state.assistant_text,
+                status=SessionStatus.CLASSIFIED_FAILURE,
+            ),
+        ]
 
     # The SDK's ``result`` is authoritative when present. When it is empty on an
     # otherwise-successful turn, fall back to the assistant text streamed this turn

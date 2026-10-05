@@ -40,6 +40,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from typing import Any, cast
 
 from curie_mail_adapter.egress import ADAPTER_SECRET_HEADER
+from curie_mail_adapter.state import MailState as DurableMailState
 
 INBOX = "sandbox@agentmail.to"
 AGENTMAIL_API_KEY = "amk-tst"
@@ -68,6 +69,36 @@ STRANGER = "stranger@evil.example"
 # adapter deliberately does not reject on it.
 WITHHELD_LABELS = ("spam", "blocked", "unauthenticated")
 _PROCESS_STATE_ROOT = tempfile.TemporaryDirectory(prefix="curie-mail-tests-")
+
+
+def seed_historical_reply(
+    mail: MailState,
+    state: DurableMailState,
+    message_id: str = "msg-1",
+    thread_id: str = "thr-1",
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Persist a turn accepted before upgrade for independent egress tests.
+
+    This fixture exercises the real SQLite store. It never supplies an
+    authentication verdict and never makes new provider mail admissible.
+    """
+    summary = mail.add_inbound(message_id, thread_id, **kwargs)
+    assert state.admit(summary) == "admitted"
+    state.store_turn(
+        message_id,
+        {
+            "kind": "email",
+            "address": INBOX,
+            "delivery_id": message_id,
+            "conversation_id": thread_id,
+            "author": email.utils.parseaddr(str(summary["from"]))[1].lower(),
+            "text": f"{summary['subject']}\n\n{kwargs.get('text', 'body text')}",
+            "reply_ref": message_id,
+        },
+    )
+    state.accept_ingress(message_id)
+    return summary
 
 
 # --- the fake AgentMail API ---------------------------------------------------
@@ -725,8 +756,13 @@ def progress_post(
     the mail adapter must not append it to the reply it is buffering.
     """
     progress: dict[str, Any] = (
-        {"kind": "card", "state": "investigating", "summary": summary, "revision": 1,
-         "terminal": False}
+        {
+            "kind": "card",
+            "state": "investigating",
+            "summary": summary,
+            "revision": 1,
+            "terminal": False,
+        }
         if kind == "card"
         else {"kind": "milestone", "milestone": "evidence", "summary": summary, "ordinal": 1}
     )

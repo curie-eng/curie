@@ -294,11 +294,13 @@ if not any(m.get("name") == "workspace" and m.get("mountPath") == "/workspace"
            for m in runner.get("volumeMounts", [])):
     fail("runner must share workspace at /workspace")
 
-signed_workspace_facts = {"CURIE_WORKSPACE_REF", "CURIE_WORKSPACE_SHA256"}
+signed_workspace_facts = {
+    "CURIE_WORKSPACE_REF", "CURIE_WORKSPACE_SHA256", "CURIE_GITHUB_API_URL",
+}
 fetch_env = set(env_map(workspace_init))
 if fetch_env != signed_workspace_facts:
     fail(
-        "workspace-init must carry only the signed exact-object reference and digest; "
+        "workspace-init must carry the signed object facts and configured GitHub API URL; "
         f"rendered env was {sorted(fetch_env)}"
     )
 
@@ -320,6 +322,9 @@ if leaked:
     )
 
 runner_env = env_map(runner)
+for consumer in (workspace_init, runner):
+    if env_map(consumer).get("CURIE_GITHUB_API_URL", {}).get("value") != "https://api.github.com":
+        fail(f"{consumer['name']} must receive the configured GitHub API URL")
 forbidden_runner = {
     "S3_ACCESS_KEY", "S3_SECRET_KEY", "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_APP_ID",
@@ -367,4 +372,139 @@ for policy in policies:
         fail(f"runner policy selector widened: {policy['metadata']['name']}")
 
 print("remote-dev capability render assertions passed")
+PY
+
+# Run the rendered init command across real HTTP, tar and Git boundaries. The
+# signed workspace archive is the same input the sandbox consumes in a claim.
+python3 - "$CHART" "$TMP" <<'PY'
+import base64
+import functools
+import hashlib
+import http.server
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tarfile
+import threading
+import time
+
+import yaml
+
+chart, scratch = map(Path, sys.argv[1:])
+root = scratch / "workspace-root"
+fixture = scratch / "workspace-fixture"
+root.mkdir()
+fixture.mkdir()
+subprocess.run(["git", "init", "--quiet", str(fixture)], check=True)
+(fixture / "README.md").write_text("managed workspace\n")
+subprocess.run(
+    ["git", "-C", str(fixture), "remote", "add", "origin", "https://github.example.com/acme-corp/acme-bot.git"],
+    check=True,
+)
+archive_path = scratch / "workspace-fixture.tar.gz"
+
+
+class ObjectHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+
+server = http.server.ThreadingHTTPServer(
+    ("127.0.0.1", 0), functools.partial(ObjectHandler, directory=str(scratch))
+)
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+try:
+    for html_base in ("https://github.example.com", "https://github.example.com/forge"):
+        api_url = f"{html_base}/api/v3"
+        rendered = subprocess.run(
+            [
+                "helm", "template", "remote-dev", str(chart),
+                "-f", str(chart / "values-dev.yaml"),
+                "--show-only", "templates/agent-sandbox.yaml",
+                "--set", "agentSandbox.deploy=true",
+                "--set", "agentSandbox.controller.deploy=false",
+                "--set", f"api.githubApiUrl={api_url}",
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        sandbox = next(
+            doc for doc in yaml.safe_load_all(rendered.stdout)
+            if doc and doc.get("kind") == "SandboxTemplate"
+        )
+        pod = sandbox["spec"]["podTemplate"]["spec"]
+        init = next(c for c in pod["initContainers"] if c["name"] == "workspace-init")
+        runner = next(c for c in pod["containers"] if c["name"] == "runner")
+        # Keep the production mount schema intact. The local subprocess owns
+        # a private scratch directory in place of the container's /workspace.
+        init_script = init["command"][-1]
+        production_root = 'root = pathlib.Path("/workspace")'
+        assert init_script.count(production_root) == 1
+        init_script = init_script.replace(
+            production_root, f"root = pathlib.Path({str(root)!r})", 1
+        )
+        for container in (init, runner):
+            env = {entry["name"]: entry.get("value") for entry in container["env"]}
+            assert env["CURIE_GITHUB_API_URL"] == api_url, container["name"]
+        init_env = {entry["name"]: entry["value"] for entry in init["env"]}
+        clean_origin = f"{html_base}/acme-corp/acme-bot.git"
+        cases = [
+            (clean_origin, True),
+            ("https://github.com/acme-corp/acme-bot.git", False),
+            ("https://other.example.com/acme-corp/acme-bot.git", False),
+            (clean_origin.replace("https://", "http://", 1), False),
+            (clean_origin.replace("https://", "https://token@", 1), False),
+            (f"{clean_origin}/", False),
+            (clean_origin.removesuffix(".git"), False),
+            (f"{clean_origin}?download=1", False),
+            (f"{clean_origin}#HEAD", False),
+            (f"{html_base}/acme-corp//acme-bot.git", False),
+        ]
+        if html_base.endswith("/forge"):
+            cases.append(("https://github.example.com/acme-corp/acme-bot.git", False))
+        for origin, accepted in cases:
+            subprocess.run(
+                ["git", "-C", str(fixture), "remote", "set-url", "origin", origin],
+                check=True,
+            )
+            with tarfile.open(archive_path, "w:gz") as archive:
+                archive.add(fixture, arcname=".")
+            digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            claim = {
+                "u": f"http://127.0.0.1:{server.server_port}/{archive_path.name}",
+                "s": digest,
+                "e": int(time.time()) + 300,
+            }
+            reference = base64.urlsafe_b64encode(json.dumps(claim).encode()).decode().rstrip("=")
+            env = {
+                "PATH": os.environ["PATH"],
+                **init_env,
+                "CURIE_WORKSPACE_REF": reference,
+                "CURIE_WORKSPACE_SHA256": digest,
+            }
+            result = subprocess.run(
+                [sys.executable, "-c", init_script],
+                env=env, capture_output=True, text=True, timeout=60,
+            )
+            if accepted:
+                assert result.returncode == 0, result.stderr
+                assert (root / "README.md").read_text() == "managed workspace\n"
+                observed = subprocess.run(
+                    ["git", "-C", str(root), "remote", "get-url", "origin"],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+                assert observed == clean_origin
+            else:
+                assert result.returncode != 0, f"workspace-init accepted {origin}"
+                assert "checkout origin" in result.stderr, result.stderr
+                assert not (root / "README.md").exists(), origin
+finally:
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=5)
+    assert not thread.is_alive(), "workspace object server did not stop"
+
+print("workspace-init configured GitHub host behavior assertions passed")
 PY

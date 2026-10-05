@@ -4,7 +4,7 @@ Date: 2026-09-22
 
 Status: Accepted
 
-**Superseded in part by [ADR 0193](0193-identity-links-live-in-provider-identity-namespaces.md)**
+**Superseded in part by [ADR 0198](0198-identity-links-live-in-provider-identity-namespaces.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 decision 1's choice to make a channel identity a row in
 `provider_installations` (identities are rows in `channel_identities`); in

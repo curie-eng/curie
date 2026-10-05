@@ -157,6 +157,8 @@ mod testsupport {
     pub(super) fn up_with_github_token(plan: GithubTokenPlan) -> Vec<OpsCommand> {
         up_commands(&UpOpts {
             retained_mail_values: None,
+            retained_runner_values: None,
+            saved_credentials: None,
             common: common(),
             github_token: plan,
             set_string: vec![],

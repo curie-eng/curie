@@ -41,6 +41,7 @@ before editing there, in addition to this file.
 |---|---|---|
 | `packages/aci-protocol` | Python (Pydantic + codegen) | [`packages/CLAUDE.md`](packages/CLAUDE.md) |
 | `packages/plugin-format` | Python (Pydantic + codegen) | [`packages/CLAUDE.md`](packages/CLAUDE.md) |
+| `packages/protected-hooks` | Python (internal source authority and transport) | [`packages/CLAUDE.md`](packages/CLAUDE.md) |
 | `apps/api` | Python (FastAPI) | [`apps/api/CLAUDE.md`](apps/api/CLAUDE.md) |
 | `apps/dispatcher` | Python (Slack Bolt) | [`apps/dispatcher/CLAUDE.md`](apps/dispatcher/CLAUDE.md) |
 | `apps/mail-adapter` | Python (stdlib HTTP + Pydantic) | [`apps/mail-adapter/CLAUDE.md`](apps/mail-adapter/CLAUDE.md) |
@@ -124,7 +125,6 @@ Set `base=next` when your worktree targets `next`.
   export TEST_LANGFUSE_HOST=${TEST_LANGFUSE_HOST:-${LANGFUSE_HOST:-http://127.0.0.1:23000}}
   export LANGFUSE_HOST="$TEST_LANGFUSE_HOST"
   export TEST_OTEL_COLLECTOR_ENDPOINT=${TEST_OTEL_COLLECTOR_ENDPOINT:-http://127.0.0.1:24318/v1/traces}
-  langfuse_health_url="$TEST_LANGFUSE_HOST/api/public/health"
   exec 9>"$baseline_lock"
   if ! flock -n 9; then
     echo "Another local Python CI baseline is already running"
@@ -145,19 +145,8 @@ Set `base=next` when your worktree targets `next`.
   uv run lint-imports
   bash scripts/check-docs.sh
   bash scripts/check-wire-tolerance.sh
-  "${compose[@]}" up -d \
-    postgres valkey clickhouse rustfs rustfs-init \
-    langfuse-web langfuse-worker otel-collector
-  "${compose[@]}" up -d --wait --wait-timeout 300 \
-    postgres valkey clickhouse rustfs \
-    langfuse-web langfuse-worker otel-collector
-  for i in $(seq 1 60); do
-    if curl -fsS "$langfuse_health_url" >/dev/null 2>&1; then
-      break
-    fi
-    sleep 3
-  done
-  curl -fsS "$langfuse_health_url" >/dev/null
+  COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" COMPOSE_FILE="$compose_file_list" \
+    python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480
   git fetch --force --tags origin refs/heads/main:refs/remotes/origin/main
   uv run python scripts/check-released-upgrade.py --self-test
   uv run python scripts/check-released-upgrade.py
@@ -247,7 +236,8 @@ is an exception to the CLI entry point guidance in `CLAUDE.md`.
    `CURIE_RELEASED_UPGRADE_POSTGRES_PORT`. Also export matching
    `TEST_VALKEY_HOST`, `TEST_VALKEY_PORT`, `TEST_S3_ENDPOINT_URL`,
    `TEST_LANGFUSE_HOST`, and `TEST_OTEL_COLLECTOR_ENDPOINT`. The baseline derives
-   runtime consumer variables and the Langfuse health URL from those values.
+   runtime consumer variables from those values, and the readiness helper reads
+   `TEST_LANGFUSE_HOST` for its web endpoint.
    For example:
 
    ```bash
@@ -798,16 +788,16 @@ just that unit tests pass.
 ### The tier decision rule
 
 Applicability is a recorded decision, not a matter of taste. Every
-behavior-bearing change classifies all six tiers below as **required** or
+behavior-bearing change classifies all seven tiers below as **required** or
 **not applicable**, and a not-applicable row states a concrete reason naming
 the surface the change does not reach. "Unit tests cover it", "low risk", "CI
 is green", and "no time" are not reasons.
 
 A behavior-bearing change has at least one required tier, on the quick path as
-much as the build path. A classification that marks all six not applicable is
+much as the build path. A classification that marks all seven not applicable is
 a claim that the change alters no runtime behavior on any surface: either say
 that plainly and carry no tier, or the tier set is wrong for this change and
-the maintainer decides, but do not proceed on all six not applicable while
+the maintainer decides, but do not proceed on all seven not applicable while
 still calling the change behavior-bearing. A change that genuinely bears no
 runtime behavior records that reason once and is exempt from tier
 classification and E2E evidence for each acceptance criterion, including on
@@ -834,6 +824,35 @@ required and proved, not carried on the original classification.
 | cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
 | live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow; also the MCP/workspace/coding-tool path set below | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
 | external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape; Slack is required on the MCP/workspace/coding-tool path set below | drive the real integration; a replayed fixture or a fake does not close this tier |
+| factory | API factory runtime, CI, progress, or publication behavior; runner verification preflight or factory progress; the dark factory example; worker work item execution | `curie dev factory-e2e run --scenario issue-to-pr` until the scenario in #3814 ships |
+
+The factory path set includes `apps/api/src/curie_api/factory_runtime*`,
+`factory_ci*`, `factory_progress*`, and `routers/publications*`;
+runner verification preflight and progress; `examples/dark-factory/`; and
+worker work item execution. Factory evidence must run the production factory
+scenario through the changed components. A canned fixture or fake scenario
+does not close this tier. Until #3814 ships its scenario, use the command in
+the factory row.
+
+The PR body guard derives minimum required tiers from changed files. A row
+required by those paths cannot be omitted or marked not applicable through
+body prose. Classify all seven rows and supply the changed files and current
+open issues to the guard. Skill and local may use fake in the mode column when
+the row supplies its exact command and an observed completed outcome. Live
+provider, external integration, and factory require `live` in the mode column;
+a blank cell or any other mode leaves the row unproved.
+
+Evidence text saying blocked, not run, or fake leaves a required row unproved
+at any tier. For a completed negative test, describe the observed outcome as
+denied, refused, or returned 401; reserve blocked, not run, and fake for
+unproved status requiring a waiver. To proceed as discovery, include the
+visible line
+`Discovery waiver: <reason> #N`, naming an open issue that tracks the missing
+proof. Table rows and waiver lines must be visible. Text inside HTML comments,
+fenced code blocks, or indented code blocks does not count as evidence.
+Any follow up named in the tier table must include its issue number.
+A waiver records the missing proof; it does not change the tier to not
+applicable or claim that the acceptance criterion passed.
 
 The path set is runner MCP catalog projection, unscoped PreToolUse,
 in-process platform MCP tools, workspace publication, and
@@ -863,8 +882,9 @@ Every meaningful acceptance criterion needs two observations, not one.
 Record both against the run, per the run state contract in
 `.claude/skills/implement/SKILL.md`, and expose them in the pull request
 through the checklist in `.github/PULL_REQUEST_TEMPLATE.md`. A required tier
-with no passing evidence record blocks completion; it is reported as a blocker,
-not carried as a note.
+with no passing evidence record blocks completion unless the discovery waiver
+above names an open issue. Report the missing proof as a blocker, including
+when proceeding under that waiver.
 
 ## Playwright: two modes
 
@@ -919,6 +939,26 @@ release train branch.
 Bug fixes, security fixes, and anything shared by both lines land on the stable
 `main` line first. Features for the next feature release land on `next`.
 
+For a patch cut whose fixes are still under preparation, use one short-lived
+preparation PR to `main` carrying those fixes, the version bump, and the atlas
+snapshot. Commit all non-version changes first and pin the atlas to that final
+non-version commit. Follow it with the version/snapshot commit, whose paths must
+stay inside `release/atlas.py::version_only_paths` for the release tag. Keep the
+head up to date with `main`; if the base or a non-version change advances,
+regenerate the pin and snapshot and rerun the required checks on the final head.
+Do not require a separate candidate PR or candidate CI round.
+
+The atlas may accept the merge commit across that version-only delta. Current
+tag authorization under
+[ADR 0195](docs/adr/0195-a-version-only-delta-reuses-its-parents-checks.md) still
+excludes the second-parent PR head as inherited CI proof. A combined preparation
+merge therefore needs its own complete required checks on `main` before direct
+tagging. [Draft ADR 0196](docs/adr/0196-combined-preparation-pr-checks.md) proposes
+reusing full green PR-head checks for an up-to-date merge with a version-only or
+empty delta; that path remains blocked until explicit ADR acceptance and
+implementation. The complete procedure is in
+[release verification](docs/release-verification.md#one-preparation-pr-carries-the-fixes-and-version).
+
 To cut a feature release candidate, merge `main` into `next` through a PR, tag
 the release candidate on `next`, and test that candidate extensively. The
 forward merge from `main` into `next` happens at release candidate prep, not
@@ -963,14 +1003,19 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
   keyword in a PR that targets `next` never fires on its own. Issues referenced
   by a `next` targeted PR are closed at the `next` into `main` merge, where the
   magic words fire once on the default branch.
-- PR bodies must contain real line breaks. The PR body guard rejects escaped
-  newline sequences because GitHub treats them as text, making closing keywords
-  inert. A patch release PR (title `Prepare the vX.Y.Z release` with Z not 0)
-  must also fill Trigger (issue numbers) and Live proof (a run URL or
-  `waiver: <reason>`); the same guard rejects either section left empty. Run
-  `scripts/check-pr-body.sh <body-file>` before opening or editing a PR
-  (`--title-file` for a release PR). See
-  [`docs/release-verification.md`](docs/release-verification.md#patch-releases-name-their-trigger-and-live-proof).
+
+PR bodies must contain real line breaks. The PR body guard rejects escaped
+newline sequences because GitHub treats them as text, making closing keywords
+inert. A patch release PR (title `Prepare the vX.Y.Z release` with Z not 0)
+must also fill Trigger (issue numbers) and Live proof (a run URL, the exact
+standalone `this-pr-ci` line inside that section, or `waiver: <reason>`);
+the same guard rejects either section left empty. The marker references the
+preparation PR's own CI and proves only the rungs that CI actually ran; a
+required live surface outside that run still needs a run URL or waiver. Run
+`scripts/check-pr-body.sh <body-file> --changed-files-file <changed-files-json> --open-issues-file <open-issues-json>` before opening or editing a PR
+(`--title-file` for a release PR). See
+[`docs/release-verification.md`](docs/release-verification.md#patch-releases-name-their-trigger-and-live-proof).
+
 - **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
   commit messages OR pull request bodies, and never add `Co-Authored-By` lines
   referencing AI.** This applies to the PR body as much as to the commits: many
@@ -981,7 +1026,7 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
 
   ```bash
   scripts/check-commit-messages.sh origin/<base>..HEAD
-  scripts/check-pr-body.sh <body-file>
+  scripts/check-pr-body.sh <body-file> --changed-files-file <changed-files-json> --open-issues-file <open-issues-json>
   scripts/check-commit-messages.sh --self-test
   scripts/check-pr-body.sh --self-test
   ```

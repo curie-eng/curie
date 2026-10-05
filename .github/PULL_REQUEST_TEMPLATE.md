@@ -28,6 +28,16 @@ Closes #
 <!-- Required for a patch release PR. Name a run URL that re-verified each
      trigger on a live surface, or an explicit waiver of the form:
      waiver: <reason>
+
+     To defer proof to this pull request's own CI, replace this comment with
+     the exact marker below on its own visible line:
+this-pr-ci
+
+     Wait for the CI checks on this pull request's current head to pass before
+     merging. A passing run proves only the ladder rungs CI executes on that
+     head. Include separate live proof or a waiver for any broader surface.
+     This pull request's own CI run URL also counts for those same rungs;
+     do not rerun a rung locally after CI has proved it on the same tree.
      Other pull requests may leave this comment in place. -->
 
 ## Fix pin verification
@@ -82,7 +92,7 @@ Fix pin waiver: <reason>
 <!-- Choose exactly one path.
 
      Behavior-bearing: keep the tier table and three evidence checkboxes below.
-     Classify every tier required or n/a with a concrete reason, and paste the
+     Classify all seven tiers required or n/a with a concrete reason, and paste the
      exact command plus what you observed for each required tier.
 
      No runtime behavior: delete the tier table and three evidence checkboxes.
@@ -100,7 +110,34 @@ Fix pin waiver: <reason>
      built-in coding-tool session capability must record live-provider plus
      external-integration evidence, or leave those required-tier rows open.
      "No model routing change" is not a valid n/a reason. Fake-model kind,
-     skill ladder, and helper-only tests are not sufficient. -->
+     skill ladder, and helper-only tests are not sufficient.
+
+     Factory is required for API factory_runtime, factory_ci, factory_progress,
+     or routers/publications changes; runner verification preflight or factory
+     progress; examples/dark-factory; and worker work item execution. Run the
+     production factory scenario through the changed components. A canned
+     fixture or fake scenario does not close this tier. Until #3814 ships its
+     scenario, use `curie dev factory-e2e run --scenario issue-to-pr`.
+
+     The guard derives minimum required tiers from changed files. Body prose
+     cannot omit a required row or make it n/a. Skill and local may use fake
+     in the mode column when the row supplies its exact command and an observed
+     completed outcome. Live provider, external integration, and factory require
+     `live` in the mode column; a blank cell or any other mode leaves the row
+     unproved.
+
+     Evidence text saying blocked, not run, or fake leaves a required row
+     unproved at any tier. For a completed negative test, describe the observed
+     outcome as denied, refused, or returned 401; reserve blocked, not run,
+     and fake for unproved status requiring a waiver. To proceed as discovery,
+     include a visible
+     line of this exact form with a concrete reason and an open issue:
+Discovery waiver: <reason> #N
+
+     Keep the row required and state the missing proof. Table rows and waiver
+     lines must be visible. Text inside HTML comments, fenced code blocks, or
+     indented code blocks does not count as evidence. Any follow up named
+     in the tier table must include its issue number. -->
 
 | Tier | Required / n/a | Reason | Mode (fake / live) | Command and observed outcome |
 | --- | --- | --- | --- | --- |
@@ -110,13 +147,15 @@ Fix pin waiver: <reason>
 | cluster | | | | |
 | live provider | | | | |
 | external integration | | | | |
+| factory | | | | |
 
-- [ ] Every required tier above names its exact command, the commit it ran
+1. [ ] Every proved required tier above names its exact command, the commit it ran
       against, the mode it ran in, and the literal outcome observed.
-- [ ] Each meaningful acceptance criterion has positive proof plus a falsifiable
+2. [ ] Each meaningful acceptance criterion has positive proof plus a falsifiable
       negative or a second independent path.
-- [ ] No required tier is left unproved; any blocked tier names its blocker in
-      the table.
+3. [ ] Every unproved required tier names its blocker in the table and has a
+      visible Discovery waiver naming an open issue. Any follow up in the
+      table includes its issue number.
 
 ## Checklist
 

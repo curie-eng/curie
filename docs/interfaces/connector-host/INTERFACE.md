@@ -161,9 +161,11 @@ When the API holds the matching public key, `render` puts a caller proxy in
 front of every hosted connector it renders
 (`packages/plugin-format/src/plugin_format/connector_render.py::ConnectorProxy`).
 The proxy runs from the worker image as `python -m curie_connector_proxy`, pulled
-with the worker's pull policy and pull secrets, and holds only the public keys
-and the connector's `admits` list, resolved at render
-(`packages/plugin-format/src/plugin_format/connector_render.py::resolved_admits`).
+with the worker's pull policy and pull secrets, and holds the public keys, the
+connector's `admits` list, resolved at render
+(`packages/plugin-format/src/plugin_format/connector_render.py::resolved_admits`),
+the connector's gated tool patterns, its name and the grant store URL
+(`apps/worker/src/curie_connector_proxy/server.py::ProxyConfig`).
 The Service keeps the connector's port, so the URL and the allowed hosts do not
 move, and lands it on the proxy's port. Both rendered NetworkPolicies open only
 that port, so nothing Curie renders opens the server's own port.
@@ -180,9 +182,10 @@ because policies are additive. An install with no caller key renders no
 
 The proxy admits a request whose token either configured key
 verifies, that has not expired and that names a listed agent
-(`apps/worker/src/curie_connector_proxy/caller.py::decide`), strips the header
-and forwards it to the server over loopback with its `Host` unchanged and its
-body as sent, never decoded
+(`apps/worker/src/curie_connector_proxy/caller.py::decide`) and, for a POST,
+that passes the grant check below. It strips the header and forwards the
+request to the server over loopback with its `Host` unchanged and its body as
+sent
 (`apps/worker/src/curie_connector_proxy/server.py::make_app`). On that forward
 it sets `X-Curie-Agent` from the verified token. When the token also carries
 `run` and `work_item` (ADR 0178), it sets `X-Curie-Run` and
@@ -193,7 +196,24 @@ loopback forward. The `-direct` Service skips the proxy, so a connector
 reached there has no run. It checks every
 path the same way, the MCP client's OAuth discovery and registration requests
 included. Its log line quotes the path, and aiohttp's own error and access logs
-redact a caller token. Any other request gets a 403 carrying a JSON-RPC error and no
+redact a caller token.
+
+An admitted POST is also read before it is forwarded. When its body holds a
+`tools/call` for a gated tool, the proxy needs exactly one
+`X-Curie-Connector-Grant` header whose grant verifies against the same keys,
+has not expired, and names this agent, this connector, this tool and the call's
+canonical arguments
+(`apps/worker/src/curie_connector_proxy/server.py::_grant_refused`). The grant's
+`jti` is then spent once in Valkey with `SET NX EX`, so a replayed grant, a
+missing grant store or a failed spend refuses the call. A body with two or more
+gated calls is refused before any grant is spent. The grant header is stripped
+before the forward. A refused grant check answers with the JSON-RPC refusal
+below, reason `grant_required`
+(`apps/worker/src/curie_connector_proxy/caller.py::GRANT_REQUIRED`). A body
+over 1 MiB is refused with a plain-text 403, not the JSON-RPC refusal, and never
+reaches the server.
+
+A request the token check does not admit gets a 403 carrying a JSON-RPC error and no
 challenge, and never reaches the server; the shape is frozen in
 `tests/vectors/connector-caller-refusal.json`, and the runner reports it as the
 connector refusing this sandbox

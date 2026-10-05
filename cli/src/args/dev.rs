@@ -44,6 +44,12 @@ pub(crate) enum DevAction {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Serve a TLS GitHub fixture or capture public check lifecycle recordings.
+    GithubStub {
+        /// `serve` or `capture`, followed by fixture flags.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Select the end to end tiers CI would run for paths or revisions.
     E2eCiSelection {
         /// Changed path. Repeat for every path in the candidate change.

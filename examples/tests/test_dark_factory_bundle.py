@@ -158,3 +158,89 @@ def test_no_private_identifiers(needle: str) -> None:
         if needle in p.read_text(errors="ignore").lower()
     ]
     assert hits == []
+
+
+def _flat(text: str) -> str:
+    return re.sub(r"\s+", " ", text)
+
+
+CONTRACT = BUNDLE / "verification" / "contract.md"
+
+
+def _contract() -> str:
+    """The one verification contract the hook hands every reader (#3874)."""
+    assert CONTRACT.is_file(), "examples/dark-factory/verification/contract.md is missing"
+    return _flat(CONTRACT.read_text())
+
+
+def test_the_contract_keeps_the_service_ci_path_and_red_on_base_procedure() -> None:
+    """A change whose tests need Postgres or Valkey still reaches publication (#3755).
+
+    The #3755 path moved from the skill into the verification contract (#3874):
+    the pull request's required CI is the delegated test's run, and the
+    red-on-base procedure keeps the new test and restores only the base source.
+    """
+    contract = _contract()
+    assert "keep the new test file" in contract
+    assert "git checkout <base-sha> -- <changed source files>" in contract
+    assert "must fail on the bug, not at import" in contract
+    assert "red-on-base was not observed in the sandbox" in contract
+    assert "in-sandbox verification was unavailable and CI is pending proof" in contract
+    assert "a failure there returns the run to `implement`" in contract
+    # Every step that used to restate the rules now defers to the contract.
+    _, body = _skill_parts()
+    flat = _flat(body)
+    failing_test = flat.split("(phase `failing_test`)", 1)[1].split("(phase `implement`", 1)[0]
+    implement = flat.split("(phase `implement`", 1)[1].split("(phase `review_diff`", 1)[0]
+    review = flat.split("(phase `review_diff`", 1)[1].split("## Loop cap", 1)[0]
+    publish = flat.split("(phase `publish`)", 1)[1].split("(phase `wait_ci`)", 1)[0]
+    for name, step in (("failing_test", failing_test), ("implement", implement)):
+        assert "verification contract" in step, name
+    # The diff review prompt carries the current table the contract defines.
+    assert "verification table" in review
+    assert "verification contract" in publish
+
+
+def test_both_reviewers_defer_to_one_contract_that_relaxes_only_service_evidence() -> None:
+    """Neither reviewer demands evidence a valid delegation makes unobtainable (#3755, #3874)."""
+    contract = _contract()
+    assert (
+        "neither reviewer asks for that test's local run results, real-service evidence, "
+        "or an observed red-on-base run"
+    ) in contract
+    # The relaxation is bounded: these always block, at plan review and diff review alike.
+    for reason in (
+        "missing_coverage",
+        "invalid_test",
+        "failing_check",
+        "missing_ci_route",
+        "package_dependency",
+    ):
+        assert f"`{reason}`" in contract, reason
+    assert "A missing package dependency is never a service gap." in contract
+    assert (
+        "Undeclared CI coverage and a failed check are never reclassified as a service gap."
+    ) in contract
+    assert (
+        "A valid delegation removes only the demand for evidence this sandbox cannot "
+        "produce, never another blocking finding."
+    ) in contract
+    for name in ("plan-reviewer", "diff-reviewer"):
+        assert "verification contract" in _flat((BUNDLE / "agents" / f"{name}.md").read_text())
+
+
+def test_delegation_binds_to_the_resolved_declaration_and_plan_review_judges_the_proposal() -> None:
+    """A route is the resolved declaration's, and the plan's test is judged as proposed (#3874)."""
+    contract = _contract()
+    # The bundle's checks, when it declares any, shadow the repository's file.
+    assert (
+        "The resolved declaration is the bundle's `verification/checks.json` when it "
+        "declares any checks"
+    ) in contract
+    assert "otherwise the repository's `.curie/verification.json`" in contract
+    assert "whose startup result was `unavailable`" in contract
+    assert ("A row relying on a repository declaration shadowed by bundle checks") in contract
+    # At plan review the test does not exist yet.
+    assert "the reviewer judges the proposed test as the plan describes it" in contract
+    assert "never demands the written test" in contract
+    assert "At diff review the reviewer reads the written test." in contract

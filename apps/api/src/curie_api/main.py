@@ -9,10 +9,11 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 import httpx
 import redis.asyncio as redis
+from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     bootstrap_service_telemetry,
@@ -31,7 +32,7 @@ from curie_api.crud import agents as crud_agents
 from . import __version__
 from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
-from .db import create_engine, create_sessionmaker
+from .db import create_engine, create_sessionmaker, create_source_gate_engine
 from .evalqueue import EvalQueue
 from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
@@ -93,6 +94,7 @@ def _validate_forwarded_allow_ips() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
     _validate_forwarded_allow_ips()
     settings = get_settings()
     # Fail closed when this image cannot serve the live schema. Migrations are
@@ -265,74 +267,78 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "limit": limit,
             },
         )
-    try:
-        yield
-    finally:
-        notice_task = app.state.deploy_notice_reconciler_task
-        if notice_task is not None:
-            notice_task.cancel()
-            try:
-                await notice_task
-            except asyncio.CancelledError:
-                pass
-        review_task = getattr(app.state, "github_review_reconciler_task", None)
-        if review_task is not None:
-            review_task.cancel()
-            try:
-                await review_task
-            except asyncio.CancelledError:
-                pass
-        # Both background loops enqueue via resume_queue (which uses the valkey
-        # client) and read via the sessionmaker, so both are stopped BEFORE
-        # valkey.aclose()/engine.dispose() below.
-        work_item_task = getattr(app.state, "work_item_reconciler_task", None)
-        if work_item_task is not None:
-            work_item_task.cancel()
-            try:
-                await work_item_task
-            except asyncio.CancelledError:
-                pass
-        task = getattr(app.state, "resume_reconciler_task", None)
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        # Stop the sweeper BEFORE closing valkey/engine so an in-flight pass does
-        # not race the closed clients. The wait-first loop wakes immediately on
-        # stop.set(); wait_for already cancels on timeout, so suppressing
-        # TimeoutError/CancelledError is the whole teardown.
-        if sweeper_stop is not None:
-            sweeper_stop.set()
-            try:
-                await asyncio.wait_for(app.state.sweeper_task, 5.0)
-            except (TimeoutError, asyncio.CancelledError):
-                pass
-        # Read-only, so simply cancel it before closing valkey.
-        watcher_task = getattr(app.state, "graveyard_watcher_task", None)
-        if watcher_task is not None:
-            watcher_task.cancel()
-            try:
-                await watcher_task
-            except asyncio.CancelledError:
-                pass
-        # Cancelled before engine.dispose(): a poll pass mid-deploy holds a
-        # session, and disposing the engine underneath it would raise on the
-        # way out rather than shutting down cleanly.
-        poller_task = getattr(app.state, "commit_poller_task", None)
-        if poller_task is not None:
-            poller_task.cancel()
-            try:
-                await poller_task
-            except asyncio.CancelledError:
-                pass
+    async with AsyncExitStack() as source_resources:
+        source_gate_engine = create_source_gate_engine()
+        source_resources.push_async_callback(source_gate_engine.dispose)
+        app.state.source_gate = SourceGate(source_gate_engine)
         try:
-            await valkey.aclose()
-            await http_client.aclose()
-            await engine.dispose()
+            yield
         finally:
-            telemetry.shutdown()
+            notice_task = app.state.deploy_notice_reconciler_task
+            if notice_task is not None:
+                notice_task.cancel()
+                try:
+                    await notice_task
+                except asyncio.CancelledError:
+                    pass
+            review_task = getattr(app.state, "github_review_reconciler_task", None)
+            if review_task is not None:
+                review_task.cancel()
+                try:
+                    await review_task
+                except asyncio.CancelledError:
+                    pass
+            # Both background loops enqueue via resume_queue (which uses the valkey
+            # client) and read via the sessionmaker, so both are stopped BEFORE
+            # valkey.aclose()/engine.dispose() below.
+            work_item_task = getattr(app.state, "work_item_reconciler_task", None)
+            if work_item_task is not None:
+                work_item_task.cancel()
+                try:
+                    await work_item_task
+                except asyncio.CancelledError:
+                    pass
+            task = getattr(app.state, "resume_reconciler_task", None)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            # Stop the sweeper BEFORE closing valkey/engine so an in-flight pass does
+            # not race the closed clients. The wait-first loop wakes immediately on
+            # stop.set(); wait_for already cancels on timeout, so suppressing
+            # TimeoutError/CancelledError is the whole teardown.
+            if sweeper_stop is not None:
+                sweeper_stop.set()
+                try:
+                    await asyncio.wait_for(app.state.sweeper_task, 5.0)
+                except (TimeoutError, asyncio.CancelledError):
+                    pass
+            # Read-only, so simply cancel it before closing valkey.
+            watcher_task = getattr(app.state, "graveyard_watcher_task", None)
+            if watcher_task is not None:
+                watcher_task.cancel()
+                try:
+                    await watcher_task
+                except asyncio.CancelledError:
+                    pass
+            # Cancelled before engine.dispose(): a poll pass mid-deploy holds a
+            # session, and disposing the engine underneath it would raise on the
+            # way out rather than shutting down cleanly.
+            poller_task = getattr(app.state, "commit_poller_task", None)
+            if poller_task is not None:
+                poller_task.cancel()
+                try:
+                    await poller_task
+                except asyncio.CancelledError:
+                    pass
+            try:
+                await valkey.aclose()
+                await http_client.aclose()
+                await engine.dispose()
+            finally:
+                telemetry.shutdown()
 
 
 def configure_logging(level: str | None = None) -> logging.Logger:
@@ -441,6 +447,7 @@ def create_app() -> FastAPI:
     app.include_router(hook_fire.router)
     app.include_router(state.router)
     app.include_router(state.internal_router)
+    app.include_router(state.released_router)
     app.include_router(memory.router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise
     # be matched by GET /approvals/{approval_id} and fail as a bad uuid.

@@ -193,6 +193,17 @@ component and rail detail in `charts/curie/README.md`.
   that refusal into a default would silently drop every scheduling
   constraint the operator asked for. A new pod surface added to the chart
   uses the helper with its class name rather than a fresh direct index.
+- **A new top level values key is nil under `--reuse-values` from any
+  release that predates it.** Helm renders the new templates against the
+  OLD chart's values.yaml plus the stored operator values, so
+  `.Values.<newKey>.<field>` dereferences nil and the upgrade dies
+  (`connectorCaller`, #3505). Read it through
+  `(get (.Values.<newKey> | default dict) "<field>")` as #3544 did.
+  `ci/reuse-values-render-assertions.sh` renders the candidate on the
+  newest stable release's and a pinned v0.10.3's values.yaml, under no
+  operator values, the release's `values-dev.yaml`, and
+  `ci/fixtures/reuse-values-operator.yaml`, and its negative control
+  reverts the #3544 guard (#3813).
 - **Fail-closed egress, always.** `security.networkPolicy.allowedEgress` is
   empty by default; an unset allowlist must never mean allow-all. If you add
   a new egress destination the runner needs, it goes into this allowlist

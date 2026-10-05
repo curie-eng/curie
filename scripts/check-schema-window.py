@@ -215,6 +215,19 @@ def main() -> int:
             f"but alembic head is {head}"
         )
 
+    # @spec PROTECTED-HOOK-SOURCE-2: compare the installed owner to actual inputs.
+    serving_path = repo_root / (
+        "packages/protected-hooks/src/curie_protected_hooks/schema_serving.json"
+    )
+    try:
+        serving = json.loads(serving_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return _fail(f"cannot read shared serving metadata: {exc}")
+    if serving != {
+        "schema_min": schema_min, "schema_head": schema_head, "revision_parents": graph
+    }:
+        return _fail("shared serving metadata differs from candidate or actual graph")
+
     api_window_path = (
         repo_root / "apps" / "api" / "src" / "curie_api" / "schema_compat.json"
     )

@@ -482,7 +482,8 @@ spec:
             - python
             - -c
             - |
-              import base64, hashlib, json, os, pathlib, shutil, signal, subprocess, sys, time, urllib.request
+              import base64, hashlib, json, os, pathlib, re, shutil, signal, subprocess, sys, time, urllib.request
+              from urllib.parse import urlsplit, urlunsplit
               class NoRedirect(urllib.request.HTTPRedirectHandler):
                   def redirect_request(self, request, fp, code, message, headers, new_url):
                       return None
@@ -552,7 +553,28 @@ spec:
                   ).strip()
               except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                   raise SystemExit("workspace-init: checkout origin is unreadable")
-              if not origin.startswith("https://github.com/") or not origin.endswith(".git") or "@" in origin:
+              try:
+                  api = urlsplit(os.environ.get("CURIE_GITHUB_API_URL", "https://api.github.com").rstrip("/"))
+                  authority = "github.com" if api.netloc == "api.github.com" else api.netloc
+                  html_base = urlunsplit((api.scheme, authority, api.path.removesuffix("/api/v3"), "", ""))
+                  parsed = urlsplit(origin)
+                  _ = parsed.port
+              except ValueError:
+                  raise SystemExit("workspace-init: checkout origin is invalid")
+              repo = origin[len(html_base) + 1:].removesuffix(".git")
+              if (
+                  parsed.scheme != "https"
+                  or not parsed.hostname
+                  or parsed.username is not None
+                  or parsed.password is not None
+                  or parsed.query
+                  or parsed.fragment
+                  or not re.fullmatch(
+                      r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?",
+                      repo,
+                  )
+                  or origin != f"{html_base}/{repo}.git"
+              ):
                   raise SystemExit("workspace-init: checkout origin is not credential-free")
               for child in stage.iterdir():
                   os.replace(child, root / child.name)
@@ -563,6 +585,8 @@ spec:
               value: ""
             - name: CURIE_WORKSPACE_SHA256
               value: ""
+            - name: CURIE_GITHUB_API_URL
+              value: {{ .Values.api.githubApiUrl | default "https://api.github.com" | quote }}
           volumeMounts:
             - name: workspace
               mountPath: {{ $wf.mountPath }}
@@ -764,6 +788,8 @@ spec:
             {{- end }}
             - name: CURIE_PLUGIN_DIR
               value: {{ $runner.pluginDir | quote }}
+            - name: CURIE_GITHUB_API_URL
+              value: {{ .Values.api.githubApiUrl | default "https://api.github.com" | quote }}
             # Generic identity for a pre-warmed, not-yet-claimed sandbox; the
             # substrate's resume path overrides it per-claim.
             - name: CURIE_SESSION_ID
@@ -778,6 +804,17 @@ spec:
               value: {{ printf "{\"max_output_tokens_per_run\":%d,\"max_usd_per_day\":%v}" (int $runner.budget.maxOutputTokensPerRun) $runner.budget.maxUsdPerDay | quote }}
             - name: CURIE_RUNNER_PORT
               value: {{ $runner.port | quote }}
+            # Fail closed (#3821): the runner refuses to boot without a bearer,
+            # so the warm template always carries the chart-owned token. The
+            # worker's per-claim Overrides injection replaces it with the
+            # per-claim minted token on every bound claim, exactly like the
+            # CURIE_CREDENTIALS warm-pod fallback above.
+            - name: CURIE_RUNNER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.runnerTokenSecretName" . }}
+                  key: runnerToken
+                  optional: false
             {{- if $wf.enabled }}
             # Kubernetes owns the emptyDir mount root; make the intended checkout
             # explicit without mutating repository config or carrying a secret.

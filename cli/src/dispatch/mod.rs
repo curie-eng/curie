@@ -342,6 +342,31 @@ pub(crate) fn cluster_connector_bind_values(
     Ok(curie::cluster_secrets::sandbox_connector_secrets(&values))
 }
 
+fn parse_runner_image_binding(raw: &str) -> Result<curie::factory_intake::RunnerImageBinding> {
+    let (agent, image) = raw.split_once('=').ok_or_else(|| {
+        curie::exit::CliError::usage("--runner-image must be AGENT=IMAGE")
+            .with_fix("pass dark-factory=ghcr.io/example/runner@sha256:<64 hex digits>")
+    })?;
+    let digest = image
+        .split_once("@sha256:")
+        .map(|(_, digest)| digest)
+        .filter(|digest| digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()));
+    if agent.is_empty()
+        || !agent.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        || digest.is_none()
+    {
+        return Err(curie::exit::CliError::usage(
+            "--runner-image must name an agent and a digest-pinned image",
+        )
+        .with_fix("pass dark-factory=ghcr.io/example/runner@sha256:<64 hex digits>")
+        .into());
+    }
+    Ok(curie::factory_intake::RunnerImageBinding {
+        agent: agent.to_string(),
+        image: image.to_string(),
+    })
+}
+
 pub(crate) async fn bind_cluster_connector_secrets(
     namespace: &str,
     release: &str,

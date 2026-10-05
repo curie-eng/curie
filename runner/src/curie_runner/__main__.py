@@ -39,7 +39,12 @@ from .approval import (
     policy_disallowed_tools,
     resolve_approval_policy,
 )
-from .config import RunnerConfig
+from .config import (
+    ALLOW_TOKENLESS_ENV,
+    RunnerConfig,
+    RunnerTokenRequiredError,
+    require_serving_token,
+)
 from .connectors import (
     build_mcp_servers,
     declared_secret_names,
@@ -55,6 +60,7 @@ from .harness.claude.approval import (
     build_can_use_tool,
     build_memory_tools,
 )
+from .harness.claude.preflight_blocked import PreflightBlockedSession
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
     BUILTIN_HARNESS_CANONICAL_PATHS,
@@ -123,7 +129,11 @@ from .turn_progress import (
     turn_progress_enabled,
 )
 from .usage_report import USAGE_PATH, UsageReporter
-from .verification import KNOWN_BLOCKER_NAMES, preflight_workspace_verification
+from .verification import (
+    KNOWN_BLOCKER_NAMES,
+    blocked_checks,
+    preflight_workspace_verification,
+)
 from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
 
 logger = logging.getLogger("curie_runner")
@@ -234,6 +244,8 @@ def _format_check_data(check: dict[str, Any]) -> str:
     if check.get("install"):
         data["install"] = check.get("install")
         data["installed"] = bool(check.get("installed"))
+    if check.get("delegated_to"):
+        data["delegated_to"] = check["delegated_to"]
     data["outcome"] = check.get("outcome", "unavailable")
     data["exit_status"] = check.get("exit_status")
     data["missing_binaries"] = list(check.get("missing_binaries", []))
@@ -288,16 +300,17 @@ def _format_check_line(check: dict[str, Any]) -> str:
             "after edits."
         )
     else:
+        # Only a delegated check reaches the prompt unavailable (#3873); an
+        # undelegated one stops the run before the model starts. The delegated
+        # check name is declared text, so it stays in the fenced data block.
         parts.append(
             "At factory startup, in-sandbox verification is unavailable for check "
-            f"{check_id}: its command could not be completed. If you change its paths, "
-            "state that in-sandbox verification was unavailable and that the "
-            "matching required CI check is pending proof only if that check selects "
-            "all changed paths. You may use publish_changes only after confirming "
-            "that matching required route, and the pull request body must state that "
-            "in-sandbox verification was unavailable and CI is pending proof. If no "
-            "matching required check exists, do not publish and the work item cannot "
-            "succeed."
+            f"{check_id}: its command could not be completed. Its declaration "
+            "delegates it to the required pull request CI check named by "
+            "delegated_to in the data block above. If you change its paths, you may "
+            "use publish_changes only after confirming that check selects all "
+            "changed paths, and the pull request body must state that in-sandbox "
+            "verification was unavailable and CI is pending proof."
         )
     parts.append(f"Missing binaries: {missing_text}. Blocked services: {blocked_text}.")
     failure_reason = check.get("failure_reason")
@@ -309,6 +322,47 @@ def _format_check_line(check: dict[str, Any]) -> str:
             f"(status {check.get('report_status')}); do not present it as recorded "
             "work item evidence."
         )
+    return " ".join(parts)
+
+
+def _preflight_blocked_explanation(verification: dict[str, Any]) -> str:
+    """The ``Could not complete:`` answer for a run whose preflight is blocked.
+
+    Names each blocked check by id with the runner-known blockers and its
+    install state, then the remedy. Declared commands, paths, ``delegated_to``,
+    process output and failure reasons never appear; a declared program is
+    referred to through its check id. At most four checks keep it short.
+    """
+
+    parts = [
+        "Could not complete: in-sandbox verification is unavailable before "
+        "implementation, so no model round ran."
+    ]
+    for check in blocked_checks(verification):
+        check_id = check.get("id")
+        missing = check.get("missing_binaries", [])
+        blocked = check.get("blocked_services", [])
+        missing_text = ", ".join(_known_name(name, check_id) for name in missing) or "none"
+        blocked_text = ", ".join(_known_name(name, check_id) for name in blocked) or "none"
+        if not check.get("install"):
+            install_text = "it declares no install"
+        elif not verification.get("lockfile_installs"):
+            install_text = (
+                "its declared install did not run because the bundle does not set lockfile_installs"
+            )
+        elif not check.get("installed"):
+            install_text = "its declared install did not complete"
+        else:
+            install_text = "its declared install ran"
+        parts.append(
+            f"Check {check_id} is blocked: missing binaries: {missing_text}; "
+            f"blocked services: {blocked_text}; {install_text}."
+        )
+    parts.append(
+        "To proceed, provide the missing prerequisite in the runner image or through "
+        "the bundle's lockfile install route and its egress, or declare delegated_to "
+        "on the check naming the required pull request CI check."
+    )
     return " ".join(parts)
 
 
@@ -569,6 +623,17 @@ def build_runner(
                 verification_url,
                 verification_token,
             )
+    # A declared check that could not run here and is not delegated to CI is
+    # blocked (#3873): the session factory then answers offline and the model
+    # never starts. A rejected report already raised above, before this point.
+    preflight_block: str | None = None
+    if blocked_checks(verification):
+        assert verification is not None
+        logger.warning(
+            "verification preflight blocked; the model will not start checks=%s",
+            ",".join(str(check.get("id")) for check in blocked_checks(verification)),
+        )
+        preflight_block = _preflight_blocked_explanation(verification)
     # Prior memory (#264) still leads the system prompt. Workspace facts are a
     # mounted-only boot block after memory. Conversation history (#20)
     # deliberately does not: ADR-0119 sends its ordered messages through the
@@ -980,7 +1045,7 @@ def build_runner(
             cwd=workspace_cwd,
             web_search_enabled=web_search_enabled,
             policy_disallowed_tools=policy_hidden_tools,
-            disallowed_tools=config.disallowed_tools,
+            disallowed_tools=config.catalogue_disallowed_tools,
         )
 
     sdk_generation = 0
@@ -1004,12 +1069,14 @@ def build_runner(
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
                 replay_messages=conversation_replay.messages,
-                disallowed_tools=config.disallowed_tools,
+                disallowed_tools=config.catalogue_disallowed_tools,
                 # The same holder the SDK tool closes over, so the scripted
                 # progress demo runs the real handler (ADR 0130).
                 turn_progress=turn_progress,
                 tool_access=tool_access,
             )
+        if preflight_block is not None:
+            return PreflightBlockedSession(preflight_block, model=config.model)
         assert real_options is not None
         nonlocal sdk_generation
         generation = sdk_generation
@@ -1397,6 +1464,22 @@ def _serve() -> None:
     )
     logger.info("runner starting fake_model=%s", fake_model)
     config = RunnerConfig.from_env(os.environ)
+    # Fail closed (#3821): without a bearer the control routes serve anything
+    # that reaches the port. Checked before the harness, the credential and the
+    # boot fetches, so a misrendered template never gets as far as a session.
+    try:
+        serving_token = require_serving_token(
+            config.runner_token, allow_tokenless=config.allow_tokenless
+        )
+    except RunnerTokenRequiredError as exc:
+        logger.error("runner refused to boot: %s", exc)
+        raise
+    if serving_token is None:
+        logger.warning(
+            "runner serving its control routes without a bearer token because %s "
+            "is set; local development only",
+            ALLOW_TOKENLESS_ENV,
+        )
     logger.info(
         "runner configured session=%s model=%s port=%d harness=%s",
         config.session.session_id,
@@ -1468,7 +1551,7 @@ def _serve() -> None:
 
     snapshot_callback = capture_mounted_workspace if workspace_path is not None else None
 
-    app = create_app(runner, token=config.runner_token, snapshotter=snapshot_callback)
+    app = create_app(runner, token=serving_token, snapshotter=snapshot_callback)
 
     async def _startup(_app: web.Application) -> None:
         try:

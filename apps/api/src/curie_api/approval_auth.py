@@ -20,14 +20,13 @@ from fastapi import Cookie, Depends, Header, HTTPException, Request, Response, s
 from curie_api.crud import console as crud_console
 
 from . import adapter_principal, approval_principal
-from .auth import require_api_key
+from .auth import CONSOLE_SESSION_COOKIE, require_api_key
 from .config import get_settings
 from .deps import SessionDep
 
 APPROVAL_PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
 ADAPTER_PRINCIPAL_HEADER = "X-Curie-Adapter-Principal"
 APPROVAL_ACTOR_HEADER = "X-Curie-Approval-Actor"
-CONSOLE_SESSION_COOKIE = "__Host-curie_console_session"
 _SAFE_ORIGIN_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _DEFAULT_ORIGIN_PORTS = {"http": 80, "https": 443}
 
@@ -171,6 +170,20 @@ def _console_origin_rejected() -> HTTPException:
     )
 
 
+def enforce_console_cookie_origin(request: Request) -> None:
+    """Reject an unsafe cookie-authenticated method whose origin host does not match.
+
+    SameSite=Strict does not stop a same-site sibling form. Safe methods are
+    not checked. The platform-key path must not call this.
+    """
+    if request.method.upper() in _SAFE_ORIGIN_METHODS:
+        return
+    if not _same_console_host(
+        _claimed_console_origin(request), _expected_console_origin(request)
+    ):
+        raise _console_origin_rejected()
+
+
 async def require_approval_principal(
     approval_id: uuid.UUID,
     request: Request,
@@ -205,11 +218,8 @@ async def require_approval_principal(
     if presented == 0:
         raise _unauthorized()
 
-    if has_cookie and request.method.upper() not in _SAFE_ORIGIN_METHODS:
-        if not _same_console_host(
-            _claimed_console_origin(request), _expected_console_origin(request)
-        ):
-            raise _console_origin_rejected()
+    if has_cookie:
+        enforce_console_cookie_origin(request)
 
     if has_adapter:
         assert x_curie_adapter_principal is not None
@@ -284,20 +294,22 @@ def platform_key_or_adapter(
     ``scope`` (ADR-0154), returning the adapter's claims or None for the key.
 
     Exactly one credential: both together are ambiguous and fail closed, as
-    the resolver's credentials do. The platform-key half is ``require_api_key``
-    unchanged, detail string included.
+    the resolver's credentials do. The platform-key half is ``require_api_key``,
+    and a live console session is that same half. An adapter plus the platform
+    key, or an adapter plus a session cookie, fails closed before verification.
     """
 
     async def dependency(
+        request: Request,
         x_api_key: Annotated[str | None, Header()] = None,
         x_curie_adapter_principal: Annotated[
             str | None, Header(alias=ADAPTER_PRINCIPAL_HEADER)
         ] = None,
     ) -> adapter_principal.AdapterClaims | None:
         if x_curie_adapter_principal is None:
-            await require_api_key(x_api_key)
+            await require_api_key(request, x_api_key)
             return None
-        if x_api_key is not None:
+        if x_api_key is not None or CONSOLE_SESSION_COOKIE in request.cookies:
             raise _unauthorized("ambiguous credentials")
         claims = adapter_principal.verify(
             x_curie_adapter_principal, get_settings().api_key, scope=scope

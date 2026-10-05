@@ -30,8 +30,10 @@ from ..behaviorpacks import (
 )
 from ..binding import (
     CONNECTOR_CALLER_TOKEN_ENV,
+    HISTORY_TOKEN_ENV,
     MAX_TURNS_ENV,
     SANDBOX_TOKEN_TTL_SECONDS,
+    boot_token_facts,
 )
 from ..capacity_wait import (
     CapacityWaitExpired,
@@ -118,6 +120,16 @@ def _boots_differently(
         return True
     if handle.caller_run != caller_run:
         return True
+    # #3823: replace a warm sandbox whose boot token cannot cover the turn
+    # this delivery is about to boot. Comparing with the new token expiry
+    # keeps a follow-up from running past the credential and getting 401s.
+    # A route with no recorded expiry is left alone.
+    if handle.state_token_exp is not None:
+        if handle.state_token_exp <= int(clock.time.time()):
+            return True
+        _agent, _cred, needed = boot_token_facts(env.get(HISTORY_TOKEN_ENV))
+        if needed is not None and handle.state_token_exp < needed:
+            return True
     return CONNECTOR_CALLER_TOKEN_ENV in env and not handle.carries_caller_token
 
 

@@ -27,7 +27,7 @@ import logging
 import secrets
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -35,7 +35,14 @@ from aci_protocol import BootEnv
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
 
-from ..binding import CONNECTOR_CALLER_TOKEN_ENV, MAX_TURNS_ENV, RUNNER_TOKEN_ENV
+from ..binding import (
+    CONNECTOR_CALLER_TOKEN_ENV,
+    HISTORY_TOKEN_ENV,
+    MAX_TURNS_ENV,
+    RUNNER_TOKEN_ENV,
+    SANDBOX_TOKEN_TTL_SECONDS,
+    boot_token_facts,
+)
 from ..workitem_dispatch import TerminationObservation
 from .affinity import AffinityStore
 from .docker import DockerSandboxClient
@@ -166,6 +173,97 @@ class SandboxSubstrate:
         self._k8s = k8s
         self._affinity = affinity
         self._config = config
+        self._boot_credential_revoker: Callable[[str, str], bool] | None = None
+
+    def set_boot_credential_revoker(self, revoker: Callable[[str, str], bool]) -> None:
+        """Report a released boot credential. The kernel wires the API call."""
+
+        self._boot_credential_revoker = revoker
+
+    def _remember_claim_credential(self, claim_name: str, env: Mapping[str, str] | None) -> None:
+        token = None
+        if env is not None:
+            token = env.get(HISTORY_TOKEN_ENV) or env.get(BootEnv.env_key("state_token"))
+        agent, cred, _exp = boot_token_facts(token)
+        if agent and cred:
+            self._affinity.remember_claim_credential(
+                claim_name, agent, cred, ttl_s=SANDBOX_TOKEN_TTL_SECONDS
+            )
+
+    def _report_boot_credential(
+        self,
+        *,
+        claim_name: str | None = None,
+        handle: SandboxHandle | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> None:
+        """Report the boot credential, and keep the record until the API accepts it.
+
+        A missing revoker leaves the record so a later reap can retry once the
+        worker is wired. A failed report does the same. Expiry of the record
+        matches the longest a token can still be valid.
+        """
+
+        agent: str | None = None
+        cred: str | None = None
+        stored: tuple[str, str] | None = None
+        if claim_name is not None:
+            stored = self._affinity.claim_credential(claim_name)
+            if stored is not None:
+                agent, cred = stored
+        if not agent or not cred:
+            if handle is not None and handle.state_credential_id and handle.state_credential_agent:
+                agent, cred = handle.state_credential_agent, handle.state_credential_id
+            else:
+                token = None
+                if env is not None:
+                    token = env.get(HISTORY_TOKEN_ENV) or env.get(BootEnv.env_key("state_token"))
+                agent, cred, _exp = boot_token_facts(token)
+        if agent and cred and claim_name is not None and stored is None:
+            self._affinity.remember_claim_credential(
+                claim_name, agent, cred, ttl_s=SANDBOX_TOKEN_TTL_SECONDS
+            )
+        if not agent or not cred:
+            return
+        revoker = self._boot_credential_revoker
+        if revoker is None:
+            return
+        try:
+            accepted = revoker(agent, cred) is True
+        except Exception:  # noqa: BLE001 - the record stays for a later retry
+            logger.warning("could not report sandbox credential %s as released", cred)
+            accepted = False
+        if accepted and claim_name is not None:
+            self._affinity.forget_claim_credential(claim_name)
+
+    def _retire_claim(
+        self,
+        name: str,
+        *,
+        request_timeout_seconds: float,
+        handle: SandboxHandle | None = None,
+        env: Mapping[str, str] | None = None,
+    ) -> None:
+        """Revoke the boot credential, then delete the claim. Every delete uses this."""
+
+        self._report_boot_credential(claim_name=name, handle=handle, env=env)
+        self._k8s.delete_claim(name, request_timeout_seconds=request_timeout_seconds)
+
+    def _retry_unreported_credentials(self) -> None:
+        """Reap retries a report whose claim is already gone."""
+
+        for claim_name, _agent, _cred in self._affinity.iter_claim_credentials():
+            try:
+                still_there = self._k8s.get_claim(
+                    claim_name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S
+                )
+            except Exception:  # noqa: BLE001 - a lookup failure is not proof the claim is gone
+                logger.warning(
+                    "could not look up claim %s while retrying its credential", claim_name
+                )
+                continue
+            if still_there is None:
+                self._report_boot_credential(claim_name=claim_name)
 
     def pod_termination(
         self, handle: SandboxHandle, *, since: datetime
@@ -448,9 +546,10 @@ class SandboxSubstrate:
             # The candidate is ready but still unrouted. Refusal retires only
             # that unexposed claim; the old route remains authoritative until
             # the generation CAS below succeeds.
-            self._k8s.delete_claim(
+            self._retire_claim(
                 candidate.claim_name,
                 request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                handle=candidate,
             )
             raise
         record = RouteRecord(handle=candidate, state=RouteState.LIVE)
@@ -461,15 +560,17 @@ class SandboxSubstrate:
             record=record,
             ttl_seconds=self._config.route_ttl_seconds,
         ):
-            self._k8s.delete_claim(
+            self._retire_claim(
                 candidate.claim_name,
                 request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                handle=candidate,
             )
             raise NoRouteError(f"late handoff lost its route fence for {thread_key}")
         try:
-            self._k8s.delete_claim(
+            self._retire_claim(
                 expected.claim_name,
                 request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                handle=expected,
             )
         except Exception:  # noqa: BLE001 - route already swapped; reaper owns cleanup
             logger.exception("late handoff left old claim for orphan reaping")
@@ -567,9 +668,10 @@ class SandboxSubstrate:
                 if old.history_ref is not None:
                     boot.setdefault(HISTORY_ENV, old.history_ref)
 
-                self._k8s.delete_claim(
+                self._retire_claim(
                     old.claim_name,
                     request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                    handle=old,
                 )
                 self._affinity.delete_if_claim(thread_key, old.claim_name)
                 handle = self._claim_fresh(
@@ -645,9 +747,10 @@ class SandboxSubstrate:
                 if record is not None:
                     claim_name = record.handle.claim_name
                     sandbox_name = record.handle.sandbox_name
-                    self._k8s.delete_claim(
+                    self._retire_claim(
                         claim_name,
                         request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                        handle=record.handle,
                     )
                     self._affinity.delete_if_claim(thread_key, claim_name)
                     released = True
@@ -781,9 +884,10 @@ class SandboxSubstrate:
         affinity_claim = record.handle.claim_name if record is not None else None
         for name in list(claim_names):
             try:
-                self._k8s.delete_claim(
+                self._retire_claim(
                     name,
                     request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                    handle=record.handle if record is not None and name == affinity_claim else None,
                 )
             except Exception as exc:  # noqa: BLE001 - absence poll still decides
                 logger.warning(
@@ -931,9 +1035,10 @@ class SandboxSubstrate:
         if remaining <= 0:
             return False
         try:
-            self._k8s.delete_claim(
+            self._retire_claim(
                 record.handle.claim_name,
                 request_timeout_seconds=min(_CONTROL_REQUEST_TIMEOUT_S, remaining),
+                handle=record.handle,
             )
             sleeps = _poll_sleeps(self._config)
             while True:
@@ -998,6 +1103,7 @@ class SandboxSubstrate:
             attributes={"service.name": "curie-worker", "operation": "cleanup"},
         ) as span:
             try:
+                self._retry_unreported_credentials()
                 inventory = self._affinity.route_inventory()
                 deleted, observed_claims = self._reap_orphans(inventory)
             except Exception as exc:  # noqa: BLE001 - existing broad catch retained
@@ -1098,7 +1204,7 @@ class SandboxSubstrate:
                 # The comparison is >=, so a claim exactly at the grace is
                 # spared. Ties go to the creator; do not simplify this to >.
                 continue
-            self._k8s.delete_claim(
+            self._retire_claim(
                 claim.name,
                 request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
             )
@@ -1191,6 +1297,7 @@ class SandboxSubstrate:
                 derived = self._existing_agent_pool(config.warm_pool, agent_name)
                 if derived is not None:
                     pool = derived
+        self._remember_claim_credential(name, env)
         self._k8s.create_claim(
             name,
             pool=pool,
@@ -1204,9 +1311,16 @@ class SandboxSubstrate:
             sandbox_name = self._await_bound(name, deadline)
             bound = self._await_service_fqdn(sandbox_name, deadline)
         except Exception:
-            self._k8s.delete_claim(name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S)
+            self._retire_claim(
+                name,
+                request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                env=env,
+            )
             raise
 
+        credential_agent, credential_id, credential_exp = boot_token_facts(
+            (env or {}).get(HISTORY_TOKEN_ENV)
+        )
         handle = SandboxHandle(
             thread_key=thread_key,
             claim_name=name,
@@ -1229,6 +1343,9 @@ class SandboxSubstrate:
             carries_caller_token=CONNECTOR_CALLER_TOKEN_ENV in (env or {}),
             carries_turn_progress=TURN_PROGRESS_ELIGIBILITY_ENV in (env or {}),
             caller_run=caller_run,
+            state_credential_agent=credential_agent,
+            state_credential_id=credential_id,
+            state_token_exp=credential_exp,
         )
         if not publish:
             return handle
@@ -1243,29 +1360,42 @@ class SandboxSubstrate:
             if winner is None:
                 continue
             if winner.state is RouteState.SUSPENDED:
-                self._k8s.delete_claim(name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S)
+                self._retire_claim(
+                    name,
+                    request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                    handle=handle,
+                )
                 raise SuspendedThreadError(thread_key)
             sandbox = self._k8s.get_sandbox(
                 winner.handle.sandbox_name,
                 request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
             )
             if sandbox is not None and sandbox.operating_mode == "Running":
-                self._k8s.delete_claim(name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S)
+                self._retire_claim(
+                    name,
+                    request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                    handle=handle,
+                )
                 if fresh_only:
                     # The winner never saw this claim's env (#2739).
                     raise RouteChangedError(thread_key)
                 return winner.handle
             self._evict_stale(thread_key, winner)
-        self._k8s.delete_claim(name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S)
+        self._retire_claim(
+            name,
+            request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+            handle=handle,
+        )
         raise NoRouteError(f"could not record a route for {thread_key} after repeated races")
 
     def _evict_stale(self, thread_key: str, record: RouteRecord) -> None:
         """Retire a route whose sandbox is gone: delete its claim (idempotent)
         and drop the route, guarded so a fresher route is never deleted."""
 
-        self._k8s.delete_claim(
+        self._retire_claim(
             record.handle.claim_name,
             request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+            handle=record.handle,
         )
         self._affinity.delete_if_claim(thread_key, record.handle.claim_name)
 

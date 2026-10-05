@@ -7,21 +7,25 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
 
 ## Load-bearing invariants
 
-- **Administrative auth is one shared API key today.** `require_api_key`
-  (`auth.py`) compares the `X-API-Key` header against `Settings.api_key` with
-  `hmac.compare_digest`. This is explicitly MVP-only; GitHub-App identity work
-  is expected to replace it eventually. The approval resolver is the recorded
-  exception (ADR-0106): the platform key may mint a subject-bound operator or
-  console credential but cannot resolve by itself, while Slack clicks arrive as
-  approval-bound attestations signed with an independent dispatcher/API key.
-  Resolver identity and channel are derived from those credentials, never the
-  request body. Do not add another auth scheme without an Accepted ADR.
+- **Administrative auth is the platform key or a live console session (ADR-0083).** `require_api_key`
+  (`auth.py`) follows ADR-0083 order: the platform key is checked first via
+  `verify_platform_key` with no database read, then a live
+  `__Host-curie_console_session` cookie through `live_console_session`.
+  `require_platform_key` never accepts a session. This is explicitly MVP-only;
+  GitHub-App identity work is expected to replace it eventually. The approval
+  resolver is the recorded exception (ADR-0106): the platform key may mint a
+  subject-bound operator or console credential but cannot resolve by itself,
+  while Slack clicks arrive as approval-bound attestations signed with an
+  independent dispatcher/API key. Resolver identity and channel are derived
+  from those credentials, never the request body. Do not add another auth
+  scheme without an Accepted ADR.
 - **The `state` router authenticates differently, on purpose (ADR-0033, #410).**
   `require_state_access` (`routers/state.py`) accepts EITHER the platform key OR a
   scoped, path-`agent_id`-bound `state` token minted by the worker for the
   sandbox, so a sandboxed agent can rehydrate its own memory/transcript without
-  holding a resolve-capable platform-wide key. Every OTHER router keeps
-  `require_api_key` (platform key only); a scoped token is rejected everywhere
+  holding a resolve-capable platform-wide key. A console session is not accepted
+  there, and a state token is still rejected by `require_api_key`. Every OTHER
+  router keeps `require_api_key`; a scoped token is rejected everywhere
   else, including `/approvals/{id}/resolve`. Do not collapse the state router
   back onto `require_api_key`, and do not extend scoped-token acceptance to
   another router without a new ADR.
@@ -112,8 +116,11 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   already-bundled sha therefore needs no access to the git remote -- which
   matters because the platform's GitHub credential can expire or be revoked
   without stopping webhook delivery (#1211). A **dev-branch** push is not
-  affected by this: it always clones and always validates, redeliveries
-  included, because the clone is also where the ancestry check (#1139) runs.
+  affected by this: it always clones and always validates, including a new
+  delivery (a new `X-GitHub-Delivery` id) of the same commit, because the
+  clone is also where the ancestry check (#1139) runs. A webhook delivery whose
+  id already deployed or promoted answers `push_duplicate` and does nothing
+  (#3820); polling has no delivery id and is unaffected.
   If you find yourself rebuilding on promote, that is a bug, not a feature --
   promotion is meant to be "the exact artifact that passed on dev," not a
   fresh build.

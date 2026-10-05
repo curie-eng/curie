@@ -24,10 +24,11 @@ trigger, and even that cut did not record live proof on the PR.
 The release pull request therefore carries two required sections, which the
 default [PR template](../.github/PULL_REQUEST_TEMPLATE.md) includes:
 
-- **Trigger** lists the issue numbers of the defects that caused the cut.
-- **Live proof** names a CI or ladder run URL that re-verified each trigger on
-  a live surface, or an explicit `waiver:` line with the reason no live run
-  was possible.
+1. **Trigger** lists the issue numbers of the defects that caused the cut.
+2. **Live proof** names a CI or ladder run URL that re-verified each trigger on
+   a live surface, the preparation PR's own CI through the exact standalone
+   marker `this-pr-ci`, or an explicit `waiver:` line with the reason no live
+   run was possible.
 
 `scripts/check-pr-body.sh` (the PR-body gate in
 [`.github/workflows/pr-body.yaml`](../.github/workflows/pr-body.yaml)) rejects a
@@ -35,10 +36,77 @@ patch release PR whose title matches `Prepare the vX.Y.Z release` when either
 section is missing, comment-only, or empty of those contents. Feature releases
 (`vX.Y.0`) are not this gate.
 
+The marker must occupy its own visible line inside **Live proof**:
+
+```markdown
+## Live proof
+
+this-pr-ci
+```
+
+A mention in prose, an HTML comment, or another section does not count. It
+references the preparation PR's own CI on its final head, so the body can be
+complete before that run has a URL. The marker passes the body-content check;
+it does not assert that CI has passed.
+
+The preparation PR's own CI run is proof for every rung CI actually ran on that
+tree. Do not rerun those rungs locally. A version-only preparation PR runs the
+local-release rung, version consistency, the schema window, release tests, and
+chart lint. A preparation PR that carries fixes is selected from its entire
+diff, including those fixes. `this-pr-ci` does not prove a live surface that CI
+did not run. Record a qualifying run URL or an explicit waiver for each trigger
+whose required live surface is outside that CI run.
+
 When an open issue is moved out of the milestone within 24 hours of the cut,
 comment on that issue naming the release it moved from. That is a process
 rule: the PR-body gate does not observe milestone moves. A milestone that
 reads "zero open issues" is not itself a reason to cut.
+
+## One preparation PR carries the fixes and version
+
+Prepare a patch cut in one short-lived branch targeting current `main`. Keep
+the trigger fixes and release preparation in the same PR; a separate candidate
+PR and candidate CI round are not required.
+
+1. Finish and review the fixes, tests, and documentation. Commit every change
+   outside the release's version-only path set before generating the atlas
+   snapshot. Record that final non-version commit's full SHA as the atlas pin.
+2. Generate the release snapshot from that pin. Make the version changes and
+   register the snapshot in a following version/snapshot commit. The only
+   permitted paths after the pin are `charts/curie/Chart.yaml`,
+   `cli/Cargo.toml`, `cli/Cargo.lock`,
+   `docs/architecture-atlas/versions.json`, and
+   `docs/architecture-atlas/snapshots/<tag>.json`. This is the shared set from
+   `release/atlas.py::version_only_paths`; another release's snapshot is outside
+   it.
+3. Open the preparation PR with the title `Prepare the vX.Y.Z release`, its
+   trigger issue numbers, and its Live proof. Run the required CI on the final
+   head. Those checks cover the combined preparation tree, including its
+   version identity. Keep the branch up to date with `main`. If the base or
+   any non-version change advances after the pin, update the branch, regenerate
+   the snapshot from the new final non-version commit, recreate the
+   version/snapshot commit, and rerun the required checks on that head.
+4. Merge only the reviewed, up-to-date head with its required checks passing.
+   The atlas gate accepts the resulting merge commit when the pin is its
+   ancestor and the aggregate delta from pin to merge contains only the
+   permitted paths, including an empty delta. A non-version merge change
+   requires a new pin and snapshot before tagging.
+
+The atlas pin and the CI proof commit serve different gates. Under current
+[ADR 0195](adr/0195-a-version-only-delta-reuses-its-parents-checks.md), the release
+authorizer can reuse only a green first-parent ancestor across a version-only
+delta. A combined preparation merge contains fixes relative to its first
+parent, and its checked PR head is the second parent. The authorizer does not
+accept that head as inherited proof. Direct tagging of this combined merge
+therefore waits for its own complete required checks on `main`, along with the
+other release gates.
+
+[Draft ADR 0196](adr/0196-combined-preparation-pr-checks.md) proposes reusing full
+green preparation-head checks when an up-to-date merge has only a version-only
+or empty delta from that head. It does not authorize this path until the ADR is
+Accepted and the release authorizer implements it. The proposed single
+preparation CI run followed by tag publication is conditional on that change;
+there is no separate candidate CI round.
 
 ## What each release publishes
 

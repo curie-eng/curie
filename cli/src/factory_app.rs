@@ -191,6 +191,136 @@ impl GithubApi {
         self.call(reqwest::Method::GET, self.url(&["app"]), jwt, None)
             .await
     }
+
+    /// Resolve once, then keep every Contents API read on the same commit.
+    /// Shapes and `ref` semantics are documented at
+    /// https://docs.github.com/en/rest/repos/repos#get-a-repository and
+    /// https://docs.github.com/en/rest/commits/commits#get-a-commit.
+    pub async fn default_branch_commit(&self, app: &InstalledApp, repo: &str) -> Result<String> {
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| CliError::usage("repository must be owner/repo"))?;
+        let token = app
+            .token_for(repo)
+            .ok_or_else(|| CliError::failure("repository is outside the App installation"))?;
+        let (status, metadata) = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["repos", owner, name]),
+                token,
+                None,
+            )
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(unexpected(status, "GET repository metadata"));
+        }
+        let branch = metadata
+            .get("default_branch")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                CliError::failure("GitHub repository response carries no default_branch")
+            })?;
+        let (status, commit) = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["repos", owner, name, "commits", branch]),
+                token,
+                None,
+            )
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(unexpected(status, "GET default branch commit"));
+        }
+        commit
+            .get("sha")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.len() >= 40 && s.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(str::to_string)
+            .ok_or_else(|| CliError::failure("GitHub commit response carries no valid sha").into())
+    }
+
+    /// A directory is an array and a file has base64 content. Neither auth
+    /// failures nor malformed successful responses mean a missing manifest.
+    /// https://docs.github.com/en/rest/repos/contents#get-repository-content
+    pub async fn contents(
+        &self,
+        app: &InstalledApp,
+        repo: &str,
+        path: &str,
+        commit: &str,
+    ) -> Result<RepositoryContent> {
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| CliError::usage("repository must be owner/repo"))?;
+        let token = app
+            .token_for(repo)
+            .ok_or_else(|| CliError::failure("repository is outside the App installation"))?;
+        let mut segments = vec!["repos", owner, name, "contents"];
+        segments.extend(path.split('/').filter(|part| !part.is_empty()));
+        let mut url = self.url(&segments);
+        url.query_pairs_mut().append_pair("ref", commit);
+        let (status, body) = self.call(reqwest::Method::GET, url, token, None).await?;
+        if status == 404 {
+            return Ok(RepositoryContent::Missing);
+        }
+        if !(200..300).contains(&status) {
+            return Err(unexpected(status, "GET repository contents"));
+        }
+        if body.is_array() {
+            let entries: Vec<RepositoryEntry> = serde_json::from_value(body).map_err(|_| {
+                CliError::failure(format!(
+                    "GitHub returned a malformed contents directory for {path}"
+                ))
+            })?;
+            return Ok(RepositoryContent::Directory(entries));
+        }
+        #[derive(serde::Deserialize)]
+        struct File {
+            #[serde(rename = "type")]
+            kind: String,
+            encoding: String,
+            content: String,
+        }
+        let file: File = serde_json::from_value(body).map_err(|_| {
+            CliError::failure(format!("GitHub returned malformed contents for {path}"))
+        })?;
+        if file.kind != "file" || file.encoding != "base64" {
+            return Err(CliError::failure(format!(
+                "GitHub returned unsupported contents encoding for {path}"
+            ))
+            .into());
+        }
+        let encoded: String = file
+            .content
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| {
+                CliError::failure(format!(
+                    "GitHub returned invalid base64 contents for {path}"
+                ))
+            })?;
+        let text = String::from_utf8(bytes).map_err(|_| {
+            CliError::failure(format!("repository toolchain file {path} is not UTF-8"))
+        })?;
+        Ok(RepositoryContent::File(text))
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct RepositoryEntry {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+pub enum RepositoryContent {
+    Missing,
+    Directory(Vec<RepositoryEntry>),
+    File(String),
 }
 
 fn unexpected(status: u16, what: &str) -> anyhow::Error {

@@ -331,7 +331,10 @@ async def work_item_usage(session: AsyncSession, work_item_id: uuid.UUID) -> Wor
     complete = True
     for row in rows:
         tokens = _tokens(row)
+        # Zero tokens cost zero whether or not a price matched.
         cost = row.estimated_cost_usd
+        if cost is None and not tokens:
+            cost = Decimal(0)
         complete = complete and cost is not None
         total = _add(total, cost)
         role = roles.setdefault(row.role, WorkItemUsageRole())

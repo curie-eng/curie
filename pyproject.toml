@@ -7,6 +7,7 @@ dependencies = [
     "aci-protocol",
     "curie-internal",
     "curie-channel-protocol",
+    "curie-protected-hooks",
     "curie-telemetry-schema",
     "plugin-format",
     "curie-api",
@@ -27,6 +28,7 @@ members = [
     "packages/aci-protocol",
     "packages/curie-internal",
     "packages/channel-protocol",
+    "packages/protected-hooks",
     "packages/plugin-format",
     "packages/telemetry-schema",
     "packages/test-support",
@@ -46,6 +48,7 @@ members = [
 aci-protocol = { workspace = true }
 curie-internal = { workspace = true }
 curie-channel-protocol = { workspace = true }
+curie-protected-hooks = { workspace = true }
 curie-telemetry-schema = { workspace = true }
 plugin-format = { workspace = true }
 curie-test-support = { workspace = true }
@@ -82,6 +85,7 @@ dev = [
 # legacy runner SDK importers. Only the Claude harness package may add imports.
 # The platform, frozen contracts, harness port and approval gate stay SDK free.
 root_packages = [
+    "curie_protected_hooks",
     "curie_api",
     "curie_internal",
     "curie_worker",
@@ -102,6 +106,13 @@ root_packages = [
 # Required for the contracts below: `claude_agent_sdk` is an EXTERNAL package, and
 # import-linter only tracks imports that leave the root packages when told to.
 include_external_packages = true
+
+# @spec PROTECTED-HOOK-LANE-1: internal transport has no application/SDK authority.
+[[tool.importlinter.contracts]]
+name = "Protected hook primitives stay independent of applications and harnesses"
+type = "forbidden"
+source_modules = ["curie_protected_hooks"]
+forbidden_modules = ["curie_api", "curie_worker", "curie_runner", "claude_agent_sdk"]
 
 [[tool.importlinter.contracts]]
 # Telemetry attribute names are shared schema, not an application or harness
@@ -245,10 +256,13 @@ testpaths = [
     # The github-activity connector ships its own test_server.py, same reason.
     "examples/github-activity/connectors",
     "tools/doclint/tests",
+    # @spec PROTECTED-HOOK-LANE-2
+    "packages/protected-hooks/tests",
     "tools/wire-tolerance-gate/tests",
     "tools/ci-retry-gate/tests",
     "tools/ci-workflow-paths/tests",
     "tools/e2e-ci-selection/tests",
+    "tools/helm-ci-gate/tests",
     "tools/fix-pin-ci/tests",
     "tools/sdk-lock-gate/tests",
     "tools/close-on-next/tests",
@@ -257,6 +271,7 @@ testpaths = [
     "tools/restore-drill/tests",
     "tools/sre-contract/tests",
     "tools/factory-e2e/tests",
+    "tools/github-stub/tests",
     "tools/runtime-assertion-gate/tests",
     # Repo-level tests that pin a seam between two apps which may not import
     # each other, such as the runner/API default memory guidance (#1461).
@@ -295,6 +310,7 @@ mypy_path = [
     "packages/aci-protocol/src",
     "packages/curie-internal/src",
     "packages/channel-protocol/src",
+    "packages/protected-hooks/src",
     "packages/plugin-format/src",
     "packages/telemetry-schema/src",
     "packages/test-support/src",
@@ -313,6 +329,7 @@ files = [
     "packages/aci-protocol/src",
     "packages/curie-internal/src",
     "packages/channel-protocol/src",
+    "packages/protected-hooks/src",
     "packages/plugin-format/src",
     "packages/telemetry-schema/src",
     "packages/test-support/src",

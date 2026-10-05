@@ -21,7 +21,7 @@ const TEMPLATES: [string, string, boolean][] = [
 const SKILL = `---
 name: deal-desk
 description: Approves or routes sales-deal discount requests in Slack
-tools: [salesforce-mcp, slack]
+allowed-tools: [salesforce-mcp, slack]
 ---
 
 # When to run

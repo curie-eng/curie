@@ -94,6 +94,44 @@ def test_refuses_runtime_changes_after_the_snapshot_pin(tmp_path):
         )
 
 
+def test_version_only_paths_are_the_shared_set_plus_that_releases_snapshot():
+    """#3858: the selector and the tag gate share this one definition."""
+    module = load_module()
+
+    assert module.version_only_paths("v0.11.2") == frozenset(
+        {
+            "charts/curie/Chart.yaml",
+            "cli/Cargo.lock",
+            "cli/Cargo.toml",
+            "docs/architecture-atlas/versions.json",
+            "docs/architecture-atlas/snapshots/v0.11.2.json",
+        }
+    )
+    assert module.version_only_paths("v0.11.2") == module.VERSION_ONLY_PATHS | {
+        "docs/architecture-atlas/snapshots/v0.11.2.json"
+    }
+    assert "docs/architecture-atlas/snapshots/v0.11.2.json" not in module.version_only_paths(
+        "v0.12.0-rc.1"
+    )
+
+
+def test_refuses_another_releases_snapshot_after_the_pin(tmp_path):
+    """#3858: only the release's own snapshot is version-only, not any snapshot."""
+    module = load_module()
+    atlas_dir = write_atlas(tmp_path, commit="b" * 40)
+
+    with pytest.raises(module.AtlasError, match="v9.9.9"):
+        module.require_release_snapshot(
+            atlas_dir,
+            "v1.2.3",
+            "a" * 40,
+            changed_paths=[
+                "cli/Cargo.toml",
+                "docs/architecture-atlas/snapshots/v9.9.9.json",
+            ],
+        )
+
+
 def test_refuses_a_snapshot_whose_metadata_does_not_match_the_manifest(tmp_path):
     module = load_module()
     atlas_dir = write_atlas(tmp_path)
@@ -138,9 +176,7 @@ def test_cli_fails_loud_when_the_release_snapshot_is_missing(tmp_path):
 
 
 def run_git(repo: Path, *args: str) -> str:
-    done = subprocess.run(
-        ["git", *args], cwd=repo, capture_output=True, text=True, check=True
-    )
+    done = subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=True)
     return done.stdout.strip()
 
 
@@ -148,9 +184,7 @@ def run_git(repo: Path, *args: str) -> str:
     ("late_path", "expected_code"),
     [("cli/Cargo.toml", 0), ("apps/api/src/curie_api/main.py", 1)],
 )
-def test_cli_checks_the_real_git_delta_after_the_snapshot_pin(
-    tmp_path, late_path, expected_code
-):
+def test_cli_checks_the_real_git_delta_after_the_snapshot_pin(tmp_path, late_path, expected_code):
     repo = tmp_path / "repo"
     repo.mkdir()
     run_git(repo, "init", "-q", "-b", "main")
@@ -187,6 +221,67 @@ def test_cli_checks_the_real_git_delta_after_the_snapshot_pin(
     assert done.returncode == expected_code, done.stdout + done.stderr
     if expected_code == 1:
         assert late_path in done.stderr
+
+
+@pytest.mark.parametrize("late_behavior_change", [False, True])
+def test_cli_checks_combined_preparation_pr_merge(tmp_path, late_behavior_change):
+    """A pin on the preparation branch includes final fixes before the bump."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_git(repo, "init", "-q", "-b", "main")
+    run_git(repo, "config", "user.email", "test@example.com")
+    run_git(repo, "config", "user.name", "Test")
+    behavior_path = "apps/api/src/curie_api/main.py"
+    behavior_file = repo / behavior_path
+    behavior_file.parent.mkdir(parents=True)
+    behavior_file.write_text("original behavior")
+    run_git(repo, "add", ".")
+    run_git(repo, "commit", "-qm", "initial behavior")
+    main_commit = run_git(repo, "rev-parse", "HEAD")
+
+    run_git(repo, "checkout", "-qb", "task/prepare-release")
+    behavior_file.write_text("final fix")
+    run_git(repo, "add", behavior_path)
+    run_git(repo, "commit", "-qm", "finish release fix")
+    snapshot_commit = run_git(repo, "rev-parse", "HEAD")
+    atlas_dir = write_atlas(repo, commit=snapshot_commit)
+    manifest = repo / "cli" / "Cargo.toml"
+    manifest.parent.mkdir()
+    manifest.write_text('[package]\nversion = "1.2.3"\n')
+    run_git(repo, "add", ".")
+    run_git(repo, "commit", "-qm", "prepare release version")
+    if late_behavior_change:
+        behavior_file.write_text("unrecorded late behavior")
+        run_git(repo, "add", behavior_path)
+        run_git(repo, "commit", "-qm", "change behavior after snapshot")
+    preparation_head = run_git(repo, "rev-parse", "HEAD")
+
+    run_git(repo, "checkout", "-q", "main")
+    run_git(repo, "merge", "--no-ff", "-qm", "merge preparation", preparation_head)
+    merge_commit = run_git(repo, "rev-parse", "HEAD")
+    assert run_git(repo, "rev-parse", "HEAD^1") == main_commit
+    assert run_git(repo, "rev-parse", "HEAD^2") == preparation_head
+
+    done = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--atlas-dir",
+            str(atlas_dir),
+            "--version",
+            "v1.2.3",
+            "--commit",
+            merge_commit,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert done.returncode == (1 if late_behavior_change else 0), done.stdout + done.stderr
+    if late_behavior_change:
+        assert behavior_path in done.stderr
+    else:
+        assert merge_commit in done.stdout
 
 
 def test_authorize_release_runs_the_atlas_gate_before_builds():

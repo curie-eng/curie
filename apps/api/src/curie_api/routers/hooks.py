@@ -12,7 +12,8 @@ stream.
 
 **Authentication is the signature, not the platform key**, exactly as the GitHub
 webhook does, so this router sits outside the ``X-API-Key`` dependency. The
-secret is per agent and derived rather than stored (see ``hook_secret``).
+secret is derived rather than stored: legacy per-agent credentials or a scoped
+source key selected by current server policy (SOURCE-2/4).
 
 **One ordering difference from ``/channels/turns``, stated because it is a real
 cost.** That route verifies its credential statelessly, before any query, so an
@@ -50,6 +51,7 @@ from datetime import UTC, datetime
 from html import escape
 from typing import Annotated, Any
 
+import anyio
 import redis.asyncio as redis
 from aci_protocol import (
     STREAM_PAYLOAD_FIELD,
@@ -71,8 +73,6 @@ from curie_telemetry import (
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
 
 from curie_api.crud import channels as crud_channels
 from curie_api.crud import workspaces as crud_workspaces
@@ -95,6 +95,7 @@ from ..hook_partition import (
     PartitionError,
     derive_partition,
 )
+from ..hook_source_auth import authenticated_source
 from ..identities import refuse_undeclared
 from ..models import Agent, AgentChannel
 from ..source_binding import MappingOutcome, resolve_source_binding
@@ -108,11 +109,6 @@ router = APIRouter(prefix="/hooks", tags=["hooks"])
 # prefix: that one is keyed by binding row id and this one by agent id, and two
 # different id spaces under one prefix could collide and swallow each other's
 # turns.
-
-# The one detail string every hook auth failure returns. Identical for "no
-# signature", "bad signature" and "no such agent", so a caller cannot use the
-# route to discover which agent ids exist.
-_AUTH_DETAIL = "missing or invalid signature"
 
 class HookAccepted(BaseModel):
     """The hook receipt. ``duplicate`` says whether THIS request enqueued.
@@ -272,18 +268,6 @@ async def _duplicate_receipt(
     )
 
 
-async def _load_agent(session: SessionDep, agent_id: uuid.UUID) -> Agent | None:
-    """Load the agent and every surface binding, or None."""
-
-    # Annotated rather than returned bare: `session.scalar` is typed Any, and the
-    # local annotation is how the rest of this package pins it (see `crud/agents.py` and
-    # `channels._resolve_binding`).
-    agent: Agent | None = await session.scalar(
-        select(Agent).where(Agent.id == agent_id).options(selectinload(Agent.channels))
-    )
-    return agent
-
-
 def _mint_turn(
     agent: Agent,
     binding: AgentChannel,
@@ -386,6 +370,8 @@ async def ingest_hook(
     7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),
        after both of those and before anything is claimed;
     8. routability, then the claim, quota and enqueue.
+    \f
+    @spec PROTECTED-HOOK-SOURCE-2/4/10.
     """
 
     if not HOOK_NAME.fullmatch(hook):
@@ -398,326 +384,338 @@ async def ingest_hook(
     settings = get_settings()
     raw = await read_bounded_body(request, settings.hook_max_body_bytes, subject="hook body")
 
-    agent = await _load_agent(session, agent_id)
-    # One refusal for "no such agent" and for "bad signature": a caller that can
-    # tell them apart can enumerate agent ids through a route that answers 401.
-    if agent is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
-    secret = hook_signing.derive(
-        settings.api_key, agent_id=str(agent.id), generation=agent.hook_generation
-    )
-    if not hook_signing.verify(
-        secret,
+    async with authenticated_source(
+        request,
+        session,
+        agent_id=agent_id,
+        hook=hook,
+        raw=raw,
+        tool_access=tool_access.value if tool_access is not None else None,
         timestamp=x_curie_timestamp,
         delivery_id=x_curie_delivery_id or "",
-        hook=hook,
-        tool_access=tool_access.value if tool_access is not None else None,
-        body=raw,
-        header=x_curie_signature_256,
-    ):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
-
-    if not x_curie_delivery_id:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            f"{hook_signing.DELIVERY_HEADER} is required: this ingress is at-least-once, so a "
-            "stable upstream id is what keeps a retried delivery from running the "
-            "agent twice",
-        )
-
-    target_supplied = conversation_id is not None or placeholder is not None
-    if target_supplied and (not conversation_id or not placeholder):
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "an explicit hook reply target requires both conversation_id and placeholder",
-        )
-
-    # Derived here and nowhere else in the order. After the signature and the
-    # delivery id, so an unsigned caller is never told which field of its payload
-    # the operator reads -- nor that this hook is partitioned at all. Before the
-    # claim, so a refusal leaves no claim key behind and the upstream's retry of a
-    # CORRECTED payload is not deduplicated away as a duplicate. And before the
-    # reply surface is selected, so a partition misconfiguration is attributed to
-    # the hook's configuration rather than surfacing as a 404 or 409 about a
-    # binding the operator would then go and inspect for nothing.
-    try:
-        partition = derive_partition(agent.hook_partitions, hook, raw)
-    except PartitionError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-
-    mapping = resolve_source_binding(
-        agent.source_bindings,
-        hook,
-        raw,
-        settings.github_repo_allowlist,
-    )
-    if mapping.status in {"unauthorized", "wrong_binding"}:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, mapping.reason)
-
-    if (kind is None) != (address is None):
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "hook reply surface requires both kind and address",
-        )
-    if adapter is not None and kind is None:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "hook reply surface adapter names a route within kind and address; pass all three",
-        )
-    # Both or neither, checked just above; naming both here lets the type
-    # checker see that the `else` branch holds a full pair.
-    if kind is None or address is None:
-        if len(agent.channels) != 1:
+        signature=x_curie_signature_256,
+    ) as source:
+        agent = source.agent
+        if not x_curie_delivery_id:
             raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                "this agent has multiple surfaces; select the hook reply surface "
-                "with both kind and address query parameters",
+                status.HTTP_400_BAD_REQUEST,
+                f"{hook_signing.DELIVERY_HEADER} is required: this ingress is at-least-once, so a "
+                "stable upstream id is what keeps a retried delivery from running the "
+                "agent twice",
             )
-        binding = agent.channels[0]
-    else:
-        # The route is the triple (ADR-0168 decision 3): `adapter` names the
-        # identity for Slack and the adapter slug for any other kind, and an
-        # omitted one means what it means to every reader -- the default Slack
-        # identity, or the agent's single route on a non-Slack pair.
-        # `crud.channels.matching_bindings` is the one matching rule every reader of a
-        # route shares; `agent.channels` is already loaded, so this calls it
-        # directly rather than issuing a fresh query.
-        if adapter is not None:
-            try:
-                refuse_undeclared(kind, route_identity(kind, adapter))
-            except ValueError as exc:
-                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-        matches = crud_channels.matching_bindings(agent.channels, kind, address, adapter)
-        if not matches:
-            unbound = "this agent has no binding for the selected kind and address"
+
+        target_supplied = conversation_id is not None or placeholder is not None
+        if target_supplied and (not conversation_id or not placeholder):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "an explicit hook reply target requires both conversation_id and placeholder",
+            )
+
+        # Derived here and nowhere else in the order. After the signature and the
+        # delivery id, so an unsigned caller is never told which field of its payload
+        # the operator reads -- nor that this hook is partitioned at all. Before the
+        # claim, so a refusal leaves no claim key behind and the upstream's retry of a
+        # CORRECTED payload is not deduplicated away as a duplicate. And before the
+        # reply surface is selected, so a partition misconfiguration is attributed to
+        # the hook's configuration rather than surfacing as a 404 or 409 about a
+        # binding the operator would then go and inspect for nothing.
+        try:
+            partition = derive_partition(agent.hook_partitions, hook, raw)
+        except PartitionError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+        mapping = resolve_source_binding(
+            agent.source_bindings,
+            hook,
+            raw,
+            settings.github_repo_allowlist,
+        )
+        if mapping.status in {"unauthorized", "wrong_binding"}:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, mapping.reason)
+
+        if (kind is None) != (address is None):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "hook reply surface requires both kind and address",
+            )
+        if adapter is not None and kind is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "hook reply surface adapter names a route within kind and address; pass all three",
+            )
+        # Both or neither, checked just above; naming both here lets the type
+        # checker see that the `else` branch holds a full pair.
+        if kind is None or address is None:
+            if len(agent.channels) != 1:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "this agent has multiple surfaces; select the hook reply surface "
+                    "with both kind and address query parameters",
+                )
+            binding = agent.channels[0]
+        else:
+            # The route is the triple (ADR-0168 decision 3): `adapter` names the
+            # identity for Slack and the adapter slug for any other kind, and an
+            # omitted one means what it means to every reader -- the default Slack
+            # identity, or the agent's single route on a non-Slack pair.
+            # `crud.channels.matching_bindings` is the one matching rule every reader of a
+            # route shares; `agent.channels` is already loaded, so this calls it
+            # directly rather than issuing a fresh query.
             if adapter is not None:
-                unbound += f" as {route_identity(kind, adapter)!r}"
-            elif kind == SLACK_KIND:
-                identities = sorted(
-                    route_identity(binding.kind, binding.adapter) or DEFAULT_IDENTITY
-                    for binding in agent.channels
-                    if binding.kind == kind and binding.address == address
-                )
-                if identities:
-                    unbound += (
-                        f" as {DEFAULT_IDENTITY!r}; it binds {kind}:{address} only as "
-                        f"{', '.join(map(repr, identities))}, so pass adapter to name one"
+                try:
+                    refuse_undeclared(kind, route_identity(kind, adapter))
+                except ValueError as exc:
+                    raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+            matches = crud_channels.matching_bindings(agent.channels, kind, address, adapter)
+            if not matches:
+                unbound = "this agent has no binding for the selected kind and address"
+                if adapter is not None:
+                    unbound += f" as {route_identity(kind, adapter)!r}"
+                elif kind == SLACK_KIND:
+                    identities = sorted(
+                        route_identity(binding.kind, binding.adapter) or DEFAULT_IDENTITY
+                        for binding in agent.channels
+                        if binding.kind == kind and binding.address == address
                     )
-            raise HTTPException(status.HTTP_404_NOT_FOUND, unbound)
-        if len(matches) > 1:
-            # Two of this agent's routes on one pair and no adapter to name
-            # one: replying through either would be a guess.
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                f"{len(matches)} routes are bound to {kind}:{address}; pass adapter to name one",
-            )
-        binding = matches[0]
+                    if identities:
+                        unbound += (
+                            f" as {DEFAULT_IDENTITY!r}; it binds {kind}:{address} only as "
+                            f"{', '.join(map(repr, identities))}, so pass adapter to name one"
+                        )
+                raise HTTPException(status.HTTP_404_NOT_FOUND, unbound)
+            if len(matches) > 1:
+                # Two of this agent's routes on one pair and no adapter to name
+                # one: replying through either would be a guess.
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    f"{len(matches)} routes are bound to {kind}:{address}; "
+                    "pass adapter to name one",
+                )
+            binding = matches[0]
 
-    thread_id = conversation_id or hook_conversation_id(agent.id, hook, partition)
-    if mapping.selects_workspace and mapping.repository is not None:
-        existing = await crud_workspaces.get_thread_workspace(
-            session, agent_id=agent.id, conversation_id=thread_id
+        thread_id = conversation_id or hook_conversation_id(agent.id, hook, partition)
+        if mapping.selects_workspace and mapping.repository is not None:
+            existing = await crud_workspaces.get_thread_workspace(
+                session, agent_id=agent.id, conversation_id=thread_id
+            )
+            if (
+                existing is not None
+                and existing.repo_full_name.casefold() != mapping.repository.casefold()
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "this alert partition is already bound to a different repository",
+                )
+
+        # No unbound-agent branch, deliberately. `AgentCreate.channel` is required and
+        # `crud.update_agent_binding` mutates the row in place rather than clearing
+        # it, so an agent with no binding is not a reachable state and a branch for it
+        # would be speculative code guarding nothing. `test_hooks.py` pins that
+        # invariant, so if a future unbind path makes it reachable, that test fails
+        # here rather than this route silently minting a turn with no reply route.
+        digest = sha16(x_curie_delivery_id)
+        # Namespaced by agent AND hook, so two hooks on one agent cannot swallow each
+        # other's deliveries when an upstream reuses its id space across them.
+        #
+        # Neither of these carries the partition, and that is deliberate rather than
+        # an oversight: one upstream delivery id must run at most once, whatever
+        # partition it names. Folding the partition in would let a retry that derived
+        # a different value run the agent a second time for the same delivery.
+        event_id = f"hook-{agent.id}-{hook}-{digest}"
+        key = f"{HOOK_KEY_PREFIX}:delivery:{agent.id}:{hook}:{digest}"
+        owner = f"pending:{pysecrets.token_hex(16)}"
+        client: redis.Redis = request.app.state.valkey
+
+        reservation = backlog_reservation(
+            key_prefix=f"{HOOK_KEY_PREFIX}:backlog:{agent.id}",
+            window_s=settings.hook_backlog_window_s,
         )
-        if (
-            existing is not None
-            and existing.repo_full_name.casefold() != mapping.repository.casefold()
-        ):
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                "this alert partition is already bound to a different repository",
-            )
+        preserve_quota = False
 
-    # No unbound-agent branch, deliberately. `AgentCreate.channel` is required and
-    # `crud.update_agent_binding` mutates the row in place rather than clearing
-    # it, so an agent with no binding is not a reachable state and a branch for it
-    # would be speculative code guarding nothing. `test_hooks.py` pins that
-    # invariant, so if a future unbind path makes it reachable, that test fails
-    # here rather than this route silently minting a turn with no reply route.
-    digest = sha16(x_curie_delivery_id)
-    # Namespaced by agent AND hook, so two hooks on one agent cannot swallow each
-    # other's deliveries when an upstream reuses its id space across them.
-    #
-    # Neither of these carries the partition, and that is deliberate rather than
-    # an oversight: one upstream delivery id must run at most once, whatever
-    # partition it names. Folding the partition in would let a retry that derived
-    # a different value run the agent a second time for the same delivery.
-    event_id = f"hook-{agent.id}-{hook}-{digest}"
-    key = f"{HOOK_KEY_PREFIX}:delivery:{agent.id}:{hook}:{digest}"
-    owner = f"pending:{pysecrets.token_hex(16)}"
-    client: redis.Redis = request.app.state.valkey
-
-    reservation = backlog_reservation(
-        key_prefix=f"{HOOK_KEY_PREFIX}:backlog:{agent.id}",
-        window_s=settings.hook_backlog_window_s,
-    )
-    preserve_quota = False
-
-    # Two attempts, not a loop: the second exists only for the narrow case where
-    # the claim key expired between our failed `SET NX` and the `GET` that would
-    # have named its owner.
-    for _attempt in range(2):
-        if await claim_delivery(client, key, owner, settings.channel_delivery_lease_s):
-            try:
-                if not await take_backlog_slot(
-                    client,
-                    reservation=reservation,
-                    limit=settings.hook_backlog_limit,
-                ):
-                    # Metered per AGENT, not per hook: the thing worth bounding is how
-                    # much work one agent's upstreams can create, and per-hook quotas
-                    # would let a source multiply its allowance by inventing names.
-                    preserve_quota = True
-                    logger.warning(
-                        "hook ingress refused event_id=%s: agent backlog quota "
-                        "of %d per %ds exceeded",
-                        event_id,
-                        settings.hook_backlog_limit,
-                        settings.hook_backlog_window_s,
-                    )
-                    raise HTTPException(
-                        status.HTTP_429_TOO_MANY_REQUESTS,
-                        "too many new hook deliveries for this agent; retry later",
-                        headers={"Retry-After": str(settings.hook_backlog_window_s)},
-                    )
-                if mapping.selects_workspace and mapping.repository is not None:
-                    await crud_workspaces.select_thread_workspace(
-                        session,
-                        agent_id=agent.id,
-                        deployment_id=None,
-                        conversation_id=thread_id,
-                        repo_full_name=mapping.repository,
-                        selected_by=f"hook:{hook}",
-                        revision=mapping.revision,
-                    )
-                turn = _mint_turn(
-                    agent,
-                    binding,
-                    hook,
-                    event_id,
-                    raw,
-                    conversation_id=thread_id,
-                    placeholder=placeholder,
-                    outcome=mapping,
-                    tool_access=tool_access,
-                )
-                carrier: dict[str, str] = {}
-                enqueue_error: Exception | None = None
-                enqueue_result: tuple[bool, str] | None = None
-                with operation_span(
-                    "curie.queue.enqueue",
-                    kind=SpanKind.PRODUCER,
-                    attributes={"service.name": "curie-api", "source": "api"},
-                ) as span:
-                    inject_trace_context(carrier)
-                    try:
-                        enqueue_result = await enqueue_owned(
-                            client,
-                            key=key,
-                            stream=settings.runs_stream,
-                            owner=owner,
-                            payload=turn.model_dump_json(),
-                            payload_field=STREAM_PAYLOAD_FIELD,
-                            lease_s=settings.channel_delivery_lease_s,
-                            transport_field=(
-                                TRACEPARENT_STREAM_FIELD
-                                if TRACEPARENT_STREAM_FIELD in carrier
-                                else None
-                            ),
-                            transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+        # Two attempts, not a loop: the second exists only for the narrow case where
+        # the claim key expired between our failed `SET NX` and the `GET` that would
+        # have named its owner.
+        for _attempt in range(2):
+            await source.ensure_live()
+            if await claim_delivery(client, key, owner, settings.channel_delivery_lease_s):
+                try:
+                    await source.ensure_live()
+                    if not await take_backlog_slot(
+                        client,
+                        reservation=reservation,
+                        limit=settings.hook_backlog_limit,
+                    ):
+                        # Metered per AGENT, not per hook: the thing worth bounding is how
+                        # much work one agent's upstreams can create, and per-hook quotas
+                        # would let a source multiply its allowance by inventing names.
+                        preserve_quota = True
+                        logger.warning(
+                            "hook ingress refused event_id=%s: agent backlog quota "
+                            "of %d per %ds exceeded",
+                            event_id,
+                            settings.hook_backlog_limit,
+                            settings.hook_backlog_window_s,
                         )
-                    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
-                        enqueue_error = exc
-                        span.set_status(StatusCode.ERROR)
-                        span.add_event("queue.enqueue.failed", {"outcome": "failure"})
-                    else:
-                        assert enqueue_result is not None
-                        span.add_event(
-                            "queue.enqueued" if enqueue_result[0] else "queue.duplicate",
-                            {"outcome": "success" if enqueue_result[0] else "pending"},
+                        raise HTTPException(
+                            status.HTTP_429_TOO_MANY_REQUESTS,
+                            "too many new hook deliveries for this agent; retry later",
+                            headers={"Retry-After": str(settings.hook_backlog_window_s)},
                         )
-                if enqueue_error is not None:
-                    record_metric(
-                        "curie.queue.enqueue",
-                        attributes={
-                            "service.name": "curie-api",
-                            "source": "api",
-                            "outcome": "failure",
-                        },
-                    )
-                    raise enqueue_error
-                assert enqueue_result is not None
-                enqueued, current = enqueue_result
-                if enqueued:
-                    record_metric(
-                        "curie.queue.enqueue",
-                        attributes={
-                            "service.name": "curie-api",
-                            "source": "api",
-                            "outcome": "success",
-                        },
-                    )
-                    record_metric(
-                        "curie.turn.accepted",
-                        attributes={
-                            "service.name": "curie-api",
-                            "source": "api",
-                            "outcome": "accepted",
-                        },
-                    )
-                    # The conversation id is here because it is the operator's only
-                    # server-side record of which thread a delivery landed on. There
-                    # is no verb that resets every partition of one hook, so a
-                    # partition is reset by its full id, and this line plus the
-                    # receipt are the two places that id is shown.
-                    logger.info(
-                        "hook ingress enqueued event_id=%s stream_id=%s hook=%s conversation_id=%s",
-                        event_id,
-                        current,
+                    if mapping.selects_workspace and mapping.repository is not None:
+                        await session.connection()
+                        await source.ensure_live()
+                        await crud_workspaces.select_thread_workspace(
+                            session,
+                            agent_id=agent.id,
+                            deployment_id=None,
+                            conversation_id=thread_id,
+                            repo_full_name=mapping.repository,
+                            selected_by=f"hook:{hook}",
+                            revision=mapping.revision,
+                        )
+                    turn = _mint_turn(
+                        agent,
+                        binding,
                         hook,
-                        turn.conversation_id,
+                        event_id,
+                        raw,
+                        conversation_id=thread_id,
+                        placeholder=placeholder,
+                        outcome=mapping,
+                        tool_access=tool_access,
                     )
-                    return HookAccepted(
-                        event_id=event_id,
-                        stream_id=current,
-                        duplicate=False,
-                        conversation_id=turn.conversation_id,
-                        tool_access=turn.tool_access,
+                    carrier: dict[str, str] = {}
+                    enqueue_error: Exception | None = None
+                    enqueue_result: tuple[bool, str] | None = None
+                    await source.ensure_live()
+                    try:
+                        with operation_span(
+                            "curie.queue.enqueue",
+                            kind=SpanKind.PRODUCER,
+                            attributes={"service.name": "curie-api", "source": "api"},
+                        ) as span:
+                            inject_trace_context(carrier)
+                            try:
+                                enqueue_result = await enqueue_owned(
+                                    client,
+                                    key=key,
+                                    stream=settings.runs_stream,
+                                    owner=owner,
+                                    payload=turn.model_dump_json(),
+                                    payload_field=STREAM_PAYLOAD_FIELD,
+                                    lease_s=settings.channel_delivery_lease_s,
+                                    transport_field=(
+                                        TRACEPARENT_STREAM_FIELD
+                                        if TRACEPARENT_STREAM_FIELD in carrier
+                                        else None
+                                    ),
+                                    transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+                                )
+                            except Exception as exc:  # noqa: BLE001 - preserve enqueue failure across telemetry errors
+                                enqueue_error = exc
+                                span.set_status(StatusCode.ERROR)
+                                span.add_event("queue.enqueue.failed", {"outcome": "failure"})
+                            else:
+                                assert enqueue_result is not None
+                                span.add_event(
+                                    "queue.enqueued" if enqueue_result[0] else "queue.duplicate",
+                                    {"outcome": "success" if enqueue_result[0] else "pending"},
+                                )
+                    except Exception:  # noqa: BLE001 - telemetry failure must not mask the enqueue error
+                        if enqueue_error is None:
+                            raise
+                    if enqueue_error is not None:
+                        try:
+                            record_metric(
+                                "curie.queue.enqueue",
+                                attributes={
+                                    "service.name": "curie-api",
+                                    "source": "api",
+                                    "outcome": "failure",
+                                },
+                            )
+                        except Exception:  # noqa: BLE001 - metric failure must not mask the enqueue error
+                            pass
+                        raise enqueue_error
+                    assert enqueue_result is not None
+                    enqueued, current = enqueue_result
+                    if enqueued:
+                        record_metric(
+                            "curie.queue.enqueue",
+                            attributes={
+                                "service.name": "curie-api",
+                                "source": "api",
+                                "outcome": "success",
+                            },
+                        )
+                        record_metric(
+                            "curie.turn.accepted",
+                            attributes={
+                                "service.name": "curie-api",
+                                "source": "api",
+                                "outcome": "accepted",
+                            },
+                        )
+                        # The conversation id is here because it is the operator's only
+                        # server-side record of which thread a delivery landed on. There
+                        # is no verb that resets every partition of one hook, so a
+                        # partition is reset by its full id, and this line plus the
+                        # receipt are the two places that id is shown.
+                        logger.info(
+                            "hook ingress enqueued event_id=%s stream_id=%s "
+                            "hook=%s conversation_id=%s",
+                            event_id,
+                            current,
+                            hook,
+                            turn.conversation_id,
+                        )
+                        return HookAccepted(
+                            event_id=event_id,
+                            stream_id=current,
+                            duplicate=False,
+                            conversation_id=turn.conversation_id,
+                            tool_access=turn.tool_access,
+                        )
+                    # Not `turn.conversation_id`: this request enqueued nothing, so the thread
+                    # the delivery landed on is the one the WINNING turn named, whatever
+                    # partition this body derives.
+                    return await _duplicate_receipt(
+                        client, settings.runs_stream, current, response, event_id, tool_access
                     )
-                # Not `turn.conversation_id`: this request enqueued nothing, so the thread
-                # the delivery landed on is the one the WINNING turn named, whatever
-                # partition this body derives.
+                except BaseException:
+                    try:
+                        with anyio.fail_after(5, shield=True):
+                            await source.ensure_live()
+                            await settle_failed_delivery(
+                                client,
+                                key=key,
+                                owner=owner,
+                                reservation=reservation,
+                                preserve_quota=preserve_quota,
+                            )
+                    except BaseException:  # noqa: BLE001 - cleanup details must not escape the original source refusal
+                        pass
+                    raise
+            held = await client.get(key)
+            if held is not None:
+                current = text(held)
                 return await _duplicate_receipt(
                     client, settings.runs_stream, current, response, event_id, tool_access
                 )
-            except BaseException:
-                await settle_failed_delivery(
-                    client,
-                    key=key,
-                    owner=owner,
-                    reservation=reservation,
-                    preserve_quota=preserve_quota,
-                )
-                raise
-        held = await client.get(key)
-        if held is not None:
-            current = text(held)
-            return await _duplicate_receipt(
-                client, settings.runs_stream, current, response, event_id, tool_access
-            )
 
-    # Both attempts found the key absent after failing to claim it. Someone is
-    # mid-flight; answering "come back" is honest and never a second XADD. The
-    # conversation id is None for the same reason the stream id is: nothing has
-    # been enqueued that this request can name.
-    if tool_access is not None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            "hook delivery tool access cannot be verified from the original turn",
+        # Both attempts found the key absent after failing to claim it. Someone is
+        # mid-flight; answering "come back" is honest and never a second XADD. The
+        # conversation id is None for the same reason the stream id is: nothing has
+        # been enqueued that this request can name.
+        if tool_access is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "hook delivery tool access cannot be verified from the original turn",
+            )
+        response.status_code = status.HTTP_202_ACCEPTED
+        return HookAccepted(
+            event_id=event_id,
+            stream_id=None,
+            duplicate=True,
+            conversation_id=None,
         )
-    response.status_code = status.HTTP_202_ACCEPTED
-    return HookAccepted(
-        event_id=event_id,
-        stream_id=None,
-        duplicate=True,
-        conversation_id=None,
-    )

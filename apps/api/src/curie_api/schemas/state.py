@@ -29,6 +29,15 @@ class StateAppendIn(BaseModel):
     reserve_bytes: int | None = Field(default=None, ge=0)
 
 
+class SandboxCredentialReleasedIn(BaseModel):
+    """The worker reporting that a sandbox claim released its boot credential
+    (#3823). ``credential`` is the ``cred`` claim shared by that claim's
+    ``state`` and ``state.app`` tokens."""
+
+    agent_id: uuid.UUID
+    credential: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
 class MemoryTurnClosedIn(BaseModel):
     """The worker reporting that a turn has ended (#3776): from now on the API
     refuses memory writes made with that turn's per-turn credential (ADR-0188),

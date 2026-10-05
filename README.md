@@ -168,15 +168,13 @@ curie local message --continue "what's 2 + 2?"
 This is the same path a real Slack `@mention`
 takes - see [`docs/slack-local-runbook.md`](docs/slack-local-runbook.md) when you're ready to try it live.
 
-Visit the console at 
+Mint a login code, then open the console at `http://localhost:28080/?api=1` and paste the code:
 
 ```bash
-http://localhost:28080/?api=1&api_key=<key>
+curie local console login --subject you@example.com
 ```
 
-where `<key>` is this install's API key: the `api_key` field of
-`~/.config/curie/local/curie.json` (or `$CURIE_CONFIG_DIR/local/curie.json`), which
-`curie local up` generates on first run. There you can see the whole conversation, its traces, metrics, and cost. The same console also surfaces logs,
+There you can see the whole conversation, its traces, metrics, and cost. The same console also surfaces logs,
 approvals, and memory, which get more relevant once this plugin is deployed on Kubernetes in production.
 
 When done run the following command
@@ -213,10 +211,12 @@ pushed branch's environment when several agents share that repository. See
 single-agent fallback and target refusal codes.
 
 Plain `cluster up` infers Anthropic or OpenRouter egress from an unambiguous
-credential prefix. On minikube, the first admission attempt reports that its
-`gvisor` RuntimeClass is absent, so Curie shows that attempt as retrying,
-applies `security.gvisor.mode=off`, and retries once. Each inference is printed
-with the equivalent override. Ambiguous credential shapes still need an explicit
+credential prefix. Before Helm runs, a `NotFound` GET for the rendered gVisor
+RuntimeClass makes Curie apply `security.gvisor.mode=off`, unless the chart
+creates that RuntimeClass. A `Forbidden` GET retains one retry only after
+admission reports `RuntimeClass "gvisor" not found`. Other read errors and
+admission refusals stay closed. Each inference is printed with the equivalent
+override. Ambiguous credential shapes still need an explicit
 `--allow-egress-host`, and explicit values that contradict detected facts are
 errors.
 

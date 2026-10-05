@@ -97,6 +97,9 @@ returns `CLAUDE_CONTRIBUTION`
 Runner boot calls its environment builder and bundle compiler and supplies its
 tool set to `SideEffectClassifier`
 (`runner/src/curie_runner/side_effects.py::SideEffectClassifier`).
+Runner boot also supplies the tool set to per-turn tool access
+(`runner/src/curie_runner/__main__.py::_readonly_tools`) and reads
+`harness.auth.credential_env_keys` for held-secret redaction.
 
 The Claude package also owns the SDK approval adapter at
 `runner/src/curie_runner/harness/claude/approval.py`. Approval policy stays in

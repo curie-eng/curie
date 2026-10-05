@@ -28,6 +28,10 @@
 #
 # Issue #1530 (runner sandbox API egress), Assertion 11.
 #
+# Issue #3821 (the runner fails closed without a bearer), Assertion 19 and its
+# negative controls. Every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from
+# the chart-owned runner token Secret and nothing renders the tokenless dev flag.
+#
 # Issue #1109/#1124 (the API's outbound GitHub credential), Assertion 12 and its
 # negative control. api.githubToken is the one OPTIONAL credential in the
 # Secret, so it is a deliberate plain pass-through rather than a
@@ -660,11 +664,18 @@ import sys
 
 import yaml
 
-# Env names in these namespaces are boot-env contract keys and must be declared.
+# Env names in these namespaces must be declared boot-env keys unless explicitly
+# classified as install-owned configuration below.
 # Anything else the runner container carries (HOME, and operator free-form
 # extraEnv on a non-default render) is out of scope by design: extraEnv is
 # operator-supplied and the contract does not govern it (issue #488, edge case 6).
 CONTRACT_PREFIXES = ("CURIE_", "OTEL_EXPORTER_OTLP_", "ANTHROPIC_")
+
+# Non-secret GitHub origin policy from api.githubApiUrl, read by workspace-init
+# and runner workspace_snapshot.py, not an ACI session payload. The chart
+# reserves it against agent extraEnv, and the worker declaration gate classifies
+# the same exact name as install-owned configuration outside frozen BootEnv.
+INSTALL_OWNED_ENV = {"CURIE_GITHUB_API_URL"}
 
 rendered, key_src = sys.argv[1], sys.argv[2]
 
@@ -708,7 +719,10 @@ if not found:
 
 # Non-vacuity floor: the render must actually carry boot env. Without this a
 # template that dropped its whole env block would sail through the subset check.
-contract_names = {n for n in found if n.startswith(CONTRACT_PREFIXES)}
+contract_names = {
+    n for n in found
+    if n.startswith(CONTRACT_PREFIXES) and n not in INSTALL_OWNED_ENV
+}
 if "CURIE_SESSION_ID" not in contract_names or len(contract_names) < 4:
     sys.stderr.write(
         "runner env does not carry a plausible boot env (expected CURIE_SESSION_ID "
@@ -2865,5 +2879,232 @@ for case_name in job pod exempt upgrade operator operator_upgrade gvisor; do
 done
 echo "  ok: classless Job and Pod hooks, classified chart-managed early hooks, classless operator-provided early hooks, and a classless gVisor post-install hook are rejected"
 
+echo "=== Assertion 19: every runner template carries the chart-owned token and never the dev flag (#3821) ==="
+# The runner refuses to boot without a bearer (#3821), so a cluster runner must
+# always get one: every SandboxTemplate's runner takes CURIE_RUNNER_TOKEN from
+# the chart-owned <fullname>-runner-token Secret (the worker's per-claim
+# Overrides injection replaces it on every bound claim), and nothing the chart
+# renders may carry CURIE_RUNNER_ALLOW_TOKENLESS, the local-dev opt-out that
+# only `curie skill up` sets. Rendered with an explicit release name so the
+# expected Secret name is derived, not guessed.
+TOKEN_CHECK="$TMP/check_runner_token.py"
+cat > "$TOKEN_CHECK" <<'PYEOF'
+"""Assert every rendered runner takes its bearer from the chart-owned Secret.
+
+argv: <rendered-dir> <release fullname> <present|absent>
+"present": every SandboxTemplate runner carries exactly one CURIE_RUNNER_TOKEN
+secretKeyRef to <fullname>-runner-token, that Secret renders with a strong
+value, and nothing carries the tokenless dev flag. "absent" (agentSandbox.deploy
+false): neither a SandboxTemplate nor the Secret renders.
+Exits 0 on pass, 1 naming the defect on failure.
+"""
+import pathlib
+import sys
+
+import yaml
+
+TOKEN = "CURIE_RUNNER_TOKEN"
+FLAG = "CURIE_RUNNER_ALLOW_TOKENLESS"
+
+rendered, fullname, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+secret_name = f"{fullname}-runner-token"
+expected_ref = {"name": secret_name, "key": "runnerToken", "optional": False}
+
+docs = []
+for path in sorted(pathlib.Path(rendered).rglob("*.yaml")):
+    for doc in yaml.safe_load_all(path.read_text()):
+        if isinstance(doc, dict):
+            docs.append((path.name, doc))
+
+templates = [(f, d) for f, d in docs if d.get("kind") == "SandboxTemplate"]
+secrets = [
+    d for _f, d in docs
+    if d.get("kind") == "Secret" and (d.get("metadata") or {}).get("name") == secret_name
+]
+errors = []
+
+if mode == "absent":
+    if templates:
+        errors.append(f"agentSandbox.deploy=false rendered {len(templates)} SandboxTemplate(s)")
+    if secrets:
+        errors.append(f"agentSandbox.deploy=false rendered the {secret_name} Secret")
+    for e in errors:
+        sys.stderr.write(e + "\n")
+    if errors:
+        sys.exit(1)
+    print("  ok: no SandboxTemplate and no runner token Secret without agentSandbox.deploy")
+    sys.exit(0)
+
+if not templates:
+    sys.stderr.write("found no SandboxTemplate; the token assert would pass vacuously\n")
+    sys.exit(1)
+
+for fname, doc in templates:
+    name = doc["metadata"]["name"]
+    pod = ((doc.get("spec") or {}).get("podTemplate") or {}).get("spec") or {}
+    runners = [c for c in pod.get("containers") or [] if c.get("name") == "runner"]
+    if len(runners) != 1:
+        errors.append(f"{fname}:{name} has {len(runners)} containers named runner, expected 1")
+        continue
+    entries = [e for e in runners[0].get("env") or [] if e.get("name") == TOKEN]
+    if len(entries) != 1:
+        errors.append(f"{fname}:{name} runner carries {len(entries)} {TOKEN} entries, expected 1")
+        continue
+    entry = entries[0]
+    if "value" in entry:
+        errors.append(f"{fname}:{name} runner {TOKEN} is a literal value, not a secretKeyRef")
+    ref = (entry.get("valueFrom") or {}).get("secretKeyRef")
+    if ref != expected_ref:
+        errors.append(f"{fname}:{name} runner {TOKEN} secretKeyRef is {ref!r}, expected {expected_ref!r}")
+
+if len(secrets) != 1:
+    errors.append(f"expected exactly one {secret_name} Secret, found {len(secrets)}")
+else:
+    value = (secrets[0].get("stringData") or {}).get("runnerToken")
+    if not isinstance(value, str) or not value.strip() or len(value) < 32:
+        errors.append(f"{secret_name} stringData.runnerToken is blank or shorter than 32 characters")
+
+# The dev flag may appear on no container or init container of any document.
+def env_names(node):
+    if isinstance(node, dict):
+        for key in ("containers", "initContainers"):
+            for c in node.get(key) or []:
+                if isinstance(c, dict):
+                    for e in c.get("env") or []:
+                        if isinstance(e, dict):
+                            yield c.get("name"), e.get("name")
+        for value in node.values():
+            yield from env_names(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from env_names(value)
+
+for fname, doc in docs:
+    for container, env in env_names(doc):
+        if env == FLAG:
+            errors.append(f"{fname}:{doc.get('kind')}/{(doc.get('metadata') or {}).get('name')} "
+                          f"container {container} carries the tokenless dev flag {FLAG}")
+
+# The security probe embeds its fixture SandboxTemplates as script text, so the
+# container walk above cannot see them; hold the script text to the same rule.
+probes = [
+    d for _f, d in docs
+    if d.get("kind") == "Job"
+    and (d.get("metadata") or {}).get("name") == f"{fullname}-security-probe"
+]
+for probe in probes:
+    text = yaml.safe_dump(probe)
+    if TOKEN not in text:
+        errors.append(f"security probe fixture templates do not carry {TOKEN}")
+    if FLAG in text:
+        errors.append(f"security probe fixture templates carry the tokenless dev flag {FLAG}")
+
+for e in errors:
+    sys.stderr.write(e + "\n")
+if errors:
+    sys.exit(1)
+print(f"  ok: {len(templates)} SandboxTemplate runner(s) take {TOKEN} from {secret_name}; "
+      f"{len(probes)} security probe(s) checked; no {FLAG} anywhere")
+PYEOF
+
+TOKEN_RELEASE=acme
+TOKEN_FULLNAME=acme-curie
+
+# Render one chart dir and check it; returns nonzero (rather than exiting) so
+# the negative controls can assert the failure.
+check_runner_token() {
+  # $1 = chart dir, $2 = present|absent, $3 = label, rest = extra helm args
+  local chart="$1" mode="$2" label="$3"
+  shift 3
+  local out
+  out="$(mktemp -d -p "$TMP")"
+  # --output-dir, not a stdout pipe (see Assertion 6).
+  helm template "$TOKEN_RELEASE" "$chart" --output-dir "$out" "$@" > /dev/null
+  echo "  render: $label"
+  python3 "$TOKEN_CHECK" "$out" "$TOKEN_FULLNAME" "$mode"
+}
+
+check_runner_token "$CHART" present "default values" \
+  || fail "default render: a SandboxTemplate runner does not take CURIE_RUNNER_TOKEN from the chart-owned Secret, or something renders the tokenless dev flag."
+# values-dev turns the sandbox substrate off; the sandbox e2e re-enables it on
+# top of the overlay, which is the dev-overlay render that carries runners.
+check_runner_token "$CHART" present "dev overlay + agentSandbox.deploy" \
+  -f "$CHART/values-dev.yaml" --set agentSandbox.deploy=true \
+  || fail "dev overlay render breaks the runner token contract."
+check_runner_token "$CHART" absent "dev overlay" -f "$CHART/values-dev.yaml" \
+  || fail "the bare dev overlay renders a SandboxTemplate or the runner token Secret."
+check_runner_token "$CHART" present "per-agent template" \
+  --set-string agentSandbox.connectorSecrets.acme-a.GITHUB_PERSONAL_ACCESS_TOKEN=example \
+  || fail "per-agent template render breaks the runner token contract."
+check_runner_token "$CHART" present "real-model credentials" \
+  --set agentSandbox.runner.credentials=dummy \
+  --set agentSandbox.runner.fakeModel=false \
+  || fail "real-model credentials render breaks the runner token contract."
+check_runner_token "$CHART" present "in-cluster inference" \
+  --set inference.deploy=true \
+  --set inference.persistence.enabled=true \
+  || fail "in-cluster inference render breaks the runner token contract."
+check_runner_token "$CHART" absent "agentSandbox.deploy=false" \
+  --set agentSandbox.deploy=false \
+  || fail "agentSandbox.deploy=false still renders a SandboxTemplate or the runner token Secret."
+
+echo "=== Assertion 19 negative controls: a tokenless or flag-carrying runner FAILS ==="
+# Each control mutates a TEMP COPY of the chart (never the real template), proves
+# the mutation found its target, and requires Assertion 19 to reject it.
+token_mutant() {
+  # $1 = control id; prints the mutant chart dir
+  local dir="$TMP/token-mutant-$1"
+  rm -rf "$dir"
+  cp -a "$CHART" "$dir"
+  printf '%s\n' "$dir"
+}
+
+MUTANT_19A="$(token_mutant 19a)"
+python3 - "$MUTANT_19A/templates/agent-sandbox.yaml" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+lines = p.read_text().splitlines(keepends=True)
+hits = [i for i, line in enumerate(lines) if line.strip() == "- name: CURIE_RUNNER_TOKEN"]
+if len(hits) != 1:
+    sys.stderr.write(f"19a could not find exactly one '- name: CURIE_RUNNER_TOKEN' entry (found {len(hits)})\n")
+    sys.exit(1)
+i = hits[0]
+# The entry and its five valueFrom/secretKeyRef/name/key/optional lines.
+del lines[i:i + 6]
+p.write_text("".join(lines))
+PYEOF
+if check_runner_token "$MUTANT_19A" present "19a: runner token entry removed" 2>&1; then
+  fail "negative control 19a did not fire: a runner with no CURIE_RUNNER_TOKEN passed Assertion 19."
+fi
+echo "  ok: 19a a runner template without the token entry is rejected"
+
+MUTANT_19B="$(token_mutant 19b)"
+[[ -f "$MUTANT_19B/templates/runner-token.yaml" ]] \
+  || fail "negative control 19b could not find templates/runner-token.yaml to delete."
+rm "$MUTANT_19B/templates/runner-token.yaml"
+if check_runner_token "$MUTANT_19B" present "19b: runner token Secret deleted" 2>&1; then
+  fail "negative control 19b did not fire: a render without the runner token Secret passed Assertion 19."
+fi
+echo "  ok: 19b a render without the runner token Secret is rejected"
+
+MUTANT_19C="$(token_mutant 19c)"
+python3 - "$MUTANT_19C/templates/agent-sandbox.yaml" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+lines = p.read_text().splitlines(keepends=True)
+hits = [i for i, line in enumerate(lines) if line.strip() == "- name: CURIE_RUNNER_PORT"]
+if len(hits) != 1:
+    sys.stderr.write(f"19c could not find exactly one '- name: CURIE_RUNNER_PORT' entry (found {len(hits)})\n")
+    sys.exit(1)
+i = hits[0]
+indent = lines[i][: len(lines[i]) - len(lines[i].lstrip())]
+lines[i:i] = [f"{indent}- name: CURIE_RUNNER_ALLOW_TOKENLESS\n", f'{indent}  value: "1"\n']
+p.write_text("".join(lines))
+PYEOF
+if check_runner_token "$MUTANT_19C" present "19c: tokenless dev flag injected" 2>&1; then
+  fail "negative control 19c did not fire: a runner carrying CURIE_RUNNER_ALLOW_TOKENLESS passed Assertion 19."
+fi
+echo "  ok: 19c a runner template carrying the tokenless dev flag is rejected"
+
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate while every other workload keeps its strategy; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays."
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate while every other workload keeps its strategy; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays; every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from the chart-owned runner token Secret and none renders the tokenless dev flag, proven by three failing negative controls."

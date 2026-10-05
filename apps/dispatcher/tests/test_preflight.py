@@ -24,7 +24,6 @@ not wait on wall-clock time.
 from __future__ import annotations
 
 import logging
-import re
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -2401,13 +2400,18 @@ def test_run_main_times_out_before_slack_with_actionable_sanitized_log(
 ) -> None:
     """A persistently unhealthy API exits once, bounded and actionable.
 
-    This is the timeout-negative sibling of delayed success. Userinfo in the URL
+    This is the timeout sibling of delayed success. Userinfo in the URL
     makes sanitization falsifiable, while a real loopback 503 keeps ``last error``
     deterministic and proves the process made multiple attempts before giving up.
+    Logical time advances only after a real response, so startup load cannot
+    consume the budget before the production client reaches the server.
     """
     from curie_dispatcher import run
 
     events: list[str] = []
+    clock = _FakeClock()
+    timeout_s = 30.0
+    sleep_delays: list[float] = []
 
     class Telemetry:
         def shutdown(self) -> None:
@@ -2437,29 +2441,52 @@ def test_run_main_times_out_before_slack_with_actionable_sanitized_log(
     with _loopback_health_server(
         [503], userinfo="operator:credential"
     ) as (api_url, requests):
-        _configure_main_env(monkeypatch, api_url=api_url, timeout_s=0.3)
+        def advance_after_response(seconds: float) -> None:
+            assert requests == ["/health"] * (len(sleep_delays) + 1), (
+                "logical time must advance only after a real HTTP response"
+            )
+            assert len(sleep_delays) < 2, (
+                "the preflight admitted another request after the logical deadline"
+            )
+            sleep_delays.append(seconds)
+            clock.sleep(timeout_s / 2)
+
+        def check_api_with_logical_clock(
+            config: DispatcherConfig,
+            *,
+            logger: logging.Logger,
+        ) -> None:
+            check_api_reachable(
+                config,
+                logger=logger,
+                monotonic=clock.monotonic,
+                sleep=advance_after_response,
+            )
+
+        monkeypatch.setattr(run, "check_api_reachable", check_api_with_logical_clock)
+        _configure_main_env(monkeypatch, api_url=api_url, timeout_s=timeout_s)
         safe_url = api_url.replace("operator:credential@", "")
-        started = time.monotonic()
         with caplog.at_level(logging.ERROR, logger="curie_dispatcher"):
             with pytest.raises(SystemExit) as excinfo:
                 run.main()
-        elapsed = time.monotonic() - started
 
     assert excinfo.value.code not in (0, None)
-    assert 0.27 <= elapsed < 0.8, (
-        f"the 0.3s entrypoint deadline was not bounded; elapsed={elapsed:.3f}s"
+    assert clock.monotonic() == timeout_s, (
+        f"the entrypoint missed its logical deadline; elapsed={clock.monotonic():.1f}s"
     )
-    assert len(requests) >= 2, (
-        f"the timeout path did not retry before failing; requests={requests!r}"
+    assert requests == ["/health", "/health"], (
+        f"the timeout path must retry before its logical deadline; requests={requests!r}"
     )
+    assert len(sleep_delays) == 2
     assert events == ["telemetry.shutdown"], (
         "terminal preflight failure must happen before Slack/heartbeat and still "
         f"shut down telemetry; events={events!r}"
     )
 
     terminal = "\n".join(record.getMessage() for record in caplog.records)
-    assert safe_url in terminal
+    assert terminal == (
+        f"cannot reach the platform API at {safe_url} after {timeout_s:.1f}s "
+        "(2 attempts, last error: HTTP 503); check CURIE_API_URL; "
+        "the API may still be starting, so check that the API pod is Ready"
+    )
     assert "operator" not in terminal and "credential" not in terminal
-    assert re.search(r"after \d+\.\d+s", terminal), terminal
-    assert re.search(r"\(\d+ attempts, last error: HTTP 503\)", terminal), terminal
-    assert "check CURIE_API_URL" in terminal

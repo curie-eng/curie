@@ -163,6 +163,16 @@ fn cluster_cases() -> Vec<ClusterCase> {
             args: &["approvals", "acme-bot", "--dry-run"],
         },
         ClusterCase {
+            name: "console",
+            args: &[
+                "console",
+                "login",
+                "--subject",
+                "operator@example.com",
+                "--dry-run",
+            ],
+        },
+        ClusterCase {
             name: "work-items",
             args: &["work-items", "--dry-run"],
         },
@@ -277,7 +287,7 @@ fn coverage_inventory_names_every_cluster_verb() {
     let covered_names: BTreeSet<&str> = cluster_cases().iter().map(|case| case.name).collect();
 
     assert_eq!(covered_names, manifest_names);
-    assert_eq!(covered_names.len(), 31);
+    assert_eq!(covered_names.len(), 32);
 }
 
 #[test]
@@ -470,6 +480,16 @@ fn connection_backed_verbs_discover_the_file_target() {
         ("versions", &["cluster", "versions", "acme-bot"]),
         ("memory", &["cluster", "memory", "acme-bot"]),
         ("approvals", &["cluster", "approvals", "acme-bot"]),
+        (
+            "console",
+            &[
+                "cluster",
+                "console",
+                "login",
+                "--subject",
+                "operator@example.com",
+            ],
+        ),
     ];
     let expected = format!(
         "could not inspect Helm state for release {FILE_RELEASE} in namespace {FILE_NAMESPACE}"
@@ -524,6 +544,40 @@ fn nested_observability_uses_the_file_target() {
     write_installation(dir.path(), FILE_NAMESPACE, FILE_RELEASE);
     let output = run(dir.path(), &["cluster", "observability", "--dry-run"], &[]);
     assert_success_target(&output, FILE_NAMESPACE, FILE_RELEASE);
+}
+
+#[test]
+fn console_login_accepts_explicit_literal_target_after_the_leaf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_installation(dir.path(), FILE_NAMESPACE, FILE_RELEASE);
+    let output = run(
+        dir.path(),
+        &[
+            "cluster",
+            "console",
+            "login",
+            "--subject",
+            "operator@example.com",
+            "--namespace",
+            "curie",
+            "--release",
+            "curie",
+        ],
+        &[("CURIE_NAMESPACE", "env-namespace")],
+    );
+    let text = combined(&output);
+    assert!(
+        !output.status.success(),
+        "empty PATH must stop discovery\n{text}"
+    );
+    assert!(
+        text.contains("could not inspect Helm state for release curie in namespace curie"),
+        "explicit literal defaults must reach release credential discovery\n{text}"
+    );
+    assert!(!text.contains(FILE_NAMESPACE), "{text}");
+    assert!(!text.contains(FILE_RELEASE), "{text}");
+    assert!(!text.contains("env-namespace"), "{text}");
+    assert!(target_diagnostics(&output).is_empty(), "{text}");
 }
 
 fn assert_observability_query_bypasses_malformed_file(args: &[&str]) {

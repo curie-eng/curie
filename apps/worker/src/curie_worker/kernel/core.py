@@ -107,6 +107,12 @@ class Kernel:
         # absent the kernel runs a generic sandbox (the F1 behavior); when present
         # it resolves channel -> agent -> bundle/budget and gates killed agents.
         self._binding = binding
+        revoker = getattr(self._substrate, "set_boot_credential_revoker", None)
+        poster = (
+            getattr(binding, "release_boot_credential_sync", None) if binding is not None else None
+        )
+        if revoker is not None and poster is not None:
+            revoker(poster)
         # The trusted repository preparation lane. It is optional for generic
         # and legacy deployments. A turn that requires a repository refuses when
         # this lane is unavailable instead of booting an empty directory.

@@ -11,6 +11,9 @@ rules:
     apps/api/src/curie_api/schema_compat.json: [released-upgrade]
     cli/src/application_schema_windows.json: [released-upgrade]
     cli/scripts/cluster-upgrade-matrix.sh: [released-upgrade]
+    # Upgrade and kind jobs run these before they pull images or create a cluster.
+    cli/scripts/configure-docker-hub-mirror.sh: [released-upgrade]
+    cli/scripts/ensure-kind-registry.sh: [released-upgrade]
     cli/tests/data/upgrade-driver.py: [released-upgrade]
     # The only charts/curie/ci files the released-upgrade jobs run.
     charts/curie/ci/live_manifest_parity.py: [released-upgrade]

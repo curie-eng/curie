@@ -15,6 +15,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
+    CHAR,
     BigInteger,
     CheckConstraint,
     DateTime,
@@ -1762,8 +1763,10 @@ class WorkflowStateEntry(Base):
         ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
     )
     # NULL is one agent-wide shared identity: for general state when the owning
-    # agent has `memory=True`, and always for the reserved `memory`/`transcript`
-    # namespaces. The binding's own `"{kind}:{address}"` is the isolated identity
+    # agent has `memory=True`, and for the reserved `memory` namespace's
+    # agent-wide rows. The `transcript` namespace is not stored in this table at
+    # all: it lives in `thread_transcripts` (ADR-0170), keyed by its own
+    # `binding_scope`. The binding's own `"{kind}:{address}"` is the isolated identity
     # for general state when `memory=False` (#1525 follow-up). Minted into the
     # worker's `state.app`/`state` token per turn from the agent's CURRENT
     # `memory` value, never read back off this column -- the column only picks
@@ -1871,6 +1874,74 @@ class ScheduleControl(Base):
     paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     resume_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+
+
+class HookSourcePolicy(Base):
+    """@spec PROTECTED-HOOK-SOURCE-1."""
+
+    __tablename__ = "hook_source_policies"
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="hook_source_policies_generation_ck"),
+        CheckConstraint(
+            "mode IN ('protected', 'ordinary')", name="hook_source_policies_mode_ck"
+        ),
+        CheckConstraint(
+            "(mode = 'protected' AND tool_access IS NOT NULL "
+            "AND tool_access = 'read-only' AND runtime_id IS NOT NULL "
+            "AND qualification_id IS NOT NULL AND bundle_digest IS NOT NULL) "
+            "OR (mode = 'ordinary' AND tool_access IS NULL AND runtime_id IS NULL "
+            "AND qualification_id IS NULL AND bundle_digest IS NULL)",
+            name="hook_source_policies_policy_ck",
+        ),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    hook: Mapped[str] = mapped_column(String(63), primary_key=True)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    operation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    mode: Mapped[str] = mapped_column(String, nullable=False)
+    tool_access: Mapped[str | None] = mapped_column(String, nullable=True)
+    runtime_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    qualification_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    bundle_digest: Mapped[str | None] = mapped_column(String, nullable=True)
+    legacy_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class HookSourceOperation(Base):
+    """@spec PROTECTED-HOOK-SOURCE-10."""
+
+    __tablename__ = "hook_source_operations"
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="hook_source_operations_generation_ck"),
+        CheckConstraint(
+            "status IN ('pending', 'committed')", name="hook_source_operations_status_ck"
+        ),
+        CheckConstraint(
+            "intent_sha256 ~ '^[0-9a-f]{64}$'", name="hook_source_operations_intent_ck"
+        ),
+        UniqueConstraint(
+            "agent_id", "hook", "generation", name="uq_hook_source_operation_generation"
+        ),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    hook: Mapped[str] = mapped_column(String(63), primary_key=True)
+    operation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    intent_sha256: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    attempted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class HookRun(Base):

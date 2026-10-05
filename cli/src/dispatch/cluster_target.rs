@@ -17,11 +17,11 @@ impl ClusterTargetSources {
         let Some((action_name, action_matches)) = cluster_matches.subcommand() else {
             return Self::default();
         };
-        let action_matches = if action_name == "hooks" {
-            let Some((_, hook_matches)) = action_matches.subcommand() else {
+        let action_matches = if matches!(action_name, "hooks" | "console") {
+            let Some((_, leaf_matches)) = action_matches.subcommand() else {
                 return Self::default();
             };
-            hook_matches
+            leaf_matches
         } else {
             // `cluster hook fire` carries namespace on the leaf, not on `hook`.
             match action_matches.subcommand() {
@@ -61,7 +61,13 @@ pub(crate) const E2E_CONNECTOR_IDENTITY_SET: &str = "e2eConnectorIdentity.enable
 
 pub(crate) fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Option<&str>) {
     match action {
-        ClusterAction::LintValues {
+        ClusterAction::Console {
+            action:
+                ClusterConsoleAction::Login {
+                    namespace, release, ..
+                },
+        }
+        | ClusterAction::LintValues {
             namespace, release, ..
         }
         | ClusterAction::Up {
@@ -151,7 +157,15 @@ pub(crate) fn retarget_cluster_action(
         }
     };
     match action {
-        ClusterAction::LintValues {
+        ClusterAction::Console {
+            action:
+                ClusterConsoleAction::Login {
+                    namespace: current_namespace,
+                    release: current_release,
+                    ..
+                },
+        }
+        | ClusterAction::LintValues {
             namespace: current_namespace,
             release: current_release,
             ..

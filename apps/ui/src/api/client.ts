@@ -1,13 +1,9 @@
 // Typed client for the B1/B2 API, reached through the same-origin /api proxy.
-// Administrative and read calls carry X-API-Key unless a function explicitly
-// documents its narrower credential (for example, console-session approval
-// resolution). Every wire shape the API declares is an alias to the types
-// generated from apps/api/openapi.json (src/api/generated.ts, refreshed with
-// `pnpm gen:api-types`), so a changed response field fails `pnpm typecheck` in
-// the consumers that read it. Only UI-side helpers (query options, error
-// shapes the schema does not declare) are written by hand here.
+// Every call authenticates with the same-origin HttpOnly console session cookie
+// (ADR-0083). API wire shapes are aliases generated from apps/api/openapi.json
+// by `pnpm gen:api-types`; UI helpers and undeclared error shapes stay local.
 
-import { API_PREFIX, apiKey } from "./config";
+import { API_PREFIX } from "./config";
 import type { components } from "./generated";
 
 type Schemas = components["schemas"];
@@ -84,12 +80,37 @@ export class ApiError extends Error {
   }
 }
 
+/** True for a 401 from the API: no credential the route accepts. */
+export function isUnauthorized(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 401;
+}
+
 function url(path: string): string {
   return `${API_PREFIX}${path}`;
 }
 
-function headers(extra?: Record<string, string>): Record<string, string> {
-  return { "X-API-Key": apiKey(), ...extra };
+type UnauthorizedListener = () => void;
+
+const unauthorizedListeners = new Set<UnauthorizedListener>();
+
+// Subscribe to 401s from any protected call. The console session gate uses this
+// to re-check the session; returns the unsubscribe.
+export function onUnauthorized(listener: UnauthorizedListener): () => void {
+  unauthorizedListeners.add(listener);
+  return () => {
+    unauthorizedListeners.delete(listener);
+  };
+}
+
+// The one wrapper every protected call goes through: the session cookie is the
+// only credential, and a 401 notifies the listeners above. It neither throws on
+// a status nor reads the body; callers keep their own error mapping.
+async function request(path: string, init: RequestInit = {}): Promise<Response> {
+  const resp = await fetch(url(path), { ...init, credentials: "same-origin" });
+  if (resp.status === 401) {
+    for (const listener of [...unauthorizedListeners]) listener();
+  }
+  return resp;
 }
 
 async function jsonOrThrow<T>(resp: Response): Promise<T> {
@@ -119,9 +140,9 @@ function describeError(body: unknown): string | null {
 
 // `model` is optional (#254); omit it for the platform default.
 export async function createAgent(input: AgentCreate): Promise<AgentOut> {
-  const resp = await fetch(url("/agents"), {
+  const resp = await request("/agents", {
     method: "POST",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
   return jsonOrThrow<AgentOut>(resp);
@@ -131,9 +152,9 @@ export async function createVersion(
   agentId: string,
   input: VersionCreate,
 ): Promise<VersionOut> {
-  const resp = await fetch(url(`/agents/${agentId}/versions`), {
+  const resp = await request(`/agents/${agentId}/versions`, {
     method: "POST",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
   return jsonOrThrow<VersionOut>(resp);
@@ -151,9 +172,8 @@ export async function uploadBundle(
 ): Promise<BundleOut> {
   const form = new FormData();
   form.append("file", archive, "bundle.zip");
-  const resp = await fetch(url(`/agents/${agentId}/versions/${versionId}/bundle`), {
+  const resp = await request(`/agents/${agentId}/versions/${versionId}/bundle`, {
     method: "PUT",
-    headers: headers(),
     body: form,
   });
   if (resp.ok) return (await resp.json()) as BundleOut;
@@ -183,25 +203,20 @@ function extractIssues(body: unknown): BundleIssue[] | null {
 // List recent traces. With agentId, the API filters to that agent's runs (its
 // traces carry the `agent-<id>` name token); without it, all recent traces.
 export async function listTraces(limit = 20, agentId?: string): Promise<RawTrace[]> {
-  const resp = await fetch(url(`/langfuse/traces${query({ limit, agent_id: agentId })}`), {
-    headers: headers(),
-  });
+  const resp = await request(`/langfuse/traces${query({ limit, agent_id: agentId })}`);
   return jsonOrThrow<RawTrace[]>(resp);
 }
 
 export async function getTrace(traceId: string): Promise<TraceTree> {
-  const resp = await fetch(url(`/langfuse/traces/${encodeURIComponent(traceId)}`), {
-    headers: headers(),
-  });
+  const resp = await request(`/langfuse/traces/${encodeURIComponent(traceId)}`);
   return jsonOrThrow<TraceTree>(resp);
 }
 
 // Promote a trace into an anonymized, runnable eval case (#259). The API reads
 // the trace, scrubs PII, and returns a case in the frozen eval-case format.
 export async function promoteTraceToEvalCase(traceId: string): Promise<EvalCaseOut> {
-  const resp = await fetch(url(`/langfuse/traces/${encodeURIComponent(traceId)}/eval-case`), {
+  const resp = await request(`/langfuse/traces/${encodeURIComponent(traceId)}/eval-case`, {
     method: "POST",
-    headers: headers(),
   });
   return jsonOrThrow<EvalCaseOut>(resp);
 }
@@ -228,9 +243,7 @@ export type EvalMatrix = Schemas["EvalMatrix"];
 // Read the eval matrix for a suite. The matrix is filtered by suite (the real
 // dimension on eval traces); `versions` caps the number of version columns.
 export async function getEvalMatrix(suite: string, versions = 5): Promise<EvalMatrix> {
-  const resp = await fetch(url(`/evals/matrix${query({ suite, versions })}`), {
-    headers: headers(),
-  });
+  const resp = await request(`/evals/matrix${query({ suite, versions })}`);
   return jsonOrThrow<EvalMatrix>(resp);
 }
 
@@ -252,9 +265,7 @@ export type RunnerPods = Schemas["RunnerPods"];
 // List the runner sandbox pods in a namespace (populates the Logs dropdown).
 // Non-2xx throws ApiError carrying the status: 503 (no cluster), 502 (other).
 export async function listRunnerPods(namespace?: string): Promise<RunnerPods> {
-  const resp = await fetch(url(`/observability/runners${query({ namespace })}`), {
-    headers: headers(),
-  });
+  const resp = await request(`/observability/runners${query({ namespace })}`);
   return jsonOrThrow<RunnerPods>(resp);
 }
 
@@ -275,9 +286,7 @@ function query(params: Record<string, string | number | boolean | undefined>): s
 }
 
 export async function getMetricsSummary(filter: MetricFilter = {}): Promise<MetricsSummary> {
-  const resp = await fetch(url(`/observability/metrics/summary${query({ ...filter })}`), {
-    headers: headers(),
-  });
+  const resp = await request(`/observability/metrics/summary${query({ ...filter })}`);
   return jsonOrThrow<MetricsSummary>(resp);
 }
 
@@ -286,9 +295,8 @@ export async function getMetricSeries(
   granularity: Granularity,
   filter: MetricFilter = {},
 ): Promise<MetricSeries> {
-  const resp = await fetch(
-    url(`/observability/metrics/series${query({ metric, granularity, ...filter })}`),
-    { headers: headers() },
+  const resp = await request(
+    `/observability/metrics/series${query({ metric, granularity, ...filter })}`,
   );
   return jsonOrThrow<MetricSeries>(resp);
 }
@@ -306,11 +314,8 @@ export async function getRunnerLogs(
   pod: string,
   opts: RunnerLogsQuery = {},
 ): Promise<PodLogs> {
-  const resp = await fetch(
-    url(
-      `/observability/runners/${encodeURIComponent(namespace)}/${encodeURIComponent(pod)}/logs${query({ ...opts })}`,
-    ),
-    { headers: headers() },
+  const resp = await request(
+    `/observability/runners/${encodeURIComponent(namespace)}/${encodeURIComponent(pod)}/logs${query({ ...opts })}`,
   );
   return jsonOrThrow<PodLogs>(resp);
 }
@@ -336,7 +341,7 @@ export type KillState = Schemas["KillState"];
 export type ThreadResetState = Schemas["ThreadResetState"];
 
 export async function getAgents(): Promise<AgentOut[]> {
-  const resp = await fetch(url("/agents"), { headers: headers() });
+  const resp = await request("/agents");
   return jsonOrThrow<AgentOut[]>(resp);
 }
 
@@ -361,19 +366,19 @@ export type WorkItemOutcome = Schemas["WorkItemOutcomeOut"];
 export type WorkItemsList = Schemas["WorkItemOutcomeList"];
 
 export async function listWorkItems(params: { agentId?: string } = {}): Promise<WorkItemsList> {
-  const resp = await fetch(url(`/work-items${query({ agent_id: params.agentId })}`), { headers: headers() });
+  const resp = await request(`/work-items${query({ agent_id: params.agentId })}`);
   return jsonOrThrow<WorkItemsList>(resp);
 }
 
 export async function getWorkItem(id: string): Promise<WorkItemOutcome> {
-  const resp = await fetch(url(`/work-items/${encodeURIComponent(id)}`), { headers: headers() });
+  const resp = await request(`/work-items/${encodeURIComponent(id)}`);
   return jsonOrThrow<WorkItemOutcome>(resp);
 }
 
-// The open /config endpoint (no API key required) carries the configurable
+// The open /config endpoint (no credential required) carries the configurable
 // org/workspace name the shared chrome renders.
 export async function getConfig(): Promise<AppConfig> {
-  const resp = await fetch(url("/config"));
+  const resp = await request("/config");
   return jsonOrThrow<AppConfig>(resp);
 }
 
@@ -392,9 +397,9 @@ export async function updateAgent(
   agentId: string,
   patch: AgentUpdate,
 ): Promise<AgentOut> {
-  const resp = await fetch(url(`/agents/${agentId}`), {
+  const resp = await request(`/agents/${agentId}`, {
     method: "PATCH",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(patch),
   });
   return jsonOrThrow<AgentOut>(resp);
@@ -415,17 +420,15 @@ export async function patchAgentChannel(
   selector: ChannelBinding,
   next: ChannelBinding,
 ): Promise<AgentOut> {
-  const resp = await fetch(
-    url(
-      `/agents/${agentId}/channels${query({
-        kind: selector.kind,
-        address: selector.address,
-        adapter: selector.adapter ?? undefined,
-      })}`,
-    ),
+  const resp = await request(
+    `/agents/${agentId}/channels${query({
+      kind: selector.kind,
+      address: selector.address,
+      adapter: selector.adapter ?? undefined,
+    })}`,
     {
       method: "PATCH",
-      headers: headers({ "Content-Type": "application/json" }),
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(next),
     },
   );
@@ -436,9 +439,9 @@ export async function addAgentSurface(
   agentId: string,
   surface: ChannelBindingWrite,
 ): Promise<AgentOut> {
-  const resp = await fetch(url(`/agents/${agentId}/channels`), {
+  const resp = await request(`/agents/${agentId}/channels`, {
     method: "POST",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(surface),
   });
   return jsonOrThrow<AgentOut>(resp);
@@ -452,15 +455,13 @@ export async function removeAgentSurface(
   agentId: string,
   surface: ChannelBinding,
 ): Promise<void> {
-  const resp = await fetch(
-    url(
-      `/agents/${agentId}/channels${query({
-        kind: surface.kind,
-        address: surface.address,
-        adapter: surface.adapter ?? undefined,
-      })}`,
-    ),
-    { method: "DELETE", headers: headers() },
+  const resp = await request(
+    `/agents/${agentId}/channels${query({
+      kind: surface.kind,
+      address: surface.address,
+      adapter: surface.adapter ?? undefined,
+    })}`,
+    { method: "DELETE" },
   );
   if (resp.ok) return;
   const body = await resp.json().catch(() => null);
@@ -470,35 +471,35 @@ export async function removeAgentSurface(
 // Delete an agent (cascades its versions/deployments server-side; 204 No Content
 // on success). A 409 (active deployment) surfaces via the thrown ApiError.
 export async function deleteAgent(agentId: string): Promise<void> {
-  const resp = await fetch(url(`/agents/${agentId}`), { method: "DELETE", headers: headers() });
+  const resp = await request(`/agents/${agentId}`, { method: "DELETE" });
   if (resp.ok) return;
   const body = await resp.json().catch(() => null);
   throw new ApiError(resp.status, describeError(body) ?? resp.statusText);
 }
 
 export async function getCost(agentId: string, range: { start?: string; end?: string } = {}): Promise<CostReport> {
-  const resp = await fetch(url(`/agents/${agentId}/cost${query({ ...range })}`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/cost${query({ ...range })}`);
   return jsonOrThrow<CostReport>(resp);
 }
 
 export async function getBudget(agentId: string): Promise<BudgetConfig> {
-  const resp = await fetch(url(`/agents/${agentId}/budget`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/budget`);
   return jsonOrThrow<BudgetConfig>(resp);
 }
 
 // PUT the budget. A non-positive value 422s server-side (Field(gt=0)); the
 // ApiError message carries the field-level reason for inline display.
 export async function putBudget(agentId: string, budget: BudgetConfig): Promise<BudgetConfig> {
-  const resp = await fetch(url(`/agents/${agentId}/budget`), {
+  const resp = await request(`/agents/${agentId}/budget`, {
     method: "PUT",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(budget),
   });
   return jsonOrThrow<BudgetConfig>(resp);
 }
 
 export async function getKillState(agentId: string): Promise<KillState> {
-  const resp = await fetch(url(`/agents/${agentId}/kill`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/kill`);
   return jsonOrThrow<KillState>(resp);
 }
 
@@ -515,12 +516,12 @@ export type BundleFile = Schemas["BundleFile"];
 export type BundleFiles = Schemas["BundleFiles"];
 
 export async function listVersions(agentId: string): Promise<VersionOut[]> {
-  const resp = await fetch(url(`/agents/${agentId}/versions`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/versions`);
   return jsonOrThrow<VersionOut[]>(resp);
 }
 
 export async function listDeployments(agentId: string): Promise<DeploymentOut[]> {
-  const resp = await fetch(url(`/deployments${query({ agent_id: agentId })}`), { headers: headers() });
+  const resp = await request(`/deployments${query({ agent_id: agentId })}`);
   return jsonOrThrow<DeploymentOut[]>(resp);
 }
 
@@ -528,7 +529,7 @@ export async function listDeployments(agentId: string): Promise<DeploymentOut[]>
 // by the env-scoped Agents/Overview views to decide which agents are live in the
 // selected environment.
 export async function listAllDeployments(): Promise<DeploymentOut[]> {
-  const resp = await fetch(url("/deployments"), { headers: headers() });
+  const resp = await request("/deployments");
   return jsonOrThrow<DeploymentOut[]>(resp);
 }
 
@@ -538,7 +539,7 @@ export async function listAllDeployments(): Promise<DeploymentOut[]> {
  * the version yet; callers distinguish it via the thrown ApiError's status.
  */
 export async function getVersionFiles(agentId: string, versionId: string): Promise<BundleFiles> {
-  const resp = await fetch(url(`/agents/${agentId}/versions/${versionId}/files`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/versions/${versionId}/files`);
   return jsonOrThrow<BundleFiles>(resp);
 }
 
@@ -548,9 +549,9 @@ export type DeploymentCreate = Schemas["DeploymentCreate"];
 // server-side). This is the third step of the redeploy sequence, after POST
 // version + PUT bundle.
 export async function createDeployment(input: DeploymentCreate): Promise<DeploymentOut> {
-  const resp = await fetch(url("/deployments"), {
+  const resp = await request("/deployments", {
     method: "POST",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
   return jsonOrThrow<DeploymentOut>(resp);
@@ -568,7 +569,7 @@ export type MemoryEntry = Schemas["MemoryEntryOut"];
 
 // List an agent's learned memory, oldest first (empty for a fresh agent).
 export async function listMemory(agentId: string): Promise<MemoryEntry[]> {
-  const resp = await fetch(url(`/agents/${agentId}/memory`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/memory`);
   return jsonOrThrow<MemoryEntry[]>(resp);
 }
 
@@ -580,9 +581,9 @@ export async function editMemory(
   content: string,
   expectedVersion: number,
 ): Promise<MemoryEntry> {
-  const resp = await fetch(url(`/agents/${agentId}/memory/${index}`), {
+  const resp = await request(`/agents/${agentId}/memory/${index}`, {
     method: "PUT",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content, expected_version: expectedVersion }),
   });
   return jsonOrThrow<MemoryEntry>(resp);
@@ -594,12 +595,9 @@ export async function deleteMemory(
   index: number,
   expectedVersion: number,
 ): Promise<void> {
-  const resp = await fetch(
-    url(`/agents/${agentId}/memory/${index}${query({ expected_version: expectedVersion })}`),
-    {
-      method: "DELETE",
-      headers: headers(),
-    },
+  const resp = await request(
+    `/agents/${agentId}/memory/${index}${query({ expected_version: expectedVersion })}`,
+    { method: "DELETE" },
   );
   if (resp.ok) return;
   const body = await resp.json().catch(() => null);
@@ -619,26 +617,24 @@ export type StateEntry = Schemas["StateEntryOut"];
 // List the namespaces an agent has stored, most-recently-written first (empty
 // for an agent that has stored nothing).
 export async function listStateNamespaces(agentId: string): Promise<StateNamespace[]> {
-  const resp = await fetch(url(`/agents/${agentId}/state`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/state`);
   return jsonOrThrow<StateNamespace[]>(resp);
 }
 
 // List every key stored under one namespace (get-by-key is not needed for the
 // read surface: the list carries each entry's value, version, and write time).
 export async function listStateEntries(agentId: string, namespace: string): Promise<StateEntry[]> {
-  const resp = await fetch(url(`/agents/${agentId}/state/${encodeURIComponent(namespace)}`), {
-    headers: headers(),
-  });
+  const resp = await request(`/agents/${agentId}/state/${encodeURIComponent(namespace)}`);
   return jsonOrThrow<StateEntry[]>(resp);
 }
 
 export async function killAgent(agentId: string): Promise<KillState> {
-  const resp = await fetch(url(`/agents/${agentId}/kill`), { method: "POST", headers: headers() });
+  const resp = await request(`/agents/${agentId}/kill`, { method: "POST" });
   return jsonOrThrow<KillState>(resp);
 }
 
 export async function resumeAgent(agentId: string): Promise<KillState> {
-  const resp = await fetch(url(`/agents/${agentId}/resume`), { method: "POST", headers: headers() });
+  const resp = await request(`/agents/${agentId}/resume`, { method: "POST" });
   return jsonOrThrow<KillState>(resp);
 }
 
@@ -650,9 +646,9 @@ export async function resumeAgent(agentId: string): Promise<KillState> {
 // confirm it landed. The thread key is arbitrary (e.g. a Slack thread ts), so it
 // is URL-encoded into the path.
 export async function resetThread(agentId: string, threadKey: string): Promise<ThreadResetState> {
-  const resp = await fetch(
-    url(`/agents/${agentId}/threads/${encodeURIComponent(threadKey)}/reset`),
-    { method: "POST", headers: headers() },
+  const resp = await request(
+    `/agents/${agentId}/threads/${encodeURIComponent(threadKey)}/reset`,
+    { method: "POST" },
   );
   return jsonOrThrow<ThreadResetState>(resp);
 }
@@ -664,9 +660,8 @@ export async function getThreadResetState(
   agentId: string,
   threadKey: string,
 ): Promise<ThreadResetState> {
-  const resp = await fetch(
-    url(`/agents/${agentId}/threads/${encodeURIComponent(threadKey)}/reset`),
-    { headers: headers() },
+  const resp = await request(
+    `/agents/${agentId}/threads/${encodeURIComponent(threadKey)}/reset`,
   );
   return jsonOrThrow<ThreadResetState>(resp);
 }
@@ -694,29 +689,26 @@ export interface ApprovalListQuery {
 // List approvals, newest first (server clamps limit to 1..200). Without a status
 // filter, every status is returned; the operator surface defaults to pending.
 export async function listApprovals(opts: ApprovalListQuery = {}): Promise<ApprovalOut[]> {
-  const resp = await fetch(
-    url(
-      `/approvals${query({
-        status_filter: opts.status,
-        agent_id: opts.agentId,
-        conversation_id: opts.conversationId,
-        limit: opts.limit,
-      })}`,
-    ),
-    { headers: headers() },
+  const resp = await request(
+    `/approvals${query({
+      status_filter: opts.status,
+      agent_id: opts.agentId,
+      conversation_id: opts.conversationId,
+      limit: opts.limit,
+    })}`,
   );
   return jsonOrThrow<ApprovalOut[]>(resp);
 }
 
 export async function getApproval(approvalId: string): Promise<ApprovalOut> {
-  const resp = await fetch(url(`/approvals/${encodeURIComponent(approvalId)}`), { headers: headers() });
+  const resp = await request(`/approvals/${encodeURIComponent(approvalId)}`);
   return jsonOrThrow<ApprovalOut>(resp);
 }
 
 // The approval's audit trail, oldest first (empty until the first resolution
 // attempt). A 404 (approval gone) surfaces via the thrown ApiError.
 export async function getApprovalAudit(approvalId: string): Promise<ApprovalAudit[]> {
-  const resp = await fetch(url(`/approvals/${encodeURIComponent(approvalId)}/audit`), { headers: headers() });
+  const resp = await request(`/approvals/${encodeURIComponent(approvalId)}/audit`);
   return jsonOrThrow<ApprovalAudit[]>(resp);
 }
 
@@ -726,6 +718,8 @@ export type ConsoleSession = Schemas["ConsoleSessionOut"];
 
 // Inspect the HttpOnly same-origin console session. No platform key is sent:
 // the ambient cookie is the only credential on this identity boundary.
+// Bypasses request() on purpose: a 401 here means signed out, not an expired
+// session, so it must not fire the unauthorized listeners.
 export async function getConsoleSession(): Promise<ConsoleSession> {
   const resp = await fetch(url("/console/session"), {
     credentials: "same-origin",
@@ -735,6 +729,8 @@ export async function getConsoleSession(): Promise<ConsoleSession> {
 
 // Exchange a single-use CLI-minted login code. The response never exposes the
 // session token; the API installs it as an HttpOnly cookie.
+// Bypasses request() on purpose: a 401 here means a bad code, not an expired
+// session, so it must not fire the unauthorized listeners.
 export async function exchangeConsoleLoginCode(code: string): Promise<ConsoleSession> {
   const resp = await fetch(url("/console/session"), {
     method: "POST",
@@ -746,14 +742,13 @@ export async function exchangeConsoleLoginCode(code: string): Promise<ConsoleSes
 }
 
 // Resolve an approval (resolve-once compare-and-set) as the immutable subject
-// in the HttpOnly console session. The request deliberately omits X-API-Key and
-// carries no caller-asserted identity/channel fields. Designed failures are 401
+// in the HttpOnly console session. Like every call, it carries only the console
+// cookie and no caller-asserted identity/channel fields. Designed failures are 401
 // (session missing/revoked/expired), 403 (not authorized), 409 (already
 // resolved), and 410 (expired).
 export async function resolveApproval(approvalId: string, input: ApprovalResolveInput): Promise<ApprovalOut> {
-  const resp = await fetch(url(`/approvals/${encodeURIComponent(approvalId)}/resolve`), {
+  const resp = await request(`/approvals/${encodeURIComponent(approvalId)}/resolve`, {
     method: "POST",
-    credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
@@ -786,7 +781,7 @@ export type NavPack = Schemas["NavPackConfig"];
 export type BehaviorPacksConfig = Schemas["BehaviorPacksConfig"];
 
 export async function getBehaviorPacks(agentId: string): Promise<BehaviorPacksConfig> {
-  const resp = await fetch(url(`/agents/${agentId}/behavior-packs`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/behavior-packs`);
   return jsonOrThrow<BehaviorPacksConfig>(resp);
 }
 
@@ -798,9 +793,9 @@ export async function putBehaviorPacks(
   agentId: string,
   config: BehaviorPacksConfig,
 ): Promise<BehaviorPacksConfig> {
-  const resp = await fetch(url(`/agents/${agentId}/behavior-packs`), {
+  const resp = await request(`/agents/${agentId}/behavior-packs`, {
     method: "PUT",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(config),
   });
   return jsonOrThrow<BehaviorPacksConfig>(resp);

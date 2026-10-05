@@ -62,6 +62,34 @@ the right reviewer, strips `isolation` and `model`, forces
 applies the cap, stops the run on a reviewer reply without a verdict, and
 refuses `publish_changes` until the diff reviewer approves. It also writes the
 `plan_review` and `review_diff` phase lines, with the round, to the pod log.
+It hands the agent and both reviewers the same verification contract,
+[`verification/contract.md`](verification/contract.md): the per-criterion
+verification table, when a check that needs an absent service may be delegated
+to a required pull request check, what always blocks, and the `VERIFICATION:`
+block each reviewer returns, which the hook records as a
+`curie_gate: verification_classified` line. When the bundle ships a
+`verification/checks.json`, both reviewers also get it after the contract.
+Without the contract no review runs.
+
+The same hook gates repository edits. `Edit`, `Write`, `MultiEdit` and
+`NotebookEdit` are refused until the `dark-factory:implement-issue` skill is
+loaded and the plan reviewer approves. After approval only test edits may run:
+an edit to a test file, or an edit to a source file that adds a test (an
+inline Rust `#[test]` module, a `def test_` function, and the like) beyond the
+ones the replaced text already held. The model writes the failing test (a
+test file, or an inline test that adds a test), runs it with Bash, then calls
+`report_progress` with phase `implement`, then edits source. When no test is
+feasible it reports `implement` directly and says why. That report is the one
+event that opens source edits; no Bash command does. The hook records evidence
+only: after a test edit it counts finished Bash commands and failed ones,
+never their text, and writes `test_edited`, `bash_after_test_edit` and
+`bash_failed_after_test_edit` on its `implement` phase line. It never claims
+a test ran. The hook fingerprints the checkout at the prompt and refuses the plan
+approval, stopping the run, if the checkout changed before it (for example
+through Bash). Its evidence lines share one `seq` counter per run:
+`curie_phase` lines carry `source: "hook"`, `curie_reported` lines record each
+`report_progress` call with the hook's last observed phase and `late: true`
+when the report trails it, and `curie_gate` lines record refusals.
 
 Both reviewers default to `anthropic/claude-opus-5.5`, served through the same
 OpenRouter key as the main loop. The Agent tool's own `model` argument only
@@ -69,6 +97,17 @@ takes Claude aliases, so the per-deployment override is the `model:` line in
 each file under `agents/`: change it in the bundle you deploy. Opus 5.5 needs
 the runner's bundled Claude Code CLI 2.1.280 or later (claude-agent-sdk
 0.2.158 or later).
+
+The runner image caps every model request at 16000 output tokens
+(`CLAUDE_CODE_MAX_OUTPUT_TOKENS` in [`runner.Dockerfile`](runner.Dockerfile)).
+Claude Code otherwise asks for up to 64000 output tokens per Opus request, and
+OpenRouter reserves credit for that whole ceiling, so a low balance refused
+every reviewer call. A verdict needs a few thousand tokens. Claude Code has no
+per-subagent ceiling, so the cap applies to the factory model's requests too.
+Plan on 5 USD of OpenRouter credit per run. Both the account balance and the
+key's own limit count, and the smaller one is what a run can spend. When
+OpenRouter refuses a reviewer call for credit (HTTP 402), the run ends with the
+out-of-credits cause and the review is not retried.
 
 ## What the bundle can reach
 

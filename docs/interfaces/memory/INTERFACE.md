@@ -135,16 +135,32 @@ The state API, not the sandbox, decides what a sandbox may do on the `memory`
 namespace (`apps/api/src/curie_api/routers/state.py::_check_memory_reach`).
 There are two sandbox credentials, both `scope="state"` tokens:
 
-- **Long-lived, read-only.** `CURIE_MEMORY_TOKEN` (and `CURIE_HISTORY_TOKEN`),
-  minted in `boot_env` with claims `{binding, memory: "read"}`. `binding` is
-  the boot binding's `"<kind>:<address>"`, or JSON null when the turn has none.
+- **Boot env, read-only.** `CURIE_MEMORY_TOKEN` (and `CURIE_HISTORY_TOKEN`),
+  minted in `boot_env` with claims `{binding, memory: "read", cred}`. `binding`
+  is the boot binding's `"<kind>:<address>"`, or JSON null when the turn has
+  none. `cred` is the credential id shared with `CURIE_STATE_TOKEN`. The token
+  expires at the turn's stream deadline plus 60 seconds, capped at 24 hours
+  (`BindingResolver.boot_env`). When the sandbox claim is
+  deleted the worker reports that id and the API refuses the token.
 - **Per turn, write.** Minted by
   `apps/worker/src/curie_worker/binding.py::BindingResolver.turn_memory_token`
   only when the agent has memory writes on, the turn names a binding and it is
   not eval-isolated, with claims `{binding, memory: "write", sender, turn}`.
   `sender` is the turn's `event.user`, or `<no person>`; `turn` is the queued
-  event id. It expires after the turn's remaining delivery budget (capped at
-  24 hours) plus 60 seconds. It rides the runner POST as `Event.memory_token`
+  event id plus a random suffix unique to each mint
+  (`apps/worker/src/curie_worker/kernel/memory.py::_with_memory_token`), so a retry or
+  continuation carries its own claim. It expires at the turn's stream deadline,
+  capped at 24 hours, with no grace. When the attempt ends the worker reports
+  the turn closed (`BindingResolver.close_turn_memory`), and the API then
+  refuses writes with that claim before expiry
+  (`apps/api/src/curie_api/routers/state.py::_check_turn_open`); if it cannot
+  check the closed-turn record it answers 503 rather than accept the write. A
+  failed close leaves the credential valid until it expires. A steering
+  attempt does not close its own claim when it ends: it hands the claim through
+  Valkey to the live turn it joined, and that turn's owner closes it when the
+  live turn ends (`Kernel._close_memory_turns`). A steer whose runner did not
+  name its live turn is never closed and stays valid until it expires. It rides the
+  runner POST as `Event.memory_token`
   (MEMORY-TOKEN-1..3), never the env. The runner keeps it on
   `MemoryTurn.write_token`, and the tool stores present it, falling back to the
   env token when the event has none.
@@ -212,9 +228,10 @@ change.
   Its consumers are the CLI (`cli/src/api.rs`, behind `curie local memory` /
   `curie local memory --add` and `curie cluster memory` /
   `curie cluster memory --add`) and the console (`apps/ui/src/api/client.ts`). Unlike
-  the sandbox path it is platform-key-only (`require_api_key`), so the scoped
-  memory token cannot reach it. This is coherent today (one loader plus the facts
-  store, one backing store, and the router says so in its own docstring), but it is the precise leak
+  the sandbox path it accepts the platform key or a live console session through
+  `require_api_key`, and the scoped sandbox token still cannot reach it. This is
+  coherent today (one loader plus the facts store, one backing store, and the
+  router says so in its own docstring), but it is the precise leak
   a real second loader would trip over: an `s3://` store would satisfy the port
   and still leave every operator read returning an empty list and every edit and
   delete 404ing, because the operator plane is addressing a Postgres row that

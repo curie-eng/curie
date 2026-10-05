@@ -7,6 +7,7 @@ the dev stack is not reachable so the unit suite stays runnable standalone.
 
 import os
 import time
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -69,24 +70,50 @@ def _max_depth(nodes: list[dict[str, Any]]) -> int:
     return 1 + max(_max_depth(n.get("children", [])) for n in nodes)
 
 
+def _poll_trace(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    trace_id: str,
+    ready: Callable[[dict[str, Any]], bool],
+    *,
+    timeout: float = 60,
+    interval: float = 2,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    last_state = "not attempted"
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            response = client.get(
+                f"/langfuse/traces/{trace_id}",
+                headers=auth_headers,
+                timeout=remaining,
+            )
+        except httpx.TransportError:
+            last_state = "temporary query failure"
+        else:
+            if response.status_code in (404, 502, 503, 504):
+                last_state = f"HTTP {response.status_code}"
+            else:
+                response.raise_for_status()
+                candidate = response.json()
+                if ready(candidate):
+                    return candidate
+                last_state = "incomplete trace"
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(interval, remaining))
+    raise AssertionError(f"exact trace did not become complete before the deadline: {last_state}")
+
+
 @pytest.mark.skipif(not _stack_up(), reason="dev compose stack not reachable")
 def test_proxy_returns_reconstructed_tree_for_seeded_trace(
     client: TestClient, auth_headers: dict[str, str],
 ) -> None:
     trace_id = _emit_three_level_trace()
 
-    deadline = time.time() + 60
-    body: dict[str, Any] | None = None
-    while time.time() < deadline:
-        resp = client.get(
-            f"/langfuse/traces/{trace_id}", headers=auth_headers
-        )
-        if resp.status_code == 200 and _max_depth(resp.json()["tree"]) >= 3:
-            body = resp.json()
-            break
-        time.sleep(2)
-
-    assert body is not None, "seeded trace never reached the proxy with depth >= 3"
+    body = _poll_trace(
+        client, auth_headers, trace_id, lambda candidate: _max_depth(candidate["tree"]) >= 3,
+    )
     assert _max_depth(body["tree"]) >= 3
     # The model-bearing span maps to a GENERATION somewhere in the tree.
     flat: list[dict[str, Any]] = []
@@ -123,22 +150,15 @@ def test_proxy_reads_approval_on_non_root_observation(
     finally:
         provider.shutdown()
 
-    deadline = time.time() + 60
-    body: dict[str, Any] | None = None
-    while time.time() < deadline:
-        resp = client.get(f"/langfuse/traces/{trace_id}", headers=auth_headers)
-        if resp.status_code == 200:
-            candidate = resp.json()
-            tree = candidate["tree"]
-            if (
-                len(tree) == 1
-                and tree[0]["name"] == "curie.queue.enqueue"
-                and {child["name"] for child in tree[0]["children"]}
-                == {"agent.run", "curie.reply.update"}
-                and candidate["approval_decision"] == decision
-            ):
-                body = candidate
-                break
-        time.sleep(2)
-    assert body is not None, "correlated approval metadata did not reach the exact proxy read"
+    def correlated(candidate: dict[str, Any]) -> bool:
+        tree = candidate["tree"]
+        return (
+            len(tree) == 1
+            and tree[0]["name"] == "curie.queue.enqueue"
+            and {child["name"] for child in tree[0]["children"]}
+            == {"agent.run", "curie.reply.update"}
+            and candidate["approval_decision"] == decision
+        )
+
+    body = _poll_trace(client, auth_headers, trace_id, correlated)
     assert body["approval_decision"] == decision

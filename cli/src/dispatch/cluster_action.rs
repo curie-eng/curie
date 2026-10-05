@@ -61,15 +61,27 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 std::path::Path::new("charts/curie").is_dir(),
             )?;
             let chart = materialize_artifact(resolved, dry_run, "chart").await?;
-            let credentials = if fake_model || local_model.is_some() {
-                None
+            // Only the shell credential is a change request. The saved one
+            // is adopted during completion when the release records no
+            // model credential of its own (#3848).
+            let (credentials, saved_credentials) = if fake_model || local_model.is_some() {
+                (None, None)
             } else {
-                ops::resolve_up_credentials(fake_model, ops::model_credential_env()?)
+                let credentials =
+                    ops::resolve_up_credentials(fake_model, ops::explicit_model_credential_env());
+                let saved_credentials = credentials
+                    .is_none()
+                    .then(ops::saved_model_credential)
+                    .flatten();
+                (credentials, saved_credentials)
             };
             emit(
                 ops::up(
                     UpOpts {
                         retained_mail_values: None,
+                        // Resolved by ops::up from the recorded release values.
+                        retained_runner_values: None,
+                        saved_credentials,
                         common: CommonOpts {
                             namespace,
                             release,
@@ -346,11 +358,16 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             private_key_file,
             org,
             timeout,
+            runner_image,
             namespace,
             release,
             chart,
             dry_run,
         } => {
+            let runner_binding = runner_image
+                .as_deref()
+                .map(parse_runner_image_binding)
+                .transpose()?;
             let webhook_secret = if disable {
                 None
             } else {
@@ -384,6 +401,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     private_key_file,
                     org,
                     intake,
+                    runner_binding,
                 })
                 .await?,
             )
@@ -1021,6 +1039,28 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 )
                 .await?,
             )
+        }
+        ClusterAction::Console {
+            action:
+                ClusterConsoleAction::Login {
+                    subject,
+                    api_url,
+                    namespace,
+                    release,
+                    dry_run,
+                },
+        } => {
+            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(
+                ClusterConn {
+                    api_url,
+                    api_key: None,
+                    namespace,
+                    release,
+                },
+                dry_run,
+            )
+            .await?;
+            emit(commands::console_login(&api_url, &api_key, &subject, dry_run).await?)
         }
         ClusterAction::Resume {
             agent,

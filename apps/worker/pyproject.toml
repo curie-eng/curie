@@ -10,6 +10,8 @@ dependencies = [
     "pydantic-settings>=2.15.0",
     "kubernetes>=36.0.3",
     "aci-protocol",
+    # @spec PROTECTED-HOOK-LANE-1: shared internal source/transport authority.
+    "curie-protected-hooks",
     "curie-telemetry",
     "curie-channel-protocol",
     "plugin-format",

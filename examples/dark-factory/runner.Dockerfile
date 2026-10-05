@@ -22,4 +22,10 @@ ENV CARGO_HOME=${HOME}/.cargo
 ENV UV_CACHE_DIR=${HOME}/.cache/uv
 ENV PNPM_HOME=${HOME}/.local/share/pnpm
 ENV PATH="/usr/local/cargo/bin:${PATH}"
+# Claude Code asks for up to 64000 output tokens per Opus request by default,
+# and OpenRouter reserves credit for the whole ceiling, so a low balance refused
+# every reviewer call (#3935). A verdict needs a few thousand tokens. The CLI
+# has no per-subagent ceiling, so this caps every request in the sandbox, the
+# factory model's included.
+ENV CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000
 USER 1000:1000

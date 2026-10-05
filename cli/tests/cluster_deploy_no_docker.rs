@@ -76,6 +76,7 @@ fn deploy_response(req: &support::Request) -> Response {
             })
             .to_string(),
         ),
+        ("PATCH", "/agents/agent-acme-bot") => Response::json(200, &agent_json().to_string()),
         ("GET", path) if path.contains("/versions/") && path.contains("/connectors?") => {
             Response::json(
                 200,

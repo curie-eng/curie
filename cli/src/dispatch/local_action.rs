@@ -283,6 +283,21 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             .await;
             emit(local::with_deploy_unreachable_hint(result, &local_api_url).await?)
         }
+        LocalAction::Console {
+            action:
+                LocalConsoleAction::Login {
+                    subject,
+                    api_url,
+                    dry_run,
+                },
+        } => {
+            let api_key = if dry_run {
+                String::new()
+            } else {
+                api::resolve_local_api_key(&api_url, message::DEFAULT_API_KEY)
+            };
+            emit(commands::console_login(&api_url, &api_key, &subject, dry_run).await?)
+        }
         LocalAction::Versions { target } => emit(commands::versions(target.into()).await?),
         LocalAction::Hooks { action } => match action {
             LocalHooksAction::Show { target } => emit(commands::hooks_show(target.into()).await?),

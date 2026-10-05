@@ -304,6 +304,155 @@ fn write_otlp_fixture(root: &Path, name: &str, documents: &[serde_json::Value]) 
     fs::write(root.join(format!("{name}.json")), rendered).expect("write OTLP fixture");
 }
 
+// Collector v0.119.0's exportMessageAsLine writes the JSON buffer and its
+// terminating newline separately, so a concurrent query can see either a
+// partial JSON buffer or valid JSON whose newline has not been written yet.
+// https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.119.0/exporter/fileexporter/file_writer.go
+#[test]
+fn local_otel_query_reads_terminated_records_before_a_partial_export() {
+    use serde_json::json;
+
+    let harness = tempfile::tempdir().expect("create local OTel fixture directory");
+    let root = harness.path();
+    write_otlp_fixture(
+        root,
+        "traces",
+        &[
+            json!({"resourceSpans": [{"scopeSpans": [{"spans": [{"traceId": "committed-trace"}]}]}]}),
+        ],
+    );
+    write_otlp_fixture(root, "logs", &[json!({"resourceLogs": []})]);
+    write_otlp_fixture(
+        root,
+        "metrics",
+        &[
+            json!({"resourceMetrics": [{"scopeMetrics": [{"metrics": [{"name": "committed.metric", "sum": {"dataPoints": [{"asInt": 2}]}}]}]}]}),
+        ],
+    );
+    for name in ["traces", "logs", "metrics"] {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(format!("{name}.json")))
+            .expect("open live OTLP fixture")
+            .write_all(b"{\"resource")
+            .expect("append in-progress export");
+    }
+
+    let result = run_local_otel_query(
+        &local_otel_query_python(),
+        "snapshot",
+        root,
+        &root.join("unused-baseline.json"),
+    );
+    assert!(
+        result.status.success(),
+        "terminated records must remain readable while the next export is partial: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&result.stdout).expect("parse committed snapshot");
+    assert_eq!(snapshot["trace_ids"], json!(["committed-trace"]));
+    assert_eq!(snapshot["metrics"].as_array().expect("metrics").len(), 1);
+    assert_eq!(snapshot["metrics"][0]["name"], "committed.metric");
+    assert_eq!(snapshot["metrics"][0]["value"], 2.0);
+}
+
+#[test]
+fn local_otel_query_defers_valid_exports_until_their_newline() {
+    use serde_json::json;
+
+    let harness = tempfile::tempdir().expect("create local OTel fixture directory");
+    let root = harness.path();
+    let script = local_otel_query_python();
+    for (name, document) in [
+        (
+            "traces",
+            json!({"resourceSpans": [{"scopeSpans": [{"spans": [{"traceId": "pending-trace"}]}]}]}),
+        ),
+        ("logs", json!({"resourceLogs": []})),
+        (
+            "metrics",
+            json!({"resourceMetrics": [{"scopeMetrics": [{"metrics": [{"name": "pending.metric", "sum": {"dataPoints": [{"asInt": 7}]}}]}]}]}),
+        ),
+    ] {
+        fs::write(
+            root.join(format!("{name}.json")),
+            serde_json::to_vec(&document).expect("serialize pending export"),
+        )
+        .expect("write export before its newline");
+    }
+
+    let before = run_local_otel_query(
+        &script,
+        "snapshot",
+        root,
+        &root.join("unused-baseline.json"),
+    );
+    assert!(
+        before.status.success(),
+        "a pending newline must not fail the query: {}",
+        String::from_utf8_lossy(&before.stderr)
+    );
+    let before_snapshot: serde_json::Value =
+        serde_json::from_slice(&before.stdout).expect("parse snapshot before commit");
+    assert_eq!(before_snapshot, json!({"trace_ids": [], "metrics": []}));
+
+    for name in ["traces", "logs", "metrics"] {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(format!("{name}.json")))
+            .expect("open pending export")
+            .write_all(b"\n")
+            .expect("commit export newline");
+    }
+    let after = run_local_otel_query(
+        &script,
+        "snapshot",
+        root,
+        &root.join("unused-baseline.json"),
+    );
+    assert!(
+        after.status.success(),
+        "the newline must make the export readable: {}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    let after_snapshot: serde_json::Value =
+        serde_json::from_slice(&after.stdout).expect("parse snapshot after commit");
+    assert_eq!(after_snapshot["trace_ids"], json!(["pending-trace"]));
+    assert_eq!(
+        after_snapshot["metrics"].as_array().expect("metrics").len(),
+        1
+    );
+    assert_eq!(after_snapshot["metrics"][0]["name"], "pending.metric");
+    assert_eq!(after_snapshot["metrics"][0]["value"], 7.0);
+}
+
+#[test]
+fn local_otel_query_rejects_malformed_terminated_exports() {
+    let script = local_otel_query_python();
+    for name in ["traces", "logs", "metrics"] {
+        let harness = tempfile::tempdir().expect("create local OTel fixture directory");
+        let root = harness.path();
+        fs::write(root.join(format!("{name}.json")), b"{\"resource\":}\n")
+            .expect("write malformed terminated export");
+        let result = run_local_otel_query(
+            &script,
+            "snapshot",
+            root,
+            &root.join("unused-baseline.json"),
+        );
+        assert!(
+            !result.status.success(),
+            "malformed terminated {name} records must fail the query"
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("JSONDecodeError"),
+            "{name} corruption must remain a JSON decoding error: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
 #[test]
 fn local_otel_failure_recovery_scopes_classified_metrics_to_the_traces_worker_instance() {
     use serde_json::json;
@@ -1297,6 +1446,183 @@ fn product_observability_requires_four_valid_seeds_and_count_only_mcp_receipt() 
         !approval.contains("curie.approval.wait"),
         "the oracle must not invent a wait span that no current emitter produces"
     );
+}
+
+fn run_plain_reply_seed(
+    function_name: &str,
+    finalized: bool,
+) -> (Output, Vec<Vec<String>>, String) {
+    let harness = tempfile::tempdir().expect("create plain reply seed harness");
+    let argv_log = harness.path().join("message-argv.log");
+    let phase_log = harness.path().join("seed-phases.log");
+    fs::write(&argv_log, b"").expect("initialize message argv log");
+    fs::write(&phase_log, b"").expect("initialize seed phase log");
+    let script = format!(
+        r#"set -euo pipefail
+WORKDIR="$TEST_WORKDIR"
+BIN=capture_message
+LIVE=1
+FAKE_SENTINEL=fake-reply
+LAST_ORDINARY_TRACE_ID=22222222222222222222222222222222
+capture_message() {{
+    printf '%s\0' "$@" >> "$TEST_MESSAGE_ARGV"
+    printf '\0' >> "$TEST_MESSAGE_ARGV"
+    printf '%s\n' "$TEST_MESSAGE_REPLY"
+    return "$TEST_MESSAGE_EXIT"
+}}
+capture_stream_cursor() {{ printf '%s-0\n' "$(wc -c < "$TEST_MESSAGE_ARGV" | tr -d ' ')"; }}
+assert_product_runner_endpoints() {{ echo endpoints >> "$TEST_PHASE_LOG"; }}
+discover_trace_id_for_seed() {{
+    printf 'discover %s\n' "$*" >> "$TEST_PHASE_LOG"
+    if [[ "$2" == curie-seed-invalid-auth-* ]]; then
+        echo 11111111111111111111111111111111
+    else
+        echo 22222222222222222222222222222222
+    fi
+}}
+query_exact_seed_trace() {{
+    printf 'query %s\n' "$*" >> "$TEST_PHASE_LOG"
+    LAST_QUERY_MEMBERSHIP=true
+}}
+ladder_compose() {{
+    case "$*" in
+        '--profile full ps -q langfuse-web') echo fixture-langfuse ;;
+        '--profile full ps -q otel-collector') echo fixture-collector ;;
+        *) return 97 ;;
+    esac
+}}
+restart_local_product_collector() {{ echo restart >> "$TEST_PHASE_LOG"; }}
+wait_product_collector_ready() {{ :; }}
+product_collector_metric_value() {{
+    if [[ "$1" == otelcol_exporter_queue_size || ! -s "$TEST_MESSAGE_ARGV" ]]; then
+        echo 0
+    else
+        echo 1
+    fi
+}}
+docker() {{
+    [[ "$*" == 'logs fixture-collector' ]] || return 97
+    echo 'HTTP Status Code 401 Permanent error not retryable error'
+}}
+restore_local_langfuse_auth() {{ echo restored >> "$TEST_PHASE_LOG"; }}
+{}
+{}
+{}
+{}
+if [[ "$TEST_SEED_FUNCTION" == seed_ordinary_turn ]]; then
+    seed_ordinary_turn local fixture-agent present
+else
+    case_local_langfuse_invalid_auth fixture-agent
+fi
+"#,
+        ladder_function("assert_finalized_reply"),
+        ladder_function("assert_product_collector_permanent_auth_rejection"),
+        ladder_function("seed_ordinary_turn"),
+        ladder_function("case_local_langfuse_invalid_auth"),
+    );
+    let output = Command::new("bash")
+        .args(["-c", &script])
+        .env("TEST_WORKDIR", harness.path())
+        .env("TEST_MESSAGE_ARGV", &argv_log)
+        .env("TEST_PHASE_LOG", &phase_log)
+        .env("TEST_SEED_FUNCTION", function_name)
+        .env(
+            "TEST_MESSAGE_REPLY",
+            serde_json::json!({"finalized": finalized, "reply": "seed complete"}).to_string(),
+        )
+        .env("TEST_MESSAGE_EXIT", if finalized { "0" } else { "7" })
+        .env_remove("STUB_STATE")
+        .env_remove("LANGFUSE_OTLP_AUTH_HEADER")
+        .output()
+        .expect("run extracted plain reply seed functions");
+    let invocations = fs::read_to_string(argv_log)
+        .expect("read captured message argv")
+        .split("\0\0")
+        .filter(|invocation| !invocation.is_empty())
+        .map(|invocation| invocation.split('\0').map(str::to_owned).collect())
+        .collect();
+    let phases = fs::read_to_string(phase_log).expect("read seed phases");
+    (output, invocations, phases)
+}
+
+#[test]
+fn plain_reply_observability_seeds_send_an_exact_marker_task() {
+    for function_name in ["seed_ordinary_turn", "case_local_langfuse_invalid_auth"] {
+        let (output, invocations, phases) = run_plain_reply_seed(function_name, true);
+        assert!(
+            output.status.success(),
+            "{function_name} must complete with a finalized reply: {}",
+            transcript(&output)
+        );
+        assert_eq!(
+            invocations.len(),
+            if function_name == "seed_ordinary_turn" {
+                1
+            } else {
+                2
+            },
+            "invalid-auth recovery must send a fresh ordinary seed"
+        );
+        for (index, argv) in invocations.iter().enumerate() {
+            assert_eq!(argv.len(), 6, "the prompt must be one argument: {argv:?}");
+            assert_eq!(
+                &argv[..5],
+                ["--json", "local", "message", "--channel", "C0LOCALDEV"]
+            );
+            let marker = argv[5]
+                .strip_prefix("Reply with exactly: ")
+                .and_then(|prompt| {
+                    prompt.strip_suffix(". Do not call tools or investigate anything.")
+                })
+                .unwrap_or_else(|| {
+                    panic!("{function_name} must send a bounded reply task: {argv:?}")
+                });
+            let prefix = if function_name == "case_local_langfuse_invalid_auth" && index == 0 {
+                "curie-seed-invalid-auth-"
+            } else {
+                "curie-seed-ordinary-"
+            };
+            assert!(
+                marker.starts_with(prefix),
+                "retain the seed marker: {marker}"
+            );
+            assert!(
+                phases.contains(marker),
+                "the exact trace receipt must use the same marker as the task: {phases}"
+            );
+        }
+    }
+}
+
+#[test]
+fn plain_reply_observability_seeds_reject_nonfinal_replies_and_restore_auth() {
+    for function_name in ["seed_ordinary_turn", "case_local_langfuse_invalid_auth"] {
+        let (output, invocations, phases) = run_plain_reply_seed(function_name, false);
+        assert!(
+            !output.status.success(),
+            "{function_name} must propagate a nonfinal CLI refusal: {}",
+            transcript(&output)
+        );
+        assert!(transcript(&output).contains("status=not_finalized"));
+        assert_eq!(
+            invocations.len(),
+            1,
+            "a refused seed must not start recovery"
+        );
+        assert!(
+            !phases.contains("discover "),
+            "a refused seed has no receipt: {phases}"
+        );
+        assert!(
+            !phases.contains("endpoints"),
+            "a refused seed must stop: {phases}"
+        );
+        assert_eq!(
+            phases.lines().filter(|line| *line == "restored").count(),
+            usize::from(function_name == "case_local_langfuse_invalid_auth"),
+            "invalid-auth failure must restore auth exactly once: {phases}"
+        );
+    }
 }
 
 #[test]

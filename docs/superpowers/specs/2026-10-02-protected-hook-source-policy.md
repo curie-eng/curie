@@ -60,15 +60,174 @@ ordinary hooks retain today's optional signed restriction and ordinary path.
 
 Use `pg_advisory_xact_lock(hashtextextended('hook-source:' || agent_uuid, 0))`
 as the single lock helper, called by all those paths. Hash collision can only
-serialize otherwise independent agents, not weaken exclusion. Publication
-occurs after the authoritative transaction commits and therefore releases this
-lock; its broker CAS supplies the remaining protection.
+serialize otherwise independent agents, not weaken exclusion. The outer gate
+transaction remains open across the separate registration and
+authoritative work commits. Release the gate after the authoritative commit
+and before publication; the broker CAS supplies the remaining protection.
+The durable operation ordering is owned by SOURCE-10 below.
 
 The lock orders a legacy request already entering enqueue before the policy
 mutation. The mutation cannot activate while that enqueue is in flight. A
 request arriving afterward reloads the new policy. This lock is required even
 though protected claim/enqueue is atomic on a different broker. No distributed
 transaction between Postgres and Valkey is assumed.
+
+The shared internal library owns a typed transaction gate and source snapshot
+resolver used by API and worker. API owns HTTP and administrative SQL writes.
+Use a dedicated bounded gate connection pool, separate from the work/claim
+pool. Every path acquires the agent gate before a work connection. Release
+preliminary authentication read transactions before waiting for the gate,
+then reload and reauthenticate through a fresh work transaction after locking.
+A locked signed request first reads only the current authentication key-family
+fields and reauthenticates, before validating full source references or operation
+history. A stale signature therefore retains the uniform authentication refusal
+even when the new source configuration is unavailable. Immediately before each
+delivery claim attempt, validate the gate context's current task, live ownership
+and transaction, and probe its held database connection. Loss detected before
+that first effect refuses without a claim. This probe does not make a later
+database disconnect atomic with an already started broker operation.
+Signed ingress repeats that held-connection probe before backlog reservation,
+workspace selection and owned enqueue after prior awaited work completes.
+Acquire the workspace work connection before its probe. Before failed-delivery
+settlement, probe again; detected gate loss leaves already-created claims or
+quota to their existing expiry/recovery rather than authorizing more writes.
+Secondary settlement or diagnostic failure preserves the original refusal.
+Request cancellation retains the existing live-gate refund behavior: shield the
+probe and settlement in the registered request task for a bounded five-second
+cleanup scope, then propagate the original cancellation. No replacement task
+may borrow the gate context, and detected gate loss still authorizes no cleanup.
+A lock waiter must not retain a work/claim connection. Pass an acquired gate
+context to inner helpers; never reacquire the same agent lock on another
+connection. Close the outer transaction on every error or cancellation path.
+
+A scheduled producer's explicit context belongs to exactly its provided guard,
+agent, exact raw hook name, current task and active outer scope. Validate that
+provenance at every effect entry; another guard's context is not authority even
+for the same agent and name. The guard uses the producer's actual work engine
+and a distinct same-DSN gate pool. No missing guard/context grants ordinary
+admission, and no ambient context or implicit replacement pool supplies one.
+A supplied work connection must belong to that exact work engine before any
+SQL statement. Enqueue-failure settlement matches the authorized agent and exact
+hook name in addition to its run ID; another source record remains unchanged.
+Secondary cleanup telemetry or diagnostic failures preserve the original
+enqueue exception, even after the settlement transaction commits.
+
+Scheduled target discovery is a read-only hint. After acquiring the source gate,
+reload the currently preferred deployment using existing precedence, then its
+bundle and exact declaration before planning any effect. Refresh budget,
+control, binding and kill decisions under that scope. A removed declaration
+has no effect. Retain the existing immutable-version bundle cache key.
+Report durable outcome counts and metrics only after their containing work
+transaction commits; rolled-back reclamation is not a committed outcome.
+
+Manual and scheduled cron producers validate the acquired gate context and
+probe its held connection after any blocking inner hook lock and immediately
+before each hook-run or schedule-control INSERT or UPDATE and each ordinary
+enqueue, including enqueue-failure cleanup. Keep the outer gate across the
+existing durable claim commit and enqueue. A failed probe authorizes no
+following mutation or enqueue; never route detected gate loss through an
+unguarded failure-cleanup write. Loss detected after a durable claim commit
+may leave that claim for existing lease/recovery behavior; it does not roll
+back the commit or authorize a replacement enqueue. A later cleanup failure
+does not replace the original safe admission/enqueue refusal. These probes
+establish current held-connection liveness, not atomicity between later SQL
+effects and a broker operation.
+
+Preserve existing durable cron claim commit before ordinary enqueue. The outer
+agent gate spans the inner claim commit and enqueue, including manual fire and
+scheduled, deferred, retry, skipped, blocked and reclaim paths. Configured
+sources whose private routing is unavailable refuse before a run claim or
+mutation. A source snapshot includes both policy and attempt-history presence:
+only absence of both means never configured. SOURCE-10 owns pending history
+and its absent-policy refusal. Existing declared cron names retain their exact
+identity, including names outside the signed hook's canonical grammar. For such
+names, check both source tables by the exact declared name under the same gate;
+any policy or attempt history closes the unavailable configured path. Do not
+lowercase, truncate or otherwise alias a legacy name to another source. Absence
+of both retains existing ordinary fire behavior. Never treat a missing or unreadable table as
+an ordinary source. The wired candidate requires the actual new ledger
+migration head as its schema minimum; preserve prior registered windows. The
+source-control candidate is `0.12.2`, with schema head and minimum both `0076`.
+Register that minimum before connecting producer paths to ledger reads; missing
+ledger support must fail startup, not fall back to ordinary admission. Keep all
+previous windows, including the unwired `0.12.1` foundation, unchanged. These
+are candidate compatibility records, not a published release.
+
+The existing internal protected-hooks package owns one installed Python serving
+resource containing candidate window, known revision IDs and actual ancestry,
+and one pure serving decision shared by API and worker. Validate that resource
+against the actual Alembic graph, CLI candidate and chart; keep every prior
+registered window unchanged. Preserve existing first-parent serving ancestry
+when a revision names multiple parents; extraction does not widen the decision
+to reachability through another parent. Preserve the current presumed-compatible
+unknown future-expand rule. No duplicate numeric minimum, API application import in
+worker/shared package, source-tree runtime asset lookup or root API-asset-copy
+pattern is permitted. API retains migration kinds, planner, upgrade commands
+and non-startup compatibility CLI behavior. Retained resource paths, if needed,
+are checked generated mirrors of the single owner.
+
+Both API and standalone worker startup call the shared read-only live revision
+and required-structure probe under each caller's own configured database
+identity, before serving or producers. Worker completes the probe before
+`build` and all boot effects, within a 30-second observation deadline covering
+connection acquisition, revision read and both checks. Subsequent owned-engine
+cleanup is separately bounded; this is not a strict 30-second whole-wall-time
+claim. Missing/multiple version rows, incompatible known revision, unreadable/
+malformed metadata, unavailable database, insufficient SELECT authority or
+deadline exhaustion refuses without migration, mutation, enqueue or ordinary
+fallback. Safe stable diagnostics contain no credential, DSN or exception text.
+
+Revision compatibility alone does not prove ledger support. Independently
+probe these actual required source columns using zero-row projections and
+compatible catalog types in a read-only transaction: `curie.agents` (`id`,
+`hook_generation`); `curie.hook_source_policies` (the eleven SOURCE-1 columns);
+and `curie.hook_source_operations` (the seven SOURCE-10 columns). Require UUID
+identities, the shipped INTEGER agent counter, BIGINT source generations,
+supported textual fields and timestamp-with-time-zone times. Additive columns
+remain compatible. A known-compatible or unknown-future stamp with missing or
+unusable required structure refuses both startups. The configured schema only
+locates version metadata; current source helpers/migrations still use `curie`.
+This adds no custom-schema producer support and proves readable structure,
+not provenance, all constraints, runtime authority or qualification.
+
+Own the probe engine immediately and dispose it on every outcome. Worker
+composition owns one separate same-DSN source-gate pool: size four, overflow
+zero, checkout timeout 30 seconds, pre-ping. Register disposal before any later
+construction can fail. Preserve READ COMMITTED and gate-before-work ordering;
+gate waiters hold no work connection. Checkout timeout does not bound network
+connect or advisory-lock wait.
+
+Own the scheduled bundle reader's S3 client immediately after construction and
+register its close before any later construction can fail. Close it through the
+existing bounded synchronous transport adapter only after cron and its owned
+reads join. This adds ownership of that reader, without changing other legacy
+bundle-client lifecycles.
+
+Cleanup stops and joins supervised cron before gate disposal, with a ten-second
+stop/cancel/join budget. Thread-backed scheduled bundle reads keep an owned
+task until the synchronous read finishes, even after supervisor cancellation.
+Cancellation of the waiting coroutine is not thread completion. A read that
+remains active keeps cron unjoined so the same producer budget reaches fatal
+exit. Each subsequent owned engine/transport close has at
+most five seconds, and an earlier close error cannot skip later attempts.
+On cooperative paths retain the primary exception/cancellation; secondary
+cleanup failures produce safe diagnostics, and failure without a primary cause
+fails shutdown. Shield only an owned bounded cleanup task; do not detach
+unbounded work. If producer join expires, perform process-level fatal exit
+within one further second, preserving safe primary-cause diagnostics. Diagnostic
+errors or blocked log sinks must not prevent that fatal exit. Owned cleanup
+diagnostics are nonthrowing and bounded; an output still blocked after five
+seconds uses the same fatal exit instead of leaving an unjoined diagnostic
+task or thread. Merely
+raising/returning to `asyncio.run` is insufficient. Do not dispose gate/work
+engines under unjoined producers or claim successful termination/disposal or
+normal exception propagation after fatal exit. Fatal-path tests run only in
+an exclusively owned subprocess.
+Worker close budgets use observed task deadlines, not only cooperative timeout
+cancellation. If an owned worker closer remains live at its five-second
+deadline, use the same bounded fatal exit; do not detach it or report cleanup
+complete. A cooperative close error still attempts later independent resources
+and preserves the primary cause.
 
 ## API DTOs and credential lifecycle
 
@@ -108,6 +267,30 @@ log includes this secret. No route returns/mints protected consumer or proof
 issuer authority using platform API_KEY. The source secret is intentionally a
 source-administrative credential, not protected broker consumption authority.
 
+New source administrative DTOs encode generation, expected_generation and
+legacy_generation as canonical decimal strings. Accept `0` or positive decimal
+without signs, whitespace, exponents or leading zeros, up to BIGINT maximum;
+committed source generations are positive. IDs use canonical lowercase UUID
+strings. The source bundle reference is the manifest bundle's bare lowercase
+64-hex content digest. Request bodies forbid extra fields and coercion. DELETE
+uses the same generation and operation-ID grammar in its query parameters.
+These choices do not change the existing legacy secret response or the integer
+generation in the scoped key's signed derivation bytes.
+
+No-row output has generation `"0"`, ordinary mode, null policy references and
+updated_at, closed activation, and the locked agent's current legacy counter.
+Its ordinary admission status depends on SOURCE-10 attempt history. For both
+absent and existing policies, the GET output reports the freshly locked agent
+counter as `legacy_generation`, so another hook's activation cannot hide the
+current ordinary credential replacement requirement. This output does not alter
+the policy row's persisted counter snapshot used by SOURCE-6 fingerprints. Row
+timestamps serialize in UTC. Stable reasons contain no exception text, broker
+endpoint or credential; use `pending_history` for the absent-policy history
+case. Administrative unknown agent is 404, malformed input is 422, rotation
+of an ordinary or absent policy is 409, and exhausted generation space is 409.
+The committed intent and historical operation-ID rules are owned by SOURCE-10.
+A fresh rotation uses a fresh operation ID.
+
 <!-- @spec PROTECTED-HOOK-SOURCE-4 -->
 Derive a base64url HMAC-SHA256 source key using the platform key and compact
 ASCII JSON bytes for `["curie.hook.source.v1", canonical_agent_uuid,
@@ -135,6 +318,13 @@ legacy key. Re-enabling allocates a higher scoped generation and rotates legacy
 again, so a scoped key or previously retained shared key cannot revive. All
 legacy derivation/verification uses the freshly locked agent counter.
 
+Before an ordinary-to-protected reservation, require the shipped agent
+counter to be nonnegative and below 2147483647. Exhaustion refuses with 409
+before broker or SQL mutation; an invalid stored counter closes with 503.
+Do not widen, wrap or reset that counter as part of source administration.
+The measured Postgres datatype and dependency versions are recorded in the
+[dependency evidence](../../adr/evidence/0191-protected-hooks/README.md).
+
 ## Broker-authoritative activation and recovery
 
 <!-- @spec PROTECTED-HOOK-SOURCE-6 -->
@@ -144,16 +334,22 @@ operation_id, mode, policy_fingerprint}`. This is authority metadata, not a
 dispatchable copy. A source-control writer credential may change only this
 family, cannot publish runtime evidence or read protected payload, and is
 separate from consume authority. Workers/source signers cannot change it.
-The policy fingerprint covers every persisted decision field including
-`legacy_generation`; use canonical serialization and SHA256.
+The policy fingerprint is SHA256 of compact sorted-key ASCII JSON containing
+exactly `agent_id`, `hook`, `generation`, `operation_id`, `mode`, `tool_access`,
+`runtime_id`, `qualification_id`, `bundle_digest` and `legacy_generation`.
+UUIDs are canonical, counters/generations are decimal strings and nullable
+fields are explicit null. `updated_at` is audit metadata and is excluded,
+as are activation, readiness and current time. Use the row's committed legacy
+counter snapshot, not a later counter from another hook's activation.
 
-Under the agent SQL lock, validate expected generation and selected references,
-then call atomic broker `reserve_and_revoke(expected_floor, operation_id,
-min_generation)`: clear active, allocate a generation strictly above both the
+After the SOURCE-10 durable pending registration under the agent gate,
+call atomic broker `reserve_and_revoke(expected_floor, operation_id,
+min_generation)` with the exact registered allocation defined by SOURCE-10: clear active, allocate a generation strictly above both the
 broker floor and committed SQL generation, and bind the reservation to the
 operation. Repeated reservation of the same current operation is idempotent.
-Persist that generation/operation and policy fields in SQL, including any
-legacy counter bump; commit SQL before broker publication. Publish active by
+Persist that generation/operation and policy fields atomically with the
+SOURCE-10 ledger transition and any legacy counter bump. SOURCE-10 owns
+the work commits and gate release before broker publication. Publish active by
 CAS only if broker floor/operation exactly match the committed row and its
 fingerprint, and required protected runtime evidence is current. This consumes
 no delivery claim. Never reduce a floor or restore the pre-mutation active
@@ -183,7 +379,9 @@ after reservation leaves the already revoked broker closed. Post-publish SQL
 response loss is recovered by GET/retry without another enqueue or key revival.
 
 Broker data loss, restart rollback or restored stale snapshots invalidate runtime
-readiness and close admission. Reprovision a new independently issued runtime
+readiness and close admission. Source-floor reconciliation includes every
+durable SOURCE-10 attempted generation, pending as well as committed; a
+current-policy row alone is not the durable high-water mark. Reprovision a new independently issued runtime
 epoch, clear readiness, reconcile source floors against durable SQL, and publish
 only current rows after qualification. Do not treat an empty broker as generation
 zero safe to activate, nor trust retained pre-reset proof. The
@@ -193,6 +391,87 @@ Postgres commit-release behavior, and orderly AOF restart with stale-proof refus
 Broker crash/rollback durability and SQL
 disconnect recovery remain unmeasured; those observations do not qualify the
 protected runtime or establish its provisioning boundary.
+
+## Durable attempted-operation identity
+
+<!-- @spec PROTECTED-HOOK-SOURCE-10 -->
+The current policy and broker reservation remember only the current operation.
+Add `hook_source_operations` as a separate additive table; keep the eleven
+policy columns unchanged. Its primary key is `(agent_id UUID, hook VARCHAR(63),
+operation_id UUID)`, with an agent foreign key and ON DELETE CASCADE. Columns
+are `intent_sha256 CHAR(64) NOT NULL`, `status VARCHAR NOT NULL`,
+`generation BIGINT NOT NULL > 0`, and `attempted_at TIMESTAMPTZ NOT NULL`
+default now. The intent is lowercase 64-hex. Status is exactly
+`pending|committed`. All attempted generations, including pending ones, are
+unique per agent/hook. Identity, intent, generation and attempt time are
+immutable; only pending-to-committed status transition is allowed, once.
+Never delete or expire operation history except by agent deletion.
+
+Intent is the lowercase SHA256 of compact sorted-key ASCII JSON with exactly
+`mode`, `tool_access`, `runtime_id`, `qualification_id` and `bundle_digest`,
+including explicit nulls. It is the desired target configuration: exclude HTTP
+method, expected CAS, operation ID, generated counters and timestamps. The
+additive migration backfills each existing current policy as committed, using
+its target intent, generation and updated_at. No older history is reconstructed
+or claimed; the foundation has no source administration wiring. Allocate the
+new migration against the fresh base without rewriting prior migrations or
+registered application windows. The wired schema minimum is that new head.
+
+Under the agent gate, validate current policy/ledger consistency. A current
+policy must have matching committed operation, generation and target intent;
+inconsistency closes with 503 before a broker write. A matching current
+committed operation and intent is replayed before stale-CAS rejection, without
+a new generation, counter or timestamp. Different intent is 409. Any historical
+committed operation or any pending operation is 409, even with fresh CAS.
+Pending never authorizes publication or resumes a mutation as committed.
+A fresh operation cannot resurrect an older UUID after another edit.
+
+Validate expected refusals, references, counter ranges and trusted runtime
+epoch before registration. Under the agent gate, allocate a generation one
+above the maximum of current policy generation (zero if absent), all ledger
+generations for this agent/hook, and the observed authenticated broker floor.
+Reject BIGINT exhaustion before registration or broker writes. Commit that
+positive pending generation through a separate work-pool transaction while
+the outer agent gate remains held. Only after confirmed registration commit
+call the SOURCE-6 reservation with expected_floor equal to the observed floor
+and min_generation equal to the registered generation minus one. The returned
+generation must equal the registered generation. Conflict, mismatch or failure
+leaves the pending allocation consumed; never rewrite or delete it. Uncertain
+registration commit returns 503 without a broker write; later locked read
+and a fresh operation resolve recovery. Commit the policy at that registered
+generation, required legacy counter bump and ledger committed status atomically
+in a subsequent work transaction. Match pending status and immutable intent
+and generation on transition.
+SQL failure or uncertain authoritative commit returns unavailable; do not
+assume rollback proved non-commit. A later locked read determines whether the
+exact current operation committed. Release the outer gate only after that
+authoritative transaction finishes, before broker CAS publication. A delayed
+publisher cannot replace a later reservation. This adds no cross-store
+transaction, activation proof or credential authority.
+
+Absence of policy plus any attempted-operation history is closed, not never
+configured. Closure begins at durable pending registration, even if reserve
+failed or was never reached. Legacy preliminary authentication may succeed,
+but fresh locked resolution returns 503 `pending_history` before any claim,
+run mutation, quota, placeholder or enqueue. GET retains the no-row generation
+zero and reports closed with that reason; it creates no protected key. All API
+and worker named-hook producers check history presence. Pre-registration
+validation or default resolver failure writes no history and preserves truly
+never-configured ordinary behavior. A later successfully committed current
+policy is governed by its exact current binding and private-receipt rules;
+older pending history does not supersede it, although its UUID remains unusable.
+
+Runtime selection is one immutable provisioner-owned deployment input, not a
+platform-writable registry. Unknown references or another runtime ID are 422;
+missing trusted broker identity, epoch or readiness is 503. Separate control
+read and source-writer authority. Default resolution is unavailable. Missing
+source keys do not prove a fresh epoch; require independently established
+source-floor recovery, including pending ledger allocations. A new broker
+epoch never permits reuse of a durably allocated source generation. A positive
+pending generation grants no source key, activation or readiness authority.
+Protected publication remains unavailable until the actual atomic authority
+path is implemented. Pure record matching or a local
+clock check cannot establish activation.
 
 ## Receipt and duplicate contract
 
@@ -320,6 +599,9 @@ Each test/implementation unit cites its corresponding ID above. Required cases:
   serialized; no-row race and reload after lock wait; invalid signatures never
   acquire the advisory lock; valid preliminary authentication followed by key
   rotation while waiting fails authoritative reauthentication; cron/fire cannot bypass.
+* SOURCE-2/10: standalone worker schema and cron campaigns resolve their configured
+  database through the existing settings owner and pass without a preceding API
+  test setting `DATABASE_URL`. Templates and clones remain real, isolated and owned.
 * SOURCE-3/4: administrative auth only; consumer/evidence secrets absent from
   every response; scoped derivation differs across hook/agent/generation;
   exact existing signature bytes; missing requested read-only still effective

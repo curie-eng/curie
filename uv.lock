@@ -18,6 +18,7 @@ members = [
     "curie-e2e-connector",
     "curie-internal",
     "curie-mail-adapter",
+    "curie-protected-hooks",
     "curie-runner",
     "curie-telemetry",
     "curie-telemetry-schema",
@@ -710,6 +711,7 @@ dependencies = [
     { name = "boto3-stubs", extra = ["s3"] },
     { name = "curie-channel-protocol" },
     { name = "curie-internal" },
+    { name = "curie-protected-hooks" },
     { name = "curie-telemetry" },
     { name = "curie-telemetry-schema" },
     { name = "fastapi" },
@@ -734,6 +736,7 @@ requires-dist = [
     { name = "boto3-stubs", extras = ["s3"], specifier = ">=1.43.57" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-internal", editable = "packages/curie-internal" },
+    { name = "curie-protected-hooks", editable = "packages/protected-hooks" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-telemetry-schema", editable = "packages/telemetry-schema" },
     { name = "fastapi", specifier = ">=0.139.2" },
@@ -881,6 +884,25 @@ requires-dist = [
 ]
 
 [[package]]
+name = "curie-protected-hooks"
+version = "0.0.0"
+source = { editable = "packages/protected-hooks" }
+dependencies = [
+    { name = "aci-protocol" },
+    { name = "cryptography" },
+    { name = "redis" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aci-protocol", editable = "packages/aci-protocol" },
+    { name = "cryptography", specifier = ">=50.0.1" },
+    { name = "redis", specifier = ">=8.1.0" },
+    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.51" },
+]
+
+[[package]]
 name = "curie-runner"
 version = "0.0.0"
 source = { editable = "runner" }
@@ -971,6 +993,7 @@ dependencies = [
     { name = "curie-dispatcher" },
     { name = "curie-e2e-connector" },
     { name = "curie-internal" },
+    { name = "curie-protected-hooks" },
     { name = "curie-telemetry" },
     { name = "httpx" },
     { name = "kubernetes" },
@@ -993,6 +1016,7 @@ requires-dist = [
     { name = "curie-dispatcher", editable = "apps/dispatcher" },
     { name = "curie-e2e-connector", editable = "apps/e2e-connector" },
     { name = "curie-internal", editable = "packages/curie-internal" },
+    { name = "curie-protected-hooks", editable = "packages/protected-hooks" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "kubernetes", specifier = ">=36.0.3" },
@@ -1017,6 +1041,7 @@ dependencies = [
     { name = "curie-e2e-connector" },
     { name = "curie-internal" },
     { name = "curie-mail-adapter" },
+    { name = "curie-protected-hooks" },
     { name = "curie-runner" },
     { name = "curie-telemetry" },
     { name = "curie-telemetry-schema" },
@@ -1051,6 +1076,7 @@ requires-dist = [
     { name = "curie-e2e-connector", editable = "apps/e2e-connector" },
     { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-mail-adapter", editable = "apps/mail-adapter" },
+    { name = "curie-protected-hooks", editable = "packages/protected-hooks" },
     { name = "curie-runner", editable = "runner" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-telemetry-schema", editable = "packages/telemetry-schema" },

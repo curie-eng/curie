@@ -73,14 +73,19 @@ from aci_protocol.service_config import STREAM_PAYLOAD_FIELD
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from channel_protocol import hook_conversation_id
 from cronsim import CronSim
-from curie_telemetry import record_metric
+from curie_protected_hooks.source_policy_sql import SourceGateInvalid, SourceSnapshotUnavailable
+from curie_telemetry import inject_trace_context, operation_span, record_metric
+from opentelemetry.trace import SpanKind
 from plugin_format import resolve_manifest
 from redis.asyncio import Redis
+from redis.typing import EncodableT
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from .bundle_store import BundleReader, extract_bundle
 from .hook_runs import retry_event_id
+from .hook_source_guard import CronHookSourceGuard, CronSourceContext
 
 logger = logging.getLogger(__name__)
 
@@ -376,7 +381,7 @@ RETURNING id
 
 _FAIL_RUN_SQL = """
 UPDATE {schema}.hook_runs SET outcome = 'failed', ended_at = now()
-WHERE id = :id AND outcome IS NULL
+WHERE id = :id AND agent_id = :agent_id AND name = :name AND outcome IS NULL
 RETURNING id
 """
 
@@ -436,9 +441,14 @@ class CronSchedulerLoop:
         claim_lease_s: float,
         default_max_usd_per_day: float,
         default_max_output_tokens_per_run: int,
+        source_guard: CronHookSourceGuard | None = None,
         started_at: datetime | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        if source_guard is not None and source_guard.work_engine is not engine:
+            raise SourceGateInvalid("invalid_source_gate")
+        self._source_guard = source_guard
         self._engine = engine
         self._redis = redis
         self._source = source
@@ -454,6 +464,11 @@ class CronSchedulerLoop:
         self._triggers: dict[tuple[uuid.UUID, str], list[dict[str, Any]]] = {}
         # Table identifiers are not user input; the schema comes from config.
         self._targets_sql = text(_TARGETS_SQL.format(schema=db_schema))
+        self._target_sql = text(
+            _TARGETS_SQL.replace("ORDER BY a.id", "WHERE a.id=:agent_id\nORDER BY a.id").format(
+                schema=db_schema
+            )
+        )
         self._bindings_sql = text(_BINDINGS_SQL.format(schema=db_schema))
         self._insert_sql = text(_INSERT_SQL.format(schema=db_schema))
         self._reclaim_sql = text(_RECLAIM_SQL.format(schema=db_schema))
@@ -468,12 +483,31 @@ class CronSchedulerLoop:
         self._settle_deferred_sql = text(_SETTLE_DEFERRED_SQL.format(schema=db_schema))
         self._reopen_sql = text(_REOPEN_SQL.format(schema=db_schema))
 
-    async def _targets(self) -> list[_Target]:
+    def _validate_source_context(
+        self, context: CronSourceContext | None, target: _Target, name: str
+    ) -> CronSourceContext:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        if self._source_guard is None or context is None:
+            raise SourceGateInvalid("invalid_source_gate")
+        self._source_guard.validate_context(context, target.agent_id, name)
+        return context
+
+    async def _targets(self, agent_id: uuid.UUID | None = None) -> list[_Target]:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
         async with self._engine.connect() as conn:
-            rows = (await conn.execute(self._targets_sql)).mappings().all()
+            rows = (
+                (
+                    await conn.execute(
+                        self._targets_sql if agent_id is None else self._target_sql,
+                        {} if agent_id is None else {"agent_id": agent_id},
+                    )
+                )
+                .mappings()
+                .all()
+            )
         return [
             _Target(
-                agent_id=row["agent_id"],
+                agent_id=uuid.UUID(str(row["agent_id"])),
                 agent_name=row["agent_name"],
                 version_id=row["version_id"],
                 bundle_ref=row["bundle_ref"],
@@ -484,7 +518,16 @@ class CronSchedulerLoop:
             for row in rows
         ]
 
+    async def _target(self, agent_id: uuid.UUID) -> _Target | None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        try:
+            rows = await self._targets(agent_id)
+        except SQLAlchemyError:
+            raise SourceSnapshotUnavailable("source_snapshot_unavailable") from None
+        return rows[0] if rows else None
+
     async def _cron_triggers(self, target: _Target) -> list[dict[str, Any]]:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
         if not target.bundle_ref:
             # No bundle attached yet; do not cache, so a later bundle attach
             # on this same active version is picked up on the next pass.
@@ -492,7 +535,23 @@ class CronSchedulerLoop:
         cache_key = (target.version_id, target.bundle_ref)
         cached = self._triggers.get(cache_key)
         if cached is None:
-            fetched = await asyncio.to_thread(self._source.triggers, target.bundle_ref)
+            read = asyncio.create_task(asyncio.to_thread(self._source.triggers, target.bundle_ref))
+            cancelled: asyncio.CancelledError | None = None
+            while not read.done():
+                try:
+                    await asyncio.shield(read)
+                except asyncio.CancelledError as exc:
+                    if cancelled is None:
+                        cancelled = exc
+                except Exception:
+                    if cancelled is None:
+                        raise
+                    break
+            if cancelled is not None:
+                if not read.cancelled():
+                    read.exception()
+                raise cancelled
+            fetched = read.result()
             cached = [t for t in fetched if isinstance(t, dict) and t.get("type") == "cron"]
             self._triggers[cache_key] = cached
         return cached
@@ -515,7 +574,15 @@ class CronSchedulerLoop:
         name: str,
         slot: datetime,
         outcome: str | None,
+        *,
+        source_context: CronSourceContext | None = None,
     ) -> uuid.UUID | None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        context = self._validate_source_context(source_context, target, name)
+        if conn.engine is not self._engine:
+            raise SourceGateInvalid("invalid_source_gate")
+        await conn.execute(self._lock_sql, {"agent_id": str(target.agent_id), "name": name})
+        await context.ensure_before_effect(target.agent_id, name)
         row = (
             await conn.execute(
                 self._insert_sql,
@@ -574,8 +641,16 @@ class CronSchedulerLoop:
         return (None, None, 0) if row is None else (row[0], row[1], row[2])
 
     async def _skip(
-        self, target: _Target, name: str, slots: list[datetime], summary: CronPassSummary
+        self,
+        target: _Target,
+        name: str,
+        slots: list[datetime],
+        summary: CronPassSummary,
+        *,
+        source_context: CronSourceContext | None = None,
     ) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        context = self._validate_source_context(source_context, target, name)
         if not slots:
             return
         if len(slots) > _MAX_SKIPPED_ROWS:
@@ -588,6 +663,7 @@ class CronSchedulerLoop:
             )
             slots = slots[-_MAX_SKIPPED_ROWS:]
         async with self._engine.begin() as conn:
+            await context.ensure_before_effect(target.agent_id, name)
             inserted = (
                 await conn.execute(
                     self._skip_sql,
@@ -612,14 +688,21 @@ class CronSchedulerLoop:
         slot: datetime,
         summary: CronPassSummary,
         defer_if_busy: bool,
+        *,
+        source_context: CronSourceContext | None = None,
     ) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
         name = str(trigger["name"])
+        context = self._validate_source_context(source_context, target, name)
         if await self._is_killed(target.agent_id) or self._budget_spent(target):
             async with self._engine.begin() as conn:
-                reclaimed = await self._lock_and_reclaim(conn, target, name, slot, summary)
-                run_id = await self._insert(conn, target, name, slot, "blocked")
-            for _ in range(reclaimed):
-                _record_fire("reclaimed")
+                reclaimed = await self._lock_and_reclaim(
+                    conn, target, name, slot, summary, source_context=context
+                )
+                run_id = await self._insert(
+                    conn, target, name, slot, "blocked", source_context=context
+                )
+            self._record_reclaimed(target, name, reclaimed, summary)
             if run_id is not None:
                 _record_fire("blocked")
                 summary.blocked += 1
@@ -631,10 +714,13 @@ class CronSchedulerLoop:
             handle = await self._reply_handle(target, trigger)
         except _UnboundTarget:
             async with self._engine.begin() as conn:
-                reclaimed = await self._lock_and_reclaim(conn, target, name, slot, summary)
-                run_id = await self._insert(conn, target, name, slot, "failed")
-            for _ in range(reclaimed):
-                _record_fire("reclaimed")
+                reclaimed = await self._lock_and_reclaim(
+                    conn, target, name, slot, summary, source_context=context
+                )
+                run_id = await self._insert(
+                    conn, target, name, slot, "failed", source_context=context
+                )
+            self._record_reclaimed(target, name, reclaimed, summary)
             if run_id is not None:
                 _record_fire("failed")
                 summary.failed += 1
@@ -643,7 +729,9 @@ class CronSchedulerLoop:
             return
 
         async with self._engine.begin() as conn:
-            reclaimed = await self._lock_and_reclaim(conn, target, name, slot, summary)
+            reclaimed = await self._lock_and_reclaim(
+                conn, target, name, slot, summary, source_context=context
+            )
             paused_at, _, _ = await self._control(conn, target, name)
             outcome: str | None
             if paused_at is not None:
@@ -652,9 +740,8 @@ class CronSchedulerLoop:
                 outcome = "deferred" if defer_if_busy else "skipped"
             else:
                 outcome = None
-            run_id = await self._insert(conn, target, name, slot, outcome)
-        for _ in range(reclaimed):
-            _record_fire("reclaimed")
+            run_id = await self._insert(conn, target, name, slot, outcome, source_context=context)
+        self._record_reclaimed(target, name, reclaimed, summary)
         if run_id is None:
             # Another replica recorded this slot first.
             summary.lost += 1
@@ -666,7 +753,7 @@ class CronSchedulerLoop:
             return
 
         try:
-            await self._enqueue(target, trigger, handle, slot, run_id)
+            await self._enqueue(target, trigger, handle, slot, run_id, source_context=context)
         except Exception:
             summary.failed += 1
             raise
@@ -679,13 +766,15 @@ class CronSchedulerLoop:
         name: str,
         slot: datetime,
         summary: CronPassSummary,
+        *,
+        source_context: CronSourceContext | None = None,
     ) -> int:
-        """Take the hook's admission lock and reclaim its claims past their lease.
-
-        Every fire of the hook does this, whatever it records for its own slot,
-        so a dead run is recorded ``reclaimed`` by the very next fire.
-        """
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        context = self._validate_source_context(source_context, target, name)
+        if conn.engine is not self._engine:
+            raise SourceGateInvalid("invalid_source_gate")
         await conn.execute(self._lock_sql, {"agent_id": str(target.agent_id), "name": name})
+        await context.ensure_before_effect(target.agent_id, name)
         reclaimed = await conn.execute(
             self._reclaim_sql,
             {
@@ -695,15 +784,22 @@ class CronSchedulerLoop:
                 "lease_s": self._claim_lease_s,
             },
         )
-        if reclaimed.rowcount:
+        return reclaimed.rowcount
+
+    def _record_reclaimed(
+        self, target: _Target, name: str, count: int, summary: CronPassSummary
+    ) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        if count:
             logger.warning(
                 "cron hook %s for agent=%s reclaimed %d claim(s) past their lease",
                 name,
                 target.agent_name,
-                reclaimed.rowcount,
+                count,
             )
-            summary.reclaimed += reclaimed.rowcount
-        return reclaimed.rowcount
+            summary.reclaimed += count
+            for _ in range(count):
+                _record_fire("reclaimed")
 
     async def _blocked_by_in_flight(
         self,
@@ -792,9 +888,12 @@ class CronSchedulerLoop:
         slot: datetime,
         run_id: uuid.UUID,
         *,
+        source_context: CronSourceContext | None = None,
         retry_expires_at: datetime | None = None,
     ) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
         name = str(trigger["name"])
+        context = self._validate_source_context(source_context, target, name)
         agent = str(target.agent_id)
         slot_iso = slot.isoformat()
         event_id = f"cron:{agent}:{name}:{slot_iso}"
@@ -812,12 +911,32 @@ class CronSchedulerLoop:
             hook_run=HookRunRef(agent_id=agent, name=name, slot_utc=slot_iso),
         )
         try:
-            await self._redis.xadd(self._stream, {STREAM_PAYLOAD_FIELD: turn.model_dump_json()})
+            with operation_span(
+                "curie.queue.enqueue",
+                kind=SpanKind.PRODUCER,
+                attributes={"service.name": "curie-worker", "source": "worker"},
+            ):
+                carrier: dict[str, str] = {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
+                inject_trace_context(carrier)
+                fields: dict[EncodableT, EncodableT] = {}
+                fields.update(carrier)
+                await context.ensure_before_effect(target.agent_id, name)
+                await self._redis.xadd(self._stream, fields)
         except Exception:
-            async with self._engine.begin() as conn:
-                failed = (await conn.execute(self._fail_run_sql, {"id": run_id})).first()
-            if failed is not None:
-                _record_fire("failed")
+            try:
+                async with self._engine.begin() as conn:
+                    await context.ensure_before_effect(target.agent_id, name)
+                    failed = (
+                        await conn.execute(
+                            self._fail_run_sql,
+                            {"id": run_id, "agent_id": target.agent_id, "name": name},
+                        )
+                    ).first()
+                if failed is not None:
+                    _record_fire("failed")
+            # preserve the primary dispatch fault if failure bookkeeping fails.
+            except Exception:  # noqa: BLE001
+                pass
             raise
 
     async def _retry_deferred(
@@ -827,10 +946,13 @@ class CronSchedulerLoop:
         zone: str,
         now: datetime,
         summary: CronPassSummary,
+        *,
+        source_context: CronSourceContext | None = None,
     ) -> None:
-        """Reopen each deferred slot of this hook, or age it out as skipped."""
+        """@spec PROTECTED-HOOK-SOURCE-2."""
 
         name = str(trigger["name"])
+        context = self._validate_source_context(source_context, target, name)
         schedule = str(trigger["schedule"])
         async with self._engine.connect() as conn:
             slots = [
@@ -846,6 +968,7 @@ class CronSchedulerLoop:
             expires_at = slot + catch_up_bound(schedule, zone, slot)
             if slot_is_stale(schedule, zone, slot, now):
                 async with self._engine.begin() as conn:
+                    await context.ensure_before_effect(target.agent_id, name)
                     settled = (
                         await conn.execute(self._settle_deferred_sql, {**key, "outcome": "skipped"})
                     ).first()
@@ -857,6 +980,7 @@ class CronSchedulerLoop:
                 continue
             if await self._is_killed(target.agent_id) or self._budget_spent(target):
                 async with self._engine.begin() as conn:
+                    await context.ensure_before_effect(target.agent_id, name)
                     settled = (
                         await conn.execute(self._settle_deferred_sql, {**key, "outcome": "blocked"})
                     ).first()
@@ -870,6 +994,7 @@ class CronSchedulerLoop:
                 handle = await self._reply_handle(target, trigger)
             except _UnboundTarget:
                 async with self._engine.begin() as conn:
+                    await context.ensure_before_effect(target.agent_id, name)
                     settled = (
                         await conn.execute(self._settle_deferred_sql, {**key, "outcome": "failed"})
                     ).first()
@@ -880,11 +1005,14 @@ class CronSchedulerLoop:
                     summary.lost += 1
                 continue
             async with self._engine.begin() as conn:
-                reclaimed = await self._lock_and_reclaim(conn, target, name, slot, summary)
+                reclaimed = await self._lock_and_reclaim(
+                    conn, target, name, slot, summary, source_context=context
+                )
                 paused_at, _, _ = await self._control(conn, target, name)
                 blocked = paused_at is not None or await self._blocked_by_in_flight(
                     conn, target, name, slot
                 )
+                await context.ensure_before_effect(target.agent_id, name)
                 row = (
                     None
                     if blocked
@@ -894,8 +1022,7 @@ class CronSchedulerLoop:
                         )
                     ).first()
                 )
-            for _ in range(reclaimed):
-                _record_fire("reclaimed")
+            self._record_reclaimed(target, name, reclaimed, summary)
             if paused_at is not None:
                 return
             if blocked:
@@ -906,64 +1033,123 @@ class CronSchedulerLoop:
                 continue
             try:
                 await self._enqueue(
-                    target, trigger, handle, slot, row[0], retry_expires_at=expires_at
+                    target,
+                    trigger,
+                    handle,
+                    slot,
+                    row[0],
+                    retry_expires_at=expires_at,
+                    source_context=context,
                 )
             except Exception:
                 summary.failed += 1
                 raise
             summary.retried += 1
 
-    async def one_pass(self, now: datetime | None = None) -> CronPassSummary:
-        """Schedule every deployed agent's cron triggers for (watermark, now]."""
+    async def _clear_resume(
+        self,
+        target: _Target,
+        name: str,
+        resume_from: datetime,
+        generation: int,
+        *,
+        source_context: CronSourceContext | None = None,
+    ) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        context = self._validate_source_context(source_context, target, name)
+        async with self._engine.begin() as conn:
+            await context.ensure_before_effect(target.agent_id, name)
+            await conn.execute(
+                self._clear_resume_sql,
+                {
+                    "agent_id": target.agent_id,
+                    "name": name,
+                    "resume_from": resume_from,
+                    "generation": generation,
+                },
+            )
 
+    async def one_pass(self, now: datetime | None = None) -> CronPassSummary:
+        """@spec PROTECTED-HOOK-SOURCE-2/10."""
         now = now or self._clock()
         window_start, self._watermark = self._watermark, now
         summary = CronPassSummary()
-        for target in await self._targets():
+        for hint in await self._targets():
             try:
-                triggers = await self._cron_triggers(target)
+                triggers = await self._cron_triggers(hint)
             except Exception:
                 summary.failed += 1
                 logger.exception(
                     "cron trigger read raised for agent=%s; continuing with the rest",
-                    target.agent_name,
+                    hint.agent_name,
                 )
                 continue
-            for trigger in triggers:
+            for hinted_trigger in triggers:
                 name, schedule, prompt = (
-                    trigger.get("name"),
-                    trigger.get("schedule"),
-                    trigger.get("prompt"),
+                    hinted_trigger.get("name"),
+                    hinted_trigger.get("schedule"),
+                    hinted_trigger.get("prompt"),
                 )
                 if not name or not schedule or not prompt:
                     continue
                 try:
-                    zone = str(trigger.get("timezone") or "UTC")
-                    async with self._engine.connect() as conn:
-                        paused_at, resume_from, generation = await self._control(
-                            conn, target, str(name)
+                    if self._source_guard is None:
+                        raise SourceSnapshotUnavailable("source_guard_unavailable")
+                    async with self._source_guard.locked_snapshot(
+                        hint.agent_id, str(name)
+                    ) as context:
+                        target = await self._target(hint.agent_id)
+                        if target is None:
+                            continue
+                        trigger = next(
+                            (
+                                item
+                                for item in await self._cron_triggers(target)
+                                if item.get("name") == name
+                            ),
+                            None,
                         )
-                    if paused_at is not None:
-                        continue
-                    await self._retry_deferred(target, trigger, zone, now, summary)
-                    start = await self._window_start(
-                        target, str(name), window_start, now, resume_from
-                    )
-                    due = resolve_slots(str(schedule), zone, start, now)
-                    fire, skipped = plan_catch_up(str(schedule), zone, due, now)
-                    await self._skip(target, str(name), skipped, summary)
-                    if fire is not None:
-                        await self._admit(target, trigger, fire, summary, resume_from is not None)
-                    if resume_from is not None:
-                        async with self._engine.begin() as conn:
-                            await conn.execute(
-                                self._clear_resume_sql,
-                                {
-                                    "agent_id": target.agent_id,
-                                    "name": str(name),
-                                    "resume_from": resume_from,
-                                    "generation": generation,
-                                },
+                        if (
+                            trigger is None
+                            or not trigger.get("schedule")
+                            or not trigger.get("prompt")
+                        ):
+                            continue
+                        schedule = trigger["schedule"]
+                        zone = str(trigger.get("timezone") or "UTC")
+                        async with self._engine.connect() as conn:
+                            paused_at, resume_from, generation = await self._control(
+                                conn, target, str(name)
+                            )
+                        if paused_at is not None:
+                            continue
+                        await self._retry_deferred(
+                            target, trigger, zone, now, summary, source_context=context
+                        )
+                        start = await self._window_start(
+                            target, str(name), window_start, now, resume_from
+                        )
+                        due = resolve_slots(str(schedule), zone, start, now)
+                        fire, skipped = plan_catch_up(str(schedule), zone, due, now)
+                        await self._skip(
+                            target, str(name), skipped, summary, source_context=context
+                        )
+                        if fire is not None:
+                            await self._admit(
+                                target,
+                                trigger,
+                                fire,
+                                summary,
+                                resume_from is not None,
+                                source_context=context,
+                            )
+                        if resume_from is not None:
+                            await self._clear_resume(
+                                target,
+                                str(name),
+                                resume_from,
+                                generation,
+                                source_context=context,
                             )
                 except Exception:
                     # Ends with this hook. The agent's other hooks, and every
@@ -972,7 +1158,7 @@ class CronSchedulerLoop:
                     logger.exception(
                         "cron hook %s raised for agent=%s; continuing with the rest",
                         name,
-                        target.agent_name,
+                        hint.agent_name,
                     )
 
         # A pass that only lost a slot race to another replica did no work,

@@ -433,26 +433,49 @@ mod tests {
         );
     }
 
+    // @spec PROTECTED-HOOK-SOURCE-2: require the ledger without rewriting prior windows.
     #[test]
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "0074");
+        assert_eq!(candidate.schema_min, "0077");
+        assert_eq!(candidate.schema_head, "0077");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
         );
 
-        let retained = candidate_window(&candidate.schema_min, &candidate.schema_head)
+        let current = candidate_window(&candidate.schema_min, &candidate.schema_head)
             .expect("candidate bounds are catalogued and ordered");
-        assert_eq!(retained.schema_min, "0074");
-        assert_eq!(retained.schema_head, "0074");
-        assert!(!live_in_window("0070", &retained));
-        assert!(!live_in_window("0071", &retained));
-        assert!(!live_in_window("0072", &retained));
-        assert!(!live_in_window("0073", &retained));
-        assert!(live_in_window("0074", &retained));
+        assert!(live_in_window("0077", &current));
+        assert!(!live_in_window("0075", &current));
+        assert!(!live_in_window("0076", &current));
+        let retained = window_for("0.12.0").expect("published foundation remains catalogued");
+        assert_eq!(retained.schema_min, "0070");
+        assert_eq!(retained.schema_head, "0073");
+        assert!(live_in_window("0070", &retained));
+        assert!(live_in_window("0071", &retained));
+        assert!(live_in_window("0072", &retained));
+        assert!(live_in_window("0073", &retained));
+        assert!(!live_in_window("0075", &retained));
         assert!(!live_in_window("0069", &retained));
+
+        let candidate_release = window_for("0.13.0").expect("feature candidate is catalogued");
+        assert_eq!(candidate_release.schema_min, candidate.schema_min);
+        assert_eq!(candidate_release.schema_head, candidate.schema_head);
+        assert!(live_in_window("0077", &candidate_release));
+        assert!(!live_in_window("0075", &candidate_release));
+        let published =
+            window_for("0.12.1").expect("released source control window remains catalogued");
+        assert_eq!(published.schema_min, "0076");
+        assert_eq!(published.schema_head, "0076");
+        assert!(live_in_window("0076", &published));
+        assert!(!live_in_window("0077", &published));
+        let stable = window_for("0.12.0").expect("released window remains catalogued");
+        assert_eq!(stable.schema_min, "0070");
+        assert_eq!(stable.schema_head, "0073");
+        assert!(live_in_window("0073", &stable));
+        assert!(!live_in_window("0075", &stable));
 
         assert_eq!(window_for("0.10.1").unwrap().schema_head, "0058");
         let prior = window_for("0.10.2").expect("0.10.2 remains catalogued");
@@ -469,6 +492,16 @@ mod tests {
             assert_eq!(released.schema_min, "0070");
             assert_eq!(released.schema_head, "0073");
         }
+    }
+
+    // @spec PROTECTED-HOOK-SOURCE-2: new candidate metadata is distinct from prior windows.
+    #[test]
+    fn source_control_candidate_0122_requires_ledger_schema() {
+        let window = window_for("0.12.2").expect("source control candidate is catalogued");
+        assert_eq!(window.schema_min, "0076");
+        assert_eq!(window.schema_head, "0076");
+        assert!(live_in_window("0076", &window));
+        assert!(!live_in_window("0075", &window));
     }
 
     #[test]

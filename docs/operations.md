@@ -18,7 +18,7 @@ Targets, see the target comparison table in the
 |---|---|
 | `kubectl` and `helm` on PATH | Every `cluster` verb wraps one or both of them. |
 | A reachable cluster | Every verb talks to the cluster's Kubernetes API server directly -- there's nothing to install onto or inspect without one. The chart's own preflights additionally need the `agents.x-k8s.io` Agent Sandbox CRDs (Custom Resource Definitions) installable and a NetworkPolicy-enforcing CNI (Container Network Interface) already present; see `charts/curie/README.md`. |
-| `runsc` (gVisor) on every node for full kernel isolation | A real model first installs with gVisor enabled. If admission reports exactly that the `gvisor` RuntimeClass is absent, plain `cluster up` shows that attempt as retrying, applies `security.gvisor.mode=off`, and retries once. Other preflight failures remain closed. Fake model installs do not need it. |
+| `runsc` (gVisor) on every node for full kernel isolation | Before Helm runs, plain `cluster up` reads the rendered preflight's RuntimeClass. A `NotFound` GET infers `security.gvisor.mode=off` unless the chart creates that RuntimeClass. A `Forbidden` GET retains one retry only after admission reports `RuntimeClass "gvisor" not found`. Other read errors and admission refusals stay closed. Fake model installs do not need it. |
 
 **For testing**, pick between **k3s**, **kind**, and **minikube** based on
 your host and how disposable the cluster needs to be. A single-node **k3s**
@@ -337,9 +337,14 @@ CIDRs after.
 `curie cluster up` inspects the two PriorityClasses and the
 `agent-sandbox-controller` Deployment. When complete Helm ownership metadata
 names another release, Curie applies the matching creation or deployment value
-as false. Missing, malformed, unreadable, or incomplete ownership does not
-authorize reuse and blocks the install. An explicit true value that contradicts
-the detected owner is a usage error.
+as false. An unowned controller Deployment is reused the same way when its
+`agent-sandbox-controller` container image is compatible with the vendored chart
+image and the Deployment is Available at its current generation, with at least
+one desired replica, all replicas updated, ready and available and none unavailable. Missing, malformed,
+or unreadable controller data does not authorize reuse. An unowned controller
+that is unhealthy or an incompatible image blocks the install and names the kubectl
+commands that make it reusable. `curie cluster status` is not that repair.
+An explicit true value that contradicts a reusable controller is a usage error.
 
 Before Helm runs, Curie establishes ownership of the primary install namespace
 with both the release and install-namespace labels. An absent namespace is
@@ -358,15 +363,18 @@ through adoption. An unavailable remote APIService registration, or inability
 to read APIService availability, blocks empty-namespace adoption. A terminating
 namespace is readable but is refused for `cluster up`.
 
-The first gVisor preflight keeps the chart default. Only the exact admission
-result `RuntimeClass "gvisor" not found` authorizes
-`security.gvisor.mode=off` and one retry. That first attempt renders as
-retrying, not as a failed install; the retry is the one installed or failed
-result. An explicit `auto` or `require` mode contradicts that result and
-errors. Other admission failures and an unavailable event watch remain closed.
-Curie prints one standard error line for every inference, including the
-equivalent override. Prepared `apply` and `diff` paths do not infer live
-cluster facts.
+Before Helm runs, plain `cluster up` reads the RuntimeClass named by the
+rendered gVisor preflight. A `NotFound` GET authorizes
+`security.gvisor.mode=off` before installation, unless the rendered chart
+creates that RuntimeClass. A present RuntimeClass keeps the configured mode.
+Only a `Forbidden` GET retains the admission fallback: the exact result
+`RuntimeClass "gvisor" not found` authorizes `security.gvisor.mode=off` and
+one retry. That first attempt renders as retrying; the retry is the installed
+or failed result. An explicit `auto` or `require` mode contradicts detected
+absence and errors. Other read errors, admission failures and an unavailable
+event watch remain closed. Curie prints one standard error line for every
+inference, including the equivalent override. Prepared `apply` and `diff`
+paths do not infer live cluster facts.
 
 A Helm release whose history is only `failed` (no `deployed` or `superseded`
 revision) is not an upgrade. `curie apply` and `curie cluster up` uninstall that
@@ -400,7 +408,14 @@ Reports whether the release is healthy, which pods are ready, and the URLs
 to reach it -- including the web console, where you can see your agents,
 their deployed versions, and their run history. That console URL includes a
 `?api=1` parameter; leave it as-is when you open it, it's just what points
-the console at this release's Curie API. `--json` also reports the current
+the console at this release's Curie API. The console opens on a login screen:
+run `curie cluster console login --subject <you>` and paste the code it prints.
+The session cookie is `__Host-` prefixed and `Secure`, so browsers store it only
+over HTTPS or from `http://localhost` / a loopback host. A sealed cluster console
+reached over plain HTTP from a non-loopback host cannot sign in; reach it through
+`kubectl port-forward` (or a kind `extraPortMappings` entry) on localhost, or
+serve it over HTTPS ([#3968](https://github.com/curie-eng/curie/issues/3968)).
+`--json` also reports the current
 upgrade phase and the last known-good version.
 
 ### `curie cluster upgrade`
@@ -620,15 +635,16 @@ curie cluster rollback
 `curie cluster rollback` puts the release back on the newest revision that
 Helm actually finished applying.
 
-That is not what a bare `helm rollback` does, and the difference bites on a
-cluster without gVisor. `cluster up` tries the install with the chart's
-gVisor default first; if the cluster has no `runsc` RuntimeClass, that attempt
-is recorded as a **failed** Helm revision before the successful retry with
-gVisor off. Do that a few times and the release history alternates
-failed/superseded/failed/superseded. `helm rollback` with no revision targets
-the immediately preceding revision -- which, on that history, is a failed one:
-a manifest Helm never finished putting on the cluster. Rolling back to it does
-not restore a working release, it re-applies a broken one.
+A bare `helm rollback` can select a failed revision from history left by
+older releases or by the `Forbidden` RuntimeClass GET admission fallback.
+Those paths can record a **failed** gVisor-enabled attempt before a successful
+retry with gVisor off, leaving a history that alternates
+failed/superseded/failed/superseded. Current `cluster up` handles a `NotFound`
+GET before Helm runs, unless the chart creates the RuntimeClass, so that
+lookup does not create a failed install revision. On a legacy or fallback
+history, `helm rollback` with no revision targets the immediately preceding
+revision, which may be a manifest Helm never finished putting on the cluster.
+Rolling back to it re-applies that broken manifest.
 
 So this verb reads the history first, skips every revision whose status is not
 `deployed` or `superseded`, and rolls back to the newest one that is. It prints
@@ -770,7 +786,10 @@ promote:
    settings, to `<your-api-url>/github/webhook`. This requires the
    Curie API to be reachable from GitHub's servers (an ingress, a load
    balancer, or a tunnel); how you expose it is an infrastructure decision
-   this chart does not make for you.
+   this chart does not make for you. The push endpoint requires the
+   `X-GitHub-Delivery` header, which GitHub always sends. A delivery that
+   errored partway through is not reprocessed under the same delivery id, so
+   push again or let commit polling pick the commit up.
 3. **The webhook secret matches.** GitHub signs each delivery
    (`x-hub-signature-256`), verified against the chart-managed
    `githubWebhookSecret`. Retrieve the generated value from the same Secret
@@ -791,7 +810,10 @@ promote:
 Each target agent owns its own Version row for the commit SHA. Dev and prod
 versions can share one immutable stored bundle object (`bundle_ref`); they do
 not share a Version row. A dev delivery always clones, checks commit ancestry,
-archives and validates, including on redelivery. A prod delivery first looks
+archives and validates, including a new delivery (a new `X-GitHub-Delivery`
+id) of a commit it has seen before. A webhook delivery whose id already
+deployed or promoted answers `push_duplicate` and does nothing; polling has no
+delivery id and is unaffected. A prod delivery first looks
 for a stored bundle for the SHA across agents bound to this repository. When
 found, it reads `deploy.yaml` from that object and promotes those exact bytes
 without fetching the remote, creating the target agent's Version row if needed
@@ -839,14 +861,14 @@ bot identity. Notice delivery uses the worker's bounded retry and dead-letter
 path.
 
 <!-- @spec DEPLOY-NOTICE-RELEASE-1 -->
-Deploy notices ship after v0.12.0. Their additive migration is `0074`,
-following the released polling-cursor migration `0073`. Applying it to a
+Deploy notices ship after v0.12.0. Their additive migration is `0077`,
+following the released source-operation migration `0076`. Applying it to a
 v0.12.0 database preserves the released work-item base and poll cursors,
 defaults existing agents to success notices off, and creates the retry outbox.
 Downgrading only this migration removes notice state and keeps those released
-features. API and packaged chart require schema `0074` because agent reads
+features. API and packaged chart require schema `0077` because agent reads
 include the new column. The CLI candidate is v0.13.0 with window
-`0074` through `0074`; the published v0.12.0 and v0.12.0-rc.1 windows
+`0077` through `0077`; the published v0.12.0 and v0.12.0-rc.1 windows
 remain `0070` through `0073`.
 The API first records selected recipients in a durable PostgreSQL outbox;
 its reconciler retries Valkey publication after a transient outage or API
@@ -1044,6 +1066,24 @@ api:
       pendingCheckPrefix: "Python pytest (shard "
 ```
 
+Checks that must rerun after a pull request metadata edit are configured per
+repository with API env `GITHUB_FACTORY_METADATA_CI`, a JSON object, default
+`{}`, checked at boot. Each `owner/name` key is matched case insensitively.
+Each value supplies `checks` for check run names and `statuses` for commit
+status contexts. An omitted list is empty, but at least one name is required.
+Every configured guard must appear with a timestamp after the metadata edit;
+stale passing guards and unrelated fresh checks cannot satisfy that requirement.
+Checks on the unchanged commit retain their passing, pending or failing evidence.
+Without a repository policy, a metadata revision ends as `ci_unverified` with
+reason `metadata_ci_not_configured`. Ordinary commit revisions are unaffected.
+
+Set this environment value through the chart's existing `api.extraEnv` or in
+the Compose environment. For Curie's own repository, the value is:
+
+```json
+{"curie-eng/curie":{"checks":["PR body (real newlines)","Fix pin verification"],"statuses":[]}}
+```
+
 The branch a factory ticket starts from and targets is set per repository with
 `api.githubFactoryBases` (API env `GITHUB_FACTORY_BASES`, a JSON object, default
 `{}`, checked at boot). Each key is an `owner/name`, matched case-insensitively;
@@ -1126,7 +1166,9 @@ determine, with the fix `curie build --plugin-dir <dir> --registry <ref>
 runner with the one the target release renders. When they differ, or either
 cannot be determined, it names every agent in `agentSandbox.runnerImages` before
 upgrading, in the plan and `--dry-run` output too, and clears those entries in
-the same `helm upgrade`. After that upgrade it deletes those agents'
+the same `helm upgrade` by deleting the keys from the retained values document.
+It does not pass a null override. A null map entry is not a deletion, and the
+chart refuses it as a digest before Helm creates a revision. After that upgrade it deletes those agents'
 SandboxClaims, as `curie cluster deploy` does, so a live thread's next turn
 starts a fresh sandbox instead of keeping the old layer. Those agents run the new platform runner without their
 layer until their owners rebuild with `curie build` and redeploy. Both checks
@@ -1940,7 +1982,8 @@ mailAdapter:
 | `mailAdapter.pollIntervalSeconds` | Seconds between polls of that inbox (default `5`). Zero or negative fails the boot gate rather than tight-looping a third-party API. |
 | `mailAdapter.maxPendingDeliveries` | Maximum unresolved inbound rows (default `1000`). At capacity new mail stays unclaimed at AgentMail rather than evicting accepted work. |
 | `mailAdapter.maxBodyBytes` / `maxReplyBytes` / `maxStateBytes` | Allocation and SQLite page bounds. Size the PVC above `maxStateBytes` for the WAL and filesystem overhead. |
-| `mailAdapter.allowedSenders` | Who may start a turn. Empty denies everyone, and with ingress on the pod refuses to boot rather than run an inbox that answers nobody; `*` is the explicit allow-all. |
+| `mailAdapter.allowedSenders` | Claimed sender allowlist. Empty fails boot with ingress enabled. Every AgentMail message currently fails sender authentication with `authentication_unverifiable`, including allowlisted senders. |
+| `mailAdapter.allowAllSenders` | Default `false`. Explicit opt in permitting a `*` entry at boot. Never bypasses sender authentication or permits an AgentMail approval answer. |
 | `mailAdapter.ingressEnabled` | `false` serves egress while sending nothing inbound. That is the staged-cutover position while the platform side of a new binding is being wired. |
 | `mailAdapter.egressSecret` | The shared secret the worker presents on `X-Curie-Adapter-Secret` and the adapter checks before any side effect. |
 | `mailAdapter.channelTokenExistingSecret` / `channelTokenExistingSecretKey` | Source the scoped channel token from an operator-managed Secret instead of the chart Secret (default key `mailChannelToken`). |
@@ -2008,11 +2051,16 @@ owned or deleted by the chart. Erasure means stopping the adapter and deleting
 the PVC plus every retained PV, snapshot, and backup. Starting on a fresh claim
 performs first-boot priming and intentionally does not backfill the inbox.
 
-The remaining operator-relevant sender boundary is documented once in the
-adapter's README rather than here: Curie authenticates no sender, so
-`mailAdapter.allowedSenders` filters an attacker-controlled `From` header and
-buys nothing unless every domain on it enforces DMARC. That section, the
-AgentMail-specific parameter names, the full config surface and the boot gates all live in
+The inbound sender gate fails closed for turns and approval answers. AgentMail
+supplies no trusted positive aligned authentication verdict that Curie can
+verify, guarantees neither header provenance nor stripping, and permits DMARC
+failure under `p=none`. Every message is refused with
+`authentication_unverifiable`; allowlisted senders, labels, missing rejection
+labels and provider supplied headers cannot bypass the gate. Any
+`mailAdapter.allowedSenders` list containing `*` also fails boot unless
+`mailAdapter.allowAllSenders=true` is explicitly set, and that opt in never
+bypasses authentication. Provider evidence, parameter names, the full config
+surface and boot gates live in
 [`apps/mail-adapter/README.md`](../apps/mail-adapter/README.md); to build an adapter for a
 different channel, see [Building a channel adapter](guides/building-a-channel-adapter.md).
 
@@ -2057,6 +2105,21 @@ can read and write only its own channel's threads. A sandbox booted by an older
 worker keeps its old transcript reach until it is replaced, so its history is
 not cut off at the upgrade; each such request logs a "legacy sandbox token"
 warning and counts on `curie.state.legacy_token`.
+
+### Sandbox state token lifetime (0.12.1)
+
+The boot env tokens (`CURIE_HISTORY_TOKEN`, `CURIE_MEMORY_TOKEN`, and
+`CURIE_STATE_TOKEN`) expire at the turn's stream deadline plus 60 seconds,
+and no later than 24 hours. When the worker deletes the sandbox claim, it
+tells the API, and the API refuses that credential immediately (403, "this
+sandbox credential has been released") even though it has not expired. The
+report is best effort. A failed report stays in Valkey until a later
+cleanup pass lands it, or until that record expires with the token. A warm
+sandbox keeps the token it booted with only while that token still covers the
+next turn. Otherwise the next new turn replaces the sandbox. A token minted before this change has no
+credential id. It stays valid until its own expiry. Upgrade the worker with
+or before the API. An older API answers 404 to the release report, which the
+worker logs once.
 
 ### Bundles that carry their own stdio MCP servers (0.11.0)
 
@@ -2619,13 +2682,19 @@ next operator.
   workspace by hand therefore needs the entry repeated per init container --
   see [Which claim env reaches which sandbox container](#which-claim-env-reaches-which-sandbox-container)
   above. It used to fail silently: every init container exited 0 (#2612).
-- **The agent-sandbox controller is enabled by default.** The chart ships the
-  agent-sandbox CRDs and deploys the vendored controller when
-  `agentSandbox.controller.deploy=true`, which is the default. A cluster that
-  has the CRDs but no controller silently never binds claims. Plain `cluster
-  up` keeps the default when the controller is absent and infers
-  `agentSandbox.controller.deploy=false` only when an existing Deployment has
-  complete Helm ownership metadata for another release.
+
+**The agent-sandbox controller is enabled by default.** The chart ships the
+agent-sandbox CRDs and deploys the vendored controller when
+`agentSandbox.controller.deploy=true`, which is the default. A cluster that
+has the CRDs but no controller silently never binds claims. Plain `cluster up`
+keeps the default when the controller is absent. It infers
+`agentSandbox.controller.deploy=false` for a Deployment owned by another Helm
+release, or for a healthy unowned external controller whose named container
+image is compatible with the vendored chart image. Unowned reuse requires an
+Available Deployment at its current generation, with at least one desired
+replica, all replicas updated, ready and available and none unavailable. Unhealthy, incompatible or
+unreadable controller data blocks reuse.
+
 - **gVisor stays off without runsc on the node.** Use the
   `values-e2e-nogvisor` overlay on nodes without `runsc`. All other
   security rails were verified ON in the first fresh-cluster install:

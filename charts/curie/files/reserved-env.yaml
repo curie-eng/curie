@@ -206,9 +206,12 @@ agentSandbox.runner:
   CURIE_BUDGET: agentSandbox.runner.budget.maxOutputTokensPerRun
   CURIE_CREDENTIALS: agentSandbox.runner.credentialsExistingSecret
   CURIE_FAKE_MODEL: agentSandbox.runner.fakeModel
+  CURIE_GITHUB_API_URL: api.githubApiUrl
   CURIE_MODEL: agentSandbox.runner.model
   CURIE_PLUGIN_DIR: agentSandbox.runner.pluginDir
+  CURIE_RUNNER_ALLOW_TOKENLESS: nothing; a cluster runner always serves a bearer (remove this override)
   CURIE_RUNNER_PORT: agentSandbox.runner.port
+  CURIE_RUNNER_TOKEN: the chart-managed runner token Secret (remove this override)
   CURIE_SANDBOX_ID: the pod identity (remove this override)
   CURIE_SESSION_ID: the chart-managed warm session identity (remove this override)
   GIT_CONFIG_COUNT: agentSandbox.runner.workspace.enabled

@@ -20,9 +20,12 @@ import contextlib
 import fcntl
 import os
 import re
+import select
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -44,11 +47,9 @@ NOT_FOUND = "/nonexistent/acme-command"
 SIGPIPE_PROBE = ["bash", "-c", 'yes | head -n 1 >/dev/null; exit "${PIPESTATUS[0]}"']
 # The lock as the drill scripts take it, on a descriptor the shell opened.
 TAKE_THE_LOCK = 'exec 9>"$1"; shift; "$@" -n 9'
-# The first GNU timeout that blocks its signals across fork() (coreutils commit
-# ab4ffc8503, https://github.com/coreutils/coreutils/issues/82). An earlier one
-# that takes a TERM before its parent has stored the child's pid runs the
-# handler's branch for a child that has not exec'd yet, _exit (128 + SIGTERM),
-# so it exits 143 and never signals the command.
+# The first GNU timeout that blocks signals across fork (coreutils ab4ffc8503).
+# An earlier one exits 143, without signalling the command, when TERM arrives
+# before the parent has stored the child pid.
 GNU_TIMEOUT_HOLDS_SIGNALS_ACROSS_FORK = (9, 5)
 
 
@@ -269,17 +270,54 @@ def test_timeout_on_expiry_reaches_the_command_group_unless_foreground(
         _kill_quietly(grandchild)
 
 
+def _command_that_publishes_its_pid(ready: Path, traps_term: bool) -> str:
+    """Shell text that publishes its pid on ``ready`` before it can be signalled.
+
+    The fifo write is the readiness signal. ``echo`` blocks in ``open`` until
+    the parent opens the fifo, so a TERM cannot arrive first. When the command
+    traps TERM it then stays in ``wait``; ``exec`` would drop the trap.
+    """
+
+    quoted = shlex.quote(str(ready))
+    if traps_term:
+        return f"trap 'exit 7' TERM; echo $$ > {quoted}; sleep 30 & wait"
+    return f"echo $$ > {quoted}; exec sleep 30"
+
+
+def _pid_from_ready_fifo(process: subprocess.Popen[str], ready: Path) -> int:
+    """Block until the child publishes its pid. Fail if it never does."""
+
+    fd = os.open(ready, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                raise AssertionError(
+                    f"child never published its pid (status {process.poll()})"
+                )
+            try:
+                readable, _, _ = select.select([fd], [], [], remaining)
+            except InterruptedError:
+                continue
+            if not readable:
+                continue
+            data = os.read(fd, 64)
+            if data:
+                return int(data.splitlines()[0])
+    finally:
+        os.close(fd)
+
+
 @pytest.mark.parametrize("implementation", _implementations("timeout"))
 @pytest.mark.parametrize(
-    ("command", "shell_status"),
-    [
-        (["sh", "-c", 'echo "$$"; exec sleep 30'], 128 + 15),
-        (["sh", "-c", "trap 'exit 7' TERM; echo \"$$\"; sleep 30 & wait"], 7),
-    ],
+    ("traps_term", "shell_status"),
+    [(False, 128 + 15), (True, 7)],
     ids=["the-command-dies-of-it", "the-command-traps-it"],
 )
 def test_timeout_passes_a_term_it_receives_to_the_command(
-    implementation: list[str], command: list[str], shell_status: int
+    implementation: list[str], traps_term: bool, shell_status: int
 ) -> None:
     """Every caller is a shell, so this is the status a shell reads.
 
@@ -288,24 +326,32 @@ def test_timeout_passes_a_term_it_receives_to_the_command(
     that and from an exit status of 143 alike, so the command must be gone too.
 
     GNU timeout before 9.5 exits 143 without signalling the command when the
-    TERM lands before its parent has returned from fork(), and a command that
-    prints as soon as it starts leaves that window open on a loaded machine:
-    GNU timeout 9.4 took it on ubuntu-24.04 Actions runners (CI runs
-    36041307028 and 36211729964). Against those versions the TERM waits until
-    timeout sleeps, since past fork() its only interruptible sleep is the wait
-    on its command, which it reaches after storing the pid. The helper holds
-    the signal across its fork instead, and
+    TERM lands before its parent has stored the child's pid (coreutils
+    ab4ffc8503). The fifo proves the child has installed ``trap`` when this
+    case uses one. On those older versions the parent is then waited on until
+    it is asleep in ``wait``, which is when it has stored the pid. The helper
+    holds the signal across its own fork, and
     test_timeout_passes_on_a_term_that_arrives_while_the_command_starts sends
     one into that fork.
     """
 
     _require_a_group_of_its_own(implementation)
+    directory = tempfile.mkdtemp(prefix="curie-term-ready-")
+    ready = Path(directory) / "ready"
+    os.mkfifo(ready)
     process = subprocess.Popen(
-        [*implementation, "30", *command], stdout=subprocess.PIPE, text=True
+        [
+            *implementation,
+            "30",
+            "sh",
+            "-c",
+            _command_that_publishes_its_pid(ready, traps_term),
+        ],
+        stdout=subprocess.DEVNULL,
+        text=True,
     )
     try:
-        assert process.stdout is not None
-        command_pid = int(process.stdout.readline())
+        command_pid = _pid_from_ready_fifo(process, ready)
         if (
             implementation == ["timeout"]
             and _gnu_version("timeout") < GNU_TIMEOUT_HOLDS_SIGNALS_ACROSS_FORK
@@ -320,6 +366,7 @@ def test_timeout_passes_a_term_it_receives_to_the_command(
         process.wait()
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process.pid, 9)
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 # gnu-process.py with its Popen slowed down, so a signal is sure to arrive after

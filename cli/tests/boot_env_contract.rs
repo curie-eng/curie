@@ -36,7 +36,20 @@ const CONTRACT_PREFIXES: [&str; 3] = ["CURIE_", "OTEL_EXPORTER_OTLP_", "ANTHROPI
 /// nor the worker ever emits it. Forcing it into the frozen contract would add
 /// a non-session var to a wire-locked model and make `from_env` parse it on
 /// every sandbox boot. It is allowlisted rather than declared.
-const ALLOWED_LITERALS: [&str; 1] = ["CURIE_CHECK_TIMEOUT_S"];
+///
+/// `CURIE_RUNNER_ALLOW_TOKENLESS` (#3821) is the same shape: a runner-local dev
+/// flag, not a boot-env key. It lets a local skill-tier or eval-sweep runner,
+/// which the CLI dials without a bearer, serve its control routes tokenless.
+/// One producer (`StartSpec::run_args` in this file), one consumer
+/// (`runner/src/curie_runner/config.py`), and the chart reserves the name so a
+/// cluster runner can never carry it. It stays deliberately outside the frozen
+/// contract, so the worker's `BootEnv` render can never emit it.
+const ALLOWED_LITERALS: [&str; 2] = ["CURIE_CHECK_TIMEOUT_S", "CURIE_RUNNER_ALLOW_TOKENLESS"];
+
+/// Runner-local knobs `StartSpec` emits that are not `BootEnv` keys. Spelled as
+/// literals: a test that referenced the constant under test would pass through
+/// any rename of it.
+const RUNNER_LOCAL_KNOBS: [&str; 1] = ["CURIE_RUNNER_ALLOW_TOKENLESS"];
 
 fn docker_rs() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/docker.rs");
@@ -185,6 +198,8 @@ fn start_spec_run_args_are_the_frozen_argv() {
         "CURIE_SANDBOX_ID=local",
         "-e",
         r#"CURIE_BUDGET={"max_output_tokens_per_run":100000,"max_usd_per_day":5.0}"#,
+        "-e",
+        "CURIE_RUNNER_ALLOW_TOKENLESS=1",
         "--read-only",
         "--tmpfs",
         "/tmp:rw,mode=1777",
@@ -220,11 +235,13 @@ fn start_spec_run_args_are_the_frozen_argv() {
     );
 }
 
-/// Every env NAME the CLI emits is a declared boot-env key.
+/// Every env NAME the CLI emits is a declared boot-env key, or one of the named
+/// runner-local knobs.
 ///
 /// The complement of the argv pin: that one freezes today's spelling, this one
 /// holds it to the contract, so a future `-e` addition cannot introduce a key
 /// `BootEnv` does not declare (the CLI equivalent of the chart render-assert).
+/// The only carve-out is `RUNNER_LOCAL_KNOBS`, each with its reason above.
 #[test]
 fn every_emitted_env_name_is_a_declared_boot_env_key() {
     let declared = [
@@ -249,14 +266,46 @@ fn every_emitted_env_name_is_a_declared_boot_env_key() {
     // Non-vacuity floor: if run_args stopped emitting env entirely, the
     // membership loop below would pass over an empty set.
     assert!(
-        names.len() >= 8,
-        "expected the every-branch-on spec to emit 8+ env vars, got {names:?}"
+        names.len() >= 9,
+        "expected the every-branch-on spec to emit 9+ env vars, got {names:?}"
     );
     for name in names {
         assert!(
-            declared.contains(&name),
+            declared.contains(&name) || RUNNER_LOCAL_KNOBS.contains(&name),
             "`docker run -e {name}` is not a declared boot-env key in \
              aci_protocol.session.BootEnv (issue #488)"
+        );
+    }
+}
+
+/// Every `StartSpec` runner serves its control routes to a CLI that sends no
+/// bearer (`cli/src/runner.rs`), so the tokenless dev flag is unconditional
+/// (#3821). Checked on the eval-sweep shape, a real-model spec with every
+/// optional branch off, so gating the flag on `fake_model` (or on any other
+/// branch) fails here: without it a real-model local runner refuses to boot.
+#[test]
+fn start_spec_always_carries_the_tokenless_dev_flag() {
+    let sweep = StartSpec {
+        fake_model: false,
+        network: None,
+        otel_endpoint: None,
+        model_base_url: None,
+        model: None,
+        ..spec()
+    };
+
+    for args in [spec().run_args(), sweep.run_args()] {
+        let pairs = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .filter(|(flag, value)| {
+                flag.as_str() == "-e" && value.as_str() == "CURIE_RUNNER_ALLOW_TOKENLESS=1"
+            })
+            .count();
+        assert_eq!(
+            pairs, 1,
+            "StartSpec::run_args must emit `-e CURIE_RUNNER_ALLOW_TOKENLESS=1` exactly once, \
+             got {pairs} in {args:?}"
         );
     }
 }

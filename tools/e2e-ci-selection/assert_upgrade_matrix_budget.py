@@ -7,7 +7,10 @@ shared image build job's wall clock to each matrix shard's run step. The images
 now build once in a separate job before the shards start.
 
 Always writes the seconds to the job summary. An overrun emits a warning;
-untrustworthy measurements still fail.
+untrustworthy measurements still fail. A completed shard can omit its
+matrix-run step timestamps for a few seconds after the job finishes
+(run 36726083300, attempt 1). The jobs API is fetched again for that miss.
+A durable miss still fails.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
@@ -302,40 +306,78 @@ def resolve_summary(explicit: str | None) -> Path | None:
     return None
 
 
+def _fail(summary_path: Path | None, exc: BudgetError) -> int:
+    write_summary(summary_path, f"## Upgrade matrix wall clock\n\nResult: failed ({exc})\n")
+    emit(str(exc), kind="error")
+    return 1
+
+
+def load_measured_rows(
+    *,
+    jobs_json: Path | None,
+    api_url: str,
+    attempts: int,
+    interval_seconds: float,
+) -> list[ShardTiming]:
+    # --jobs-json is a complete fixture. Retrying it cannot change the bytes.
+    # The missing-timestamp error is raised when the run duration is read, not
+    # when the job list is parsed, so the retry has to force that read.
+    fetches = 1 if jobs_json is not None else attempts
+    last_error: BudgetError | None = None
+    for attempt in range(fetches):
+        try:
+            if jobs_json is not None:
+                jobs = read_jobs_json(jobs_json)
+            else:
+                repository = os.environ.get("GITHUB_REPOSITORY", "")
+                run_id = os.environ.get("GITHUB_RUN_ID", "")
+                token = os.environ.get("GITHUB_TOKEN", "")
+                if not repository or not run_id or not token:
+                    raise BudgetError(
+                        "GITHUB_REPOSITORY, GITHUB_RUN_ID, and GITHUB_TOKEN are "
+                        "required without --jobs-json"
+                    )
+                jobs = fetch_jobs(api_url, repository, run_id, token)
+            rows = timings_from_jobs(jobs)
+            for row in rows:
+                _ = row.shard_plus_images_seconds
+        except BudgetError as exc:
+            last_error = exc
+            retryable = str(exc).startswith("missing matrix-run step timestamps")
+            if jobs_json is not None or not retryable or attempt + 1 >= fetches:
+                raise
+            time.sleep(interval_seconds)
+            continue
+        return rows
+    if last_error is None:
+        raise BudgetError("jobs payload could not be measured")
+    raise last_error
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--jobs-json", type=Path)
     parser.add_argument("--summary", type=Path)
     parser.add_argument("--api-url", default=os.environ.get("GITHUB_API_URL", DEFAULT_API_URL))
+    parser.add_argument("--fetch-attempts", type=int, default=4)
+    parser.add_argument("--fetch-interval-seconds", type=float, default=3)
     args = parser.parse_args(argv)
+    if args.fetch_attempts < 1:
+        print("fetch-attempts must be at least 1", file=sys.stderr)
+        return 2
 
     summary_path = resolve_summary(str(args.summary) if args.summary else None)
     try:
-        if args.jobs_json is not None:
-            jobs = read_jobs_json(args.jobs_json)
-        else:
-            repository = os.environ.get("GITHUB_REPOSITORY", "")
-            run_id = os.environ.get("GITHUB_RUN_ID", "")
-            token = os.environ.get("GITHUB_TOKEN", "")
-            if not repository or not run_id or not token:
-                raise BudgetError(
-                    "GITHUB_REPOSITORY, GITHUB_RUN_ID, and GITHUB_TOKEN are "
-                    "required without --jobs-json"
-                )
-            jobs = fetch_jobs(args.api_url, repository, run_id, token)
-        rows = timings_from_jobs(jobs)
-    except BudgetError as exc:
-        write_summary(summary_path, f"## Upgrade matrix wall clock\n\nResult: failed ({exc})\n")
-        emit(str(exc), kind="error")
-        return 1
-
-    try:
+        rows = load_measured_rows(
+            jobs_json=args.jobs_json,
+            api_url=args.api_url,
+            attempts=args.fetch_attempts,
+            interval_seconds=args.fetch_interval_seconds,
+        )
         longest = max(rows, key=lambda row: (row.shard_plus_images_seconds, row.shard))
         asserted = longest.shard_plus_images_seconds
     except BudgetError as exc:
-        write_summary(summary_path, f"## Upgrade matrix wall clock\n\nResult: failed ({exc})\n")
-        emit(str(exc), kind="error")
-        return 1
+        return _fail(summary_path, exc)
     over = asserted > BUDGET_SECONDS
     write_summary(summary_path, render_summary(rows, longest, over))
     if over:

@@ -14,16 +14,29 @@ from typing import Any
 import pytest
 import redis
 import redis.asyncio as aioredis
-from aci_protocol import STREAM_PAYLOAD_FIELD, WORKER_GROUP_DEFAULT
+from aci_protocol import (
+    STREAM_PAYLOAD_FIELD,
+    WORKER_GROUP_DEFAULT,
+    QueuedTurn,
+    ReplyHandle,
+    TurnSource,
+)
 from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
 from curie_api.config import get_settings
 from curie_api.workitem_dispatch import admit, fence_published
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_telemetry import metrics as telemetry_metrics
+from curie_telemetry import tracing as telemetry_tracing
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
+from opentelemetry import trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind
+from redis.exceptions import ResponseError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -49,6 +62,162 @@ RECONCILER_STEPS = (
     "_redispatch_lapsed_acquisitions",
     "_publish_execute_wakes",
 )
+
+
+@pytest.fixture
+def reconciler_spans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[tuple[TracerProvider, InMemorySpanExporter]]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(telemetry_tracing, "_tracer", provider.get_tracer("curie-telemetry"))
+    try:
+        yield provider, exporter
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("marked", [False, True], ids=["direct", "marked"])
+def test_work_item_enqueue_carrier_names_the_recorded_producer_span(
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    reconciler_spans: tuple[TracerProvider, InMemorySpanExporter],
+    marked: bool,
+) -> None:
+    provider, exporter = reconciler_spans
+    turn = QueuedTurn(
+        event_id=f"work-item-{uuid.uuid4()}-execute-1",
+        conversation_id=WIRE_CONVERSATION,
+        author=REQUESTER,
+        text=OBJECTIVE,
+        source=TurnSource.WEBHOOK,
+        reply_handle=ReplyHandle(kind="slack", channel=ADDRESS, placeholder=None),
+        received_at="2026-10-03T00:00:00+00:00",
+    )
+    marker_key = f"{runs_stream}:enqueue-marker"
+
+    async def steps(
+        _maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        client: aioredis.Redis,
+    ) -> None:
+        try:
+            with provider.get_tracer("test-ingress").start_as_current_span("test.ingress"):
+                marker = (marker_key, 60) if marked else None
+                await reconciler._xadd(turn, marker=marker)
+                if marked:
+                    await reconciler._xadd(turn, marker=marker)
+        finally:
+            await client.delete(marker_key)
+
+    _run(steps, runs_stream)
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    fields = entries[0][1]
+    assert fields[STREAM_PAYLOAD_FIELD] == turn.model_dump_json()
+    carrier = fields["traceparent"].split("-")
+    spans = exporter.get_finished_spans()
+    ingress = next(span for span in spans if span.name == "test.ingress")
+    enqueue = next(
+        span for span in spans
+        if span.name == "curie.queue.enqueue" and span.context.span_id == int(carrier[2], 16)
+    )
+    assert enqueue.kind is SpanKind.PRODUCER
+    assert enqueue.attributes["curie.source"] == "api"
+    assert enqueue.parent.span_id == ingress.context.span_id
+    assert enqueue.context.trace_id == ingress.context.trace_id == int(carrier[1], 16)
+
+
+@pytest.mark.parametrize("marked", [False, True], ids=["direct", "marked"])
+def test_work_item_enqueue_without_a_tracer_preserves_the_payload_only(
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+    marked: bool,
+) -> None:
+    monkeypatch.setattr(
+        telemetry_tracing, "_tracer", trace.NoOpTracerProvider().get_tracer("test")
+    )
+    turn = QueuedTurn(
+        event_id=f"work-item-{uuid.uuid4()}-terminate-1",
+        conversation_id=WIRE_CONVERSATION,
+        author=REQUESTER,
+        text=OBJECTIVE,
+        source=TurnSource.WEBHOOK,
+        reply_handle=ReplyHandle(kind="slack", channel=ADDRESS, placeholder=None),
+        received_at="2026-10-03T00:00:00+00:00",
+    )
+    marker_key = f"{runs_stream}:enqueue-marker"
+
+    async def steps(
+        _maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        client: aioredis.Redis,
+    ) -> None:
+        try:
+            await reconciler._xadd(turn, marker=(marker_key, 60) if marked else None)
+        finally:
+            await client.delete(marker_key)
+
+    _run(steps, runs_stream)
+    assert [fields for _, fields in valkey.xrange(runs_stream)] == [
+        {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
+    ]
+
+
+def test_work_item_enqueue_retry_keeps_the_producer_carrier(
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+    reconciler_spans: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    provider, exporter = reconciler_spans
+    turn = QueuedTurn(
+        event_id=f"work-item-{uuid.uuid4()}-execute-1",
+        conversation_id=WIRE_CONVERSATION,
+        author=REQUESTER,
+        text=OBJECTIVE,
+        source=TurnSource.WEBHOOK,
+        reply_handle=ReplyHandle(kind="slack", channel=ADDRESS, placeholder=None),
+        received_at="2026-10-03T00:00:00+00:00",
+    )
+    attempts = 0
+
+    async def steps(
+        _maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        client: aioredis.Redis,
+    ) -> None:
+        original = client.xadd
+
+        async def fail_once(*args: Any, **kwargs: Any) -> Any:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ResponseError("NOGROUP injected publication failure")
+            return await original(*args, **kwargs)
+
+        with monkeypatch.context() as fault:
+            fault.setattr(client, "xadd", fail_once)
+            with provider.get_tracer("test-ingress").start_as_current_span("test.ingress"):
+                await reconciler._xadd(turn)
+
+    _run(steps, runs_stream)
+    assert attempts == 2
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    fields = entries[0][1]
+    assert fields[STREAM_PAYLOAD_FIELD] == turn.model_dump_json()
+    carrier = fields["traceparent"].split("-")
+    enqueue = [span for span in exporter.get_finished_spans() if span.name == "curie.queue.enqueue"]
+    assert len(enqueue) == 1
+    assert enqueue[0].kind is SpanKind.PRODUCER
+    assert enqueue[0].context.trace_id == int(carrier[1], 16)
+    assert enqueue[0].context.span_id == int(carrier[2], 16)
 
 
 @pytest.fixture

@@ -12,9 +12,13 @@ import pytest
 from curie_api.config import get_settings
 from curie_api.models import ThreadPublicationLineage
 from curie_api.workitems import lifecycle as workitems
-from sqlalchemy import select, text
+from sqlalchemy import DateTime, event, literal, select, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.sql.elements import ClauseElement
+from sqlalchemy.sql.functions import FunctionElement
+from sqlalchemy.sql.visitors import replacement_traverse
 
 REPO = "acme-corp/acme-bot"
 CONVERSATION = "slack:C0EXAMPLE1:1700000000.000100"
@@ -1382,14 +1386,48 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
         service_engine = create_async_engine(get_settings().database_url)
         observer_engine = create_async_engine(get_settings().database_url)
         service_task: asyncio.Task[workitems.WorkItemResult] | None = None
+        service_now: datetime | None = None
+        lineage_lock_observed = False
+        clock_inputs: list[tuple[bool, bool, datetime]] = []
 
+        def use_controlled_sql_clock(
+            _connection: Connection,
+            statement: ClauseElement,
+            multiparams: Any,
+            params: Any,
+            _execution_options: Any,
+        ) -> tuple[ClauseElement, Any, Any]:
+            def replace_clock(element: ClauseElement) -> ClauseElement | None:
+                if (
+                    isinstance(element, FunctionElement)
+                    and getattr(element, "name", None) == "clock_timestamp"
+                ):
+                    assert service_now is not None
+                    clock_inputs.append(
+                        (lineage_lock_observed, getattr(statement, "is_update", False), service_now)
+                    )
+                    return literal(service_now, type_=DateTime(timezone=True))
+                return None
+
+            # PostgreSQL still acquires locks and evaluates the original
+            # predicates against the immutable stored deadline.
+            return replacement_traverse(statement, {}, replace_clock), multiparams, params
+
+        event.listen(
+            service_engine.sync_engine,
+            "before_execute",
+            use_controlled_sql_clock,
+            retval=True,
+        )
         try:
             async with AsyncSession(setup_engine) as setup:
                 agent_id = await _agent(setup, "deadline-crossing-agent")
                 lineage_id = await _lineage(setup, agent_id, pr=125)
                 item_id, request_id = uuid.uuid4(), uuid.uuid4()
-                execution_deadline = await _now(setup) + timedelta(seconds=5)
-                started_at = execution_deadline - timedelta(seconds=1800)
+                database_now = await _now(setup)
+                service_now = database_now
+                execution_deadline = database_now + timedelta(hours=2)
+                started_at = database_now - timedelta(minutes=30)
                 await setup.execute(
                     text(
                         "INSERT INTO curie.work_items "
@@ -1489,23 +1527,21 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
                                 )
                             await asyncio.sleep(0.01)
 
-                    await asyncio.wait_for(observe_lineage_lock_wait(), timeout=5)
-
-                    async def wait_for_database_deadline() -> datetime:
-                        while True:
-                            database_now = await _now(observer)
-                            if database_now >= execution_deadline:
-                                return database_now
-                            await asyncio.sleep(0.01)
-
-                    crossed_at = await asyncio.wait_for(
-                        wait_for_database_deadline(), timeout=20
+                    await asyncio.wait_for(observe_lineage_lock_wait(), timeout=60)
+                    assert any(
+                        not after_lock and clock == database_now
+                        for after_lock, _is_update, clock in clock_inputs
                     )
-                    assert crossed_at >= execution_deadline
+                    service_now = execution_deadline + timedelta(seconds=1)
+                    lineage_lock_observed = True
                     await holder.rollback()
                     holder_released = True
 
-                    result = await asyncio.wait_for(service_task, timeout=10)
+                    result = await asyncio.wait_for(service_task, timeout=60)
+                    assert any(
+                        after_lock and is_update and clock == service_now
+                        for after_lock, is_update, clock in clock_inputs
+                    ), result
                     conflict = _conflict(result, "execution_deadline_elapsed")
                     assert (conflict.work_item_version, conflict.request_version) == (
                         2,
@@ -1543,6 +1579,11 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
             if service_task is not None and not service_task.done():
                 service_task.cancel()
                 await asyncio.gather(service_task, return_exceptions=True)
+            event.remove(
+                service_engine.sync_engine,
+                "before_execute",
+                use_controlled_sql_clock,
+            )
             await asyncio.gather(
                 setup_engine.dispose(),
                 lock_engine.dispose(),

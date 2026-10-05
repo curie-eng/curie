@@ -1,7 +1,7 @@
 ---
 seam: Triggers
 kind: SOFT
-impls: 7 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook, GH factory issue intake, factory missed-label reconcile) + per-agent cron scheduler (worker cron_loop)
+impls: 8 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook, GH factory issue intake, GH factory poll intake, factory missed-label reconcile) + per-agent cron scheduler (worker cron_loop)
 grade: not separately graded
 epics:
   - "#29"
@@ -13,7 +13,7 @@ order: 17
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 7 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook, GH factory issue intake, factory missed-label reconcile) + per-agent cron scheduler (worker cron_loop) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 8 hardcoded (Slack, GH push, GH review, commit poll, generic HMAC hook, GH factory issue intake, GH factory poll intake, factory missed-label reconcile) + per-agent cron scheduler (worker cron_loop) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -27,7 +27,7 @@ runs stream ([ADR-0079](../../adr/0079-inbound-triggers-as-a-new-event-kind.md) 
 its ingress is bespoke code that verifies its own source's credential and shape, then
 enqueues a `QueuedTurn` (`packages/aci-protocol/src/aci_protocol/turn.py::QueuedTurn`)
 whose `source` (`packages/aci-protocol/src/aci_protocol/turn.py::TurnSource`) names what
-caused it. The seven ingresses below share that one stream contract, and **that contract
+caused it. The eight ingresses below share that one stream contract, and **that contract
 is the seam.** A new trigger is a new producer of `QueuedTurn`, owned by whichever service
 already receives its source, not an implementation of a trigger interface. Downstream of
 the stream, the consumer, kernel, and claim path learn nothing about which ingress
@@ -35,7 +35,7 @@ produced a turn beyond `TurnSource.is_job`.
 
 Why no port: the ingresses differ exactly where a port would sit. Slack arrives over
 Socket Mode under the app token, GitHub and the generic hook arrive as HMAC-signed HTTP,
-and the commit poll, the factory label reconciler, and the cron scheduler are timers with no inbound request at all. A
+and the commit poll, the factory poll intake, the factory label reconciler, and the cron scheduler are timers with no inbound request at all. A
 port over those would either restate the `QueuedTurn` contract under another name or
 abstract away the authentication each receiver exists to perform. The `SOFT` kind above
 means exactly this: the line is a wire payload, not a code interface. The wire payload
@@ -45,7 +45,7 @@ ACI protocol; this file catalogs its trigger producers.
 ## Current contract
 
 The cross-trigger contract is the queued turn, nothing more: a new trigger means adding
-another handler that mints a `QueuedTurn` with the right `source`. The seven that exist:
+another handler that mints a `QueuedTurn` with the right `source`. The eight that exist:
 
 - **Slack mention** — `apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`:
   the `@app.event("app_mention")` listener (wired in
@@ -76,16 +76,28 @@ another handler that mints a `QueuedTurn` with the right `source`. The seven tha
   the issue body into the platform. It does not enqueue directly: the WorkItem
   reconciler later publishes the execute turn
   (`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._publish_execute_wakes`).
-- **Factory missed-label reconciliation**:
+- **Factory poll intake** (ADR-0187):
+  `apps/api/src/curie_api/factory_poll_intake.py::poll_once` is the default factory
+  door. `github_factory_intake` is `"poll"` unless an operator sets `"webhook"`. One
+  pass lists labeled issues, mentions, and review feedback for each bound repository
+  with the installation credential and admits through the same verification the
+  webhook uses, without writing a delivery receipt. Cursors live in
+  `curie.factory_poll_cursors`, and one API replica polls at a time under a Postgres
+  advisory lock. It runs as a step of the API's WorkItem reconciler loop
+  (`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._reconcile_missed_labels`),
+  every `github_factory_poll_interval_s` (45 seconds by default), and only when
+  factory ingress is on. In poll mode no webhook secret is needed to boot.
+- **Factory missed-label reconciliation** (webhook mode only):
   `apps/api/src/curie_api/factory_label_reconcile.py::reconcile_missed_labels` lists
   open issues carrying the factory label on every bound repository and admits any with
   no WorkItem, through the same verification as the webhook, once the label is older
   than `github_factory_reconcile_grace_s`. GitHub does not redeliver a failed webhook,
-  so without it a label is lost. It runs as a step of the API's WorkItem reconciler
-  loop (`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._reconcile_missed_labels`),
-  at most every `github_factory_reconcile_interval_s` (300 seconds by default, 0
-  disables it), and only when factory ingress is on. The signed webhook remains
-  the immediate intake path; reconciliation recovers labels whose delivery was missed.
+  so without it a label is lost. It runs in the same step of the API's WorkItem
+  reconciler loop in place of `poll_once`, at most every
+  `github_factory_reconcile_interval_s` (300 seconds by default, 0 disables it), and
+  only when factory ingress is on and `github_factory_intake` is `"webhook"`. In that
+  mode the signed webhook remains the immediate intake path and reconciliation
+  recovers labels whose delivery was missed. In poll mode this function does not run.
 - **Commit poll** — `apps/api/src/curie_api/commitpoller.py::CommitPoller.run_forever`:
   a timer in the API asks GitHub whether the deploy branches moved and hands any
   new commit to the same `process_push(...)`. Off unless
@@ -133,8 +145,8 @@ another handler that mints a `QueuedTurn` with the right `source`. The seven tha
   restart its signer. The [Alert source installation](../../../examples/sre-bot/README.md#alert-source-opt-in)
   documents the existing ConfigMap update steps.
 
-The seven share no abstraction: a Slack Bolt event listener, three paths through a
-FastAPI GitHub HMAC route, two asyncio timers, and a FastAPI generic HMAC route. The GitHub push
+The eight share no abstraction: a Slack Bolt event listener, three paths through a
+FastAPI GitHub HMAC route, three asyncio timers, and a FastAPI generic HMAC route. The GitHub push
 and commit poll converge one step earlier than the others -- both call
 `process_push`, deliberately, so the two deploy ingresses cannot disagree about
 what a push means.
@@ -180,7 +192,7 @@ not built (#3666), so a declared webhook validates its shape but does not yet wi
 
 ## Implementations today
 
-Seven hardcoded external triggers in two different processes, plus the declared per-agent cron
+Eight hardcoded external triggers in two different processes, plus the declared per-agent cron
 scheduler in the worker:
 
 1. Slack `app_mention` in the dispatcher (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`).
@@ -188,7 +200,7 @@ scheduler in the worker:
 3. Commit poll in the API (`apps/api/src/curie_api/commitpoller.py::CommitPoller.run_forever`),
    opt-in via `api.commitPollIntervalSeconds`. Timer-driven wake is therefore no longer
    entirely unbuilt: this one is real, though it is a single hardcoded platform timer. The
-   per-agent declared `cron` is item 8.
+   per-agent declared `cron` is item 9.
 4. Generic HMAC hook in the API (`apps/api/src/curie_api/routers/hooks.py::ingest_hook`).
 5. GitHub review feedback in the API
    (`apps/api/src/curie_api/routers/github.py::github_webhook`), with worker-only
@@ -199,9 +211,13 @@ scheduler in the worker:
    that the WorkItem reconciler later enqueues.
 7. Factory missed-label reconciliation in the API
    (`apps/api/src/curie_api/factory_label_reconcile.py::reconcile_missed_labels`), a
-   step of the WorkItem reconciler loop that recovers labels whose signed
-   webhook delivery was missed.
-8. Declared cron triggers in the worker
+   step of the WorkItem reconciler loop that, in webhook mode only, recovers labels
+   whose signed webhook delivery was missed.
+8. Factory poll intake in the API
+   (`apps/api/src/curie_api/factory_poll_intake.py::poll_once`), the default intake: a
+   step of the same loop that lists labeled issues, mentions, and review feedback from
+   GitHub and admits them.
+9. Declared cron triggers in the worker
    (`apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop.run_forever`, ADR-0099, #268):
    each tick reads every in-force deployment's `cron` triggers, records the due slot in
    `hook_runs`, and enqueues one CRON turn. `GET /schedules`
@@ -210,7 +226,7 @@ scheduler in the worker:
    `curie cluster schedules` read that route. Operator guide: [Cron triggers](../../guides/cron-triggers.md).
 
 Plus three further wake paths that also enqueue a run without going through any of those
-seven: the Slack block-action handler
+eight: the Slack block-action handler
 (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_action`), the approval-resume
 enqueue (`apps/api/src/curie_api/resumequeue.py::ResumeQueue.enqueue`), and the CLI's own
 enqueue (`cli/src/message.rs` via `synthetic_turn`/`xadd`/`new_event_id` in
@@ -221,7 +237,7 @@ enqueue (`cli/src/message.rs` via `synthetic_turn`/`xadd`/`new_event_id` in
 Each trigger carries its source's shape up to the stream and no further: Slack triggers
 are Bolt-event-shaped and authed by the Slack app token; the GitHub trigger is
 HMAC-signature-shaped and lives "outside the X-API-Key dependency" (`github.py`
-docstring). The factory label reconciler has no inbound request; it reaches GitHub with
+docstring). The factory poll intake and the label reconciler have no inbound request; it reaches GitHub with
 the installation credential and re-runs the webhook path's installation, label, and
 write-permission checks itself. That is by design, not a gap awaiting a port: the common event contract these
 ingresses reconcile into is the `QueuedTurn` itself, and each transport-specific receiver
@@ -247,4 +263,4 @@ not to any trigger.
 
 - **Epic(s):** #29, closed with the decision above: trigger is not a seam, and new triggers are new event kinds on the runs stream. Remaining work is tracked by #2935 (per-hook model, prompt and env), #2936 (bind hooks from the control plane), #2938 (a cron hook targeting a thread), and #3666 (map a declared webhook onto its hook).
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — not one of the six swappable jobs; not separately graded.
-- **ADR(s):** [ADR-0079](../../adr/0079-inbound-triggers-as-a-new-event-kind.md) (Accepted) — inbound triggers as a new event kind, ingested by the API; [ADR-0099](../../adr/0099-hooks-are-bundle-declared-turns-the-system-starts.md) (Accepted) — hooks are bundle-declared turns the system starts.
+- **ADR(s):** [ADR-0079](../../adr/0079-inbound-triggers-as-a-new-event-kind.md) (Accepted) — inbound triggers as a new event kind, ingested by the API; [ADR-0099](../../adr/0099-hooks-are-bundle-declared-turns-the-system-starts.md) (Accepted) — hooks are bundle-declared turns the system starts; [ADR-0187](../../adr/0187-the-factory-polls-github-and-the-platform-reads-the-issue.md) (Accepted): the factory polls GitHub for its work, and the webhook becomes optional.

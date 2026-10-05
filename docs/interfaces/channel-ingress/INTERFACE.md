@@ -107,16 +107,26 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   [ACI producer seam](../aci-producer/INTERFACE.md). A turn producer sets it
   only toward a worker and runner that implement it (TOOL-ACCESS-6): one that
   does not decodes the field and drops it, and the turn then runs
-  unrestricted. No first-party ingress sets it (for example the Slack
-  dispatcher, the wire ingress and the API resume queue); an operator's own
-  synthetic producer, such as a canary on the disconnected cluster-message
-  relay, is the intended caller. An absent value is today's turn.
+  unrestricted. The one first-party ingress that sets it is the signed hook
+  route (`apps/api/src/curie_api/routers/hooks.py::ingest_hook`), when the
+  caller passes the `tool_access` query parameter; the signature covers that
+  policy with the body, and the operator must first confirm the worker and
+  runner implement it. The Slack dispatcher, the wire ingress and the API
+  resume queue never set it, and an operator's own synthetic producer, such as
+  a canary on the disconnected cluster-message relay, may. An absent value is
+  today's turn.
 - **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
   whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
   (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral
   events (`turn.status`, `reply.update`, `reply.post`, `turn.completed`) over a
-  worker-local `TargetRoute`. One verb, but a second channel still supports three shapes,
-  not one:
+  worker-local `TargetRoute`. Beside the verb, the kernel asks two optional capability
+  questions that are not on the Protocol: `undeliverable_reason(kind, route)`, which drops a
+  turn addressed to a Slack identity this worker holds no token for before any model call,
+  and `edits_in_place(kind, route)`, which decides whether a sibling-limit notice can edit
+  the placeholder. `ReplySinkRouter`
+  (`apps/worker/src/curie_worker/reply_sink.py::ReplySinkRouter`) finds them with `getattr`
+  and answers `None` and `False` for an adapter without them. One verb, but a second channel
+  still supports three shapes, not one:
   - `reply.update` (`packages/channel-protocol/src/channel_protocol/reply.py::ReplyUpdate`)
     carries either a streamed or final `text`, edited in place over the ingress placeholder,
     or a `message` plus `settled` pair that turns an already-posted platform message into
@@ -351,6 +361,14 @@ attachments from Discord or mail).
   Email is another datapoint: it accumulates reply events per
   `(conversation_id, reply_ref)` and sends one threaded mail on `turn.completed`
   (`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.send_reply`).
+- **Still leaks: Slack-only capability queries.** The kernel calls
+  `undeliverable_reason` and `edits_in_place` on its sink
+  (`apps/worker/src/curie_worker/kernel/core.py::Kernel`), but only `SlackReplyAdapter`
+  (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.undeliverable_reason`,
+  `apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.edits_in_place`) implements
+  them. They are duck-typed rather than declared on `ReplySink`, so a second adapter that
+  edits in place or holds per-identity credentials gets the defaults silently, with no
+  conformance failure.
 - **Fixed (#1459, ADR-0096).** The binding surface was Slack-typed in the control plane, not
   just at the channel edges: the agents table carried a `slack_channel` column, and agent
   create/update validated it as a Slack channel id, so binding any other channel kind took a

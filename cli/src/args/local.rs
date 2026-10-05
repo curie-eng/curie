@@ -28,9 +28,30 @@ pub(crate) enum LocalHookAction {
     },
 }
 
+#[derive(Subcommand)]
+pub(crate) enum LocalConsoleAction {
+    /// Mint a Console login code using the stored local installation credential.
+    Login {
+        /// Subject bound to the Console session created from this code.
+        #[arg(long, value_name = "SUBJECT", value_parser = parse_console_subject)]
+        subject: String,
+        /// Platform API base URL.
+        #[arg(long, default_value = message::DEFAULT_LOCAL_API_URL, env = "CURIE_API_URL")]
+        api_url: String,
+        /// Print the request plan without minting a code.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 /// Subcommands of `curie local`.
 #[derive(Subcommand)]
 pub(crate) enum LocalAction {
+    /// Bootstrap access to the Curie Console.
+    Console {
+        #[command(subcommand)]
+        action: LocalConsoleAction,
+    },
     /// Bring the dev stack up (`core` with `--minimal`, else `full`) and print URLs. Add `--slack` for the optional dispatcher.
     ///
     /// Model parity with `curie skill up`: `local up` runs the real model when a

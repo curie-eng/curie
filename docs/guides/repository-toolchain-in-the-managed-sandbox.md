@@ -252,6 +252,12 @@ bundle file stops the runner at startup.
       "paths": ["**/*.rs", "**/Cargo.toml", "Cargo.lock"],
       "install": ["cargo", "fetch", "--locked"],
       "command": ["cargo", "test", "--locked"]
+    },
+    {
+      "id": "integration",
+      "paths": ["services/**", "migrations/**"],
+      "command": ["make", "integration-test"],
+      "delegated_to": "integration-tests"
     }
   ]
 }
@@ -276,11 +282,36 @@ check whose paths match the files it changes. A change outside every declared
 check's paths is told that no check was declared for that area, so a Rust change
 is never pointed at a Python suite.
 
-For a factory Python change, any failed check refuses publication. Any check that
-could not run stamps the pull request with "In-sandbox verification was
-unavailable." and that CI is pending proof. With no check named `python`, the
-stamp says that no in-sandbox Python verification check was declared. The
-required CI check remains the only proof of success.
+After the startup probe, each declared check takes one of three routes:
+
+1. A check that passed or failed runs in the sandbox. Its result is recorded and
+   the model starts.
+2. A check that is unavailable and sets `delegated_to` is delegated to that
+   required pull request CI check, and the model starts.
+3. A check that is unavailable and does not set `delegated_to` is blocked.
+
+`delegated_to` is optional. It is 1 to 64 printable characters with no backticks
+and no leading or trailing spaces, and it names the required pull request CI
+check that proves the check when it cannot run in the sandbox, for example when
+its command needs a binary the runner image lacks or a service the sandbox cannot
+reach. The example above delegates `integration` to a CI check named
+`integration-tests`. The value is declared text, so the agent sees it only in the
+fenced data block. The factory does not complete the run until that named CI check
+has run and passed on the pull request; a missing, skipped or neutral check leaves
+CI unverified.
+
+Any blocked check ends the run before the model starts. The issue gets a
+`Could not complete:` explanation that names each blocked check by id with its
+missing binaries and blocked services, says whether its declared install ran, and
+tells the operator to provide the prerequisite or add `delegated_to`. The run
+ends as `early_stop` with a usage line of zero tokens, and the sandbox is
+released. A `not_declared` record takes no route and still starts the model.
+
+For a factory Python change, any failed check refuses publication. A delegated
+check that could not run stamps the pull request with "In-sandbox verification
+was unavailable." and says that CI is pending proof. With no check named
+`python`, the stamp says that no in-sandbox Python verification check was
+declared. The required CI check remains the only proof of success.
 
 ### Live registry dependencies
 

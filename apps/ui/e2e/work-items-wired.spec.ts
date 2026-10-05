@@ -1,8 +1,14 @@
 import { test, expect, type Page } from "@playwright/test";
+import { stubConsoleSession } from "./support/consoleSession";
 
 // Wired Work items (#2577) in the stackless suite: GET /work-items and
 // GET /work-items/{id} are stubbed with real-shaped responses via route
 // interception, so these run headless with no backend.
+
+// The console sits behind the login gate (#1047): sign this spec in.
+test.beforeEach(async ({ page }) => {
+  await stubConsoleSession(page);
+});
 
 const AGENT = { id: "ag-1", name: "factory", channels: [{ kind: "github", address: "acme-corp/acme-bot" }], created_at: "2026-09-01T00:00:00Z" };
 

@@ -1701,6 +1701,18 @@ fn deploy_api_response(
                 }),
             )
         }
+        ("PATCH", path) if path.starts_with("/agents/") && path.matches('/').count() == 2 => {
+            let id = path.trim_start_matches("/agents/");
+            response_json(
+                200,
+                json!({
+                    "id": id,
+                    "name": id,
+                    "channels": [],
+                    "memory": false
+                }),
+            )
+        }
         ("GET", path) if path.contains("/versions/") && path.contains("/connectors?") => {
             let target = target_from_agent(path);
             let (manifests, owned_secret_name, owned_secret_keys) = match connectors {

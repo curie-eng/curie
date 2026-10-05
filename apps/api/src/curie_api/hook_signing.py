@@ -99,7 +99,7 @@ def derive(api_key: str, *, agent_id: str, generation: int) -> str:
     return signature(api_key, f"{_LABEL}:{agent_id}:{generation}")
 
 
-def _material(
+def material(
     timestamp: str,
     delivery_id: str,
     body: bytes,
@@ -146,8 +146,8 @@ def sign(
 
     if "." in delivery_id:
         raise ValueError("a hook delivery id may not contain '.'")
-    material = _material(timestamp, delivery_id, body, hook=hook, tool_access=tool_access)
-    digest = hmac.new(secret.encode(), material, hashlib.sha256)
+    signing_input = material(timestamp, delivery_id, body, hook=hook, tool_access=tool_access)
+    digest = hmac.new(secret.encode(), signing_input, hashlib.sha256)
     return "sha256=" + digest.hexdigest()
 
 

@@ -614,6 +614,66 @@ def test_the_continuation_is_bounded_to_one(make_harness) -> None:
     asyncio.run(exercise())
 
 
+# --- W-T1 (#3873): a preflight-blocked runner answers every turn offline -----------------
+
+# Replays the runner's PreflightBlockedSession shape (runner/src/curie_runner/
+# harness/claude/preflight_blocked.py, #3873) as seen through SessionRunner translation: a text
+# delta and a DONE final carrying the same explanation, and no ToolNote, on EVERY
+# turn, including the kernel's continuation. The kernel already ends this shape as
+# early_stop; this pins the terminus the runner change relies on.
+BLOCKED_EXPLANATION = (
+    "Could not complete: in-sandbox verification is unavailable before "
+    "implementation, so no model round ran. Blocked check: check-1 "
+    "(package_registry)."
+)
+
+
+def test_a_preflight_blocked_runner_ends_as_early_stop_and_releases_the_claim(
+    make_harness,
+) -> None:
+    from curie_worker.kernel.constants import _EARLY_STOP_PROMPT
+
+    def blocked_turn() -> list[OutboundEvent]:
+        return [TextDelta(text=BLOCKED_EXPLANATION), _done(BLOCKED_EXPLANATION)]
+
+    async def exercise() -> None:
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.runner.turn_scripts = [blocked_turn(), blocked_turn()]
+            h.runner.default_script = [_done("a third turn must never open")]
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            )
+
+            assert len(h.runner.opened) == 2
+            assert h.runner.opened[0] == ISSUE_PROMPT
+            assert _EARLY_STOP_PROMPT in h.runner.opened[1]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "early_stop"
+            assert finish["detail"] == BLOCKED_EXPLANATION
+            assert publications.creates == []
+            assert "hold_for_approval" not in items.calls
+            assert h.fake_k8s.deleted_claims
+            assert h.fake_k8s.claims == {}
+
+    asyncio.run(exercise())
+
+
+# Liveness sibling: a turn that calls a work tool and ends without publishing
+# finishing as no_pull_request is already covered by
+# test_work_tools_without_a_progress_report_end_as_no_pull_request (W2b), so none
+# is added here.
+
+
 # --- W5 / W6 / W6b: the detail on the terminal record --------------------------------
 
 

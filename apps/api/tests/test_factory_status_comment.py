@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,7 @@ from curie_api.config import get_settings
 from curie_api.factory_notices import FINAL_MARKER, marker_for
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
-from test_factory_progress import DECLARATION, report
+from test_factory_progress import DECLARATION, STAGED_DECLARATION, report
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     _LABELS,
     REPO,
@@ -245,6 +246,56 @@ def test_a_note_is_not_rendered_into_the_comment(admitted: Any) -> None:  # noqa
     (comment,) = _marked(sink, request_id)
     assert "@octocat" not in comment["body"]
     assert "evil.example" not in comment["body"]
+
+
+def test_diff_review_failure_keeps_completed_phases_after_renewed_plan_review(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 9924)
+    _reconcile()
+    comment_id = _notices(request_id)[0]["comment_id"]
+    sink.requests.clear()
+    epoch = _start_running(request_id)
+    for phase, loop_round in (
+        ("plan", 1),
+        ("plan_review", 1),
+        ("failing_test", None),
+        ("implement", 1),
+        ("review_diff", 1),
+        ("plan_review", 2),
+    ):
+        response = report(
+            client, request_id, phase, round=loop_round, declaration=STAGED_DECLARATION
+        )
+        assert response.status_code == 201, response.text
+    _finish_failed(client, request_id, epoch, "runner_escalated")
+    _reconcile()
+
+    assert _posts(sink) == []
+    assert [path for path, _ in _patches(sink)] == [
+        f"/repos/{REPO}/issues/comments/{comment_id}"
+    ]
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"]
+    for label in ("Plan", "Plan review", "Failing test", "Implement"):
+        assert f"[x] {label}" in body
+    assert "[ ] **Review diff** (in progress)" in body
+    assert "[ ] Publish PR" in body
+    assert "Status: FAILED" in body
+    assert FINAL_MARKER in body
+
+    token = _notices(request_id)[0]["card_token"]
+    card = client.get(f"/v1/factory/cards/{token}.svg")
+    assert card.status_code == 200, card.text
+    stages = {
+        node.get("data-stage"): set((node.get("class") or "").split())
+        for node in ET.fromstring(card.text).iter()
+        if node.get("data-stage")
+    }
+    assert all("done" in stages[stage] for stage in ("plan", "plan_review", "implement"))
+    assert "blocked" in stages["review_diff"]
+    assert "pending" in stages["wait_ci"]
 
 
 def test_phase_labels_are_markdown_escaped(admitted: Any) -> None:  # noqa: F811

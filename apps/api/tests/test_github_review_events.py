@@ -1435,7 +1435,9 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                     return WorkspaceClaimCoordinator(
                         preparer=WorkspacePreparer(
                             credentials=WorkspaceCredentialClient(
-                                api_url=api_url, worker_token="fixture-review-worker-token"
+                                api_url=api_url,
+                                github_api_url=settings.github_api_url,
+                                worker_token="fixture-review-worker-token",
                             ),
                             commands=SubprocessCommands(),
                             objects=WorkspaceObjectStore(client=objects_client, bucket=bucket),
@@ -1760,6 +1762,7 @@ def test_reserved_review_keeps_ordinary_slack_routing(
                         preparer=WorkspacePreparer(
                             credentials=WorkspaceCredentialClient(
                                 api_url=api_url,
+                                github_api_url=settings.github_api_url,
                                 worker_token="fixture-review-worker-token",
                             ),
                             commands=SubprocessCommands(),
@@ -2045,6 +2048,7 @@ def test_review_history_capacity_failure_posts_one_pr_notice_end_to_end(
                         preparer=WorkspacePreparer(
                             credentials=WorkspaceCredentialClient(
                                 api_url=api_url,
+                                github_api_url=settings.github_api_url,
                                 worker_token="fixture-review-worker-token",
                             ),
                             commands=SubprocessCommands(),

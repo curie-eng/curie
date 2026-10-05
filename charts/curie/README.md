@@ -109,6 +109,12 @@ marker in place, so a successful release Job means release processing completed;
 confirm the actual claim state with `curie cluster status`. The marker TTL is a
 last-resort expiry, not a promise of prompt convergence for a current pause.
 
+The drain, attest and release hook Jobs share `worker.upgradeDrain.resources`.
+Worker dependency imports peaked at approximately `148Mi` in subprocess
+measurements, so the default memory request and limit are both `384Mi`, giving
+more than twice that peak. When overriding this block, size both the memory
+request and limit to at least twice the deployed worker image's measured peak.
+
 **Step 2 -- connect Slack + a real model.** When you have Slack tokens and a
 model credential, upgrade in place (the exact command is also printed in
 `NOTES.txt` after step 1):

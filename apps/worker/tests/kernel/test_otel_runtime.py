@@ -1323,6 +1323,7 @@ def test_no_event_id_survives_a_turn_or_crosses_into_the_next_one(
 def test_thread_reset_drain_spans_are_not_stamped_with_the_turns_event_id(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
+    thread_reset_keys,
 ) -> None:
     """T9 (R1, AC 3/AC 5): the wrong-correlation pin for the scope placement.
 
@@ -1348,39 +1349,35 @@ def test_thread_reset_drain_spans_are_not_stamped_with_the_turns_event_id(
             await consumer.ensure_group()
             # A DIFFERENT thread than the turn's: the drain tears down thread B
             # while turn A is in flight on the same handler task.
-            await h.async_redis.sadd(consumer_module.THREAD_RESET_SET, "thread-reset-victim")
-            try:
-                event = _qevent(
-                    "turn under a drain",
-                    thread="thread-drain-turn",
-                    event_id="Ev0EXAMPLEDRAIN1",
-                )
-                await _deliver(consumer, h, {"payload": event.model_dump_json()})
+            await h.async_redis.sadd(thread_reset_keys.requests, "thread-reset-victim")
+            event = _qevent(
+                "turn under a drain",
+                thread="thread-drain-turn",
+                event_id="Ev0EXAMPLEDRAIN1",
+            )
+            await _deliver(consumer, h, {"payload": event.model_dump_json()})
 
-                releases = _spans(probe, "curie.sandbox.release")
-                # (a) Fail loudly rather than pass vacuously: no release span
-                #     means the drain never ran and (b) below proves nothing.
-                assert releases, (
-                    "the thread-reset drain did not run, so this test could not "
-                    "observe whether its spans were wrongly stamped"
+            releases = _spans(probe, "curie.sandbox.release")
+            # (a) Fail loudly rather than pass vacuously: no release span
+            #     means the drain never ran and (b) below proves nothing.
+            assert releases, (
+                "the thread-reset drain did not run, so this test could not "
+                "observe whether its spans were wrongly stamped"
+            )
+            # (b) The drain describes ANOTHER thread; a Tempo query for this
+            #     turn must not return it.
+            assert [span.attributes.get("event_id") for span in releases] == [None] * len(
+                releases
+            ), (
+                "a thread-reset teardown span was stamped with the in-flight "
+                "turn's event id: the scope opens before the drain"
+            )
+            # The turn's own spans are stamped, so this is not passing
+            # because stamping is broken everywhere.
+            for name in _REQUEST_PATH_SPANS:
+                assert set(_event_ids(probe, name)) == {"Ev0EXAMPLEDRAIN1"}, (
+                    f"{name} lost the event id"
                 )
-                # (b) The drain describes ANOTHER thread; a Tempo query for this
-                #     turn must not return it.
-                assert [span.attributes.get("event_id") for span in releases] == [None] * len(
-                    releases
-                ), (
-                    "a thread-reset teardown span was stamped with the in-flight "
-                    "turn's event id: the scope opens before the drain"
-                )
-                # The turn's own spans are stamped, so this is not passing
-                # because stamping is broken everywhere.
-                for name in _REQUEST_PATH_SPANS:
-                    assert set(_event_ids(probe, name)) == {"Ev0EXAMPLEDRAIN1"}, (
-                        f"{name} lost the event id"
-                    )
-            finally:
-                await h.async_redis.delete(consumer_module.THREAD_RESET_SET)
-                await h.async_redis.delete(consumer_module.THREAD_RESET_INFLIGHT_SET)
 
     asyncio.run(go())
 

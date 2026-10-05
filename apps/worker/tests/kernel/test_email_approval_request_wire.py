@@ -46,8 +46,8 @@ _SECOND = "second.approver@example.com"
 def _mail_runtime(tmp_path: Path, *, cc: list[str] | None) -> Iterator[tuple[Any, str]]:
     """A real mail adapter with approvals on, its egress server, and both fakes.
 
-    Seeds one asking message from the requester and admits it, so the adapter
-    holds the reply the card is rendered into.
+    Seeds one asking turn accepted before upgrade in SQLite, so the adapter
+    holds the reply the card is rendered into without admitting new mail.
     """
 
     mail = support.MailState()
@@ -71,9 +71,10 @@ def _mail_runtime(tmp_path: Path, *, cc: list[str] | None) -> Iterator[tuple[Any
     egress = make_server(adapter, 0)
     threading.Thread(target=egress.serve_forever, daemon=True).start()
     try:
-        mail.add_inbound("msg-ask", "th-wire", text="Please send the quote", cc=cc)
-        adapter.poll_once()
-        assert len(ingress.requests) == 1
+        support.seed_historical_reply(
+            mail, adapter.state, "msg-ask", "th-wire", text="Please send the quote", cc=cc
+        )
+        assert adapter.state.live_reply_refs("th-wire") == ["msg-ask"]
         yield mail, f"http://127.0.0.1:{egress.server_port}/"
     finally:
         for server in (egress, api, provider):

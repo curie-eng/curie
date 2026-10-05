@@ -128,6 +128,17 @@ affinity:
 {{- printf "%s-secrets" (include "curie.fullname" .) -}}
 {{- end -}}
 
+{{/* ---- Chart-owned runner token Secret name (issue #3821) ----
+     The warm-pod runner bearer lives in its own chart-owned Secret,
+     independent of every `existingSecret` override, so a BYO credentials
+     Secret never has to carry it. runner-token.yaml renders it, and
+     agent-sandbox.yaml (through `curie.sandboxTemplate`: the generic template,
+     every per-agent template, and the security probe fixtures) references it,
+     both by this one name. */}}
+{{- define "curie.runnerTokenSecretName" -}}
+{{- printf "%s-runner-token" (include "curie.fullname" .) -}}
+{{- end -}}
+
 {{/* Resolve a store credential Secret, defaulting to the chart Secret. */}}
 {{- define "curie.storeSecretName" -}}
 {{- .store.existingSecret | default (include "curie.secretName" .root) -}}

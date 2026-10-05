@@ -97,6 +97,46 @@ class AffinityStore:
     def _key(self, thread_key: str) -> str:
         return f"{self._prefix}:route:{thread_key}"
 
+    def _claim_cred_key(self, claim_name: str) -> str:
+        return f"{self._prefix}:claim-cred:{claim_name}"
+
+    def remember_claim_credential(
+        self, claim_name: str, agent: str, credential: str, *, ttl_s: int
+    ) -> None:
+        """Keep a deleted claim's boot credential until the API accepts the report."""
+
+        self._redis.set(
+            self._claim_cred_key(claim_name),
+            f"{agent}\n{credential}",
+            ex=ttl_s,
+        )
+
+    def claim_credential(self, claim_name: str) -> tuple[str, str] | None:
+        raw = self._redis.get(self._claim_cred_key(claim_name))
+        if raw is None:
+            return None
+        text = raw.decode() if isinstance(raw, bytes) else str(raw)
+        agent, separator, credential = text.partition("\n")
+        if not separator or not agent or not credential:
+            return None
+        return agent, credential
+
+    def forget_claim_credential(self, claim_name: str) -> None:
+        self._redis.delete(self._claim_cred_key(claim_name))
+
+    def iter_claim_credentials(self) -> list[tuple[str, str, str]]:
+        """``(claim_name, agent, credential)`` for reports that have not landed."""
+
+        found: list[tuple[str, str, str]] = []
+        prefix = f"{self._prefix}:claim-cred:"
+        for key in self._redis.scan_iter(match=f"{prefix}*"):
+            name = key.decode() if isinstance(key, bytes) else str(key)
+            claim_name = name.removeprefix(prefix)
+            pair = self.claim_credential(claim_name)
+            if pair is not None:
+                found.append((claim_name, pair[0], pair[1]))
+        return found
+
     def get(self, thread_key: str) -> RouteRecord | None:
         raw = self._redis.get(self._key(thread_key))
         if raw is None:
@@ -109,9 +149,7 @@ class AffinityStore:
         lost the race (an existing route wins; the caller should adopt it and
         release its own claim)."""
 
-        result = self._redis.set(
-            self._key(thread_key), record.to_json(), nx=True, ex=ttl_seconds
-        )
+        result = self._redis.set(self._key(thread_key), record.to_json(), nx=True, ex=ttl_seconds)
         return bool(result)
 
     def replace(self, thread_key: str, record: RouteRecord, ttl_seconds: int) -> None:
@@ -147,9 +185,7 @@ class AffinityStore:
 
         return bool(self._redis.expire(self._key(thread_key), ttl_seconds))
 
-    def touch_if_live_claim(
-        self, thread_key: str, claim_name: str, ttl_seconds: int
-    ) -> bool:
+    def touch_if_live_claim(self, thread_key: str, claim_name: str, ttl_seconds: int) -> bool:
         """Refresh the TTL only of a LIVE route that still names ``claim_name``."""
 
         return bool(
@@ -199,8 +235,7 @@ class AffinityStore:
             if keys:
                 pipeline = self._pressure_redis.pipeline(transaction=False)
                 key_texts = [
-                    key.decode("utf-8") if isinstance(key, bytes) else str(key)
-                    for key in keys
+                    key.decode("utf-8") if isinstance(key, bytes) else str(key) for key in keys
                 ]
                 for key_text in key_texts:
                     pipeline.get(key_text)
@@ -279,9 +314,7 @@ class AffinityStore:
         inventory = self.route_inventory(thread_keys_scan_count)
         return set().union(*inventory.values())
 
-    def route_inventory(
-        self, thread_keys_scan_count: int = 500
-    ) -> dict[RouteState, set[str]]:
+    def route_inventory(self, thread_keys_scan_count: int = 500) -> dict[RouteState, set[str]]:
         """Authoritative unexpired route claims grouped by persisted state."""
 
         inventory: dict[RouteState, set[str]] = {state: set() for state in RouteState}

@@ -259,6 +259,18 @@ class _FakeK8s:
         pass
 
 
+# The eval liveness test's ceilings for observing a marker publish or renew.
+# A healthy consumer satisfies each within milliseconds; the ceiling only
+# bounds how long a broken one takes to fail, so it sits far above any stall.
+_OBSERVE_S = 30.0
+# Renewed every third of its TTL, so a renewal shows within about a second,
+# while a stall must exceed about two seconds to fail the generation closed.
+_ALIVE_TTL_MS = 3_000
+# Above the test's 300ms reclaim idle, as the config requires, and far above
+# the drain and report the test waits on after the last renewal.
+_CAPABILITY_TTL_MS = 60_000
+
+
 def _cfg(stream: str, group: str, **overrides: object) -> WorkerConfig:
     base: dict[str, object] = {
         "valkey_host": _VH,
@@ -405,8 +417,14 @@ def test_eval_consumer_publishes_and_renews_shared_liveness_lifecycle(
                 f"test:evals:{token}",
                 f"g-{token}",
                 reclaim_min_idle_ms=300,
-                consumer_heartbeat_ttl_ms=150,
-                consumer_capability_ttl_ms=450,
+                # The consumer fails its generation closed when a renewal is
+                # not confirmed inside this lease, so at 150ms one stalled
+                # renewal ended consumer.run() mid-drain (#3861).
+                consumer_heartbeat_ttl_ms=_ALIVE_TTL_MS,
+                # Long enough that the final EXISTS proves shutdown left the
+                # marker in place. At 450ms it was also a budget on the drain
+                # and the report, which a stalled runner overran (#3861).
+                consumer_capability_ttl_ms=_CAPABILITY_TTL_MS,
                 read_block_ms=10,
             )
             client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
@@ -462,10 +480,12 @@ def test_eval_consumer_publishes_and_renews_shared_liveness_lifecycle(
                     return int(alive_ttl), int(capable_ttl)
 
                 task = asyncio.create_task(consumer.run())
-                # One EXISTS per key can observe the 150ms alive lease in its
-                # last milliseconds and fail the following assert. Require both
+                # One EXISTS per key can observe the alive lease in its last
+                # milliseconds and fail the following assert. Require both
                 # TTLs in one round trip, with margin, and do not sample again.
-                deadline = time.monotonic() + 2
+                # The ceilings below only bound a broken consumer; a healthy
+                # one exits each loop on its first matching sample.
+                deadline = time.monotonic() + _OBSERVE_S
                 while time.monotonic() < deadline:
                     alive_ttl, capable_ttl = await liveness_ttls()
                     if alive_ttl > 40 and capable_ttl > 40:
@@ -474,20 +494,20 @@ def test_eval_consumer_publishes_and_renews_shared_liveness_lifecycle(
                 else:
                     pytest.fail("eval consumer did not publish both liveness markers")
 
-                await _wait_until(lambda: bool(fake.seen))
+                await _wait_until(lambda: bool(fake.seen), timeout=_OBSERVE_S)
                 consumer.request_stop()
                 # b23d87c9b polled one PTTL sample after a sleep longer than the
                 # 150ms alive lease. That sleep is the other race: a stalled
                 # refresh expires the key and kills the generation before the
                 # sample. A rise in both TTLs is one renewal transaction. A
                 # non-positive sample resets the baselines, so a lapse and a
-                # later republish cannot count as that renewal. The 450ms
-                # capability lease would otherwise still be the original key.
+                # later republish cannot count as that renewal. Without a rise the
+                # capability lease could still be the original key.
                 low_alive: int | None = None
                 low_capable: int | None = None
                 alive_rose = False
                 capable_rose = False
-                renewal_deadline = time.monotonic() + 2
+                renewal_deadline = time.monotonic() + _OBSERVE_S
                 while time.monotonic() < renewal_deadline:
                     if task.done():
                         break

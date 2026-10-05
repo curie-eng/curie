@@ -92,8 +92,10 @@ than an open bag of `gen_ai.*` names.
   thread-lock, sandbox, runner RPC, approval, completion-outbox, reply, HTTP,
   background-loop, connector-reconcile skips, end to end namespace reaper health,
   schedule fires, eval work,
-  transcript-capacity, state mutations, supervised-task restarts, tool results, and
-  Slack Socket Mode connection state.
+  transcript-capacity, capacity waits (`curie.capacity.wait`), state mutations,
+  legacy state-token use (`curie.state.legacy_token`), supervised-task restarts,
+  work-item reconciler step failures (`curie.work_item.reconciler.step.failure`), tool
+  results, and Slack Socket Mode connection state.
   `record_metric`
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`) rejects undeclared
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
@@ -337,8 +339,9 @@ The three hoist readers bind those keys through the closed enum:
 (`apps/api/src/curie_api/langfuse.py::_TOOL_NAME_ATTR`) is
 `SpanAttributeKey.TOOL_NAME.value` and is surfaced as `toolName` on each observation
 node. The remaining leak
-is the three `langfuse.*` writer attributes (`langfuse.trace.name`,
-`langfuse.session.id`, `langfuse.user.id`) and the `/langfuse` URL namespace.
+is the five `langfuse.*` writer attributes (`langfuse.trace.name`,
+`langfuse.session.id`, `langfuse.user.id`, `langfuse.observation.input`,
+`langfuse.observation.output`) and the `/langfuse` URL namespace.
 
 ## Cross-links
 

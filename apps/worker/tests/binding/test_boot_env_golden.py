@@ -425,14 +425,20 @@ def test_a_scoped_boot_carries_a_caller_token_signed_for_its_agent() -> None:
     assert before + SANDBOX_TOKEN_TTL_SECONDS <= exp <= after + SANDBOX_TOKEN_TTL_SECONDS
 
 
-def test_the_caller_token_expires_with_the_state_tokens() -> None:
+def test_the_caller_token_keeps_the_day_cap_when_state_tokens_do_not() -> None:
+    # ADR 0178 keeps the caller token on SANDBOX_TOKEN_TTL_SECONDS. #3823
+    # shortens only the boot state tokens, so the two expiries no longer match.
+    before = int(time.time())
     env = _boot_env(
         WorkerConfig(connector_caller_signing_key=_caller_seed(), **_SCOPED), _resolved()
     )
-    assert (
-        _claims(env["CURIE_CONNECTOR_CALLER_TOKEN"])["exp"]
-        == _claims(env["CURIE_STATE_TOKEN"])["exp"]
-    )
+    after = int(time.time())
+    caller_exp = _claims(env["CURIE_CONNECTOR_CALLER_TOKEN"])["exp"]
+    state_exp = _claims(env["CURIE_STATE_TOKEN"])["exp"]
+    assert isinstance(caller_exp, int)
+    assert isinstance(state_exp, int)
+    assert before + SANDBOX_TOKEN_TTL_SECONDS <= caller_exp <= after + SANDBOX_TOKEN_TTL_SECONDS
+    assert state_exp < caller_exp
 
 
 def test_without_a_signing_key_a_scoped_boot_is_unchanged() -> None:
@@ -495,9 +501,7 @@ def test_boot_env_omits_channel_bound_without_kind_or_address() -> None:
 
 
 def test_boot_env_marks_a_turn_bound_to_a_channel() -> None:
-    env = _boot_env_with_channel(
-        WorkerConfig(), _resolved(), kind="slack", address="C0EXAMPLE1"
-    )
+    env = _boot_env_with_channel(WorkerConfig(), _resolved(), kind="slack", address="C0EXAMPLE1")
     assert env["CURIE_CHANNEL_BOUND"] == "1"
 
 
@@ -507,9 +511,7 @@ def test_boot_env_omits_channel_bound_when_the_address_is_blank() -> None:
 
 
 def test_boot_env_omits_channel_bound_when_the_kind_is_blank() -> None:
-    env = _boot_env_with_channel(
-        WorkerConfig(), _resolved(), kind="", address="C0EXAMPLE1"
-    )
+    env = _boot_env_with_channel(WorkerConfig(), _resolved(), kind="", address="C0EXAMPLE1")
     assert "CURIE_CHANNEL_BOUND" not in env
 
 

@@ -223,6 +223,12 @@ class Settings(BaseSettings):
         default_factory=dict,
         validation_alias="GITHUB_FACTORY_PYTHON_CI",
     )
+    # Checks and commit statuses that rerun after a metadata edit, per
+    # repository: {"checks": [str, ...], "statuses": [str, ...]}.
+    github_factory_metadata_ci: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        validation_alias="GITHUB_FACTORY_METADATA_CI",
+    )
     # Bases a factory ticket may start from and target, per repository
     # (#3095, ADR 0186), a JSON object keyed by ``owner/name`` (matched
     # case-insensitively): ``{"bases": [str, ...], "default_base": str | null}``.
@@ -909,6 +915,37 @@ class Settings(BaseSettings):
                     " non-empty string or null"
                 )
             policies[repo] = {"check": check, "paths": list(paths), "pendingCheckPrefix": prefix}
+        return policies
+
+    @field_validator("github_factory_metadata_ci", mode="before")
+    @classmethod
+    def _validate_factory_metadata_ci(cls, value: Any) -> dict[str, dict[str, Any]]:
+        if isinstance(value, str):
+            value = json.loads(value) if value.strip() else {}
+        if not isinstance(value, dict):
+            raise ValueError("GITHUB_FACTORY_METADATA_CI must be a JSON object")
+        policies: dict[str, dict[str, Any]] = {}
+        for repo, policy in value.items():
+            if not isinstance(repo, str) or not valid_repository_name(repo):
+                raise ValueError(f"GITHUB_FACTORY_METADATA_CI key {repo!r} is not owner/name")
+            if not isinstance(policy, dict) or set(policy) - {"checks", "statuses"}:
+                raise ValueError(f"GITHUB_FACTORY_METADATA_CI[{repo!r}] has an invalid shape")
+            names: dict[str, list[str]] = {}
+            for surface in ("checks", "statuses"):
+                entries = policy.get(surface, [])
+                if not isinstance(entries, list) or not all(
+                    isinstance(entry, str) and entry.strip() for entry in entries
+                ):
+                    raise ValueError(
+                        f"GITHUB_FACTORY_METADATA_CI[{repo!r}].{surface} must be a list"
+                        " of nonempty names"
+                    )
+                names[surface] = list(entries)
+            if not names["checks"] and not names["statuses"]:
+                raise ValueError(
+                    f"GITHUB_FACTORY_METADATA_CI[{repo!r}] must name a check or status"
+                )
+            policies[repo] = names
         return policies
 
     @field_validator("github_factory_bases", mode="before")

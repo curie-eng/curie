@@ -36,6 +36,7 @@ from curie_api.crud import agents as crud_agents
 from curie_api.crud import channels as crud_channels
 from curie_api.schemas.state import (
     MemoryTurnClosedIn,
+    SandboxCredentialReleasedIn,
     StateAppendIn,
     StateEntryOut,
     StateEntryPut,
@@ -93,6 +94,11 @@ _FACT_KEY = re.compile(r"^fact-[0-9a-f]{32}\Z")
 # (duplicated, since neither service imports the other's package). The record
 # only has to outlive the credential it refuses.
 MEMORY_TURN_CLOSED_TTL_S = 24 * 60 * 60
+# #3823: a released boot credential stays recorded for the longest a sandbox
+# token can still be valid (the worker's SANDBOX_TOKEN_TTL_SECONDS cap).
+SANDBOX_CREDENTIAL_RELEASED_TTL_S = 24 * 60 * 60
+_CREDENTIAL_ID = re.compile(r"^[0-9a-f]{32}$")
+CREDENTIAL_RELEASED = "this sandbox credential has been released"
 TURN_ENDED = "this conversation's turn has ended"
 
 
@@ -148,8 +154,42 @@ def _state_principal(payload: dict[str, Any]) -> StatePrincipal:
     )
 
 
+async def _check_credential_current(request: Request, agent_id: uuid.UUID, cred: object) -> None:
+    """#3823: refuse a boot credential the worker has reported released.
+
+    A token with no ``cred`` claim is a pre-change mint. Expiry still applies
+    to it. A present claim that is not the id shape we mint is refused. A
+    Valkey failure is a 503, so a released credential is never treated as live
+    because the check could not be read.
+    """
+
+    if cred is None:
+        return
+    if not isinstance(cred, str) or _CREDENTIAL_ID.fullmatch(cred) is None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "sandbox credential is not recognized")
+    client: redis.Redis = request.app.state.valkey
+    try:
+        released = await client.exists(_released_credential_key(agent_id, cred))
+    except (redis.RedisError, OSError) as exc:
+        logger.warning("state: could not check sandbox credential %s: %r", cred, exc)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "could not check this sandbox credential",
+        ) from exc
+    if released:
+        logger.warning("state: refused released sandbox credential %s for agent %s", cred, agent_id)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, CREDENTIAL_RELEASED)
+
+
+def _released_credential_key(agent_id: uuid.UUID, credential: str) -> str:
+    """Valkey record that ``credential`` of ``agent_id`` was released (#3823)."""
+
+    return f"{get_settings().worker_key_prefix}:sandbox-credential-released:{agent_id}:{credential}"
+
+
 async def require_state_access(
     agent_id: uuid.UUID,
+    request: Request,
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> StatePrincipal:
     """State-router auth (ADR-0033): the platform key (trusted callers) OR a
@@ -169,12 +209,13 @@ async def require_state_access(
         agent = str(agent_id)
         payload = sandbox_token.decode(x_api_key, api_key, agent=agent, scope=STATE_SCOPE)
         if payload is not None:
+            await _check_credential_current(request, agent_id, payload.get("cred"))
             return _state_principal(payload)
-        if sandbox_token.verify(x_api_key, api_key, agent=agent, scope=STATE_APP_SCOPE):
+        app_payload = sandbox_token.decode(x_api_key, api_key, agent=agent, scope=STATE_APP_SCOPE)
+        if app_payload is not None:
+            await _check_credential_current(request, agent_id, app_payload.get("cred"))
             return StatePrincipal(StateCaller.APP)
-    raise HTTPException(
-        status.HTTP_401_UNAUTHORIZED, detail="missing or invalid credential"
-    )
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="missing or invalid credential")
 
 
 def _state_path(
@@ -249,9 +290,7 @@ def _check_memory_reach(
             "memory facts are written with PUT; append is not allowed with a sandbox credential",
         )
     if key is None or _FACT_KEY.fullmatch(key) is None:
-        _refuse(
-            principal, agent_id, path, "only fact keys are writable with a sandbox credential"
-        )
+        _refuse(principal, agent_id, path, "only fact keys are writable with a sandbox credential")
 
 
 def _transcript_key_admitted(principal: StatePrincipal, agent_id: uuid.UUID, key: str) -> bool:
@@ -331,9 +370,7 @@ def _check_transcript_reach(
     if requested_binding is not None and principal.binding != requested_binding:
         _refuse(principal, agent_id, path, "credential is scoped to another channel")
     if key is not None and not _transcript_key_admitted(principal, agent_id, key):
-        _refuse(
-            principal, agent_id, path, "transcript belongs to another channel or no channel"
-        )
+        _refuse(principal, agent_id, path, "transcript belongs to another channel or no channel")
 
 
 def _visible_transcripts(
@@ -473,9 +510,7 @@ async def forbid_reserved_namespace(
         )
 
 
-router = APIRouter(
-    prefix="/agents", tags=["state"], dependencies=[Depends(require_state_access)]
-)
+router = APIRouter(prefix="/agents", tags=["state"], dependencies=[Depends(require_state_access)])
 
 
 # Advisory-lock class for the per-agent namespace-count cap (#933). The
@@ -774,8 +809,7 @@ async def _put_state(
         if data.expected_version is not None and data.expected_version != entry.version:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
-                f"version mismatch: expected {data.expected_version}, "
-                f"stored {entry.version}",
+                f"version mismatch: expected {data.expected_version}, stored {entry.version}",
             )
         entry.value = data.value
         entry.version += 1
@@ -872,9 +906,7 @@ async def _append_state(
     if await crud_agents.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     if namespace == TRANSCRIPT_NAMESPACE:
-        row = await transcripts.append(
-            session, agent_id, scope, key, data.item, data.reserve_bytes
-        )
+        row = await transcripts.append(session, agent_id, scope, key, data.item, data.reserve_bytes)
         return _transcript_out(row)
     entry = await _get_entry_locked(session, agent_id, scope, namespace, key)
     if entry is None:
@@ -1079,9 +1111,7 @@ async def _get_state(
     response: Response,
 ) -> StateEntryOut:
     if namespace == TRANSCRIPT_NAMESPACE:
-        headers = {
-            "X-Curie-Transcript-Max-Bytes": str(get_settings().transcript_max_thread_bytes)
-        }
+        headers = {"X-Curie-Transcript-Max-Bytes": str(get_settings().transcript_max_thread_bytes)}
         row = await transcripts.get(session, agent_id, scope, key)
         if row is None:
             raise HTTPException(
@@ -1280,9 +1310,7 @@ async def _delete_state(
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     if namespace == TRANSCRIPT_NAMESPACE:
-        return recorded(
-            await transcripts.remove(session, agent_id, scope, key, expected_version)
-        )
+        return recorded(await transcripts.remove(session, agent_id, scope, key, expected_version))
     entry = await _get_entry(session, agent_id, scope, namespace, key)
     if expected_version is None:
         if entry is not None:
@@ -1423,4 +1451,46 @@ async def close_memory_turn(data: MemoryTurnClosedIn, request: Request) -> Respo
             status.HTTP_503_SERVICE_UNAVAILABLE, "could not record the turn as ended"
         ) from exc
     logger.info("state: memory turn %s ended for agent %s", data.turn, data.agent_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+released_router = APIRouter(
+    prefix="/v1/internal/state",
+    tags=["internal-state"],
+    dependencies=[Depends(require_internal_worker_token)],
+)
+
+
+@released_router.post("/released-credentials", status_code=status.HTTP_204_NO_CONTENT)
+async def release_sandbox_credential(
+    data: SandboxCredentialReleasedIn, request: Request
+) -> Response:
+    """Record that a sandbox claim released its boot credential. Idempotent.
+
+    The record expires once no token carrying that id could still be valid
+    (``SANDBOX_CREDENTIAL_RELEASED_TTL_S``).
+    """
+
+    client: redis.Redis = request.app.state.valkey
+    try:
+        await client.set(
+            _released_credential_key(data.agent_id, data.credential),
+            "1",
+            ex=SANDBOX_CREDENTIAL_RELEASED_TTL_S,
+        )
+    except (redis.RedisError, OSError) as exc:
+        logger.warning(
+            "state: could not record sandbox credential %s as released: %r",
+            data.credential,
+            exc,
+        )
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "could not record the sandbox credential as released",
+        ) from exc
+    logger.info(
+        "state: sandbox credential %s released for agent %s",
+        data.credential,
+        data.agent_id,
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)

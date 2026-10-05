@@ -215,7 +215,10 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0190 | [Automated hook sources cannot widen their tool access](0190-automated-hook-sources-cannot-widen-their-tool-access.md) | Accepted |
 | 0191 | [Protected hooks use a separately authorized delivery lane](0191-protected-hook-delivery-authority.md) | Accepted |
 | 0192 | [The model sees the platform sender](0192-the-model-sees-the-platform-sender.md) | Accepted |
-| 0193 | [Identity links live in provider identity namespaces](0193-identity-links-live-in-provider-identity-namespaces.md) | Accepted |
+| 0193 | [Cluster up reads a missing RuntimeClass before install](0193-cluster-up-reads-a-missing-runtimeclass-before-install.md) | Accepted |
 | 0194 | [The plugin-format contract is the frozen schema plus a parity gate](0194-plugin-format-contract-is-the-frozen-schema-plus-a-parity-gate.md) | Accepted |
+| 0195 | [A version-only delta reuses its parent's checks](0195-a-version-only-delta-reuses-its-parents-checks.md) | Accepted |
+| 0196 | [Combined preparation PR checks can prove an unchanged release merge](0196-combined-preparation-pr-checks.md) | Draft |
 | 0197 | [The factory reaches code hosts and trackers through two ports](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md) | Accepted |
+| 0198 | [Identity links live in provider identity namespaces](0198-identity-links-live-in-provider-identity-namespaces.md) | Accepted |
 <!-- END GENERATED: adr-index -->

@@ -39,7 +39,10 @@ from curie_api.crud import (
 from curie_api.crud import (
     versions as crud_versions,
 )
+from curie_api.db import create_sessionmaker
 from curie_api.deps import get_eval_queue
+from curie_api.github_review_audit import claim_push_delivery, settle_push_delivery
+from curie_api.routers import github as github_router
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_test_support.scaffold import scaffolded_deploy_yaml
 from opentelemetry.sdk.metrics import MeterProvider
@@ -144,7 +147,16 @@ def _build_bare_repo_with_pull_only_commit(
     return clone_url, pull_sha
 
 
-def _post(client: Any, event: str, payload: dict[str, Any], secret: str = SECRET) -> Any:
+def _post(
+    client: Any,
+    event: str,
+    payload: dict[str, Any],
+    secret: str = SECRET,
+    *,
+    delivery: str | None = None,
+) -> Any:
+    """Sign and post one delivery; each call is a fresh delivery id unless one is given."""
+
     body = json.dumps(payload).encode()
     sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return client.post(
@@ -152,6 +164,7 @@ def _post(client: Any, event: str, payload: dict[str, Any], secret: str = SECRET
         content=body,
         headers={
             "X-GitHub-Event": event,
+            "X-GitHub-Delivery": delivery or str(uuid.uuid4()),
             "X-Hub-Signature-256": sig,
             "Content-Type": "application/json",
         },
@@ -1600,7 +1613,10 @@ def test_a_redelivered_dev_push_reuses_the_version_without_rebuilding(
     GitHub redelivers a webhook whenever the first attempt looks unhealthy, and
     an operator can redeliver by hand from the deliveries UI. The version is
     already built and stored, so the second delivery must reuse that row rather
-    than build a second one or fan out a second eval.
+    than build a second one or fan out a second eval. The two posts carry
+    distinct `X-GitHub-Delivery` ids, so this is the "new delivery id for the
+    same commit behaves as today" half of #3820; a replay of the SAME id is
+    `test_a_replayed_push_delivery_id_deploys_and_promotes_once`.
 
     What it must NOT claim is that the dev lane skips the clone. The dev lane
     deliberately still clones on every delivery, because the clone is where
@@ -1652,6 +1668,337 @@ def test_a_redelivered_dev_push_reuses_the_version_without_rebuilding(
     ).json()
     assert [d["environment"] for d in deployments] == ["dev", "dev"], deployments
     assert {d["version_id"] for d in deployments} == {first["version_id"]}
+
+
+def test_a_replayed_push_delivery_id_deploys_and_promotes_once(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A second POST with the same X-GitHub-Delivery does nothing (#3820).
+
+    A signed push replayed byte for byte, by GitHub or by anyone holding a
+    captured delivery, must not deploy or promote again. The dev replay and the
+    prod replay are both pinned, because they reach a Deployment row through
+    different paths (build versus stored-bundle reuse). The eval queue is
+    recorded across both dev posts so "one job" cannot pass by the fan-out
+    having stopped working.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    dev_delivery = str(uuid.uuid4())
+    prod_delivery = str(uuid.uuid4())
+
+    eval_queue = _RecordingEvalQueue()
+    client.app.dependency_overrides[get_eval_queue] = lambda: eval_queue
+    try:
+        dev_payload = _push_payload("refs/heads/dev", sha, clone_url)
+        first = _post(client, "push", dev_payload, delivery=dev_delivery)
+        replay = _post(client, "push", dev_payload, delivery=dev_delivery)
+
+        prod_payload = _push_payload("refs/heads/main", sha, clone_url)
+        promoted = _post(client, "push", prod_payload, delivery=prod_delivery)
+        prod_replay = _post(client, "push", prod_payload, delivery=prod_delivery)
+    finally:
+        client.app.dependency_overrides.pop(get_eval_queue, None)
+
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "deployed", first.json()
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["status"] == "push_duplicate", replay.json()
+    assert replay.json()["version_id"] is None
+    assert replay.json()["deployment_id"] is None
+    assert len(eval_queue.jobs) == 1, "a replayed delivery must not fan out a second eval"
+
+    assert promoted.json()["status"] == "promoted", promoted.json()
+    assert prod_replay.status_code == 200, prod_replay.text
+    assert prod_replay.json()["status"] == "push_duplicate", prod_replay.json()
+    assert prod_replay.json()["deployment_id"] is None
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert sorted(d["environment"] for d in deployments) == ["dev", "prod"], deployments
+    assert {d["id"] for d in deployments} == {
+        first.json()["deployment_id"],
+        promoted.json()["deployment_id"],
+    }
+
+
+def test_a_push_delivery_id_is_case_folded_and_otherwise_canonical(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A push must name its delivery in canonical form, or nothing can dedupe it.
+
+    Case is folded, the same rule the review arm applies, so the uppercase
+    spelling of a spent id is the same delivery and answers `push_duplicate`.
+    Any other spelling (braces, urn:) or a missing header is refused rather
+    than given a second receipt to replay under.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    payload = _push_payload("refs/heads/dev", sha, clone_url)
+    delivery = str(uuid.uuid4())
+
+    first = _post(client, "push", payload, delivery=delivery)
+    assert first.json()["status"] == "deployed", first.text
+
+    uppercase = _post(client, "push", payload, delivery=delivery.upper())
+    assert uppercase.status_code == 200, uppercase.text
+    assert uppercase.json()["status"] == "push_duplicate", uppercase.text
+
+    braced = _post(client, "push", payload, delivery="{" + delivery + "}")
+    assert braced.status_code == 400, braced.text
+    assert braced.json()["detail"] == {"code": "invalid_delivery"}
+
+    body = json.dumps(payload).encode()
+    missing = client.post(
+        "/github/webhook",
+        content=body,
+        headers={
+            "X-GitHub-Event": "push",
+            "X-Hub-Signature-256": "sha256="
+            + hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest(),
+            "Content-Type": "application/json",
+        },
+    )
+    assert missing.status_code == 400, missing.text
+    assert missing.json()["detail"] == {"code": "invalid_delivery"}
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert [d["id"] for d in deployments] == [first.json()["deployment_id"]]
+
+
+def test_a_reused_delivery_id_with_a_different_body_is_ignored(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """One delivery id binds one body; a different body under it does nothing."""
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    delivery = str(uuid.uuid4())
+
+    first = _post(
+        client, "push", _push_payload("refs/heads/dev", sha, clone_url), delivery=delivery
+    )
+    assert first.json()["status"] == "deployed", first.json()
+
+    reused = _post(
+        client, "push", _push_payload("refs/heads/main", sha, clone_url), delivery=delivery
+    )
+    assert reused.status_code == 200, reused.text
+    assert reused.json()["status"] == "ignored", reused.json()
+    assert reused.json()["errors"] == [{"code": "delivery_identity_conflict"}]
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert [d["environment"] for d in deployments] == ["dev"], deployments
+
+
+def test_a_redelivery_of_an_ignored_push_with_the_same_id_still_deploys(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """Only a delivery that deployed or promoted is spent.
+
+    GitHub's Redeliver button reuses the original X-GitHub-Delivery id, and the
+    #2436 repair is "fix the cause, redeliver the same sha". So a delivery that
+    was ignored (here: no agent bound to the repository yet) must still deploy
+    when redelivered under the same id once the cause is fixed. A third post is
+    then the duplicate, which proves the receipt settled on the second.
+    """
+
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    payload = _push_payload("refs/heads/dev", sha, clone_url)
+    delivery = str(uuid.uuid4())
+
+    ignored = _post(client, "push", payload, delivery=delivery)
+    assert ignored.status_code == 200, ignored.text
+    assert ignored.json()["status"] == "ignored", ignored.json()
+
+    agent_id = _register_agent(client, auth_headers)
+    redelivered = _post(client, "push", payload, delivery=delivery)
+    assert redelivered.status_code == 200, redelivered.text
+    assert redelivered.json()["status"] == "deployed", redelivered.json()
+
+    replay = _post(client, "push", payload, delivery=delivery)
+    assert replay.json()["status"] == "push_duplicate", replay.json()
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert [d["id"] for d in deployments] == [redelivered.json()["deployment_id"]]
+
+
+class _FailingEvalQueue:
+    """An eval producer whose enqueue fails, after the deployment row committed."""
+
+    async def enqueue(self, job: Any) -> str:
+        raise RuntimeError("eval queue unavailable")
+
+
+def test_a_push_delivery_that_crashed_after_deploying_is_never_reprocessed(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delivery that raised mid-flight stays unsettled and cannot deploy twice.
+
+    `process_push` commits the dev Deployment row before it enqueues the eval
+    job, so an enqueue failure leaves a real deployment behind an errored
+    request. Replaying that delivery id must answer `delivery_unsettled` and do
+    nothing, because nothing can tell whether it deployed. A NEW delivery id
+    for the same commit is still processed normally.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    payload = _push_payload("refs/heads/dev", sha, clone_url)
+    delivery = str(uuid.uuid4())
+
+    monkeypatch.setattr(client._transport, "raise_server_exceptions", False)
+    client.app.dependency_overrides[get_eval_queue] = lambda: _FailingEvalQueue()
+    try:
+        crashed = _post(client, "push", payload, delivery=delivery)
+    finally:
+        client.app.dependency_overrides.pop(get_eval_queue, None)
+    assert crashed.status_code == 500, crashed.text
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert len(deployments) == 1, "the crash happened after the deployment committed"
+
+    eval_queue = _RecordingEvalQueue()
+    client.app.dependency_overrides[get_eval_queue] = lambda: eval_queue
+    try:
+        replay = _post(client, "push", payload, delivery=delivery)
+        fresh = _post(client, "push", payload)
+    finally:
+        client.app.dependency_overrides.pop(get_eval_queue, None)
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["status"] == "push_duplicate", replay.json()
+    assert replay.json()["errors"] == [{"code": "delivery_unsettled"}]
+    assert replay.json()["deployment_id"] is None
+
+    assert fresh.status_code == 200, fresh.text
+    assert fresh.json()["status"] == "deployed", fresh.json()
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert len(deployments) == 2, deployments
+    assert fresh.json()["deployment_id"] in {d["id"] for d in deployments}
+
+
+def test_a_push_releases_its_request_connection_before_settling(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The settle never waits for a connection while the request still holds one.
+
+    `process_push` leaves the request session in a transaction after a deploy
+    (its refresh of the committed Deployment row). If the settle opened its own
+    session before that connection went back to the pool, concurrent pushes
+    could each hold one connection while waiting for a second. Recorded at the
+    moment the settle runs, for both a deployed and an ignored push.
+    """
+
+    _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+
+    sessions: list[Any] = []
+    real_process_push = github_router.process_push
+
+    async def _recording_process_push(session: Any, *args: Any, **kwargs: Any) -> Any:
+        sessions.append(session)
+        return await real_process_push(session, *args, **kwargs)
+
+    held_at_settle: list[bool] = []
+    real_settle = github_router.settle_push_delivery
+
+    async def _recording_settle(*args: Any, **kwargs: Any) -> None:
+        held_at_settle.append(sessions[-1].in_transaction())
+        await real_settle(*args, **kwargs)
+
+    monkeypatch.setattr(github_router, "process_push", _recording_process_push)
+    monkeypatch.setattr(github_router, "settle_push_delivery", _recording_settle)
+
+    deployed = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    ignored = _post(client, "push", _push_payload("refs/heads/feature-x", sha, clone_url))
+
+    assert deployed.json()["status"] == "deployed", deployed.text
+    assert ignored.json()["status"] == "ignored", ignored.text
+    assert held_at_settle == [False, False]
+
+
+def test_overlapping_claims_of_one_push_delivery_admit_exactly_one(
+    clean_db: None,
+) -> None:
+    """Concurrent claims of one delivery id against real Postgres pick one owner.
+
+    The committed `pending` receipt is the in-flight marker, so every other
+    overlapping claim answers `unsettled` rather than waiting on a row lock.
+    Once settled accepted, the id is spent. A receipt settled `rejected` is
+    reopened by exactly one of several concurrent claims (#2436 liveness).
+    """
+
+    payload = {"ref": "refs/heads/dev", "after": "0" * 40}
+    body = json.dumps(payload).encode()
+
+    async def exercise() -> tuple[list[str], str, list[str], str]:
+        engine = create_async_engine(get_settings().database_url)
+        maker = create_sessionmaker(engine)
+
+        def claim(delivery_id: uuid.UUID) -> Any:
+            return claim_push_delivery(
+                maker, delivery_id=delivery_id, event="push", body=body, payload=payload
+            )
+
+        try:
+            spent = uuid.uuid4()
+            first = list(await asyncio.gather(*(claim(spent) for _ in range(5))))
+            await settle_push_delivery(maker, delivery_id=spent, status="accepted")
+            after_accept = await claim(spent)
+
+            repaired = uuid.uuid4()
+            assert await claim(repaired) == "process"
+            await settle_push_delivery(
+                maker, delivery_id=repaired, status="rejected", reason="push_rejected"
+            )
+            reopened = list(await asyncio.gather(*(claim(repaired) for _ in range(5))))
+            await settle_push_delivery(maker, delivery_id=repaired, status="accepted")
+            after_repair = await claim(repaired)
+        finally:
+            await engine.dispose()
+        return first, after_accept, reopened, after_repair
+
+    first, after_accept, reopened, after_repair = asyncio.run(exercise())
+
+    assert sorted(first) == ["process"] + ["unsettled"] * 4, first
+    assert after_accept == "duplicate"
+    assert sorted(reopened) == ["process"] + ["unsettled"] * 4, reopened
+    assert after_repair == "duplicate"
 
 
 def test_a_dev_push_for_a_sha_no_longer_on_the_branch_is_still_rejected(

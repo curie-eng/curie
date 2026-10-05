@@ -111,8 +111,10 @@ The control routes (`/v1/event`, `/v1/steer`, `/v1/interrupt`, `/v1/reset`,
 header matching `CURIE_RUNNER_TOKEN` when that env var is set, returning 401
 otherwise. This is per-sandbox transport auth (defense-in-depth on the ACI
 ingress alongside the NetworkPolicy), not part of the frozen ACI wire contract.
-Enforcement is only-when-configured: with the var unset the app is pass-through
-(CLI, fake-model CI, and pre-token sandboxes stay unauthenticated). `GET
+A runner with the var unset or blank refuses to boot with
+`RunnerTokenRequiredError` unless `CURIE_RUNNER_ALLOW_TOKENLESS=1` is set, which
+only `curie skill up` and the eval sweep set; the chart always supplies a token
+from the `<release>-runner-token` Secret (#3821). `GET
 /healthz` and probe-only `GET /status` are never gated (the chart readinessProbe
 hits `/healthz`); replacement authority comes only from authenticated
 `GET /v1/status`.
@@ -345,7 +347,9 @@ resources and fake provider credentials, with no real model or approval action.
   loads into the prompt, one number for both; default 200, a nonpositive or
   unparseable value falls back to the default),
   `CURIE_RUNNER_PORT`, `CURIE_RUNNER_TOKEN` (per-sandbox bearer token gating
-  the three ACI POST routes; enforced only when set), `CURIE_FAKE_MODEL`
+  the control routes; required: the runner refuses to boot without it),
+  `CURIE_RUNNER_ALLOW_TOKENLESS` (local development only, `1` or `true`: serve
+  without a bearer token; a set token is still enforced), `CURIE_FAKE_MODEL`
   (offline smoke; no model call), `CURIE_DISALLOWED_TOOLS` (optional
   comma-separated tool names removed from the session and refused even under
   bypassPermissions; unset keeps every tool available). This stops the named
@@ -355,6 +359,10 @@ resources and fake provider credentials, with no real model or approval action.
   still-permitted shell tool (e.g. `Bash`) can reach the same HTTP state API
   directly. Naming `Bash` alongside the state tools closes that path today;
   removing the token itself needs a code change, not a config knob.
+  `CURIE_CHANNEL_BOUND` (optional, set by the worker when the turn has a
+  channel kind and address) adds the `SendMessage` and `PushNotification`
+  built-ins to that same removed list (#3336): neither reaches anyone from a
+  channel agent. Unset or false leaves the list exactly as configured.
   Hosted-connector Bearer secrets are a different class (#2559): the runner
   expands `Authorization: Bearer ${NAME}` into the in-memory MCP catalog at
   boot and drops `NAME` from the process environment (and from
@@ -379,6 +387,7 @@ curie build
 # Offline round-trip (fake model, no credential), OTel to the dev collector:
 docker run -d --name runner-smoke --network curie_default \
   -e CURIE_FAKE_MODEL=1 -e CURIE_PLUGIN_DIR=/unused \
+  -e CURIE_RUNNER_ALLOW_TOKENLESS=1 \
   -e CURIE_SESSION_ID=smoke -e CURIE_SANDBOX_ID=sbx \
   -e 'CURIE_BUDGET={"max_output_tokens_per_run":100000,"max_usd_per_day":5.0}' \
   -e OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -614,3 +615,41 @@ def test_a_runner_booted_for_another_run_is_replaced() -> None:
     assert _boots_differently(handle(run_a), env, caller_run=run_a) is False
     assert _boots_differently(handle(None), env, caller_run=run_a) is True
     assert _boots_differently(handle(None), {}, caller_run=None) is False
+
+
+def test_an_expired_boot_token_replaces_the_warm_sandbox() -> None:
+    """#3823: a follow-up replaces a sandbox whose token cannot cover that turn."""
+
+    from curie_internal.sandbox_token import mint
+    from curie_worker.binding import HISTORY_TOKEN_ENV
+
+    base = dict(
+        thread_key="slack:C0EXAMPLE1:t",
+        claim_name="claim",
+        sandbox_name="sandbox",
+        namespace="curie",
+        service_fqdn="sandbox.curie.svc",
+        port=8080,
+        session_id="session",
+    )
+    exp = int(time.time()) + 100
+    handle = SandboxHandle(**base, state_token_exp=exp)
+    later = mint(
+        "api-key",
+        agent="22222222-2222-4222-8222-222222222222",
+        scope="state",
+        exp=exp + 500,
+        claims={"cred": "ab" * 16, "binding": None, "memory": "read"},
+    )
+    sooner = mint(
+        "api-key",
+        agent="22222222-2222-4222-8222-222222222222",
+        scope="state",
+        exp=exp - 10,
+        claims={"cred": "cd" * 16, "binding": None, "memory": "read"},
+    )
+    assert _boots_differently(handle, {HISTORY_TOKEN_ENV: later}) is True
+    assert _boots_differently(handle, {HISTORY_TOKEN_ENV: sooner}) is False
+    dead = SandboxHandle(**base, state_token_exp=int(time.time()) - 1)
+    assert _boots_differently(dead, {}) is True
+    assert _boots_differently(SandboxHandle(**base), {}) is False

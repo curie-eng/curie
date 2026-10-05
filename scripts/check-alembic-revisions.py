@@ -22,6 +22,13 @@ DEFAULT_KINDS_FILE = (
     / "revision_kinds.json"
 )
 DEFAULT_WINDOW_FILE = DEFAULT_KINDS_FILE.with_name("schema_compat.json")
+DEFAULT_SERVING_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "packages/protected-hooks/src/curie_protected_hooks/schema_serving.json"
+)
+DEFAULT_CATALOG_FILE = (
+    Path(__file__).resolve().parents[1] / "cli/src/application_schema_windows.json"
+)
 DEFAULT_CHART_METADATA = (
     Path(__file__).resolve().parents[1] / "charts/curie/files/schema-compat.json"
 )
@@ -250,13 +257,11 @@ def main() -> int:
                 print(f"  invalid kinds: {', '.join(invalid)}", file=sys.stderr)
             return 1
 
-        # ADR-0142: the API remains the sole schema authority. The chart copy
-        # lets the CLI inspect the target before creating any cluster resource
-        # or relying on a container runtime on the operator's machine.
+        # @spec PROTECTED-HOOK-SOURCE-2: installed serving metadata owns its mirror.
         try:
-            window = json.loads(DEFAULT_WINDOW_FILE.read_text(encoding="utf-8"))
+            window = json.loads(DEFAULT_CATALOG_FILE.read_text(encoding="utf-8"))["candidate"]
             if window["schema_head"] != heads[0] or window["schema_min"] not in graph_ids:
-                raise ValueError("API compatibility window does not name the current graph")
+                raise ValueError("candidate compatibility window does not name the current graph")
             revisions = []
             for revision in ScriptDirectory(str(script_location)).walk_revisions():
                 parent = revision.down_revision
@@ -273,6 +278,23 @@ def main() -> int:
                         "sha256": hashlib.sha256(Path(revision.path).read_bytes()).hexdigest(),
                     }
                 )
+            serving = {
+                "schema_min": window["schema_min"],
+                "schema_head": window["schema_head"],
+                "revision_parents": {
+                    row["revision"]: row["parents"] for row in revisions
+                },
+            }
+            serving_text = json.dumps(serving, indent=2, sort_keys=True) + "\n"
+            window_text = json.dumps(window, indent=2, sort_keys=True) + "\n"
+            if args.write_upgrade_metadata:
+                DEFAULT_SERVING_FILE.parent.mkdir(parents=True, exist_ok=True)
+                DEFAULT_SERVING_FILE.write_text(serving_text, encoding="utf-8")
+                DEFAULT_WINDOW_FILE.write_text(window_text, encoding="utf-8")
+            if DEFAULT_SERVING_FILE.read_text(encoding="utf-8") != serving_text:
+                raise ValueError("shared serving metadata differs from candidate or actual graph")
+            if json.loads(DEFAULT_WINDOW_FILE.read_text(encoding="utf-8")) != window:
+                raise ValueError("API window mirror differs from shared serving metadata")
             metadata = {
                 "schema_min": window["schema_min"],
                 "schema_head": window["schema_head"],

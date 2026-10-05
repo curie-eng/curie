@@ -696,12 +696,30 @@ pub fn layers_stopping_to_match(
     }
 }
 
-/// The `--set` pairs that clear each affected agent's layered runner.
-pub fn runner_image_clears(agents: &[String]) -> Vec<String> {
-    agents
-        .iter()
-        .map(|agent| format!("agentSandbox.runnerImages.{agent}=null"))
-        .collect()
+/// Remove layered runner bindings from retained upgrade values (#3849).
+///
+/// Deleting the key is the clear. A null entry is not: Helm 3.20 keeps the
+/// previous digest when `--set key=null` follows a values file, and a nil
+/// entry fails the chart digest guard before a revision is created. Other
+/// agents, connector secrets, and unrelated settings stay.
+pub fn omit_runner_image_bindings(values: &mut serde_json::Value, agents: &[String]) {
+    let Some(images) = values
+        .pointer_mut("/agentSandbox/runnerImages")
+        .and_then(|node| node.as_object_mut())
+    else {
+        return;
+    };
+    for agent in agents {
+        images.remove(agent);
+    }
+    if images.is_empty() {
+        if let Some(sandbox) = values
+            .pointer_mut("/agentSandbox")
+            .and_then(|node| node.as_object_mut())
+        {
+            sandbox.remove("runnerImages");
+        }
+    }
 }
 
 /// The deploy-time decision: `Ok` when the lock's recorded base is the
@@ -751,7 +769,12 @@ pub fn runner_base_verdict(
     ))
 }
 
-fn helm_get_json(common: &CommonOpts, what: &str, all: bool, revision: u32) -> OpsCommand {
+pub(crate) fn helm_get_json(
+    common: &CommonOpts,
+    what: &str,
+    all: bool,
+    revision: u32,
+) -> OpsCommand {
     let mut args = vec![
         plain("get"),
         plain(what),
@@ -774,7 +797,7 @@ fn helm_get_json(common: &CommonOpts, what: &str, all: bool, revision: u32) -> O
 /// revision deployed, and that one is what the worker runs. With no deployed
 /// revision at all, the reason names the newest record so the operator knows
 /// which revision to roll back from.
-fn serving_revision(
+pub(crate) fn serving_revision(
     history: &serde_json::Value,
     release: &str,
 ) -> std::result::Result<u32, String> {
@@ -1635,10 +1658,33 @@ esac
             layered
         );
         assert!(layers_stopping_to_match(&[], Some(RUNNER_A), Some(RUNNER_B)).is_empty());
+        let mut values = serde_json::json!({"agentSandbox": {
+            "runnerImages": {"factory": RUNNER_A, "acme-other": RUNNER_B},
+            "connectorSecrets": {"factory": {"API_TOKEN": "acme-secret"}}
+        }, "api": {"existingSecret": "acme-api-credentials"}});
+        omit_runner_image_bindings(&mut values, &layered);
+        assert!(values
+            .pointer("/agentSandbox/runnerImages/factory")
+            .is_none());
         assert_eq!(
-            runner_image_clears(&layered),
-            vec!["agentSandbox.runnerImages.factory=null"]
+            values
+                .pointer("/agentSandbox/runnerImages/acme-other")
+                .and_then(|v| v.as_str()),
+            Some(RUNNER_B)
         );
+        assert_eq!(
+            values
+                .pointer("/agentSandbox/connectorSecrets/factory/API_TOKEN")
+                .and_then(|v| v.as_str()),
+            Some("acme-secret")
+        );
+        assert_eq!(
+            values
+                .pointer("/api/existingSecret")
+                .and_then(|v| v.as_str()),
+            Some("acme-api-credentials")
+        );
+        assert!(!values.to_string().contains("null"));
     }
 
     #[test]

@@ -31,7 +31,11 @@ WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 ACQUISITION_ACTIONS = frozenset(
     {
         "astral-sh/setup-uv",
+        "azure/setup-helm",
+        "actions/setup-node",
+        "pnpm/action-setup",
         "docker/setup-buildx-action",
+        "docker/setup-qemu-action",
         "docker/login-action",
         "actions/download-artifact",
         "helm/kind-action",
@@ -50,6 +54,46 @@ RETRY_ALLOWLIST = frozenset(
         ("ci.yaml", "e2e-cluster-chart-regressions", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-rollout-recovery", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-upgrade-matrix", "Create the disposable kind cluster"),
+        # Issue #3866: the same acquisition class as the #1106 wraps, on the
+        # ci.yaml and helm-ci.yaml steps that were still a single attempt.
+        ("ci.yaml", "action-pins", "Install uv"),
+        ("ci.yaml", "rust-lint", "Install uv"),
+        ("ci.yaml", "rust-test", "Install uv"),
+        ("ci.yaml", "rust-test", "Install Helm for CLI consumer render tests"),
+        ("ci.yaml", "contracts-ts", "Install Node"),
+        ("ci.yaml", "ui", "Install pnpm"),
+        ("ci.yaml", "ui", "Install Node"),
+        (
+            "ci.yaml",
+            "ci-images",
+            "Set up a cache-only buildx builder "
+            "(named, NOT the default -- preserves the overlay's FROM)",
+        ),
+        ("ci.yaml", "images", "Set up QEMU"),
+        ("ci.yaml", "images", "Set up Buildx"),
+        ("ci.yaml", "repo-toolchain-proof", "Install uv"),
+        ("ci.yaml", "changes", "Install uv"),
+        ("ci.yaml", "e2e-ladder-cluster", "Install Helm"),
+        ("ci.yaml", "e2e-ladder-cluster", "Install uv for publication proof"),
+        ("ci.yaml", "e2e-cluster-chart-regressions", "Install Helm"),
+        (
+            "ci.yaml",
+            "e2e-cluster-chart-regressions",
+            "Install uv for the connector readiness render",
+        ),
+        ("ci.yaml", "e2e-cluster-rollout-recovery", "Install Helm"),
+        ("ci.yaml", "e2e-released-upgrade", "Install Helm"),
+        ("ci.yaml", "e2e-released-upgrade", "Create the disposable kind cluster"),
+        ("ci.yaml", "e2e-released-upgrade-negative", "Install Helm"),
+        ("ci.yaml", "e2e-released-upgrade-negative", "Create the disposable kind cluster"),
+        ("ci.yaml", "e2e-cluster-upgrade-matrix", "Install Helm"),
+        ("ci.yaml", "e2e-required", "Install uv for the runtime assertion gate"),
+        ("helm-ci.yaml", "chart-lint-and-assertions-1", "Install Helm"),
+        ("helm-ci.yaml", "chart-assertions-2", "Install Helm"),
+        ("helm-ci.yaml", "chart-assertions-2", "Install uv"),
+        ("helm-ci.yaml", "chart-assertions-retained-values", "Install Helm"),
+        ("helm-ci.yaml", "reserved-env-upgrade", "Install Helm"),
+        ("helm-ci.yaml", "reserved-env-upgrade", "Create the kind cluster"),
         ("dependency-audit.yaml", "python-audit", "Install uv"),
         ("gitleaks.yaml", "gitleaks", "Pull the gitleaks image"),
         ("release.yaml", "build", "Set up Buildx"),
@@ -177,13 +221,6 @@ SHELL_KEYWORDS = frozenset({"do", "done", "fi", "then", "else", "esac", "true", 
 # deliberate decision with the same weight as adding one to RETRY_ALLOWLIST.
 RUN_RETRY_EXEMPT: frozenset[tuple[str, str, str]] = frozenset(
     {
-        ("ci.yaml", "python-pytest", "Wait for Langfuse to serve"),
-        # The fix pin job boots the same dev stack as the pytest shards,
-        # for the same reason and with the same readiness poll: Langfuse
-        # web has no compose healthcheck, so `--wait` returns while it is
-        # merely running. A readiness poll for an external service, not a
-        # retry of anything this repository builds or gates.
-        ("fix-pin.yaml", "fix-pin", "Wait for Langfuse to serve"),
         # The candidate API has already rolled out; this only waits for the
         # temporary local port-forward to expose its external health state.
         (
@@ -611,7 +648,7 @@ def test_rule_4_no_protected_step_carries_a_retry() -> None:
         "eligible acquisition, or it is not retrying:\n" + _render(unaccounted)
     )
     # Positive exercise of `_run_retry_construct` against real workflow steps.
-    # Both readiness polls use a loop keyword together with a sleep, so all this
+    # The exempt readiness polls use a loop keyword with a sleep, so all this
     # guards is the LOOP_KEYWORDS and SLEEP_CALL half of the helper: a typo in
     # either would satisfy every rule above just as well as a clean repository.
     #

@@ -146,13 +146,10 @@ fn stable_v0100_sorts_after_its_release_candidate_for_fail_forward() {
     );
 }
 
+/// @spec PROTECTED-HOOK-SOURCE-1
+/// The published graph through 0076 is followed by deploy notice expansion 0077.
+// @spec PROTECTED-HOOK-SOURCE-10
 // @spec DEPLOY-NOTICE-RELEASE-1.
-/// Released 0.9.1 reports catalog head 0044. The packaged chart applies
-/// expansions through 0059, contracts 0060 and 0063, feature-train expansions
-/// through 0069, route-identity contract 0070, then memory-writes expansion
-/// 0071, work item base expansion 0072, polling cursor expansion 0073,
-/// and deploy notice expansion 0074,
-/// so the upgrade is forward-only.
 #[test]
 fn v091_source_upgrades_through_the_packaged_chart_graph() {
     let source = window_for("0.9.1").expect("0.9.1 is catalogued");
@@ -161,18 +158,22 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0044");
-    assert_eq!(target.schema_min, "0074");
-    assert_eq!(target.schema_head, "0074");
+    assert_eq!(target.schema_min, "0077");
+    assert_eq!(target.schema_head, "0077");
 
     let pending =
         pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
+    assert_eq!(
+        pending.last().expect("candidate expansion is pending").kind,
+        "expand"
+    );
     let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
     assert_eq!(
         revisions,
         [
             "0045", "0046", "0047", "0048", "0049", "0050", "0051", "0052", "0053", "0054", "0055",
             "0056", "0057", "0058", "0059", "0060", "0061", "0062", "0063", "0064", "0065", "0066",
-            "0067", "0068", "0069", "0070", "0071", "0072", "0073", "0074"
+            "0067", "0068", "0069", "0070", "0071", "0072", "0073", "0075", "0076", "0077"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -203,9 +204,10 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
     );
     assert_eq!(decision.action, "apply");
     assert_eq!(decision.source_head.as_deref(), Some("0044"));
-    assert_eq!(decision.target_min, "0074");
+    assert_eq!(decision.target_min, "0077");
 }
 
+// @spec PROTECTED-HOOK-SOURCE-10
 #[test]
 fn released_v0101_upgrades_through_the_new_feature_train_revision() {
     // @spec DEPLOY-NOTICE-RELEASE-1.
@@ -215,15 +217,19 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0058");
-    assert_eq!(target.schema_head, "0074");
+    assert_eq!(target.schema_head, "0077");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.1 reaches the new head");
+    assert_eq!(
+        pending.last().expect("candidate expansion is pending").kind,
+        "expand"
+    );
     let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
     assert_eq!(
         revisions,
         [
             "0059", "0060", "0061", "0062", "0063", "0064", "0065", "0066", "0067", "0068", "0069",
-            "0070", "0071", "0072", "0073", "0074"
+            "0070", "0071", "0072", "0073", "0075", "0076", "0077"
         ]
     );
 
@@ -244,13 +250,11 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
         Some(&source.schema_head),
     );
     assert_eq!(decision.action, "apply");
-    assert_eq!(decision.target_min, "0074");
+    assert_eq!(decision.target_min, "0077");
 }
 
-/// Released 0.10.2 stamps 0062. Stable 0.10.3 follows with contract 0063,
-/// the feature train continues with expansions through 0069, contract
-/// 0070 establishes route identity, then expansions 0071 through 0074 add
-/// memory writes, work item bases, polling cursors, and deploy notices.
+/// @spec PROTECTED-HOOK-SOURCE-1
+// @spec PROTECTED-HOOK-SOURCE-10
 #[test]
 fn released_v0102_upgrades_through_the_feature_train_revisions() {
     // @spec DEPLOY-NOTICE-RELEASE-1.
@@ -260,14 +264,19 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0062");
+    assert_eq!(target.schema_head, "0077");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.2 reaches the new head");
+    assert_eq!(
+        pending.last().expect("candidate expansion is pending").kind,
+        "expand"
+    );
     let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
     assert_eq!(
         revisions,
         [
             "0063", "0064", "0065", "0066", "0067", "0068", "0069", "0070", "0071", "0072", "0073",
-            "0074"
+            "0075", "0076", "0077"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -295,10 +304,8 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
     assert_eq!(decision.action, "apply");
 }
 
-/// Released 0.10.3 owns revision 0063. The feature train must start after it,
-/// so an upgrade applies every unreleased expansion without mistaking the
-/// released factory queue migration for runner resources. Route identity 0070
-/// is the only contract step; expansions 0071 through 0074 follow it.
+/// @spec PROTECTED-HOOK-SOURCE-1
+// @spec PROTECTED-HOOK-SOURCE-10
 #[test]
 fn released_v0103_upgrades_through_the_renumbered_feature_train() {
     // @spec DEPLOY-NOTICE-RELEASE-1.
@@ -308,12 +315,20 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0063");
+    assert_eq!(target.schema_head, "0077");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.3 reaches the new head");
+    assert_eq!(
+        pending.last().expect("candidate expansion is pending").kind,
+        "expand"
+    );
     let revisions: Vec<&str> = pending.iter().map(|step| step.revision.as_str()).collect();
     assert_eq!(
         revisions,
-        ["0064", "0065", "0066", "0067", "0068", "0069", "0070", "0071", "0072", "0073", "0074"]
+        [
+            "0064", "0065", "0066", "0067", "0068", "0069", "0070", "0071", "0072", "0073", "0075",
+            "0076", "0077"
+        ]
     );
     let contracts: Vec<&str> = pending
         .iter()

@@ -242,6 +242,13 @@ Curie leans on these systems rather than building its own (ADR-0007,
 - **claude-agent-sdk** as the harness (ADR-0005) — one of the two most load-bearing adopt calls of all
 - **the Claude Code plugin format verbatim** — the other, which ADR-0007 calls "the distribution wedge — do not invent a format"
 
+AgentMail's filtering does not establish sender authentication that Curie can
+verify. It supplies no trusted positive aligned verdict or guarantee of header
+provenance and stripping. The mail adapter therefore refuses every current
+AgentMail inbound message with `authentication_unverifiable` before starting a
+turn or resolving an approval. Replies for historical accepted deliveries remain
+deliverable. See [inbound security](apps/mail-adapter/README.md#inbound-security).
+
 Curie builds **seven** things around that spine: the API, the dispatcher, the mail
 adapter, the worker+runner glue, the UI, the CLI, and the umbrella Helm chart ([Deployment, CI, and release](#deployment-ci-and-release)). The
 chart is a built thing, not a packaging afterthought. The security rails are

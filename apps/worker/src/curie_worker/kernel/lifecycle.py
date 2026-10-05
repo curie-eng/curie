@@ -539,7 +539,11 @@ async def _process_event(
             # No kind/address: there is no binding to scope the state
             # namespace to. No approval grant, resumed kind or decision
             # either: a targetless turn is never a resume.
-            boot_env = binding.boot_env(resolved, thread_key)
+            boot_env = binding.boot_env(
+                resolved,
+                thread_key,
+                token_ttl_s=self._runner.turn_deadline_s(claim._remaining_budget(lease)),
+            )
             workspace_deployment_id = resolved.deployment_id
             packs = binding.packs_for(resolved)
             approval_routes = resolved.approval_routes
@@ -675,6 +679,7 @@ async def _process_event(
             boot_env_kwargs: dict[str, Any] = {
                 "kind": handle.kind,
                 "address": handle.channel,
+                "token_ttl_s": self._runner.turn_deadline_s(claim._remaining_budget(lease)),
             }
             # The internal thread key is channel-scoped, so it no longer
             # starts with the eval marker carried by conversation_id.

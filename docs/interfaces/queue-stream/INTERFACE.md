@@ -311,6 +311,22 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
   error it can recognize as a missing group; and an atomic "set a TTL marker only if
   absent, and append only if the marker was set" step, which is what keeps one
   reconciler round from enqueueing the same turn twice.
+- **Retention trims the consumed streams with a raw Lua script.** The settled-entry
+  pass (`apps/worker/src/curie_worker/stream_retention.py::trim_settled`, driven by
+  `apps/worker/src/curie_worker/stream_retention.py::StreamRetention`) reads each
+  group with `XINFO GROUPS` and `XPENDING`, then issues `XTRIM ... MINID` in one EVAL
+  script on the worker's concrete client. None of those verbs is on `StreamBroker`. A
+  second broker must supply an equivalent "drop everything every group has
+  acknowledged and that is older than the lag window" operation, or keep unbounded
+  growth.
+- **The delivery lease store reads and claims the stream off-port.**
+  `apps/worker/src/curie_worker/delivery_lease.py::DeliveryLeaseStore` is another
+  narrow adjacent adapter on the concrete client. `entry_vanished` calls `xrange`
+  for one exact entry id, and `heartbeat` runs a Lua script that renews the lease
+  and re-claims the PEL row with `XCLAIM ... JUSTID` to the current consumer, so
+  the claim does not burn a delivery of the ADR-0039 budget. A second broker must
+  provide a claim that moves ownership without bumping the delivery count, or
+  that budget accounting changes.
 - **The redis-py exception surface leaks.** The ports type the verbs but not the error
   contract: `redis.exceptions` propagate through the callers unabstracted, so a non-redis
   broker must either raise redis-py-compatible exceptions or the call sites must learn its
@@ -328,4 +344,4 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
 - **Epic(s):** #85 — vision: make the broker itself swappable behind the stream contract
 - **Epic(s):** #7 — payload promotion into `packages/aci-protocol` (overlaps the channel seam, landed)
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — opinionated core (`curie:runs` stream), not one of the six swap jobs
-- **ADR(s):** [ADR-0027](../../adr/0027-thin-broker-port-defer-second-broker.md) — the broker port at the non-sacred seams; [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — adopt-not-build (Valkey adopted; second broker deferred); [ADR-0039](../../adr/0039-bounded-delivery-and-a-dead-letter-graveyard.md) — the delivery cap and dead-letter graveyard that added `xpending_range`/`xrange`/`xadd` to the port; [ADR-0131](../../adr/0131-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md) — an adjacent fenced-owner store for delivery liveness and the execution budget, not a `StreamBroker` verb
+- **ADR(s):** [ADR-0027](../../adr/0027-thin-broker-port-defer-second-broker.md) — the broker port at the non-sacred seams; [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — adopt-not-build (Valkey adopted; second broker deferred); [ADR-0039](../../adr/0039-bounded-delivery-and-a-dead-letter-graveyard.md) — the delivery cap and dead-letter graveyard that added `xpending_range`/`xrange`/`xadd` to the port; [ADR-0131](../../adr/0131-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md) — an adjacent fenced-owner store for delivery liveness and the execution budget, not a `StreamBroker` verb; [ADR-0184](../../adr/0184-settled-stream-entries-are-trimmed-receipts-live-in-postgres-backlog-is-counted.md): settled stream entries are trimmed by the worker's retention pass, an off-port `XTRIM MINID`

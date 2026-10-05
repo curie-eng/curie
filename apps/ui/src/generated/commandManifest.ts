@@ -895,6 +895,52 @@ export const commandManifest = {
       "name": "local",
       "subcommands": [
         {
+          "about": "Bootstrap access to the Curie Console",
+          "hidden": false,
+          "name": "console",
+          "subcommands": [
+            {
+              "about": "Mint a Console login code using the stored local installation credential",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Subject bound to the Console session created from this code",
+                  "id": "subject",
+                  "long": "subject",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Print the request plan without minting a code",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "login"
+            }
+          ]
+        },
+        {
           "about": "Bring the dev stack up (`core` with `--minimal`, else `full`) and print URLs. Add `--slack` for the optional dispatcher",
           "args": [
             {
@@ -1252,9 +1298,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                ""
-              ],
               "env": "SLACK_APP_TOKEN",
               "global": false,
               "help": "Slack app token. Defaults from SLACK_APP_TOKEN",
@@ -1264,9 +1307,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                ""
-              ],
               "env": "SLACK_BOT_TOKEN",
               "global": false,
               "help": "Slack bot token. Defaults from SLACK_BOT_TOKEN",
@@ -1356,9 +1396,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "valkeypass"
-              ],
               "env": "CURIE_VALKEY_PASSWORD",
               "global": false,
               "help": "Valkey password (compose default `valkeypass`). Prefer the CURIE_VALKEY_PASSWORD env var over passing a real secret on the command line, where it leaks via `ps` and shell history",
@@ -1376,9 +1413,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "help": "Platform API key for the default-channel lookup",
@@ -1470,9 +1504,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "valkeypass"
-              ],
               "env": "CURIE_VALKEY_PASSWORD",
               "global": false,
               "help": "Valkey password (compose default `valkeypass`). Prefer the CURIE_VALKEY_PASSWORD env var over passing a real secret on the command line, where it leaks via `ps` and shell history",
@@ -1490,9 +1521,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "help": "Platform API key for the default-channel lookup",
@@ -1653,9 +1681,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "help": "Platform API key",
@@ -1766,9 +1791,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -1818,9 +1840,6 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "default_values": [
-                    "curie-dev-key"
-                  ],
                   "env": "CURIE_API_KEY",
                   "global": false,
                   "id": "api_key",
@@ -1865,9 +1884,6 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "default_values": [
-                    "curie-dev-key"
-                  ],
                   "env": "CURIE_API_KEY",
                   "global": false,
                   "id": "api_key",
@@ -1919,9 +1935,6 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "default_values": [
-                    "curie-dev-key"
-                  ],
                   "env": "CURIE_API_KEY",
                   "global": false,
                   "id": "api_key",
@@ -1968,9 +1981,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -2071,9 +2081,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -2310,9 +2317,6 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "default_values": [
-                    "curie-dev-key"
-                  ],
                   "env": "CURIE_API_KEY",
                   "global": false,
                   "help": "Platform API key",
@@ -2348,9 +2352,6 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "default_values": [
-                    "curie-dev-key"
-                  ],
                   "env": "CURIE_API_KEY",
                   "global": false,
                   "help": "Platform API key",
@@ -2439,9 +2440,6 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "default_values": [
-                    "curie-dev-key"
-                  ],
                   "env": "CURIE_API_KEY",
                   "global": false,
                   "help": "Platform API key",
@@ -2570,9 +2568,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -2674,9 +2669,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -2722,9 +2714,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -2802,9 +2791,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -2902,9 +2888,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -2949,9 +2932,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -3008,9 +2988,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -3063,9 +3040,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -3130,9 +3104,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -3195,9 +3166,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -3266,9 +3234,6 @@ export const commandManifest = {
                   "required": false
                 },
                 {
-                  "default_values": [
-                    "curie-dev-key"
-                  ],
                   "env": "CURIE_API_KEY",
                   "global": false,
                   "id": "api_key",
@@ -3316,9 +3281,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "curie-dev-key"
-              ],
               "env": "CURIE_API_KEY",
               "global": false,
               "id": "api_key",
@@ -3372,6 +3334,72 @@ export const commandManifest = {
       "name": "cluster",
       "subcommands": [
         {
+          "about": "Bootstrap access to the Curie Console",
+          "hidden": false,
+          "name": "console",
+          "subcommands": [
+            {
+              "about": "Mint a Console login code using the selected release credential",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Subject bound to the Console session created from this code",
+                  "id": "subject",
+                  "long": "subject",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to reach the release API over loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Print the request plan without minting a code",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "login"
+            }
+          ]
+        },
+        {
           "about": "Report value paths that differ between a release and pending Helm files. A nonempty report is advisory and exits successfully",
           "args": [
             {
@@ -3411,7 +3439,7 @@ export const commandManifest = {
           "name": "lint-values"
         },
         {
-          "about": "Install or upgrade the Curie release via Helm (helm upgrade --install). By default it puts the UI and Langfuse on node ports for tailnet/LAN access; pass --no-expose to keep them ClusterIP-only. Set CURIE_CREDENTIALS to a supported model provider credential (CURIE_MODEL_CREDENTIALS is a deprecated alias) to install with the real model. A fresh install without it uses fake mode. A rerun preserves the recorded model configuration. Use --fake-model to explicitly downgrade to fake mode. An sk-ant- or sk-or- credential infers its provider egress when --allow-egress-host is absent. Other credential shapes remain sealed until their provider or a raw range is explicit. Existing singleton resources are reused only from complete Helm ownership metadata. An exact admission result that the gvisor RuntimeClass is absent applies security.gvisor.mode=off and retries once. Every inferred value is printed",
+          "about": "Install or upgrade the Curie release via Helm (helm upgrade --install). By default it puts the UI and Langfuse on node ports for tailnet/LAN access; pass --no-expose to keep them ClusterIP-only. Set CURIE_CREDENTIALS to a supported model provider credential (CURIE_MODEL_CREDENTIALS is a deprecated alias) to install with the real model. A fresh install without it uses fake mode. A rerun preserves the recorded model configuration. Use --fake-model to explicitly downgrade to fake mode. An sk-ant- or sk-or- credential infers its provider egress when --allow-egress-host is absent. Other credential shapes remain sealed until their provider or a raw range is explicit. A controller owned by another Helm release is reused. A healthy unowned controller whose image matches the chart is reused. An unhealthy or different unowned controller stops the install and names the kubectl repair. A direct GET that returns NotFound applies security.gvisor.mode=off before the first install and prints the inference. A forbidden lookup still applies that override from the exact admission result and retries once. Every inferred value is printed",
           "args": [
             {
               "default_values": [
@@ -4190,9 +4218,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                ""
-              ],
               "env": "SLACK_APP_TOKEN",
               "global": false,
               "help": "Slack app token. Defaults from SLACK_APP_TOKEN",
@@ -4202,9 +4227,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                ""
-              ],
               "env": "SLACK_BOT_TOKEN",
               "global": false,
               "help": "Slack bot token. Defaults from SLACK_BOT_TOKEN",
@@ -4275,9 +4297,6 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                ""
-              ],
               "global": false,
               "help": "Path to the App's PEM private key file. The path is passed to helm with --set-file, so the key's contents never enter argv",
               "id": "private_key",
@@ -4481,6 +4500,14 @@ export const commandManifest = {
               "help": "Helm `--timeout` in seconds for the upgrade. Default: the release's own drain contract, the `curie.ai/minimum-helm-timeout-seconds` annotation on its pre-upgrade worker drain hook (worker deliveryBudgetSeconds + reserve + Job and grace slack), never below 900. A factory install with a 10800s budget needs about 21900s",
               "id": "timeout",
               "long": "timeout",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Bind this digest-pinned runner image in the same helm upgrade as the intake settings (`AGENT=ghcr.io/example/runner@sha256:<digest>`). The chart is still `--chart`. The values mode stays `--reuse-values`",
+              "id": "runner_image",
+              "long": "runner-image",
               "positional": false,
               "required": false
             },
@@ -7021,7 +7048,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Kubernetes context. When omitted, the current kubeconfig context is used. When neither exists, a kind cluster is created",
+              "help": "Kubernetes context. An explicit name is used with no prompt. When omitted, a current kind context proceeds with no prompt, and no current context creates a kind cluster. Any other current context requires confirmation in a terminal and is refused without one. Pass this flag to proceed without a prompt",
               "id": "context",
               "long": "context",
               "positional": false,
@@ -7437,9 +7464,6 @@ export const commandManifest = {
           "required": false
         },
         {
-          "default_values": [
-            "curie-dev-key"
-          ],
           "env": "CURIE_API_KEY",
           "global": false,
           "help": "Platform API key",
@@ -7790,6 +7814,24 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "factory-e2e"
+        },
+        {
+          "about": "Serve a TLS GitHub fixture or capture public check lifecycle recordings",
+          "args": [
+            {
+              "global": false,
+              "help": "`serve` or `capture`, followed by fixture flags",
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709552000,
+                "min": 1
+              },
+              "positional": true,
+              "required": true
+            }
+          ],
+          "hidden": false,
+          "name": "github-stub"
         },
         {
           "about": "Select the end to end tiers CI would run for paths or revisions",

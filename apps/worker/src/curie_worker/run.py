@@ -25,6 +25,7 @@ import httpx
 import redis
 from aci_protocol.s3 import build_s3_client
 from aci_protocol.turn import DEFAULT_IDENTITY
+from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import bootstrap_service_telemetry, record_metric
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry
@@ -56,6 +57,7 @@ from .e2e_reaper import E2EReaperLoop
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
+from .hook_source_guard import CronHookSourceGuard
 from .kernel.core import Kernel
 from .kernel.memory import drain_pending_memory_closes
 from .killswitch import KillSwitch
@@ -85,12 +87,14 @@ from .sandbox import (
     SubstrateConfig,
     SuspendedThreadError,
 )
+from .schema_startup import assert_worker_schema
 from .sibling_turns import build_sibling_limit
 from .slack_tokens import slack_bot_tokens
 from .stream_retention import StreamRetention, build_stream_retention
 from .sweep import SweepCoverage
 from .threadlock import ThreadLock
 from .upgrade_drain import UpgradeDrainGate
+from .worker_lifecycle import WorkerResources
 from .workitem_dispatch import WorkItemDispatchClient
 from .workitem_orphans import WorkItemOrphanSweeper
 from .workspace import (
@@ -107,8 +111,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Runtime:
-    """The wired worker: the two Valkey consumers (runs + evals) plus the
-    resources whose lifetimes they share, so ``_run`` can drive and dispose them."""
+    """@spec PROTECTED-HOOK-SOURCE-2."""
 
     consumer: Consumer
     killswitch: KillSwitch
@@ -144,6 +147,8 @@ class Runtime:
     # Trims settled entries off the runs and eval streams (ADR 0184). Optional
     # only so a Runtime constructed elsewhere need not name it.
     stream_retention: StreamRetention | None = None
+    resources: WorkerResources | None = None
+    source_gate: SourceGate | None = None
 
 
 # 365 days, the ceiling shared by all three operator-tunable seconds knobs
@@ -357,6 +362,7 @@ def _sandbox_client(
         client = DockerSandboxClient(
             image=env.get("CURIE_RUNNER_IMAGE", "curie-runner"),
             bundle_store=bundle_store,
+            github_api_url=config.publication_github_api_url,
             network=env.get("CURIE_DOCKER_NETWORK") or None,
             otel_endpoint=runner_otel_endpoint or None,
             default_plugin_dir=config.bundle_plugin_dir,
@@ -383,15 +389,39 @@ def _sandbox_client(
     return KubernetesSandboxClient(sub_config.namespace)
 
 
-def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
+def create_source_gate_engine(config: WorkerConfig) -> AsyncEngine:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+    return create_async_engine(
+        config.database_url, pool_size=4, max_overflow=0, pool_timeout=30, pool_pre_ping=True
+    )
+
+
+async def _close_sync(close: Callable[[], None]) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+    await asyncio.to_thread(close)
+
+
+def build(
+    config: WorkerConfig, env: Mapping[str, str], *, resources: WorkerResources | None = None
+) -> Runtime:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+    owner = resources if resources is not None else WorkerResources()
+    owner.register_close("memory-drain", drain_pending_memory_closes, order=0)
+    gate_engine = create_source_gate_engine(config)
+    owner.register_close("source-gate", gate_engine.dispose, order=100)
+    source_gate = SourceGate(gate_engine)
+    engine = create_async_engine(config.database_url, pool_pre_ping=True)
+    owner.register_close("work-engine", engine.dispose, order=90)
     async_redis: AsyncRedis = AsyncRedis(
         **config.valkey_client_kwargs(),
         socket_timeout=config.valkey_socket_timeout_s,
     )
+    owner.register_close("runs-redis", async_redis.aclose, order=40)
     sync_redis = redis.Redis(
         **config.valkey_client_kwargs(),
         socket_timeout=config.valkey_socket_timeout_s,
     )
+    owner.register_close("affinity-redis", lambda: _close_sync(sync_redis.close), order=43)
     pressure_async_redis: AsyncRedis = AsyncRedis(
         **config.valkey_client_kwargs(),
         socket_timeout=1.0,
@@ -400,6 +430,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         driver_info=None,
         maint_notifications_config=MaintNotificationsConfig(enabled=False),
     )
+    owner.register_close("pressure-redis", pressure_async_redis.aclose, order=41)
     sub_config = _substrate_config(env)
     substrate = SandboxSubstrate(
         _sandbox_client(config, env, sub_config),
@@ -411,15 +442,17 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         total_timeout_s=config.runner_total_timeout_s,
         snapshot_patch_max_bytes=config.publication_patch_max_bytes,
     )
-    engine = create_async_engine(config.database_url, pool_pre_ping=True)
+    owner.register_close("runner", runner.close, order=10)
     binding = BindingResolver(engine, config)
+    workspace_s3 = build_s3_client(
+        endpoint_url=config.s3_endpoint_url,
+        access_key=config.s3_access_key,
+        secret_key=config.s3_secret_key,
+        region=config.s3_region,
+    )
+    owner.register_close("workspace-s3", lambda: _close_sync(workspace_s3.close), order=70)
     workspace_objects = WorkspaceObjectStore(
-        client=build_s3_client(
-            endpoint_url=config.s3_endpoint_url,
-            access_key=config.s3_access_key,
-            secret_key=config.s3_secret_key,
-            region=config.s3_region,
-        ),
+        client=workspace_s3,
         bucket=config.workspace_bucket,
         prefix=config.workspace_object_prefix,
     )
@@ -428,6 +461,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
             preparer=WorkspacePreparer(
                 credentials=WorkspaceCredentialClient(
                     api_url=config.api_base_url,
+                    github_api_url=config.publication_github_api_url,
                     worker_token=config.internal_worker_token,
                 ),
                 commands=SubprocessCommands(),
@@ -512,6 +546,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     # One API-lane HTTP client shared by the approval writer (#244) and the two
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
     eval_http = httpx.AsyncClient(timeout=30.0)
+    owner.register_close("eval-http", eval_http.aclose, order=30)
     approval_client = ApprovalClient(
         api_base_url=config.api_base_url,
         api_key=config.api_key,
@@ -527,6 +562,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         client=eval_http,
     )
     sink = build_reply_sink(config, slack_tokens=slack_tokens)
+    owner.register_close("reply-sink", sink.aclose, order=20)
     # ADR-0168 decision 6. None unless a sibling identity can exist here, so a
     # stock install asks no auth.test, reads no binding and makes no Valkey
     # call for it.
@@ -545,8 +581,12 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     )
     # One bundle trigger source, shared: the cron loop fires slots from it, and
     # a sweep's coverage read dates the slot in the same trigger's zone (#2878).
+    cron_bundle_store = BundleStore(config)
+    owner.register_close(
+        "cron-bundle-s3", lambda: _close_sync(cron_bundle_store._client.close), order=71
+    )
     trigger_source = BundleTriggerSource(
-        BundleStore(config),
+        cron_bundle_store,
         max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
         max_compression_ratio=config.bundle_max_compression_ratio,
         max_members=config.bundle_max_members,
@@ -635,6 +675,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         **config.valkey_client_kwargs(),
         socket_timeout=config.valkey_socket_timeout_s,
     )
+    owner.register_close("eval-redis", eval_redis.aclose, order=42)
     eval_consumer = EvalStreamConsumer(
         redis=eval_redis,
         config=config,
@@ -684,6 +725,8 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         eval_redis=eval_redis,
         eval_http=eval_http,
         engine=engine,
+        resources=owner,
+        source_gate=source_gate,
         card_store=card_store,
         orphan_sweeper=(
             WorkItemOrphanSweeper(
@@ -704,6 +747,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         connector_loop=_build_connector_loop(config, engine),
         e2e_reaper=_build_e2e_reaper(config, work_items),
         cron_loop=CronSchedulerLoop(
+            source_guard=CronHookSourceGuard(source_gate, engine),
             engine=engine,
             redis=async_redis,
             source=trigger_source,
@@ -1125,7 +1169,23 @@ def _build_publication_loop(
 
 
 async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
-    rt = build(config, env)
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
+    await assert_worker_schema(config)
+    resources = WorkerResources()
+    primary: BaseException | None = None
+    try:
+        rt = build(config, env, resources=resources)
+        await _run_runtime(rt, config, resources)
+    # retain the primary fault while guaranteed resource cleanup runs.
+    except BaseException as error:  # noqa: BLE001
+        primary = error
+    finally:
+        await resources.aclose(primary=primary)
+    logging.getLogger("curie_worker").info("worker stopped")
+
+
+async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResources) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
 
     loop = asyncio.get_running_loop()
 
@@ -1133,8 +1193,10 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
     # heartbeat runs on this same event loop, so a wedged loop stops touching the
     # file and the k8s exec probe restarts the pod (issue #71).
     shutdown = asyncio.Event()
+    installed_signals: list[signal.Signals] = []
 
     def _stop() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
         rt.consumer.request_stop()
         rt.killswitch.request_stop()
         rt.eval_consumer.request_stop()
@@ -1142,8 +1204,16 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
             rt.deploy_notice_consumer.request_stop()
         shutdown.set()
 
+    def _remove_signals() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        for sig in installed_signals:
+            loop.remove_signal_handler(sig)
+
+    resources.register_stop("shutdown", _stop)
+    resources.register_stop("signal-handlers", _remove_signals)
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _stop)
+        installed_signals.append(sig)
 
     logging.getLogger("curie_worker").info("worker starting")
     # One-shot, before any consumer reads: rekey approval-card refs left under
@@ -1196,110 +1266,41 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
                 logger.exception("work-item orphan boot sweep failed; continuing boot")
     retention = getattr(rt, "stream_retention", None)
     policy = _supervise_policy(config)
-    try:
-        # return_exceptions=True + per-task restart: a crash in one consumer must
-        # not cancel its siblings (#673). Supervisors only return on shutdown.
-        await asyncio.gather(
-            _supervise("runs", rt.consumer.run, shutdown, **policy),
-            _supervise("killswitch", rt.killswitch.run, shutdown, **policy),
-            _supervise("evals", rt.eval_consumer.run, shutdown, **policy),
-            *(
-                [_supervise("deploy-notices", rt.deploy_notice_consumer.run, shutdown, **policy)]
-                if rt.deploy_notice_consumer is not None
-                else []
-            ),
-            _supervise(
-                "heartbeat",
-                lambda: run_heartbeat(config.heartbeat_file, config.heartbeat_interval_s, shutdown),
-                shutdown,
-                **policy,
-            ),
-            *(
-                [
-                    _supervise(
-                        "connectors",
-                        lambda: rt.connector_loop.run_forever(shutdown),  # type: ignore[union-attr]
-                        shutdown,
-                        **policy,
-                    )
-                ]
-                if rt.connector_loop is not None
-                else []
-            ),
-            *(
-                [
-                    _supervise(
-                        "e2e-reaper",
-                        lambda: rt.e2e_reaper.run_forever(shutdown),  # type: ignore[union-attr]
-                        shutdown,
-                        **policy,
-                    )
-                ]
-                if getattr(rt, "e2e_reaper", None) is not None
-                else []
-            ),
-            *(
-                [
-                    _supervise(
-                        "cron",
-                        lambda: rt.cron_loop.run_forever(shutdown),  # type: ignore[union-attr]
-                        shutdown,
-                        **policy,
-                    )
-                ]
-                if rt.cron_loop is not None
-                else []
-            ),
-            *(
-                [
-                    _supervise(
-                        "publications",
-                        lambda: rt.publication_loop.run_forever(shutdown),  # type: ignore[union-attr]
-                        shutdown,
-                        **policy,
-                    )
-                ]
-                if getattr(rt, "publication_loop", None) is not None
-                else []
-            ),
-            *(
-                [
-                    _supervise(
-                        "work-item-orphans",
-                        lambda: sweeper.run_forever(shutdown),
-                        shutdown,
-                        **policy,
-                    )
-                ]
-                if sweeper is not None
-                else []
-            ),
-            *(
-                [
-                    _supervise(
-                        "stream-retention",
-                        lambda: retention.run_forever(shutdown),
-                        shutdown,
-                        **policy,
-                    )
-                ]
-                if retention is not None
-                else []
-            ),
-            return_exceptions=True,
+
+    def launch(name: str, factory: Callable[[], Awaitable[None]]) -> asyncio.Task[None]:
+        """@spec PROTECTED-HOOK-SOURCE-2."""
+        task = asyncio.create_task(
+            _supervise(name, factory, shutdown, **policy), name=f"curie-worker:{name}"
         )
-    finally:
-        # Memory turn closes still in flight get a short grace, then are let
-        # go: an unclosed credential is refused at its expiry anyway (#3776).
-        await drain_pending_memory_closes()
-        await rt.runner.close()
-        await rt.sink.aclose()
-        await rt.eval_http.aclose()
-        await rt.async_redis.aclose()
-        await rt.pressure_async_redis.aclose()
-        await rt.eval_redis.aclose()
-        await rt.engine.dispose()
-    logging.getLogger("curie_worker").info("worker stopped")
+        resources.register_task(name, task)
+        return task
+
+    tasks = [
+        launch("runs", rt.consumer.run),
+        launch("killswitch", rt.killswitch.run),
+        launch("evals", rt.eval_consumer.run),
+        launch(
+            "heartbeat",
+            lambda: run_heartbeat(config.heartbeat_file, config.heartbeat_interval_s, shutdown),
+        ),
+    ]
+    if rt.deploy_notice_consumer is not None:
+        tasks.append(launch("deploy-notices", rt.deploy_notice_consumer.run))
+    if rt.connector_loop is not None:
+        tasks.append(launch("connectors", lambda: rt.connector_loop.run_forever(shutdown)))  # type: ignore[union-attr]
+    if getattr(rt, "e2e_reaper", None) is not None:
+        tasks.append(launch("e2e-reaper", lambda: rt.e2e_reaper.run_forever(shutdown)))  # type: ignore[union-attr]
+    if rt.cron_loop is not None:
+        tasks.append(launch("cron", lambda: rt.cron_loop.run_forever(shutdown)))  # type: ignore[union-attr]
+    if getattr(rt, "publication_loop", None) is not None:
+        tasks.append(launch("publications", lambda: rt.publication_loop.run_forever(shutdown)))  # type: ignore[union-attr]
+    if sweeper is not None:
+        tasks.append(launch("work-item-orphans", lambda: sweeper.run_forever(shutdown)))
+    if retention is not None:
+        tasks.append(launch("stream-retention", lambda: retention.run_forever(shutdown)))
+    # Cancellation returns to the owner without an implicit, unbounded gather join.
+    # Each supervisor still contains ordinary failures and preserves sibling isolation.
+    await asyncio.wait(tasks)
 
 
 def main(env: Mapping[str, str] | None = None) -> None:

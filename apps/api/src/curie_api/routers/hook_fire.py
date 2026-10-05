@@ -7,15 +7,28 @@ so the worker settles the row when the turn ends.
 
 from __future__ import annotations
 
+import logging
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
 from aci_protocol import HookRunRef, QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from channel_protocol import hook_conversation_id
+from curie_protected_hooks.source_policy_sql import (
+    SourceAgentNotFound,
+    SourceGate,
+    SourceGateContext,
+    SourceGateInvalid,
+    SourceSnapshotUnavailable,
+    ensure_source_gate_live,
+    read_source_snapshot,
+)
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import text
+from sqlalchemy import select, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -25,8 +38,11 @@ from curie_api.schemas.schedules import HookFireOut, ScheduleOutcome
 from ..auth import require_api_key
 from ..db import SCHEMA
 from ..deps import SessionDep, StoreDep
+from ..hook_partition import HOOK_NAME
+from ..models import Agent
 
 router = APIRouter(dependencies=[Depends(require_api_key)])
+logger = logging.getLogger(__name__)
 
 _DEFAULT_USD = 10.0
 _DEFAULT_TOKENS = 100_000
@@ -134,14 +150,63 @@ def _record(
     )
 
 
+@asynccontextmanager
+async def _source_locked_agent(
+    request: Request, session: AsyncSession, agent_id: uuid.UUID
+) -> AsyncIterator[tuple[Agent, SourceGateContext]]:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+    try:
+        await session.rollback()
+        gate = getattr(request.app.state, "source_gate", None)
+        if not isinstance(gate, SourceGate):
+            raise SourceSnapshotUnavailable("source_gate_unavailable")
+        async with gate.hold(agent_id) as held:
+            agent: Agent | None = await session.scalar(
+                select(Agent).where(Agent.id == agent_id).execution_options(populate_existing=True)
+            )
+            if agent is None:
+                raise HTTPException(404, "agent not found")
+            yield agent, held
+    except (SourceAgentNotFound, SourceGateInvalid, SourceSnapshotUnavailable, SQLAlchemyError):
+        raise HTTPException(503, "authority_unavailable") from None
+
+
+async def _require_ordinary_source(
+    session: AsyncSession, held: SourceGateContext, name: str
+) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
+    if HOOK_NAME.fullmatch(name):
+        snapshot = await read_source_snapshot(held, await session.connection(), name)
+        if not snapshot.never_configured:
+            raise HTTPException(503, snapshot.refusal_reason or "authority_unavailable")
+        return
+    await ensure_source_gate_live(held)
+    presence = (
+        await session.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM curie.hook_source_policies "
+                "WHERE agent_id=:agent AND hook=:hook) AS policy, "
+                "EXISTS (SELECT 1 FROM curie.hook_source_operations "
+                "WHERE agent_id=:agent AND hook=:hook) AS history"
+            ),
+            {"agent": held.agent_id, "hook": name},
+        )
+    ).one()
+    await ensure_source_gate_live(held)
+    if presence.policy or presence.history:
+        raise HTTPException(503, "authority_unavailable" if presence.policy else "pending_history")
+
+
 async def _insert(
     session: AsyncSession,
     *,
+    held: SourceGateContext,
     agent_id: uuid.UUID,
     version_id: uuid.UUID,
     name: str,
     outcome: str | None,
 ) -> Any:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
     slot = datetime.now(UTC)
     await session.execute(_sql(_LOCK_SQL), {"agent_id": str(agent_id), "name": name})
     if outcome is None:
@@ -150,6 +215,7 @@ async def _insert(
         ).first()
         if busy is not None:
             outcome = "skipped"
+    await ensure_source_gate_live(held)
     row = (
         (
             await session.execute(
@@ -179,106 +245,127 @@ async def fire_hook(
     agent_id: str,
     name: str,
 ) -> HookFireOut:
-    """Run one named cron hook now and return its run record."""
+    """Run one named cron hook now and return its run record.
+    \f
+    @spec PROTECTED-HOOK-SOURCE-2/10.
+    """
 
     selected = await resolve_agent(session, agent_id)
-    deployment = (
-        (await session.execute(_sql(_IN_FORCE_SQL), {"agent_id": selected.id})).mappings().first()
-    )
-    if deployment is None or deployment["bundle_ref"] is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "agent has no in-force bundle")
-    try:
-        data = await store.get(str(deployment["bundle_ref"]))
-        declared = await run_in_threadpool(read_triggers, data)
-    except Exception as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, "stored bundle could not be read") from exc
-    trigger = _cron(declared, name)
-    if trigger is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "hook is not declared")
-    prompt = trigger.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "hook is not declared")
-
-    killed = await request.app.state.kill_switch.is_killed(selected.id)
-    terminal: str | None = None
-    handle: ReplyHandle | None = None
-    if killed or _budget_spent(
-        deployment["max_usd_per_day"], deployment["max_output_tokens_per_run"]
-    ):
-        terminal = "blocked"
-    else:
-        address = trigger.get("target")
-        if isinstance(address, str) and address.strip():
-            bindings = (
-                (
-                    await session.execute(
-                        _sql(_BINDINGS_SQL),
-                        {"agent_id": selected.id, "address": address.strip()},
-                    )
-                )
-                .mappings()
-                .all()
-            )
-            candidates = list(bindings)
-            slack_identities = len(candidates) > 1 and all(
-                b["kind"] == SLACK_KIND for b in candidates
-            )
-            if slack_identities:
-                # ADR-0168 decision 3: a trigger names an address, never an
-                # identity; several of this agent's identities there mean its
-                # default Slack one, as the cron loop reads the same target.
-                candidates = [
-                    b
-                    for b in candidates
-                    if b["kind"] == SLACK_KIND
-                    and route_identity(b["kind"], b["adapter"]) == DEFAULT_IDENTITY
-                ]
-            if len(candidates) != 1:
-                terminal = "failed"
-            else:
-                binding = candidates[0]
-                handle = ReplyHandle(
-                    kind=binding["kind"],
-                    channel=binding["address"],
-                    placeholder=None,
-                    endpoint=binding["endpoint"],
-                    adapter=binding["adapter"],
-                )
-
-    await session.commit()
-    async with session.begin():
-        outcome, row = await _insert(
-            session,
-            agent_id=selected.id,
-            version_id=deployment["version_id"],
-            name=name,
-            outcome=terminal,
+    selected_id = uuid.UUID(str(selected.id))
+    async with _source_locked_agent(request, session, selected_id) as (selected, held):
+        deployment = (
+            (await session.execute(_sql(_IN_FORCE_SQL), {"agent_id": selected.id}))
+            .mappings()
+            .first()
         )
-    record = _record(agent_id=selected.id, agent=selected.name, name=name, row=row)
-    if outcome is not None:
-        return record
+        if deployment is None or deployment["bundle_ref"] is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "agent has no in-force bundle")
+        try:
+            data = await store.get(str(deployment["bundle_ref"]))
+            declared = await run_in_threadpool(read_triggers, data)
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "stored bundle could not be read"
+            ) from exc
+        trigger = _cron(declared, name)
+        if trigger is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "hook is not declared")
+        prompt = trigger.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "hook is not declared")
 
-    slot_iso = row["slot_utc"].isoformat()
-    turn = QueuedTurn(
-        event_id=f"cron:{selected.id}:{name}:{slot_iso}",
-        conversation_id=hook_conversation_id(selected.id, name),
-        author=f"cron:{name}",
-        text=prompt.strip(),
-        source=TurnSource.CRON,
-        reply_handle=handle,
-        received_at=datetime.now(UTC).isoformat(),
-        hook_run=HookRunRef(agent_id=str(selected.id), name=name, slot_utc=slot_iso),
-    )
-    try:
-        await request.app.state.resume_queue.enqueue(turn)
-    except Exception as exc:
+        await _require_ordinary_source(session, held, name)
+
+        killed = await request.app.state.kill_switch.is_killed(selected.id)
+        terminal: str | None = None
+        handle: ReplyHandle | None = None
+        if killed or _budget_spent(
+            deployment["max_usd_per_day"], deployment["max_output_tokens_per_run"]
+        ):
+            terminal = "blocked"
+        else:
+            address = trigger.get("target")
+            if isinstance(address, str) and address.strip():
+                bindings = (
+                    (
+                        await session.execute(
+                            _sql(_BINDINGS_SQL),
+                            {"agent_id": selected.id, "address": address.strip()},
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                candidates = list(bindings)
+                slack_identities = len(candidates) > 1 and all(
+                    b["kind"] == SLACK_KIND for b in candidates
+                )
+                if slack_identities:
+                    # ADR-0168 decision 3: a trigger names an address, never an
+                    # identity; several of this agent's identities there mean its
+                    # default Slack one, as the cron loop reads the same target.
+                    candidates = [
+                        b
+                        for b in candidates
+                        if b["kind"] == SLACK_KIND
+                        and route_identity(b["kind"], b["adapter"]) == DEFAULT_IDENTITY
+                    ]
+                if len(candidates) != 1:
+                    terminal = "failed"
+                else:
+                    binding = candidates[0]
+                    handle = ReplyHandle(
+                        kind=binding["kind"],
+                        channel=binding["address"],
+                        placeholder=None,
+                        endpoint=binding["endpoint"],
+                        adapter=binding["adapter"],
+                    )
+
+        await session.commit()
         async with session.begin():
-            failed = (await session.execute(_sql(_FAIL_SQL), {"id": row["id"]})).mappings().one()
-        record = _record(agent_id=selected.id, agent=selected.name, name=name, row=failed)
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE, "hook fire could not be queued"
-        ) from exc
-    return record
+            outcome, row = await _insert(
+                session,
+                held=held,
+                agent_id=selected.id,
+                version_id=deployment["version_id"],
+                name=name,
+                outcome=terminal,
+            )
+        record = _record(agent_id=selected.id, agent=selected.name, name=name, row=row)
+        if outcome is not None:
+            return record
+
+        slot_iso = row["slot_utc"].isoformat()
+        turn = QueuedTurn(
+            event_id=f"cron:{selected.id}:{name}:{slot_iso}",
+            conversation_id=hook_conversation_id(selected.id, name),
+            author=f"cron:{name}",
+            text=prompt.strip(),
+            source=TurnSource.CRON,
+            reply_handle=handle,
+            received_at=datetime.now(UTC).isoformat(),
+            hook_run=HookRunRef(agent_id=str(selected.id), name=name, slot_utc=slot_iso),
+        )
+        try:
+            await ensure_source_gate_live(held)
+            await request.app.state.resume_queue.enqueue(turn)
+        except Exception as exc:
+            try:
+                async with session.begin():
+                    await session.connection()
+                    await ensure_source_gate_live(held)
+                    failed = (
+                        (await session.execute(_sql(_FAIL_SQL), {"id": row["id"]})).mappings().one()
+                    )
+                record = _record(agent_id=selected.id, agent=selected.name, name=name, row=failed)
+            except Exception:  # noqa: BLE001 - source cleanup diagnostics may contain credentials
+                # The committed claim remains recoverable when cleanup has no authority.
+                logger.warning("hook_fire_cleanup_unavailable")
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "hook fire could not be queued"
+            ) from exc
+        return record
 
 
 @router.get(

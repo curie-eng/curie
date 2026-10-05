@@ -1,7 +1,7 @@
 ---
 seam: Approval / authorizer
 kind: CLEAN
-impls: 3 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list)
+impls: 5 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list, email list, no verifiable approvers)
 grade: not separately graded
 epics:
   - "#22"
@@ -22,7 +22,7 @@ credential cleanup, so adapter retries cannot repeat a GitHub mutation.
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 3 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 5 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list, email list, no verifiable approvers) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -121,7 +121,11 @@ in code now:
   A surface with no MCP tools or only explicitly read-only tools and no grantable
   policy route carries no generic pager, because approval cannot unlock an action it
   cannot perform. `readOnlyHint` is not authorization and does not change gates
-  or tool execution. A live probe that explicitly reports `readOnlyHint=true` also feeds
+  or tool execution on an ordinary turn. A read-only turn is different: it admits only the
+  read-only tool set, minus any tool a gate requires, and refuses every other call before the
+  approval gate sees it, so it raises no approval and cannot spend a boot grant
+  (`runner/src/curie_runner/tool_access.py::TurnToolAccess`,
+  `runner/src/curie_runner/__main__.py::_readonly_tools`). A live probe that explicitly reports `readOnlyHint=true` also feeds
   the MCP tool's SDK-visible name to the read-only classifier, suppressing the side-effect
   flag, no-retry-after-side-effects classification, and therefore its receipt line. A
   missing or `false` hint, an unknown surface, or a failed probe remains potentially
@@ -219,7 +223,11 @@ in code now:
   the boot turn (`ApprovalGate.consume_grant`), then re-denies; `reset()` expires an unspent
   grant on the next turn so an adopted warm-pod follow-up cannot inherit it. The grant is
   **tool-name-scoped** (a different gated tool, or a second call to the same one, still
-  gates), **agent-bound** (delivered only when the approval's `agent_id` matches the
+  gates) and, for a permission gate, **argument-bound** (#3174): the worker carries the
+  denied call's stored arguments on the resume boot input
+  (`binding.approval_grant_arguments`), and the runner admits only a call whose arguments are
+  canonically equal to them, refusing a mismatched call without spending the grant
+  (`runner/src/curie_runner/approval.py::ApprovalGate.grant_argument_mismatch`), **agent-bound** (delivered only when the approval's `agent_id` matches the
   agent resolved for the channel, so a rebound channel cannot cross-grant), scoped to
   **a permission gate, or an operator-opted (`grantableViaPolicy`) policy gate** (enforced by
   the `gate_kind`/`granted_tool` columns; for the NULL-fallback window the
@@ -235,12 +243,11 @@ in code now:
   requirement needs its own future policy. **Known gaps:** (1) *fail-safe adoption* -- if the pod is
   still live when the resume arrives (suspend failed, or a user mention resumed the thread
   first), `claim()` adopts it and the boot env is ignored, so the grant is lost and the
-  action re-pauses (self-heals via re-approval). (2) *tool-name, not argument, scoping* --
-  the granted tool may be invoked on the resume turn with different arguments than the
-  human saw. ADR-0035 named a durable structured-provenance follow-up for this; that
-  provenance has now LANDED as ADR-0046 (the `gate_kind`/`granted_tool` columns above), but it
-  discriminates *which* gate may grant rather than binding the granted *arguments*, so
-  argument-scoping remains open (deferred to #558's operator-gated grantability). Among gates
+  action re-pauses (self-heals via re-approval). (2) *name-only policy grants*: a
+  `grantableViaPolicy` grant carries no arguments, because it authorizes a business decision
+  rather than one call, so its granted tool may be invoked on the resume turn with any
+  arguments. An approval recorded before arguments were carried also stays name-only.
+  Permission-gate grants are argument-bound (#3174), as above. Among gates
   that set `grantableViaPolicy`, deploy validation also requires a route be claimed by only one
   distinct tool: two grantable gates on the same route naming the same tool are a duplicate and
   validate fine, but naming different tools is rejected as `approval_policy.grant_route_ambiguous`,
@@ -409,7 +416,7 @@ names as unrecognized on purpose, so arming one still trips the existing
 ## Implementations today
 
 **One authorizer** (`apps/api/src/curie_api/authorizer.py`, pure policy with no Slack in
-it) over **four approver sets** behind the `ApproverSet` port (ADR-0034), after an
+it) over **five approver sets** behind the `ApproverSet` port (ADR-0034), after an
 independent authentication boundary resolves one of ADR-0106's `chat`, `console`, or
 `operator` principals, or ADR-0154's `adapter` principal. A set answers only "is this actor in the set"; every rule that is
 not membership lives in the authorizer, applied identically whatever the set. Requester
@@ -426,7 +433,7 @@ The resolve body carries policy input only: `decision` and optional `note`. The 
 operator principals and Console login codes but, alone, is not a human identity and cannot
 resolve an approval.
 
-Two of the three sets are Slack's, and that is the honest framing: a channel and a user
+Two of the five sets are Slack's, and that is the honest framing: a channel and a user
 group are two ways Slack says "who is in the authorized set", not a neutral baseline plus a
 Slack feature.
 
@@ -473,7 +480,7 @@ Slack feature.
   raised, so this set meets only an approval pending from before that rule or one whose
   route was rewritten while it pended.
 
-Platform-RBAC remains the epic's fourth set and is not built.
+Platform-RBAC, the set the epic once planned as its fourth, is not built.
 
 **The audit vocabulary is frozen.** Each set's `audit_name` pins its pre-ADR-0034 class
 name, so `approval_audit.authorizer` still records `ChannelMembershipAuthorizer`,
@@ -617,8 +624,12 @@ Slack entirely.
 **`GroupMembershipSource`** (`usergroups.py`) is the narrowest port, behind
 `SlackUserGroupMembers`: `async members(group_id) -> UserGroupMembership`, raising
 `UserGroupLookupError` for every mode that yields no member set. Its one implementation is
-`SlackUserGroupClient` (`slack_usergroups.py`), which reads `usergroups.users.list` with the
-API's own bot token (`SLACK_BOT_TOKEN`, `usergroups:read` scope) and caches member sets in
+`SlackUserGroupClient` (`slack_usergroups.py`), which reads `usergroups.users.list` with a
+bot token (`usergroups:read` scope). `build_approver_set_selector`
+(`apps/api/src/curie_api/slack_approvers.py::build_approver_set_selector`) builds one client per
+configured Slack identity, each with that identity's own token and its own cache, and the
+selector hands a user-group set the client for the identity that posted the card; the
+`default` identity's client uses `SLACK_BOT_TOKEN`. Each client caches member sets in
 process for `slack_usergroup_cache_ttl_s` (env `SLACK_USERGROUP_CACHE_TTL_S`, default 60s;
 `0` forces a per-resolve fetch).
 

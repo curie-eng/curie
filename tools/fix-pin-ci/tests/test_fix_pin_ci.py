@@ -1047,10 +1047,15 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     assert job.get("name") == "Python (ruff + mypy + pytest)"
     # The suite runs in the python-pytest shards; the required job only waits
     # for them to aggregate their results, and always() keeps it from skipping.
-    assert job.get("needs") == "python-pytest"
+    assert job.get("needs") == ["changes", "python-pytest"]
     assert job.get("if") == "always()", "the required Python check must not be skippable"
     shard_job, steps = _python_job(document, "python-pytest")
-    assert "needs" not in shard_job and "if" not in shard_job
+    # #3858: the shards wait for the `changes` selection and run only when it
+    # selected pytest; the required job above still reports either way.
+    shard_needs = shard_job.get("needs")
+    shard_needs = [shard_needs] if isinstance(shard_needs, str) else list(shard_needs or [])
+    assert "changes" in shard_needs
+    assert shard_job.get("if") == "${{ needs.changes.outputs.pytest == 'true' }}"
 
     permissions = job.get("permissions")
     assert isinstance(permissions, dict), "the Python job must declare job level permissions"
@@ -1074,7 +1079,8 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
 
     stack_index = _single_step_index(
         steps,
-        lambda step: "docker compose -f compose.dev.yaml up -d" in _string(step, "run"),
+        lambda step: _string(step, "run").strip()
+        == "python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480",
         "dev stack startup",
     )
     migration_index = _single_step_index(
@@ -1255,7 +1261,8 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     )
     stack_index = _single_step_index(
         steps,
-        lambda step: "docker compose -f compose.dev.yaml up -d" in _string(step, "run"),
+        lambda step: _string(step, "run").strip()
+        == "python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480",
         "dev stack startup",
     )
     migration_index = _single_step_index(

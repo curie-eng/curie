@@ -195,6 +195,13 @@ class SandboxHandle:
     # this runner was not booted for a work item. Missing on a route written
     # before the field existed, which reads as no run.
     caller_run: str | None = None
+    # #3823: the boot state token's credential id, the agent it names, and its
+    # absolute expiry. Missing on a route written before the field existed.
+    # Release reports the id; a later turn replaces a route whose token has
+    # already expired.
+    state_credential_id: str | None = None
+    state_credential_agent: str | None = None
+    state_token_exp: int | None = None
     # Whether this runner booted with ADR 0130's model-visible tool and prompt.
     # False rehydrates legacy routes conservatively and forces one replacement
     # before an eligible turn may adopt them.

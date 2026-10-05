@@ -3,11 +3,11 @@
 import hashlib
 import re
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .models import GitHubReviewDelivery
 
@@ -28,20 +28,15 @@ def _enum(value: Any, choices: set[str]) -> str:
     return value if isinstance(value, str) and value in choices else "other"
 
 
-async def claim_review_delivery(
+async def _insert_delivery(
     session: AsyncSession,
     *,
     delivery_id: uuid.UUID,
     event: str,
     body: bytes,
     payload: Any,
-) -> tuple[GitHubReviewDelivery, bool]:
-    """Serialize a delivery header and bind every alias to its original bytes.
-
-    HMAC verification belongs to the caller and must precede this function.
-    The body is hashed in memory and never persisted. Holding this row lock
-    until admission commits makes same-header races adopt one canonical result.
-    """
+) -> tuple[str, bool]:
+    """Insert the receipt unless the id exists; return the body digest and whether it was new."""
     data = _object(payload)
     if event == "issues":
         source = _object(data.get("issue"))
@@ -57,7 +52,7 @@ async def claim_review_delivery(
     login = sender.get("login")
     if not isinstance(login, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login) is None:
         login = None
-    await session.execute(
+    inserted = await session.scalar(
         insert(GitHubReviewDelivery)
         .values(
             delivery_id=delivery_id,
@@ -100,7 +95,14 @@ async def claim_review_delivery(
             ),
         )
         .on_conflict_do_nothing(index_elements=["delivery_id"])
+        .returning(GitHubReviewDelivery.delivery_id)
     )
+    return digest, inserted is not None
+
+
+async def _lock_delivery(
+    session: AsyncSession, *, delivery_id: uuid.UUID, event: str, digest: str
+) -> tuple[GitHubReviewDelivery, bool]:
     row = await session.scalar(
         select(GitHubReviewDelivery)
         .where(GitHubReviewDelivery.delivery_id == delivery_id)
@@ -112,6 +114,91 @@ async def claim_review_delivery(
         row.replay_conflicts += 1
         row.version += 1
     return row, conflict
+
+
+async def claim_review_delivery(
+    session: AsyncSession,
+    *,
+    delivery_id: uuid.UUID,
+    event: str,
+    body: bytes,
+    payload: Any,
+) -> tuple[GitHubReviewDelivery, bool]:
+    """Serialize a delivery header and bind every alias to its original bytes.
+
+    HMAC verification belongs to the caller and must precede this function.
+    The body is hashed in memory and never persisted. Holding this row lock
+    until admission commits makes same-header races adopt one canonical result.
+    """
+    digest, _inserted = await _insert_delivery(
+        session, delivery_id=delivery_id, event=event, body=body, payload=payload
+    )
+    return await _lock_delivery(session, delivery_id=delivery_id, event=event, digest=digest)
+
+
+PushClaim = Literal["process", "duplicate", "unsettled", "conflict"]
+
+
+async def claim_push_delivery(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    delivery_id: uuid.UUID,
+    event: str,
+    body: bytes,
+    payload: Any,
+) -> PushClaim:
+    """Claim a push delivery id in one short transaction of its own (#3820).
+
+    The committed `pending` receipt is the in-flight marker; no connection or
+    row lock is held while the caller processes the push, which then settles
+    the receipt with `settle_push_delivery`. Answers:
+
+    `process`: this caller owns the delivery. Either the receipt is new, or a
+    previous delivery under this id was ignored, rejected, or retryable and is
+    reopened as `pending`.
+    `duplicate`: a delivery under this id already deployed or promoted.
+    `unsettled`: the receipt is still `pending`. Another delivery under this id
+    is in flight, or one crashed before settling, possibly after it deployed.
+    Processing it again could deploy twice, so it is never retaken.
+    `conflict`: the id is already bound to a different event or body.
+
+    HMAC verification belongs to the caller and must precede this function.
+    """
+    async with sessionmaker() as session, session.begin():
+        digest, inserted = await _insert_delivery(
+            session, delivery_id=delivery_id, event=event, body=body, payload=payload
+        )
+        row, conflict = await _lock_delivery(
+            session, delivery_id=delivery_id, event=event, digest=digest
+        )
+        if conflict:
+            return "conflict"
+        if inserted:
+            return "process"
+        if row.status == "accepted":
+            return "duplicate"
+        if row.status == "pending":
+            return "unsettled"
+        settle_review_delivery(row, "pending")
+        return "process"
+
+
+async def settle_push_delivery(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    *,
+    delivery_id: uuid.UUID,
+    status: str,
+    reason: str | None = None,
+) -> None:
+    """Settle a push receipt claimed by `claim_push_delivery`, in its own transaction."""
+    async with sessionmaker() as session, session.begin():
+        row = await session.scalar(
+            select(GitHubReviewDelivery)
+            .where(GitHubReviewDelivery.delivery_id == delivery_id)
+            .with_for_update()
+        )
+        assert row is not None
+        settle_review_delivery(row, status, reason)
 
 
 def settle_review_delivery(

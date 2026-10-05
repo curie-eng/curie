@@ -352,6 +352,7 @@ _HTTP_OPERATIONS = [
     "/v1/internal/github/reviews/{event_id}/reserve",
     "/v1/internal/github/reviews/{event_id}/verify",
     "/v1/internal/memory/closed-turns",
+    "/v1/internal/state/released-credentials",
     "/v1/internal/publications",
     "/v1/internal/publications/precheck/context",
     "/v1/internal/publications/lineage",

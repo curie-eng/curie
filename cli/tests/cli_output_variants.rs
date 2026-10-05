@@ -669,6 +669,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 agent: "dark-factory".to_string(),
                 deadline_seconds: 3600,
                 budget_usd: 5.0,
+                credit_remaining_usd: Some(73.49),
             },
         ],
     );

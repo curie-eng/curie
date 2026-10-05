@@ -1940,6 +1940,29 @@ export interface paths {
         patch: operations["advance_publication_lineage_v1_internal_publications__publication_id__lineage_patch"];
         trace?: never;
     };
+    "/v1/internal/state/released-credentials": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Release Sandbox Credential
+         * @description Record that a sandbox claim released its boot credential. Idempotent.
+         *
+         *     The record expires once no token carrying that id could still be valid
+         *     (``SANDBOX_CREDENTIAL_RELEASED_TTL_S``).
+         */
+        post: operations["release_sandbox_credential_v1_internal_state_released_credentials_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/work-items/admissions": {
         parameters: {
             query?: never;
@@ -5657,6 +5680,21 @@ export interface components {
             work_item_id: string;
         };
         /**
+         * SandboxCredentialReleasedIn
+         * @description The worker reporting that a sandbox claim released its boot credential
+         *     (#3823). ``credential`` is the ``cred`` claim shared by that claim's
+         *     ``state`` and ``state.app`` tokens.
+         */
+        SandboxCredentialReleasedIn: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Credential */
+            credential: string;
+        };
+        /**
          * ScheduleControlOut
          * @description Current operator pause state for a named cron hook.
          */
@@ -6050,7 +6088,9 @@ export interface components {
          *     ``check`` is the declared check id and ``command`` the exact command the
          *     runner ran for it. ``not_declared`` records that neither the bundle nor the
          *     repository declared a check, so no command ran: its check, command and
-         *     exit_status are null and it carries no blockers.
+         *     exit_status are null and it carries no blockers. ``delegated_to`` optionally
+         *     names the required CI check that stands in for a declared check; it is
+         *     never valid on ``not_declared``.
          */
         VerificationObservation: {
             /** Blocked Services */
@@ -6059,6 +6099,8 @@ export interface components {
             check: string | null;
             /** Command */
             command: string | null;
+            /** Delegated To */
+            delegated_to?: string | null;
             /** Exit Status */
             exit_status: number | null;
             /** Missing Binaries */
@@ -10301,6 +10343,39 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["PublicationLineageOut"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    release_sandbox_credential_v1_internal_state_released_credentials_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SandboxCredentialReleasedIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

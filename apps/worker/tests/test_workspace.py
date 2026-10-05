@@ -20,6 +20,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import tarfile
 import threading
 import uuid
@@ -61,12 +62,16 @@ class _CommandResult:
 class _FakeCommands:
     """A subprocess port whose clone writes the credential leak we must strip."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, clone_url: str = CLEAN_URL) -> None:
         self.calls: list[dict[str, Any]] = []
         self.events: list[str] = []
         self.available = True
         self.fail_stage: str | None = None
         self.head_sha = "a" * 40
+        self.clone_url = clone_url
+        self.authenticated_url = clone_url.replace(
+            "https://", "https://redeemed-credential-value@", 1
+        )
 
     def require(self, executable: str) -> None:
         self.calls.append({"require": executable})
@@ -100,7 +105,7 @@ class _FakeCommands:
             (checkout / ".git").mkdir()
             (checkout / ".git" / "config").write_text(
                 '[remote "origin"]\n'
-                f"\turl = {AUTHENTICATED_URL}\n"
+                f"\turl = {self.authenticated_url}\n"
                 "\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
             )
             (checkout / "README.md").write_text("workspace ready\n")
@@ -119,14 +124,14 @@ class _FakeCommands:
             self.events.append("set-url")
             assert cwd is not None
             config = cwd / ".git" / "config"
-            config.write_text(config.read_text().replace(AUTHENTICATED_URL, CLEAN_URL))
+            config.write_text(config.read_text().replace(self.authenticated_url, self.clone_url))
             return _CommandResult()
 
         if "config" in args and "--get" in args and "remote.origin.url" in args:
             self.events.append("verify-origin")
             assert cwd is not None
             config = (cwd / ".git" / "config").read_text()
-            value = CLEAN_URL if CLEAN_URL in config else AUTHENTICATED_URL
+            value = self.clone_url if self.clone_url in config else self.authenticated_url
             return _CommandResult(stdout=f"{value}\n")
 
         if "rev-parse" in args:
@@ -147,6 +152,7 @@ class _FakeCredentialClient:
             repo_full_name="acme-corp/acme-bot",
             clone_url=CLEAN_URL,
             authorization_header=GIT_CREDENTIAL,
+            github_html_base="https://github.com",
         )
 
 
@@ -429,6 +435,7 @@ def test_internal_workspace_redemption_uses_only_worker_auth_and_deployment_id(
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
+        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -448,6 +455,140 @@ def test_internal_workspace_redemption_uses_only_worker_auth_and_deployment_id(
     assert "repo" not in request["url"]
     assert redeemed.repo_full_name == "acme-corp/acme-bot"
     assert redeemed.authorization_header == GIT_CREDENTIAL
+
+
+@pytest.mark.parametrize(
+    ("github_api_url", "html_base"),
+    [
+        ("https://api.github.com", "https://github.com"),
+        ("https://github.example.com/api/v3", "https://github.example.com"),
+        ("https://github.example.com/forge/api/v3", "https://github.example.com/forge"),
+    ],
+)
+def test_workspace_redemption_accepts_only_the_configured_github_html_base(
+    workspace: Any, github_api_url: str, html_base: str
+) -> None:
+    # GHES documents its REST base as https://HOSTNAME/api/v3:
+    # https://docs.github.com/en/enterprise-server@3.15/rest/using-the-rest-api/getting-started-with-the-rest-api
+    clone_url = f"{html_base}/acme-corp/acme-bot.git"
+
+    def transport(**_request: Any) -> Any:
+        return SimpleNamespace(
+            status=200,
+            headers={"Cache-Control": "no-store"},
+            body=json.dumps(
+                {
+                    "repo_full_name": "acme-corp/acme-bot",
+                    "clone_url": clone_url,
+                    "authorization_header": GIT_CREDENTIAL,
+                }
+            ).encode(),
+        )
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        github_api_url=github_api_url,
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    redeemed = client.redeem(DEPLOYMENT_ID, "1700000000.000100")
+
+    assert redeemed.clone_url == clone_url
+    assert redeemed.github_html_base == html_base
+
+
+@pytest.mark.parametrize(
+    "clone_url",
+    [
+        CLEAN_URL,
+        "https://other.example.com/forge/acme-corp/acme-bot.git",
+        "http://github.example.com/forge/acme-corp/acme-bot.git",
+        "https://token@github.example.com/forge/acme-corp/acme-bot.git",
+        "https://github.example.com/acme-corp/acme-bot.git",
+        "https://github.example.com/forge/acme-corp/other-bot.git",
+        "https://github.example.com/forge/acme-corp/acme-bot.git/",
+        "https://github.example.com/forge/acme-corp/acme-bot.git?download=1",
+        "https://github.example.com/forge/acme-corp/acme-bot.git#HEAD",
+        "https://github.example.com/forge/acme-corp//acme-bot.git",
+        "https://github.example.com:443/forge/acme-corp/acme-bot.git",
+    ],
+)
+def test_workspace_redemption_refuses_noncanonical_or_foreign_clone_urls(
+    workspace: Any, clone_url: str
+) -> None:
+    def transport(**_request: Any) -> Any:
+        return SimpleNamespace(
+            status=200,
+            headers={"Cache-Control": "no-store"},
+            body=json.dumps(
+                {
+                    "repo_full_name": "acme-corp/acme-bot",
+                    "clone_url": clone_url,
+                    "authorization_header": GIT_CREDENTIAL,
+                }
+            ).encode(),
+        )
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        github_api_url="https://github.example.com/forge/api/v3",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    with pytest.raises(workspace.WorkspacePreparationError, match="invalid credential response"):
+        client.redeem(DEPLOYMENT_ID, "1700000000.000100")
+
+
+def test_ghes_clone_auth_is_host_scoped_and_removed_from_the_archive(
+    workspace: Any, tmp_path: Path
+) -> None:
+    html_base = "https://github.example.com/forge"
+    clone_url = f"{html_base}/acme-corp/acme-bot.git"
+    credential = workspace.WorkspaceCredential(
+        repo_full_name="acme-corp/acme-bot",
+        clone_url=clone_url,
+        authorization_header=GIT_CREDENTIAL,
+        github_html_base=html_base,
+    )
+    commands = _FakeCommands(clone_url=clone_url)
+    objects = _StreamingObjectStore()
+    preparer = workspace.WorkspacePreparer(
+        credentials=SimpleNamespace(redeem=lambda *_args: credential),
+        commands=commands,
+        objects=objects,
+        scratch_root=tmp_path / "clone-scratch",
+        limits=_limits(workspace),
+    )
+
+    prepared = _prepare(preparer)
+    clone = next(call for call in commands.calls if "clone" in call.get("argv", []))
+    env = clone["env"]
+    assert clone_url in clone["argv"]
+    assert env["GIT_CONFIG_KEY_1"] == "http.https://github.example.com/.extraHeader"
+    assert env["GIT_CONFIG_VALUE_1"] == f"Authorization: {GIT_CREDENTIAL}"
+    # Ask real Git to resolve the ephemeral URL scope; the recorded header
+    # must never match a request to public GitHub or another HTTPS authority.
+    for url, expected in (
+        (clone_url, f"Authorization: {GIT_CREDENTIAL}"),
+        (CLEAN_URL, ""),
+        ("https://other.example.com/forge/acme-corp/acme-bot.git", ""),
+    ):
+        result = subprocess.run(
+            ["git", "config", "--get-urlmatch", "http.extraHeader", url],
+            cwd=tmp_path,
+            env={**os.environ, **env, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.stdout.strip() == expected
+        assert result.returncode == (0 if expected else 1)
+    archive_config = _archive_members(objects.objects[prepared.object_key])[".git/config"]
+    assert archive_config.count(clone_url.encode()) == 1
+    assert b"redeemed-credential-value" not in archive_config
+    assert prepared.clean_clone_url == clone_url
 
 
 def test_runtime_repo_parser_accepts_one_root_url_and_rejects_ambiguous(
@@ -714,6 +855,7 @@ def test_internal_workspace_selection_sends_author_thread_and_optional_repo(
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
+        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -743,6 +885,7 @@ def test_unallowlisted_selection_names_the_chart_allowlist(
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
+        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -769,6 +912,7 @@ def test_internal_workspace_selection_accepts_explicit_unselected_response(
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
+        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -790,6 +934,7 @@ def test_workspace_coordinator_propagates_absent_repository_selection(
 
     credentials = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
+        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -833,6 +978,7 @@ def test_internal_workspace_selection_409_maps_machine_code_not_detail_prose(
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
+        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -877,6 +1023,7 @@ def test_internal_workspace_selection_409_unmapped_code_is_invalid_response(
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
+        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -1966,6 +2113,7 @@ def test_unallowlisted_selection_is_the_allowlist_refusal_type(workspace: Any) -
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
+        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )

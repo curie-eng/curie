@@ -1500,6 +1500,11 @@ fn stored_local_api_key() -> Option<String> {
     crate::local_stack_keys::stored_api_key(&resources.project)
 }
 
+/// Resolve a local API credential through the existing stored project key rule.
+pub fn resolve_local_api_key(base_url: &str, api_key: &str) -> String {
+    api_key_for_destination(base_url, api_key, stored_local_api_key)
+}
+
 /// Build the one kind of HTTP client this CLI makes requests with.
 ///
 /// The loopback `no_proxy` rule is a SECURITY property, not a convenience: a
@@ -2006,13 +2011,19 @@ impl ApiClient {
     pub const APPROVALS_LIST_LIMIT: usize = 200;
 
     pub fn new(base_url: &str, api_key: &str) -> Result<Self> {
+        let api_key = resolve_local_api_key(base_url, api_key);
+        Self::with_resolved_key(base_url, &api_key)
+    }
+
+    /// Construct with the exact credential resolved for the selected installation.
+    /// A cluster tunnel is loopback too, so it must not trigger local key discovery.
+    pub fn with_resolved_key(base_url: &str, api_key: &str) -> Result<Self> {
         warn_if_insecure(base_url);
         let http = http_client(base_url, Some(std::time::Duration::from_secs(5)))
             .context("building HTTP client")?;
-        let api_key = api_key_for_destination(base_url, api_key, stored_local_api_key);
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key,
+            api_key: api_key.to_string(),
             http,
         })
     }
@@ -2878,12 +2889,15 @@ impl ApiClient {
         commit_sha: Option<&str>,
         workspace: WorkspaceIntent,
     ) -> Result<PreparedDeployOutcome> {
-        // Bind per-agent connector secrets (ADR-0009, #429). A PATCH covers both
-        // a freshly created agent and a redeploy that rotates a value; an empty
-        // map leaves the agent's current secrets untouched.
-        if !secrets.is_empty() {
-            self.update_agent_secrets(&agent.id, secrets).await?;
-        }
+        // Bind per-agent connector secrets (ADR-0009, #429). A PATCH covers a
+        // freshly created agent, a redeploy that rotates a value, and a
+        // redeploy whose bundle declares none. The API clears on `{}`. Skipping
+        // that write left the previous names on the agent while the cluster
+        // bind removed the Helm secret, so the worker still required a
+        // per-agent warm pool the chart no longer rendered (#3853).
+        // The returned row is not kept: resolve_agent already reconciled the
+        // channel and repo, and this response is only the secret write.
+        self.update_agent_secrets(&agent.id, secrets).await?;
         let version = self
             .create_version(&agent.id, version_label, created_by, commit_sha)
             .await?;

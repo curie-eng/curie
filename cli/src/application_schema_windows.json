@@ -1,7 +1,7 @@
 {
   "candidate": {
-    "schema_head": "0074",
-    "schema_min": "0074"
+    "schema_min": "0077",
+    "schema_head": "0077"
   },
   "revisions": [
     "0001",
@@ -77,7 +77,9 @@
     "0071",
     "0072",
     "0073",
-    "0074"
+    "0075",
+    "0076",
+    "0077"
   ],
   "windows": {
     "0.10.0": {
@@ -124,9 +126,13 @@
       "schema_head": "0073",
       "schema_min": "0070"
     },
-    "0.13.0": {
-      "schema_head": "0074",
-      "schema_min": "0074"
+    "0.12.1": {
+      "schema_head": "0076",
+      "schema_min": "0076"
+    },
+    "0.12.2": {
+      "schema_head": "0076",
+      "schema_min": "0076"
     },
     "0.8.0": {
       "schema_head": "0036",
@@ -185,6 +191,10 @@
     "0.9.3": {
       "schema_head": "0045",
       "schema_min": "0045"
+    },
+    "0.13.0": {
+      "schema_min": "0077",
+      "schema_head": "0077"
     }
   }
 }

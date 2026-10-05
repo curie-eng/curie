@@ -8,10 +8,12 @@ CURIE_FAKE_MODEL must fail loudly instead of silently degrading to a fake.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import logging
 import signal
 import socket
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -407,6 +409,74 @@ def test_docker_runner_uses_its_network_specific_otlp_endpoint(
     assert endpoint_args == (
         [f"OTEL_EXPORTER_OTLP_ENDPOINT={expected_endpoint}"] if expected_endpoint else []
     )
+
+
+@pytest.mark.parametrize("prefix", ["", "/forge"])
+def test_docker_runner_snapshot_uses_the_workers_configured_github_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, prefix: str
+) -> None:
+    from curie_runner.workspace_snapshot import capture_workspace_snapshot
+
+    calls: list[list[str]] = []
+
+    def capture_docker(
+        _self: DockerSandboxClient,
+        args: list[str],
+        *,
+        request_timeout_seconds: float,
+    ) -> str:
+        assert request_timeout_seconds > 0
+        calls.append(args)
+        return ""
+
+    html_base = f"https://github.example.com{prefix}"
+    github_api_url = f"{html_base}/api/v3"
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
+    monkeypatch.setattr(DockerSandboxClient, "_docker", capture_docker)
+    client = _sandbox_client(
+        WorkerConfig(fake_model=True, publication_github_api_url=github_api_url),
+        {
+            "CURIE_SANDBOX_SUBSTRATE": "docker",
+            "CURIE_GITHUB_API_URL": "https://other.example.com/api/v3",
+        },
+        _SUB,
+    )
+    assert isinstance(client, DockerSandboxClient)
+    client.create_claim(
+        "acme-sandbox",
+        pool="pool",
+        env={
+            "CURIE_FAKE_MODEL": "1",
+            "CURIE_GITHUB_API_URL": "https://other.example.com/api/v3",
+        },
+    )
+    assignments = [arg for arg in calls[0] if arg.startswith("CURIE_GITHUB_API_URL=")]
+    assert assignments == [f"CURIE_GITHUB_API_URL={github_api_url}"]
+    # Feed the emitted container setting into the actual runner snapshot
+    # boundary, proving a managed GHES checkout remains publishable locally.
+    monkeypatch.setenv("CURIE_GITHUB_API_URL", assignments[0].partition("=")[2])
+    repo_name = "acme-corp/acme-bot"
+    for args in (
+        ("init", "--quiet"),
+        ("remote", "add", "origin", f"{html_base}/{repo_name}.git"),
+    ):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git", "-c", "user.name=Curie Test", "-c", "user.email=curie@example.com",
+            "commit", "--quiet", "-m", "Initial fixture",
+        ],
+        cwd=tmp_path, check=True, capture_output=True,
+    )
+    (tmp_path / "README.md").write_text("GHES change\n")
+
+    captured = capture_workspace_snapshot(tmp_path, expected_repo=repo_name)
+
+    assert captured.repo_full_name == repo_name
+    assert captured.changed_paths == ("README.md",)
+    assert b"GHES change" in captured.patch
 
 
 def test_sandbox_client_docker_prepulls_image(monkeypatch) -> None:
@@ -882,6 +952,21 @@ def test_supervise_policy_reads_worker_config() -> None:
     }
 
 
+def _legacy_boot_schema_support() -> Any:
+    """Baseline fixture prerequisite only, @spec PROTECTED-HOOK-SOURCE-2/10."""
+    path = Path(__file__).with_name("test_source_worker_startup.py")
+    spec = importlib.util.spec_from_file_location("_legacy_worker_startup_setup", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_legacy_schema = _legacy_boot_schema_support()
+worker_db = _legacy_schema.worker_db
+worker_templates = _legacy_schema.worker_templates
+
+
 # -- #1751: the boot rekey is CALLED by _run, once, before any consumer reads --
 #
 # Every other test of the legacy approval-card migration drives
@@ -993,13 +1078,27 @@ class _FakeRuntime:
         self.orphan_sweeper = None
 
 
+def _register_legacy_fake_transports(runtime: _FakeRuntime, resources: Any) -> None:
+    """Existing baseline fakes only, @spec PROTECTED-HOOK-SOURCE-2."""
+    resources.register_close("legacy-runner", runtime.runner.close, order=20)
+    resources.register_close("legacy-sink", runtime.sink.close, order=30)
+    resources.register_close("legacy-http", runtime.eval_http.aclose, order=40)
+    resources.register_close("legacy-runs-redis", runtime.async_redis.aclose, order=50)
+    resources.register_close("legacy-pressure-redis", runtime.pressure_async_redis.aclose, order=51)
+    resources.register_close("legacy-eval-redis", runtime.eval_redis.aclose, order=52)
+    resources.register_close("legacy-engine", runtime.engine.dispose, order=70)
+
+
 def _boot(
     monkeypatch: pytest.MonkeyPatch,
     *,
+    database_url: str,
     raises: BaseException | None = None,
     stall_s: float = 0.0,
 ) -> list[str]:
-    """Drive one full ``_run`` boot against the fakes and return the event log.
+    """@spec PROTECTED-HOOK-SOURCE-2/10.
+
+    Drive one full ``_run`` boot against the fakes and return the event log.
 
     The card store is built here rather than passed in, so it records into the
     very list the fake consumers append to: one shared log is what makes the
@@ -1014,8 +1113,11 @@ def _boot(
     events: list[str] = []
     card_store = _FakeCardStore(events, raises=raises, stall_s=stall_s)
 
-    def fake_build(config: WorkerConfig, env: Any) -> _FakeRuntime:
-        return _FakeRuntime(card_store, events)
+    def fake_build(config: WorkerConfig, env: Any, *, resources: Any) -> _FakeRuntime:
+        """Baseline compatibility only, @spec PROTECTED-HOOK-SOURCE-2."""
+        runtime = _FakeRuntime(card_store, events)
+        _register_legacy_fake_transports(runtime, resources)
+        return runtime
 
     async def fake_heartbeat(*_args: Any, **_kwargs: Any) -> None:
         return None
@@ -1024,13 +1126,15 @@ def _boot(
     monkeypatch.setattr(run, "run_heartbeat", fake_heartbeat)
     # The outer wait_for is a deadlock guard, not the behaviour under test: a
     # regression that leaves _run blocked must fail this suite, not hang CI.
-    asyncio.run(asyncio.wait_for(run._run(WorkerConfig(), {}), timeout=10))
+    asyncio.run(asyncio.wait_for(run._run(WorkerConfig(database_url=database_url), {}), timeout=10))
     return events
 
 
 def test_run_supervises_the_cron_loop_until_shutdown(
     monkeypatch: pytest.MonkeyPatch,
+    worker_db: Any,
 ) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
     # The cron loop is always on (#268): _run must start it under the same
     # supervisor as its siblings and hand it the shared shutdown flag, so a
     # SIGTERM that stops the consumers also stops the scheduler.
@@ -1046,9 +1150,14 @@ def test_run_supervises_the_cron_loop_until_shutdown(
             await asyncio.sleep(0)
         shutdown.set()
 
-    monkeypatch.setattr(run, "build", lambda config, env: runtime)
+    def fake_build(config: WorkerConfig, env: Any, *, resources: Any) -> _FakeRuntime:
+        """Baseline compatibility only, @spec PROTECTED-HOOK-SOURCE-2."""
+        _register_legacy_fake_transports(runtime, resources)
+        return runtime
+
+    monkeypatch.setattr(run, "build", fake_build)
     monkeypatch.setattr(run, "run_heartbeat", stopping_heartbeat)
-    asyncio.run(asyncio.wait_for(run._run(WorkerConfig(), {}), timeout=10))
+    asyncio.run(asyncio.wait_for(run._run(WorkerConfig(database_url=worker_db[2]), {}), timeout=10))
 
     assert events.count("cron") == 1
     assert "cron-stopped" in events
@@ -1107,8 +1216,10 @@ def test_cron_tick_interval_reads_its_env_knob(monkeypatch: pytest.MonkeyPatch) 
 
 def test_run_migrates_legacy_card_refs_once_at_boot(
     monkeypatch: pytest.MonkeyPatch,
+    worker_db: Any,
 ) -> None:
-    events = _boot(monkeypatch)
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
+    events = _boot(monkeypatch, database_url=worker_db[2])
     # Exactly once: it is a boot migration, not something supervised or retried,
     # and a second pass would re-walk the keyspace on every restart for nothing.
     assert events.count("migrate") == 1
@@ -1116,12 +1227,14 @@ def test_run_migrates_legacy_card_refs_once_at_boot(
 
 def test_run_migrates_legacy_card_refs_before_the_consumers_start(
     monkeypatch: pytest.MonkeyPatch,
+    worker_db: Any,
 ) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
     # The ordering the whole fix rests on. A ref still under the pre-#1723 thread
     # key must be rekeyed onto its approval id BEFORE the runs consumer can read
     # a resume turn for it -- otherwise the card the turn settles is the one the
     # migration has not reached yet, which is the stranding #1751 exists to end.
-    events = _boot(monkeypatch)
+    events = _boot(monkeypatch, database_url=worker_db[2])
     assert events[0] == "migrate"
     assert "runs" in events
 
@@ -1129,11 +1242,13 @@ def test_run_migrates_legacy_card_refs_before_the_consumers_start(
 def test_run_boots_the_consumers_when_the_migration_fails(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    worker_db: Any,
 ) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
     # A Valkey blip during a best-effort boot migration must degrade to "those
     # cards stay live until their TTL", never to a worker that will not start.
     with caplog.at_level(logging.WARNING, logger="curie_worker.run"):
-        events = _boot(monkeypatch, raises=RuntimeError("valkey down"))
+        events = _boot(monkeypatch, database_url=worker_db[2], raises=RuntimeError("valkey down"))
 
     assert events.count("migrate") == 1
     assert "runs" in events  # boot continued past the failure
@@ -1149,7 +1264,9 @@ def test_run_boots_the_consumers_when_the_migration_fails(
 def test_run_boots_the_consumers_when_the_migration_exceeds_its_budget(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    worker_db: Any,
 ) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
     # The bound exists because this pass runs BEFORE the liveness heartbeat
     # starts: unbounded, a degraded Valkey stalls readiness until the exec probe
     # kills the pod, and a best-effort migration becomes a restart loop. The
@@ -1158,7 +1275,7 @@ def test_run_boots_the_consumers_when_the_migration_exceeds_its_budget(
     monkeypatch.setattr(run, "_CARD_MIGRATION_BUDGET_S", 0.01)
     with caplog.at_level(logging.WARNING, logger="curie_worker.run"):
         # Far past the patched budget; wait_for cancels it, so nothing waits 30s.
-        events = _boot(monkeypatch, stall_s=30.0)
+        events = _boot(monkeypatch, database_url=worker_db[2], stall_s=30.0)
 
     assert events.count("migrate") == 1
     assert "runs" in events  # boot continued past the cut-short migration
@@ -1514,12 +1631,16 @@ def test_supervise_keeps_tracebacks_for_connection_failures_after_boot(
 def test_run_warns_in_one_line_when_valkey_is_not_ready_for_the_boot_migration(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    worker_db: Any,
 ) -> None:
-    """Valkey still coming up on a fresh install is expected at boot (#3079): the
+    """@spec PROTECTED-HOOK-SOURCE-2/10.
+
+    Valkey still coming up on a fresh install is expected at boot (#3079): the
     migration is skipped with a one-line warning, not a traceback."""
     with caplog.at_level(logging.DEBUG, logger="curie_worker.run"):
         events = _boot(
             monkeypatch,
+            database_url=worker_db[2],
             raises=redis.exceptions.ConnectionError("Error connecting to valkey:6379"),
         )
 

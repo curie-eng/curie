@@ -18,8 +18,15 @@ from aci_protocol import (
 )
 from channel_protocol.work_item_events import execute_event_id, terminate_event_id
 from curie_internal.streams import ensure_group
-from curie_telemetry import record_metric
+from curie_telemetry import (
+    TRACEPARENT_STREAM_FIELD,
+    inject_trace_context,
+    operation_span,
+    record_metric,
+)
+from opentelemetry.trace import SpanKind
 from redis.exceptions import ResponseError
+from redis.typing import EncodableT
 from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
@@ -44,7 +51,12 @@ logger = logging.getLogger(__name__)
 # can leave a marker without its turn.
 _MARK_AND_XADD = """
 if redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1]) then
-  redis.call('XADD', KEYS[2], '*', ARGV[2], ARGV[3])
+  local args = {KEYS[2], '*', ARGV[2], ARGV[3]}
+  if ARGV[4] ~= '' and ARGV[5] ~= '' then
+    table.insert(args, ARGV[4])
+    table.insert(args, ARGV[5])
+  end
+  redis.call('XADD', unpack(args))
   return 1
 end
 return 0
@@ -82,36 +94,42 @@ class WorkItemReconciler:
         await ensure_group(self._valkey, self._stream(), self._group(), start_id="$")
 
     async def _xadd(self, turn: QueuedTurn, *, marker: tuple[str, int] | None = None) -> None:
-        if marker is not None:
-            # Set the round's marker NX and append atomically; a marker that is
-            # already set means the turn is already on the stream.
-            key, ttl = marker
-            await self._ensure_group()
-            await self._valkey.eval(
-                _MARK_AND_XADD,
-                2,
-                key,
-                self._stream(),
-                ttl,
-                STREAM_PAYLOAD_FIELD,
-                turn.model_dump_json(),
-            )
-            return
-        try:
-            await self._ensure_group()
-            await self._valkey.xadd(
-                self._stream(), {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
-            )
-        except ResponseError as exc:
-            message = str(exc)
-            if "NOGROUP" in message or "no such key" in message.lower():
+        with operation_span(
+            "curie.queue.enqueue",
+            kind=SpanKind.PRODUCER,
+            attributes={"service.name": "curie-api", "source": "api"},
+        ):
+            carrier: dict[str, str] = {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
+            inject_trace_context(carrier)
+            fields: dict[EncodableT, EncodableT] = {}
+            fields.update(carrier)
+            if marker is not None:
+                # Set the round's marker NX and append atomically; a marker that is
+                # already set means the turn is already on the stream.
+                key, ttl = marker
                 await self._ensure_group()
-                await self._valkey.xadd(
+                await self._valkey.eval(
+                    _MARK_AND_XADD,
+                    2,
+                    key,
                     self._stream(),
-                    {STREAM_PAYLOAD_FIELD: turn.model_dump_json()},
+                    ttl,
+                    STREAM_PAYLOAD_FIELD,
+                    carrier[STREAM_PAYLOAD_FIELD],
+                    TRACEPARENT_STREAM_FIELD if TRACEPARENT_STREAM_FIELD in carrier else "",
+                    carrier.get(TRACEPARENT_STREAM_FIELD, ""),
                 )
                 return
-            raise
+            try:
+                await self._ensure_group()
+                await self._valkey.xadd(self._stream(), fields)
+            except ResponseError as exc:
+                message = str(exc)
+                if "NOGROUP" in message or "no such key" in message.lower():
+                    await self._ensure_group()
+                    await self._valkey.xadd(self._stream(), fields)
+                    return
+                raise
 
     async def run_once(self) -> None:
         for name, step in (

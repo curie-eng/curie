@@ -124,7 +124,7 @@ def test_workspace_preamble_forbids_a_substitute_test_runner() -> None:
 
 # --- declared verification checks (#3521) ------------------------------------------
 
-_PYTHON_COMMAND = "uv run pytest runner/tests -q"
+_PYTHON_COMMAND = "uv run pytest unitconv/tests -q"
 _RUST_COMMAND = "cargo test --locked"
 
 
@@ -134,6 +134,7 @@ def _check(
     command: str,
     *,
     outcome: str = "passed",
+    delegated_to: str | None = None,
 ) -> dict[str, object]:
     return {
         "id": check_id,
@@ -145,6 +146,7 @@ def _check(
         "missing_binaries": [] if outcome == "passed" else ["uv"],
         "blocked_services": [],
         "report_status": 201,
+        "delegated_to": delegated_to,
     }
 
 
@@ -244,7 +246,15 @@ def test_python_only_declaration_does_not_present_python_as_the_check_for_rust()
 
 
 def test_unavailable_check_result_is_scoped_to_that_check() -> None:
-    unavailable = _check("python", ["**/*.py"], _PYTHON_COMMAND, outcome="unavailable")
+    # #3873: an unavailable check that reaches the prompt is always delegated;
+    # an undelegated one stops the run before the model.
+    unavailable = _check(
+        "python",
+        ["**/*.py"],
+        _PYTHON_COMMAND,
+        outcome="unavailable",
+        delegated_to="unit-tests",
+    )
 
     preamble = _preamble(_verification(unavailable, _RUST))
 
@@ -253,6 +263,40 @@ def test_unavailable_check_result_is_scoped_to_that_check() -> None:
     python_line = _check_line(preamble, "python", _PYTHON_COMMAND)
     assert "unavailable" in python_line
     assert "unavailable" not in _check_line(preamble, "rust", _RUST_COMMAND)
+    instruction = next(
+        line for line in preamble.splitlines() if line.startswith("- Check python:")
+    )
+    assert "delegat" in instruction.casefold()
+    assert "CI is pending proof" in instruction
+    assert "do not publish and the work item cannot succeed" not in preamble
+    assert "If no matching required check exists" not in preamble
+    fenced = re.search(r"```json\n(.*?)\n```", preamble, flags=re.DOTALL)
+    assert fenced is not None
+    outside = preamble[: fenced.start()] + preamble[fenced.end() :]
+    assert '"delegated_to":"unit-tests"' in fenced.group(1)
+    assert "unit-tests" not in outside
+
+
+def test_check_data_carries_delegated_to_only_when_set() -> None:
+    import json
+
+    from curie_runner.__main__ import _format_check_data
+
+    delegated = json.loads(
+        _format_check_data(
+            _check(
+                "python",
+                ["**/*.py"],
+                _PYTHON_COMMAND,
+                outcome="unavailable",
+                delegated_to="unit-tests",
+            )
+        )
+    )
+    undelegated = json.loads(_format_check_data(_RUST))
+
+    assert delegated["delegated_to"] == "unit-tests"
+    assert "delegated_to" not in undelegated
 
 
 def test_lockfile_installs_allow_only_the_declared_install_commands() -> None:

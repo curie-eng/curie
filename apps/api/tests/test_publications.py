@@ -2569,6 +2569,7 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                 )
                 credentials = WorkspaceCredentialClient(
                     api_url="https://api.example.test",
+                    github_api_url=get_settings().github_api_url,
                     worker_token=WORKER_TOKEN,
                     transport=_testclient_transport(client),
                 )
@@ -2960,6 +2961,7 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
                 )
                 credentials = WorkspaceCredentialClient(
                     api_url="https://api.example.test",
+                    github_api_url=get_settings().github_api_url,
                     worker_token=WORKER_TOKEN,
                     transport=_testclient_transport(client),
                 )
@@ -6767,8 +6769,10 @@ def _factory_publication_case(
         "base_sha": BASE_SHA,
         "work_item_request_id": str(request_id),
         "work_item_runtime_epoch": runtime_epoch,
-        "patch_b64": base64.b64encode(b"diff --git a/example.py b/example.py\n").decode(),
-        "changed_paths": ["apps/api/src/example.py"],
+        "patch_b64": base64.b64encode(
+            b"diff --git a/unitconv/convert.py b/unitconv/convert.py\n"
+        ).decode(),
+        "changed_paths": ["unitconv/convert.py"],
         "expires_in_seconds": 600,
         "title": "Verify the factory publication route",
         "body": "The change updates the factory verification route.",
@@ -6776,20 +6780,11 @@ def _factory_publication_case(
     yield client, request_id, payload
 
 
-CURIE_PYTHON_CI_CHECK = "Python (ruff + mypy + pytest)"
-CURIE_PYTHON_CI_POLICY = {
-    "check": CURIE_PYTHON_CI_CHECK,
-    "paths": [
-        "apps",
-        "runner",
-        "cli",
-        "adapters",
-        "packages",
-        "examples/tests",
-        "tools",
-        "release",
-    ],
-    "pendingCheckPrefix": "Python pytest (shard ",
+CONVERSION_PYTHON_CI_CHECK = "Unit conversion suite"
+CONVERSION_PYTHON_CI_POLICY = {
+    "check": CONVERSION_PYTHON_CI_CHECK,
+    "paths": ["unitconv", "tests"],
+    "pendingCheckPrefix": "Conversion batch ",
 }
 
 
@@ -6803,10 +6798,10 @@ def _configure_python_ci(
 
 
 @pytest.fixture
-def _curie_python_ci(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Configure Curie's own Python CI layout for the factory repository."""
+def _conversion_python_ci(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Configure the foreign unit conversion repository's own CI layout."""
 
-    _configure_python_ci(monkeypatch, {FACTORY_REPO: CURIE_PYTHON_CI_POLICY})
+    _configure_python_ci(monkeypatch, {FACTORY_REPO: CONVERSION_PYTHON_CI_POLICY})
     yield
     get_settings.cache_clear()
 
@@ -6817,7 +6812,7 @@ def _record_factory_verification(
     *,
     outcome: str = "unavailable",
     check: str = "python",
-    command: str = "uv run pytest runner/tests -q",
+    command: str = "uv run pytest unitconv/tests -q",
 ) -> Any:
     observation: dict[str, Any]
     if outcome == "not_declared":
@@ -6872,7 +6867,7 @@ def _post_factory_publication(
 
 
 def test_factory_publication_adds_unavailable_and_pending_proof_to_python_pr_body(
-    _curie_python_ci: None,
+    _conversion_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -6889,12 +6884,12 @@ def test_factory_publication_adds_unavailable_and_pending_proof_to_python_pr_bod
     )[0]["body"]
     assert payload["body"] in body
     assert "In-sandbox verification was unavailable." in body
-    assert "Python (ruff + mypy + pytest) is pending proof." in body
+    assert "Unit conversion suite is pending proof." in body
     assert "verification passed" not in body.casefold()
 
 
 _NOT_DECLARED_STAMP = "No in-sandbox Python verification check was declared."
-_PENDING_PROOF_STAMP = "Python (ruff + mypy + pytest) is pending proof."
+_PENDING_PROOF_STAMP = "Unit conversion suite is pending proof."
 
 
 def _factory_publication_body(publication_id: str) -> str:
@@ -6907,7 +6902,7 @@ def _factory_publication_body(publication_id: str) -> str:
 
 
 def test_factory_python_publication_with_no_declared_check_states_it_was_not_declared(
-    _curie_python_ci: None,
+    _conversion_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -6926,7 +6921,7 @@ def test_factory_python_publication_with_no_declared_check_states_it_was_not_dec
 
 
 def test_factory_python_publication_with_only_a_rust_check_is_not_declared_for_python(
-    _curie_python_ci: None,
+    _conversion_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -6962,7 +6957,7 @@ def test_factory_python_publication_with_a_passed_python_check_adds_no_stamp(
 
 
 def test_factory_python_publication_uses_the_python_check_among_several(
-    _curie_python_ci: None,
+    _conversion_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -7020,7 +7015,7 @@ def test_factory_python_publication_refuses_any_failed_declared_check(
         request_id,
         outcome="failed",
         check="api",
-        command="uv run pytest apps/api/tests -q",
+        command="uv run pytest tests -q",
     )
     assert failed.status_code == 201, failed.text
 
@@ -7031,7 +7026,7 @@ def test_factory_python_publication_refuses_any_failed_declared_check(
 
 
 def test_factory_python_publication_stamps_an_unavailable_check_under_any_id(
-    _curie_python_ci: None,
+    _conversion_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -7040,7 +7035,7 @@ def test_factory_python_publication_stamps_an_unavailable_check_under_any_id(
         request_id,
         outcome="unavailable",
         check="api",
-        command="uv run pytest apps/api/tests -q",
+        command="uv run pytest tests -q",
     )
     assert recorded.status_code == 201, recorded.text
 
@@ -7088,11 +7083,11 @@ def test_factory_python_publication_refuses_a_failed_preflight_observation(
 
 
 def test_factory_python_publication_refuses_when_ci_does_not_select_the_path(
-    _curie_python_ci: None,
+    _conversion_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
-    payload["changed_paths"] = ["examples/coder/factory_fixture.py"]
+    payload["changed_paths"] = ["scripts/convert.py"]
     recorded = _record_factory_verification(client, request_id)
     assert recorded.status_code == 201, recorded.text
 
@@ -7100,7 +7095,7 @@ def test_factory_python_publication_refuses_when_ci_does_not_select_the_path(
 
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.required_python_ci_unselected"
-    assert "examples/coder/factory_fixture.py" in refused.json()["detail"]["message"]
+    assert "scripts/convert.py" in refused.json()["detail"]["message"]
 
 
 def test_factory_non_python_publication_keeps_its_existing_body_without_python_claims(
@@ -7118,7 +7113,7 @@ def test_factory_non_python_publication_keeps_its_existing_body_without_python_c
 
 
 def test_later_non_python_publication_keeps_prior_python_proof_pending(
-    _curie_python_ci: None,
+    _conversion_python_ci: None,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -7141,7 +7136,7 @@ def test_later_non_python_publication_keeps_prior_python_proof_pending(
 
     assert created.status_code == 201, created.text
     assert "In-sandbox verification was unavailable." in created.json()["body"]
-    assert "Python (ruff + mypy + pytest) is pending proof." in created.json()["body"]
+    assert "Unit conversion suite is pending proof." in created.json()["body"]
 
 
 # --- per-repository Python CI policy (#3617) ------------------------------------------
@@ -7165,14 +7160,14 @@ def test_outside_python_layout_without_a_policy_is_published_with_repository_ci_
     body = _factory_publication_body(created.json()["id"])
     assert _NOT_DECLARED_STAMP in body
     assert _REPOSITORY_PENDING_PROOF in body
-    assert CURIE_PYTHON_CI_CHECK not in body
+    assert CONVERSION_PYTHON_CI_CHECK not in body
 
 
 def test_outside_python_layout_without_a_policy_accepts_any_python_path(
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
     client, request_id, payload = _factory_publication_case
-    payload["changed_paths"] = ["examples/coder/factory_fixture.py"]
+    payload["changed_paths"] = ["scripts/convert.py"]
     recorded = _record_factory_verification(client, request_id)
     assert recorded.status_code == 201, recorded.text
 
@@ -7188,7 +7183,7 @@ def test_policy_for_another_repository_does_not_apply(
     monkeypatch: pytest.MonkeyPatch,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
-    _configure_python_ci(monkeypatch, {"curie-eng/curie": CURIE_PYTHON_CI_POLICY})
+    _configure_python_ci(monkeypatch, {"acme-corp/another-repository": CONVERSION_PYTHON_CI_POLICY})
     client, request_id, payload = _factory_publication_case
     payload["changed_paths"] = ["unitconv/convert.py"]
     recorded = _record_factory_verification(client, request_id, outcome="not_declared")
@@ -7218,7 +7213,7 @@ def test_custom_policy_names_its_check_in_the_pending_proof_stamp(
     assert created.status_code == 201, created.text
     body = _factory_publication_body(created.json()["id"])
     assert "Unit tests is pending proof." in body
-    assert CURIE_PYTHON_CI_CHECK not in body
+    assert CONVERSION_PYTHON_CI_CHECK not in body
     assert _REPOSITORY_PENDING_PROOF not in body
 
 
@@ -7230,8 +7225,8 @@ def test_custom_policy_refuses_a_path_outside_its_selection(
         monkeypatch, {FACTORY_REPO: {"check": "Unit tests", "paths": ["src"]}}
     )
     client, request_id, payload = _factory_publication_case
-    # Selected by Curie's layout, not by this repository's.
-    payload["changed_paths"] = ["apps/api/src/example.py"]
+    # Selected by the conversion policy, outside this custom policy's layout.
+    payload["changed_paths"] = ["unitconv/convert.py"]
     recorded = _record_factory_verification(client, request_id)
     assert recorded.status_code == 201, recorded.text
 
@@ -7239,4 +7234,4 @@ def test_custom_policy_refuses_a_path_outside_its_selection(
 
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.required_python_ci_unselected"
-    assert "apps/api/src/example.py" in refused.json()["detail"]["message"]
+    assert "unitconv/convert.py" in refused.json()["detail"]["message"]

@@ -6263,9 +6263,9 @@ mod tests {
     }
 
     /// A stalled private executable drives the real readiness wait without
-    /// depending on kubectl, DNS, or a cluster. Each trial must spend its lookup
-    /// budget, return the turn channel, and kill the PID the shim recorded.
-    /// Removing the shared timeout fails the outer harness; removing
+    /// depending on kubectl, DNS, or a cluster. Each trial advances an injected
+    /// clock to prove expiry returns the turn channel and kills the recorded PID.
+    /// Removing the shared timeout leaves the lookup pending at expiry; removing
     /// `kill_on_drop` leaves that known child alive and fails cleanup.
     #[tokio::test]
     async fn the_cluster_arm_degrades_without_leaking_a_port_forward() {
@@ -6305,7 +6305,7 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("create temporary directory");
         let script = temp.path().join("stalled-port-forward");
-        crate::test_executable::install(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 60\n");
+        crate::test_executable::install(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 86400\n");
         let opts = MessageOpts {
             api_key: HINT_API_KEY.to_string(),
             local: false,
@@ -6322,9 +6322,9 @@ mod tests {
             );
             let mut plumbing = Box::pin(start_port_forward(&cmd, opts.api_local_port, "api"));
 
-            // Confirm startup before measuring cancellation. Move the same owned
+            // Confirm real process startup before pausing time. Move the same owned
             // future into the helper so its timeout must drop the real child.
-            let pid = tokio::time::timeout(Duration::from_secs(1), async {
+            let pid = tokio::time::timeout(Duration::from_secs(60), async {
                 loop {
                     tokio::select! {
                         result = &mut plumbing => {
@@ -6349,22 +6349,39 @@ mod tests {
                 "trial {trial}: shim must be alive before cancellation"
             );
 
-            let started = Instant::now();
-            let resolved = tokio::time::timeout(
-                Duration::from_secs(1),
-                hint_channel_with_cluster_plumbing(
-                    &opts,
-                    TurnVerb::Cluster,
-                    HINT_TURN_CHANNEL,
-                    HINT_APPROVAL_ID,
-                    hint_far_deadline(),
-                    budget,
-                    plumbing,
-                ),
-            )
-            .await
-            .expect("the cluster lookup must return before the outer harness expires");
-            let elapsed = started.elapsed();
+            tokio::time::pause();
+            let mut lookup = Box::pin(hint_channel_with_cluster_plumbing(
+                &opts,
+                TurnVerb::Cluster,
+                HINT_TURN_CHANNEL,
+                HINT_APPROVAL_ID,
+                hint_far_deadline(),
+                budget,
+                plumbing,
+            ));
+            assert!(
+                futures_util::poll!(lookup.as_mut()).is_pending(),
+                "trial {trial}: the started port-forward must stall the lookup"
+            );
+            tokio::time::advance(budget - Duration::from_millis(1)).await;
+            assert!(
+                futures_util::poll!(lookup.as_mut()).is_pending(),
+                "trial {trial}: the lookup must remain pending before its budget expires"
+            );
+            assert!(
+                child_running(pid),
+                "trial {trial}: the child must remain alive until expiry"
+            );
+            // Tokio timers have millisecond granularity. Advance one tick past
+            // expiry, far short of the port-forward's own readiness deadline.
+            tokio::time::advance(Duration::from_millis(2)).await;
+            let resolved = match futures_util::poll!(lookup.as_mut()) {
+                std::task::Poll::Ready(resolved) => resolved,
+                std::task::Poll::Pending => {
+                    panic!("trial {trial}: lookup remained pending after its budget expired")
+                }
+            };
+            tokio::time::resume();
 
             assert_eq!(
                 resolved, HINT_TURN_CHANNEL,
@@ -6374,20 +6391,15 @@ mod tests {
                 !resolved.is_empty(),
                 "trial {trial}: the fallback must be nonempty"
             );
-            assert!(
-                elapsed <= budget + Duration::from_millis(500),
-                "trial {trial}: lookup exceeded its budget plus scheduling margin: {elapsed:?}"
-            );
-
-            // The kernel may apply the drop signal after the helper returns.
-            let cleanup_deadline = Instant::now() + Duration::from_millis(500);
-            while child_running(pid) && Instant::now() < cleanup_deadline {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            assert!(
-                !child_running(pid),
-                "trial {trial}: lookup left child PID {pid} alive"
-            );
+            // The kernel applies the drop signal independently of Tokio's clock.
+            // This broad watchdog detects a leak, without measuring CPU scheduling.
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while child_running(pid) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("trial {trial}: lookup left child PID {pid} alive"));
         }
         eprintln!("cluster hint cancellation passed 50 of 50 trials");
     }
@@ -7367,6 +7379,78 @@ mod tests {
         rest.split_whitespace().next()?.chars().next()
     }
 
+    /// An interrupted `poll` is not a missing child. `poll` returns `EINTR`
+    /// even when the process restarts interrupted calls.
+    #[cfg(target_os = "linux")]
+    fn readiness_poll_was_interrupted(rc: i32, err: i32) -> bool {
+        rc < 0 && err == libc::EINTR
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_interrupted_readiness_poll_is_not_a_failure() {
+        assert!(readiness_poll_was_interrupted(-1, libc::EINTR));
+        assert!(!readiness_poll_was_interrupted(-1, libc::EIO));
+        assert!(!readiness_poll_was_interrupted(1, libc::EINTR));
+    }
+
+    /// Pid of the shim, published on `ready` only after that stub has exec'd.
+    #[cfg(target_os = "linux")]
+    fn pid_published_on(ready: std::fs::File) -> u32 {
+        use std::os::fd::AsRawFd;
+
+        let fd = ready.as_raw_fd();
+        // SAFETY: `fd` is the open fifo this function owns, and these fcntl
+        // commands only change that descriptor's flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "read fifo flags");
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "mark the readiness fifo nonblocking"
+        );
+        let started = std::time::Instant::now();
+        let limit = std::time::Duration::from_secs(10);
+        loop {
+            let left = limit.saturating_sub(started.elapsed());
+            assert!(!left.is_zero(), "the shim never published its pid");
+            let timeout_ms = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `pollfd` points at one stack descriptor for this fifo.
+            let ready_count = unsafe { libc::poll(&raw mut pollfd, 1, timeout_ms) };
+            if ready_count < 0 {
+                let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if readiness_poll_was_interrupted(ready_count, err) {
+                    continue;
+                }
+                panic!("readiness poll failed: {err}");
+            }
+            if ready_count == 1 {
+                break;
+            }
+        }
+        let mut buf = [0u8; 64];
+        let n = loop {
+            // SAFETY: `buf` is writable storage and `fd` is the same open fifo.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if err == libc::EINTR {
+                    continue;
+                }
+                panic!("readiness read failed: {err}");
+            }
+            break n;
+        };
+        assert!(n > 0, "the readiness fifo closed before a pid");
+        let line = std::str::from_utf8(&buf[..n as usize]).expect("pid is utf 8");
+        line.trim().parse().expect("the recorded pid is a number")
+    }
+
     /// #1031(d), second half: bounding the WAIT is not bounding the WORK. A
     /// timeout that only drops the future leaves the `docker` client running
     /// against the wedged daemon, so every timed-out `local message` strands
@@ -7377,30 +7461,57 @@ mod tests {
     #[tokio::test]
     async fn a_timed_out_probe_kills_the_docker_child_it_abandoned() {
         let temp = tempfile::tempdir().expect("create temporary directory");
-        let pidfile = temp.path().join("pid");
+        let ready_path = temp.path().join("ready");
+        use std::os::unix::ffi::OsStrExt;
+        let ready_c =
+            std::ffi::CString::new(ready_path.as_os_str().as_bytes()).expect("ready fifo path");
+        assert_eq!(
+            unsafe { libc::mkfifo(ready_c.as_ptr(), 0o600) },
+            0,
+            "create the readiness fifo: {}",
+            std::io::Error::last_os_error()
+        );
+        // Hold the fifo open for read and write before spawn. The shim's
+        // `echo` then cannot block waiting for a reader, and it cannot finish
+        // the write before this descriptor exists.
+        let ready = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&ready_path)
+            .expect("open readiness fifo");
         let script = temp.path().join("wedged-docker");
         crate::test_executable::install(&script, "#!/bin/sh\necho $$ > \"$1\"\nexec sleep 60\n");
+        // Exec only after the stub's write descriptor is gone. A read-only
+        // reopen that we drop is the barrier: `install` has already synced
+        // and closed its own write.
+        drop(std::fs::File::open(&script).expect("stub is closed"));
 
         let cmd = OpsCommand::new(
             script.to_str().expect("shim path is UTF 8"),
-            vec![plain(pidfile.to_str().expect("pidfile path is UTF 8"))],
+            vec![plain(ready_path.to_str().expect("ready path is UTF 8"))],
         );
-        let reason = bounded_worker_probe(
-            async {
-                let (_ok, _out, _err) = run_capture(&cmd).await?;
-                Ok((None, None))
-            },
-            Duration::from_millis(300),
+        let probe = tokio::spawn(async move {
+            bounded_worker_probe(
+                async {
+                    let (_ok, _out, _err) = run_capture(&cmd).await?;
+                    Ok((None, None))
+                },
+                Duration::from_millis(300),
+            )
+            .await
+        });
+        let published = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || pid_published_on(ready)),
         )
         .await
-        .expect_err("a shim that never answers must time out");
+        .expect("the shim never published its pid");
+        let pid = published.expect("readiness read task");
+        let reason = probe
+            .await
+            .expect("probe task")
+            .expect_err("a shim that never answers must time out");
         assert!(reason.contains("did not answer within"), "{reason}");
-
-        let pid: u32 = std::fs::read_to_string(&pidfile)
-            .expect("the shim recorded its pid before sleeping")
-            .trim()
-            .parse()
-            .expect("the recorded pid is a number");
 
         // The kill is delivered on drop; give the kernel a moment to land it.
         let mut state = proc_state(pid);

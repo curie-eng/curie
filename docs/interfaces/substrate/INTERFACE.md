@@ -25,7 +25,7 @@ The substrate is where a conversation thread claims, dials, suspends, and reaps 
 
 A second implementation must satisfy the `SandboxClient` `Protocol` at `apps/worker/src/curie_worker/sandbox/types.py::SandboxClient`, nine methods:
 
-- `create_claim(name, *, pool, env=None, labels=None) -> None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.create_claim`)
+- `create_claim(name, *, pool, env=None, labels=None, runner_resources=None, agent_name=None) -> None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.create_claim`); every implementation must apply `filter_agent_child_env` (`apps/worker/src/curie_worker/sandbox/types.py::filter_agent_child_env`) to `env` before building the agent child environment
 - `get_claim(name, *, request_timeout_seconds) -> ClaimView | None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.get_claim`)
 - `delete_claim(name, *, request_timeout_seconds) -> None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.delete_claim`)
 - `list_claims(*, label_selector) -> list[ClaimView]` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.list_claims`)
@@ -63,6 +63,8 @@ Scoped tokens diverge the same way (#3842). The binding puts the runner, history
 Attachment redemption diverges the same way (#2567). Docker redeems the capability in `apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient._prepare_attachments` and bind-mounts the files read-only. Kubernetes hands the key only to the `attachments-init` container (`apps/worker/src/curie_worker/sandbox/k8s.py::ATTACHMENT_INIT_CONTAINERS`, applied in `apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient.create_claim`) and keeps it off the runner.
 
 Workspace redemption has the same substrate split. Docker fetches, validates, and bind-mounts the archive in `apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient._prepare_workspace`. Kubernetes forwards only the workspace ref and digest to the `workspace-init` container (`apps/worker/src/curie_worker/sandbox/k8s.py::WORKSPACE_INIT_CONTAINERS`, applied in `apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient.create_claim`).
+
+Pool selection leaks the port in two places. `SandboxSubstrate` imports the concrete `DockerSandboxClient` (`apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient`) and branches on `isinstance` in `_claim_fresh`: Docker uses `SubstrateConfig.warm_pool` as is, and every other client goes through `claim_warm_pool` and the per-agent pool lookup. That lookup, `SandboxSubstrate._existing_agent_pool`, also probes the client with `getattr(self._k8s, "warm_pool_exists", None)`, a method that is not on the `SandboxClient` `Protocol` and that only `KubernetesSandboxClient` defines (`apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient.warm_pool_exists`). A third substrate would be sent down the Kubernetes branch and silently skip the per-agent pool probe unless it defines that method. This is documented, not scheduled: moving pool selection behind the port is worth doing only when a third substrate is real.
 
 ## Cross-links
 

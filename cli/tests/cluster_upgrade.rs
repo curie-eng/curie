@@ -542,8 +542,11 @@ async fn dry_run_names_stale_runner_layers_and_clears_them_in_the_apply() {
         .expect("plan has an apply line");
     assert_eq!(
         apply,
-        "helm upgrade curie charts/curie -n curie --wait --timeout 15m -f <retained-values> \
-         --set agentSandbox.runnerImages.factory=null --set agentSandbox.runnerImages.sre-bot=null"
+        "helm upgrade curie charts/curie -n curie --wait --timeout 15m -f <retained-values>"
+    );
+    assert!(
+        !apply.contains("=null"),
+        "a null runnerImages override is the render refusal: {apply}"
     );
     let notice = plan
         .lines
@@ -568,9 +571,10 @@ async fn dry_run_names_stale_runner_layers_and_clears_them_in_the_apply() {
     );
     let json = output_json(&out).to_string();
     assert!(
-        json.contains("agentSandbox.runnerImages.sre-bot=null"),
-        "{json}"
+        !json.contains("=null"),
+        "the plan must not pass a null digest: {json}"
     );
+    assert!(json.contains("sre-bot"), "{json}");
     assert_eq!(host.mutate_calls, 0);
 
     let mut untouched = FakeUpgradeHost::installed("0.10.0").with_retained_values();
@@ -583,6 +587,48 @@ async fn dry_run_names_stale_runner_layers_and_clears_them_in_the_apply() {
     assert!(plan.lines.iter().all(|l| !l.contains("runnerImages")
         && !l.starts_with("runner layers:")
         && !l.contains("sandboxclaim")));
+}
+
+/// #3849: a Helm apply error is a terminal failed checkpoint at apply.
+/// The previous known-good version stays the one that was serving.
+#[tokio::test]
+async fn apply_error_records_a_failed_checkpoint_and_keeps_the_previous_release() {
+    let mut host = FakeUpgradeHost::installed("0.11.1").apply_error(
+        "agentSandbox.runnerImages.acme-bot must be a digest reference, got \"<nil>\"",
+    );
+    let out = run_lifecycle(opts("0.11.2"), &mut host)
+        .await
+        .expect("apply failure is a completed failure payload");
+    let json = output_json(&out);
+    assert_eq!(json["status"], "failed", "{json}");
+    assert_eq!(json["phase"], "apply", "{json}");
+    assert_eq!(json["previous_serving"], true, "{json}");
+    assert_eq!(json["known_good_version"], "0.11.1", "{json}");
+    assert_eq!(host.current_version(), "0.11.1");
+    assert_eq!(host.mutate_calls, 1, "apply is attempted once");
+    let view = host.status_view();
+    assert_eq!(view.status, "failed");
+    assert_eq!(view.phase.as_deref(), Some("apply"));
+    let record: serde_json::Value = serde_json::from_str(&host.persisted_json()).unwrap();
+    assert_eq!(record["status"], "failed");
+    assert_eq!(record["failed_phase"], "apply");
+    assert!(record["completed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|phase| phase == "migrate"));
+    assert!(!record["completed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|phase| phase == "apply"));
+    assert!(
+        json["fail_forward"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("<nil>"),
+        "{json}"
+    );
 }
 
 /// #3422: a real upgrade that clears layered agents' runner images retires

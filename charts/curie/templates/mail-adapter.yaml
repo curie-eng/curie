@@ -361,6 +361,8 @@ spec:
             # process fall back to its own default and start.
             - name: CURIE_MAIL_ALLOWED_SENDERS
               value: {{ join "," .Values.mailAdapter.allowedSenders | quote }}
+            - name: CURIE_MAIL_ALLOW_ALL_SENDERS
+              value: {{ .Values.mailAdapter.allowAllSenders | default false | quote }}
             # #2731: the exact set of addresses the egress NetworkPolicy admits
             # on TCP 443, comma-joined in the same order as its ipBlock rules, so
             # the adapter can pin to /32 entries when DNS rotates the provider's

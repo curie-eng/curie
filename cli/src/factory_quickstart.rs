@@ -4,11 +4,13 @@
 //! The command chains kind (only when no kube context is targeted), `cluster
 //! up` with gVisor off on that kind path, the printed App registration link,
 //! and on the second run the App setup, polling intake, and the published
-//! dark factory deploy. It never opens a browser and never runs `gh`.
+//! dark factory deploy. A current context that is not a kind context (`kind-`
+//! prefix) is confirmed in a terminal and refused without one. An explicit
+//! `--context` is not asked. It never opens a browser and never runs `gh`.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 
 use anyhow::Result;
 
@@ -24,6 +26,11 @@ pub const DEFAULT_BUDGET_USD: f64 = 5.0;
 pub const AGENT_NAME: &str = "dark-factory";
 pub const GVISOR_OFF_SET: &str = "security.gvisor.mode=off";
 pub const POLL_INTAKE: &str = "poll";
+/// The model the factory's plan and diff reviewers run. It must match the
+/// dark-factory bundle's `progress/phases.json` and agent frontmatter.
+pub const REVIEWER_MODEL: &str = "anthropic/claude-opus-5.5";
+/// The OpenRouter credit one factory run should have available (#3935).
+pub const RUN_CREDIT_USD: f64 = 5.0;
 
 #[derive(Debug, Clone)]
 pub struct QuickstartOpts {
@@ -61,6 +68,9 @@ pub struct PlanInput {
     pub credential_in_env: bool,
     pub release_has_real_model: bool,
     pub interactive: bool,
+    /// The release is already the chart and the quickstart values, so this
+    /// plan must not invoke `cluster up`.
+    pub release_at_target: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,9 +116,13 @@ pub enum Action {
 #[derive(Debug, Clone)]
 pub struct Planned {
     pub context: String,
+    /// Why `context` was selected. `--dry-run` prints this before any step.
+    pub context_reason: String,
     pub kind_cluster: Option<String>,
     pub credential: CredentialDecision,
     pub actions: Vec<Action>,
+    /// `cluster up` was left out because the release is already at the target.
+    pub skipped_cluster_up: bool,
 }
 
 #[derive(Debug)]
@@ -135,6 +149,8 @@ pub enum QuickstartOutput {
         agent: String,
         deadline_seconds: u32,
         budget_usd: f64,
+        /// OpenRouter credit left to the model credential, when it was read.
+        credit_remaining_usd: Option<f64>,
     },
 }
 
@@ -169,6 +185,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 agent,
                 deadline_seconds,
                 budget_usd,
+                credit_remaining_usd,
             } => serde_json::json!({
                 "phase": "ready",
                 "context": context,
@@ -187,6 +204,9 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 "agent": agent,
                 "execution_deadline_seconds": deadline_seconds,
                 "budget_usd": budget_usd,
+                "reviewer_model": REVIEWER_MODEL,
+                "run_credit_usd": RUN_CREDIT_USD,
+                "credit_remaining_usd": credit_remaining_usd,
             }),
         }
     }
@@ -194,17 +214,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
     fn render(&self, ui: &crate::ui::Ui) {
         match self {
             Self::DryRun(plan) => plan.render(ui),
-            Self::Registration {
-                context,
-                url,
-                steps,
-                kind_cluster,
-            } => {
-                if let Some(name) = kind_cluster {
-                    ui.payload(&format!("Kind cluster {name}, context {context}."));
-                } else {
-                    ui.payload(&format!("Using Kubernetes context {context}."));
-                }
+            Self::Registration { url, steps, .. } => {
                 ui.payload("No App id was passed. Register the factory App, then rerun:");
                 ui.payload_plain(url);
                 for (index, step) in steps.iter().enumerate() {
@@ -225,6 +235,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 agent,
                 deadline_seconds,
                 budget_usd,
+                credit_remaining_usd,
                 ..
             } => {
                 let mention_note = if *mention_inferred {
@@ -246,6 +257,14 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 ));
                 ui.payload(&format!(
                     "Deployed {agent} from {runner_image}. Execution deadline {deadline_seconds}s. Publication auto. Budget {budget_usd} USD."
+                ));
+                // Worded apart from the pre-deploy low-credit warning.
+                let credit_left = credit_remaining_usd
+                    .map(|left| format!(" The key has {left:.2} USD left."))
+                    .unwrap_or_default();
+                ui.payload(&format!(
+                    "Reviewers run {REVIEWER_MODEL}. Plan on {} USD of OpenRouter credit per run.{credit_left}",
+                    budget_display(RUN_CREDIT_USD)
                 ));
             }
         }
@@ -314,27 +333,110 @@ pub struct RerunTarget<'a> {
 }
 
 pub fn registration_steps(target: &RerunTarget<'_>) -> Vec<String> {
-    let org = target
-        .org
-        .map(|org| format!(" --org {org}"))
-        .unwrap_or_default();
+    let mut rerun = format!(
+        "Rerun: curie factory quickstart --repo {} --context {}",
+        target.repo, target.context
+    );
+    for (flag, value, default) in [
+        ("--namespace", target.namespace, "curie"),
+        ("--release", target.release, "curie"),
+        ("--model", target.model, DEFAULT_MODEL),
+    ] {
+        if value != default {
+            rerun.push_str(&format!(" {flag} {value}"));
+        }
+    }
+    if let Some(org) = target.org {
+        rerun.push_str(&format!(" --org {org}"));
+    }
+    rerun.push_str(" --app-id <APP_ID> --private-key-file <PATH.pem>");
     vec![
         "Open the link and click Create GitHub App. The name, permissions, and the disabled webhook are already filled in.".to_string(),
         "On the App settings page, note the App ID and click Generate a private key to download the .pem file.".to_string(),
         format!("Click Install App and install it on {}.", target.repo),
-        format!(
-            "Rerun: curie factory quickstart --repo {repo} --context {context} --namespace {namespace} --release {release} --model {model}{org} --app-id <APP_ID> --private-key-file <PATH.pem>",
-            repo = target.repo,
-            context = target.context,
-            namespace = target.namespace,
-            release = target.release,
-            model = target.model,
-        ),
+        rerun,
     ]
 }
 
 pub fn kind_context_name(kind_name: &str) -> String {
     format!("kind-{kind_name}")
+}
+
+/// Kind writes kubeconfig contexts as `kind-<cluster>`. The same prefix selects
+/// the gVisor-off path, so confirmation uses it too.
+fn is_kind_context(name: &str) -> bool {
+    name.starts_with("kind-")
+}
+
+fn unconfirmed_remote_context<'a>(
+    explicit: Option<&'a str>,
+    current: Option<&'a str>,
+) -> Option<&'a str> {
+    match (explicit, current) {
+        (None, Some(name)) if !is_kind_context(name) => Some(name),
+        _ => None,
+    }
+}
+
+fn unconfirmed_context_error(name: &str) -> anyhow::Error {
+    CliError::usage(format!(
+        "refusing to install into Kubernetes context {name} because it is not a kind context and stdin is not a terminal. Pass --context {name} to proceed"
+    ))
+    .with_fix(format!("rerun with --context {name}"))
+    .into()
+}
+
+fn context_confirmation_line(name: &str, line: &str) -> Result<()> {
+    if matches!(line.trim(), "y" | "Y" | "yes" | "Yes") {
+        return Ok(());
+    }
+    Err(CliError::usage(format!(
+        "refusing to install into Kubernetes context {name} without confirmation. Pass --context {name} to proceed"
+    ))
+    .with_fix(format!("rerun with --context {name}"))
+    .into())
+}
+
+fn confirm_remote_context(name: &str, interactive: bool) -> Result<()> {
+    if !interactive {
+        return Err(unconfirmed_context_error(name));
+    }
+    eprint!("Kubernetes context {name} is not a kind context. Install Curie into it? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|err| CliError::failure(format!("reading confirmation from stdin: {err}")))?;
+    context_confirmation_line(name, &line)
+}
+
+fn context_reason(
+    explicit: Option<&str>,
+    current: Option<&str>,
+    context: &str,
+    create_kind: bool,
+    kind_cluster: Option<&str>,
+) -> String {
+    if explicit.is_some() {
+        format!("Kubernetes context: {context} because --context was passed")
+    } else if let Some(name) = current {
+        if is_kind_context(name) {
+            format!("Kubernetes context: {context} because the current context is a kind context")
+        } else {
+            format!(
+                "Kubernetes context: {context} because it is the current context and it is not a kind context; a terminal must confirm before install, and a non-terminal run stops until --context {context} is passed"
+            )
+        }
+    } else if create_kind {
+        format!(
+            "Kubernetes context: {context} because no current context is set, so a kind cluster is created"
+        )
+    } else {
+        let name = kind_cluster.unwrap_or(context);
+        format!(
+            "Kubernetes context: {context} because no current context is set and kind cluster {name} already exists"
+        )
+    }
 }
 
 pub fn bundle_dir(namespace: &str, release: &str) -> PathBuf {
@@ -386,6 +488,14 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         .with_fix("pass a name of letters, digits, and hyphens, or omit --kind-name")
         .into());
     }
+    if !input.interactive {
+        if let Some(name) = unconfirmed_remote_context(
+            input.explicit_context.as_deref(),
+            input.current_context.as_deref(),
+        ) {
+            return Err(unconfirmed_context_error(name));
+        }
+    }
 
     let owned_kind = kind_context_name(&input.kind_name);
     let context = input
@@ -397,9 +507,9 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
     // the one this command created on a previous run, still gets gVisor off
     // and the CoreDNS scale. A remote context does not.
     let kind_target = input.explicit_context.is_none() && input.current_context.is_none()
-        || context.starts_with("kind-");
+        || is_kind_context(&context);
     let kind_cluster = kind_target.then(|| {
-        if context.starts_with("kind-") {
+        if is_kind_context(&context) {
             context.trim_start_matches("kind-").to_string()
         } else {
             input.kind_name.clone()
@@ -456,7 +566,12 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         up.push("--set".into());
         up.push(GVISOR_OFF_SET.into());
     }
-    actions.push(Action::Cluster { args: up });
+    // ADR 0114 and ADR 0193 keep install-fact inference inside `cluster up`.
+    // The skip stays here: quickstart does not invoke `cluster up` when the
+    // release is already that chart and these values.
+    if !input.release_at_target {
+        actions.push(Action::Cluster { args: up });
+    }
 
     if finishing {
         actions.push(Action::Intake(Box::new(finish_intake_opts(
@@ -481,8 +596,16 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         });
     }
 
+    let context_reason = context_reason(
+        input.explicit_context.as_deref(),
+        input.current_context.as_deref(),
+        &context,
+        create_kind,
+        kind_cluster.as_deref(),
+    );
     Ok(Planned {
         context,
+        context_reason,
         kind_cluster,
         credential: credential_decision(
             input.credential_in_env,
@@ -490,6 +613,7 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
             input.interactive,
         ),
         actions,
+        skipped_cluster_up: input.release_at_target,
     })
 }
 
@@ -513,11 +637,21 @@ fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIntakeOpts {
         private_key_file: input.private_key_file.as_ref().map(PathBuf::from),
         org: input.org.clone(),
         intake: Some(POLL_INTAKE.into()),
+        runner_binding: None,
     }
 }
 
 pub fn describe(planned: &Planned) -> Vec<String> {
-    let mut lines = Vec::new();
+    let toolchain = if planned
+        .actions
+        .iter()
+        .any(|action| matches!(action, Action::Intake(_)))
+    {
+        crate::factory_toolchain::PLAN_NOTE
+    } else {
+        crate::factory_toolchain::SKIPPED_NOTE
+    };
+    let mut lines = vec![toolchain.into(), planned.context_reason.clone()];
     match &planned.credential {
         CredentialDecision::UseEnv => {
             lines.push("model credential: use CURIE_CREDENTIALS (no prompt)".to_string());
@@ -540,6 +674,11 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                     .to_string(),
             );
         }
+    }
+    if planned.skipped_cluster_up {
+        lines.push(
+            "skip cluster up: the release is already at the target chart and values".to_string(),
+        );
     }
     for action in &planned.actions {
         match action {
@@ -580,7 +719,7 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 lines.push(format!(
-                    "configure factory intake api.githubFactoryIntake={intake} for {} with --app-id {} --private-key-file {} and no webhook secret",
+                    "configure factory intake api.githubFactoryIntake={intake} for {} with --app-id {} --private-key-file {} and no webhook secret; the same helm upgrade binds the dark factory runner image",
                     opts.repos.join(","),
                     opts.app_id.as_deref().unwrap_or(""),
                     opts.private_key_file
@@ -640,12 +779,171 @@ pub fn plan_touches_forbidden_tool(lines: &[String]) -> Option<String> {
     None
 }
 
+fn check_prerequisites(
+    explicit_context: Option<&str>,
+    current_context: Option<&str>,
+    mut on_path: impl FnMut(&str) -> bool,
+) -> Result<()> {
+    let tools = [
+        ("docker", "https://docs.docker.com/get-docker/"),
+        (
+            "kind",
+            "https://kind.sigs.k8s.io/docs/user/quick-start/#installation",
+        ),
+        ("kubectl", "https://kubernetes.io/docs/tasks/tools/"),
+        ("helm", "https://helm.sh/docs/intro/install/"),
+    ];
+    let required = if explicit_context.is_none() && current_context.is_none() {
+        &tools[..]
+    } else {
+        &tools[2..]
+    };
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|(tool, _)| !on_path(tool))
+        .map(|(tool, url)| format!("{tool}: {url}"))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::failure(format!(
+        "missing required tools on PATH: {}",
+        missing.join("; ")
+    ))
+    .with_fix("install the listed tools using their official guides, add them to PATH, and rerun")
+    .into())
+}
+
+/// True when `metadata` names `chart_version` and `values` already hold the
+/// quickstart install: the requested model, a real model, and gVisor off on a
+/// kind target.
+pub fn quickstart_release_matches(
+    chart_version: &str,
+    metadata: &serde_json::Value,
+    values: &serde_json::Value,
+    model: &str,
+    kind_target: bool,
+) -> bool {
+    let deployed = metadata
+        .get("version")
+        .and_then(|value| value.as_str())
+        .filter(|version| !version.is_empty())
+        .or_else(|| {
+            metadata
+                .get("chart")
+                .and_then(|value| value.as_str())
+                .and_then(|chart| chart.rsplit_once('-').map(|(_, version)| version))
+        });
+    if deployed != Some(chart_version) {
+        return false;
+    }
+    let recorded_model = values
+        .pointer("/agentSandbox/runner/model")
+        .and_then(|value| value.as_str());
+    let real_model =
+        values.pointer("/agentSandbox/runner/fakeModel") == Some(&serde_json::json!(false));
+    let gvisor_off = values
+        .pointer("/security/gvisor/mode")
+        .and_then(|value| value.as_str())
+        == Some("off");
+    recorded_model == Some(model) && real_model && (!kind_target || gvisor_off)
+}
+
+async fn capture_helm_json(cmd: &crate::ops::OpsCommand) -> Result<Option<serde_json::Value>> {
+    let (ok, stdout, _) = crate::ops::run_capture(cmd).await?;
+    if !ok {
+        return Ok(None);
+    }
+    Ok(serde_json::from_str(&stdout).ok())
+}
+
+/// Values and metadata of the revision the release is serving. `None` when
+/// helm has no `deployed` revision: a failed install can still carry the
+/// target chart and values, and that must not count as installed (#3934).
+async fn deployed_release_snapshot(
+    common: &CommonOpts,
+) -> Result<Option<(serde_json::Value, serde_json::Value)>> {
+    let Some(history) = capture_helm_json(&crate::ops::helm_history_cmd(common)).await? else {
+        return Ok(None);
+    };
+    let revision = match crate::cluster_secrets::serving_revision(&history, &common.release) {
+        Ok(revision) => revision,
+        Err(_) => return Ok(None),
+    };
+    let values = capture_helm_json(&crate::cluster_secrets::helm_get_json(
+        common, "values", false, revision,
+    ))
+    .await?;
+    let metadata = capture_helm_json(&crate::cluster_secrets::helm_get_json(
+        common, "metadata", false, revision,
+    ))
+    .await?;
+    Ok(match (values, metadata) {
+        (Some(values), Some(metadata)) => Some((values, metadata)),
+        _ => None,
+    })
+}
+
+async fn release_matches_quickstart_target(
+    opts: &QuickstartOpts,
+    kind_target: bool,
+) -> Result<bool> {
+    let common = CommonOpts {
+        namespace: opts.namespace.clone(),
+        release: opts.release.clone(),
+        dry_run: false,
+    };
+    let chart_version = crate::ops::chart_version(&opts.chart).await?;
+    let Some((values, metadata)) = deployed_release_snapshot(&common).await? else {
+        return Ok(false);
+    };
+    Ok(quickstart_release_matches(
+        &chart_version,
+        &metadata,
+        &values,
+        &opts.model,
+        kind_target,
+    ))
+}
+
 pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     let current = if opts.context.is_some() {
         None
     } else {
         crate::kube_context::current_context_name()
     };
+    check_prerequisites(
+        opts.context.as_deref(),
+        current.as_deref(),
+        crate::ops::on_path,
+    )?;
+    // The finishing pass discovers repository needs before pinning a kube
+    // context or reading Helm. Dry-run describes these reads without making
+    // them, and the first pass has no installation credential yet.
+    if !opts.dry_run {
+        match (&opts.app_id, &opts.private_key_file) {
+            (Some(id), Some(file)) if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) => {
+                crate::factory_toolchain::preflight(id, file, std::slice::from_ref(&opts.repo))
+                    .await?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(CliError::usage(
+                    "pass a numeric --app-id and --private-key-file together",
+                )
+                .into())
+            }
+        }
+    }
+    // Confirm before pin or helm. A non-terminal refusal here never reads the
+    // release, and a declined prompt never installs.
+    let real_interactive = std::io::stdin().is_terminal();
+    if !opts.dry_run {
+        if let Some(name) = unconfirmed_remote_context(opts.context.as_deref(), current.as_deref())
+        {
+            confirm_remote_context(name, real_interactive)?;
+        }
+    }
     let existing = if opts.context.is_none() && current.is_none() {
         match kind_clusters().await {
             Ok(clusters) => clusters,
@@ -658,7 +956,6 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     } else {
         Vec::new()
     };
-    let interactive = std::io::stdin().is_terminal();
     let credential_in_env = crate::ops::model_credential_env()?.is_some();
     let targeted = opts.context.clone().or_else(|| current.clone());
     if let Some(context) = &targeted {
@@ -672,6 +969,12 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
         false
     } else {
         release_model_recorded(&opts).await?
+    };
+    let release_at_target = match &targeted {
+        Some(context) if !opts.dry_run => {
+            release_matches_quickstart_target(&opts, is_kind_context(context)).await?
+        }
+        _ => false,
     };
     let planned = quickstart_plan(&PlanInput {
         repo: opts.repo.clone(),
@@ -693,9 +996,14 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
         chart: opts.chart.clone(),
         credential_in_env,
         release_has_real_model,
-        interactive,
+        // Dry-run reports a non-kind current context instead of refusing it.
+        interactive: opts.dry_run || real_interactive,
+        release_at_target,
     })?;
     if opts.dry_run {
+        let mut planned = planned;
+        planned.credential =
+            credential_decision(credential_in_env, release_has_real_model, real_interactive);
         return Ok(QuickstartOutput::DryRun(DryRunPlan {
             lines: describe(&planned),
         }));
@@ -709,7 +1017,7 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
                 .into(),
         );
     }
-    execute(&planned).await
+    execute(&planned, &opts, release_has_real_model).await
 }
 
 async fn release_model_recorded(opts: &QuickstartOpts) -> Result<bool> {
@@ -726,17 +1034,48 @@ async fn release_model_recorded(opts: &QuickstartOpts) -> Result<bool> {
     })
 }
 
-async fn execute(planned: &Planned) -> Result<QuickstartOutput> {
+async fn execute(
+    planned: &Planned,
+    opts: &QuickstartOpts,
+    mut release_has_real_model: bool,
+) -> Result<QuickstartOutput> {
+    crate::ui::ui().note(&format!("Kubernetes context: {}", planned.context));
+    if planned.skipped_cluster_up {
+        crate::ui::ui().note("release already at the target chart and values; skipping cluster up");
+    }
     let mut prompted = false;
     let mut intake_json = serde_json::Value::Null;
+    let mut rendered_image: Option<String> = None;
+    let mut credit_remaining_usd = None;
     for action in &planned.actions {
+        if matches!(action, Action::Deploy { .. }) {
+            credit_remaining_usd = check_credit(release_has_real_model).await;
+        }
         if matches!(action, Action::Cluster { .. }) && !prompted {
             prompted = true;
+            if planned.kind_cluster.is_some() {
+                // The plan could not read the release: the context did not
+                // exist yet. Read it now, before `cluster up` records a key.
+                // It only picks the key the credit check reads, so a failed
+                // read never stops the install; it skips the saved key instead.
+                release_has_real_model =
+                    crate::kube_context::pin_for_cluster_command(Some(&planned.context)).is_err()
+                        || release_model_recorded(opts).await.unwrap_or(true);
+            }
             ensure_credential(&planned.credential)?;
         }
         match action {
-            Action::External { program, args } => run_program(program, args).await?,
-            Action::Cluster { args } => run_self(args).await?,
+            Action::External { program, args } => {
+                let step = if program == "kind" {
+                    "Creating kind cluster"
+                } else {
+                    "Scaling CoreDNS"
+                };
+                run_program(program, args, step).await?;
+            }
+            Action::Cluster { args } => {
+                run_self(args, "Installing Curie").await?;
+            }
             Action::Register {
                 org,
                 repo,
@@ -763,14 +1102,84 @@ async fn execute(planned: &Planned) -> Result<QuickstartOutput> {
                 });
             }
             Action::Intake(intake) => {
-                crate::kube_context::pin_for_cluster_command(Some(&planned.context))?;
-                let output = crate::factory_intake::factory_intake((**intake).clone()).await?;
-                intake_json = output.to_json();
+                crate::ui::ui().note("Rendering factory bundle");
+                let image =
+                    render_published_bundle(&intake.common.namespace, &intake.common.release)
+                        .await
+                        .map_err(|error| {
+                            let (_, fix) = crate::exit::classify(&error);
+                            step_error(
+                                Path::new("curie"),
+                                &[
+                                    "--plugin-dir".into(),
+                                    bundle_dir(&intake.common.namespace, &intake.common.release)
+                                        .display()
+                                        .to_string(),
+                                ],
+                                "Rendering factory bundle",
+                                error,
+                                fix.as_deref(),
+                            )
+                        })?;
+                rendered_image = Some(image.clone());
+                // ADR 0173 decision 5: refuse a layer built on another runner
+                // before this upgrade binds `agentSandbox.runnerImages`.
+                // `cluster deploy` repeats the check; it must not be the first
+                // time the release learns the image.
+                let bundle = bundle_dir(&intake.common.namespace, &intake.common.release);
+                if let Err(error) =
+                    crate::cluster_secrets::check_layered_runner_base(&intake.common, &bundle).await
+                {
+                    let (_, fix) = crate::exit::classify(&error);
+                    return Err(step_error(
+                        Path::new("curie"),
+                        &["--plugin-dir".into(), bundle.display().to_string()],
+                        "Checking the runner base",
+                        error,
+                        fix.as_deref(),
+                    ));
+                }
+                let mut args = vec![
+                    "cluster".into(),
+                    "factory".into(),
+                    "--context".into(),
+                    planned.context.clone(),
+                    "--namespace".into(),
+                    intake.common.namespace.clone(),
+                    "--release".into(),
+                    intake.common.release.clone(),
+                    "--chart".into(),
+                    intake.chart.clone(),
+                    "--repo".into(),
+                    intake.repos.join(","),
+                    "--intake".into(),
+                    POLL_INTAKE.into(),
+                    "--app-id".into(),
+                    intake.app_id.clone().unwrap_or_default(),
+                    "--private-key-file".into(),
+                    intake
+                        .private_key_file
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                ];
+                if let Some(org) = &intake.org {
+                    args.extend(["--org".into(), org.clone()]);
+                }
+                args.push("--runner-image".into());
+                args.push(format!("{AGENT_NAME}={image}"));
+                intake_json = run_self(&args, "Configuring factory intake").await?;
                 if intake_json.get("github_app").is_none() {
-                    return Err(CliError::failure(
-                        "factory intake did not record the App; nothing further was deployed",
-                    )
-                    .into());
+                    return Err(step_error(
+                        Path::new("curie"),
+                        &args,
+                        "Configuring factory intake",
+                        CliError::failure(
+                            "factory intake did not record the App; nothing further was deployed",
+                        )
+                        .into(),
+                        None,
+                    ));
                 }
             }
             Action::Deploy {
@@ -781,58 +1190,90 @@ async fn execute(planned: &Planned) -> Result<QuickstartOutput> {
                 deadline_seconds,
                 budget_usd,
             } => {
-                let image = render_published_bundle(namespace, release).await?;
                 let dir = bundle_dir(namespace, release);
-                run_self(&[
-                    "cluster".into(),
-                    "deploy".into(),
-                    "--context".into(),
-                    context.clone(),
-                    "--namespace".into(),
-                    namespace.clone(),
-                    "--release".into(),
-                    release.clone(),
-                    "--plugin-dir".into(),
-                    dir.display().to_string(),
-                    "--agent".into(),
-                    AGENT_NAME.into(),
-                    "--env".into(),
-                    "prod".into(),
-                    "--repo".into(),
-                    repo.clone(),
-                ])
+                let image = match rendered_image.clone() {
+                    Some(image) => image,
+                    None => {
+                        crate::ui::ui().note("Rendering factory bundle");
+                        render_published_bundle(namespace, release)
+                            .await
+                            .map_err(|error| {
+                                let (_, fix) = crate::exit::classify(&error);
+                                step_error(
+                                    Path::new("curie"),
+                                    &["--plugin-dir".into(), dir.display().to_string()],
+                                    "Rendering factory bundle",
+                                    error,
+                                    fix.as_deref(),
+                                )
+                            })?
+                    }
+                };
+                run_self(
+                    &[
+                        "cluster".into(),
+                        "deploy".into(),
+                        "--context".into(),
+                        context.clone(),
+                        "--namespace".into(),
+                        namespace.clone(),
+                        "--release".into(),
+                        release.clone(),
+                        "--plugin-dir".into(),
+                        dir.display().to_string(),
+                        "--agent".into(),
+                        AGENT_NAME.into(),
+                        "--env".into(),
+                        "prod".into(),
+                        "--repo".into(),
+                        repo.clone(),
+                    ],
+                    "Deploying dark factory",
+                )
                 .await?;
-                run_self(&cluster_agent(
-                    "surfaces",
-                    context,
-                    namespace,
-                    release,
-                    &["--add".into(), format!("github={repo}")],
-                ))
+                run_self(
+                    &cluster_agent(
+                        "surfaces",
+                        context,
+                        namespace,
+                        release,
+                        &["--add".into(), format!("github={repo}")],
+                    ),
+                    "Binding GitHub repository",
+                )
                 .await?;
-                run_self(&cluster_agent(
-                    "overrides",
-                    context,
-                    namespace,
-                    release,
-                    &["--execution-deadline".into(), deadline_seconds.to_string()],
-                ))
+                run_self(
+                    &cluster_agent(
+                        "overrides",
+                        context,
+                        namespace,
+                        release,
+                        &["--execution-deadline".into(), deadline_seconds.to_string()],
+                    ),
+                    "Setting execution deadline",
+                )
                 .await?;
-                run_self(&cluster_agent(
-                    "publication-policy",
-                    context,
-                    namespace,
-                    release,
-                    &["--policy".into(), "auto".into()],
-                ))
+                run_self(
+                    &cluster_agent(
+                        "publication-policy",
+                        context,
+                        namespace,
+                        release,
+                        &["--policy".into(), "auto".into()],
+                    ),
+                    "Setting publication policy",
+                )
                 .await?;
-                run_self(&cluster_agent(
-                    "budget",
-                    context,
-                    namespace,
-                    release,
-                    &["--limit".into(), budget_display(*budget_usd)],
-                ))
+                run_self(
+                    &cluster_agent(
+                        "budget",
+                        context,
+                        namespace,
+                        release,
+                        &["--limit".into(), budget_display(*budget_usd)],
+                    ),
+                    "Setting factory budget",
+                )
                 .await?;
                 let app = intake_json
                     .get("github_app")
@@ -883,11 +1324,67 @@ async fn execute(planned: &Planned) -> Result<QuickstartOutput> {
                     agent: AGENT_NAME.into(),
                     deadline_seconds: *deadline_seconds,
                     budget_usd: *budget_usd,
+                    credit_remaining_usd,
                 });
             }
         }
     }
     Err(CliError::failure("quickstart plan produced no result").into())
+}
+
+/// The key whose OpenRouter credit to check. An explicit key wins because
+/// `cluster up` deploys it. The saved key counts only when the release records
+/// no model; otherwise `cluster up` keeps the release's recorded key (#3848)
+/// and the saved key's balance would belong to a different key.
+pub fn credit_check_key(
+    explicit: Option<String>,
+    saved: Option<String>,
+    release_has_real_model: bool,
+) -> Option<String> {
+    explicit.or(if release_has_real_model { None } else { saved })
+}
+
+/// Warns before deploy when the model credential has less OpenRouter credit
+/// than one factory run needs, because a reviewer refused for credit ends the
+/// run (#3935). Never fails the command; returns the credit left when known.
+async fn check_credit(release_has_real_model: bool) -> Option<f64> {
+    let ui = crate::ui::ui();
+    let key = match credit_check_key(
+        crate::ops::explicit_model_credential_env(),
+        crate::ops::saved_model_credential(),
+        release_has_real_model,
+    ) {
+        Some(key) => key,
+        None if release_has_real_model => {
+            ui.note("OpenRouter credit not checked: the deployed key is the one recorded in the cluster");
+            return None;
+        }
+        None => {
+            ui.note("OpenRouter credit not checked: no local model credential");
+            return None;
+        }
+    };
+    match crate::openrouter_credit::remaining_credit_usd(&key).await {
+        Ok(Some(left)) => {
+            if left < RUN_CREDIT_USD {
+                ui.warn(&format!(
+                    "OpenRouter credit left: {left:.2} USD, below the {} USD one factory run needs. The reviewers run {REVIEWER_MODEL}. Add credit at https://openrouter.ai/settings/credits before labelling an issue.",
+                    budget_display(RUN_CREDIT_USD)
+                ));
+            }
+            Some(left)
+        }
+        Ok(None) => {
+            ui.note("OpenRouter credit not checked: the key has no limit and the account balance is not readable");
+            None
+        }
+        Err(error) => {
+            // The error is built without the key; the replace is a backstop.
+            let reason = format!("{error:#}").replace(&key, "<key>");
+            ui.note(&format!("OpenRouter credit not checked: {reason}"));
+            None
+        }
+    }
 }
 
 fn budget_display(value: f64) -> String {
@@ -1012,63 +1509,161 @@ async fn render_published_bundle(namespace: &str, release: &str) -> Result<Strin
     }
 }
 
-async fn run_self(args: &[String]) -> Result<()> {
+async fn run_self(args: &[String], step: &str) -> Result<serde_json::Value> {
     let program = std::env::current_exe().map_err(|err| {
         CliError::failure(format!("cannot locate the curie binary to continue: {err}"))
     })?;
-    run_command(&program, args).await
+    // Structured child results let intake cross the same process boundary as
+    // the other steps. Plain captured diagnostics retain every inference while
+    // parent plumbing controls whether the full child detail is shown.
+    let mut args = args.to_vec();
+    args.extend([
+        "--json".into(),
+        "--debug".into(),
+        "--color".into(),
+        "never".into(),
+    ]);
+    let output = run_command(&program, &args, step).await?;
+    serde_json::from_slice(&output.stdout).map_err(|error| {
+        step_error(
+            &program,
+            &args,
+            step,
+            CliError::failure(format!("child result was not JSON: {error}")).into(),
+            None,
+        )
+    })
 }
 
-async fn run_program(program: &str, args: &[String]) -> Result<()> {
+async fn run_program(program: &str, args: &[String], step: &str) -> Result<()> {
     require_on_path(program)?;
-    run_command(Path::new(program), args).await
+    run_command(Path::new(program), args, step).await?;
+    Ok(())
 }
 
-async fn run_command(program: &Path, args: &[String]) -> Result<()> {
+fn step_error(
+    program: &Path,
+    args: &[String],
+    step: &str,
+    source: anyhow::Error,
+    fix: Option<&str>,
+) -> anyhow::Error {
+    let paths = regex::Regex::new(r#"(^|[\s\"'`(])(?:/|~/)[^\s\"'`<>),;]+"#)
+        .expect("static quickstart path redaction pattern");
+    let redact = |text: &str| {
+        let mut text = text.to_string();
+        if program.is_absolute() {
+            text = text.replace(&program.display().to_string(), "curie");
+        }
+        for pair in args.windows(2) {
+            if pair[0] == "--chart" || pair[0] == "--plugin-dir" {
+                text = text.replace(
+                    &pair[1],
+                    if pair[0] == "--chart" {
+                        "<chart>"
+                    } else {
+                        "<bundle>"
+                    },
+                );
+            }
+        }
+        paths
+            .replace_all(&text, "$1<path>")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let fix = redact(&fix.map(str::to_string).unwrap_or_else(|| {
+        format!("rerun curie factory quickstart with --debug to inspect {step}; address the reported cause and rerun; completed steps are safe to repeat")
+    }));
+    let cause = redact(&source.to_string().replace("Error:", ""));
+    let message = format!("{step} failed: {cause}");
+    let source = crate::exit::with_json_payload(
+        source.context(format!("{} {}", program.display(), args.join(" "))),
+        serde_json::json!({ "error": message, "fix": fix }),
+    );
+    crate::exit::operator_context(source, message, Some(fix))
+}
+
+async fn run_command(program: &Path, args: &[String], step: &str) -> Result<Output> {
     let ui = crate::ui::ui();
+    ui.note(step);
     ui.plumbing(&format!("+ {} {}", program.display(), args.join(" ")));
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args);
-    if ui.json() {
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let output = cmd.output().await.map_err(|err| {
-            CliError::failure(format!("{} failed to start: {err}", program.display()))
-        })?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(CliError::failure(format!(
-                "{} {} failed: {}{}",
-                program.display(),
-                args.join(" "),
-                stderr.trim(),
-                if stdout.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" {}", stdout.trim())
-                }
-            ))
-            .into());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if args.first().map(String::as_str) == Some("cluster")
+        && args.get(1).map(String::as_str) == Some("factory")
+    {
+        // Poll quickstart has no webhook secret, just as its in-process plan.
+        cmd.env_remove(crate::factory_intake::WEBHOOK_SECRET_ENV);
+    }
+    let output = cmd.output().await.map_err(|error| {
+        step_error(
+            program,
+            args,
+            step,
+            CliError::failure(format!("failed to start: {error}")).into(),
+            None,
+        )
+    })?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stderr.lines() {
+        if line.starts_with("Kubernetes context:") {
+            continue;
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            eprint!("{stderr}");
-        }
-        Ok(())
-    } else {
-        let status = cmd.status().await.map_err(|err| {
-            CliError::failure(format!("{} failed to start: {err}", program.display()))
-        })?;
-        if status.success() {
-            Ok(())
+        // ADR 0114 Decision 4 requires each detected inference to stay visible,
+        // even when the wrapper hides the child's other successful output.
+        if line.starts_with("inferred ") {
+            ui.note(line);
         } else {
-            Err(
-                CliError::failure(format!("{} {} failed", program.display(), args.join(" ")))
-                    .with_fix("fix the reported step and rerun; completed steps are safe to repeat")
-                    .into(),
-            )
+            ui.plumbing(line);
         }
     }
+    for line in stdout.lines() {
+        ui.plumbing(line);
+    }
+    if !output.status.success() {
+        let json: Option<serde_json::Value> = serde_json::from_slice(&output.stdout).ok();
+        let message = json
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(|value| value.as_str());
+        // Some children report only the process status in JSON. Their final
+        // captured failure diagnostic carries the actual tool rejection.
+        let diagnostic = stderr.lines().rev().find_map(|line| {
+            line.split_once(" failed: ")
+                .or_else(|| line.split_once("Error: "))
+                .map(|(_, cause)| cause)
+        });
+        let message = match message {
+            Some(message) if message.contains("exited nonzero") => {
+                diagnostic.unwrap_or(message).to_string()
+            }
+            Some(message) => message.to_string(),
+            None => diagnostic
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{}{}", stderr.trim(), stdout.trim())),
+        };
+        let class = match output.status.code() {
+            Some(2) => crate::exit::ExitClass::Usage,
+            Some(3) => crate::exit::ExitClass::Transient,
+            Some(4) => crate::exit::ExitClass::Unsupported,
+            _ => crate::exit::ExitClass::Failure,
+        };
+        let fix = json
+            .as_ref()
+            .and_then(|value| value.get("fix"))
+            .and_then(|value| value.as_str());
+        let source = CliError {
+            message,
+            fix: fix.map(str::to_string),
+            class,
+        }
+        .into();
+        return Err(step_error(program, args, step, source, fix));
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -1094,6 +1689,145 @@ mod tests {
             credential_in_env: false,
             release_has_real_model: false,
             interactive: true,
+            release_at_target: false,
+        }
+    }
+
+    #[test]
+    fn a_matching_release_skips_cluster_up_and_a_model_change_does_not() {
+        let metadata = serde_json::json!({"version": "0.12.2", "chart": "curie-0.12.2"});
+        let values = serde_json::json!({
+            "security": {"gvisor": {"mode": "off"}},
+            "agentSandbox": {"runner": {"model": DEFAULT_MODEL, "fakeModel": false}}
+        });
+        assert!(quickstart_release_matches(
+            "0.12.2",
+            &metadata,
+            &values,
+            DEFAULT_MODEL,
+            true
+        ));
+        assert!(!quickstart_release_matches(
+            "0.12.1",
+            &metadata,
+            &values,
+            DEFAULT_MODEL,
+            true
+        ));
+        assert!(!quickstart_release_matches(
+            "0.12.2",
+            &metadata,
+            &values,
+            "other/model",
+            true
+        ));
+        let mut drifted = values.clone();
+        drifted["security"]["gvisor"]["mode"] = serde_json::json!("auto");
+        assert!(!quickstart_release_matches(
+            "0.12.2",
+            &metadata,
+            &drifted,
+            DEFAULT_MODEL,
+            true
+        ));
+        assert!(quickstart_release_matches(
+            "0.12.2",
+            &metadata,
+            &drifted,
+            DEFAULT_MODEL,
+            false
+        ));
+        let mut input = base();
+        input.release_at_target = true;
+        input.current_context = Some("kind-curie-factory".into());
+        let lines = describe(&quickstart_plan(&input).unwrap());
+        let text = lines.join("\n");
+        assert!(text.contains("skip cluster up"), "{text}");
+        assert!(!text.contains("curie cluster up"), "{text}");
+    }
+
+    #[test]
+    fn all_prerequisites_present_accepts_both_cluster_paths() {
+        for (explicit, current, expected) in [
+            (None, None, vec!["docker", "kind", "kubectl", "helm"]),
+            (Some("acme-cluster"), None, vec!["kubectl", "helm"]),
+            (None, Some("acme-cluster"), vec!["kubectl", "helm"]),
+        ] {
+            let mut checked = Vec::new();
+            check_prerequisites(explicit, current, |tool| {
+                checked.push(tool.to_string());
+                true
+            })
+            .unwrap();
+            assert_eq!(checked, expected);
+        }
+    }
+
+    #[test]
+    fn one_missing_prerequisite_names_the_tool_and_official_install_url() {
+        for (explicit, current) in [
+            (None, None),
+            (Some("acme-cluster"), None),
+            (None, Some("acme-cluster")),
+        ] {
+            let error = check_prerequisites(explicit, current, |tool| tool != "helm").unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("helm"), "{message}");
+            assert!(
+                message.contains("https://helm.sh/docs/intro/install/"),
+                "{message}"
+            );
+            assert!(!message.contains("docker"), "{message}");
+            assert!(!message.contains("kind"), "{message}");
+            assert!(!message.contains("kubectl"), "{message}");
+        }
+    }
+
+    #[test]
+    fn missing_kind_path_prerequisites_are_reported_together() {
+        let error = check_prerequisites(None, None, |tool| tool == "helm").unwrap_err();
+        let message = error.to_string();
+        for expected in [
+            "docker",
+            "https://docs.docker.com/get-docker/",
+            "kind",
+            "https://kind.sigs.k8s.io/docs/user/quick-start/#installation",
+            "kubectl",
+            "https://kubernetes.io/docs/tasks/tools/",
+        ] {
+            assert!(message.contains(expected), "{message}");
+        }
+        assert!(!message.contains("https://helm.sh/"), "{message}");
+    }
+
+    #[test]
+    fn missing_existing_context_prerequisites_are_reported_together() {
+        for (explicit, current) in [(Some("acme-cluster"), None), (None, Some("acme-cluster"))] {
+            let error = check_prerequisites(explicit, current, |_| false).unwrap_err();
+            let message = error.to_string();
+            for expected in [
+                "kubectl",
+                "https://kubernetes.io/docs/tasks/tools/",
+                "helm",
+                "https://helm.sh/docs/intro/install/",
+            ] {
+                assert!(message.contains(expected), "{message}");
+            }
+            assert!(!message.contains("docker"), "{message}");
+            assert!(!message.contains("kind"), "{message}");
+        }
+    }
+
+    #[test]
+    fn targeted_contexts_accept_missing_docker_and_kind_including_kind_contexts() {
+        for (explicit, current) in [
+            (Some("acme-cluster"), None),
+            (None, Some("acme-cluster")),
+            (Some("kind-acme-cluster"), None),
+            (None, Some("kind-acme-cluster")),
+        ] {
+            check_prerequisites(explicit, current, |tool| matches!(tool, "kubectl" | "helm"))
+                .unwrap();
         }
     }
 
@@ -1127,6 +1861,8 @@ mod tests {
         input.existing_kind_clusters = vec!["curie-factory".into()];
         let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
         assert!(!text.contains("kind create"), "{text}");
+        assert!(text.contains("already exists"), "{text}");
+        assert!(!text.contains("is created"), "{text}");
         assert!(
             text.contains("scale deployment/coredns --replicas=1"),
             "{text}"
@@ -1150,9 +1886,20 @@ mod tests {
         let mut input = base();
         input.current_context = Some("k8".into());
         let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
-        assert!(!text.contains("kind "), "{text}");
+        assert!(!text.contains("kind create"), "{text}");
         assert!(text.contains("--context k8"), "{text}");
+        assert!(text.contains("must confirm"), "{text}");
         assert!(!text.contains("security.gvisor.mode=off"), "{text}");
+    }
+
+    #[test]
+    fn a_declined_context_confirmation_names_the_context_flag() {
+        let err = context_confirmation_line("work-cluster", "n").unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(shown.contains("--context work-cluster"), "{shown}");
+        assert!(context_confirmation_line("work-cluster", "y").is_ok());
+        assert!(context_confirmation_line("work-cluster", "yes").is_ok());
+        assert!(context_confirmation_line("work-cluster", "").is_err());
     }
 
     #[test]
@@ -1201,8 +1948,9 @@ mod tests {
         });
         let text = steps.join("\n");
         assert!(text.contains(
-            "curie factory quickstart --repo acme/widgets --context kind-curie-factory --namespace factory-ns --release factory --model z-ai/glm-5.3-flash --app-id <APP_ID> --private-key-file <PATH.pem>"
+            "curie factory quickstart --repo acme/widgets --context kind-curie-factory --namespace factory-ns --release factory --app-id <APP_ID> --private-key-file <PATH.pem>"
         ));
+        assert!(!text.contains("--model"));
         assert!(!text.to_ascii_lowercase().contains("gh "));
         assert!(!text.contains("webhook secret"));
         let url = crate::factory_app::registration_url(None, "curie-factory-abcdef12");
@@ -1217,8 +1965,13 @@ mod tests {
         input.release = "trial".into();
         let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
         assert!(text.contains(
-            "--repo acme/widgets --context remote-cluster --namespace acme --release trial --model z-ai/glm-5.3-flash"
+            "--repo acme/widgets --context remote-cluster --namespace acme --release trial --app-id"
         ), "{text}");
+        let rerun = text
+            .lines()
+            .find(|line| line.starts_with("Rerun:"))
+            .unwrap();
+        assert!(!rerun.contains("--model"), "{rerun}");
         assert!(!text.contains("kind create"), "{text}");
     }
 

@@ -24,6 +24,45 @@ from .harness.registry import DEFAULT_HARNESS
 from .memory_facts import MAX_FACTS_PER_MEMORY
 from .thinking import parse_thinking
 
+# Runner-local dev knob (#3821), NOT a BootEnv key: the frozen contract stays
+# untouched, exactly like CURIE_HARNESS and CURIE_DISALLOWED_TOOLS below. Only
+# the CLI skill tier sets it (cli/src/docker.rs StartSpec::run_args); the chart
+# reserves the name so a cluster runner can never carry it.
+ALLOW_TOKENLESS_ENV = "CURIE_RUNNER_ALLOW_TOKENLESS"
+_RUNNER_TOKEN_ENV = BootEnv.env_key("runner_token")
+
+
+class RunnerTokenRequiredError(RuntimeError):
+    """The runner has no bearer token and was not explicitly allowed to serve without one."""
+
+
+def require_serving_token(runner_token: str | None, *, allow_tokenless: bool) -> str | None:
+    """The bearer the server must enforce, or None only under the dev flag.
+
+    A blank or whitespace-only token is missing: enforcing it would accept a
+    bearer nobody minted. A set token wins over the flag and is returned
+    unchanged, so the comparison stays byte-for-byte.
+    """
+
+    if runner_token and runner_token.strip():
+        return runner_token
+    if allow_tokenless:
+        return None
+    raise RunnerTokenRequiredError(
+        # No "token:" before the env name: the stdout redaction would read the
+        # name as a secret value and drop it from the structured log line.
+        f"refusing to serve the control routes because {_RUNNER_TOKEN_ENV} is "
+        "unset or blank, so they would accept any caller. A cluster sandbox always receives "
+        "one. Only a local development runner may serve without it, by setting "
+        f"{ALLOW_TOKENLESS_ENV}=1."
+    )
+
+
+# Claude Code built-ins that reach no one from a channel agent (#3336): the model
+# only burns a turn calling them, so a channel-bound turn drops them from the
+# catalogue.
+CHANNEL_HIDDEN_TOOLS: tuple[str, ...] = ("SendMessage", "PushNotification")
+
 
 @dataclass(frozen=True)
 class RunnerConfig:
@@ -114,6 +153,12 @@ class RunnerConfig:
     memory_max_facts: int = MAX_FACTS_PER_MEMORY
     # Channel kind of this boot (#3818). None is an unbound boot.
     channel_kind: str | None = None
+    # The runner-local CURIE_RUNNER_ALLOW_TOKENLESS dev flag as parsed (#3821).
+    # Only require_serving_token consumes it; a set token always wins.
+    allow_tokenless: bool = False
+    # Whether this turn is bound to a channel, as the worker sent it (#3336).
+    # Absent or false keeps the catalogue unchanged.
+    channel_bound: bool = False
 
     @property
     def memory_writes_on(self) -> bool:
@@ -126,6 +171,19 @@ class RunnerConfig:
         if self.memory_writes is not None:
             return self.memory_writes
         return bool(self.channel_memory_ref)
+
+    @property
+    def catalogue_disallowed_tools(self) -> tuple[str, ...]:
+        """The tool names to remove from the model catalogue (#3336).
+
+        The operator list in order, plus the channel-hidden built-ins when the
+        turn is channel-bound.
+        """
+
+        if not self.channel_bound:
+            return self.disallowed_tools
+        extra = tuple(name for name in CHANNEL_HIDDEN_TOOLS if name not in self.disallowed_tools)
+        return (*self.disallowed_tools, *extra)
 
     @property
     def ceiling(self) -> int:
@@ -174,6 +232,9 @@ class RunnerConfig:
             for name in env.get("CURIE_DISALLOWED_TOOLS", "").split(",")
             if name.strip()
         )
+        # Runner-local dev flag (#3821), not a BootEnv key. Deliberately spelled
+        # one way: only 1/true (any case, trimmed) opts out of authentication.
+        allow_tokenless = env.get(ALLOW_TOKENLESS_ENV, "").strip().lower() in ("1", "true")
         return cls(
             session=boot.session,
             model=boot.model,
@@ -196,8 +257,10 @@ class RunnerConfig:
             history_max_turns=boot.history_max_turns,
             history_max_bytes=boot.history_max_bytes,
             disallowed_tools=disallowed_tools,
+            allow_tokenless=allow_tokenless,
             connector_caller_token=boot.connector_caller_token,
             memory_writes=boot.memory_writes,
+            channel_bound=boot.channel_bound is True,
             memory_max_facts=(
                 boot.memory_max_facts
                 if boot.memory_max_facts is not None

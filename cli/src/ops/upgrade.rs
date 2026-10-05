@@ -213,6 +213,10 @@ struct UpgradeRecord {
     /// run (#2861); absent from checkpoints older binaries persisted.
     #[serde(default)]
     skipped: Vec<UpgradePhase>,
+    /// The phase that stopped the run. `completed` stays the phases that
+    /// finished, so cluster status can still name the failure (#3849).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failed_phase: Option<UpgradePhase>,
     status: String,
     plan: Vec<String>,
     /// Whether the DrainPreflight worker-reachability check has already run
@@ -405,6 +409,7 @@ pub struct FakeUpgradeHost {
     in_flight: Vec<String>,
     retained_values: bool,
     runner_layer_clears: Vec<String>,
+    apply_error: Option<String>,
     applied: bool,
     /// Agents whose claims Apply retired (#3422), in retirement order.
     pub retired_claims: Vec<String>,
@@ -430,6 +435,7 @@ impl FakeUpgradeHost {
             in_flight: Vec::new(),
             retained_values: false,
             runner_layer_clears: Vec::new(),
+            apply_error: None,
             applied: false,
             retired_claims: Vec::new(),
             drain_calls: 0,
@@ -510,6 +516,12 @@ impl FakeUpgradeHost {
         self
     }
 
+    /// Helm apply returns this error and does not move the release (#3849).
+    pub fn apply_error(mut self, message: &str) -> Self {
+        self.apply_error = Some(message.to_string());
+        self
+    }
+
     pub fn clear_interrupt(&mut self) {
         self.interrupt_after = None;
         self.fail_at = None;
@@ -572,6 +584,9 @@ impl UpgradeDriver for FakeUpgradeHost {
     }
     fn apply_target(&mut self, to: &str) -> Result<()> {
         self.mutate_calls += 1;
+        if let Some(message) = &self.apply_error {
+            bail!("{message}");
+        }
         self.applied = true;
         self.set_current(Some(to.to_string()));
         Ok(())
@@ -623,7 +638,10 @@ fn status_from_record(
     match record {
         None => UpgradeStatusView::idle(fallback_known_good),
         Some(r) => UpgradeStatusView {
-            phase: r.completed.last().map(|p| p.as_str().to_string()),
+            phase: r
+                .failed_phase
+                .map(|phase| phase.as_str().to_string())
+                .or_else(|| r.completed.last().map(|p| p.as_str().to_string())),
             status: r.status.clone(),
             known_good_version: r.known_good_version.clone().or(fallback_known_good),
             target_version: Some(r.target_version.clone()),
@@ -652,7 +670,6 @@ fn plan_lines(
         &opts.to,
         from.is_none(),
         retained_values.then_some(RETAINED_VALUES_PLACEHOLDER),
-        runner_layer_clears,
         helm_timeout_seconds,
     );
     let from = from.unwrap_or("none");
@@ -1007,6 +1024,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
             known_good_version: host.known_good(),
             completed: Vec::new(),
             skipped: Vec::new(),
+            failed_phase: None,
             status: "in_progress".into(),
             plan: plan.clone(),
             drain_completed: false,
@@ -1053,6 +1071,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
             }
             PhaseOutcome::Failed => {
                 record.status = "failed".into();
+                record.failed_phase = Some(phase);
                 let previous = host.serving_previous();
                 if record.fail_forward.is_none() {
                     record.fail_forward = Some(fail_forward_for(
@@ -1139,10 +1158,33 @@ fn execute_phase<H: UpgradeDriver>(
         UpgradePhase::Checkpoint => Ok(PhaseOutcome::Continue),
         UpgradePhase::Migrate => Ok(PhaseOutcome::Continue),
         UpgradePhase::Apply => {
-            host.apply_target(&opts.to)?;
+            if let Err(error) = host.apply_target(&opts.to) {
+                // A Helm render or apply error used to leave the checkpoint
+                // at migrate / in_progress (#3849). Store the same terminal
+                // failure the other phases already record.
+                record.fail_forward = Some(fail_forward_for(
+                    opts,
+                    host.serving_previous(),
+                    &format!(
+                        "upgrade failed during apply: {}",
+                        truncate_reason(&host.redact(&format!("{error:#}")))
+                    ),
+                ));
+                return Ok(PhaseOutcome::Failed);
+            }
             // #3422: a cleared layer only reaches live threads once their
             // claims are gone, as `cluster deploy` does (#3300).
-            host.retire_runner_layer_claims()?;
+            if let Err(error) = host.retire_runner_layer_claims() {
+                record.fail_forward = Some(fail_forward_for(
+                    opts,
+                    host.serving_previous(),
+                    &format!(
+                        "upgrade failed during apply: {}",
+                        truncate_reason(&host.redact(&format!("{error:#}")))
+                    ),
+                ));
+                return Ok(PhaseOutcome::Failed);
+            }
             Ok(PhaseOutcome::Continue)
         }
         UpgradePhase::Converge => {
@@ -1379,7 +1421,6 @@ fn helm_upgrade_argv(
     to: &str,
     install: bool,
     values: Option<&str>,
-    runner_layer_clears: &[String],
     timeout_seconds: u64,
 ) -> Vec<String> {
     let chart = chart_ref(opts);
@@ -1409,11 +1450,10 @@ fn helm_upgrade_argv(
         argv.push("-f".into());
         argv.push(values.to_string());
     }
-    // After `-f`, so the clear wins over a retained layered digest (#3218).
-    for pair in crate::cluster_secrets::runner_image_clears(runner_layer_clears) {
-        argv.push("--set".into());
-        argv.push(pair);
-    }
+    // Stale runner bindings are removed from the retained values document
+    // before this argv is built (#3849). A `--set key=null` after `-f` is not
+    // a deletion: Helm 3.20 keeps the previous digest, and a nil entry fails
+    // the chart digest guard before a revision is created.
     argv
 }
 
@@ -2017,6 +2057,34 @@ impl LiveHost {
         );
         self.runner_layer_clears =
             layer_clears_from_refs(&layered, current.as_deref(), target.as_deref());
+        if self.runner_layer_clears.is_empty() {
+            return;
+        }
+        let Some(raw) = self.overlay.as_deref() else {
+            self.config_refusal = Some(
+                "stale runner image bindings could not be removed because the upgrade has no retained values"
+                    .into(),
+            );
+            return;
+        };
+        let mut values: serde_json::Value = match serde_json::from_str(raw) {
+            Ok(values) => values,
+            Err(error) => {
+                self.config_refusal = Some(format!(
+                    "could not read retained values to remove stale runner image bindings: {error}"
+                ));
+                return;
+            }
+        };
+        crate::cluster_secrets::omit_runner_image_bindings(&mut values, &self.runner_layer_clears);
+        match helm_values_document(&values) {
+            Ok(next) => self.overlay = Some(next),
+            Err(error) => {
+                self.config_refusal = Some(format!(
+                    "could not remove stale runner image bindings before upgrade: {error:#}"
+                ));
+            }
+        }
     }
 
     /// The target chart's own `agentSandbox.runner` defaults, when the chart
@@ -2269,6 +2337,39 @@ impl LiveHost {
         Ok(Some((helm_values_document(&outcome.values)?, schema_plan)))
     }
 
+    /// The chart version of the revision Helm still marks deployed.
+    /// A failed upgrade often leaves the previous revision deployed (#3421).
+    fn observe_deployed_version(&mut self) {
+        let history_cmd = super::verbs::helm_history_cmd(&self.opts.common);
+        let Ok((true, history_out, _)) = self.run(&history_cmd) else {
+            return;
+        };
+        let Ok(history) = serde_json::from_str::<serde_json::Value>(&history_out) else {
+            return;
+        };
+        let Ok(revision) =
+            crate::cluster_secrets::serving_revision(&history, &self.opts.common.release)
+        else {
+            return;
+        };
+        let metadata =
+            crate::cluster_secrets::helm_get_json(&self.opts.common, "metadata", false, revision);
+        let Ok((true, metadata_out, _)) = self.run(&metadata) else {
+            return;
+        };
+        let Ok(document) = serde_json::from_str::<serde_json::Value>(&metadata_out) else {
+            return;
+        };
+        let Some(version) = document
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .filter(|version| !version.is_empty())
+        else {
+            return;
+        };
+        self.set_current(Some(version.to_string()));
+    }
+
     /// The chart version the release reports. `scripts/check-version-consistency.sh`
     /// is required on every PR and release and asserts Chart.yaml `version` ==
     /// `appVersion` == the CLI version, so this one field is the whole answer
@@ -2419,7 +2520,6 @@ impl LiveHost {
             to,
             self.current.is_none(),
             values.as_deref(),
-            &self.runner_layer_clears,
             self.helm_timeout_seconds,
         )
         .into_iter()
@@ -2582,7 +2682,12 @@ impl UpgradeDriver for LiveHost {
         self.live_drain_preflight()
     }
     fn apply_target(&mut self, to: &str) -> Result<()> {
-        self.helm_upgrade(to)?;
+        if let Err(error) = self.helm_upgrade(to) {
+            // Helm can fail after it has already moved the deployed revision.
+            // Re-read that revision so previous_serving is not the pre-apply cache.
+            self.observe_deployed_version();
+            return Err(error);
+        }
         // R2: what the release reports, not what was requested, is what was
         // installed. Helm can exit 0 on a revision that never moved.
         let observed = self.inspect_version();
@@ -2688,7 +2793,30 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         Err(error) => Err(error),
     };
     let result = wrap_schema_refusal(&live, result);
-    finish_owned_upgrade(&mut live, result)
+    // Apply failures stay a non-zero exit. The checkpoint is already the
+    // terminal failed record, and ownership is released first (#3849).
+    refuse_failed_apply(finish_owned_upgrade(&mut live, result))
+}
+
+fn refuse_failed_apply(result: Result<ClusterUpgradeOutput>) -> Result<ClusterUpgradeOutput> {
+    match result {
+        Ok(output) => match &output {
+            ClusterUpgradeOutput::Completed {
+                status,
+                phase,
+                fail_forward,
+                ..
+            } if status == "failed" && phase == "apply" => {
+                let reason = fail_forward
+                    .as_ref()
+                    .map(|item| item.reason.clone())
+                    .unwrap_or_else(|| "upgrade failed during apply".to_string());
+                Err(crate::ui::ui().failed_report(&output, anyhow::anyhow!(reason)))
+            }
+            _ => Ok(output),
+        },
+        Err(error) => Err(error),
+    }
 }
 
 fn wrap_schema_refusal(

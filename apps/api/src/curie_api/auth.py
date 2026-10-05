@@ -1,17 +1,19 @@
-"""Single-API-key authentication.
+"""Platform key first, then a live console session.
 
-MVP auth is one shared key delivered in the `X-API-Key` header and compared
-against Settings.api_key. J1 replaces this with GitHub-App-scoped identities.
+The platform key in the `X-API-Key` header is checked first, with no database
+read. A live console session is accepted only after that check fails. J1
+replaces this with GitHub-App-scoped identities.
 """
 
 import hmac
 from typing import Annotated
 
-from fastapi import Header, HTTPException, status
+from fastapi import Header, HTTPException, Request, status
 
 from .config import get_settings
 
 API_KEY_HEADER = "X-API-Key"
+CONSOLE_SESSION_COOKIE = "__Host-curie_console_session"
 
 
 def verify_platform_key(x_api_key: str | None) -> bool:
@@ -26,13 +28,30 @@ def verify_platform_key(x_api_key: str | None) -> bool:
 
 
 async def require_api_key(
+    request: Request,
     x_api_key: Annotated[str | None, Header()] = None,
 ) -> None:
-    if not verify_platform_key(x_api_key):
+    if verify_platform_key(x_api_key):
+        return
+    token = request.cookies.get(CONSOLE_SESSION_COOKIE)
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing or invalid API key",
         )
+    from .approval_auth import enforce_console_cookie_origin
+
+    enforce_console_cookie_origin(request)
+    from .crud import console as crud_console
+
+    async with request.app.state.sessionmaker() as session:
+        row = await crud_console.live_console_session(session, token)
+    if row is not None:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="missing or invalid API key",
+    )
 
 
 async def require_platform_key(

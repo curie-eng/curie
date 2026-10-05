@@ -49,6 +49,7 @@ from curie_test_support.valkey import (
 from curie_test_support.valkey import (
     VALKEY_PW as _VALKEY_PW,
 )
+from curie_worker import consumer as consumer_module
 from curie_worker.approval_cards import ApprovalCardStore
 from curie_worker.config import WorkerConfig
 from curie_worker.kernel.core import Kernel
@@ -189,6 +190,35 @@ def make_hook_run() -> Callable[..., contextlib.AbstractAsyncContextManager[Hook
             await engine.dispose()
 
     return seed
+
+
+@dataclass(frozen=True)
+class ThreadResetKeys:
+    """Per-test thread-reset request, in-flight and result keys."""
+
+    requests: str
+    inflight: str
+    result_prefix: str
+
+
+@pytest.fixture
+def thread_reset_keys(names: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> ThreadResetKeys:
+    """Point the consumer's thread-reset keys at per-test keys (#3807).
+
+    The production keys are fixed cross-service constants, so on the shared
+    Valkey a concurrent test's consumer would drain, delete, or inject this
+    test's reset requests. The test owns its keys instead; they live under the
+    ``names`` prefix, whose teardown deletes them.
+    """
+    keys = ThreadResetKeys(
+        requests=f"{names['prefix']}:thread-reset-requests",
+        inflight=f"{names['prefix']}:thread-reset-inflight",
+        result_prefix=f"{names['prefix']}:thread-reset-result:",
+    )
+    monkeypatch.setattr(consumer_module, "THREAD_RESET_SET", keys.requests)
+    monkeypatch.setattr(consumer_module, "THREAD_RESET_INFLIGHT_SET", keys.inflight)
+    monkeypatch.setattr(consumer_module, "THREAD_RESET_RESULT_PREFIX", keys.result_prefix)
+    return keys
 
 
 def make_config(names: dict[str, str], **overrides: object) -> WorkerConfig:

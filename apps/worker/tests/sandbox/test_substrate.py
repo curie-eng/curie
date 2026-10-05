@@ -2105,7 +2105,11 @@ def test_fresh_only_claim_refuses_a_docker_runner_that_restarted_after_lookup(
 
     class _RestartingDocker(DockerSandboxClient):
         def __init__(self) -> None:
-            super().__init__(image="curie-runner", bundle_store=_FakeBundleStore())
+            super().__init__(
+                image="curie-runner",
+                bundle_store=_FakeBundleStore(),
+                github_api_url="https://api.github.com",
+            )
             self.status = "running"
             self.created: list[str] = []
 

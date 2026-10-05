@@ -92,7 +92,7 @@ reserved ones (and write transcripts) to rehydrate the agent across a
 suspend/resume. On the `memory` namespace its claims narrow it (ADR-0188,
 `apps/api/src/curie_api/routers/state.py::_check_memory_reach`): the `binding`
 claim names the one channel whose memory it reaches, the boot-env token is
-`memory: "read"`, and only the per-turn write credential on `Event.memory_token`
+`memory: "read"` and carries a `cred` id, and only the per-turn write credential on `Event.memory_token`
 may write, only fact keys, with the API stamping its `sender` claim as the
 author. A token with no `memory` claim (a pre-ADR-0188 worker's) fails closed
 there. On `transcript` the `binding` claim holds it to its own channel's threads
@@ -141,6 +141,7 @@ route-state contract:
 - `replace(thread_key, record, ttl_seconds) -> None` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.replace`)
 - `replace_if_generation(...) -> bool`: the CAS primitive, replacing a route only while its claim and generation match (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.replace_if_generation`)
 - `touch(thread_key, ttl_seconds) -> bool` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.touch`)
+- `touch_if_live_claim(thread_key, claim_name, ttl_seconds) -> bool`: extend the TTL only while the route still names that claim; the substrate calls it in production (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.touch_if_live_claim`)
 - `delete_if_claim(thread_key, claim_name) -> bool` — guarded delete via a Lua script (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.delete_if_claim`, script at `apps/worker/src/curie_worker/sandbox/affinity.py::_DELETE_IF_CLAIM`)
 - `pressure_get(thread_key) -> RouteRecord | None` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.pressure_get`)
 - `pressure_candidates(...) -> PressureScanResult` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.pressure_candidates`)
