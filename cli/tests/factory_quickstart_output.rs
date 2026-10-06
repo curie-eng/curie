@@ -1477,7 +1477,7 @@ fn factory_quickstart_rerun_preserves_the_recorded_native_model_without_a_local_
     assert_eq!(
         upgrades.len(),
         1,
-        "only the merged intake upgrade is needed"
+        "only the merged intake upgrade is needed: {upgrades:?}"
     );
     assert!(
         upgrades[0].iter().any(|arg| arg == "--reuse-values"),
