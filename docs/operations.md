@@ -2063,9 +2063,10 @@ The boot env tokens (`CURIE_HISTORY_TOKEN`, `CURIE_MEMORY_TOKEN`, and
 `CURIE_STATE_TOKEN`) expire at the turn's stream deadline plus 60 seconds,
 and no later than 24 hours. When the worker deletes the sandbox claim, it
 tells the API, and the API refuses that credential immediately (403, "this
-sandbox credential has been released") even though it has not expired. The
-report is best effort. A failed report stays in Valkey until a later
-cleanup pass lands it, or until that record expires with the token. A warm
+sandbox credential has been released") even though it has not expired. Each
+claim gets its own credential id, so a retry after a failed claim boots with a
+credential the API still accepts. The report is best effort. A failed report
+stays in Valkey until a later cleanup pass lands it, or until that record expires with the token. A warm
 sandbox keeps the token it booted with only while that token still covers the
 next turn. Otherwise the next new turn replaces the sandbox. A token minted before this change has no
 credential id. It stays valid until its own expiry. Upgrade the worker with

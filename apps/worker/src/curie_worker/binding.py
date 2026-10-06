@@ -68,7 +68,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 from urllib.parse import quote
 
@@ -1393,6 +1393,65 @@ class BindingResolver:
             return False
         return True
 
+    def fresh_boot_credential(self, env: Mapping[str, str]) -> dict[str, str]:
+        """A copy of ``env`` whose boot state tokens carry a new credential id (#3823).
+
+        Deleting a claim releases the credential its env carried, and a retry
+        claims again from the same env. The substrate calls this for every new
+        claim, so no claim boots with a credential an earlier claim released.
+        Every other claim, the agent, scope, and expiry, is kept. A token
+        without a credential id, or one this key did not sign, is left as is.
+        """
+
+        out = dict(env)
+        api_key = self._config.api_key
+        if not api_key:
+            return out
+        credential_id = uuid.uuid4().hex
+        reissued: dict[str, str] = {}
+        for key in (HISTORY_TOKEN_ENV, MEMORY_TOKEN_ENV, BootEnv.env_key("state_token")):
+            token = out.get(key)
+            if not token:
+                continue
+            if token not in reissued:
+                fresh = _reissue_boot_token(token, api_key, credential_id)
+                if fresh is None:
+                    if boot_token_facts(token)[1] is not None:
+                        logger.warning(
+                            "could not give %s a new sandbox credential; it keeps its own", key
+                        )
+                    continue
+                reissued[token] = fresh
+            out[key] = reissued[token]
+        return out
+
+
+def _reissue_boot_token(token: str, api_key: str, credential_id: str) -> str | None:
+    """``token`` re-signed with ``credential_id`` as its ``cred``, or None."""
+
+    agent, cred, _exp = boot_token_facts(token)
+    unsigned = _unsigned_payload(token)
+    scope = None if unsigned is None else unsigned.get("scope")
+    if agent is None or cred is None or not isinstance(scope, str):
+        return None
+    payload = sandbox_token.decode(token, api_key, agent=agent, scope=scope)
+    if payload is None:
+        return None
+    claims = {k: v for k, v in payload.items() if k not in {"agent", "scope", "exp"}}
+    claims["cred"] = credential_id
+    return sandbox_token.mint(api_key, agent=agent, scope=scope, exp=payload["exp"], claims=claims)
+
+
+def _unsigned_payload(token: str | None) -> dict[str, Any] | None:
+    if not token or token.count(".") != 2:
+        return None
+    try:
+        segment = token.split(".")[1]
+        payload = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
 
 def boot_token_facts(token: str | None) -> tuple[str | None, str | None, int | None]:
     """``(agent, cred, exp)`` from a boot state token this worker minted.
@@ -1402,15 +1461,8 @@ def boot_token_facts(token: str | None) -> tuple[str | None, str | None, int | N
     #3823 credential id.
     """
 
-    if not token or token.count(".") != 2:
-        return None, None, None
-    try:
-        segment = token.split(".")[1]
-        padded = segment + "=" * (-len(segment) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded))
-    except (ValueError, json.JSONDecodeError):
-        return None, None, None
-    if not isinstance(payload, dict):
+    payload = _unsigned_payload(token)
+    if payload is None:
         return None, None, None
     agent = payload.get("agent")
     cred = payload.get("cred")

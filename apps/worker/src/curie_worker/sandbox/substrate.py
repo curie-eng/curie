@@ -174,11 +174,23 @@ class SandboxSubstrate:
         self._affinity = affinity
         self._config = config
         self._boot_credential_revoker: Callable[[str, str], bool] | None = None
+        self._boot_credential_minter: Callable[[Mapping[str, str]], dict[str, str]] | None = None
 
     def set_boot_credential_revoker(self, revoker: Callable[[str, str], bool]) -> None:
         """Report a released boot credential. The kernel wires the API call."""
 
         self._boot_credential_revoker = revoker
+
+    def set_boot_credential_minter(
+        self, minter: Callable[[Mapping[str, str]], dict[str, str]]
+    ) -> None:
+        """Give each new claim its own boot credential. The kernel wires the signer.
+
+        A retry claims again from the env whose credential the failed claim
+        already released, and the API refuses a released credential.
+        """
+
+        self._boot_credential_minter = minter
 
     def _remember_claim_credential(self, claim_name: str, env: Mapping[str, str] | None) -> None:
         token = None
@@ -1280,6 +1292,8 @@ class SandboxSubstrate:
                 derived = self._existing_agent_pool(config.warm_pool, agent_name)
                 if derived is not None:
                     pool = derived
+        if env is not None and self._boot_credential_minter is not None:
+            env = self._boot_credential_minter(env)
         self._remember_claim_credential(name, env)
         self._k8s.create_claim(
             name,
