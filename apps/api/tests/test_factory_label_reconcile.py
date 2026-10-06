@@ -209,10 +209,10 @@ def _requests(number: int) -> list[dict[str, Any]]:
                         "SELECT r.status, r.objective, r.requester "
                         "FROM curie.work_items w "
                         "JOIN curie.execution_requests r ON r.work_item_id = w.id "
-                        "WHERE w.github_repository_id = :repo "
-                        "AND w.github_issue_number = :number"
+                        "WHERE w.tracker_scope_id = :repo "
+                        "AND w.tracker_issue_id = :number"
                     ),
-                    {"repo": REPO_ID, "number": number},
+                    {"repo": str(REPO_ID), "number": str(number)},
                 )
                 return [dict(row) for row in result.mappings()]
         finally:

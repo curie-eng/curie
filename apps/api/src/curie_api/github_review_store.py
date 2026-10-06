@@ -35,6 +35,8 @@ from curie_api.schemas.publications import ReviewRevisionReserve
 from .config import Settings
 from .delivery import backlog_reservation, enqueue_owned, take_backlog_slot
 from .forges.github.transport import github_headers
+from .forges.hosts import github_host
+from .forges.types import GITHUB
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_review_audit import settle_review_delivery
 from .github_review_events import (
@@ -78,17 +80,17 @@ class ReviewContext:
     @property
     def truth(self) -> BoundReviewLineage:
         assert self.lineage.pr_number is not None and self.lineage.head_sha is not None
-        assert self.lineage.github_repository_id is not None
-        assert self.lineage.github_installation_id is not None
-        assert self.lineage.github_pr_node_id is not None and self.lineage.base_ref is not None
+        assert self.lineage.repository_project_id is not None
+        assert self.lineage.code_host_installation_id is not None
+        assert self.lineage.code_host_pr_id is not None and self.lineage.base_ref is not None
         return BoundReviewLineage(
             self.lineage.repo_full_name,
             self.lineage.pr_number,
             self.lineage.branch,
             self.lineage.head_sha,
-            self.lineage.github_repository_id,
-            self.lineage.github_installation_id,
-            self.lineage.github_pr_node_id,
+            int(self.lineage.repository_project_id),
+            self.lineage.code_host_installation_id,
+            self.lineage.code_host_pr_id,
             self.lineage.base_ref,
         )
 
@@ -103,7 +105,9 @@ async def review_context(
         await session.scalars(
             select(ThreadPublicationLineage)
             .where(
-                ThreadPublicationLineage.github_repository_id == feedback.repository_id,
+                ThreadPublicationLineage.code_host_kind == GITHUB,
+                ThreadPublicationLineage.code_host_host == github_host(settings),
+                ThreadPublicationLineage.repository_project_id == str(feedback.repository_id),
                 ThreadPublicationLineage.pr_number == feedback.pr_number,
                 ThreadPublicationLineage.status == "open",
             )
@@ -117,8 +121,8 @@ async def review_context(
     lineage = candidates[0]
     if (
         lineage.head_sha is None
-        or lineage.github_installation_id != feedback.installation_id
-        or lineage.github_pr_node_id is None
+        or lineage.code_host_installation_id != feedback.installation_id
+        or lineage.code_host_pr_id is None
         or lineage.base_ref is None
         or lineage.binding_id is None
         or lineage.binding_generation is None
@@ -177,7 +181,7 @@ async def _identity_pending(session: AsyncSession, feedback: UnverifiedFeedback)
         select(ThreadPublicationLineage.id)
         .where(
             ThreadPublicationLineage.status == "open",
-            ThreadPublicationLineage.github_repository_id.is_(None),
+            ThreadPublicationLineage.repository_project_id.is_(None),
             ThreadPublicationLineage.pr_number.is_(None),
             ThreadPublicationLineage.binding_id.is_not(None),
             func.lower(ThreadPublicationLineage.repo_full_name)
@@ -808,7 +812,11 @@ class GitHubReviewReconciler:
         if row.lineage_id is None:
             return False
         lineage = await session.get(ThreadPublicationLineage, row.lineage_id)
-        if lineage is None or lineage.pr_number is None or lineage.github_installation_id is None:
+        if (
+            lineage is None
+            or lineage.pr_number is None
+            or lineage.code_host_installation_id is None
+        ):
             return False
         try:
             feedback = feedback_from_row(row)
@@ -817,15 +825,16 @@ class GitHubReviewReconciler:
         if (
             feedback.repo_full_name.casefold() != lineage.repo_full_name.casefold()
             or feedback.pr_number != lineage.pr_number
-            or feedback.repository_id != lineage.github_repository_id
-            or feedback.installation_id != lineage.github_installation_id
+            or lineage.code_host_kind != GITHUB
+            or str(feedback.repository_id) != lineage.repository_project_id
+            or feedback.installation_id != lineage.code_host_installation_id
         ):
             return False
         try:
             token = await run_in_threadpool(
                 credentials_for(self._settings).token_for_verified_installation,
                 lineage.repo_full_name,
-                lineage.github_installation_id,
+                lineage.code_host_installation_id,
             )
         except (GitHubAppError, GitHubInstallationRefused, ValueError):
             return False

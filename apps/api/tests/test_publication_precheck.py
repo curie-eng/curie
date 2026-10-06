@@ -107,10 +107,11 @@ def precheck_case(
     )[0]
     _execute(
         "UPDATE curie.thread_publication_lineages SET "
-        "github_repository_id = :repository, github_installation_id = :installation, "
-        "github_pr_node_id = :node, base_ref = 'main' WHERE id = :lineage",
+        "code_host_kind = 'github', code_host_host = 'github.com', "
+        "repository_project_id = :repository, code_host_installation_id = :installation, "
+        "code_host_pr_id = :node, base_ref = 'main' WHERE id = :lineage",
         {
-            "repository": REPOSITORY_ID,
+            "repository": str(REPOSITORY_ID),
             "installation": INSTALLATION_ID,
             "node": PR_NODE_ID,
             "lineage": uuid.UUID(lineage_id),
@@ -120,13 +121,14 @@ def precheck_case(
     now = datetime.now(UTC)
     _execute(
         "INSERT INTO curie.work_items "
-        "(id, github_repository_id, github_issue_number, github_installation_id, "
-        "agent_id, repo_full_name, conversation_id, publication_lineage_id) "
-        "VALUES (:id, :repository, 3215, :installation, :agent, :repo, "
-        ":conversation, :lineage)",
+        "(id, tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, "
+        "code_host_kind, code_host_host, repository_project_id, code_host_installation_id, "
+        "agent_id, repository_path, conversation_id, publication_lineage_id) "
+        "VALUES (:id, 'github', 'github.com', :repository, '3215', 'github', 'github.com', "
+        ":repository, :installation, :agent, :repo, :conversation, :lineage)",
         {
             "id": work_item_id,
-            "repository": REPOSITORY_ID,
+            "repository": str(REPOSITORY_ID),
             "installation": INSTALLATION_ID,
             "agent": uuid.UUID(deployment["agent_id"]),
             "repo": (
@@ -303,7 +305,7 @@ def _durable_snapshot() -> tuple[list[dict[str, Any]], ...]:
             "(SELECT count(*) FROM curie.credential_redemption_audit_entries) AS redemptions"
         ),
         _rows(
-            "SELECT id, publication_lineage_id, version, conversation_id, repo_full_name "
+            "SELECT id, publication_lineage_id, version, conversation_id, repository_path "
             "FROM curie.work_items ORDER BY id"
         ),
         _rows(
@@ -541,12 +543,14 @@ def test_running_factory_request_without_existing_pr_gets_authenticated_absence(
     now = datetime.now(UTC)
     _execute(
         "INSERT INTO curie.work_items "
-        "(id, github_repository_id, github_issue_number, github_installation_id, "
-        "agent_id, repo_full_name, conversation_id) "
-        "VALUES (:id, :repository, 3216, :installation, :agent, :repo, :conversation)",
+        "(id, tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, "
+        "code_host_kind, code_host_host, repository_project_id, code_host_installation_id, "
+        "agent_id, repository_path, conversation_id) "
+        "VALUES (:id, 'github', 'github.com', :repository, '3216', 'github', 'github.com', "
+        ":repository, :installation, :agent, :repo, :conversation)",
         {
             "id": work_item_id,
-            "repository": REPOSITORY_ID,
+            "repository": str(REPOSITORY_ID),
             "installation": INSTALLATION_ID,
             "agent": uuid.UUID(case["deployment"]["agent_id"]),
             "repo": REPO,

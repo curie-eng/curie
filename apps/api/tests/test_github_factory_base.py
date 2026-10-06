@@ -163,8 +163,8 @@ def _work_item(number: int) -> dict[str, Any] | None:
     rows = _rows(
         "SELECT id, base_branch, base_source, base_commit, base_label_ignored, "
         "publication_lineage_id FROM curie.work_items "
-        "WHERE github_repository_id = :repo AND github_issue_number = :number",
-        {"repo": REPO_ID, "number": number},
+        "WHERE tracker_scope_id = :repo AND tracker_issue_id = :number",
+        {"repo": str(REPO_ID), "number": str(number)},
     )
     return rows[0] if rows else None
 
@@ -192,7 +192,7 @@ def _open_lineage(work_item_id: uuid.UUID, *, status: str = "open") -> None:
     """Attach a thread publication lineage (an open factory PR) to the WorkItem."""
 
     item = _rows(
-        "SELECT agent_id, conversation_id, repo_full_name FROM curie.work_items WHERE id = :id",
+        "SELECT agent_id, conversation_id, repository_path FROM curie.work_items WHERE id = :id",
         {"id": work_item_id},
     )[0]
     version_id, deployment_id, lineage_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
@@ -217,7 +217,7 @@ def _open_lineage(work_item_id: uuid.UUID, *, status: str = "open") -> None:
             "agent": item["agent_id"],
             "deployment": deployment_id,
             "conversation": item["conversation_id"],
-            "repo": item["repo_full_name"],
+            "repo": item["repository_path"],
             "base": NEXT_SHA,
             "branch": f"curie/publication-{lineage_id.hex}",
             "url": f"https://github.com/{REPO}/pull/77",
@@ -460,8 +460,8 @@ def test_a_missing_base_branch_is_refused_once_and_not_substituted(
     assert _work_item(number) is None
     assert _rows(
         "SELECT r.id FROM curie.execution_requests r JOIN curie.work_items w "
-        "ON w.id = r.work_item_id WHERE w.github_issue_number = :number",
-        {"number": number},
+        "ON w.id = r.work_item_id WHERE w.tracker_issue_id = :number",
+        {"number": str(number)},
     ) == []
     # No fallback to the default: main is never read.
     assert "main" not in api.branch_requests

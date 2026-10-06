@@ -181,7 +181,7 @@ async def redeem_workspace_credential(
             .where(
                 WorkItem.agent_id == deployment.agent_id,
                 WorkItem.conversation_id == data.conversation_id,
-                WorkItem.repo_full_name == repo,
+                WorkItem.repository_path == repo,
             )
             .limit(2)
         )

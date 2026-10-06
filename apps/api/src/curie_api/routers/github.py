@@ -115,7 +115,7 @@ async def github_webhook(
         # it disabled, actionable PR feedback reaches the factory's unbound guard.
         review_enabled = settings.github_review_ingress_enabled
         if factory_enabled and (
-            await factory_owns(session, x_github_event, payload)
+            await factory_owns(session, settings, x_github_event, payload)
             or (
                 not review_enabled
                 and is_actionable_feedback(

@@ -93,7 +93,7 @@ def _repository(publication: Publication, lineage: ThreadPublicationLineage) -> 
     return repository_ref(
         get_settings(),
         path=publication.repo_full_name,
-        project_id=lineage.github_repository_id,
+        project_id=lineage.repository_project_id,
     )
 
 

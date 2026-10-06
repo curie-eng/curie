@@ -55,16 +55,27 @@ const STAGES: Stage[] = [
 
 const PROGRESS: Progress = { current: "implement", note: "zq-latest-note: fixing the retry jitter", stages: STAGES };
 
-function outcome(
-  overrides: Partial<Omit<WorkItemOutcome, "state">> & { state?: State; title?: string | null; progress?: Progress } = {},
-): WorkItemOutcome {
-  const n = overrides.github_issue_number ?? 398;
+function outcome({
+  issue = 398,
+  ...overrides
+}: Partial<Omit<WorkItemOutcome, "state">> & {
+  state?: State;
+  title?: string | null;
+  progress?: Progress;
+  issue?: number;
+} = {}): WorkItemOutcome {
   return {
     id: "wi-1",
     agent_id: "ag-1",
-    repo_full_name: "acme/payments",
-    github_issue_number: n,
-    issue_url: `https://github.com/acme/payments/issues/${n}`,
+    tracker: {
+      kind: "github",
+      host: "github.com",
+      scope_id: "4401",
+      issue_id: String(issue),
+      display_key: null,
+      url: `https://github.com/acme/payments/issues/${issue}`,
+    },
+    repository: { code_host_kind: "github", host: "github.com", project_id: "4401", path: "acme/payments" },
     cancelled_at: null,
     created_at: iso(2 * HOUR),
     updated_at: iso(HOUR),
@@ -224,7 +235,7 @@ describe("WiredFactory (#4102)", () => {
       outcome({
         id: `wi-${state}`,
         state,
-        github_issue_number: 100 + i,
+        issue: 100 + i,
         title: `zq-title-${state}`,
         actionable_cause: `zq-cause-${state}`,
       }),
@@ -254,13 +265,13 @@ describe("WiredFactory (#4102)", () => {
   it("titles each lane and shows its count", async () => {
     vi.mocked(listWorkItems).mockResolvedValue(
       list([
-        outcome({ id: "q1", state: "queued", github_issue_number: 1 }),
-        outcome({ id: "q2", state: "waiting", github_issue_number: 2 }),
-        outcome({ id: "q3", state: "queued", github_issue_number: 3 }),
-        outcome({ id: "r1", state: "running", github_issue_number: 4 }),
-        outcome({ id: "n1", state: "failed", github_issue_number: 5 }),
-        outcome({ id: "n2", state: "expired", github_issue_number: 6 }),
-        outcome({ id: "s1", state: "published", github_issue_number: 7 }),
+        outcome({ id: "q1", state: "queued", issue: 1 }),
+        outcome({ id: "q2", state: "waiting", issue: 2 }),
+        outcome({ id: "q3", state: "queued", issue: 3 }),
+        outcome({ id: "r1", state: "running", issue: 4 }),
+        outcome({ id: "n1", state: "failed", issue: 5 }),
+        outcome({ id: "n2", state: "expired", issue: 6 }),
+        outcome({ id: "s1", state: "published", issue: 7 }),
       ]),
     );
     renderView();
@@ -290,10 +301,10 @@ describe("WiredFactory (#4102)", () => {
   it("counts several cancelled items on the cancelled line", async () => {
     vi.mocked(listWorkItems).mockResolvedValue(
       list([
-        outcome({ id: "c1", state: "cancelled", github_issue_number: 11 }),
-        outcome({ id: "c2", state: "cancelled", github_issue_number: 12 }),
-        outcome({ id: "c3", state: "cancelled", github_issue_number: 13 }),
-        outcome({ id: "r1", state: "running", github_issue_number: 14 }),
+        outcome({ id: "c1", state: "cancelled", issue: 11 }),
+        outcome({ id: "c2", state: "cancelled", issue: 12 }),
+        outcome({ id: "c3", state: "cancelled", issue: 13 }),
+        outcome({ id: "r1", state: "running", issue: 14 }),
       ]),
     );
     renderView();
@@ -308,7 +319,7 @@ describe("WiredFactory (#4102)", () => {
       outcome({
         id: `p${i}`,
         state: "published",
-        github_issue_number: 500 + i,
+        issue: 500 + i,
         title: `zq-shipped-${i}`,
         updated_at: iso((12 - i) * HOUR),
         pr: { number: 900 + i, url: `https://github.com/acme/payments/pull/${900 + i}`, status: "merged" },
@@ -339,18 +350,18 @@ describe("WiredFactory (#4102)", () => {
   it("computes the three KPI tiles: in flight, needs you, and shipped in the last 7 days", async () => {
     vi.mocked(listWorkItems).mockResolvedValue(
       list([
-        outcome({ id: "q1", state: "queued", github_issue_number: 1 }),
-        outcome({ id: "q2", state: "waiting", github_issue_number: 2 }),
-        outcome({ id: "r1", state: "running", github_issue_number: 3 }),
-        outcome({ id: "r2", state: "publishing", github_issue_number: 4 }),
-        outcome({ id: "r3", state: "cancellation_requested", github_issue_number: 5 }),
-        outcome({ id: "n1", state: "awaiting_approval", github_issue_number: 6 }),
-        outcome({ id: "n2", state: "completed_unpublished", github_issue_number: 7 }),
-        outcome({ id: "s1", state: "published", github_issue_number: 8, updated_at: iso(DAY) }),
-        outcome({ id: "s2", state: "published", github_issue_number: 9, updated_at: iso(6 * DAY) }),
+        outcome({ id: "q1", state: "queued", issue: 1 }),
+        outcome({ id: "q2", state: "waiting", issue: 2 }),
+        outcome({ id: "r1", state: "running", issue: 3 }),
+        outcome({ id: "r2", state: "publishing", issue: 4 }),
+        outcome({ id: "r3", state: "cancellation_requested", issue: 5 }),
+        outcome({ id: "n1", state: "awaiting_approval", issue: 6 }),
+        outcome({ id: "n2", state: "completed_unpublished", issue: 7 }),
+        outcome({ id: "s1", state: "published", issue: 8, updated_at: iso(DAY) }),
+        outcome({ id: "s2", state: "published", issue: 9, updated_at: iso(6 * DAY) }),
         // Older than 7 days: in the Shipped lane but not the 7d tile.
-        outcome({ id: "s3", state: "published", github_issue_number: 10, updated_at: iso(9 * DAY), title: "zq-old-ship" }),
-        outcome({ id: "c1", state: "cancelled", github_issue_number: 11 }),
+        outcome({ id: "s3", state: "published", issue: 10, updated_at: iso(9 * DAY), title: "zq-old-ship" }),
+        outcome({ id: "c1", state: "cancelled", issue: 11 }),
       ]),
     );
     renderView();
@@ -367,18 +378,18 @@ describe("WiredFactory (#4102)", () => {
   it("renders the lane card per Decision 7", async () => {
     vi.mocked(listWorkItems).mockResolvedValue(
       list([
-        outcome({ id: "r1", state: "running", github_issue_number: 398, progress: PROGRESS }),
+        outcome({ id: "r1", state: "running", issue: 398, progress: PROGRESS }),
         outcome({
           id: "n1",
           state: "failed",
-          github_issue_number: 401,
+          issue: 401,
           title: null,
           actionable_cause: "zq-needs-you-cause",
         }),
         outcome({
           id: "s1",
           state: "published",
-          github_issue_number: 377,
+          issue: 377,
           title: "zq-shipped-title",
           pr: { number: 4123, url: "https://github.com/acme/payments/pull/4123", status: "merged" },
         }),

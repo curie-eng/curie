@@ -125,7 +125,7 @@ async def publication_store() -> AsyncIterator[tuple[AsyncEngine, str, PostgresP
                     f'CREATE TABLE "{schema}".thread_publication_lineages ('
                     "id uuid PRIMARY KEY, version integer NOT NULL DEFAULT 1, "
                     "branch text NOT NULL, pr_number integer, pr_url text, head_sha text, "
-                    "github_repository_id bigint, github_pr_node_id text)"
+                    "repository_project_id text, code_host_pr_id text)"
                 )
             )
             await connection.execute(

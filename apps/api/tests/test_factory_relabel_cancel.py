@@ -52,9 +52,9 @@ def _all(number: int) -> list[dict[str, Any]]:
         "w.readmit_request_id, w.readmit_requester, w.readmit_objective "
         "FROM curie.execution_requests r "
         "JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE w.github_repository_id = :repo AND w.github_issue_number = :number "
+        "WHERE w.tracker_scope_id = :repo AND w.tracker_issue_id = :number "
         "ORDER BY r.sequence",
-        {"repo": REPO_ID, "number": number},
+        {"repo": str(REPO_ID), "number": str(number)},
     )
 
 

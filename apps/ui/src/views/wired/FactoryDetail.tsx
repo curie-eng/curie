@@ -62,7 +62,7 @@ function DetailBody({
   return (
     <div data-testid="factory-detail">
       <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <ExtLink href={item.issue_url} style={{ fontFamily: C.mono, fontSize: 12 }}>
+        <ExtLink href={item.tracker.url} style={{ fontFamily: C.mono, fontSize: 12 }}>
           {issueRef(item)}
         </ExtLink>
         <StatePill state={item.state} />

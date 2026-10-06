@@ -611,11 +611,13 @@ def test_delete_agent_removes_work_requests_and_internal_lineage_without_github(
                 await conn.execute(
                     text(
                         "INSERT INTO curie.work_items "
-                        "(id, github_repository_id, github_issue_number, "
-                        "github_installation_id, agent_id, repo_full_name, "
-                        "conversation_id, publication_lineage_id, version, "
-                        "next_sequence) VALUES "
-                        "(:id, 101, 2573, 202, :agent, :repo, :conversation, "
+                        "(id, tracker_kind, tracker_host, tracker_scope_id, "
+                        "tracker_issue_id, code_host_kind, code_host_host, "
+                        "repository_project_id, code_host_installation_id, agent_id, "
+                        "repository_path, conversation_id, publication_lineage_id, "
+                        "version, next_sequence) VALUES "
+                        "(:id, 'github', 'github.com', '101', '2573', 'github', "
+                        "'github.com', '101', 202, :agent, :repo, :conversation, "
                         ":lineage, 2, 2)"
                     ),
                     {

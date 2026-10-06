@@ -106,13 +106,13 @@ def _record_base(
     _execute(
         "UPDATE curie.work_items SET base_branch = :branch, base_source = :source, "
         "base_commit = :commit, base_label_ignored = :ignored "
-        "WHERE github_issue_number = :number",
+        "WHERE tracker_issue_id = :number",
         {
             "branch": branch,
             "source": source,
             "commit": commit,
             "ignored": ignored,
-            "number": number,
+            "number": str(number),
         },
     )
 

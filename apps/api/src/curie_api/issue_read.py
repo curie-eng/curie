@@ -24,6 +24,7 @@ from .config import Settings
 from .forges.errors import ForgeError
 from .forges.github.comments import static_token
 from .forges.github.tracker import GitHubTracker, IssueContent
+from .forges.types import GITHUB
 from .github_app import GitHubAppError, GitHubCredentials
 from .models import MAX_EXECUTION_DEADLINE_SECONDS, ExecutionRequest, WorkItem
 
@@ -78,7 +79,13 @@ async def read_issue_authority(
     if row is None:
         raise IssueReadRefused
     item, execution, now = row
-    if item.cancelled_at is not None:
+    # The sandbox read goes through the GitHub tracker; another tracker has no
+    # read path yet, so its execution cannot mint one.
+    if (
+        item.cancelled_at is not None
+        or item.tracker_kind != GITHUB
+        or item.code_host_installation_id is None
+    ):
         raise IssueReadRefused
     if running:
         if (
@@ -97,10 +104,10 @@ async def read_issue_authority(
     return IssueReadAuthority(
         work_item_id=item.id,
         execution_request_id=execution.id,
-        repo_full_name=item.repo_full_name,
-        github_repository_id=item.github_repository_id,
-        github_installation_id=item.github_installation_id,
-        issue_number=item.github_issue_number,
+        repo_full_name=item.repository_path,
+        github_repository_id=int(item.tracker_scope_id),
+        github_installation_id=item.code_host_installation_id,
+        issue_number=int(item.tracker_issue_id),
         execution_deadline=execution.execution_deadline,
     )
 

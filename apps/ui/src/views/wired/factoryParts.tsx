@@ -66,8 +66,10 @@ export function StatePill({ state }: { state: State }) {
   );
 }
 
+// The tracker's display key (a Jira key) when it has one, else the repository
+// path and the issue id. The link is always the tracker's own (ADR 0197).
 export function issueRef(item: WorkItemOutcome): string {
-  return `${item.repo_full_name}#${item.github_issue_number}`;
+  return item.tracker.display_key ?? `${item.repository.path}#${item.tracker.issue_id}`;
 }
 
 // An outbound link that never selects the card it sits in.

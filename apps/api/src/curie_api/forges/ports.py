@@ -122,6 +122,13 @@ class Tracker(Protocol):
         """Apply the factory state label ``add`` and drop each of ``remove``."""
         ...
 
+    def issue_url(self, issue: TrackerIssueRef) -> str:
+        """The tracker's web link to ``issue``; work item links come from here.
+
+        Makes no request. Raises `NotFound` for an issue outside this tracker.
+        """
+        ...
+
     async def closing_reference(self, issue: TrackerIssueRef, repository: RepositoryRef) -> str:
         """The text a pull request body carries to reference (and close) the issue."""
         ...

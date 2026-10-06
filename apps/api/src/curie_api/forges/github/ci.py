@@ -192,7 +192,7 @@ async def mint_ci_token(
     return await mint_repository_token(
         settings,
         lineage.repo_full_name,
-        lineage.github_installation_id or work_item.github_installation_id,
+        lineage.code_host_installation_id or work_item.code_host_installation_id,
         head_sha,
     )
 
@@ -503,7 +503,7 @@ async def _observe_ci_detail(
         settings,
         client,
         repo_full_name=lineage.repo_full_name,
-        installation_id=lineage.github_installation_id or work_item.github_installation_id,
+        installation_id=lineage.code_host_installation_id or work_item.code_host_installation_id,
         head_sha=head_sha,
         log_deadline=log_deadline,
         diagnostics=True,

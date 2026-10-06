@@ -23,18 +23,21 @@ from curie_api.crud import (
 from curie_api.crud import (
     publications as crud_publications,
 )
+from curie_api.forges.types import GITHUB, RepositoryRef, TrackerIssueRef
 from curie_api.threadkeys import (
     pre_identity_thread_key,
     route_thread_key,
     route_thread_key_matches,
 )
 from curie_api.workitem_dispatch import (
+    Admission,
     admit,
     cancel,
     claim_terminate_publishes,
     readmit,
     running_for_conversation,
 )
+from curie_api.workitems.lifecycle import work_item_identity_values
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -142,22 +145,21 @@ async def _mail_agent(session: AsyncSession) -> uuid.UUID:
     return agent_id
 
 
-def _facts(agent_id: uuid.UUID, **overrides: Any) -> SimpleNamespace:
+def _facts(agent_id: uuid.UUID, **overrides: Any) -> Admission:
     values: dict[str, Any] = {
         "agent_id": agent_id,
         "kind": "email",
         "address": ADDRESS,
         "reply_conversation_id": THREAD,
-        "repo_full_name": "acme-corp/acme-bot",
-        "github_repository_id": 101,
-        "github_issue_number": 3104,
-        "github_installation_id": 202,
+        "issue": TrackerIssueRef(GITHUB, "github.com", "101", "3104"),
+        "repository": RepositoryRef(GITHUB, "github.com", "101", "acme-corp/acme-bot"),
+        "code_host_installation_id": 202,
         "objective": "Implement the admitted work item",
         "requester": "U0REQUEST1",
         "request_id": uuid.uuid4(),
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return Admission(**values)
 
 
 def test_admission_keys_a_mail_work_item_by_its_identity(clean_db: None, allowlisted: None) -> None:
@@ -191,17 +193,19 @@ async def _legacy_mail_work_item(session: AsyncSession) -> tuple[uuid.UUID, uuid
     await session.execute(
         text(
             "INSERT INTO curie.work_items "
-            "(id, github_repository_id, github_issue_number, github_installation_id, "
-            "agent_id, repo_full_name, conversation_id) "
-            "VALUES (:id, :repo_id, :issue, :install, :agent_id, :repo, :conversation_id)"
+            "(id, tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, "
+            "tracker_display_key, code_host_kind, code_host_host, repository_project_id, "
+            "repository_path, code_host_installation_id, agent_id, conversation_id) "
+            "VALUES (:id, :tracker_kind, :tracker_host, :tracker_scope_id, "
+            ":tracker_issue_id, :tracker_display_key, :code_host_kind, :code_host_host, "
+            ":repository_project_id, :repository_path, :install, :agent_id, "
+            ":conversation_id)"
         ),
         {
             "id": work_item_id,
-            "repo_id": facts.github_repository_id,
-            "issue": facts.github_issue_number,
-            "install": facts.github_installation_id,
+            **work_item_identity_values(facts.issue, facts.repository),
+            "install": facts.code_host_installation_id,
             "agent_id": agent_id,
-            "repo": facts.repo_full_name,
             "conversation_id": OLD_KEY,
         },
     )
@@ -441,8 +445,10 @@ async def _bind_lineage(
         agent_id=agent_id,
         conversation_id=conversation_id,
         repo_full_name="acme-corp/acme-bot",
-        github_repository_id=None,
-        github_installation_id=None,
+        code_host_kind=None,
+        code_host_host=None,
+        repository_project_id=None,
+        code_host_installation_id=None,
     )
     publication: Any = SimpleNamespace(execution_request_id=request_id)
     await crud_lineages._bind_running_work_item_lineage(

@@ -44,7 +44,7 @@ from .code_host_trust import code_host_verify
 from .config import Settings
 from .factory_comment_text import marker_for, redact_factory_comment
 from .factory_progress import PhaseView, phase_view, pill_for
-from .factory_reply_target import github_host, stored_reply_target
+from .factory_reply_target import stored_reply_target
 from .factory_usage import usage_line, work_item_usage
 from .forges.errors import ForgeError
 from .forges.github.comments import static_token
@@ -59,7 +59,7 @@ from .forges.github.marked_comments import (
 from .forges.github.tracker import GitHubTracker
 from .forges.github.transport import github_headers
 from .forges.ports import Tracker
-from .forges.types import ReplyTarget, TrackerIssueRef
+from .forges.types import GITHUB, ReplyTarget, TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .models import (
     ExecutionRequest,
@@ -615,10 +615,9 @@ async def sync_status_comments(
 @dataclass(frozen=True)
 class _StatusClaim:
     row: FactoryStatusComment
-    repo_full_name: str
-    github_installation_id: int
-    github_repository_id: int
-    github_issue_number: int
+    repository_path: str
+    code_host_installation_id: int | None
+    tracker_issue: TrackerIssueRef
     work_item_id: uuid.UUID
     status: str
     target: ReplyTarget
@@ -704,7 +703,7 @@ async def _claim_next(
         )
         .execution_options(synchronize_session=False)
     )
-    target = stored_reply_target(request, work_item, github_host(settings.github_html_base))
+    target = stored_reply_target(request, work_item)
     body = await _render(
         session,
         settings,
@@ -717,10 +716,9 @@ async def _claim_next(
     )
     claim = _StatusClaim(
         row=row,
-        repo_full_name=work_item.repo_full_name,
-        github_installation_id=work_item.github_installation_id,
-        github_repository_id=work_item.github_repository_id,
-        github_issue_number=work_item.github_issue_number,
+        repository_path=work_item.repository_path,
+        code_host_installation_id=work_item.code_host_installation_id,
+        tracker_issue=work_item.tracker_issue,
         work_item_id=work_item.id,
         status=request.status,
         target=target,
@@ -774,18 +772,21 @@ async def _sync_one(
     claim: _StatusClaim,
 ) -> int:
     row = claim.row
+    if claim.tracker_issue.kind != GITHUB or claim.code_host_installation_id is None:
+        # Only the GitHub tracker posts status comments today.
+        return 0
     try:
         token = await run_in_threadpool(
             credentials_for(settings).token_for_verified_installation,
-            claim.repo_full_name,
-            claim.github_installation_id,
+            claim.repository_path,
+            claim.code_host_installation_id,
         )
     except (GitHubInstallationRefused, GitHubAppError, ValueError):
         return 0
     github = GitHubCommentClient(
         client=client,
         api=settings.github_api_url.rstrip("/"),
-        repo_path=f"/repos/{repo_url_path(claim.repo_full_name)}",
+        repo_path=f"/repos/{repo_url_path(claim.repository_path)}",
         headers=github_headers(token),
     )
     writes = 0
@@ -795,8 +796,8 @@ async def _sync_one(
         tracker = GitHubTracker.from_settings(
             settings,
             client,
-            repo_full_name=claim.repo_full_name,
-            repository_id=claim.github_repository_id,
+            repo_full_name=claim.repository_path,
+            repository_id=int(claim.tracker_issue.scope_id),
             token=static_token(token),
         )
         writes += await _sync_labels(tracker, claim)
@@ -809,11 +810,11 @@ async def _sync_comment(
 ) -> int:
     row, target, body, now = claim.row, claim.target, claim.body, claim.now
     if row.subject_title is None:
-        row.subject_title = await subject_title(github, claim.github_issue_number, target)
+        row.subject_title = await subject_title(github, int(claim.tracker_issue.issue_id), target)
     terminal = FINAL_MARKER in body
     writes = 0
     if row.comment_id is None:
-        outcome = await deliver(github, claim.github_issue_number, row, target, body)
+        outcome = await deliver(github, int(claim.tracker_issue.issue_id), row, target, body)
         if outcome is None:
             return 0
         if outcome[0] == "refused":
@@ -986,12 +987,7 @@ async def _sync_labels(tracker: Tracker, claim: _StatusClaim) -> int:
     desired = desired_label(claim.status)
     if row.applied_label == desired:
         return 0
-    issue = TrackerIssueRef(
-        tracker.kind,
-        tracker.host,
-        str(claim.github_repository_id),
-        str(claim.github_issue_number),
-    )
+    issue = claim.tracker_issue
     remove = [name for name in (*STATE_LABELS, *LEGACY_STATE_LABELS) if name != desired]
     try:
         await tracker.set_state_label(issue, add=desired or None, remove=remove)

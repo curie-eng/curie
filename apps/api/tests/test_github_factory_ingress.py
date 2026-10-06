@@ -26,6 +26,7 @@ import httpx
 import pytest
 from curie_api.config import get_settings
 from curie_api.forges.github.identity import issue_lock_keys_for
+from curie_api.forges.hosts import github_issue_ref
 from curie_api.github_factory import (
     admit_notice,
     handle_factory_delivery,
@@ -119,12 +120,12 @@ def _requests(number: int) -> list[dict[str, Any]]:
     return _rows(
         "SELECT r.id, r.status, r.terminal_cause, r.objective, r.requester, "
         "r.reply_kind, w.id AS work_item_id, w.cancelled_at, "
-        "w.publication_lineage_id, w.github_issue_number "
+        "w.publication_lineage_id, w.tracker_issue_id "
         "FROM curie.work_items w "
         "LEFT JOIN curie.execution_requests r ON r.work_item_id = w.id "
-        "WHERE w.github_repository_id = :repo AND w.github_issue_number = :number "
+        "WHERE w.tracker_scope_id = :repo AND w.tracker_issue_id = :number "
         "ORDER BY r.sequence",
-        {"repo": REPO_ID, "number": number},
+        {"repo": str(REPO_ID), "number": str(number)},
     )
 
 
@@ -278,7 +279,7 @@ def test_repository_outside_the_allowlist_does_not_admit(
 
     assert response.status_code == 200, response.text
     assert _code(response) == "repository_not_allowed"
-    assert _rows("SELECT id FROM curie.work_items WHERE github_repository_id = 999001") == []
+    assert _rows("SELECT id FROM curie.work_items WHERE tracker_scope_id = '999001'") == []
 
 
 def test_sender_without_write_permission_does_not_admit(
@@ -506,16 +507,21 @@ def test_admission_retains_issue_lock_until_caller_commit(
                 httpx.AsyncClient(transport=httpx.MockTransport(api.handle)) as github,
             ):
                 caller_pid = await session.scalar(text("SELECT pg_backend_pid()"))
-                await lock_issue(session, REPO_ID, number)
+                await lock_issue(
+                    session,
+                    github_issue_ref(
+                        get_settings(), repository_id=REPO_ID, issue_number=number
+                    ),
+                )
                 verified = await verify_current(notice, settings=get_settings(), client=github)
                 admitted = await admit_notice(session, notice, get_settings(), verified)
                 assert admitted.status == "factory_admitted", admitted
                 assert not await observer.scalar(
                     text(
                         "SELECT EXISTS (SELECT 1 FROM curie.work_items "
-                        "WHERE github_repository_id = :repo AND github_issue_number = :number)"
+                        "WHERE tracker_scope_id = :repo AND tracker_issue_id = :number)"
                     ),
-                    {"repo": REPO_ID, "number": number},
+                    {"repo": str(REPO_ID), "number": str(number)},
                 )
                 request_visible = text(
                     "SELECT EXISTS (SELECT 1 FROM curie.execution_requests WHERE id = :request_id)"

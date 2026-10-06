@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from curie_api.config import Settings
 from curie_api.forges.github.transport import get_github_json, list_pages, parse_time
+from curie_api.forges.types import RepositoryRef
 from curie_api.github_review_events import (
     FeedbackIgnored,
     FeedbackUnavailable,
@@ -30,7 +31,6 @@ class Cursor:
     review_comments_since: datetime | None = None
     reviews_since: datetime | None = None
     etags: dict[str, str] = field(default_factory=dict)
-    repository_id: int | None = None
 
 
 def since_param(stored: datetime | None, now: datetime) -> str:
@@ -75,15 +75,17 @@ def human_actor(event: dict[str, Any]) -> tuple[int, str] | None:
 
 
 async def open_pulls(
-    sessionmaker: async_sessionmaker[AsyncSession], repo: str, repository_id: int
+    sessionmaker: async_sessionmaker[AsyncSession], repository: RepositoryRef
 ) -> list[int]:
     async with sessionmaker() as session:
         rows = await session.scalars(
             select(ThreadPublicationLineage.pr_number)
             .join(WorkItem, WorkItem.publication_lineage_id == ThreadPublicationLineage.id)
             .where(
-                WorkItem.repo_full_name == repo,
-                WorkItem.github_repository_id == repository_id,
+                WorkItem.repository_path == repository.path,
+                WorkItem.code_host_kind == repository.kind,
+                WorkItem.code_host_host == repository.host,
+                WorkItem.repository_project_id == repository.project_id,
                 WorkItem.cancelled_at.is_(None),
                 ThreadPublicationLineage.status == "open",
                 ThreadPublicationLineage.pr_number.is_not(None),

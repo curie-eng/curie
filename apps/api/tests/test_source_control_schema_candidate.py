@@ -34,7 +34,7 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     )
     # The next-only migrations follow the immutable published 0.12.2 chain.
     # The minimum tracks the newest schema the app reads (#2911's tenant scope).
-    assert window == {"schema_min": "0102", "schema_head": "0102"}
+    assert window == {"schema_min": "0103", "schema_head": "0103"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -53,8 +53,8 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     data = catalog()
     assert data["windows"].get("0.12.2") == {"schema_min": "0076", "schema_head": "0081"}
     assert data["windows"].get("0.12.3") == {"schema_min": "0076", "schema_head": "0093"}
-    assert data["windows"].get("0.13.0") == {"schema_min": "0102", "schema_head": "0102"}
-    assert data["revisions"][-8:] == [
+    assert data["windows"].get("0.13.0") == {"schema_min": "0103", "schema_head": "0103"}
+    assert data["revisions"][-9:] == [
         "0095",
         "0096",
         "0097",
@@ -63,11 +63,11 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0100",
         "0101",
         "0102",
+        "0103",
     ]
-    assert (
-        json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())["0102"]
-        == "expand"
-    )
+    kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
+    assert kinds["0102"] == "expand"
+    assert kinds["0103"] == "contract"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -111,8 +111,8 @@ def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
             with TestClient(create_app()):
                 pass
         assert current_revision() == "0100"
-        command.upgrade(alembic_config(), "0102")
-        assert current_revision() == "0102"
+        command.upgrade(alembic_config(), "0103")
+        assert current_revision() == "0103"
         with TestClient(create_app()) as client:
             response = client.get("/health")
             assert response.status_code == 200
