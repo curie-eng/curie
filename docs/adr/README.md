@@ -224,4 +224,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0199 | [The factory admits only tickets it can start and finish](0199-the-factory-admits-only-tickets-it-can-start-and-finish.md) | Accepted |
 | 0200 | [Agents read and edit canvases shared into their bound channels](0200-agents-read-and-edit-canvases-shared-into-their-bound-channels.md) | Accepted |
 | 0203 | [Automated remediation is a pre-qualified action the platform executes and verifies](0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md) | Accepted |
+| 0204 | [The factory checks its environment before it admits a ticket](0204-the-factory-checks-its-environment-before-it-admits-a-ticket.md) | Accepted |
 <!-- END GENERATED: adr-index -->

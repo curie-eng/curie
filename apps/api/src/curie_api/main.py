@@ -65,6 +65,7 @@ from .routers import (
     github,
     github_reviews,
     hook_fire,
+    hook_source_policy,
     hooks,
     memory,
     observability,
@@ -458,6 +459,7 @@ def create_app() -> FastAPI:
     app.include_router(config.router)
     app.include_router(console.router)
     app.include_router(agents.router)
+    app.include_router(hook_source_policy.router)
     app.include_router(deployments.router)
     app.include_router(bundles.router)
     app.include_router(deploy_targets.router)

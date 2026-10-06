@@ -92,7 +92,10 @@ def test_a_recorded_call_survives_the_worker_to_api_hop(client: Any, anyio_backe
     assert row["post_state"] == {"spec": {"replicas": 10}}
     assert row["target"] == {"kind": "Deployment", "name": "api"}
     assert row["status"] == "succeeded"
-    assert row["undoable"] is True
+    # @spec ACTION-EXECUTOR-11: a cleartext ``prior`` crosses and is stored as
+    # history, but it is not a sealed envelope, so the row is not undoable.
+    # Field survival, not reversibility, is what this seam test pins.
+    assert row["undoable"] is False
 
 
 def test_a_call_that_never_reported_what_it_left_is_not_offered_as_undoable(
