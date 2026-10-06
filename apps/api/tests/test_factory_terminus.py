@@ -364,6 +364,18 @@ class _GitHubComments(BaseHTTPRequestHandler):
         if annotations is not None:
             self._send(200, server.annotations.get(int(annotations.group(1)), []))
             return True
+        branch = re.fullmatch(rf"/repos/{repo}/branches/(.+)", path)
+        if branch is not None:
+            # Get a branch; the base head's checks are then served by ci_scripts.
+            # https://docs.github.com/en/rest/branches/branches#get-a-branch
+            name = unquote(branch.group(1))
+            server.requests.append(("GET", path, None))
+            sha = server.branches.get(name)
+            if sha is None:
+                self._send(404, {"message": "Branch not found"})
+            else:
+                self._send(200, {"name": name, "commit": {"sha": sha}})
+            return True
         return False
 
     def do_PATCH(self) -> None:  # noqa: N802
@@ -487,6 +499,8 @@ class _CommentServer(ThreadingHTTPServer):
         self.ci_cursor: dict[str, int] = {}
         self.ci_observations: list[str] = []
         self.annotations: dict[int, list[dict[str, Any]]] = {}
+        # #4105. Branch name -> the sha it points to; empty means every base read 404s.
+        self.branches: dict[str, str] = {}
         # #3741. 403 matches a token with no Actions write permission.
         self.rerun_status = 403
         self.rerun_statuses: list[int] = []
@@ -1334,6 +1348,42 @@ def _attach_publication(
                     raise AssertionError(f"work item {work_item_id} was not linked")
                 if request["id"] is None:
                     raise AssertionError("running request is missing")
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def _set_base_ref(work_item_id: uuid.UUID, base_ref: str) -> None:
+    """Give the work item's lineage a PR base branch (#4105).
+
+    The identity check constraint wants the repository id, installation id, PR
+    node id and base ref all set together, so they are written in one UPDATE.
+    """
+
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                changed = await conn.execute(
+                    text(
+                        "UPDATE curie.thread_publication_lineages SET "
+                        "github_repository_id = :repo_id, "
+                        "github_installation_id = :installation_id, "
+                        "github_pr_node_id = :node_id, base_ref = :base_ref "
+                        "WHERE id = (SELECT publication_lineage_id FROM curie.work_items "
+                        "WHERE id = :id)"
+                    ),
+                    {
+                        "repo_id": REPO_ID,
+                        "installation_id": INSTALLATION_ID,
+                        "node_id": f"PR_fixture_{work_item_id.hex}",
+                        "base_ref": base_ref,
+                        "id": work_item_id,
+                    },
+                )
+                if changed.rowcount != 1:
+                    raise AssertionError(f"work item {work_item_id} has no lineage")
         finally:
             await engine.dispose()
 
