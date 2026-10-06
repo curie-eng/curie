@@ -93,7 +93,14 @@ def _detail(
     base_runs: tuple[dict[str, Any], ...] | None = None,
     base_statuses: tuple[dict[str, Any], ...] | None = None,
 ) -> CiDetail:
-    base_read = base_runs is not None or base_statuses is not None
+    # The base fields are passed only when a test reads a base head, so every
+    # other detail is built exactly as before #4105.
+    base: dict[str, Any] = {}
+    if base_runs is not None or base_statuses is not None:
+        base = {
+            "base_check_runs": list(base_runs or ()),
+            "base_statuses": list(base_statuses or ()),
+        }
     return CiDetail(
         state="unavailable" if reason is not None else "observed",
         reason=reason,
@@ -101,8 +108,7 @@ def _detail(
         check_runs=list(runs),
         statuses=list(statuses),
         annotations=annotations or {},
-        base_check_runs=list(base_runs or ()) if base_read else None,
-        base_statuses=list(base_statuses or ()) if base_read else None,
+        **base,
     )
 
 
