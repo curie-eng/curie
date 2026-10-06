@@ -45,6 +45,7 @@ from .langfuse import LangfuseClient
 from .resumequeue import ResumeQueue
 from .resumereconciler import ResumeReconciler
 from .routers import (
+    action_executions,
     actions,
     agents,
     approval_recovery,
@@ -479,6 +480,8 @@ def create_app() -> FastAPI:
     app.include_router(approval_recovery.router)
     app.include_router(approvals.router)
     app.include_router(actions.router)
+    app.include_router(action_executions.probe_router)
+    app.include_router(action_executions.router)
     app.include_router(publication_precheck.router)
     app.include_router(publications.router)
     app.include_router(publications.internal_router)

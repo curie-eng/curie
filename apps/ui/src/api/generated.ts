@@ -2,6 +2,133 @@
 // Do not edit by hand. Regenerate with `pnpm gen:api-types` in apps/ui and commit.
 
 export interface paths {
+    "/action-executions/claim": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Claim Execution
+         * @description Claim the oldest claimable execution under a lease, or ``204``.
+         *
+         *     @spec ACTION-EXECUTOR-17 and the ACTION-EXECUTOR-20 amendment: a
+         *     ``requested`` row is claimable, and so is a ``claimed`` row whose lease
+         *     expired, which is reclaimed with the next attempt so the earlier holder's
+         *     fence is stale. A reclaim forgets the earlier attempt's observation, so the
+         *     new holder must observe again. After ``MAX_ATTEMPTS`` the row is refused.
+         *     @spec ACTION-EXECUTOR-1: with the executor off, nothing is handed out.
+         */
+        post: operations["claim_execution_action_executions_claim_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/action-executions/{execution_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Execution
+         * @description @spec ACTION-EXECUTOR-18: the execution's receipt.
+         */
+        get: operations["get_execution_action_executions__execution_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/action-executions/{execution_id}/dispatch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Dispatch Execution
+         * @description Commit ``dispatched``, the last step before a write call.
+         *
+         *     @spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-15: only a ``claimed``
+         *     restore whose observed version equalled the recorded one dispatches. A
+         *     probe never does (ACTION-EXECUTOR-1). A forward execution dispatches only
+         *     once the API creates its ledger row at dispatch (ACTION-EXECUTOR-19), which
+         *     is not built yet, so it is refused here too.
+         */
+        post: operations["dispatch_execution_action_executions__execution_id__dispatch_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/action-executions/{execution_id}/observation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Record Observation
+         * @description Compare the version observed now with the version the action left.
+         *
+         *     @spec ACTION-EXECUTOR-15. Equal: recorded, the execution stays ``claimed``
+         *     and may dispatch. Any difference, or an absent or malformed version: the
+         *     execution ends ``refused`` with ``version_conflict`` and the action is
+         *     released, with the ``refused_conflict`` audit row naming both versions.
+         */
+        post: operations["record_observation_action_executions__execution_id__observation_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/action-executions/{execution_id}/outcome": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Report Outcome
+         * @description Record how an execution ended.
+         *
+         *     @spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-18 @spec ACTION-EXECUTOR-20.
+         *     ``refused`` lands only on a ``claimed`` row, with a pre-dispatch code:
+         *     past ``dispatched`` the call may have reached the connector. ``confirmed``,
+         *     ``failed`` and ``indeterminate`` land only on a ``dispatched`` row, except
+         *     a probe, which never dispatches and is ``confirmed`` from ``claimed`` with
+         *     the verbs it observed. An unknown post-dispatch code is normalized by stage.
+         *     A replay of the stored outcome returns the row unchanged; a different one
+         *     is refused and the first stands.
+         */
+        post: operations["report_outcome_action_executions__execution_id__outcome_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/actions": {
         parameters: {
             query?: never;
@@ -104,17 +231,22 @@ export interface paths {
         put?: never;
         /**
          * Undo Action
-         * @description Rule on putting back what this action changed.
+         * @description Rule on putting back what this action changed, and request the restore.
          *
-         *     A 200 authorizes a restore and names the call that performs it; every other
-         *     outcome is a refusal that changed nothing. The refusals are ordered from the
-         *     record's own state outward to the world, so the most specific true reason is
-         *     the one the operator is told.
+         *     @spec ACTION-EXECUTOR-3. A 202 means a ``requested`` restore execution and
+         *     its ``authorized`` audit row were written together; every other outcome is
+         *     a refusal that wrote one audit row and no execution. The refusals are
+         *     ordered from the record's own state outward, so the most specific true
+         *     reason is the one the operator is told.
          *
          *     Authorization runs first, before any of the record's own state is examined:
          *     whether an actor may undo at all precedes whether this particular undo is
-         *     safe, and it keeps a refused actor from learning the resource's state through
-         *     a conflict message.
+         *     possible, and it keeps a refused actor from learning anything about the
+         *     record, its versions included.
+         *
+         *     The caller no longer supplies the live state: the executor observes the
+         *     version through the pinned connector and the API compares it before any
+         *     write (ACTION-EXECUTOR-15).
          */
         post: operations["undo_action_actions__action_id__undo_post"];
         delete?: never;
@@ -1228,6 +1360,30 @@ export interface paths {
         get: operations["get_config_config_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/connector-capabilities/probes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create Probe
+         * @description Request a capability probe of one connector image for one agent.
+         *
+         *     @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13. Keyed
+         *     ``probe:<agent>:<connector>:<digest>``, so a replay adopts the agent's
+         *     existing probe (``200``) rather than creating a second.
+         */
+        post: operations["create_probe_connector_capabilities_probes_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2700,49 +2856,36 @@ export interface components {
             tool: string;
         };
         /**
-         * ActionRestore
-         * @description The call an authorized undo permits: put this state back on that target.
-         */
-        ActionRestore: {
-            /** Prior State */
-            prior_state: {
-                [key: string]: unknown;
-            };
-            /** Target */
-            target: {
-                [key: string]: unknown;
-            };
-        };
-        /**
          * ActionUndo
          * @description A request to put back what an action changed.
          *
-         *     ``observed_state`` is the resource as it looks NOW, read by whoever will
-         *     perform the restore. The platform cannot read it itself -- nothing here can
-         *     reach a connector -- and it will not assume: an absent observation is refused
-         *     rather than treated as "unchanged".
+         *     @spec ACTION-EXECUTOR-3: the platform observes the live version itself
+         *     through the pinned connector (ACTION-EXECUTOR-15), so a caller-supplied
+         *     observation is no longer evidence. An ``observed_state`` sent by an older
+         *     caller is ignored as an unknown field, never compared.
          */
         ActionUndo: {
             /** Actor */
             actor: string;
             /** Actor Channel */
             actor_channel?: string | null;
-            /** Observed State */
-            observed_state?: {
-                [key: string]: unknown;
-            } | null;
         };
         /**
          * ActionUndoOut
-         * @description An authorization, not a receipt.
+         * @description A requested restore, not a receipt and not the call to make.
          *
-         *     The API rules and returns; something else performs the restore (ADR-0117
-         *     leaves where that executor lives undecided). So this names the call to make
-         *     rather than claiming it was made.
+         *     @spec ACTION-EXECUTOR-3: the ruling answers with the execution it created
+         *     and that execution's state. It never carries the ``target``, the sealed
+         *     ``prior_state`` or a version; the receipt is the execution's own read.
          */
         ActionUndoOut: {
-            action: components["schemas"]["ActionOut"];
-            restore: components["schemas"]["ActionRestore"];
+            /**
+             * Execution Id
+             * Format: uuid
+             */
+            execution_id: string;
+            /** State */
+            state: string;
         };
         /** Activity */
         Activity: {
@@ -4730,6 +4873,127 @@ export interface components {
              */
             version_id: string;
         };
+        /**
+         * ExecutionClaim
+         * @description @spec ACTION-EXECUTOR-17: who claims, and for how long the lease holds.
+         */
+        ExecutionClaim: {
+            /** Lease Owner */
+            lease_owner: string;
+            /** Lease Seconds */
+            lease_seconds: number;
+        };
+        /**
+         * ExecutionCreated
+         * @description A created or adopted execution: its identity and state, nothing else.
+         */
+        ExecutionCreated: {
+            /**
+             * Execution Id
+             * Format: uuid
+             */
+            execution_id: string;
+            /** State */
+            state: string;
+        };
+        /**
+         * ExecutionFence
+         * @description @spec ACTION-EXECUTOR-17: the fence every later transition presents.
+         */
+        ExecutionFence: {
+            /** Attempt */
+            attempt: number;
+            /** Lease Owner */
+            lease_owner: string;
+        };
+        /**
+         * ExecutionObservation
+         * @description @spec ACTION-EXECUTOR-15: the version ``observe_version`` reported now.
+         *
+         *     Absent, empty or malformed is accepted here and answered as a conflict by
+         *     the route, never as a 422: the spec refuses the restore in that case, and a
+         *     rejected request would leave the execution waiting instead.
+         */
+        ExecutionObservation: {
+            /** Attempt */
+            attempt: number;
+            /** Lease Owner */
+            lease_owner: string;
+            /** Version */
+            version?: string | null;
+        };
+        /**
+         * ExecutionOut
+         * @description One execution as the worker and the receipt read it.
+         *
+         *     @spec ACTION-EXECUTOR-18. Deliberately without ``outcome``,
+         *     ``arguments_sha256`` or ``forward_arguments``: the read names what ran and
+         *     how it ended, never a version, an argument or a state.
+         */
+        ExecutionOut: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Attempt */
+            attempt: number;
+            /** Connector */
+            connector: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Dispatched At */
+            dispatched_at: string | null;
+            /** Failure Code */
+            failure_code: string | null;
+            /** Finished At */
+            finished_at: string | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Kind */
+            kind: string;
+            /** Lease Expires At */
+            lease_expires_at: string | null;
+            /** Lease Owner */
+            lease_owner: string | null;
+            /** Refusal Code */
+            refusal_code: string | null;
+            /** Requested By */
+            requested_by: string | null;
+            /** State */
+            state: string;
+            /** Subject Action Id */
+            subject_action_id: string | null;
+            /** Tool */
+            tool: string | null;
+        };
+        /**
+         * ExecutionOutcome
+         * @description @spec ACTION-EXECUTOR-18 @spec ACTION-EXECUTOR-20: the terminal report.
+         *
+         *     ``state`` is one of ``refused``, ``confirmed``, ``failed`` or
+         *     ``indeterminate``; ``code`` is checked against its stage by the route.
+         *     ``advertised`` is a probe's report only: the verbs whose ``tools/list``
+         *     entry met ACTION-EXECUTOR-13's rule.
+         */
+        ExecutionOutcome: {
+            /** Advertised */
+            advertised?: string[] | null;
+            /** Attempt */
+            attempt: number;
+            /** Code */
+            code?: string | null;
+            /** Lease Owner */
+            lease_owner: string;
+            /** State */
+            state: string;
+        };
         /** FinishBody */
         FinishBody: {
             /** Cause */
@@ -5358,6 +5622,21 @@ export interface components {
             namespace: string;
             /** Pod */
             pod: string;
+        };
+        /**
+         * ProbeCreate
+         * @description @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13: exactly these three keys.
+         */
+        ProbeCreate: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Connector */
+            connector: string;
+            /** Digest */
+            digest: string;
         };
         /** ProgressReport */
         ProgressReport: {
@@ -7004,6 +7283,192 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    claim_execution_action_executions_claim_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecutionClaim"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionOut"];
+                };
+            };
+            /** @description Nothing is claimable. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_execution_action_executions__execution_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                execution_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    dispatch_execution_action_executions__execution_id__dispatch_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                execution_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecutionFence"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    record_observation_action_executions__execution_id__observation_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                execution_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecutionObservation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    report_outcome_action_executions__execution_id__outcome_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                execution_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecutionOutcome"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_actions_actions_get: {
         parameters: {
             query?: {
@@ -7195,7 +7660,7 @@ export interface operations {
         };
         responses: {
             /** @description Successful Response */
-            200: {
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -9774,6 +10239,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AppConfig"];
+                };
+            };
+        };
+    };
+    create_probe_connector_capabilities_probes_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProbeCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionCreated"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

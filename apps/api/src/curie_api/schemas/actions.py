@@ -72,34 +72,26 @@ class ActionOut(BaseModel):
 class ActionUndo(BaseModel):
     """A request to put back what an action changed.
 
-    ``observed_state`` is the resource as it looks NOW, read by whoever will
-    perform the restore. The platform cannot read it itself -- nothing here can
-    reach a connector -- and it will not assume: an absent observation is refused
-    rather than treated as "unchanged".
+    @spec ACTION-EXECUTOR-3: the platform observes the live version itself
+    through the pinned connector (ACTION-EXECUTOR-15), so a caller-supplied
+    observation is no longer evidence. An ``observed_state`` sent by an older
+    caller is ignored as an unknown field, never compared.
     """
 
     actor: str
     actor_channel: str | None = None
-    observed_state: dict[str, Any] | None = None
-
-
-class ActionRestore(BaseModel):
-    """The call an authorized undo permits: put this state back on that target."""
-
-    target: dict[str, Any]
-    prior_state: dict[str, Any]
 
 
 class ActionUndoOut(BaseModel):
-    """An authorization, not a receipt.
+    """A requested restore, not a receipt and not the call to make.
 
-    The API rules and returns; something else performs the restore (ADR-0117
-    leaves where that executor lives undecided). So this names the call to make
-    rather than claiming it was made.
+    @spec ACTION-EXECUTOR-3: the ruling answers with the execution it created
+    and that execution's state. It never carries the ``target``, the sealed
+    ``prior_state`` or a version; the receipt is the execution's own read.
     """
 
-    action: ActionOut
-    restore: ActionRestore
+    execution_id: uuid.UUID
+    state: str
 
 
 class ActionAuditOut(BaseModel):

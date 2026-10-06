@@ -12,12 +12,13 @@ second one matters more than it looks: the prior state on a record is what a
 restore replays, so a completion allowed to rewrite it moves the target of an
 undo that has already been offered to a human.
 
-Ruling on an undo IS here, and executing one is not. Nothing in the platform can
-reach a connector, so this decides whether a restore is permitted and hands back
-the call to make. Keeping the ruling and the execution apart is what makes
-deferring the executor safe: a refusal is recorded and returned before anything
-could act on it, so whichever executor lands cannot bypass the check by holding
-the connector's address.
+Ruling on an undo is here, and executing one is the action executor's
+(ACTION-EXECUTOR-3). A granted ruling writes a ``requested`` restore execution
+and its ``authorized`` audit row in one transaction and returns the
+execution's id; it never hands back the ``target`` or the sealed snapshot, and
+never marks the action undone. The executor observes the live version through
+the pinned connector and reports through ``routers/action_executions.py``,
+which writes ``undone_at`` only when the restore is confirmed.
 """
 
 import logging
@@ -28,6 +29,7 @@ from typing import Annotated, NoReturn
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.crud import actions as crud_actions
 from curie_api.crud import approvals as crud_approvals
@@ -36,7 +38,6 @@ from curie_api.schemas.actions import (
     ActionComplete,
     ActionOut,
     ActionRecord,
-    ActionRestore,
     ActionUndo,
     ActionUndoOut,
 )
@@ -45,7 +46,15 @@ from ..action_undoable import undo_refusal, undoable_action_ids
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, SessionDep, StoreDep, get_store
-from ..models import ActionAuditEntry, ActionStatus, AgentAction, Approval
+from ..models import (
+    ActionAuditEntry,
+    ActionExecution,
+    ActionStatus,
+    AgentAction,
+    Approval,
+    ExecutionKind,
+    ExecutionState,
+)
 from ..storage import BundleStore, ObjectStore
 
 logger = logging.getLogger(__name__)
@@ -229,8 +238,8 @@ async def _authorize_undo(
 
 
 async def _refuse(
-    session: SessionDep,
-    action: AgentAction,
+    session: AsyncSession,
+    action_id: uuid.UUID,
     data: ActionUndo,
     *,
     kind: str,
@@ -248,7 +257,7 @@ async def _refuse(
 
     session.add(
         ActionAuditEntry(
-            action_id=action.id,
+            action_id=action_id,
             action=kind,
             actor=data.actor,
             actor_channel=data.actor_channel,
@@ -265,7 +274,12 @@ async def _refuse(
     raise HTTPException(code, reason)
 
 
-@router.post("/{action_id}/undo", response_model=ActionUndoOut)
+_EXECUTOR_DISABLED_REASON = "the action executor is not enabled on this installation"
+
+
+@router.post(
+    "/{action_id}/undo", response_model=ActionUndoOut, status_code=status.HTTP_202_ACCEPTED
+)
 async def undo_action(
     action_id: uuid.UUID,
     data: ActionUndo,
@@ -273,17 +287,22 @@ async def undo_action(
     approver_sets: ApproverSetSelectorDep,
     store: _RulingStoreDep = None,
 ) -> ActionUndoOut:
-    """Rule on putting back what this action changed.
+    """Rule on putting back what this action changed, and request the restore.
 
-    A 200 authorizes a restore and names the call that performs it; every other
-    outcome is a refusal that changed nothing. The refusals are ordered from the
-    record's own state outward to the world, so the most specific true reason is
-    the one the operator is told.
+    @spec ACTION-EXECUTOR-3. A 202 means a ``requested`` restore execution and
+    its ``authorized`` audit row were written together; every other outcome is
+    a refusal that wrote one audit row and no execution. The refusals are
+    ordered from the record's own state outward, so the most specific true
+    reason is the one the operator is told.
 
     Authorization runs first, before any of the record's own state is examined:
     whether an actor may undo at all precedes whether this particular undo is
-    safe, and it keeps a refused actor from learning the resource's state through
-    a conflict message.
+    possible, and it keeps a refused actor from learning anything about the
+    record, its versions included.
+
+    The caller no longer supplies the live state: the executor observes the
+    version through the pinned connector and the API compares it before any
+    write (ACTION-EXECUTOR-15).
     """
 
     action = await crud_actions.get_action(session, action_id)
@@ -294,7 +313,7 @@ async def undo_action(
     if not allowed:
         await _refuse(
             session,
-            action,
+            action.id,
             data,
             kind="refused_unauthorized",
             reason=reason or "not authorized to undo this action",
@@ -305,7 +324,7 @@ async def undo_action(
     if action.undone_at is not None:
         await _refuse(
             session,
-            action,
+            action.id,
             data,
             kind="refused_already_undone",
             reason="this action was already undone",
@@ -314,7 +333,7 @@ async def undo_action(
     if action.status != ActionStatus.succeeded:
         await _refuse(
             session,
-            action,
+            action.id,
             data,
             kind="refused_unsuccessful",
             reason=(
@@ -324,8 +343,8 @@ async def undo_action(
             code=status.HTTP_409_CONFLICT,
         )
     # @spec ACTION-EXECUTOR-11: the ruling follows the derived ``undoable``. A
-    # record missing any ingredient is refused with that ingredient's code,
-    # before any granted-undo audit row could be written.
+    # record missing any ingredient, or holding a live restore, is refused with
+    # that code before any granted-undo audit row could be written.
     code = await undo_refusal(session, store or BundleStore(get_settings()), action)
     if code is not None:
         reason = _INGREDIENT_REASONS.get(code, "this action cannot be undone")
@@ -334,77 +353,76 @@ async def undo_action(
             # refusal state the same sentence.
             reason = action.detail
         await _refuse(
-            session, action, data, kind=code, reason=reason, code=status.HTTP_409_CONFLICT
+            session, action.id, data, kind=code, reason=reason, code=status.HTTP_409_CONFLICT
         )
-    if data.observed_state is None:
-        # Not an assumption of "unchanged". The platform cannot read the resource
-        # itself, and a restore performed without looking is the blind restore
-        # decision 4 exists to prevent.
+    # @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-20: the last ruling check.
+    # Off, an undo that would authorize a restore is refused with 503, one
+    # audit row and no execution.
+    if not get_settings().action_executor_enabled:
         await _refuse(
             session,
-            action,
+            action.id,
             data,
-            kind="refused_unobserved",
-            reason="refusing to restore without the live state to compare against",
-            code=status.HTTP_412_PRECONDITION_FAILED,
-        )
-    if action.post_state is None:
-        await _refuse(
-            session,
-            action,
-            data,
-            kind="refused_uncomparable",
-            reason=(
-                "this call never reported what it left, so whether the world has moved "
-                "since cannot be determined"
-            ),
-            code=status.HTTP_409_CONFLICT,
-        )
-    if data.observed_state != action.post_state:
-        # The rule the feature lives on. Naming both states matters as much as
-        # refusing: the operator has to see that their own fix is what stopped
-        # this, rather than reading it as a platform malfunction.
-        await _refuse(
-            session,
-            action,
-            data,
-            kind="refused_conflict",
-            reason="the target changed after this action; refusing to restore over it",
-            code=status.HTTP_409_CONFLICT,
-            evidence={"left": action.post_state, "observed": data.observed_state},
+            kind="executor_disabled",
+            reason=_EXECUTOR_DISABLED_REASON,
+            code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
-    assert action.target is not None and action.prior_state is not None  # narrowed above
-    claimed = await crud_actions.claim_action_undo(session, action, actor=data.actor)
-    if claimed is None:
-        await _refuse(
-            session,
-            action,
-            data,
-            kind="refused_already_undone",
-            reason="this action was already undone",
-            code=status.HTTP_409_CONFLICT,
-        )
+    # Narrowed by ``undo_refusal``: a record with every ingredient has an
+    # agent, a sealed envelope, a version, a connector and its digest.
+    assert action.agent_id is not None and action.prior_state is not None
+    assert action.connector is not None and action.connector_digest is not None
+    subject_id = action.id
+    audit_id = uuid.uuid4()
+    execution_id = uuid.uuid4()
+    execution = ActionExecution(
+        id=execution_id,
+        kind=ExecutionKind.restore.value,
+        agent_id=action.agent_id,
+        connector=action.connector,
+        tool="restore",
+        subject_action_id=subject_id,
+        connector_digest=action.connector_digest,
+        authority_kind="undo_ruling",
+        authority_ref=str(audit_id),
+        requested_by=data.actor,
+        # @spec ACTION-EXECUTOR-2: keyed by the authorizing audit row.
+        idempotency_key=f"restore:{subject_id}:{audit_id}",
+        state=ExecutionState.requested.value,
+        attempt=0,
+    )
+    session.add(execution)
     session.add(
         ActionAuditEntry(
-            action_id=action.id,
+            id=audit_id,
+            action_id=subject_id,
             action="authorized",
             actor=data.actor,
             actor_channel=data.actor_channel,
             authorizer=authorizer,
             authorized=True,
-            # Never the envelope or a state (ACTION-EXECUTOR-11): the key
-            # identifier and the recorded version only.
-            evidence={"kid": action.prior_state.get("kid"), "version": action.post_version},
+            # @spec ACTION-EXECUTOR-3: the execution id, the key identifier and
+            # the recorded version only; never the envelope or a state.
+            evidence={
+                "execution_id": str(execution_id),
+                "kid": action.prior_state.get("kid"),
+                "version": action.post_version,
+            },
             created_at=func.clock_timestamp(),
         )
     )
-    await session.commit()
-    await session.refresh(claimed)
-    return ActionUndoOut(
-        # The claim just set ``undone_at``, which the record half of the
-        # derivation refuses before reading anything else, so the full
-        # derivation answers False here by construction (ACTION-EXECUTOR-11).
-        action=_out(claimed, undoable=False),
-        restore=ActionRestore(target=action.target, prior_state=action.prior_state),
-    )
+    try:
+        await session.commit()
+    except IntegrityError:
+        # A concurrent ruling won the partial unique index on live restores
+        # (ACTION-EXECUTOR-2): turn the loss into an audited refusal.
+        await session.rollback()
+        await _refuse(
+            session,
+            subject_id,
+            data,
+            kind="refused_restore_in_flight",
+            reason=_INGREDIENT_REASONS["refused_restore_in_flight"],
+            code=status.HTTP_409_CONFLICT,
+        )
+    return ActionUndoOut(execution_id=execution_id, state=ExecutionState.requested.value)
