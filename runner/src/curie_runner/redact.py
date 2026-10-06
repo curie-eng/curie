@@ -362,6 +362,16 @@ class OutboundRedactor:
             return any(self._held(key) or self._held(item) for key, item in value.items())
         return False
 
+    def _held_in_bytes(self, data: bytes) -> bool:
+        """True when a held literal (raw or base64 form) occurs in ``data``.
+
+        @spec ACTION-EXECUTOR-10: the decoded ciphertext of a valid envelope, so
+        a plaintext secret that is merely base64-wrapped never crosses. Real
+        ciphertext is random bytes and does not contain a held value.
+        """
+
+        return any(secret.encode("utf-8") in data for secret in self._secrets)
+
     def _side_effect_result(self, result: dict[str, object]) -> tuple[dict[str, object], bool]:
         """Scrub a ``side_effect_flag`` result; replay inputs verbatim or withheld.
 
@@ -369,7 +379,8 @@ class OutboundRedactor:
         validates as a sealed envelope, ``version`` and ``target``. They are
         never altered: pattern rules skip a valid envelope's ciphertext but run
         over its ``kid``, ``version`` and ``target``; the held literal check runs
-        over all of them, ciphertext included. Any match withholds all three
+        over all of them, ciphertext included, and over the decoded ciphertext
+        bytes. Any match withholds all three
         (set to null). Every other field keeps the ordinary scrubbing. Returns
         the result and whether anything in it was replaced or withheld, which
         is the frozen meaning of ``redacted``.
@@ -385,6 +396,7 @@ class OutboundRedactor:
                 withhold
                 or self._matches(envelope["kid"])
                 or self._held(envelope["ciphertext"])
+                or self._held_in_bytes(base64.b64decode(cast("str", envelope["ciphertext"])))
             )
         others = {key: value for key, value in result.items() if key not in replay}
         scrubbed_others = cast("dict[str, object]", self._content(others))

@@ -32,8 +32,8 @@ redefine them.
 
 ## Current contract
 
-A second implementation is an **ACI server**, an HTTP process serving eight authenticated
-control routes. The eight POST endpoints (`runner/src/curie_runner/server.py`, seven every
+A second implementation is an **ACI server**, an HTTP process serving eight required authenticated
+control routes (seven POSTs and `GET /v1/status`) plus one optional executor route. The eight POST endpoints (`runner/src/curie_runner/server.py`, seven every
 server serves plus one optional executor route): `POST /v1/event` opens a
 turn, `POST /v1/steer` injects into the live turn (409 if none running),
 `POST /v1/interrupt` hard-stops it, `POST /v1/reset` discards the conversation so the

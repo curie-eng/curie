@@ -10,11 +10,15 @@ executor loop in three phases, each over its own standalone MCP session:
 * ``observe``: one call of the read verb ``observe_version`` with
   ``{"target": <target>}``; returns its ``version`` string, or null.
 * ``call``: exactly one ``tools/call`` of ``tool`` with the canonical argument
-  text and the grant header, after the preflight.
+  text and the grant header, after the preflight. A call refused by preflight
+  still spends the sandbox's one call; a connector without a URL, which the
+  grant cannot ride to, is refused ``connector_not_hosted``. ``list`` stops past
+  ``LIST_PAGE_LIMIT`` pages and a result past ``CALL_RESULT_MAX_BYTES`` is an
+  error, neither retried.
 
 Within one sandbox the only accepted orders are ``list``, ``list`` then
-``observe`` then ``call``, and ``list`` then ``call``; a restore needs the
-``observe`` before it. Every refusal is decided before any write is dialed.
+``observe`` then a restore ``call``, and ``list`` then a forward ``call``.
+Every refusal is decided before any write is dialed.
 The worker's client and every shape here are frozen in
 ``tests/vectors/runner-execute.json``. Nothing here emits an ACI frame or logs
 an argument, envelope, version or result.
@@ -52,6 +56,9 @@ _SCHEMA_TOOLS = (RESTORE_TOOL, OBSERVE_TOOL)
 _DIAL_TIMEOUT_SECONDS = 15.0
 # The write call's own bound. Past it the outcome is unknown, never refused.
 _CALL_TIMEOUT_SECONDS = 60.0
+# Bounds (runner-execute.json ``bounds``): past either, no retry.
+LIST_PAGE_LIMIT = 100
+CALL_RESULT_MAX_BYTES = 1048576
 
 # Route refusals and their HTTP status (runner-execute.json ``refusals``).
 _STATUS = {
@@ -61,9 +68,14 @@ _STATUS = {
     "restore_not_advertised": 409,
     "restore_schema_mismatch": 409,
     "arguments_mismatch": 409,
+    "connector_not_hosted": 409,
     "connector_unreachable": 502,
     "call_outcome_unknown": 502,
 }
+
+
+class _ListTooLong(Exception):
+    """The connector's tool list spans more than ``LIST_PAGE_LIMIT`` pages."""
 
 
 class ExecuteRefusal(Exception):
@@ -229,10 +241,12 @@ class Executor:
             accepted = not done
         elif request.phase == "observe":
             accepted = done == ["list"]
+        elif request.tool == RESTORE_TOOL:
+            # A restore always follows the version observation.
+            accepted = done == ["list", "observe"]
         else:
-            accepted = done == ["list", "observe"] or (
-                done == ["list"] and request.tool != RESTORE_TOOL
-            )
+            # A forward tool is ``list`` then ``call``; it never follows ``observe``.
+            accepted = done == ["list"]
         if not accepted:
             raise ExecuteRefusal("phase_out_of_order")
         if request.phase != "list" and (
@@ -267,7 +281,11 @@ class Executor:
                     ) as session:
                         await session.initialize()
                         cursor: str | None = None
+                        pages = 0
                         while True:
+                            if pages >= LIST_PAGE_LIMIT:
+                                raise _ListTooLong
+                            pages += 1
                             result = await session.list_tools(
                                 params=PaginatedRequestParams(cursor=cursor)
                             )
@@ -321,6 +339,9 @@ class Executor:
 
     async def _call(self, request: _Request) -> dict[str, Any]:
         assert request.tool is not None and request.arguments is not None
+        # The sandbox's one call is spent by any call that passed ordering, a
+        # preflight refusal included, so no later call can dial.
+        self._done.append("call")
         if request.tool == RESTORE_TOOL:
             refusal = restore_refusal(self._tools)
             if refusal is not None:
@@ -330,9 +351,12 @@ class Executor:
         arguments = canonical_arguments(request.arguments)
         if arguments is None:
             raise ExecuteRefusal("arguments_mismatch")
+        config = self._config(request.connector)
+        if not isinstance(config.get("url"), str) or not config.get("url"):
+            # The grant header rides only to a URL connector; never dial a write
+            # the caller proxy cannot verify.
+            raise ExecuteRefusal("connector_not_hosted")
         config = self._config(request.connector, request.grant)
-        # Spent before dialing: whatever happens next, no second call follows.
-        self._done.append("call")
         try:
             with anyio.fail_after(_CALL_TIMEOUT_SECONDS):
                 result = await self._dial_call(config, request.tool, arguments)
@@ -345,6 +369,15 @@ class Executor:
             raise ExecuteRefusal("call_outcome_unknown") from exc
         if not isinstance(result, CallToolResult):
             raise ExecuteRefusal("call_outcome_unknown")
+        size = len(result.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
+        if size > CALL_RESULT_MAX_BYTES:
+            # The write landed once; an oversized result is an error, never retried.
+            logger.warning(
+                "execute call result over bound connector=%s bytes=%d",
+                request.connector,
+                size,
+            )
+            return {"phase": "call", "is_error": True, "structured": None}
         structured = result.structured_content
         return {
             "phase": "call",
