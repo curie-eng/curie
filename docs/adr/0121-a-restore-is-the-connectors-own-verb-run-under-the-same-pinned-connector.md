@@ -121,10 +121,11 @@ and the code, not the container.
    must also advertise `restore`, or it advertises no restore at all and is
    treated as restoring nothing.** Both halves are inspectable before deploy
    from the advertised tool list, and neither is a claim about a specific
-   action. No gate reads MCP `readOnlyHint` today: the runtime gate in
-   `runner/src/curie_runner/side_effects.py` classifies by a harness-declared
-   read-only tool-name allowlist, deny by default, so the deploy-time check
-   this decision needs is new work, not an existing gate.
+   action. The runner already reads `readOnlyHint` at boot
+   (`runner/src/curie_runner/mcp_tool_capability.py`) to build the read-only
+   tool set that receipts, retry safety and read-only turns use; that is a
+   runtime hint, not an authorization decision. No deploy-time check of restore
+   capability exists yet, so the check this decision needs is new work.
 
    This is not the manifest ADR-0117 rejected. That rejection was of a
    declaration that an action *is reversible*, because it could disagree with
