@@ -38,7 +38,7 @@ from ..action_execution_codes import (
     CodeRejected,
     outcome_code,
 )
-from ..auth import require_platform_key
+from ..auth import require_internal_worker_token, require_platform_key
 from ..config import get_settings
 from ..deps import SessionDep
 from ..models import (
@@ -60,12 +60,21 @@ from ..schemas.action_executions import (
     ProbeCreate,
 )
 
+# Route decisions: the writing routes take the internal worker token, never
+# the platform or operator key, so a key holder cannot forge a confirmed
+# restore or a ``restore_capable`` row. The receipt stays on the platform key
+# for the operator CLI (ACTION-EXECUTOR-23).
 probe_router = APIRouter(
     prefix="/connector-capabilities",
     tags=["action-executions"],
-    dependencies=[Depends(require_platform_key)],
+    dependencies=[Depends(require_internal_worker_token)],
 )
 router = APIRouter(
+    prefix="/action-executions",
+    tags=["action-executions"],
+    dependencies=[Depends(require_internal_worker_token)],
+)
+receipt_router = APIRouter(
     prefix="/action-executions",
     tags=["action-executions"],
     dependencies=[Depends(require_platform_key)],
@@ -164,18 +173,30 @@ def _audit(
     )
 
 
+_CLOSING_REASONS = {
+    ExecutionState.confirmed: "the connector confirmed the restore",
+    ExecutionState.failed: "the restore failed",
+    ExecutionState.indeterminate: "the restore may or may not have been applied",
+    ExecutionState.refused: "the restore was refused before any write",
+}
+
+
 def _finish(
     session: AsyncSession,
     execution: ActionExecution,
     state: ExecutionState,
     code: str | None,
     now: datetime,
+    *,
+    versions: dict[str, str | None] | None = None,
 ) -> None:
-    """End ``execution`` in ``state`` and write what the ledger owes for it.
+    """End ``execution`` in ``state`` and write its one closing audit row.
 
-    @spec ACTION-EXECUTOR-18: a confirmed restore appends ``confirmed``; a
-    failed or indeterminate one appends its code. ``undone_at`` is written by
-    ``_confirm_restore`` only, never here.
+    @spec ACTION-EXECUTOR-18 and the route decisions: every terminal restore
+    outcome writes one closing row on its action naming its state and code,
+    with versions only (the conflict refusal names both). A confirmed restore's
+    row is ``confirmed``; a version conflict's is ``refused_conflict``.
+    ``undone_at`` is written by ``_confirm_restore`` only, never here.
     """
 
     execution.state = state
@@ -186,16 +207,22 @@ def _finish(
         execution.failure_code = code
     if execution.kind != ExecutionKind.restore:
         return
-    if state in (ExecutionState.failed, ExecutionState.indeterminate):
-        session.add(
-            _audit(
-                execution,
-                kind=state.value,
-                authorized=False,
-                reason=f"the restore ended {state.value} ({code})",
-                evidence={"code": code},
-            )
+    kind = state.value
+    reason = _CLOSING_REASONS[state]
+    if state == ExecutionState.refused and code == "version_conflict":
+        # Naming both versions is the point: the operator has to see that
+        # their own change is what stopped the restore.
+        kind = "refused_conflict"
+        reason = "the target changed after this action; refusing to restore over it"
+    session.add(
+        _audit(
+            execution,
+            kind=kind,
+            authorized=state == ExecutionState.confirmed,
+            reason=reason if code is None else f"{reason} ({code})",
+            evidence={"state": state.value, "code": code, **(versions or {})},
         )
+    )
 
 
 async def _confirm_restore(
@@ -216,20 +243,25 @@ async def _confirm_restore(
         )
         .execution_options(synchronize_session=False)
     )
-    session.add(
-        _audit(
-            execution,
-            kind="confirmed",
-            authorized=True,
-            reason="the connector confirmed the restore",
-            evidence={},
-        )
-    )
 
 
 # --------------------------------------------------------------------------- #
 # The probe producer (ACTION-EXECUTOR-1, -13)
 # --------------------------------------------------------------------------- #
+
+
+# Route decisions: a probe in one of these states is adopted by a later
+# request for the same agent, connector and digest. A ``refused`` or
+# ``failed`` probe is not: it recorded no capability, so blocking a new probe
+# would leave the digest not restore capable for good.
+_ADOPTED_PROBE_STATES = frozenset(
+    {
+        ExecutionState.requested,
+        ExecutionState.claimed,
+        ExecutionState.dispatched,
+        ExecutionState.confirmed,
+    }
+)
 
 
 @probe_router.post("/probes", response_model=ExecutionCreated, status_code=status.HTTP_201_CREATED)
@@ -238,46 +270,61 @@ async def create_probe(
 ) -> ExecutionCreated:
     """Request a capability probe of one connector image for one agent.
 
-    @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13. Keyed
-    ``probe:<agent>:<connector>:<digest>``, so a replay adopts the agent's
-    existing probe (``200``) rather than creating a second.
+    @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13 and the route decisions.
+    The first probe is keyed ``probe:<agent>:<connector>:<digest>``; a request
+    while the latest probe is pending or confirmed adopts it (``200``). After a
+    probe that ended ``refused`` or ``failed``, the next one is a new execution
+    whose key carries the next probe attempt number (``...:<digest>:2`` and
+    so on). A probe's ``authority_ref`` is its key: the body is exactly three
+    keys, so no reconcile pass id can reach it.
     """
 
     if await session.get(Agent, data.agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
-    key = f"probe:{data.agent_id}:{data.connector}:{data.digest}"
-    created = await session.scalar(
-        insert(ActionExecution)
-        .values(
-            id=uuid.uuid4(),
-            kind=ExecutionKind.probe.value,
-            agent_id=data.agent_id,
-            connector=data.connector,
-            tool=None,
-            connector_digest=data.digest,
-            authority_kind="capability_probe",
-            # The body carries no reconcile pass id (it is exactly three
-            # keys), so the authority reference is the probe's own key.
-            authority_ref=key,
-            idempotency_key=key,
-            state=ExecutionState.requested.value,
-            attempt=0,
-        )
-        .on_conflict_do_nothing(constraint="uq_action_executions_agent_idempotency_key")
-        .returning(ActionExecution.id)
+    base = f"probe:{data.agent_id}:{data.connector}:{data.digest}"
+    same_triple = (
+        ActionExecution.agent_id == data.agent_id,
+        ActionExecution.kind == ExecutionKind.probe,
+        or_(
+            ActionExecution.idempotency_key == base,
+            ActionExecution.idempotency_key.startswith(f"{base}:", autoescape=True),
+        ),
     )
-    await session.commit()
-    if created is None:
-        response.status_code = status.HTTP_200_OK
-        existing = await session.scalar(
-            select(ActionExecution).where(
-                ActionExecution.agent_id == data.agent_id,
-                ActionExecution.idempotency_key == key,
+    while True:
+        earlier = (
+            await session.scalars(
+                select(ActionExecution)
+                .where(*same_triple)
+                .order_by(ActionExecution.created_at.desc(), ActionExecution.id.desc())
             )
+        ).all()
+        if earlier and earlier[0].state in _ADOPTED_PROBE_STATES:
+            await session.commit()
+            response.status_code = status.HTTP_200_OK
+            return ExecutionCreated(execution_id=earlier[0].id, state=earlier[0].state)
+        key = base if not earlier else f"{base}:{len(earlier) + 1}"
+        created = await session.scalar(
+            insert(ActionExecution)
+            .values(
+                id=uuid.uuid4(),
+                kind=ExecutionKind.probe.value,
+                agent_id=data.agent_id,
+                connector=data.connector,
+                tool=None,
+                connector_digest=data.digest,
+                authority_kind="capability_probe",
+                authority_ref=key,
+                idempotency_key=key,
+                state=ExecutionState.requested.value,
+                attempt=0,
+            )
+            .on_conflict_do_nothing(constraint="uq_action_executions_agent_idempotency_key")
+            .returning(ActionExecution.id)
         )
-        assert existing is not None
-        return ExecutionCreated(execution_id=existing.id, state=existing.state)
-    return ExecutionCreated(execution_id=created, state=ExecutionState.requested.value)
+        await session.commit()
+        if created is not None:
+            return ExecutionCreated(execution_id=created, state=ExecutionState.requested.value)
+        # A concurrent request took this key first: read again and adopt it.
 
 
 # --------------------------------------------------------------------------- #
@@ -356,7 +403,7 @@ async def claim_execution(data: ExecutionClaim, session: SessionDep) -> Any:
         return _out(execution)
 
 
-@router.get("/{execution_id}", response_model=ExecutionOut)
+@receipt_router.get("/{execution_id}", response_model=ExecutionOut)
 async def get_execution(execution_id: uuid.UUID, session: SessionDep) -> ExecutionOut:
     """@spec ACTION-EXECUTOR-18: the execution's receipt."""
 
@@ -394,10 +441,13 @@ async def record_observation(
     if execution.kind != ExecutionKind.restore:
         raise _conflict("only a restore observes a version")
     seen, version = _observed(execution)
+    # Security review F6: a malformed version is stored and audited at most at
+    # the sealed version bound, never at whatever length the connector sent.
+    observed = data.version[:_MAX_VERSION] if data.version is not None else None
     if seen:
         # A replay of the same observation answers the row unchanged, whether
         # it was equal or a conflict; another version is a conflicting report.
-        if version != data.version:
+        if version != observed:
             raise _conflict("a different version was already observed")
         return _out(execution)
     if execution.state != ExecutionState.claimed:
@@ -405,23 +455,14 @@ async def record_observation(
 
     action = await session.get(AgentAction, execution.subject_action_id)
     recorded = action.post_version if action is not None else None
-    observed = data.version
-    valid = bool(observed) and len(observed or "") <= _MAX_VERSION
+    valid = bool(data.version) and len(data.version or "") <= _MAX_VERSION
     if valid and recorded and observed == recorded:
         execution.outcome = {"observed_version": observed}
     else:
-        execution.outcome = {"observed_version": observed, "recorded_version": recorded}
-        _finish(session, execution, ExecutionState.refused, "version_conflict", now)
-        # Naming both versions is the point: the operator has to see that
-        # their own change is what stopped the restore.
-        session.add(
-            _audit(
-                execution,
-                kind="refused_conflict",
-                authorized=False,
-                reason="the target changed after this action; refusing to restore over it",
-                evidence={"recorded_version": recorded, "observed_version": observed},
-            )
+        versions = {"recorded_version": recorded, "observed_version": observed}
+        execution.outcome = dict(versions)
+        _finish(
+            session, execution, ExecutionState.refused, "version_conflict", now, versions=versions
         )
     await session.commit()
     await session.refresh(execution)
@@ -449,6 +490,12 @@ async def dispatch_execution(
     execution = await _locked(session, execution_id)
     now = await _now(session)
     _check_fence(execution, data, now)
+    # Route decisions: the setting stops a lease already held, not only new
+    # claims, so nothing enters ``dispatched`` while the executor is off.
+    if not get_settings().action_executor_enabled:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "the action executor is not enabled"
+        )
     if execution.state == ExecutionState.dispatched:
         return _out(execution)
     if execution.state != ExecutionState.claimed:

@@ -239,6 +239,10 @@ export interface paths {
          *     ordered from the record's own state outward, so the most specific true
          *     reason is the one the operator is told.
          *
+         *     The actor is ``principal``, authenticated as the approval resolver
+         *     authenticates one; a body ``actor`` is not authority, and one that differs
+         *     from the principal is refused before anything else is examined.
+         *
          *     Authorization runs first, before any of the record's own state is examined:
          *     whether an actor may undo at all precedes whether this particular undo is
          *     possible, and it keeps a refused actor from learning anything about the
@@ -1379,9 +1383,13 @@ export interface paths {
          * Create Probe
          * @description Request a capability probe of one connector image for one agent.
          *
-         *     @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13. Keyed
-         *     ``probe:<agent>:<connector>:<digest>``, so a replay adopts the agent's
-         *     existing probe (``200``) rather than creating a second.
+         *     @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13 and the route decisions.
+         *     The first probe is keyed ``probe:<agent>:<connector>:<digest>``; a request
+         *     while the latest probe is pending or confirmed adopts it (``200``). After a
+         *     probe that ended ``refused`` or ``failed``, the next one is a new execution
+         *     whose key carries the next probe attempt number (``...:<digest>:2`` and
+         *     so on). A probe's ``authority_ref`` is its key: the body is exactly three
+         *     keys, so no reconcile pass id can reach it.
          */
         post: operations["create_probe_connector_capabilities_probes_post"];
         delete?: never;
@@ -2859,16 +2867,17 @@ export interface components {
          * ActionUndo
          * @description A request to put back what an action changed.
          *
-         *     @spec ACTION-EXECUTOR-3: the platform observes the live version itself
-         *     through the pinned connector (ACTION-EXECUTOR-15), so a caller-supplied
-         *     observation is no longer evidence. An ``observed_state`` sent by an older
-         *     caller is ignored as an unknown field, never compared.
+         *     @spec ACTION-EXECUTOR-3: the actor is the authenticated principal, never
+         *     this body. ``actor`` is accepted only as a cross-check: one that differs
+         *     from the principal is refused. Channel evidence likewise comes from the
+         *     principal. The platform observes the live version itself through the
+         *     pinned connector (ACTION-EXECUTOR-15), so a caller-supplied observation is
+         *     no longer evidence; an ``observed_state`` sent by an older caller is
+         *     ignored as an unknown field, never compared.
          */
         ActionUndo: {
             /** Actor */
-            actor: string;
-            /** Actor Channel */
-            actor_channel?: string | null;
+            actor?: string | null;
         };
         /**
          * ActionUndoOut
@@ -7287,7 +7296,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                "x-api-key"?: string | null;
+                "X-Curie-Worker-Token"?: string | null;
             };
             path?: never;
             cookie?: never;
@@ -7362,7 +7371,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                "x-api-key"?: string | null;
+                "X-Curie-Worker-Token"?: string | null;
             };
             path: {
                 execution_id: string;
@@ -7399,7 +7408,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                "x-api-key"?: string | null;
+                "X-Curie-Worker-Token"?: string | null;
             };
             path: {
                 execution_id: string;
@@ -7436,7 +7445,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                "x-api-key"?: string | null;
+                "X-Curie-Worker-Token"?: string | null;
             };
             path: {
                 execution_id: string;
@@ -7646,12 +7655,16 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+                "X-Curie-Adapter-Principal"?: string | null;
+                "X-Curie-Approval-Actor"?: string | null;
             };
             path: {
                 action_id: string;
             };
-            cookie?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
         };
         requestBody: {
             content: {
@@ -10247,7 +10260,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                "x-api-key"?: string | null;
+                "X-Curie-Worker-Token"?: string | null;
             };
             path?: never;
             cookie?: never;

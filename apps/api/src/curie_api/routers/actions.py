@@ -21,12 +21,14 @@ the pinned connector and reports through ``routers/action_executions.py``,
 which writes ``undone_at`` only when the restore is confirmed.
 """
 
+import hashlib
+import json
 import logging
 import uuid
 from collections.abc import Sequence
 from typing import Annotated, NoReturn
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response, status
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,7 +45,15 @@ from curie_api.schemas.actions import (
 )
 
 from ..action_undoable import undo_refusal, undoable_action_ids
-from ..auth import require_api_key
+from ..approval_auth import (
+    ADAPTER_PRINCIPAL_HEADER,
+    APPROVAL_ACTOR_HEADER,
+    APPROVAL_PRINCIPAL_HEADER,
+    AuthenticatedApprovalPrincipal,
+    authenticate_principal,
+    principal_credentials_presented,
+)
+from ..auth import CONSOLE_SESSION_COOKIE, require_api_key
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, SessionDep, StoreDep, get_store
 from ..models import (
@@ -195,10 +205,10 @@ UNGATED = "ungated"
 async def _authorize_undo(
     session: SessionDep,
     action: AgentAction,
-    data: ActionUndo,
+    principal: AuthenticatedApprovalPrincipal,
     approver_sets: ApproverSetSelectorDep,
 ) -> tuple[str, bool, str]:
-    """Decide whether ``data.actor`` may undo ``action`` (ADR-0117 decision 3).
+    """Decide whether ``principal`` may undo ``action`` (ADR-0117 decision 3).
 
     Symmetry, in both directions. A call nobody had to approve is not gated on
     the way back: the state being restored is one the cluster was already in, and
@@ -206,12 +216,12 @@ async def _authorize_undo(
     authorizer of that same route, resolved against membership the way ADR-0034
     resolves an approver -- someone who could have permitted the change.
 
-    ADR-0106's authenticated-principal contract applies to approval resolution,
-    not this ADR-0117 action-undo seam. This path preserves ADR-0117's existing
-    approver-set check over ``data.actor`` and ``data.actor_channel`` and adds no
-    distinct-requester rule; adding one would demand MORE authorization than the
-    forward action needed, which decision 3 rules out in the same sentence that
-    requires the route.
+    @spec ACTION-EXECUTOR-3: a ruling now causes a real restore, so the actor
+    and its channel evidence are the authenticated ADR-0106 principal's, never a
+    body field. Membership is asked about that principal exactly as the approval
+    resolver asks it. No distinct-requester rule is added; one would demand MORE
+    authorization than the forward action needed, which decision 3 rules out in
+    the same sentence that requires the route.
     """
 
     if action.gate_approval_id is None:
@@ -225,7 +235,7 @@ async def _authorize_undo(
 
     binding = await crud_approvals.get_approval_route_binding(session, approval)
     approver_set = approver_sets(approval, binding)
-    verdict = await approver_set.contains(data.actor, data.actor_channel)
+    verdict = await approver_set.contains(principal.subject, principal.actor_channel)
     if verdict.undetermined:
         # `member` is meaningless here. Failing open would let an outage at the
         # membership provider authorize a write into a customer's cluster.
@@ -240,7 +250,7 @@ async def _authorize_undo(
 async def _refuse(
     session: AsyncSession,
     action_id: uuid.UUID,
-    data: ActionUndo,
+    principal: AuthenticatedApprovalPrincipal,
     *,
     kind: str,
     reason: str,
@@ -259,8 +269,8 @@ async def _refuse(
         ActionAuditEntry(
             action_id=action_id,
             action=kind,
-            actor=data.actor,
-            actor_channel=data.actor_channel,
+            actor=principal.subject,
+            actor_channel=principal.actor_channel,
             authorizer=authorizer,
             authorized=False,
             reason=reason,
@@ -276,8 +286,109 @@ async def _refuse(
 
 _EXECUTOR_DISABLED_REASON = "the action executor is not enabled on this installation"
 
+# @spec ACTION-EXECUTOR-3: the undo ruling is authenticated by an ADR-0106
+# principal, not by the platform key, so it lives on its own router without
+# the ``require_api_key`` dependency the ledger routes share.
+undo_router = APIRouter(prefix="/actions", tags=["actions"])
 
-@router.post(
+
+async def require_undo_principal(
+    action_id: uuid.UUID,
+    request: Request,
+    session: SessionDep,
+    x_curie_approval_principal: Annotated[
+        str | None, Header(alias=APPROVAL_PRINCIPAL_HEADER)
+    ] = None,
+    console_session: Annotated[str | None, Cookie(alias=CONSOLE_SESSION_COOKIE)] = None,
+    x_curie_adapter_principal: Annotated[str | None, Header(alias=ADAPTER_PRINCIPAL_HEADER)] = None,
+    x_curie_approval_actor: Annotated[str | None, Header(alias=APPROVAL_ACTOR_HEADER)] = None,
+) -> AuthenticatedApprovalPrincipal:
+    """The authenticated principal ruling an undo of ``action_id``.
+
+    @spec ACTION-EXECUTOR-3, the executor route decisions: the actor and its
+    channel evidence come from exactly one chat, console, operator or adapter
+    credential, authenticated by the approval resolver's own implementation.
+    A chat credential is bound to an approval, and here that is the approval
+    that gated the action, so an ungated action admits no chat credential. An
+    adapter may rule only on an action whose gating approval it serves, by the
+    resolver's predicate; anything else reads as a missing action.
+    """
+
+    principal_credentials_presented(
+        x_curie_approval_principal, console_session, x_curie_adapter_principal
+    )
+    action = await crud_actions.get_action(session, action_id)
+    if action is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "action not found")
+    gate_id = action.gate_approval_id
+    principal = await authenticate_principal(
+        approval_id=gate_id,
+        request=request,
+        session=session,
+        x_curie_approval_principal=x_curie_approval_principal,
+        console_session=console_session,
+        x_curie_adapter_principal=x_curie_adapter_principal,
+        x_curie_approval_actor=x_curie_approval_actor,
+    )
+    if principal.kind == "adapter":
+        approval = await session.get(Approval, gate_id) if gate_id is not None else None
+        if approval is None or not await crud_approvals.approval_served_by(
+            session, approval, principal.adapter_bindings
+        ):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "action not found")
+    return principal
+
+
+UndoPrincipalDep = Annotated[AuthenticatedApprovalPrincipal, Depends(require_undo_principal)]
+
+# @spec ACTION-EXECUTOR-2: what a uniqueness or key violation on the ruling's
+# commit means, by the constraint it names. Only the live restore index is a
+# restore in flight; any other name is re-raised rather than misreported.
+_COMMIT_REFUSALS = {
+    "uq_action_executions_live_restore": (
+        "refused_restore_in_flight",
+        _INGREDIENT_REASONS["refused_restore_in_flight"],
+    ),
+    "uq_action_executions_agent_idempotency_key": (
+        "refused_duplicate_ruling",
+        "an execution under this ruling's key already exists; rule again",
+    ),
+    "fk_action_executions_subject_agent": (
+        "refused_no_agent",
+        _INGREDIENT_REASONS["refused_no_agent"],
+    ),
+    "action_executions_agent_id_fkey": (
+        "refused_no_agent",
+        _INGREDIENT_REASONS["refused_no_agent"],
+    ),
+}
+
+
+def _violated_constraint(exc: IntegrityError) -> str | None:
+    return getattr(exc.orig.__cause__, "constraint_name", None) if exc.orig else None
+
+
+def restore_arguments_sha256(target: dict[str, object], prior_state: dict[str, object]) -> str:
+    """SHA-256 of the restore call's canonical argument bytes.
+
+    @spec ACTION-EXECUTOR-7, route decisions: the ruling is the restore's
+    creator, so it stores the digest of ``{"target", "prior_state"}`` in the
+    proxy's canonical form (sorted keys, ``,``/``:``, ``ensure_ascii=False``).
+    ``expected_version`` joins the call only when the connector's schema
+    declares it (ACTION-EXECUTOR-15), which the ruling cannot know; the worker
+    recomputes over these two keys before adding it.
+    """
+
+    text = json.dumps(
+        {"target": target, "prior_state": prior_state},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@undo_router.post(
     "/{action_id}/undo", response_model=ActionUndoOut, status_code=status.HTTP_202_ACCEPTED
 )
 async def undo_action(
@@ -285,6 +396,7 @@ async def undo_action(
     data: ActionUndo,
     session: SessionDep,
     approver_sets: ApproverSetSelectorDep,
+    principal: UndoPrincipalDep,
     store: _RulingStoreDep = None,
 ) -> ActionUndoOut:
     """Rule on putting back what this action changed, and request the restore.
@@ -294,6 +406,10 @@ async def undo_action(
     a refusal that wrote one audit row and no execution. The refusals are
     ordered from the record's own state outward, so the most specific true
     reason is the one the operator is told.
+
+    The actor is ``principal``, authenticated as the approval resolver
+    authenticates one; a body ``actor`` is not authority, and one that differs
+    from the principal is refused before anything else is examined.
 
     Authorization runs first, before any of the record's own state is examined:
     whether an actor may undo at all precedes whether this particular undo is
@@ -309,12 +425,23 @@ async def undo_action(
     if action is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "action not found")
 
-    authorizer, allowed, reason = await _authorize_undo(session, action, data, approver_sets)
+    if data.actor is not None and data.actor.strip() != principal.subject:
+        await _refuse(
+            session,
+            action.id,
+            principal,
+            kind="refused_actor_mismatch",
+            reason="the request names an actor other than the authenticated principal",
+            code=status.HTTP_403_FORBIDDEN,
+            authorizer="principal",
+        )
+
+    authorizer, allowed, reason = await _authorize_undo(session, action, principal, approver_sets)
     if not allowed:
         await _refuse(
             session,
             action.id,
-            data,
+            principal,
             kind="refused_unauthorized",
             reason=reason or "not authorized to undo this action",
             code=status.HTTP_403_FORBIDDEN,
@@ -325,7 +452,7 @@ async def undo_action(
         await _refuse(
             session,
             action.id,
-            data,
+            principal,
             kind="refused_already_undone",
             reason="this action was already undone",
             code=status.HTTP_409_CONFLICT,
@@ -334,7 +461,7 @@ async def undo_action(
         await _refuse(
             session,
             action.id,
-            data,
+            principal,
             kind="refused_unsuccessful",
             reason=(
                 f"the call did not succeed (status {action.status}), so there is nothing "
@@ -353,7 +480,7 @@ async def undo_action(
             # refusal state the same sentence.
             reason = action.detail
         await _refuse(
-            session, action.id, data, kind=code, reason=reason, code=status.HTTP_409_CONFLICT
+            session, action.id, principal, kind=code, reason=reason, code=status.HTTP_409_CONFLICT
         )
     # @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-20: the last ruling check.
     # Off, an undo that would authorize a restore is refused with 503, one
@@ -362,7 +489,7 @@ async def undo_action(
         await _refuse(
             session,
             action.id,
-            data,
+            principal,
             kind="executor_disabled",
             reason=_EXECUTOR_DISABLED_REASON,
             code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -372,6 +499,7 @@ async def undo_action(
     # agent, a sealed envelope, a version, a connector and its digest.
     assert action.agent_id is not None and action.prior_state is not None
     assert action.connector is not None and action.connector_digest is not None
+    assert action.target is not None
     subject_id = action.id
     audit_id = uuid.uuid4()
     execution_id = uuid.uuid4()
@@ -385,7 +513,8 @@ async def undo_action(
         connector_digest=action.connector_digest,
         authority_kind="undo_ruling",
         authority_ref=str(audit_id),
-        requested_by=data.actor,
+        requested_by=principal.subject,
+        arguments_sha256=restore_arguments_sha256(action.target, action.prior_state),
         # @spec ACTION-EXECUTOR-2: keyed by the authorizing audit row.
         idempotency_key=f"restore:{subject_id}:{audit_id}",
         state=ExecutionState.requested.value,
@@ -397,8 +526,8 @@ async def undo_action(
             id=audit_id,
             action_id=subject_id,
             action="authorized",
-            actor=data.actor,
-            actor_channel=data.actor_channel,
+            actor=principal.subject,
+            actor_channel=principal.actor_channel,
             authorizer=authorizer,
             authorized=True,
             # @spec ACTION-EXECUTOR-3: the execution id, the key identifier and
@@ -413,16 +542,22 @@ async def undo_action(
     )
     try:
         await session.commit()
-    except IntegrityError:
-        # A concurrent ruling won the partial unique index on live restores
-        # (ACTION-EXECUTOR-2): turn the loss into an audited refusal.
+    except IntegrityError as exc:
+        # Mapped by the constraint it names (route decisions): a concurrent
+        # ruling winning the live restore index is a restore in flight; any
+        # other named violation is its own refusal, and an unknown one is not
+        # dressed up as either.
         await session.rollback()
+        mapped = _COMMIT_REFUSALS.get(_violated_constraint(exc) or "")
+        if mapped is None:
+            raise
+        kind, reason = mapped
         await _refuse(
             session,
             subject_id,
-            data,
-            kind="refused_restore_in_flight",
-            reason=_INGREDIENT_REASONS["refused_restore_in_flight"],
+            principal,
+            kind=kind,
+            reason=reason,
             code=status.HTTP_409_CONFLICT,
         )
     return ActionUndoOut(execution_id=execution_id, state=ExecutionState.requested.value)

@@ -444,27 +444,21 @@
         "type": "object"
       },
       "ActionUndo": {
-        "description": "A request to put back what an action changed.\n\n@spec ACTION-EXECUTOR-3: the platform observes the live version itself\nthrough the pinned connector (ACTION-EXECUTOR-15), so a caller-supplied\nobservation is no longer evidence. An ``observed_state`` sent by an older\ncaller is ignored as an unknown field, never compared.",
+        "description": "A request to put back what an action changed.\n\n@spec ACTION-EXECUTOR-3: the actor is the authenticated principal, never\nthis body. ``actor`` is accepted only as a cross-check: one that differs\nfrom the principal is refused. Channel evidence likewise comes from the\nprincipal. The platform observes the live version itself through the\npinned connector (ACTION-EXECUTOR-15), so a caller-supplied observation is\nno longer evidence; an ``observed_state`` sent by an older caller is\nignored as an unknown field, never compared.",
         "properties": {
           "actor": {
-            "title": "Actor",
-            "type": "string"
-          },
-          "actor_channel": {
             "anyOf": [
               {
+                "maxLength": 256,
                 "type": "string"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Actor Channel"
+            "title": "Actor"
           }
         },
-        "required": [
-          "actor"
-        ],
         "title": "ActionUndo",
         "type": "object"
       },
@@ -10402,7 +10396,7 @@
         "parameters": [
           {
             "in": "header",
-            "name": "x-api-key",
+            "name": "X-Curie-Worker-Token",
             "required": false,
             "schema": {
               "anyOf": [
@@ -10413,7 +10407,7 @@
                   "type": "null"
                 }
               ],
-              "title": "X-Api-Key"
+              "title": "X-Curie-Worker-Token"
             }
           }
         ],
@@ -10535,7 +10529,7 @@
           },
           {
             "in": "header",
-            "name": "x-api-key",
+            "name": "X-Curie-Worker-Token",
             "required": false,
             "schema": {
               "anyOf": [
@@ -10546,7 +10540,7 @@
                   "type": "null"
                 }
               ],
-              "title": "X-Api-Key"
+              "title": "X-Curie-Worker-Token"
             }
           }
         ],
@@ -10605,7 +10599,7 @@
           },
           {
             "in": "header",
-            "name": "x-api-key",
+            "name": "X-Curie-Worker-Token",
             "required": false,
             "schema": {
               "anyOf": [
@@ -10616,7 +10610,7 @@
                   "type": "null"
                 }
               ],
-              "title": "X-Api-Key"
+              "title": "X-Curie-Worker-Token"
             }
           }
         ],
@@ -10675,7 +10669,7 @@
           },
           {
             "in": "header",
-            "name": "x-api-key",
+            "name": "X-Curie-Worker-Token",
             "required": false,
             "schema": {
               "anyOf": [
@@ -10686,7 +10680,7 @@
                   "type": "null"
                 }
               ],
-              "title": "X-Api-Key"
+              "title": "X-Curie-Worker-Token"
             }
           }
         ],
@@ -11078,7 +11072,7 @@
     },
     "/actions/{action_id}/undo": {
       "post": {
-        "description": "Rule on putting back what this action changed, and request the restore.\n\n@spec ACTION-EXECUTOR-3. A 202 means a ``requested`` restore execution and\nits ``authorized`` audit row were written together; every other outcome is\na refusal that wrote one audit row and no execution. The refusals are\nordered from the record's own state outward, so the most specific true\nreason is the one the operator is told.\n\nAuthorization runs first, before any of the record's own state is examined:\nwhether an actor may undo at all precedes whether this particular undo is\npossible, and it keeps a refused actor from learning anything about the\nrecord, its versions included.\n\nThe caller no longer supplies the live state: the executor observes the\nversion through the pinned connector and the API compares it before any\nwrite (ACTION-EXECUTOR-15).",
+        "description": "Rule on putting back what this action changed, and request the restore.\n\n@spec ACTION-EXECUTOR-3. A 202 means a ``requested`` restore execution and\nits ``authorized`` audit row were written together; every other outcome is\na refusal that wrote one audit row and no execution. The refusals are\nordered from the record's own state outward, so the most specific true\nreason is the one the operator is told.\n\nThe actor is ``principal``, authenticated as the approval resolver\nauthenticates one; a body ``actor`` is not authority, and one that differs\nfrom the principal is refused before anything else is examined.\n\nAuthorization runs first, before any of the record's own state is examined:\nwhether an actor may undo at all precedes whether this particular undo is\npossible, and it keeps a refused actor from learning anything about the\nrecord, its versions included.\n\nThe caller no longer supplies the live state: the executor observes the\nversion through the pinned connector and the API compares it before any\nwrite (ACTION-EXECUTOR-15).",
         "operationId": "undo_action_actions__action_id__undo_post",
         "parameters": [
           {
@@ -11093,7 +11087,7 @@
           },
           {
             "in": "header",
-            "name": "x-api-key",
+            "name": "X-Curie-Approval-Principal",
             "required": false,
             "schema": {
               "anyOf": [
@@ -11104,7 +11098,55 @@
                   "type": "null"
                 }
               ],
-              "title": "X-Api-Key"
+              "title": "X-Curie-Approval-Principal"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Adapter-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Adapter-Principal"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Actor"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "__Host-curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "  Host-Curie Console Session"
             }
           }
         ],
@@ -16250,12 +16292,12 @@
     },
     "/connector-capabilities/probes": {
       "post": {
-        "description": "Request a capability probe of one connector image for one agent.\n\n@spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13. Keyed\n``probe:<agent>:<connector>:<digest>``, so a replay adopts the agent's\nexisting probe (``200``) rather than creating a second.",
+        "description": "Request a capability probe of one connector image for one agent.\n\n@spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13 and the route decisions.\nThe first probe is keyed ``probe:<agent>:<connector>:<digest>``; a request\nwhile the latest probe is pending or confirmed adopts it (``200``). After a\nprobe that ended ``refused`` or ``failed``, the next one is a new execution\nwhose key carries the next probe attempt number (``...:<digest>:2`` and\nso on). A probe's ``authority_ref`` is its key: the body is exactly three\nkeys, so no reconcile pass id can reach it.",
         "operationId": "create_probe_connector_capabilities_probes_post",
         "parameters": [
           {
             "in": "header",
-            "name": "x-api-key",
+            "name": "X-Curie-Worker-Token",
             "required": false,
             "schema": {
               "anyOf": [
@@ -16266,7 +16308,7 @@
                   "type": "null"
                 }
               ],
-              "title": "X-Api-Key"
+              "title": "X-Curie-Worker-Token"
             }
           }
         ],

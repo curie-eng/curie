@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ActionRecord(BaseModel):
@@ -72,14 +72,16 @@ class ActionOut(BaseModel):
 class ActionUndo(BaseModel):
     """A request to put back what an action changed.
 
-    @spec ACTION-EXECUTOR-3: the platform observes the live version itself
-    through the pinned connector (ACTION-EXECUTOR-15), so a caller-supplied
-    observation is no longer evidence. An ``observed_state`` sent by an older
-    caller is ignored as an unknown field, never compared.
+    @spec ACTION-EXECUTOR-3: the actor is the authenticated principal, never
+    this body. ``actor`` is accepted only as a cross-check: one that differs
+    from the principal is refused. Channel evidence likewise comes from the
+    principal. The platform observes the live version itself through the
+    pinned connector (ACTION-EXECUTOR-15), so a caller-supplied observation is
+    no longer evidence; an ``observed_state`` sent by an older caller is
+    ignored as an unknown field, never compared.
     """
 
-    actor: str
-    actor_channel: str | None = None
+    actor: str | None = Field(default=None, max_length=256)
 
 
 class ActionUndoOut(BaseModel):
