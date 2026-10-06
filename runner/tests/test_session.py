@@ -1982,11 +1982,10 @@ def test_auth_fast_fail_survives_a_wedged_interrupt(caplog) -> None:
 
 
 def test_transient_model_error_is_not_fast_failed() -> None:
-    # A transient AssistantMessage.error (e.g. a hard rate-limit) is NOT a
-    # credential rejection: it must not credential-reject; must reach DONE.
-    # The SDK token is constrained to unclassified rather than passed through.
+    # Overload remains recoverable; subscription usage limits have a different
+    # terminal remedy and must not change this neighboring successful path.
     script = [
-        AssistantMessage(content=[], model="m", error="rate_limit"),
+        AssistantMessage(content=[], model="m", error="overloaded"),
         ResultMessage(
             subtype="success", duration_ms=1, duration_api_ms=1,
             is_error=False, num_turns=1, session_id="s", result="recovered",
@@ -2901,3 +2900,125 @@ def test_healthy_connector_still_queries_the_model() -> None:
     events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
     assert fake.queries == ["go"]
     assert events[-1].status == SessionStatus.DONE
+
+
+@pytest.mark.parametrize(
+    ("error", "text"),
+    [
+        ("rate_limit", ""),
+        ("unknown", "You've hit your session limit · resets 3pm (UTC)"),
+        ("authentication_failed", "You've hit your session limit · resets 3pm (UTC)"),
+    ],
+)
+def test_subscription_usage_limit_interrupts_before_sdk_retry_or_later_success(
+    error: str, text: str
+) -> None:
+    # Exact producer text: SDK 0.2.159's bundled CLI 2.1.281 nFn/oFn/_h;
+    # session-limit reset output is recorded in test_translate.py as well.
+    sentinel = "SHOULD-NOT-RUN-AFTER-SUBSCRIPTION-LIMIT"
+    script = [
+        AssistantMessage(content=[TextBlock(text=text)] if text else [], model="m", error=error),
+        AssistantMessage(content=[TextBlock(text=sentinel)], model="m"),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1,
+            is_error=False, num_turns=1, session_id="s", result=sentinel,
+        ),
+    ]
+    runner, fake = _runner(lambda: script)
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert [event.classification for event in errors] == ["model-usage-limited"]
+    assert events[-1].status is SessionStatus.CLASSIFIED_FAILURE
+    assert runner.status is SessionStatus.CLASSIFIED_FAILURE
+    assert fake.interrupts >= 1
+    assert all(sentinel not in getattr(event, "text", "") for event in events)
+
+
+
+@pytest.mark.parametrize("tool", ["Agent", "Task"])
+def test_reviewer_subscription_limit_interrupts_before_parent_success(tool: str) -> None:
+    # The recorded bundled CLI failed-reviewer shape is documented in
+    # test_reviewer_credit_real_cli.py; only its provider refusal text differs.
+    sentinel = "SHOULD-NOT-RUN-AFTER-REVIEWER-USAGE-LIMIT"
+    script = [
+        AssistantMessage(
+            content=[ToolUseBlock(
+                id="toolu_usage_reviewer", name=tool,
+                input={"description": "Diff review", "subagent_type": "reviewer"},
+            )], model="m",
+        ),
+        UserMessage(content=[ToolResultBlock(
+            tool_use_id="toolu_usage_reviewer", is_error=True,
+            content="Agent terminated early due to an API error: "
+            "You've hit your session limit · resets 3pm (UTC)",
+        )]),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1,
+            is_error=False, num_turns=2, session_id="s", result=sentinel,
+        ),
+    ]
+    runner, fake = _runner(lambda: script)
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert [event.classification for event in errors] == ["model-usage-limited"]
+    assert events[-1].status is SessionStatus.CLASSIFIED_FAILURE
+    assert fake.interrupts >= 1
+    assert all(sentinel not in getattr(event, "text", "") for event in events)
+
+
+def test_batched_reviewer_credit_refusal_cannot_replace_the_usage_limit_remedy() -> None:
+    # Parallel tool calls return one user message containing a tool_result for
+    # each call, as documented by the provider:
+    # https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use
+    # The failed Agent result envelope is recorded by test_reviewer_credit_real_cli.
+    usage_text = (
+        "Agent terminated early due to an API error: "
+        "You've hit your session limit · resets 3pm (UTC)"
+    )
+    sentinel = "SHOULD-NOT-CONTINUE-AFTER-BATCHED-REVIEWER-LIMITS"
+    script = [
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="toolu_usage",
+                    name="Agent",
+                    input={"description": "Plan review", "subagent_type": "reviewer"},
+                ),
+                ToolUseBlock(
+                    id="toolu_credit",
+                    name="Task",
+                    input={"description": "Diff review", "subagent_type": "reviewer"},
+                ),
+            ],
+            model="m",
+        ),
+        UserMessage(
+            content=[
+                ToolResultBlock(tool_use_id="toolu_usage", is_error=True, content=usage_text),
+                ToolResultBlock(
+                    tool_use_id="toolu_credit",
+                    is_error=True,
+                    content="Agent terminated early due to an API error: "
+                    "API Error: 402 This request requires more credits",
+                ),
+            ]
+        ),
+        AssistantMessage(content=[TextBlock(text=sentinel)], model="m"),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=2,
+            session_id="s",
+            result=sentinel,
+        ),
+    ]
+    runner, fake = _runner(lambda: script)
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert errors[-1].classification == "model-usage-limited"
+    assert "session limit" in errors[-1].message
+    assert events[-1].status is SessionStatus.CLASSIFIED_FAILURE
+    assert fake.interrupts >= 1
+    assert all(sentinel not in getattr(event, "text", "") for event in events)

@@ -982,6 +982,114 @@ printf '1'
     );
 }
 
+fn run_cluster_approval_inline_failure_guard(log: &str, previous: bool, log_status: i32) -> Output {
+    let source = repo_text(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/e2e-cluster-approval-resume-restarts.sh"),
+    );
+    let (_, guard_tail) = source
+        .split_once("\ninline_failed=0\n")
+        .expect("approval resume script must check the inline enqueue failure");
+    let (guard, _) = guard_tail
+        .split_once("\necho \"API logged the failed inline resume enqueue")
+        .expect("inline failure guard must precede its success announcement");
+    let function = |name: &str| {
+        let marker = format!("{name}() {{");
+        let (_, tail) = source
+            .split_once(&marker)
+            .unwrap_or_else(|| panic!("approval resume script must define {name}"));
+        let (body, _) = tail
+            .split_once("\n}\n")
+            .unwrap_or_else(|| panic!("approval resume function {name} must close"));
+        format!("{marker}{body}\n}}\n")
+    };
+    let harness = tempfile::tempdir().expect("create inline failure guard harness");
+    let log_path = harness.path().join("api.log");
+    fs::write(&log_path, log).expect("write API log fixture");
+    let script = format!(
+        r#"set -euo pipefail
+APPROVAL_ID=acme-approval
+API_DEPLOYMENT=acme-api
+SCRIPT_STARTED_RFC3339=2026-01-01T00:00:00Z
+LISTENER_ERR=/dev/null
+LISTENER_OUT=/dev/null
+pods_by_selector_of() {{
+    [[ "$1 $2" == 'deployment acme-api' ]] || return 97
+    printf 'acme-api-pod\tacme-uid\tready\n'
+}}
+kube() {{
+    [[ "$1 $2 $3 $4 $5" == 'logs acme-api-pod -c api --since-time=2026-01-01T00:00:00Z' ]] || return 97
+    local previous=0
+    [[ "${{6:-}}" != --previous ]] || previous=1
+    if [[ "$previous" == "$TEST_LOG_PREVIOUS" ]]; then
+        cat "$TEST_API_LOG"
+        return "$TEST_LOG_STATUS"
+    fi
+}}
+{}
+{}
+inline_failed=0
+{}
+"#,
+        function("fail"),
+        function("dump_diagnostics"),
+        guard,
+    );
+    Command::new("bash")
+        .args(["-c", &script])
+        .env("TEST_API_LOG", &log_path)
+        .env("TEST_LOG_PREVIOUS", if previous { "1" } else { "0" })
+        .env("TEST_LOG_STATUS", log_status.to_string())
+        .output()
+        .expect("run the extracted inline failure guard")
+}
+
+#[test]
+fn cluster_approval_inline_failure_guard_drains_logs_and_preserves_pipefail() {
+    let marker = "approval acme-approval approved by operator; resume enqueue failed, reconciler will retry\n";
+    let trailing = format!("approval acme-approval observed {}\n", "x".repeat(128)).repeat(12_000);
+    assert!(trailing.len() > 1_000_000);
+    let large_log = format!("{marker}{trailing}");
+
+    for previous in [false, true] {
+        let lane = if previous { "previous" } else { "current" };
+        for (label, log, status) in [
+            ("missing marker", "approval acme-approval approved\n", 0),
+            (
+                "different approval",
+                "approval acme-other approved; resume enqueue failed\n",
+                0,
+            ),
+            ("log command exited 37", marker, 37),
+        ] {
+            let output = run_cluster_approval_inline_failure_guard(log, previous, status);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "the {lane} log lane must reject {label}: {}",
+                transcript(&output)
+            );
+            assert!(
+                transcript(&output).contains("scenario did not exercise the failed inline enqueue"),
+                "the {lane} log lane must reject {label} through the actual guard: {}",
+                transcript(&output)
+            );
+        }
+
+        let output = run_cluster_approval_inline_failure_guard(&large_log, previous, 0);
+        assert!(
+            output.status.success(),
+            "the {lane} log lane must consume all matching approval lines after the early failure marker without a broken pipe: {}",
+            transcript(&output)
+        );
+        assert!(
+            !transcript(&output).contains("Broken pipe"),
+            "the {lane} log lane must leave its upstream grep able to drain: {}",
+            transcript(&output)
+        );
+    }
+}
+
 // --- Assertion group 1: arms the GRADED path -------------------------------
 
 /// The nightly workflow must arm live grading with the exact double-quoted

@@ -9,9 +9,11 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tomllib
+import uuid
 from pathlib import Path
 
 import pytest
@@ -358,6 +360,131 @@ def test_selection_historical_cli_dry_run_json(
     report = json.loads(result.stdout)
     assert test_directory in json.dumps(report["checks"])
     assert all({"name", "status", "detail"} <= check.keys() for check in report["checks"])
+
+
+def test_dry_run_affected_tests_use_ci_xdist_scheduling(
+    repository: Path, recorded_gh: Path
+) -> None:
+    paths = (FIXTURES / "pr-3332-paths.txt").read_text().splitlines()
+    commit_paths(repository, paths)
+    result = full_preflight(repository, "--dry-run", "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    checks = {check["name"]: check for check in json.loads(result.stdout)["checks"]}
+    detail = checks["Affected Python tests"]["detail"]
+    assert "-n 4 --dist loadgroup" in detail
+    assert "apps/api/tests" in detail
+
+
+def load_released_upgrade_gate():
+    path = ROOT / "scripts/check-released-upgrade.py"
+    spec = importlib.util.spec_from_file_location("curie_preflight_released_upgrade_gate", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def private_base_environment(project: str, override: Path) -> dict[str, str]:
+    # The environment private_services builds before port discovery.
+    override.write_text("services: {}\n")
+    return {
+        **os.environ,
+        "COMPOSE_PROJECT_NAME": project,
+        "COMPOSE_FILE": f"{ROOT / 'compose.dev.yaml'}{os.pathsep}{override}",
+    }
+
+
+def test_private_service_environment_replaces_a_conflicting_ambient_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    override = tmp_path / "override.yaml"
+    base = {
+        **private_base_environment("curie-preflight-example", override),
+        "CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT": "someone-elses-stack",
+        "CURIE_RELEASED_UPGRADE_COMPOSE_FILES": str(ROOT / "compose.dev.yaml"),
+        "CURIE_RELEASED_UPGRADE_POSTGRES_HOST": "localhost",
+        "CURIE_RELEASED_UPGRADE_POSTGRES_PORT": "25432",
+    }
+    environment = load_tool().private_service_environment(
+        base, postgres=43210, valkey=43211, s3=43212, otel=43213
+    )
+    assert base["CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT"] == "someone-elses-stack"
+    assert environment["CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT"] == "curie-preflight-example"
+    assert environment["CURIE_RELEASED_UPGRADE_POSTGRES_PORT"] == "43210"
+    assert environment["CURIE_RELEASED_UPGRADE_INTEGRATION"] == "1"
+    database = "postgresql+asyncpg://postgres:postgres@127.0.0.1:43210/postgres"
+    assert environment["DATABASE_URL"] == database
+    assert environment["TEST_DATABASE_URL"] == database
+    gate = load_released_upgrade_gate()
+    for name, value in environment.items():
+        if name.startswith("CURIE_RELEASED_UPGRADE_"):
+            monkeypatch.setenv(name, value)
+    resources = gate._released_upgrade_resources_from_env()
+    assert resources.compose_project == "curie-preflight-example"
+    assert resources.compose_files == (
+        (ROOT / "compose.dev.yaml").resolve(),
+        override.resolve(),
+    )
+    assert resources.postgres_host == "127.0.0.1"
+    assert resources.postgres_port == 43210
+
+
+def unused_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def released_upgrade_gate_tests(environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "-rs",
+            "apps/api/tests/test_released_upgrade_gate.py",
+            "-k",
+            "isolated_upgrade_resources_reject_mismatch or sibling_postgres_identity",
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_private_service_environment_unavailable_postgres_fails_the_real_gate_tests(
+    tmp_path: Path, docker_toolchain: str
+) -> None:
+    # The private project has no containers, so `docker compose ps -q postgres`
+    # succeeds with empty output and the gate fixture reaches its "not running" branch.
+    project = "curie-preflight-absent-" + uuid.uuid4().hex[:8]
+    environment = load_tool().private_service_environment(
+        private_base_environment(project, tmp_path / "override.yaml"),
+        postgres=unused_port(),
+        valkey=unused_port(),
+        s3=unused_port(),
+        otel=unused_port(),
+    )
+    environment.pop("CI", None)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = released_upgrade_gate_tests(environment)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "selected Compose PostgreSQL is not running" in output
+    assert "skipped" not in output
+    # Negative control: the integration flag alone turns the skip into a failure.
+    del environment["CURIE_RELEASED_UPGRADE_INTEGRATION"]
+    control = released_upgrade_gate_tests(environment)
+    control_output = control.stdout + control.stderr
+    assert control.returncode == 0, control_output
+    assert "skipped" in control_output
+    assert "selected Compose PostgreSQL is not running" in control_output
 
 
 def test_selection_docs_only_ignores_always_list() -> None:

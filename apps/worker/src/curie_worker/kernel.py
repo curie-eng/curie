@@ -591,6 +591,7 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
         "ledger-error",
         "model-credential-rejected",
         "model-credit-exhausted",
+        "model-usage-limited",
         "approval-not-acted",
         "false-completion",
         "publication-unrecorded",
@@ -624,6 +625,7 @@ def map_error_classification(raw: str | None) -> str:
 # ``runner_escalated``.
 _ESCALATION_CAUSES = {
     "model-credit-exhausted": "model_credit_exhausted",
+    "model-usage-limited": "model_usage_limited",
     "model-credential-rejected": "model_credential_rejected",
     "rate-limit": "model_rate_limited",
     "server-error": "model_error",
@@ -1932,6 +1934,10 @@ class Kernel:
         )
         if revoker is not None and poster is not None:
             revoker(poster)
+        minter = getattr(self._substrate, "set_boot_credential_minter", None)
+        signer = getattr(binding, "fresh_boot_credential", None) if binding is not None else None
+        if minter is not None and signer is not None:
+            minter(signer)
         # The trusted repository preparation lane. It is optional for generic
         # and legacy deployments. A turn that requires a repository refuses when
         # this lane is unavailable instead of booting an empty directory.

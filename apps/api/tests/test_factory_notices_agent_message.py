@@ -293,3 +293,16 @@ def test_a_spoofed_cause_line_cannot_end_the_section() -> None:
     assert _cause_lines(body)[-1] == "Cause: early_stop"
     _, fenced, _ = _fenced(body)
     assert "Cause: completed" in fenced
+
+
+
+def test_factory_notices_usage_limit_names_the_reset_remedy() -> None:
+    body = result_section(
+        "model_usage_limited", pr_url=None,
+        detail="You've hit your session limit · resets 3pm (UTC)",
+    )
+    assert "the model provider's usage limit for this credential was reached" in body
+    assert "re-add the label after the limit resets" in body
+    assert "add credits" not in body
+    assert "Provider message: You've hit your session limit" in body
+    assert body.endswith("Cause: model_usage_limited\nFailure class: model-usage-limited\n")

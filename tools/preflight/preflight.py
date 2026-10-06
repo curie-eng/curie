@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +43,50 @@ class TransientError(ValueError):
 
 class GateFailure(ValueError):
     """A well-formed invocation reached a failing product verification gate."""
+
+
+def pytest_command(tests: Sequence[str]) -> list[str]:
+    # Matches CI's xdist scheduling; the root conftest.py groups tests for loadgroup.
+    return ["uv", "run", "pytest", "-q", "-n", "4", "--dist", "loadgroup", *tests]
+
+
+def released_upgrade_environment(
+    project: str, compose_files: str, postgres_port: int
+) -> dict[str, str]:
+    # scripts/check-released-upgrade.py reads this isolation contract; INTEGRATION=1
+    # makes a missing private Postgres fail instead of skip, as in the isolated baseline.
+    return {
+        "CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT": project,
+        "CURIE_RELEASED_UPGRADE_COMPOSE_FILES": compose_files,
+        "CURIE_RELEASED_UPGRADE_POSTGRES_HOST": "127.0.0.1",
+        "CURIE_RELEASED_UPGRADE_POSTGRES_PORT": str(postgres_port),
+        "CURIE_RELEASED_UPGRADE_INTEGRATION": "1",
+    }
+
+
+def private_service_environment(
+    environment: dict[str, str], *, postgres: int, valkey: int, s3: int, otel: int
+) -> dict[str, str]:
+    # Every endpoint the Python gates read, pointed at the private project's
+    # published ports. Ambient values for the same variables are replaced.
+    database = f"postgresql+asyncpg://postgres:postgres@127.0.0.1:{postgres}/postgres"
+    return {
+        **environment,
+        **released_upgrade_environment(
+            environment["COMPOSE_PROJECT_NAME"], environment["COMPOSE_FILE"], postgres
+        ),
+        "DATABASE_URL": database,
+        "TEST_DATABASE_URL": database,
+        "TEST_VALKEY_HOST": "127.0.0.1",
+        "TEST_VALKEY_PORT": str(valkey),
+        "VALKEY_HOST": "127.0.0.1",
+        "VALKEY_PORT": str(valkey),
+        "S3_ENDPOINT_URL": f"http://127.0.0.1:{s3}",
+        "TEST_S3_ENDPOINT_URL": f"http://127.0.0.1:{s3}",
+        "TEST_OTEL_COLLECTOR_ENDPOINT": f"http://127.0.0.1:{otel}/v1/traces",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{otel}",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+    }
 
 
 def exact(job: str, step: str, command: str, cwd: str, group: str) -> Check:
@@ -1011,20 +1055,8 @@ def private_services(root: Path, worktree: Path) -> Iterator[dict[str, str]]:
                 valkey = port("valkey", 6379)
                 s3 = port("rustfs", 9000)
                 otel = port("otel-collector", 4318)
-                environment.update(
-                    {
-                        "DATABASE_URL": f"postgresql+asyncpg://postgres:postgres@127.0.0.1:{postgres}/postgres",
-                        "TEST_DATABASE_URL": f"postgresql+asyncpg://postgres:postgres@127.0.0.1:{postgres}/postgres",
-                        "TEST_VALKEY_HOST": "127.0.0.1",
-                        "TEST_VALKEY_PORT": str(valkey),
-                        "VALKEY_HOST": "127.0.0.1",
-                        "VALKEY_PORT": str(valkey),
-                        "S3_ENDPOINT_URL": f"http://127.0.0.1:{s3}",
-                        "TEST_S3_ENDPOINT_URL": f"http://127.0.0.1:{s3}",
-                        "TEST_OTEL_COLLECTOR_ENDPOINT": f"http://127.0.0.1:{otel}/v1/traces",
-                        "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{otel}",
-                        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-                    }
+                environment = private_service_environment(
+                    environment, postgres=postgres, valkey=valkey, s3=s3, otel=otel
                 )
                 migration = run_check(
                     root / "apps/api",
@@ -1188,7 +1220,7 @@ def execute_full(
     selection = {
         "name": "Affected Python tests",
         "status": "planned" if tests else "skipped",
-        "detail": shlex.join(["uv", "run", "pytest", "-q", *tests])
+        "detail": shlex.join(pytest_command(tests))
         if tests
         else "No changed workspace members select Python tests",
     }
@@ -1209,7 +1241,7 @@ def execute_full(
                 run_check(
                     root,
                     "Affected Python tests",
-                    ["uv", "run", "pytest", "-q", *tests],
+                    pytest_command(tests),
                     environment,
                 ),
             )

@@ -616,8 +616,9 @@ inline_failed=0
 while read -r api_pod; do
     [[ -n "$api_pod" ]] || continue
     for prev in "" "--previous"; do
+        # Drain the log stream so an early match cannot cause a SIGPIPE false refusal.
         if kube logs "$api_pod" -c api --since-time="$SCRIPT_STARTED_RFC3339" $prev 2>/dev/null \
-            | grep -F "approval $APPROVAL_ID " | grep -qF "resume enqueue failed"; then
+            | grep -F "approval $APPROVAL_ID " | grep -F "resume enqueue failed" >/dev/null; then
             inline_failed=1
         fi
     done
