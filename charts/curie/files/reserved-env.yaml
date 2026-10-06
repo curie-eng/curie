@@ -10,6 +10,8 @@ worker:
   CURIE_ATTACHMENT_MAX_FILE_BYTES: worker.attachments.maxFileBytes
   CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS: worker.attachments.referenceTtlSeconds
   CURIE_ATTACHMENT_RETENTION_TTL_SECONDS: worker.attachments.retentionTtlSeconds
+  CURIE_ATTACHMENT_THREAD_MAX_BYTES: worker.attachments.threadMaxBytes
+  CURIE_ATTACHMENT_THREAD_MAX_FILES: worker.attachments.threadMaxFiles
   CURIE_CLAIM_TIMEOUT_SECONDS: worker.claimTimeoutSeconds
   CURIE_CONNECTOR_APP_NAME: nameOverride
   CURIE_CONNECTOR_CALLER_SIGNING_KEY: connectorCaller.signingKey
@@ -203,6 +205,7 @@ dispatcher:
   VALKEY_TLS: valkey.tls
 agentSandbox.runner:
   ANTHROPIC_BASE_URL: inference.service.port
+  CURIE_ATTACHMENTS_MANIFEST: the claim's attachment manifest, filled per boot (remove this override)
   CURIE_BUDGET: agentSandbox.runner.budget.maxOutputTokensPerRun
   CURIE_CREDENTIALS: agentSandbox.runner.credentialsExistingSecret
   CURIE_FAKE_MODEL: agentSandbox.runner.fakeModel

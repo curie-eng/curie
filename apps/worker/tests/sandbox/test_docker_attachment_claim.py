@@ -23,9 +23,13 @@ unusable name, over the cap. A refusal must leave nothing half-materialized.
 **What is mocked, and why only that.** The presigned object store's HTTP GET,
 and nothing else. It is an external service; the decode, the digest check, the
 cap, the materialization, the chmod and the argv are all exercised for real.
-The download is intercepted at ``urllib.request.urlopen``, which is the call
-``_prepare_workspace`` makes -- a driver that fetches some other way will fail
-here saying it never fetched at all, which is the correct thing for it to say.
+The download is intercepted at ``urllib.request.OpenerDirector.open``, which
+both ``urllib.request.urlopen`` (the call ``_prepare_workspace`` makes) and an
+opener built with a refusing redirect handler go through. A 302 is resolved the
+way urllib resolves it: by asking the opener's own redirect handler, so a driver
+that follows redirects is seen following one. A driver that fetches some other
+way will fail here saying it never fetched at all, which is the correct thing
+for it to say.
 
 **The mount path is a cross-substrate seam.** ``curie_runner.__main__.ATTACHMENTS_DIR``
 is compiled into the runner (the reference env is deliberately scoped away from
@@ -35,6 +39,17 @@ landed), and ``charts/curie/values.yaml`` templates the same path for the pod.
 file adds the third side, so the docker driver cannot mount somewhere the runner
 never looks.
 
+**ADR 0205: the thread's files, and parity with the init container.** A boot
+now carries the thread's earlier files alongside the current message's, and
+what the driver makes of a payload is pinned case by case in the shared vector
+``tests/vectors/attachment-init-outcomes.json``. The chart's
+``ci/attachment-init-behavior-assertions.sh`` executes the rendered
+``attachments-init`` program on the same file, so the two substrates cannot
+drift. Names are written exactly as recorded (the worker disambiguates against
+the thread's ledger; nothing here renames), current files are all-or-nothing,
+earlier files are best effort with a recorded reason, a digest mismatch is
+always fatal, and the outcome lands in the mount's hidden status file.
+
 **The refusal type** is ``AttachmentResolutionError`` -- the lane's own error,
 which ``decode_attachment_refs`` already raises for a malformed or non-HTTP(S)
 reference. A subclass is fine; a bare ``RuntimeError`` is not, because the
@@ -43,7 +58,9 @@ kernel and the eval consumer distinguish lanes by exception type.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import shutil
 import subprocess
 import tempfile
@@ -176,21 +193,102 @@ class _FakeObjectStore:
         self.objects: dict[str, tuple[bytes, int]] = {}
         self.requested: list[str] = []
         self.delivered: dict[str, int] = {}
+        # url -> HTTP status answered instead of the object.
+        self.errors: dict[str, int] = {}
+        # urls whose body goes silent after the headers: the read raises the
+        # socket timeout, and the monotonic clock jumps past any fetch deadline,
+        # which is what a real stall costs the boot.
+        self.stalls: set[str] = set()
+        # urls that hand over one byte per read and advance the clock a step
+        # each time: no read trips a socket timeout, the body outlasts the deadline.
+        self.drips: set[str] = set()
+        # url -> location a 302 points at.
+        self.redirects: dict[str, str] = {}
+        self.clock: _Clock | None = None
 
     def add(self, url: str, payload: bytes, *, chunk_size: int = 16) -> str:
         self.objects[url] = (payload, chunk_size)
         return url
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(urllib.request, "urlopen", self._urlopen)
+        store = self
 
-    def _urlopen(self, request: Any, *_args: Any, **_kwargs: Any) -> _FakeBody:
-        url = str(getattr(request, "full_url", request))
+        def _open(
+            opener: urllib.request.OpenerDirector, request: Any, *_a: Any, **_k: Any
+        ) -> _FakeBody:
+            return store._open(opener, request)
+
+        monkeypatch.setattr(urllib.request.OpenerDirector, "open", _open)
+
+    def _open(self, opener: urllib.request.OpenerDirector, request: Any) -> _FakeBody:
+        if isinstance(request, str):
+            request = urllib.request.Request(request)
+        url = str(request.full_url)
         self.requested.append(url)
+        if url in self.redirects:
+            target = self.redirects[url]
+            handlers = [
+                h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)
+            ]
+            follow = (
+                handlers[0].redirect_request(request, None, 302, "Found", {}, target)  # type: ignore[arg-type]
+                if handlers
+                else None
+            )
+            if follow is None:
+                raise urllib.error.HTTPError(url, 302, "Found", {}, None)  # type: ignore[arg-type]
+            return self._open(opener, follow)
+        if url in self.errors:
+            code = self.errors[url]
+            raise urllib.error.HTTPError(url, code, "store refused", {}, None)  # type: ignore[arg-type]
         if url not in self.objects:
             raise urllib.error.HTTPError(url, 404, "no such object", {}, None)  # type: ignore[arg-type]
         payload, chunk_size = self.objects[url]
+        if url in self.stalls:
+            return _StalledBody(self, url, payload, chunk_size)
+        if url in self.drips:
+            return _DrippingBody(self, url, payload, 1)
         return _FakeBody(self, url, payload, chunk_size)
+
+
+class _StalledBody(_FakeBody):
+    def read(self, amount: int | None = None) -> bytes:
+        if self._store.clock is not None:
+            self._store.clock.advance(_STALL_SECONDS)
+        raise TimeoutError("timed out")
+
+
+class _DrippingBody(_FakeBody):
+    def read(self, amount: int | None = None) -> bytes:
+        if self._store.clock is not None:
+            self._store.clock.advance(_DRIP_STEP_SECONDS)
+        return super().read(1)
+
+
+# Longer than any fetch deadline either substrate could configure.
+_STALL_SECONDS = 10_000.0
+# One drip byte costs this much monotonic time: inside any socket timeout, and
+# the vector's drip bodies (>= 15 bytes) add up past the driver's deadline.
+_DRIP_STEP_SECONDS = 30.0
+
+
+class _Clock:
+    """``time.monotonic`` plus a jump a stalled fetch adds.
+
+    The deadline is a monotonic one (a wall clock can step); ``time.time`` is
+    left alone so an unexpired reference does not expire because of the jump.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._real = time.monotonic
+        self._offset = 0.0
+        monkeypatch.setattr(time, "monotonic", self.now)
+
+    def now(self) -> float:
+        return self._real() + self._offset
+
+    def advance(self, seconds: float) -> None:
+        self._offset += seconds
 
 
 @pytest.fixture
@@ -397,90 +495,6 @@ def test_attachments_are_materialized_and_bind_mounted_read_only(
     assert objects.requested == [report_url, notes_url]
 
 
-def test_two_attachments_sharing_a_filename_both_survive(
-    objects: _FakeObjectStore, staged: list[Path]
-) -> None:
-    """Two ``report.pdf`` in one message. Both must be readable.
-
-    Before this, both were written to ``<mount>/report.pdf`` and the second
-    destroyed the first: the agent saw one file where two arrived, with nothing
-    saying one had been lost. That is exactly the silent loss #2567 exists to
-    close, reintroduced one layer down, and it defeats the lane's own
-    all-or-nothing argument -- a partial set reads to an agent like a complete
-    one.
-
-    The disambiguation is asserted by NAME, not merely by count: the scheme is a
-    cross-substrate contract (the rendered ``attachments-init`` program applies
-    the same one, and ci/attachment-init-behavior-assertions.sh executes it on
-    this case), so a driver that invented its own suffix would still mount two
-    files and still be wrong.
-    """
-
-    first, second, third = b"first report", b"second report", b"third report"
-    urls = [
-        objects.add("https://objects.example.test/attachments/a/000.bin", first),
-        objects.add("https://objects.example.test/attachments/a/001.bin", second),
-        objects.add("https://objects.example.test/attachments/a/002.bin", third),
-    ]
-
-    client = _client()
-    client.create_claim(
-        "claim-attachments",
-        pool="pool",
-        env=_env(
-            _ref(url=urls[0], name="report.pdf", payload=first),
-            _ref(url=urls[1], name="report.pdf", payload=second),
-            _ref(url=urls[2], name="report.pdf", payload=third),
-        ),
-    )
-
-    root, _mode = _attachment_mount(client.calls[0])
-    visible = sorted(entry.name for entry in root.iterdir() if not entry.name.startswith("."))
-    assert visible == ["report-2.pdf", "report-3.pdf", "report.pdf"], (
-        f"three same-named uploads materialized as {visible}; one of them was "
-        "silently destroyed or renamed by some other scheme than the chart's"
-    )
-    # The bytes, not just the names: a scheme that produced three paths but
-    # pointed two of them at the same object would pass a name-only check.
-    assert (root / "report.pdf").read_bytes() == first
-    assert (root / "report-2.pdf").read_bytes() == second
-    assert (root / "report-3.pdf").read_bytes() == third
-    assert objects.requested == urls
-
-
-def test_a_collision_with_an_already_disambiguated_name_does_not_overwrite(
-    objects: _FakeObjectStore, staged: list[Path]
-) -> None:
-    """A person really did upload a file called ``report-2.pdf``.
-
-    The counter has to skip a name that is already taken, or the disambiguation
-    itself becomes the overwrite it was added to prevent.
-    """
-
-    first, literal, third = b"one", b"literally report-2", b"three"
-    urls = [
-        objects.add("https://objects.example.test/attachments/a/000.bin", first),
-        objects.add("https://objects.example.test/attachments/a/001.bin", literal),
-        objects.add("https://objects.example.test/attachments/a/002.bin", third),
-    ]
-
-    client = _client()
-    client.create_claim(
-        "claim-attachments",
-        pool="pool",
-        env=_env(
-            _ref(url=urls[0], name="report.pdf", payload=first),
-            _ref(url=urls[1], name="report-2.pdf", payload=literal),
-            _ref(url=urls[2], name="report.pdf", payload=third),
-        ),
-    )
-
-    root, _mode = _attachment_mount(client.calls[0])
-    assert (root / "report.pdf").read_bytes() == first
-    assert (root / "report-2.pdf").read_bytes() == literal
-    assert (root / "report-3.pdf").read_bytes() == third
-
-
 def test_the_mount_path_agrees_with_the_runner_and_the_chart(
     objects: _FakeObjectStore, staged: list[Path]
 ) -> None:
@@ -529,9 +543,10 @@ def test_the_mount_path_agrees_with_the_runner_and_the_chart(
 def test_disabling_either_attachment_gate_omits_the_rendered_runner_mount(
     worker_enabled: bool, runner_enabled: bool
 ) -> None:
-    assert _chart_attachments_mount_paths(
-        worker_enabled=worker_enabled, runner_enabled=runner_enabled
-    ) == []
+    assert (
+        _chart_attachments_mount_paths(worker_enabled=worker_enabled, runner_enabled=runner_enabled)
+        == []
+    )
 
 
 def test_the_signed_reference_never_reaches_the_runner_container(
@@ -665,66 +680,6 @@ def test_a_non_http_reference_is_refused_and_materializes_nothing(
     _left_nothing(staged)
 
 
-@pytest.mark.parametrize("name", ["", "   ", ".", "..", "/"], ids=lambda n: repr(n))
-def test_a_filename_that_escapes_the_mount_root_is_refused(
-    name: str, objects: _FakeObjectStore, staged: list[Path]
-) -> None:
-    """The names the chart's attachments-init calls "unusable", refused here too.
-
-    The filename is text supplied by whoever uploaded the file. None of these
-    can name a file inside the mount, so materializing one either writes outside
-    the root or clobbers the root itself.
-    """
-
-    payload = b"a,b\n"
-    url = objects.add("https://objects.example.test/attachments/a/000.bin", payload)
-    client = _client()
-
-    _refused(
-        client,
-        _env(_ref(url=url, name=name, payload=payload)),
-        because=f"an attachment named {name!r}",
-    )
-
-    assert objects.requested == [], "an unusable name must be refused before any fetch"
-    assert client.calls == []
-    _left_nothing(staged)
-
-
-def test_a_name_carrying_a_path_never_writes_outside_the_mount_root(
-    objects: _FakeObjectStore, staged: list[Path]
-) -> None:
-    """Refuse it or basename it -- but nothing may land above the root.
-
-    ``attachments-init`` takes the basename and then re-checks the resolved
-    parent, so a traversal is neutralized rather than refused there. Either
-    behavior is fine here; a file appearing outside the mount is not.
-    """
-
-    payload = b"a,b\n"
-    url = objects.add("https://objects.example.test/attachments/a/000.bin", payload)
-    client = _client()
-
-    try:
-        client.create_claim(
-            "claim-attachments",
-            pool="pool",
-            env=_env(_ref(url=url, name="../escape.csv", payload=payload)),
-        )
-    except AttachmentResolutionError:
-        _left_nothing(staged)
-        return
-
-    root, _mode = _attachment_mount(client.calls[0])
-    strays = [
-        path
-        for staged_dir in staged
-        for path in staged_dir.rglob("escape.csv")
-        if path.parent != root
-    ]
-    assert strays == [], f"an attachment name traversed out of the mount root: {strays}"
-
-
 # --- the size cap, both directions -------------------------------------------
 
 
@@ -791,6 +746,208 @@ def test_the_oversize_download_stops_pulling_at_the_cap(
         "download must be refused at the crossing chunk, not buffered and then measured"
     )
     _left_nothing(staged)
+
+
+# --- ADR 0205: the shared outcome vector ------------------------------------
+
+
+_MANIFEST_ENV = "CURIE_ATTACHMENTS_MANIFEST"
+
+
+def _vector() -> dict[str, Any]:
+    path = _repo_root() / "tests" / "vectors" / "attachment-init-outcomes.json"
+    return json.loads(path.read_text())
+
+
+_VECTOR = _vector()
+
+
+def _encode_wire(entries: list[dict[str, Any]]) -> str:
+    """The claim-env value, built by hand like the chart script builds it.
+
+    Not through ``encode_attachment_refs``: the vector is the contract, and the
+    ``c`` field (current or earlier) is part of the wire whatever the worker's
+    own dataclass calls it.
+    """
+
+    raw = json.dumps(entries, separators=(",", ":"), sort_keys=True).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _vector_payload(
+    case: dict[str, Any], objects: _FakeObjectStore
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    wire: list[dict[str, Any]] = []
+    by_url: dict[str, dict[str, Any]] = {}
+    now = int(time.time())
+    for index, item in enumerate(case["entries"]):
+        body = item["body"].encode()
+        if item["serve"] == "oversize":
+            body = b"z" * (_VECTOR["cap_bytes"] + 1)
+        url = f"https://objects.example.test/attachments/vector/{index:03d}.bin"
+        served = body + b" tampered" if item["serve"] == "digest_mismatch" else body
+        objects.add(url, served)
+        if item["serve"].startswith("http_"):
+            objects.errors[url] = int(item["serve"].removeprefix("http_"))
+        if item["serve"] == "stall":
+            objects.stalls.add(url)
+        if item["serve"] == "drip":
+            objects.drips.add(url)
+        if item["serve"] == "redirect":
+            objects.add(url + ".moved", body)
+            objects.redirects[url] = url + ".moved"
+        entry: dict[str, Any] = {
+            "n": item["n"],
+            "u": url,
+            "s": hashlib.sha256(body).hexdigest(),
+            "b": len(body),
+            "e": now - 60 if item["serve"] == "expired" else now + 300,
+            "m": "text/plain",
+        }
+        if "c" in item:
+            entry["c"] = item["c"]
+        wire.append(entry)
+        by_url[url] = item
+    return _encode_wire(wire), by_url
+
+
+def _assert_common(
+    case: dict[str, Any],
+    by_url: dict[str, dict[str, Any]],
+    requested: list[str],
+    objects: _FakeObjectStore,
+) -> None:
+    """The invariants every vector case carries, as the chart script checks them."""
+
+    fetched = [by_url[url] for url in requested if url in by_url]
+    order = [item["n"] for item in fetched]
+    seen_earlier = False
+    for item in fetched:
+        if item.get("c", 1) != 1:
+            seen_earlier = True
+        else:
+            assert not seen_earlier, (
+                f"current entry {item['n']!r} was fetched after an earlier one ({order}); "
+                "the current message's files come first"
+            )
+    assert not [i["n"] for i in fetched if i["serve"] == "expired"], (
+        f"an expired reference was fetched ({order}); it must be skipped unfetched"
+    )
+    late = {row["name"] for row in case.get("status") or [] if row["reason"] == "deadline"}
+    assert not [i["n"] for i in fetched if i["n"] in late and i["serve"] != "drip"], (
+        f"an entry past the overall deadline was fetched ({order}); it must be skipped unfetched"
+    )
+    if case.get("refused_before_fetch"):
+        assert requested == [], (
+            f"the payload was refused only after fetching {order}; an unusable name "
+            "must be refused before any byte is pulled"
+        )
+    followed = [url for url in requested if url.endswith(".moved")]
+    assert followed == [], f"a redirect was followed to {followed}; it must be refused"
+    for url, item in by_url.items():
+        if item["serve"] == "drip":
+            delivered = objects.delivered.get(url, 0)
+            assert delivered < len(item["body"].encode()), (
+                f"{item['n']!r} was read to the end ({delivered} bytes) although it "
+                "dripped past the fetch deadline; the deadline must cut a slow body off"
+            )
+
+
+def _assert_nothing_outside(root: Path, staged_dirs: list[Path]) -> None:
+    strays = [
+        path
+        for staged_dir in staged_dirs
+        if staged_dir.exists()
+        for path in staged_dir.rglob("*")
+        if path != root and path.parent != root
+    ]
+    assert strays == [], f"something was written outside the mount root: {strays}"
+
+
+@pytest.mark.parametrize("case", _VECTOR["cases"], ids=[c["name"] for c in _VECTOR["cases"]])
+def test_the_docker_driver_matches_the_shared_init_outcome_vector(
+    case: dict[str, Any],
+    objects: _FakeObjectStore,
+    staged: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR 0205 decisions 4, 6 and 8, the same cases the rendered init runs.
+
+    ``charts/curie/ci/attachment-init-behavior-assertions.sh`` executes the
+    chart's ``attachments-init`` program on this vector; this runs the docker
+    driver on it. A case that passes on one substrate and not the other is the
+    drift the vector exists to catch.
+    """
+
+    objects.clock = _Clock(monkeypatch)
+    encoded, by_url = _vector_payload(case, objects)
+    # The vector's per-file cap, the same number the chart script renders.
+    client = _client(limits=_limits(max_file_bytes=_VECTOR["cap_bytes"]))
+    env = {**_BASE_ENV, ATTACHMENTS_REF_ENV: encoded}
+
+    if case["outcome"] == "fatal":
+        _refused(client, env, because=f"vector case {case['name']}")
+        assert client.calls == [], "no container may be started for a refused claim"
+        _left_nothing(staged)
+        _assert_common(case, by_url, objects.requested, objects)
+        return
+
+    client.create_claim("claim-attachments", pool="pool", env=env)
+    root, mode = _attachment_mount(client.calls[0])
+    assert mode == "ro"
+    visible = {
+        entry.name: entry.read_bytes() for entry in root.iterdir() if not entry.name.startswith(".")
+    }
+    assert visible == {name: body.encode() for name, body in case["visible"].items()}
+    hidden = sorted(entry.name for entry in root.iterdir() if entry.name.startswith("."))
+    status_name = _VECTOR["status_file"]
+    # A legacy payload (no "c") may or may not write the status file.
+    allowed = [[status_name]] if case["status"] is not None else [[], [status_name]]
+    assert hidden in allowed, (
+        f"hidden entries {hidden} in the mount; expected one of {allowed} "
+        "(written to a temp name and renamed into place)"
+    )
+    _assert_nothing_outside(root, staged)
+    if case["status"] is not None:
+        status_path = root / status_name
+        assert status_path.stat().st_mode & 0o004, "the status file is not readable by the runner"
+        status = json.loads(status_path.read_text())
+        assert set(status) == {"v", "files"} and status["v"] == _VECTOR["status_version"], status
+        assert all(set(row) == {"name", "status", "reason"} for row in status["files"]), status
+        got = sorted(status["files"], key=lambda r: r["name"])
+        want = sorted(case["status"], key=lambda r: r["name"])
+        assert [r["name"] for r in got] == [r["name"] for r in want], (got, want)
+        for row, expected in zip(got, want, strict=True):
+            reasons = expected["reason"]
+            reasons = reasons if isinstance(reasons, list) else [reasons]
+            assert row["status"] == expected["status"] and row["reason"] in reasons, (row, expected)
+    _assert_common(case, by_url, objects.requested, objects)
+
+
+def test_the_attachment_manifest_is_forwarded_to_the_runner(
+    objects: _FakeObjectStore, staged: list[Path]
+) -> None:
+    """The manifest is the runner's, unlike the reference.
+
+    ADR 0205 decision 8: it names files and outcomes and carries no
+    capability, and the runner needs it to tell the current message's files
+    from earlier ones. The reference stays worker-owned; the manifest must not
+    join it in ``_WORKER_OWNED_ENV``.
+    """
+
+    payload = b"x"
+    url = objects.add("https://objects.example.test/attachments/a/000.bin", payload)
+    manifest = "eyJ2IjoxfQ"
+    env = {**_env(_ref(url=url, name="report.csv", payload=payload)), _MANIFEST_ENV: manifest}
+    client = _client()
+    client.create_claim("claim-attachments", pool="pool", env=env)
+
+    forwarded = [
+        e for e in _flag_values(client.calls[0], "-e") if e.startswith(f"{_MANIFEST_ENV}=")
+    ]
+    assert forwarded == [f"{_MANIFEST_ENV}={manifest}"], (
+        f"{_MANIFEST_ENV} did not reach the runner container as given: {forwarded}"
+    )
 
 
 # --- cleanup -----------------------------------------------------------------

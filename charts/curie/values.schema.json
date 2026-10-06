@@ -272,6 +272,13 @@
             "bucket": {"type": "string", "minLength": 3}
           }
         },
+        "attachments": {
+          "type": "object",
+          "properties": {
+            "threadMaxFiles": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "threadMaxBytes": {"type": "integer", "minimum": 1}
+          }
+        },
           "publication": {
             "type": "object",
             "properties": {
