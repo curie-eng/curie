@@ -109,9 +109,16 @@ def test_a_moved_world_is_refused_with_both_states_named(
 
 
 def test_a_refused_undo_changes_nothing(client: Any, auth_headers: Any) -> None:
-    """`an undo either restores the recorded state or changes nothing at all`."""
+    """`an undo either restores the recorded state or changes nothing at all`.
+
+    @spec ACTION-EXECUTOR-11: this record's ``prior_state`` is cleartext, so it
+    is not ``undoable`` under the sealed rule before or after the refusal. What
+    the refusal must not move is the whole record as the API reads it, so the
+    read after is compared with the read before, field for field.
+    """
 
     action = _record(client, auth_headers)
+    before = client.get(f"/actions/{action['id']}", headers=auth_headers).json()
 
     refused = _undo(
         client, auth_headers, action["id"], observed_state={"spec": {"replicas": 7}}
@@ -121,9 +128,11 @@ def test_a_refused_undo_changes_nothing(client: Any, auth_headers: Any) -> None:
     # this passes against an API with no undo endpoint at all.
     assert refused.status_code == 409
     after = client.get(f"/actions/{action['id']}", headers=auth_headers).json()
+    assert after == before
     assert after["undone_at"] is None
-    assert after["undoable"] is True
+    assert after["undone_by"] is None
     assert after["prior_state"] == PRIOR
+    assert after["undoable"] is False
 
 
 def test_an_unseen_world_is_refused_rather_than_assumed(

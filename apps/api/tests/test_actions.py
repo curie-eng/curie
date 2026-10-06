@@ -13,6 +13,9 @@ What this file holds:
 2. **Reversibility is deny-by-default.** ``undoable`` is derived from what the
    record actually holds, so a completion that carried no prior state produces a
    record that says it cannot be undone, with no connector declaring anything.
+   Under the sealed rule (ACTION-EXECUTOR-11) a cleartext prior state is history,
+   not a snapshot: it is stored as reported and never makes a record undoable.
+   ``test_action_undoable_ingredients.py`` holds the positive case.
 3. **A completion lands once.** Recording the same result twice must not
    overwrite a record with a second, later account of the same call.
 """
@@ -86,9 +89,17 @@ def test_a_redelivered_turn_adopts_the_record_it_already_wrote(
     assert len(listed.json()) == 1
 
 
-def test_a_completed_call_that_captured_its_prior_state_is_undoable(
+def test_a_completed_call_with_a_cleartext_prior_state_is_stored_but_not_undoable(
     client: Any, auth_headers: Any
 ) -> None:
+    """@spec ACTION-EXECUTOR-11: legacy cleartext rows are not undoable.
+
+    The completion still lands in full -- status, prior state, completion time --
+    because the record is the history of the call. What it no longer earns is an
+    undo: a cleartext ``prior_state`` is not a sealed envelope (ACTION-EXECUTOR-9),
+    and this record carries no version, digest, capability or custody either.
+    """
+
     action_id = client.post("/actions", json=_open_body(), headers=auth_headers).json()["id"]
 
     response = client.post(
@@ -99,8 +110,10 @@ def test_a_completed_call_that_captured_its_prior_state_is_undoable(
     body = response.json()
     assert body["status"] == "succeeded"
     assert body["prior_state"] == {"spec": {"replicas": 3}}
+    assert body["post_state"] == {"spec": {"replicas": 10}}
+    assert body["target"] == {"kind": "Deployment", "namespace": "public", "name": "api"}
     assert body["completed_at"] is not None
-    assert body["undoable"] is True
+    assert body["undoable"] is False
 
 
 def test_a_call_that_reported_no_prior_state_is_not_undoable(
