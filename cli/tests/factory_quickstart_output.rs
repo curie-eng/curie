@@ -26,7 +26,10 @@ const INDEX: &str =
 
 // The driver answers explicit external commands and rejects unknown ones.
 // State lives inside the owned temporary fixture, never in a real cluster.
-const TOOL_DRIVER: &str = r#"#!/usr/bin/python3
+// The interpreter resolves through PATH (the repo's driver convention, as
+// in `cluster_connection_transport.rs`): a hardcoded `#!/usr/bin/python3`
+// shebang ENOENTs on hosts that keep python3 outside /usr/bin.
+const TOOL_DRIVER: &str = r#"#!/usr/bin/env python3
 import json, os, sys, time
 from pathlib import Path
 root = Path(os.environ['QUICKSTART_FIXTURE'])
@@ -157,7 +160,14 @@ if tool == 'kubectl':
             time.sleep(10); sys.exit(0)
         if kind == 'events' and any('jsonpath=' in arg for arg in args): sys.exit(0)
         if kind in ['namespace','namespaces'] and name not in ['-o','--output']:
-            emit({'apiVersion':'v1','kind':'Namespace','metadata':{'name':name,'uid':'fixture-'+name,'resourceVersion':'1','labels':{'curietech.ai/created-by':release,'curietech.ai/created-in':ns}}})
+            # QUICKSTART_NS_LABELS replaces the owned labels on every namespace
+            # the driver answers, like the other env-gated knobs: the labelled
+            # case only needs the first probe before the refusal fires.
+            labels = {'curietech.ai/created-by':release,'curietech.ai/created-in':ns}
+            override = os.environ.get('QUICKSTART_NS_LABELS')
+            if override:
+                labels = json.loads(override)
+            emit({'apiVersion':'v1','kind':'Namespace','metadata':{'name':name,'uid':'fixture-'+name,'resourceVersion':'1','labels':labels}})
         if kind in ['secret','secrets']: absent(kind, name)
         if kind in ['priorityclass','priorityclasses'] and name not in ['-o','--output']: emit(owned('PriorityClass',name))
         if kind in ['deployment','deployments'] and name == 'agent-sandbox-controller': emit(owned('Deployment',name))
@@ -248,6 +258,17 @@ struct Fixture {
     platform: MockServer,
     registry: MockServer,
     openrouter: MockServer,
+}
+
+// The fixture bin dir goes FIRST on PATH, so the driver shims shadow any
+// real helm/kubectl/kind/docker, and the ambient PATH tails it only to hand
+// the driver its `python3` interpreter (see the shebang note above).
+fn driver_path(bin_dir: &std::path::Path) -> std::ffi::OsString {
+    let mut paths = vec![bin_dir.to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::join_paths(paths).expect("join quickstart driver PATH")
 }
 
 impl Fixture {
@@ -362,10 +383,7 @@ impl Fixture {
         cmd.args(["factory", "quickstart", "--repo", "acme/widgets", "--chart"])
             .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../charts/curie"))
             .args(extra)
-            .env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", self.dir.path().join("bin").display()),
-            )
+            .env("PATH", driver_path(&self.dir.path().join("bin")))
             .env("QUICKSTART_FIXTURE", self.dir.path())
             .env("QUICKSTART_VERSION", env!("CARGO_PKG_VERSION"))
             .env("KUBECONFIG", self.dir.path().join("kubeconfig"))
@@ -960,6 +978,60 @@ fn poll_quickstart_ignores_an_exported_webhook_secret() {
     assert!(
         intake["api"].get("githubWebhookSecret").is_none(),
         "poll intake must not write a webhook secret"
+    );
+}
+
+#[test]
+fn a_foreign_labelled_namespace_refusal_names_quickstart_remedies_not_adopt() {
+    // #3996: quickstart has no --adopt, so the `cluster up` child's refusal
+    // must not suggest one; and the listed foreign labels must not include the
+    // kubernetes.io/metadata.name every namespace carries.
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(
+            false,
+            &[
+                "--context",
+                "acme-cluster",
+                "--namespace",
+                "qs-adopt",
+                "--release",
+                "qs-adopt",
+                "--color",
+                "never",
+            ],
+        )
+        .env("QUICKSTART_NAMESPACE", "qs-adopt")
+        .env("QUICKSTART_RELEASE", "qs-adopt")
+        .env(
+            "QUICKSTART_NS_LABELS",
+            r#"{"foo":"bar","kubernetes.io/metadata.name":"qs-adopt"}"#,
+        )
+        .output()
+        .unwrap();
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a foreign-labelled namespace must stop the install: {shown}"
+    );
+    assert!(shown.contains("Installing Curie failed"), "{shown}");
+    assert!(shown.contains("has foreign labels (foo)"), "{shown}");
+    assert!(
+        !shown.contains("kubernetes.io/metadata.name"),
+        "the label every namespace carries is not foreign: {shown}"
+    );
+    assert!(
+        shown.contains("kubectl --context acme-cluster label namespace qs-adopt foo-"),
+        "{shown}"
+    );
+    assert!(shown.contains("rerun with a different `--namespace`"), "{shown}");
+    assert!(
+        !shown.contains("--adopt"),
+        "quickstart has no --adopt to suggest: {shown}"
     );
 }
 

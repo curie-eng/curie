@@ -1585,6 +1585,14 @@ fn step_error(
     crate::exit::operator_context(source, message, Some(fix))
 }
 
+/// Marks the `cluster up` child quickstart spawns. Quickstart has no
+/// `--adopt`, so that child's adoption refusals must not suggest one;
+/// `ops::up` swaps in quickstart-safe remedies instead (#3996). Set only on
+/// the `cluster up` child and removed from every other child, so an inherited
+/// marker cannot leak sideways. Hand-set before a direct `cluster up` it
+/// merely swaps in the quickstart wording -- harmless.
+pub const QUICKSTART_CHILD_ENV: &str = "CURIE_FACTORY_QUICKSTART_CHILD";
+
 async fn run_command(program: &Path, args: &[String], step: &str) -> Result<Output> {
     let ui = crate::ui::ui();
     ui.note(step);
@@ -1596,6 +1604,17 @@ async fn run_command(program: &Path, args: &[String], step: &str) -> Result<Outp
     {
         // Poll quickstart has no webhook secret, just as its in-process plan.
         cmd.env_remove(crate::factory_intake::WEBHOOK_SECRET_ENV);
+    }
+    if args.first().map(String::as_str) == Some("cluster")
+        && args.get(1).map(String::as_str) == Some("up")
+    {
+        // The install child runs under quickstart, which has no --adopt to
+        // offer (#3996).
+        cmd.env(QUICKSTART_CHILD_ENV, "1");
+    } else {
+        // A marker inherited from a quickstart parent must not reach any
+        // other child.
+        cmd.env_remove(QUICKSTART_CHILD_ENV);
     }
     let output = cmd.output().await.map_err(|error| {
         step_error(

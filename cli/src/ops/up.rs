@@ -1215,6 +1215,19 @@ const ADOPTION_RECORD_LIMIT: usize = 4096;
 const ADOPT_HINT: &str =
     "; pass --adopt to adopt it anyway, recording what was adopted on the namespace";
 
+/// Which precondition stopped an adoption. Quickstart runs `cluster up` as a
+/// child and has no `--adopt` of its own to offer (#3996), so the variant
+/// picks the remedy wording that does work from quickstart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdoptionRefusal {
+    /// Incomplete or foreign `curietech.ai/created-by`/`created-in` labels.
+    OwnershipLabels,
+    /// Labels beyond what [`labels_allow_empty_adoption`] permits.
+    ForeignLabels,
+    /// Non-default objects already inside the namespace.
+    ForeignContents,
+}
+
 /// Emitted alongside [`MODEL_CREDENTIAL_KEY`], and only when a credential is
 /// present -- see `up_commands`, which pushes both inside one `if let`.
 pub(crate) const FAKE_MODEL_KEY: &str = "agentSandbox.runner.fakeModel";
@@ -9138,6 +9151,90 @@ mod tests {
             "the conflict guard matches the key trimmed on both ends"
         );
     }
+
+    // #3996: a quickstart-run `cluster up` child has no `--adopt` to offer,
+    // and the label every namespace carries is not foreign.
+    #[test]
+    fn foreign_label_keys_omits_only_the_names_mirror() {
+        let ns = "qs-adopt";
+        let mirror = "kubernetes.io/metadata.name".to_string();
+        let mut labels = BTreeMap::new();
+        labels.insert("foo".to_string(), "bar".to_string());
+        labels.insert(mirror.clone(), ns.to_string());
+        // The mirror of the namespace's own name is not a foreign label.
+        assert_eq!(foreign_label_keys(&labels, ns), vec!["foo".to_string()]);
+        // A mismatched value is a real label and stays listed.
+        labels.insert(mirror.clone(), "other".to_string());
+        assert_eq!(
+            foreign_label_keys(&labels, ns).join(", "),
+            "foo, kubernetes.io/metadata.name"
+        );
+        // The empty-adoption allowance itself is unchanged: the mirror alone
+        // adopts, anything else does not.
+        let mut mirror_only = BTreeMap::new();
+        mirror_only.insert(mirror, ns.to_string());
+        assert!(labels_allow_empty_adoption(&mirror_only, ns));
+        assert!(!labels_allow_empty_adoption(&labels, ns));
+    }
+
+    #[test]
+    fn cluster_up_refusals_keep_the_adopt_hint() {
+        let ns = "qs-adopt";
+        let keys = vec!["foo".to_string()];
+        let ctx = Some("acme-cluster");
+        let refusals = [
+            AdoptionRefusal::OwnershipLabels,
+            AdoptionRefusal::ForeignLabels,
+            AdoptionRefusal::ForeignContents,
+        ];
+        for refusal in refusals {
+            let hinted = adoption_refusal_hint(refusal, false, ctx, ns, &keys);
+            assert_eq!(hinted, ADOPT_HINT);
+        }
+    }
+
+    #[test]
+    fn quickstart_refusals_name_quickstart_remedies_not_adopt() {
+        let ns = "qs-adopt";
+        let keys = vec!["foo".to_string()];
+        let ctx = Some("acme-cluster");
+        // Foreign labels: strip them with kubectl, or another namespace. One
+        // command carries every `<key>-` removal, quoted so a key that needs
+        // quotes keeps the `-` inside them.
+        let hint = adoption_refusal_hint(AdoptionRefusal::ForeignLabels, true, ctx, ns, &keys);
+        assert_eq!(
+            hint,
+            "; remove it with `kubectl --context acme-cluster label namespace qs-adopt foo-`, \
+             or rerun with a different `--namespace`"
+        );
+        let argo = "argocd.argoproj.io/instance".to_string();
+        let two_keys = vec!["foo".to_string(), argo];
+        let hint = adoption_refusal_hint(AdoptionRefusal::ForeignLabels, true, ctx, ns, &two_keys);
+        assert_eq!(
+            hint,
+            "; remove it with `kubectl --context acme-cluster label namespace qs-adopt foo- \
+             'argocd.argoproj.io/instance-'`, or rerun with a different `--namespace`"
+        );
+        // No pinned context: the plain command, never an empty `--context`.
+        let hint = adoption_refusal_hint(AdoptionRefusal::ForeignLabels, true, None, ns, &keys);
+        assert_eq!(
+            hint,
+            "; remove it with `kubectl label namespace qs-adopt foo-`, \
+             or rerun with a different `--namespace`"
+        );
+        // Foreign ownership labels and non-default contents cannot be fixed
+        // from quickstart either: only the other-namespace remedy applies.
+        let unfixable = [
+            AdoptionRefusal::OwnershipLabels,
+            AdoptionRefusal::ForeignContents,
+        ];
+        for refusal in unfixable {
+            let hint = adoption_refusal_hint(refusal, true, ctx, ns, &keys);
+            assert_eq!(hint, "; rerun with a different `--namespace`");
+            assert!(!hint.contains("--adopt"), "{hint}");
+            assert!(!hint.contains("kubectl"), "{hint}");
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -9397,8 +9494,15 @@ async fn establish_primary_namespace_ownership(o: &CommonOpts, adopt: bool) -> R
                 let by = created_by.map(String::as_str).unwrap_or("<missing>");
                 let install = created_in.map(String::as_str).unwrap_or("<missing>");
                 bail!(
-                    "namespace `{}` has incomplete or foreign ownership labels: {CREATED_BY_LABEL}={by}, {CREATED_IN_LABEL}={install}; refusing to mutate it{ADOPT_HINT}",
-                    o.namespace
+                    "namespace `{}` has incomplete or foreign ownership labels: {CREATED_BY_LABEL}={by}, {CREATED_IN_LABEL}={install}; refusing to mutate it{}",
+                    o.namespace,
+                    adoption_refusal_hint(
+                        AdoptionRefusal::OwnershipLabels,
+                        quickstart_child(),
+                        pinned_context().as_deref(),
+                        &o.namespace,
+                        &[]
+                    )
                 );
             }
             if o.namespace == CONTROLLER_DEPLOYMENT_NAMESPACE {
@@ -9409,18 +9513,33 @@ async fn establish_primary_namespace_ownership(o: &CommonOpts, adopt: bool) -> R
             }
             let foreign_labels = !labels_allow_empty_adoption(&record.labels, &o.namespace);
             if foreign_labels && !adopt {
-                let keys = record.labels.keys().cloned().collect::<Vec<_>>().join(", ");
+                let keys = foreign_label_keys(&record.labels, &o.namespace);
+                let listing = keys.join(", ");
                 bail!(
-                    "namespace `{}` has foreign labels ({keys}) and cannot be adopted{ADOPT_HINT}",
-                    o.namespace
+                    "namespace `{}` has foreign labels ({listing}) and cannot be adopted{}",
+                    o.namespace,
+                    adoption_refusal_hint(
+                        AdoptionRefusal::ForeignLabels,
+                        quickstart_child(),
+                        pinned_context().as_deref(),
+                        &o.namespace,
+                        &keys
+                    )
                 );
             }
             let contents = namespace_foreign_contents(&o.namespace).await?;
             if let Some(detail) = &contents {
                 if !adopt {
                     bail!(
-                        "namespace `{}` contains non-default objects and cannot be adopted: {detail}{ADOPT_HINT}",
-                        o.namespace
+                        "namespace `{}` contains non-default objects and cannot be adopted: {detail}{}",
+                        o.namespace,
+                        adoption_refusal_hint(
+                            AdoptionRefusal::ForeignContents,
+                            quickstart_child(),
+                            pinned_context().as_deref(),
+                            &o.namespace,
+                            &[]
+                        )
                     );
                 }
             }
@@ -9734,6 +9853,78 @@ fn labels_allow_empty_adoption(labels: &BTreeMap<String, String>, namespace: &st
                 .get("kubernetes.io/metadata.name")
                 .map(String::as_str)
                 == Some(namespace))
+}
+
+/// Label keys that stop an adoption, in listing order. Every namespace carries
+/// `kubernetes.io/metadata.name` -- it mirrors the namespace's own name, and
+/// [`labels_allow_empty_adoption`] already allows it -- so it is not foreign:
+/// omit it from the listing when its value matches the name. A mismatched
+/// value is a real label and stays listed (#3996).
+fn foreign_label_keys(labels: &BTreeMap<String, String>, namespace: &str) -> Vec<String> {
+    labels
+        .iter()
+        .filter(|(key, value)| {
+            !(key.as_str() == "kubernetes.io/metadata.name" && value.as_str() == namespace)
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// The trailing remedy on an adoption refusal. A direct `cluster up` keeps
+/// the `--adopt` hint. The quickstart-spawned `cluster up` child has no
+/// `--adopt` to pass, so its refusals must instead name actions that work
+/// from quickstart: strip the foreign labels with kubectl, or install under
+/// another namespace (#3996). Every `<key>-` removal rides the one quoted
+/// kubectl command, so the `-` stays inside the quotes of any key that
+/// needs them.
+fn adoption_refusal_hint(
+    refusal: AdoptionRefusal,
+    quickstart: bool,
+    context: Option<&str>,
+    namespace: &str,
+    foreign_keys: &[String],
+) -> String {
+    if !quickstart {
+        return ADOPT_HINT.to_string();
+    }
+    match refusal {
+        AdoptionRefusal::OwnershipLabels | AdoptionRefusal::ForeignContents => {
+            "; rerun with a different `--namespace`".to_string()
+        }
+        AdoptionRefusal::ForeignLabels => {
+            let pinned = match context {
+                Some(context) => format!("--context {} ", shell_quote(context)),
+                None => String::new(),
+            };
+            let removals = foreign_keys
+                .iter()
+                .map(|key| shell_quote(&format!("{key}-")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                "; remove it with `kubectl {pinned}label namespace {} {}`, \
+                 or rerun with a different `--namespace`",
+                shell_quote(namespace),
+                removals
+            )
+        }
+    }
+}
+
+/// Whether this process is the `cluster up` child a `factory quickstart` run
+/// spawned. Quickstart sets [`crate::factory_quickstart::QUICKSTART_CHILD_ENV`]
+/// on that child and clears it on every other one (#3996).
+fn quickstart_child() -> bool {
+    std::env::var(crate::factory_quickstart::QUICKSTART_CHILD_ENV).as_deref() == Ok("1")
+}
+
+/// The context `pin_for_cluster_command` exported for this process, if any --
+/// the same source `kubectl_repair_prefix` reads.
+fn pinned_context() -> Option<String> {
+    match std::env::var("HELM_KUBECONTEXT") {
+        Ok(context) if !context.is_empty() => Some(context),
+        _ => None,
+    }
 }
 
 async fn namespace_foreign_contents(namespace: &str) -> Result<Option<String>> {
