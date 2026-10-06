@@ -32,9 +32,10 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
         if resource == "api"
         else catalog()["candidate"]
     )
-    # The candidate keeps moving as later migrations land (#2909 added 0078, #3819 added 0079);
+    # The candidate keeps moving as later migrations land (#2909 added 0078, #3819 added 0079,
+    # #4067 added 0081);
     # the point of this test is that the min side tracks the ledger schema.
-    assert window == {"schema_min": "0077", "schema_head": "0079"}
+    assert window == {"schema_min": "0077", "schema_head": "0081"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -51,8 +52,8 @@ def test_new_candidate_release_fields_are_0130(field: str) -> None:
 def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
     data = catalog()
-    assert data["windows"].get("0.13.0") == {"schema_min": "0077", "schema_head": "0079"}
-    assert data["revisions"][-3:] == ["0077", "0078", "0079"]
+    assert data["windows"].get("0.13.0") == {"schema_min": "0077", "schema_head": "0081"}
+    assert data["revisions"][-3:] == ["0078", "0079", "0081"]
     assert (
         json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())["0077"]
         == "expand"

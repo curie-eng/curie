@@ -218,7 +218,7 @@ adds `action_executions`:
 | `connector_digest` | text | The `sha256:` digest the call must run against. |
 | `authority_kind`, `authority_ref` | text | `undo_ruling` with the authorizing audit row id, `policy` with the generation reference, `approval` with the approval id, `capability_probe` with the reconcile pass id. |
 | `requested_by` | text, nullable | The ruling's actor; copied to `undone_by` on confirmation. |
-| `idempotency_key` | text, unique | Restore: `restore:<action id>:<authorizing audit row id>`. Forward: supplied by the authority owner. Probe: `probe:<agent>:<connector>:<digest>`. |
+| `idempotency_key` | text, unique per `agent_id` | Restore: `restore:<action id>:<authorizing audit row id>`. Forward: supplied by the authority owner. Probe: `probe:<agent>:<connector>:<digest>`. |
 | `state` | text | ACTION-EXECUTOR-17. |
 | `refusal_code`, `failure_code` | text, nullable | ACTION-EXECUTOR-20. |
 | `attempt`, `lease_owner`, `lease_expires_at` | int, text, timestamptz | Claim fencing. |
@@ -226,12 +226,18 @@ adds `action_executions`:
 | `outcome` | JSONB, nullable | Version strings, key identifier and codes only; never an envelope, a state or a result. |
 
 Constraints: check constraints on `kind` and `state`; a unique partial index on
-`subject_action_id` for `kind = 'restore'` and `state <> 'refused'`.
+`subject_action_id` for `kind = 'restore'` and `state <> 'refused'`; uniqueness
+of `idempotency_key` within one `agent_id`, so one agent's key can never adopt
+another agent's execution; and a composite foreign key from
+(`subject_action_id`, `agent_id`) to the subject action's (`id`, `agent_id`), so
+an execution always runs under the agent whose action it concerns.
 
 Acceptance: real Postgres upgrade, downgrade and upgrade round trip; existing
 `agent_actions` rows survive unchanged; a second non-refused restore for one
 action violates the index; an unknown state violates the check; a replayed
-creation with the same idempotency key adopts the existing row.
+creation with the same idempotency key adopts the existing row; the same key
+under another agent creates a distinct row; an execution whose `agent_id`
+differs from its subject action's agent violates the foreign key.
 
 <!-- @spec ACTION-EXECUTOR-3 -->
 **ACTION-EXECUTOR-3. A ruling becomes an execution request without a model.**
@@ -474,8 +480,13 @@ versions. Ruling refusal codes for missing ingredients: `refused_unsealed`,
 `refused_unversioned`, `refused_no_digest`, `refused_not_restore_capable`,
 `refused_key_custody`, `refused_no_agent`.
 
+The undo route applies this derivation from the change that adds it: an action
+whose `undoable` is false is refused with its code before any audit evidence of
+a granted undo is written, so a read and a ruling never disagree.
+
 Acceptance: each missing ingredient alone makes `undoable` false through the
-real API read and maps to its code; a legacy cleartext row is refused
+real API read and maps to its code; the undo route refuses the same action with
+that code and writes no granted-undo audit row; a legacy cleartext row is refused
 `refused_unsealed`; a confirmed restore sets `undone_at`; a failed or
 indeterminate one does not and still blocks a second undo.
 
