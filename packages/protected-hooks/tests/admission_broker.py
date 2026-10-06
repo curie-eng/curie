@@ -622,10 +622,11 @@ def snapshot(broker):
 
 
 def facade(broker, atomic, limit=100):
-    """Explicit trusted immutable tuple, @spec PROTECTED-HOOK-ADMISSION-1."""
+    """Explicit trusted immutable tuple: the provisioner's trusted manifest in place of a
+    bare broker identity, @spec PROTECTED-HOOK-ADMISSION-1."""
     return atomic.AtomicAdmission(
         client(broker),
-        broker_identity=broker.manifest().as_dict()["broker_identity"],
+        trusted_manifest=broker.manifest(),
         trusted_max_readiness_ms=60000,
         backlog_limit=limit,
     )
