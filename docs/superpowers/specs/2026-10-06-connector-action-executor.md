@@ -564,8 +564,9 @@ unchanged. In one executor sandbox, after `list`:
 
 1. `observe` calls the pinned connector's `observe_version` with the recorded
    `target`. This is the version observed now.
-2. The worker compares it with the recorded `post_version`. On any difference,
-   or an absent or malformed version, it writes audit `refused_conflict` naming
+2. The worker reports it to the API's observation route, and the API compares
+   it with the recorded `post_version`. On any difference, or an absent or
+   malformed version, the API writes audit `refused_conflict` naming
    both versions, ends the execution `refused` with `version_conflict`, and
    makes no `restore` call.
 3. Only on equality does it commit `dispatched` and run `call` with
@@ -732,6 +733,33 @@ routes use the platform API key the worker already holds. A finished probe
 records one `connector_capabilities` row for its agent, connector and digest,
 with `restore_capable` true only when the probe observed both `restore` and
 `observe_version` (ACTION-EXECUTOR-8).
+
+Review decisions for the routes, which the worker and later tasks rely on:
+
+* The undo ruling derives its actor and channel evidence from an authenticated
+  chat, console, operator or adapter principal, exactly as the approval resolver
+  does under ADR 0106; a self-asserted `actor` in the request body is not
+  authority, and a body actor that differs from the principal is refused. A
+  ruling now causes a real restore, so a platform key alone cannot impersonate
+  an approver.
+* The internal probe, claim, observation, report and dispatch routes require
+  the internal worker token, not the platform or operator key, so a key holder
+  cannot forge a confirmed restore or a `restore_capable` capability row. With
+  the executor disabled, claim and dispatch hand out nothing.
+* The ruling stores `arguments_sha256` for the restore call it authorizes, as
+  ACTION-EXECUTOR-7 requires of the creator.
+* A probe's `authority_ref` is its probe key. A probe that ended `refused` or
+  `failed` does not block a later probe of the same agent, connector and digest:
+  the next probe is a new execution whose key carries the next probe attempt
+  number, and only a non-terminal or confirmed probe is adopted.
+* Lease expiry: a claim is attempted at most three times; an expired claim
+  before dispatch is reclaimed with the next attempt, the third expiry ends
+  `refused` with `runner_unavailable`, and an expired dispatched execution ends
+  `indeterminate` with `response_lost`.
+* Every terminal restore outcome writes one closing audit row naming its state
+  and code, with versions only. A database uniqueness violation is mapped to
+  the constraint it names; only the live restore index maps to
+  `refused_restore_in_flight`.
 
 Acceptance: a table-driven test drives each code through its real producer and
 asserts the terminal state; an injected unknown code is normalized.
