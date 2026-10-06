@@ -50,6 +50,8 @@ const MISSING_ID: &str = "99999999-9999-9999-9999-999999999999";
 /// Not a UUID: the CLI may refuse it itself or pass the API's 422 through;
 /// both are an ADR-0021 usage error.
 const MALFORMED_ID: &str = "not-a-uuid";
+/// An action whose undo the API refuses with 503 because the executor is off.
+const EXECUTOR_OFF_ACTION_ID: &str = "88888888-8888-8888-8888-888888888888";
 
 /// The execution the granted undo creates.
 const EXECUTION_ID: &str = "66666666-6666-6666-6666-666666666666";
@@ -65,6 +67,8 @@ const SNAPSHOT_MARKER: &str = "sealed-envelope-ciphertext-must-never-print";
 
 const IN_FLIGHT_REASON: &str = "a restore of this action already exists";
 const UNAUTHORIZED_REASON: &str = "not authorized to undo this action";
+/// `_EXECUTOR_DISABLED_REASON` in `apps/api/src/curie_api/routers/actions.py`.
+const EXECUTOR_DISABLED_REASON: &str = "the action executor is not enabled on this installation";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -92,7 +96,7 @@ fn action_json(id: &str, undoable: bool) -> Value {
         "arguments": {"name": "web", "replicas": 3},
         "result": {"ok": true},
         "prior_state": {"kid": "kid-1", "ciphertext": SNAPSHOT_MARKER},
-        "post_state": null,
+        "post_state": {"sealed": SNAPSHOT_MARKER},
         "target": {"kind": "deployment", "name": "web"},
         "detail": null,
         "gate_approval_id": null,
@@ -201,6 +205,9 @@ fn api() -> MockServer {
             }
             ("POST", p) if p == format!("/actions/{FORBIDDEN_ACTION_ID}/undo") => {
                 detail(403, UNAUTHORIZED_REASON)
+            }
+            ("POST", p) if p == format!("/actions/{EXECUTOR_OFF_ACTION_ID}/undo") => {
+                detail(503, EXECUTOR_DISABLED_REASON)
             }
             ("POST", p) if p == format!("/actions/{MISSING_ID}/undo") => {
                 detail(404, "action not found")
@@ -756,5 +763,370 @@ fn execution_human_receipt_names_state_and_code() {
                 "the receipt names code {code}: {shown}"
             );
         }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Review round 1
+// --------------------------------------------------------------------------
+
+// @spec ACTION-EXECUTOR-23 @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-20
+/// M1. The executor-disabled 503 is a configuration refusal, not an outage:
+/// only an operator changing the installation can change the answer, so it
+/// must not carry the retryable class (3). It is a failure (1) whose fix names
+/// the setting that enables the executor.
+#[test]
+fn undo_refused_because_the_executor_is_disabled_is_not_retryable_and_names_the_setting() {
+    for tier in ["local", "cluster"] {
+        let server = api();
+        let output = run(
+            tier,
+            &["undo", EXECUTOR_OFF_ACTION_ID],
+            &server,
+            Some(OPERATOR_PRINCIPAL),
+            true,
+        );
+        let what = format!("{tier} actions undo (executor disabled)");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{what}: a disabled executor is a failure (exit 1), never the retryable exit 3:\n{}",
+            text(&output)
+        );
+        let value = one_object(&output, &what);
+        assert_error_object(&value, &what);
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap()
+                .contains(EXECUTOR_DISABLED_REASON),
+            "{what}: the error states the API's reason: {value}"
+        );
+        let fix = value["fix"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{what}: the refusal carries a fix: {value}"));
+        assert!(
+            fix.contains("CURIE_ACTION_EXECUTOR_ENABLED") || fix.contains("actionExecutor.enabled"),
+            "{what}: the fix names how to enable the executor (the chart value \
+             actionExecutor.enabled or CURIE_ACTION_EXECUTOR_ENABLED): {fix}"
+        );
+    }
+}
+
+/// Run `curie cluster actions ..` with NO `--api-url`/`--api-key`, so the
+/// cluster tier would have to discover its connection, with an empty `PATH`
+/// (no helm, no kubectl) and no kubeconfig, as `cluster_target.rs` does.
+fn run_cluster_undiscovered(args: &[&str], principal: Option<&str>) -> Output {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let empty_path = dir.path().join("empty-path");
+    std::fs::create_dir_all(&empty_path).expect("create empty PATH");
+    let mut command = Command::new(bin());
+    command
+        .args(["cluster", "actions"])
+        .args(args)
+        .arg("--json")
+        .current_dir(dir.path())
+        .env_clear()
+        .env("HOME", dir.path())
+        .env("PATH", &empty_path)
+        .env("KUBECONFIG", dir.path().join("no-kubeconfig"))
+        .env("NO_COLOR", "1")
+        .env("CI", "1");
+    if let Some(principal) = principal {
+        command.env("CURIE_APPROVAL_PRINCIPAL_TOKEN", principal);
+    }
+    command
+        .output()
+        .unwrap_or_else(|err| panic!("run curie cluster actions {}: {err}", args.join(" ")))
+}
+
+fn assert_no_connection_discovery(output: &Output, what: &str) {
+    let shown = text(output);
+    for marker in ["Helm", "helm", "kubectl", "port-forward", "kube context"] {
+        assert!(
+            !shown.contains(marker),
+            "{what}: the input error must be raised before connection discovery, \
+             but the output mentions {marker:?}:\n{shown}"
+        );
+    }
+}
+
+// @spec ACTION-EXECUTOR-23
+/// M2. At the cluster tier without `--api-url`, a malformed id is a usage error
+/// naming the id, raised before any Helm, kube or port-forward step.
+#[test]
+fn cluster_tier_refuses_a_malformed_id_before_discovering_the_connection() {
+    for verb in ["show", "undo", "execution"] {
+        let output = run_cluster_undiscovered(&[verb, MALFORMED_ID], Some(OPERATOR_PRINCIPAL));
+        let what = format!("cluster actions {verb} {MALFORMED_ID} (no --api-url)");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{what}: a malformed id is a usage error:\n{}",
+            text(&output)
+        );
+        let value = one_object(&output, &what);
+        assert_error_object(&value, &what);
+        assert!(
+            value["error"].as_str().unwrap().contains(MALFORMED_ID),
+            "{what}: the error names the malformed id: {value}"
+        );
+        assert_no_connection_discovery(&output, &what);
+    }
+}
+
+// @spec ACTION-EXECUTOR-23 @spec ACTION-EXECUTOR-3
+/// M2. At the cluster tier without `--api-url`, a missing principal is a usage
+/// error naming CURIE_APPROVAL_PRINCIPAL_TOKEN, raised before the release's key
+/// Secret is read or a tunnel opened.
+#[test]
+fn cluster_tier_refuses_a_missing_principal_before_discovering_the_connection() {
+    let output = run_cluster_undiscovered(&["undo", ACTION_ID], None);
+    let what = "cluster actions undo without a principal (no --api-url)";
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{what}: a missing principal is a usage error:\n{}",
+        text(&output)
+    );
+    let value = one_object(&output, what);
+    assert_error_object(&value, what);
+    assert!(
+        value.to_string().contains("CURIE_APPROVAL_PRINCIPAL_TOKEN"),
+        "{what}: the error names the env-backed credential: {value}"
+    );
+    assert_no_connection_discovery(&output, what);
+}
+
+// @spec ACTION-EXECUTOR-23
+/// M3. `list --conversation <id>` scopes the read with the API's
+/// `conversation_id` filter, and never asks for more than the API's cap.
+#[test]
+fn list_filters_by_conversation_at_both_tiers() {
+    for tier in ["local", "cluster"] {
+        let server = api();
+        let output = run(
+            tier,
+            &["list", "--conversation", "thread-1"],
+            &server,
+            None,
+            true,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{tier} actions list --conversation must succeed:\n{}",
+            text(&output)
+        );
+        one_object(&output, &format!("{tier} actions list --conversation"));
+        let listed: Vec<Request> = server
+            .recorded()
+            .into_iter()
+            .filter(|r| r.method == "GET" && r.path.starts_with("/actions?"))
+            .collect();
+        assert_eq!(listed.len(), 1, "{tier} list reads GET /actions once");
+        let path = &listed[0].path;
+        assert!(
+            path.contains("conversation_id=thread-1"),
+            "{tier} list --conversation passes conversation_id: {path}"
+        );
+        if let Some(limit) = path
+            .split(['?', '&'])
+            .find_map(|pair| pair.strip_prefix("limit="))
+        {
+            let limit: u32 = limit.parse().expect("limit is a number");
+            assert!(
+                (1..=200).contains(&limit),
+                "{tier} list asks for at most the API's cap: {path}"
+            );
+        }
+    }
+}
+
+// @spec ACTION-EXECUTOR-23
+/// M3. The API returns the OLDEST actions first and caps a page at 200. When a
+/// page comes back full, both outputs say the list may be truncated, and the
+/// human one says which end was kept.
+#[test]
+fn a_full_page_is_reported_as_possibly_truncated_oldest_first() {
+    let server = serve(|request: &Request| {
+        let (route, _) = request.path.split_once('?').unwrap_or((&request.path, ""));
+        match (request.method.as_str(), route) {
+            ("GET", "/agents") => Response::json(200, &format!("[{}]", agent_json())),
+            ("GET", "/actions") => {
+                let rows: Vec<Value> = (0..200)
+                    .map(|n| action_json(&format!("11111111-1111-1111-1111-{n:012}"), false))
+                    .collect();
+                Response::json(200, &Value::Array(rows).to_string())
+            }
+            _ => detail(405, "unexpected request"),
+        }
+    });
+
+    let json_out = run(
+        "local",
+        &["list", "--agent", AGENT_NAME],
+        &server,
+        None,
+        true,
+    );
+    assert_eq!(json_out.status.code(), Some(0), "{}", text(&json_out));
+    let value = one_object(&json_out, "list of a full page");
+    assert_eq!(
+        value["truncated"],
+        Value::Bool(true),
+        "a full page of 200 is reported truncated: {}",
+        value["truncated"]
+    );
+
+    let human = run(
+        "local",
+        &["list", "--agent", AGENT_NAME],
+        &server,
+        None,
+        false,
+    );
+    assert_eq!(human.status.code(), Some(0), "{}", text(&human));
+    let shown = text(&human).to_lowercase();
+    assert!(
+        shown.contains("200") && (shown.contains("more") || shown.contains("truncat")),
+        "the human list says a full page may be truncated: {shown}"
+    );
+    assert!(
+        shown.contains("oldest"),
+        "the human list says the kept page is the OLDEST actions, so an operator \
+         looking for a recent one knows to narrow the filter: {shown}"
+    );
+}
+
+// @spec ACTION-EXECUTOR-23
+/// L1. `list` and `show` never print snapshot material, in either mode, even
+/// though every stub row carries a sealed `prior_state` and a `post_state`.
+#[test]
+fn list_and_show_never_print_snapshot_material() {
+    for tier in ["local", "cluster"] {
+        for args in [vec!["list", "--agent", AGENT_NAME], vec!["show", ACTION_ID]] {
+            for json_mode in [true, false] {
+                let server = api();
+                let output = run(tier, &args, &server, None, json_mode);
+                let what = format!("{tier} actions {} (json={json_mode})", args.join(" "));
+                assert_eq!(output.status.code(), Some(0), "{what}:\n{}", text(&output));
+                assert!(
+                    !text(&output).contains(SNAPSHOT_MARKER),
+                    "{what}: never prints snapshot material:\n{}",
+                    text(&output)
+                );
+                if json_mode {
+                    let value = one_object(&output, &what);
+                    assert!(
+                        !contains_key(&value, "prior_state") && !contains_key(&value, "post_state"),
+                        "{what}: carries no prior_state or post_state: {value}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// @spec ACTION-EXECUTOR-18
+/// L2. The receipt hand-projects the `ActionExecution` mirror (renaming `id`,
+/// folding `refusal_code`/`failure_code` into `code`), so the pair must be
+/// declared to the emit-parity gate in `cli/api-mirrors.json`; the gate only
+/// checks declared pairs. The folded codes are declared omissions with a reason.
+#[test]
+fn the_receipt_projection_is_declared_to_the_emit_parity_gate() {
+    let mirrors: Value = serde_json::from_str(include_str!("../api-mirrors.json"))
+        .expect("cli/api-mirrors.json parses");
+    let entry = mirrors["emits"]
+        .as_array()
+        .expect("api-mirrors.json has an emits array")
+        .iter()
+        .find(|e| e["output"] == "ActionsOutput" && e["struct"] == "ActionExecution")
+        .unwrap_or_else(|| {
+            panic!("emits must declare the (ActionsOutput, ActionExecution) projection")
+        });
+    let omissions = entry["omissions"].as_array().cloned().unwrap_or_default();
+    for field in ["refusal_code", "failure_code"] {
+        let declared = omissions
+            .iter()
+            .find(|o| o["field"] == field)
+            .unwrap_or_else(|| {
+                panic!("{field} folds into `code` and is a declared omission: {entry}")
+            });
+        assert!(
+            declared["why"]
+                .as_str()
+                .is_some_and(|why| !why.trim().is_empty()),
+            "{field}: the omission states why: {declared}"
+        );
+    }
+}
+
+// @spec ACTION-EXECUTOR-23
+/// L3. A principal token with a trailing newline (an `$(cat file)` export)
+/// behaves at `actions undo` exactly as it does at `approvals --resolve`: the
+/// same exit class, one error object, no request reaching the API, and the
+/// token never printed.
+#[test]
+fn a_principal_with_a_trailing_newline_behaves_as_it_does_for_approvals_resolve() {
+    let token = format!("{OPERATOR_PRINCIPAL}\n");
+    let observe = |argv: &[&str]| -> (Option<i32>, Value, usize, String) {
+        let server = serve(|_| detail(500, "unexpected request"));
+        let output = Command::new(bin())
+            .args(argv)
+            .args([
+                "--api-url",
+                &server.base_url,
+                "--api-key",
+                TEST_API_KEY,
+                "--json",
+            ])
+            .env_remove("CURIE_API_URL")
+            .env_remove("CURIE_API_KEY")
+            .env("CURIE_APPROVAL_PRINCIPAL_TOKEN", &token)
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap_or_else(|err| panic!("run curie {}: {err}", argv.join(" ")));
+        let what = argv.join(" ");
+        let value = one_object(&output, &what);
+        assert_error_object(&value, &what);
+        (
+            output.status.code(),
+            value,
+            server.recorded().len(),
+            text(&output),
+        )
+    };
+
+    let (approvals_code, approvals_value, approvals_sent, approvals_text) = observe(&[
+        "local",
+        "approvals",
+        "weather",
+        "--resolve",
+        "22222222-2222-2222-2222-222222222222",
+    ]);
+    let (undo_code, undo_value, undo_sent, undo_text) =
+        observe(&["local", "actions", "undo", ACTION_ID]);
+
+    assert_eq!(
+        undo_code, approvals_code,
+        "undo classifies a newline-terminated token as approvals --resolve does\n\
+         approvals: {approvals_value}\nundo: {undo_value}"
+    );
+    assert_eq!(
+        undo_sent, approvals_sent,
+        "undo sends what approvals --resolve sends for the same token"
+    );
+    assert_eq!(
+        undo_value["fix"].is_null(),
+        approvals_value["fix"].is_null(),
+        "undo carries a fix exactly when approvals --resolve does\n\
+         approvals: {approvals_value}\nundo: {undo_value}"
+    );
+    for (what, shown) in [("approvals", approvals_text), ("undo", undo_text)] {
+        assert!(
+            !shown.contains(OPERATOR_PRINCIPAL),
+            "{what}: the token is never printed: {shown}"
+        );
     }
 }
