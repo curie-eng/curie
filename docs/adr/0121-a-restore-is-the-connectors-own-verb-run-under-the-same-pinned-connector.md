@@ -2,7 +2,11 @@
 
 Date: 2026-08-25
 
-Status: Draft
+Status: Accepted
+
+Maintainer jw3329 explicitly approved acceptance on 2026-10-05, together with
+[ADR 0124](0124-a-snapshot-is-sealed-to-the-connector-that-wrote-it.md), its prerequisite, and
+[ADR 0203](0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md), which relies on this executor.
 
 Answers the one decision
 [ADR-0117](0117-a-tool-that-changes-the-world-reports-what-it-changed.md)
@@ -115,9 +119,13 @@ and the code, not the container.
    So the checkable rule is about capability, and it is deliberately broader than
    the runtime question: **a connector advertising any tool that is not read-only
    must also advertise `restore`, or it advertises no restore at all and is
-   treated as restoring nothing.** Both halves are inspectable before deploy --
-   `readOnlyHint` is already how this repository's own gate finds write tools --
-   and neither is a claim about a specific action.
+   treated as restoring nothing.** Both halves are inspectable before deploy
+   from the advertised tool list, and neither is a claim about a specific
+   action. The runner already reads `readOnlyHint` at boot
+   (`runner/src/curie_runner/mcp_tool_capability.py`) to build the read-only
+   tool set that receipts, retry safety and read-only turns use; that is a
+   runtime hint, not an authorization decision. No deploy-time check of restore
+   capability exists yet, so the check this decision needs is new work.
 
    This is not the manifest ADR-0117 rejected. That rejection was of a
    declaration that an action *is reversible*, because it could disagree with

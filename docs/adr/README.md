@@ -150,10 +150,10 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0118 | [Binding cardinality is the multi surface opt in](0118-binding-cardinality-is-the-multi-surface-opt-in.md) | Accepted |
 | 0119 | [A resumed thread rebuilds its prefix so the prompt cache still hits](0119-a-resumed-thread-rebuilds-its-prefix-so-the-prompt-cache-still-hits.md) | Accepted |
 | 0120 | [First-party email delivery state is local durable single-writer state](0120-durable-first-party-email-state.md) | Accepted |
-| 0121 | [A restore is the connector's own verb, run under the same pinned connector](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md) | Draft |
+| 0121 | [A restore is the connector's own verb, run under the same pinned connector](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md) | Accepted |
 | 0122 | [A warm pool's runner token is per version, not per pod](0122-a-warm-pools-runner-token-is-per-version-not-per-pod.md) | Accepted |
 | 0123 | [A pending approval's approver set does not follow its route binding](0123-a-pending-approvals-approver-set-does-not-follow-its-route-binding.md) | Accepted |
-| 0124 | [A snapshot is sealed to the connector that wrote it](0124-a-snapshot-is-sealed-to-the-connector-that-wrote-it.md) | Draft |
+| 0124 | [A snapshot is sealed to the connector that wrote it](0124-a-snapshot-is-sealed-to-the-connector-that-wrote-it.md) | Accepted |
 | 0125 | [Managed repository workspaces and approval-gated publication are platform capabilities](0125-managed-repository-workspaces-and-approval-gated-publication.md) | Accepted |
 | 0126 | [Runtime repository selection is sticky authorized thread state](0126-runtime-repository-selection-is-sticky-authorized-thread-state.md) | Accepted |
 | 0127 | [An inbound ACP client admits any ACP harness behind the harness port](0127-an-inbound-acp-client-admits-any-acp-harness.md) | Draft |
@@ -223,4 +223,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0198 | [Identity links live in provider identity namespaces](0198-identity-links-live-in-provider-identity-namespaces.md) | Accepted |
 | 0199 | [The factory admits only tickets it can start and finish](0199-the-factory-admits-only-tickets-it-can-start-and-finish.md) | Accepted |
 | 0200 | [Agents read and edit canvases shared into their bound channels](0200-agents-read-and-edit-canvases-shared-into-their-bound-channels.md) | Accepted |
+| 0203 | [Automated remediation is a pre-qualified action the platform executes and verifies](0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md) | Accepted |
 <!-- END GENERATED: adr-index -->
