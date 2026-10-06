@@ -27,7 +27,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import Settings, get_settings
+from curie_api.factory_notices import _GitHub, _sync_labels
+from curie_api.github_factory import VerifiedIssue, _fresh_base
+from curie_api.github_factory_events import FactoryNotice, FactoryRefused
+from curie_api.github_review_events import FeedbackUnavailable
 from curie_api.main import create_app
+from curie_api.models import FactoryStatusComment, WorkItem
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import text
@@ -47,6 +52,7 @@ from test_github_factory_ingress import (
 )
 
 MARKER = "<!-- curie-factory-base-refusal -->"
+NOT_IMPLEMENTABLE = "curie-factory:not-implementable"
 MAIN_SHA = "1" * 40
 NEXT_SHA = "2" * 40
 TRAIN = {REPO: {"bases": ["main", "next"], "default_base": "main"}}
@@ -521,6 +527,191 @@ def test_a_branch_lookup_outage_is_retryable_not_a_refusal(
     assert response.status_code == 503, response.text
     assert _work_item(number) is None
     assert api.posts() == []
+
+
+# --- Rejection label (ADR 0199) ---------------------------------------------------------
+
+
+def _rejection_notice(number: int) -> FactoryNotice:
+    return FactoryNotice(
+        delivery_id=uuid.uuid4(),
+        event="issues",
+        action="labeled",
+        disposition="admit",
+        installation_id=INSTALLATION_ID,
+        repository_id=REPO_ID,
+        repo_full_name=REPO,
+        issue_number=number,
+        sender_id=6601,
+        sender_login="octocat",
+        label_event_id=900000 + number,
+    )
+
+
+def _refusal_github(
+    recorded: list[tuple[str, str, Any]],
+    *,
+    label_status: int = 200,
+    missing_branch: str | None = None,
+) -> httpx.MockTransport:
+    """A unit stand-in for one fresh admission's GitHub writes, recorded."""
+
+    def github(request: httpx.Request) -> httpx.Response:
+        stored: Any = json.loads(request.content) if request.content else None
+        recorded.append((request.method, request.url.path, stored))
+        if (
+            request.method == "GET"
+            and missing_branch is not None
+            and request.url.path.endswith(f"/branches/{missing_branch}")
+        ):
+            return httpx.Response(404, json={"message": "Branch not found"})
+        if request.method == "GET" and request.url.path.endswith("/comments"):
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and request.url.path.endswith("/comments"):
+            return httpx.Response(201, json={"id": 880500})
+        if request.method == "POST" and request.url.path.endswith("/labels"):
+            return httpx.Response(label_status, json=[])
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    return httpx.MockTransport(github)
+
+
+def _refuse(
+    recorded: list[tuple[str, str, Any]],
+    number: int,
+    labels: set[str],
+    default_branch: str,
+    *,
+    missing_branch: str | None = None,
+    label_status: int = 200,
+) -> None:
+    """One fresh admission against the exact refusal seam, `_fresh_base`."""
+
+    notice = _rejection_notice(number)
+    verified = VerifiedIssue(
+        labels=labels, default_branch=default_branch, token="t", repo_path=f"/repos/{REPO}"
+    )
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(
+            transport=_refusal_github(
+                recorded, label_status=label_status, missing_branch=missing_branch
+            )
+        ) as client:
+            await _fresh_base(notice, verified, Settings(_env_file=None), client)
+
+    asyncio.run(exercise())
+
+
+def _assert_comment_then_label(recorded: list[tuple[str, str, Any]], number: int) -> str:
+    """The refusal comment write, then the rejection label write, in order."""
+
+    comments = [
+        entry
+        for entry in recorded
+        if entry[0] == "POST" and entry[1] == f"/repos/{REPO}/issues/{number}/comments"
+    ]
+    labels = [
+        entry for entry in recorded if entry[1] == f"/repos/{REPO}/issues/{number}/labels"
+    ]
+    assert labels == [
+        ("POST", f"/repos/{REPO}/issues/{number}/labels", {"labels": [NOT_IMPLEMENTABLE]})
+    ]
+    (comment,) = comments
+    assert MARKER in comment[2]["body"]
+    assert recorded.index(comment) < recorded.index(labels[0])
+    return comment[2]["body"]
+
+
+def test_a_base_conflict_refusal_applies_the_not_implementable_label() -> None:
+    recorded: list[tuple[str, str, Any]] = []
+    number = next(_ISSUES)
+
+    with pytest.raises(FactoryRefused) as refused:
+        _refuse(recorded, number, {"base:next", "base:main"}, "main")
+    assert refused.value.code == "base_conflict"
+
+    body = _assert_comment_then_label(recorded, number)
+    assert "more than one base label" in body
+
+
+def test_a_missing_base_refusal_applies_the_not_implementable_label() -> None:
+    recorded: list[tuple[str, str, Any]] = []
+    number = next(_ISSUES)
+
+    # With the default bases map the only allowed branch is the repository
+    # default, so base:main passes the allowed check and reaches the read.
+    with pytest.raises(FactoryRefused) as refused:
+        _refuse(recorded, number, {"base:main"}, "main", missing_branch="main")
+    assert refused.value.code == "base_missing"
+
+    body = _assert_comment_then_label(recorded, number)
+    assert "does not exist in the repository" in body
+
+
+def test_a_refused_not_implementable_label_write_still_refuses_the_admission() -> None:
+    recorded: list[tuple[str, str, Any]] = []
+    number = next(_ISSUES)
+
+    with pytest.raises(FactoryRefused) as refused:
+        _refuse(recorded, number, {"base:next", "base:main"}, "main", label_status=403)
+    assert refused.value.code == "base_conflict"
+
+    _assert_comment_then_label(recorded, number)
+
+
+def test_an_unavailable_not_implementable_label_write_defers_the_refusal() -> None:
+    recorded: list[tuple[str, str, Any]] = []
+    number = next(_ISSUES)
+
+    with pytest.raises(FeedbackUnavailable) as unavailable:
+        _refuse(recorded, number, {"base:next", "base:main"}, "main", label_status=502)
+    assert unavailable.value.code == "base_refusal_unavailable"
+
+    # The comment stands; only the label write deferred the pass.
+    (comment,) = [
+        entry
+        for entry in recorded
+        if entry[0] == "POST" and entry[1] == f"/repos/{REPO}/issues/{number}/comments"
+    ]
+    assert MARKER in comment[2]["body"]
+
+
+def test_the_first_state_label_pass_deletes_the_not_implementable_label() -> None:
+    recorded: list[tuple[str, str, Any]] = []
+    number = 9351
+    row = FactoryStatusComment(execution_request_id=uuid.uuid4(), scan_page=1)
+    item = WorkItem(github_issue_number=number)
+
+    def github(request: httpx.Request) -> httpx.Response:
+        stored: Any = json.loads(request.content) if request.content else None
+        recorded.append((request.method, request.url.path, stored))
+        if request.method == "POST" and request.url.path.endswith("/labels"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(204)
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(github)) as client:
+            await _sync_labels(
+                _GitHub(client, "https://api.github.com", f"/repos/{REPO}", {}),
+                row,
+                item,
+                "waiting",
+            )
+
+    asyncio.run(exercise())
+
+    assert (
+        "POST",
+        f"/repos/{REPO}/issues/{number}/labels",
+        {"labels": ["curie-factory:queued"]},
+    ) in recorded
+    assert (
+        "DELETE",
+        f"/repos/{REPO}/issues/{number}/labels/{NOT_IMPLEMENTABLE}",
+        None,
+    ) in recorded
+    assert row.applied_label == "curie-factory:queued"
 
 
 # --- Frozen base -----------------------------------------------------------------------
