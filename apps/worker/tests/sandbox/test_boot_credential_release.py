@@ -92,3 +92,33 @@ def test_a_preexisting_handle_is_persisted_when_the_report_fails(
     )
     substrate._retire_claim(handle.claim_name, request_timeout_seconds=5, handle=handle)
     assert affinity.claim_credential(handle.claim_name) == (agent, cred)
+
+
+def test_a_reclaim_from_the_same_env_boots_with_a_new_credential(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    from curie_worker.binding import BindingResolver
+    from curie_worker.config import WorkerConfig
+
+    resolver = BindingResolver.__new__(BindingResolver)
+    resolver._config = WorkerConfig(api_key="api-key")  # type: ignore[attr-defined]
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    reported: list[str] = []
+    substrate.set_boot_credential_revoker(lambda _agent, cred: reported.append(cred) or True)
+    substrate.set_boot_credential_minter(resolver.fresh_boot_credential)
+    agent = "55555555-5555-4555-8555-555555555555"
+    env = {
+        HISTORY_TOKEN_ENV: mint(
+            "api-key",
+            agent=agent,
+            scope="state",
+            exp=int(time.time()) + 600,
+            claims={"binding": "slack:C0EXAMPLE1", "memory": "read", "cred": uuid.uuid4().hex},
+        )
+    }
+    first = substrate.claim("thread-again", env=env)
+    assert substrate.release("thread-again")
+    assert reported == [first.state_credential_id]
+    second = substrate.claim("thread-again", env=env)
+    assert second.state_credential_id is not None
+    assert second.state_credential_id not in reported
