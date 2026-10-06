@@ -4,7 +4,7 @@ Polling is the default door. One pass lists labeled issues, mentions, and
 review feedback for each bound repository, then admits through the same
 verification the webhook uses. It does not write a delivery receipt.
 
-Cursors live in ``curie.factory_poll_cursors``. ``since`` moves only to the
+Cursors live in ``curie.factory_poll_cursors``, keyed by tracker scope. ``since`` moves only to the
 newest timestamp on a page that was applied, because GitHub's ``since`` is
 inclusive. An ETag is stored only after that apply. A 304 creates no work.
 
@@ -24,13 +24,14 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 from sqlalchemy import desc, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 from starlette.concurrency import run_in_threadpool
 
 from curie_api.factory_label_reconcile import bound_repositories, parse_time
@@ -60,6 +61,8 @@ from .forges.github.tracker import (
     read_repository,
 )
 from .forges.github.transport import PollUnavailable
+from .forges.hosts import repository_ref
+from .forges.types import TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_factory_events import FactoryNotice, mentions_login
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
@@ -83,8 +86,7 @@ def _engine(sessionmaker: async_sessionmaker[AsyncSession]) -> Any:
 
 async def _label_already_admitted(
     sessionmaker: async_sessionmaker[AsyncSession],
-    repository_id: int,
-    number: int,
+    issue: TrackerIssueRef,
     event: dict[str, Any],
 ) -> bool:
     """True when this label event is not newer than the work item's latest request.
@@ -98,7 +100,7 @@ async def _label_already_admitted(
     if event_at is None:
         return False
     async with sessionmaker() as session:
-        item = await github_factory.work_item_for(session, repository_id, number)
+        item = await github_factory.work_item_for(session, issue)
         if item is None or item.cancelled_at is not None:
             return False
         latest = await session.scalar(
@@ -165,7 +167,6 @@ async def _poll_repository(
     client: httpx.AsyncClient,
     repo: str,
 ) -> None:
-    cursor = await _load_cursor(sessionmaker, repo)
     now = datetime.now(UTC)
     installation_id, token = await run_in_threadpool(
         credentials_for(settings).fresh_installation_token, repo, None
@@ -178,7 +179,6 @@ async def _poll_repository(
         raise Unavailable(repo_path)
     if not isinstance(repository.get("full_name"), str):
         raise Unavailable(repo_path)
-    cursor.repository_id = repository_id
     tracker = GitHubTracker.from_settings(
         settings,
         client,
@@ -186,6 +186,10 @@ async def _poll_repository(
         repository_id=repository_id,
         token=static_token(token),
     )
+    # The cursor belongs to the tracker scope, the repository's immutable id,
+    # so a rename keeps it (ADR 0197).
+    scope = _Scope(tracker.kind, tracker.host, str(repository_id), repo)
+    cursor = await _load_cursor(sessionmaker, scope)
     await _admit_labeled(
         sessionmaker,
         settings,
@@ -214,7 +218,9 @@ async def _poll_repository(
         repo_path=repo_path,
         installation_id=installation_id,
     )
-    owned = await open_pulls(sessionmaker, repo, repository_id)
+    owned = await open_pulls(
+        sessionmaker, repository_ref(settings, path=repo, project_id=repository_id)
+    )
     await admit_review_comments(
         sessionmaker,
         settings,
@@ -242,7 +248,7 @@ async def _poll_repository(
         installation_id=installation_id,
         owned=owned,
     )
-    await _save_cursor(sessionmaker, repo, cursor)
+    await _save_cursor(sessionmaker, scope, cursor)
 
 
 async def _admit_labeled(
@@ -289,7 +295,7 @@ async def _admit_labeled(
                 label=label,
                 label_event_id=event["id"],
             )
-            if await _label_already_admitted(sessionmaker, repository_id, number, event):
+            if await _label_already_admitted(sessionmaker, tracker.issue(number), event):
                 # Later base labels only report disagreement with the frozen base.
                 # Reusing the admission here would cancel or replace the live run.
                 notice = replace(notice, disposition="base_label")
@@ -315,15 +321,12 @@ async def _cancel_stale(
         items = list(
             await session.scalars(
                 select(WorkItem).where(
-                    WorkItem.github_repository_id == repository_id,
+                    *_in_scope(tracker),
                     WorkItem.cancelled_at.is_(None),
-                    WorkItem.github_issue_number.is_not(None),
                 )
             )
         )
-        numbers = sorted(
-            {item.github_issue_number for item in items if item.github_issue_number}
-        )
+        numbers = sorted({int(item.tracker_issue_id) for item in items})
     label = settings.github_factory_label
     keys = {f"issue:{number}:{label}" for number in numbers}
     for key in list(cursor.etags):
@@ -375,17 +378,24 @@ async def _cancel_stale(
             logger.info("factory stale issue poll for %s issue %s deferred", repo, number)
 
 
+def _in_scope(tracker: GitHubTracker) -> tuple[ColumnElement[bool], ...]:
+    """The WorkItems keyed under this tracker's scope (its repository id)."""
+
+    return (
+        WorkItem.tracker_kind == tracker.kind,
+        WorkItem.tracker_host == tracker.host,
+        WorkItem.tracker_scope_id == str(tracker.repository_id),
+    )
+
+
 async def _issue_numbers(
-    sessionmaker: async_sessionmaker[AsyncSession], repository_id: int
+    sessionmaker: async_sessionmaker[AsyncSession], tracker: GitHubTracker
 ) -> set[int]:
     async with sessionmaker() as session:
         rows = await session.scalars(
-            select(WorkItem.github_issue_number).where(
-                WorkItem.github_repository_id == repository_id,
-                WorkItem.github_issue_number.is_not(None),
-            )
+            select(WorkItem.tracker_issue_id).where(*_in_scope(tracker))
         )
-    return {number for number in rows if isinstance(number, int)}
+    return {int(number) for number in rows}
 
 
 async def _admit_mentions(
@@ -407,8 +417,12 @@ async def _admit_mentions(
     )
     if listed is None:
         return
-    factory_issues = await _issue_numbers(sessionmaker, repository_id)
-    owned_pulls = set(await open_pulls(sessionmaker, repo, repository_id))
+    factory_issues = await _issue_numbers(sessionmaker, tracker)
+    owned_pulls = set(
+        await open_pulls(
+            sessionmaker, repository_ref(settings, path=repo, project_id=repository_id)
+        )
+    )
     for comment in listed:
         if not isinstance(comment, dict):
             continue
@@ -481,12 +495,14 @@ async def _apply_notice(
 ) -> None:
     async with sessionmaker() as session:
         try:
-            await github_factory.lock_issue(session, notice.repository_id, notice.issue_number)
+            await github_factory.lock_issue(
+                session, github_factory.notice_issue(notice, settings)
+            )
             verified = await github_factory.verify_current(
                 notice, settings=settings, client=client
             )
             if notice.disposition == "cancel":
-                await github_factory.cancel_notice(session, notice)
+                await github_factory.cancel_notice(session, notice, settings)
             elif notice.disposition == "base_label":
                 await github_factory.record_base_label_notice(session, notice, verified, settings)
             else:
@@ -500,9 +516,23 @@ async def _apply_notice(
         await session.commit()
 
 
-async def _load_cursor(sessionmaker: async_sessionmaker[AsyncSession], repo: str) -> Cursor:
+@dataclass(frozen=True)
+class _Scope:
+    """A cursor's key (kind, host, scope id) and the path it is displayed by."""
+
+    kind: str
+    host: str
+    scope_id: str
+    path: str
+
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.kind, self.host, self.scope_id)
+
+
+async def _load_cursor(sessionmaker: async_sessionmaker[AsyncSession], scope: _Scope) -> Cursor:
     async with sessionmaker() as session:
-        row = await session.get(FactoryPollCursor, repo)
+        row = await session.get(FactoryPollCursor, scope.key)
         if row is None:
             return Cursor()
         raw = row.etags if isinstance(row.etags, dict) else {}
@@ -512,19 +542,20 @@ async def _load_cursor(sessionmaker: async_sessionmaker[AsyncSession], repo: str
             review_comments_since=row.review_comments_since,
             reviews_since=row.reviews_since,
             etags=etags,
-            repository_id=row.repository_id,
         )
 
 
 async def _save_cursor(
-    sessionmaker: async_sessionmaker[AsyncSession], repo: str, cursor: Cursor
+    sessionmaker: async_sessionmaker[AsyncSession], scope: _Scope, cursor: Cursor
 ) -> None:
     async with sessionmaker() as session:
-        row = await session.get(FactoryPollCursor, repo)
+        row = await session.get(FactoryPollCursor, scope.key)
         if row is None:
             row = FactoryPollCursor(
-                repo_full_name=repo,
-                repository_id=cursor.repository_id,
+                tracker_kind=scope.kind,
+                tracker_host=scope.host,
+                tracker_scope_id=scope.scope_id,
+                scope_path=scope.path,
                 comments_since=cursor.comments_since,
                 review_comments_since=cursor.review_comments_since,
                 reviews_since=cursor.reviews_since,
@@ -533,7 +564,7 @@ async def _save_cursor(
             )
             session.add(row)
         else:
-            row.repository_id = cursor.repository_id
+            row.scope_path = scope.path
             row.comments_since = cursor.comments_since
             row.review_comments_since = cursor.review_comments_since
             row.reviews_since = cursor.reviews_since

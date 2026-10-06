@@ -63,10 +63,10 @@ class WorkItemAcquireGrant:
     work_item_id: uuid.UUID
     conversation_id: str
     wait_deadline: str
-    # The repository the signed delivery bound to the WorkItem. None only on
+    # The repository path frozen on the WorkItem at admission. None only on
     # the synthetic grant an approval resume rebuilds, which keeps the
     # thread's existing workspace selection.
-    repo_full_name: str | None
+    repository_path: str | None
 
 
 @dataclass(frozen=True)
@@ -205,9 +205,9 @@ class WorkItemDispatchClient:
                 # An API replica from before #2992 omits the field mid-rollout.
                 # The acquisition is already committed, so read absence as "no
                 # WorkItem repository" rather than failing the wake.
-                repo_full_name=(
-                    str(body["repo_full_name"])
-                    if body.get("repo_full_name") is not None
+                repository_path=(
+                    str(body["repository_path"])
+                    if body.get("repository_path") is not None
                     else None
                 ),
             )
@@ -533,7 +533,7 @@ class WorkItemRun:
         self.work_item_id = grant.work_item_id
         self.owner = owner
         self.generation = grant.generation
-        self.repo_full_name = grant.repo_full_name
+        self.repository_path = grant.repository_path
         self.event_id = event_id
         self.thread_key = thread_key
         self.started = False

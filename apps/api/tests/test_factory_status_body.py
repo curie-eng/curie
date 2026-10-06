@@ -383,7 +383,7 @@ def test_every_factory_comment_creation_redacts_at_the_http_boundary(target_kind
                 GitHubCommentClient(
                     client, "https://api.github.com", "/repos/acme-corp/acme-bot", {}
                 ),
-                WorkItem(github_issue_number=3936),
+                WorkItem(tracker_issue_id="3936"),
                 FactoryStatusComment(execution_request_id=REQUEST, scan_page=1),
                 target,
                 f"{_PROVIDER_DETAIL}\n{_PR_URL}\n{marker_for(REQUEST)}\n",

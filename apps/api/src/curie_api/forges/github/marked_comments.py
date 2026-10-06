@@ -46,7 +46,7 @@ async def subject_title(
     """The issue or PR title for the card, read once. A failed read stays NULL."""
 
     if target.pull_request is None:
-        path = f"{github.repo_path}/issues/{work_item.github_issue_number}"
+        path = f"{github.repo_path}/issues/{work_item.tracker_issue_id}"
     else:
         path = f"{github.repo_path}/pulls/{target.pull_request.number}"
     try:
@@ -76,7 +76,7 @@ async def deliver(
 
     api, repo_path, headers, client = github.api, github.repo_path, github.headers, github.client
     number = (
-        work_item.github_issue_number
+        int(work_item.tracker_issue_id)
         if target.pull_request is None
         else int(target.pull_request.number)
     )

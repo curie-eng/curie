@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/work-items/v1.1.json",
+  "$id": "https://schemas.curietech.ai/cli/work-items/v2.json",
   "title": "curie <tier> work-items --json",
   "description": "The agent-facing payload of `curie <tier> work-items [ID]`: the dry-run plan, the factory work item list (`items`, `limit`, `truncated`), or one work item under `item` with live CI. `state` and `actionable_cause` are the platform API's strings, never derived by the CLI.",
   "$defs": {
@@ -203,15 +203,75 @@
         }
       ]
     },
+    "tracker": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The tracker issue that keys the work item (ADR 0197). `scope_id` and `issue_id` are the tracker's immutable ids as text; `display_key` (a Jira key) is display only; `url` is the tracker's own link to the issue.",
+      "required": [
+        "kind",
+        "host",
+        "scope_id",
+        "issue_id",
+        "display_key",
+        "url"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "scope_id": {
+          "type": "string"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "display_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The repository frozen on the work item at admission. `project_id` is the identity; `path` is display.",
+      "required": [
+        "code_host_kind",
+        "host",
+        "project_id",
+        "path"
+      ],
+      "properties": {
+        "code_host_kind": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
     "item": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "id",
         "agent_id",
-        "repo_full_name",
-        "github_issue_number",
-        "issue_url",
+        "tracker",
+        "repository",
         "cancelled_at",
         "created_at",
         "updated_at",
@@ -233,14 +293,11 @@
         "agent_id": {
           "type": "string"
         },
-        "repo_full_name": {
-          "type": "string"
+        "tracker": {
+          "$ref": "#/$defs/tracker"
         },
-        "github_issue_number": {
-          "type": "integer"
-        },
-        "issue_url": {
-          "type": "string"
+        "repository": {
+          "$ref": "#/$defs/repository"
         },
         "cancelled_at": {
           "type": [

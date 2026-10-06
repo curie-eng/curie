@@ -182,8 +182,8 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
     terminal = request.terminal_cause if request.terminal_at is not None else None
     body = render_card(
         CardInput(
-            repo=work_item.repo_full_name,
-            issue_number=work_item.github_issue_number,
+            repo=work_item.repository_path,
+            issue_number=int(work_item.tracker_issue_id),
             title=row.subject_title,
             revision_pr=revision_pr,
             status=request.status,

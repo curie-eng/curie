@@ -95,7 +95,7 @@ class LineageReconciler:
     async def _batch(self) -> list[_Open]:
         async with self._sessionmaker() as session:
             query = (
-                select(ThreadPublicationLineage, WorkItem.github_repository_id)
+                select(ThreadPublicationLineage, WorkItem.repository_project_id)
                 .join(WorkItem, WorkItem.publication_lineage_id == ThreadPublicationLineage.id)
                 .where(
                     ThreadPublicationLineage.status == "open",
@@ -119,7 +119,7 @@ class LineageReconciler:
             # Snapshot before the rollback, which expires every loaded row.
             found: list[_Open] = []
             seen: set[uuid.UUID] = set()
-            for lineage, work_item_repository_id in rows:
+            for lineage, work_item_project_id in rows:
                 if lineage.id in seen:
                     continue
                 seen.add(lineage.id)
@@ -135,7 +135,7 @@ class LineageReconciler:
                         pull_request=pull_request_ref(
                             self._settings,
                             path=lineage.repo_full_name,
-                            project_id=lineage.github_repository_id or work_item_repository_id,
+                            project_id=lineage.repository_project_id or work_item_project_id,
                             number=lineage.pr_number,
                         ),
                     )

@@ -167,8 +167,8 @@ def _all_requests(number: int) -> list[dict[str, Any]]:
     return _rows(
         "SELECT r.id, r.status FROM curie.execution_requests r "
         "JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE w.github_issue_number = :number ORDER BY r.sequence",
-        {"number": number},
+        "WHERE w.tracker_issue_id = :number ORDER BY r.sequence",
+        {"number": str(number)},
     )
 
 

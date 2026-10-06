@@ -15,6 +15,7 @@ from .. import workitem_dispatch
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import SessionDep
+from ..forges.types import RepositoryRef, TrackerIssueRef
 from ..workitem_dispatch import DispatchConflict
 
 router = APIRouter(
@@ -24,18 +25,59 @@ router = APIRouter(
 )
 
 
+class TrackerIssueIn(BaseModel):
+    """The tracker issue that keys the WorkItem (ADR 0197 identity rule 1)."""
+
+    kind: str = Field(min_length=1)
+    host: str = Field(min_length=1)
+    scope_id: str = Field(min_length=1)
+    issue_id: str = Field(min_length=1)
+    display_key: str | None = Field(default=None, min_length=1)
+
+
+class RepositoryIn(BaseModel):
+    """The repository frozen on the WorkItem (ADR 0197 identity rules 2 and 3)."""
+
+    code_host_kind: str = Field(min_length=1)
+    host: str = Field(min_length=1)
+    project_id: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+
+
 class AdmissionFacts(BaseModel):
     agent_id: uuid.UUID
     kind: str = Field(min_length=1)
     address: str = Field(min_length=1)
     reply_conversation_id: str = Field(min_length=1)
-    repo_full_name: str = Field(min_length=1)
-    github_repository_id: int = Field(gt=0)
-    github_issue_number: int = Field(gt=0)
-    github_installation_id: int = Field(gt=0)
+    tracker: TrackerIssueIn
+    repository: RepositoryIn
+    code_host_installation_id: int | None = Field(default=None, gt=0)
     objective: str = Field(min_length=1, max_length=65536)
     requester: str = Field(min_length=1)
     request_id: uuid.UUID
+
+    def admission(self) -> workitem_dispatch.Admission:
+        tracker, repository = self.tracker, self.repository
+        return workitem_dispatch.Admission(
+            agent_id=self.agent_id,
+            kind=self.kind,
+            address=self.address,
+            reply_conversation_id=self.reply_conversation_id,
+            issue=TrackerIssueRef(
+                tracker.kind,
+                tracker.host,
+                tracker.scope_id,
+                tracker.issue_id,
+                tracker.display_key,
+            ),
+            repository=RepositoryRef(
+                repository.code_host_kind, repository.host, repository.project_id, repository.path
+            ),
+            code_host_installation_id=self.code_host_installation_id,
+            objective=self.objective,
+            requester=self.requester,
+            request_id=self.request_id,
+        )
 
 
 class CancelBody(BaseModel):
@@ -114,7 +156,7 @@ def _admission_body(result: WorkItemOutcome) -> dict[str, Any]:
 async def admit_work_item(
     facts: AdmissionFacts, session: SessionDep
 ) -> dict[str, Any]:
-    result = await workitem_dispatch.admit(session, facts)
+    result = await workitem_dispatch.admit(session, facts.admission())
     if isinstance(result, WorkItemOutcome):
         if result.request is None:
             raise HTTPException(status.HTTP_409_CONFLICT, {"code": "not_found"})
@@ -209,7 +251,7 @@ async def acquire_work_item_request(
         "work_item_id": result.work_item_id,
         "conversation_id": result.conversation_id,
         "wait_deadline": result.wait_deadline,
-        "repo_full_name": result.repo_full_name,
+        "repository_path": result.repository_path,
     }
 
 

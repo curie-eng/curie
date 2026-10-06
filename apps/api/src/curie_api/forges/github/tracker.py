@@ -187,6 +187,14 @@ def _parse_cursor(cursor: str | None) -> tuple[int, int]:
     return int(events), int(comments)
 
 
+def issue_url(html_base: str, repo_full_name: str, issue: TrackerIssueRef) -> str:
+    """The web link to a GitHub issue on ``repo_full_name``. Makes no request."""
+
+    if issue.kind != GITHUB or not issue.issue_id.isascii() or not issue.issue_id.isdigit():
+        raise NotFound("issue")
+    return f"{html_base.rstrip('/')}/{repo_full_name}/issues/{issue.issue_id}"
+
+
 class GitHubTracker:
     """The factory's tracker on one GitHub repository."""
 
@@ -219,6 +227,7 @@ class GitHubTracker:
             raise ValueError("page_size must be positive")
         self._client = client
         self._api = api.rstrip("/")
+        self._html_base = html_base
         self.host = urlsplit(html_base).netloc.lower()
         self.repo_full_name = repo_full_name
         self.repository_id = repository_id
@@ -577,6 +586,10 @@ class GitHubTracker:
                 complete = False
         if not complete:
             raise Unavailable("labels")
+
+    def issue_url(self, issue: TrackerIssueRef) -> str:
+        self._number(issue)
+        return issue_url(self._html_base, self.repo_full_name, issue)
 
     async def closing_reference(self, issue: TrackerIssueRef, repository: RepositoryRef) -> str:
         number = self._number(issue)

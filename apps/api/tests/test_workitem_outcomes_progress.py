@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from curie_api.config import get_settings
 from curie_api.factory_progress import phase_view
+from curie_api.forges.hosts import github_issue_ref, repository_ref
 from curie_api.github_app import _RESOLVERS
 from curie_api.main import create_app
 from curie_api.models import (
@@ -160,10 +161,9 @@ def _facts(agent_id: str, issue_number: int) -> SimpleNamespace:
         kind="slack",
         address=ADDRESS,
         reply_conversation_id=WIRE_CONVERSATION,
-        repo_full_name=REPO,
-        github_repository_id=101,
-        github_issue_number=issue_number,
-        github_installation_id=202,
+        issue=github_issue_ref(get_settings(), repository_id=101, issue_number=issue_number),
+        repository=repository_ref(get_settings(), path=REPO, project_id=101),
+        code_host_installation_id=202,
         objective="Implement the admitted work item",
         requester="U0REQUEST1",
         request_id=uuid.uuid4(),

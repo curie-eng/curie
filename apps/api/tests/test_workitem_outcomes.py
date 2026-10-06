@@ -29,6 +29,7 @@ from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import lineages as crud_lineages
 from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
 from curie_api.forges.github.ci import CiDetail
+from curie_api.forges.hosts import github_issue_ref, repository_ref
 from curie_api.forges.types import (
     GITHUB,
     CheckState,
@@ -125,8 +126,7 @@ FORBIDDEN_KEYS = {
     "traceparent",
     "summary",
     "token",
-    "github_installation_id",
-    "github_repository_id",
+    "code_host_installation_id",
     "version",
 }
 CORRECTNESS_VERDICT_KEYS = {"verdict", "passed", "correct"}
@@ -235,16 +235,24 @@ def _agent(
     }
 
 
-def _facts(agent_id: str, **overrides: Any) -> SimpleNamespace:
+def _facts(
+    agent_id: str,
+    *,
+    repository_id: int = 101,
+    issue_number: int = 2577,
+    **overrides: Any,
+) -> SimpleNamespace:
+    settings = get_settings()
     values: dict[str, Any] = {
         "agent_id": uuid.UUID(agent_id),
         "kind": "slack",
         "address": ADDRESS,
         "reply_conversation_id": WIRE_CONVERSATION,
-        "repo_full_name": REPO,
-        "github_repository_id": 101,
-        "github_issue_number": 2577,
-        "github_installation_id": 202,
+        "issue": github_issue_ref(
+            settings, repository_id=repository_id, issue_number=issue_number
+        ),
+        "repository": repository_ref(settings, path=REPO, project_id=repository_id),
+        "code_host_installation_id": 202,
         "objective": OBJECTIVE,
         "requester": REQUESTER,
         "request_id": uuid.uuid4(),
@@ -487,7 +495,14 @@ def _assert_common(body: Mapping[str, Any]) -> None:
     assert body["correctness"] == {"asserted": False, "owner": "bundle"}
     assert not CORRECTNESS_VERDICT_KEYS & set(_keys(body))
     assert isinstance(body["actionable_cause"], str) and body["actionable_cause"]
-    assert body["issue_url"] == f"https://github.com/{REPO}/issues/2577"
+    assert body["tracker"] == {
+        "kind": "github",
+        "host": "github.com",
+        "scope_id": "101",
+        "issue_id": "2577",
+        "display_key": None,
+        "url": f"https://github.com/{REPO}/issues/2577",
+    }
 
 
 # --- one test per state -----------------------------------------------------
@@ -505,8 +520,13 @@ def test_fresh_admission_is_waiting_with_issue_and_no_pr(
     _assert_common(body)
     assert body["id"] == str(seeded.work_item_id)
     assert body["agent_id"] == agent["agent_id"]
-    assert body["repo_full_name"] == REPO
-    assert body["github_issue_number"] == 2577
+    assert body["repository"] == {
+        "code_host_kind": "github",
+        "host": "github.com",
+        "project_id": "101",
+        "path": REPO,
+    }
+    assert body["tracker"]["issue_id"] == "2577"
     assert body["pr"] is None
     assert body["publication"] is None
     assert body["objective"] == OBJECTIVE
@@ -900,7 +920,7 @@ def test_opened_pr_binds_only_the_publication_request(
     agent = _agent(stack, auth_headers)
     owner = _completed(stack, agent)
     publication = _publish(stack, agent["deployment_id"])
-    other_facts = _facts(agent["agent_id"], github_issue_number=2578)
+    other_facts = _facts(agent["agent_id"], issue_number=2578)
     other = _admit(other_facts)
     _start(other_facts.request_id)
     assert _bound_lineage(owner.work_item_id) is None
@@ -917,7 +937,7 @@ def test_verified_repository_identity_must_match_work_item_to_bind(
     stack: TestClient, auth_headers: dict[str, str]
 ) -> None:
     agent = _agent(stack, auth_headers)
-    facts = _facts(agent["agent_id"], github_repository_id=102)
+    facts = _facts(agent["agent_id"], repository_id=102)
     seeded = _admit(facts)
     _start(facts.request_id)
     publication = _publish(stack, agent["deployment_id"])
@@ -951,6 +971,7 @@ def test_verified_repository_identity_must_match_work_item_to_bind(
                 metadata_updated_at=None,
             ),
             identity=VerifiedPublicationIdentity(
+                host="github.com",
                 repository_id=101,
                 installation_id=202,
                 pr_node_id="PR_example_123",
@@ -960,12 +981,12 @@ def test_verified_repository_identity_must_match_work_item_to_bind(
         )
         opened = await session.execute(
             text(
-                "SELECT github_repository_id, pr_url FROM "
+                "SELECT repository_project_id, pr_url FROM "
                 "curie.thread_publication_lineages WHERE id = :id"
             ),
             {"id": uuid.UUID(publication["lineage_id"])},
         )
-        assert opened.one() == (101, PR_URL)
+        assert opened.one() == ("101", PR_URL)
 
     async def run_advance() -> None:
         engine = create_async_engine(get_settings().database_url)
@@ -1136,11 +1157,16 @@ def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
     work_item_id = uuid.uuid4()
     item = WorkItem(
         id=work_item_id,
-        github_repository_id=101,
-        github_issue_number=2577,
-        github_installation_id=202,
+        tracker_kind="github",
+        tracker_host="github.com",
+        tracker_scope_id="101",
+        tracker_issue_id="2577",
+        code_host_kind="github",
+        code_host_host="github.com",
+        repository_project_id="101",
+        repository_path=REPO,
+        code_host_installation_id=202,
         agent_id=uuid.uuid4(),
-        repo_full_name=REPO,
         conversation_id=WIRE_CONVERSATION,
         cancelled_at=None,
         created_at=now,
@@ -1172,10 +1198,11 @@ def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
         approval=None,
         pending_turn_approval=False,
         now=now,
-        issue_base="https://github.com",
+        issue_url=f"https://github.com/{REPO}/issues/2577",
     )
 
     assert outcome.state == "cancelled"
+    assert outcome.tracker.url == f"https://github.com/{REPO}/issues/2577"
     assert "pull request closed" in outcome.actionable_cause
     assert "issue label" not in outcome.actionable_cause
     assert outcome.requests[0].terminal_cause == "lineage_closed"
@@ -1250,11 +1277,11 @@ def test_no_runtime_owner_or_secret_material_reaches_list_or_detail(
     stack: TestClient, auth_headers: dict[str, str]
 ) -> None:
     agent = _agent(stack, auth_headers)
-    running = _facts(agent["agent_id"], github_issue_number=1)
+    running = _facts(agent["agent_id"], issue_number=1)
     running_item = _admit(running)
     _start(running.request_id)
     published = _completed(
-        stack, agent, github_issue_number=2, reply_conversation_id="1700000000.000200"
+        stack, agent, issue_number=2, reply_conversation_id="1700000000.000200"
     )
     publication = _publish(
         stack, agent["deployment_id"], conversation_id="1700000000.000200"
@@ -1323,7 +1350,7 @@ def test_list_items_carry_state_and_null_ci_and_filter_by_agent(
     mine_item = _admit(_facts(mine["agent_id"], address=mine["address"]))
     _admit(
         _facts(
-            theirs["agent_id"], address=theirs["address"], github_issue_number=2578
+            theirs["agent_id"], address=theirs["address"], issue_number=2578
         )
     )
 
@@ -1346,7 +1373,7 @@ def test_list_truncation_flag(
 ) -> None:
     agent = _agent(stack, auth_headers)
     for issue in (1, 2, 3):
-        _admit(_facts(agent["agent_id"], github_issue_number=issue))
+        _admit(_facts(agent["agent_id"], issue_number=issue))
 
     body = stack.get("/work-items", params={"limit": 2}, headers=auth_headers).json()
 
@@ -1413,9 +1440,9 @@ def _ci_inputs(*, pr: bool = True, head_sha: str | None = HEAD_SHA) -> tuple[Any
         pr_number=PR_NUMBER if pr else None,
         pr_url=PR_URL if pr else None,
         head_sha=head_sha,
-        github_installation_id=None,
+        code_host_installation_id=None,
     )
-    work_item = SimpleNamespace(repo_full_name=REPO, github_installation_id=202)
+    work_item = SimpleNamespace(repository_path=REPO, code_host_installation_id=202)
     return lineage, work_item
 
 
@@ -3011,7 +3038,7 @@ def _ci_view(host: _RollupHost, **lineage: Any) -> Any:
         "pr_number": PR_NUMBER,
         "head_sha": HEAD_SHA,
         "repo_full_name": REPO,
-        "github_repository_id": None,
+        "repository_project_id": None,
     }
     values.update(lineage)
     return asyncio.run(
@@ -3019,7 +3046,7 @@ def _ci_view(host: _RollupHost, **lineage: Any) -> Any:
             host,  # type: ignore[arg-type]
             get_settings(),
             SimpleNamespace(**values),  # type: ignore[arg-type]
-            SimpleNamespace(github_repository_id=101),  # type: ignore[arg-type]
+            SimpleNamespace(repository_project_id="101"),  # type: ignore[arg-type]
         )
     )
 

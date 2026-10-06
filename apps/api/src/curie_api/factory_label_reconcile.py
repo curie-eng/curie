@@ -135,7 +135,7 @@ async def _reconcile_repository(
         missing = [
             number
             for number in numbers
-            if await github_factory.work_item_for(session, repository_id, number) is None
+            if await github_factory.work_item_for(session, tracker.issue(number)) is None
         ]
     grace = timedelta(seconds=settings.github_factory_reconcile_grace_s)
     admitted = 0
@@ -187,14 +187,10 @@ async def _admit(
 ) -> bool:
     async with sessionmaker() as session:
         try:
-            await github_factory.lock_issue(session, notice.repository_id, notice.issue_number)
+            issue = github_factory.notice_issue(notice, settings)
+            await github_factory.lock_issue(session, issue)
             # A delivery may have admitted it since the listing; the lock orders us.
-            if (
-                await github_factory.work_item_for(
-                    session, notice.repository_id, notice.issue_number
-                )
-                is not None
-            ):
+            if await github_factory.work_item_for(session, issue) is not None:
                 await session.rollback()
                 return False
             verified = await github_factory.verify_current(notice, settings=settings, client=client)

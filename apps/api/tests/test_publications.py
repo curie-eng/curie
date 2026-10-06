@@ -5076,9 +5076,11 @@ def test_policy_revocation_and_cancellation_block_credential_redemption(
     _, cancelled = _create_publication(client, payload)
     _execute(
         "INSERT INTO curie.work_items "
-        "(id, github_repository_id, github_issue_number, github_installation_id, "
-        "agent_id, repo_full_name, conversation_id, cancelled_at) "
-        "VALUES (:id, 1, 2575, 1, :agent_id, :repo, :conversation_id, now())",
+        "(id, tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, "
+        "code_host_kind, code_host_host, repository_project_id, code_host_installation_id, "
+        "agent_id, repository_path, conversation_id, cancelled_at) "
+        "VALUES (:id, 'github', 'github.com', '1', '2575', 'github', 'github.com', '1', 1, "
+        ":agent_id, :repo, :conversation_id, now())",
         {
             "id": uuid.uuid4(),
             "agent_id": uuid.UUID(deployment["agent_id"]),
@@ -5392,9 +5394,9 @@ def test_review_reservation_refuses_legacy_unproved_lineage(
     assert _rows("SELECT count(*) AS n FROM curie.publication_review_reservations")[0]["n"] == 0
     assert (
         _rows(
-            "SELECT github_repository_id FROM curie.thread_publication_lineages WHERE id=:id",
+            "SELECT repository_project_id FROM curie.thread_publication_lineages WHERE id=:id",
             {"id": publication["lineage_id"]},
-        )[0]["github_repository_id"]
+        )[0]["repository_project_id"]
         is None
     )
     valkey = connect_or_skip(decode_responses=True)
@@ -5531,7 +5533,8 @@ def test_post_capture_publication_binds_route_then_first_advance_binds_github_id
     captured = _rows(
         "SELECT l.binding_id, l.binding_generation, l.reply_conversation_id, "
         "l.conversation_id, c.id AS current_binding_id, c.generation AS current_generation, "
-        "l.github_repository_id, l.github_installation_id, l.github_pr_node_id, l.base_ref "
+        "l.code_host_kind, l.code_host_host, l.repository_project_id, "
+        "l.code_host_installation_id, l.code_host_pr_id, l.base_ref "
         "FROM curie.thread_publication_lineages l "
         "JOIN curie.agent_channels c ON c.id = l.binding_id "
         "WHERE l.id = :id",
@@ -5545,9 +5548,11 @@ def test_post_capture_publication_binds_route_then_first_advance_binds_github_id
             "conversation_id": scoped_conversation,
             "current_binding_id": captured[0]["current_binding_id"],
             "current_generation": captured[0]["current_generation"],
-            "github_repository_id": None,
-            "github_installation_id": None,
-            "github_pr_node_id": None,
+            "code_host_kind": None,
+            "code_host_host": None,
+            "repository_project_id": None,
+            "code_host_installation_id": None,
+            "code_host_pr_id": None,
             "base_ref": None,
         }
     ]
@@ -5565,14 +5570,17 @@ def test_post_capture_publication_binds_route_then_first_advance_binds_github_id
     )
     assert advanced.status_code == 200, advanced.text
     assert _rows(
-        "SELECT github_repository_id, github_installation_id, github_pr_node_id, base_ref, "
+        "SELECT code_host_kind, code_host_host, repository_project_id, "
+        "code_host_installation_id, code_host_pr_id, base_ref, "
         "head_sha, version FROM curie.thread_publication_lineages WHERE id = :id",
         {"id": publication["lineage_id"]},
     ) == [
         {
-            "github_repository_id": 9001,
-            "github_installation_id": 41,
-            "github_pr_node_id": "PR_example_123",
+            "code_host_kind": "github",
+            "code_host_host": "github.com",
+            "repository_project_id": "9001",
+            "code_host_installation_id": 41,
+            "code_host_pr_id": "PR_example_123",
             "base_ref": "main",
             "head_sha": FIRST_REVISION_SHA,
             "version": 2,
@@ -5632,9 +5640,11 @@ def test_enterprise_publication_advances_and_refreshes_the_same_lineage(
         "pr_url": ENTERPRISE_PR_URL,
         "head_sha": FIRST_REVISION_SHA,
         "version": 2,
-        "github_repository_id": 9001,
-        "github_installation_id": 41,
-        "github_pr_node_id": "PR_example_123",
+        "code_host_kind": "github",
+        "code_host_host": "github.example.com",
+        "repository_project_id": "9001",
+        "code_host_installation_id": 41,
+        "code_host_pr_id": "PR_example_123",
         "base_ref": "main",
     }
 
@@ -5963,14 +5973,17 @@ def test_review_identity_cannot_change_on_existing_pr_advance(
     )
     assert refused.status_code == (503 if mutation == "status" else 409), refused.text
     stored = _rows(
-        "SELECT github_repository_id, github_installation_id, github_pr_node_id, "
+        "SELECT code_host_kind, code_host_host, repository_project_id, "
+        "code_host_installation_id, code_host_pr_id, "
         "head_sha, version FROM curie.thread_publication_lineages WHERE id=:id",
         {"id": lineage["id"]},
     )[0]
     assert stored == {
-        "github_repository_id": 9001,
-        "github_installation_id": 41,
-        "github_pr_node_id": "PR_example_123",
+        "code_host_kind": "github",
+        "code_host_host": "github.com",
+        "repository_project_id": "9001",
+        "code_host_installation_id": 41,
+        "code_host_pr_id": "PR_example_123",
         "head_sha": FIRST_REVISION_SHA,
         "version": lineage["version"],
     }
@@ -5982,9 +5995,11 @@ def test_review_identity_constraints_reject_partial_authority(
     client, truth, _ = review_lineage_app
     _, _, lineage = _verified_lineage(client, truth, auth_headers)
     for assignment in (
-        "github_repository_id=NULL",
-        "github_installation_id=NULL",
-        "github_pr_node_id=NULL",
+        "code_host_kind=NULL",
+        "code_host_host=NULL",
+        "repository_project_id=NULL",
+        "code_host_installation_id=NULL",
+        "code_host_pr_id=NULL",
         "base_ref=NULL",
     ):
         with pytest.raises(IntegrityError):
@@ -5994,10 +6009,10 @@ def test_review_identity_constraints_reject_partial_authority(
             )
     assert (
         _rows(
-            "SELECT github_repository_id FROM curie.thread_publication_lineages WHERE id=:id",
+            "SELECT repository_project_id FROM curie.thread_publication_lineages WHERE id=:id",
             {"id": lineage["id"]},
-        )[0]["github_repository_id"]
-        == 9001
+        )[0]["repository_project_id"]
+        == "9001"
     )
 
 
@@ -6127,14 +6142,14 @@ def test_verified_github_pr_has_only_one_conversation_owner(
     )
     owners = _rows(
         "SELECT id FROM curie.thread_publication_lineages "
-        "WHERE github_repository_id=9001 AND pr_number=:number",
+        "WHERE repository_project_id='9001' AND pr_number=:number",
         {"number": PR_NUMBER},
     )
     assert owners == [{"id": uuid.UUID(lineage["id"])}]
     assert _rows(
-        "SELECT github_repository_id,head_sha FROM curie.thread_publication_lineages WHERE id=:id",
+        "SELECT repository_project_id,head_sha FROM curie.thread_publication_lineages WHERE id=:id",
         {"id": other["lineage_id"]},
-    ) == [{"github_repository_id": None, "head_sha": None}]
+    ) == [{"repository_project_id": None, "head_sha": None}]
 
 
 def test_adding_app_after_pat_publication_does_not_backfill_legacy_identity(
@@ -6171,9 +6186,9 @@ def test_adding_app_after_pat_publication_does_not_backfill_legacy_identity(
     assert advanced.status_code == 200, advanced.text
     assert truth["calls"] == []
     assert _rows(
-        "SELECT github_repository_id,head_sha FROM curie.thread_publication_lineages WHERE id=:id",
+        "SELECT repository_project_id,head_sha FROM curie.thread_publication_lineages WHERE id=:id",
         {"id": publication["lineage_id"]},
-    ) == [{"github_repository_id": None, "head_sha": SECOND_REVISION_SHA}]
+    ) == [{"repository_project_id": None, "head_sha": SECOND_REVISION_SHA}]
     assert _reserve_review(client, advanced.json(), "review:legacy-replay").status_code == 409
 
 
@@ -6271,7 +6286,8 @@ def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
 def _lineage_identity(lineage_id: str) -> dict[str, Any]:
     return _rows(
         "SELECT status, pr_number, pr_url, head_sha, version, "
-        "github_repository_id, github_installation_id, github_pr_node_id, base_ref "
+        "code_host_kind, code_host_host, repository_project_id, code_host_installation_id, "
+        "code_host_pr_id, base_ref "
         "FROM curie.thread_publication_lineages WHERE id = :id",
         {"id": uuid.UUID(lineage_id)},
     )[0]
@@ -6499,9 +6515,11 @@ def test_worker_lineage_patch_captures_immutable_identity_in_real_postgres(
         "pr_url": PR_URL,
         "head_sha": FIRST_REVISION_SHA,
         "version": work.lineage_version + 1,
-        "github_repository_id": 9001,
-        "github_installation_id": 41,
-        "github_pr_node_id": "PR_example_123",
+        "code_host_kind": "github",
+        "code_host_host": "github.com",
+        "repository_project_id": "9001",
+        "code_host_installation_id": 41,
+        "code_host_pr_id": "PR_example_123",
         "base_ref": "main",
     }
     assert _rows(
@@ -6662,9 +6680,11 @@ def test_stale_worker_lease_refuses_before_terminal_provider_and_leaves_rows_unc
         "pr_url": None,
         "head_sha": None,
         "version": 1,
-        "github_repository_id": None,
-        "github_installation_id": None,
-        "github_pr_node_id": None,
+        "code_host_kind": None,
+        "code_host_host": None,
+        "repository_project_id": None,
+        "code_host_installation_id": None,
+        "code_host_pr_id": None,
         "base_ref": None,
     }
 
@@ -6706,9 +6726,11 @@ def test_terminal_patch_response_maps_to_the_worker_terminal_cas(
         "pr_url": PR_URL,
         "head_sha": FIRST_REVISION_SHA,
         "version": work.lineage_version + 1,
-        "github_repository_id": None,
-        "github_installation_id": None,
-        "github_pr_node_id": None,
+        "code_host_kind": None,
+        "code_host_host": None,
+        "repository_project_id": None,
+        "code_host_installation_id": None,
+        "code_host_pr_id": None,
         "base_ref": None,
     }
 

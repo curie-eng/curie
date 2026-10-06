@@ -197,9 +197,20 @@ fn work_item_outcome() -> Box<curie::api::WorkItemOutcome> {
         serde_json::from_value(serde_json::json!({
             "id": "33333333-3333-4333-8333-333333333333",
             "agent_id": "44444444-4444-4444-8444-444444444444",
-            "repo_full_name": "curie-eng/curie",
-            "github_issue_number": 2577,
-            "issue_url": "https://github.com/curie-eng/curie/issues/2577",
+            "tracker": {
+                "kind": "github",
+                "host": "github.com",
+                "scope_id": "1001",
+                "issue_id": "2577",
+                "display_key": null,
+                "url": "https://github.com/curie-eng/curie/issues/2577"
+            },
+            "repository": {
+                "code_host_kind": "github",
+                "host": "github.com",
+                "project_id": "1001",
+                "path": "curie-eng/curie"
+            },
             "cancelled_at": null,
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:05:00Z",

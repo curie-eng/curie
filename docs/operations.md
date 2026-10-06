@@ -2280,6 +2280,44 @@ Run that command with its trailing `up -d --wait` replaced by
 --wipe` followed by `curie local up` starts from an empty database, which
 applies every migration without the flag.
 
+### Tracker issue identity migration (Alembic revision 0080)
+
+Revision 0080 is a contract migration (ADR 0197, "Identity"). A factory work
+item is keyed by its tracker issue, as (tracker kind, tracker host, scope id,
+issue id), and the repository chosen at admission is stored on it as (code host
+kind, code host host, project id) with its path. The GitHub repository id,
+issue number and installation columns are replaced, not kept beside the new
+ones, so an application from before 0080 cannot serve against the migrated
+schema and a rollback below it is refused once it has run. Upgrade with
+`curie cluster upgrade --forward-only`, or set `api.migrate.forwardOnly=true`
+on a direct `helm upgrade`.
+
+Every existing work item, publication lineage and poll cursor is GitHub, and
+the migration fills in the GitHub host. It takes it from the
+`GITHUB_API_URL` the chart passes to the migrate Job from
+`api.githubApiUrl`, the way the API derives its GitHub web host
+(`api.github.com` is `github.com`). A migration run outside the chart, on a
+GitHub Enterprise install, must set `GITHUB_API_URL` or
+`CURIE_MIGRATION_GITHUB_HOST` (the bare host, which wins); otherwise it
+assumes `github.com` and the stored rows will not match the host the GitHub
+adapter reports.
+
+Primary keys, execution request ids and advisory lock keys are unchanged, so
+a label, mention or review that is replayed after the upgrade still matches
+the request it admitted before. A poll cursor that never recorded its
+repository id is dropped, and of two cursors for one repository (it was
+renamed) only the newer is kept; the next poll reads back over the lookback
+window and admission discards what it has already seen.
+
+The work items API and `curie <tier> work-items --json` (schema
+`work-items/v2`) replace `repo_full_name`, `github_issue_number` and
+`issue_url` with a `tracker` object (`kind`, `host`, `scope_id`, `issue_id`,
+`display_key`, `url`) and a `repository` object (`code_host_kind`, `host`,
+`project_id`, `path`). `tracker.url` is the tracker's own link to the issue.
+
+A downgrade restores the GitHub columns and refuses while any row names a
+tracker or code host other than GitHub.
+
 ### Before you upgrade, check what would be removed
 
 ```bash

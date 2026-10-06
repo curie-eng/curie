@@ -595,9 +595,9 @@ def _requests(number: int) -> list[dict[str, Any]]:
         "w.base_branch, w.base_source, w.base_commit, w.base_label_ignored "
         "FROM curie.work_items w "
         "LEFT JOIN curie.execution_requests r ON r.work_item_id = w.id "
-        "WHERE w.github_repository_id = :repo AND w.github_issue_number = :number "
+        "WHERE w.tracker_scope_id = :repo AND w.tracker_issue_id = :number "
         "ORDER BY r.sequence",
-        {"repo": REPO_ID, "number": number},
+        {"repo": str(REPO_ID), "number": str(number)},
     )
 
 
@@ -989,8 +989,10 @@ def test_poll_prunes_persisted_etags_for_cancelled_issues_and_closed_lineages(
     _complete(healthy_request["id"])
     _run_once(github)
     before = _rows(
-        "SELECT etags FROM curie.factory_poll_cursors WHERE repo_full_name = :repo",
-        {"repo": REPO},
+        "SELECT etags FROM curie.factory_poll_cursors WHERE tracker_kind = 'github' "
+        "AND tracker_host = 'github.com' AND tracker_scope_id = :scope "
+        "AND scope_path = :path",
+        {"scope": str(REPO_ID), "path": REPO},
     )
     assert len(before) == 1
     cancelled_key = f"issue:{cancelled}:{LABEL}"
@@ -1016,8 +1018,10 @@ def test_poll_prunes_persisted_etags_for_cancelled_issues_and_closed_lineages(
 
     assert _requests(cancelled)[0]["cancelled_at"] is not None
     after = _rows(
-        "SELECT etags FROM curie.factory_poll_cursors WHERE repo_full_name = :repo",
-        {"repo": REPO},
+        "SELECT etags FROM curie.factory_poll_cursors WHERE tracker_kind = 'github' "
+        "AND tracker_host = 'github.com' AND tracker_scope_id = :scope "
+        "AND scope_path = :path",
+        {"scope": str(REPO_ID), "path": REPO},
     )
     assert len(after) == 1
     assert cancelled_key not in after[0]["etags"]

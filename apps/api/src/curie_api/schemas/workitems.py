@@ -183,12 +183,36 @@ class WorkItemProgressOut(BaseModel):
     stages: list[WorkItemStageOut]
 
 
+class WorkItemTrackerOut(BaseModel):
+    """The tracker issue that keys the WorkItem (ADR 0197).
+
+    ``scope_id`` and ``issue_id`` are the tracker's immutable ids as text;
+    ``display_key`` (a Jira key) is for display only. ``url`` is the tracker's
+    own link to the issue.
+    """
+
+    kind: str
+    host: str
+    scope_id: str
+    issue_id: str
+    display_key: str | None
+    url: str
+
+
+class WorkItemRepositoryOut(BaseModel):
+    """The repository frozen on the WorkItem at admission; ``path`` is display."""
+
+    code_host_kind: str
+    host: str
+    project_id: str
+    path: str
+
+
 class WorkItemOutcomeOut(BaseModel):
     id: uuid.UUID
     agent_id: uuid.UUID
-    repo_full_name: str
-    github_issue_number: int
-    issue_url: str
+    tracker: WorkItemTrackerOut
+    repository: WorkItemRepositoryOut
     cancelled_at: datetime | None
     created_at: datetime
     updated_at: datetime

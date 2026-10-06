@@ -118,9 +118,11 @@ async def _review_fixture(
     await session.flush()
     github_fields: dict[str, Any] = (
         {
-            "github_repository_id": 9101,
-            "github_installation_id": 41,
-            "github_pr_node_id": "PR_example_review",
+            "code_host_kind": "github",
+            "code_host_host": "github.com",
+            "repository_project_id": "9101",
+            "code_host_installation_id": 41,
+            "code_host_pr_id": "PR_example_review",
             "base_ref": "main",
             "pr_number": 71,
             "pr_url": f"https://github.com/{REPO}/pull/71",

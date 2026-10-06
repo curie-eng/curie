@@ -40,7 +40,7 @@ from .code_host_trust import code_host_verify
 from .config import Settings
 from .factory_comment_text import marker_for, redact_factory_comment
 from .factory_progress import PhaseView, phase_view, pill_for
-from .factory_reply_target import github_host, stored_reply_target
+from .factory_reply_target import stored_reply_target
 from .factory_usage import usage_line, work_item_usage
 from .forges.errors import ForgeError
 from .forges.github.comments import static_token
@@ -53,7 +53,7 @@ from .forges.github.marked_comments import (
 from .forges.github.tracker import GitHubTracker
 from .forges.github.transport import github_headers
 from .forges.ports import Tracker
-from .forges.types import ReplyTarget, TrackerIssueRef
+from .forges.types import GITHUB, ReplyTarget
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .models import (
     ExecutionRequest,
@@ -576,19 +576,22 @@ async def _sync_one(
     latest: bool,
     paused_for_upgrade: bool = False,
 ) -> int:
-    target = stored_reply_target(request, work_item, github_host(settings.github_html_base))
+    target = stored_reply_target(request, work_item)
+    if work_item.tracker_kind != GITHUB or work_item.code_host_installation_id is None:
+        # Only the GitHub tracker posts status comments today.
+        return 0
     try:
         token = await run_in_threadpool(
             credentials_for(settings).token_for_verified_installation,
-            work_item.repo_full_name,
-            work_item.github_installation_id,
+            work_item.repository_path,
+            work_item.code_host_installation_id,
         )
     except (GitHubInstallationRefused, GitHubAppError, ValueError):
         return 0
     github = GitHubCommentClient(
         client=client,
         api=settings.github_api_url.rstrip("/"),
-        repo_path=f"/repos/{repo_url_path(work_item.repo_full_name)}",
+        repo_path=f"/repos/{repo_url_path(work_item.repository_path)}",
         headers=github_headers(token),
     )
     writes = 0
@@ -608,8 +611,8 @@ async def _sync_one(
         tracker = GitHubTracker.from_settings(
             settings,
             client,
-            repo_full_name=work_item.repo_full_name,
-            repository_id=work_item.github_repository_id,
+            repo_full_name=work_item.repository_path,
+            repository_id=int(work_item.tracker_scope_id),
             token=static_token(token),
         )
         writes += await _sync_labels(tracker, row, work_item, request.status)
@@ -803,7 +806,7 @@ async def _sync_labels(
     desired = desired_label(status)
     if row.applied_label == desired:
         return 0
-    issue = _tracker_issue(tracker, work_item)
+    issue = work_item.tracker_issue
     remove = [name for name in (*STATE_LABELS, *LEGACY_STATE_LABELS) if name != desired]
     try:
         await tracker.set_state_label(issue, add=desired or None, remove=remove)
@@ -811,17 +814,6 @@ async def _sync_labels(
         return 0
     row.applied_label = desired
     return 1
-
-
-def _tracker_issue(tracker: Tracker, work_item: WorkItem) -> TrackerIssueRef:
-    """The WorkItem's issue on its tracker, until the WorkItem is keyed by it (ADR 0197)."""
-
-    return TrackerIssueRef(
-        tracker.kind,
-        tracker.host,
-        str(work_item.github_repository_id),
-        str(work_item.github_issue_number),
-    )
 
 
 async def _clock(session: AsyncSession) -> Any:

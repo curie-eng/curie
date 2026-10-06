@@ -331,6 +331,15 @@ pub enum WorkItemsOutput {
     DryRun(crate::ui::DryRunPlan),
 }
 
+/// How an operator names the issue: the tracker's display key (a Jira key)
+/// when it has one, else `<repository path>#<issue id>`.
+pub(super) fn work_item_issue_label(item: &crate::api::WorkItemOutcome) -> String {
+    item.tracker
+        .display_key
+        .clone()
+        .unwrap_or_else(|| format!("{}#{}", item.repository.path, item.tracker.issue_id))
+}
+
 pub(super) fn work_item_pr_cell(item: &crate::api::WorkItemOutcome) -> String {
     item.pr
         .as_ref()
@@ -361,16 +370,18 @@ impl crate::ui::CliOutput for WorkItemsOutput {
                     .map(|item| {
                         vec![
                             item.id.clone(),
-                            format!("{}#{}", item.repo_full_name, item.github_issue_number),
+                            work_item_issue_label(item),
                             item.state.clone(),
                             work_item_pr_cell(item),
+                            item.tracker.url.clone(),
                             item.actionable_cause.clone(),
                         ]
                     })
                     .collect();
                 // The last column is never padded: a long cause must not
                 // trail every row with spaces out to the widest cause.
-                let table = crate::ui::table(&["ID", "ISSUE", "STATE", "PR", "CAUSE"], &rows, &[]);
+                let table =
+                    crate::ui::table(&["ID", "ISSUE", "STATE", "PR", "LINK", "CAUSE"], &rows, &[]);
                 let trimmed: Vec<&str> = table.lines().map(str::trim_end).collect();
                 ui.payload_plain(&trimmed.join("\n"));
                 if list.truncated {
@@ -385,7 +396,7 @@ impl crate::ui::CliOutput for WorkItemsOutput {
                 line("id", &item.id);
                 line(
                     "issue",
-                    &format!("{}#{}", item.repo_full_name, item.github_issue_number),
+                    &format!("{} {}", work_item_issue_label(item), item.tracker.url),
                 );
                 line("state", &item.state);
                 line("cause", &item.actionable_cause);

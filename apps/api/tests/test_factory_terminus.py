@@ -181,8 +181,8 @@ def _request(number: int) -> dict[str, Any]:
         "w.version AS work_version "
         "FROM curie.execution_requests r "
         "JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE w.github_repository_id = :repo AND w.github_issue_number = :number",
-        {"repo": REPO_ID, "number": number},
+        "WHERE w.tracker_scope_id = :repo AND w.tracker_issue_id = :number",
+        {"repo": str(REPO_ID), "number": str(number)},
     )
     assert len(rows) == 1, rows
     return rows[0]
@@ -744,8 +744,7 @@ def _attach_publication(
                     (
                         await conn.execute(
                             text(
-                                "SELECT agent_id, conversation_id, repo_full_name, "
-                                "github_repository_id, github_installation_id, version "
+                                "SELECT agent_id, conversation_id, repository_path, version "
                                 "FROM curie.work_items WHERE id = :id"
                             ),
                             {"id": work_item_id},
@@ -774,7 +773,7 @@ def _attach_publication(
                 )
                 approval_id, publication_id = uuid.uuid4(), uuid.uuid4()
                 pr_url = (
-                    None if pr is None else f"https://github.com/{item['repo_full_name']}/pull/{pr}"
+                    None if pr is None else f"https://github.com/{item['repository_path']}/pull/{pr}"
                 )
                 await conn.execute(
                     text(
@@ -810,7 +809,7 @@ def _attach_publication(
                         "agent": item["agent_id"],
                         "deployment": deployment_id,
                         "conversation": item["conversation_id"],
-                        "repo": item["repo_full_name"],
+                        "repo": item["repository_path"],
                         "base": "0123456789abcdef0123456789abcdef01234567",
                         "branch": f"curie/publication-{lineage_id.hex}",
                         "pr": pr,
@@ -831,7 +830,7 @@ def _attach_publication(
                         "id": approval_id,
                         "agent": item["agent_id"],
                         "conversation": item["conversation_id"],
-                        "channel": item["repo_full_name"],
+                        "channel": item["repository_path"],
                         "dedupe": f"terminus-{publication_id.hex}",
                     },
                 )
@@ -855,10 +854,10 @@ def _attach_publication(
                         "conversation": item["conversation_id"],
                         "lineage": lineage_id,
                         "request_id": request["id"],
-                        "repo": item["repo_full_name"],
+                        "repo": item["repository_path"],
                         "status": status,
                         "base": "0123456789abcdef0123456789abcdef01234567",
-                        "channel": item["repo_full_name"],
+                        "channel": item["repository_path"],
                         "result": pr_url,
                     },
                 )
@@ -886,8 +885,9 @@ def _attach_publication(
 def _set_base_ref(work_item_id: uuid.UUID, base_ref: str) -> None:
     """Give the work item's lineage a PR base branch (#4105).
 
-    The identity check constraint wants the repository id, installation id, PR
-    node id and base ref all set together, so they are written in one UPDATE.
+    The identity check constraint wants the code host identity, installation
+    id, PR id and base ref all set together, so they are written in one UPDATE,
+    with the code host identity copied from the work item.
     """
 
     async def go() -> None:
@@ -896,15 +896,16 @@ def _set_base_ref(work_item_id: uuid.UUID, base_ref: str) -> None:
             async with engine.begin() as conn:
                 changed = await conn.execute(
                     text(
-                        "UPDATE curie.thread_publication_lineages SET "
-                        "github_repository_id = :repo_id, "
-                        "github_installation_id = :installation_id, "
-                        "github_pr_node_id = :node_id, base_ref = :base_ref "
-                        "WHERE id = (SELECT publication_lineage_id FROM curie.work_items "
-                        "WHERE id = :id)"
+                        "UPDATE curie.thread_publication_lineages AS l SET "
+                        "code_host_kind = w.code_host_kind, "
+                        "code_host_host = w.code_host_host, "
+                        "repository_project_id = w.repository_project_id, "
+                        "code_host_installation_id = :installation_id, "
+                        "code_host_pr_id = :node_id, base_ref = :base_ref "
+                        "FROM curie.work_items AS w "
+                        "WHERE w.id = :id AND l.id = w.publication_lineage_id"
                     ),
                     {
-                        "repo_id": REPO_ID,
                         "installation_id": INSTALLATION_ID,
                         "node_id": f"PR_fixture_{work_item_id.hex}",
                         "base_ref": base_ref,
@@ -972,7 +973,7 @@ def _revision_objective(pr: int, fragment: str) -> str:
 
 def _work_item_row(work_item_id: uuid.UUID) -> dict[str, Any]:
     return _rows(
-        "SELECT w.id, w.conversation_id, w.agent_id, w.github_issue_number, "
+        "SELECT w.id, w.conversation_id, w.agent_id, w.tracker_issue_id, "
         "w.publication_lineage_id, l.deployment_id, l.pr_number "
         "FROM curie.work_items w "
         "JOIN curie.thread_publication_lineages l ON l.id = w.publication_lineage_id "

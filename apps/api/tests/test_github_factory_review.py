@@ -321,11 +321,12 @@ def _own_pull_request(
                         "INSERT INTO curie.thread_publication_lineages "
                         "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
                         "base_sha, branch, pr_number, pr_url, head_sha, status, version, "
-                        "latest_revision, github_repository_id, github_installation_id, "
-                        "github_pr_node_id, base_ref) VALUES "
+                        "latest_revision, code_host_kind, code_host_host, "
+                        "repository_project_id, code_host_installation_id, "
+                        "code_host_pr_id, base_ref) VALUES "
                         "(:id, :agent, :deployment, :conversation, :repo, :base, :branch, "
-                        ":pr, :url, :head, :status, 1, 1, :repo_id, :installation, "
-                        ":node, :base_ref)"
+                        ":pr, :url, :head, :status, 1, 1, 'github', 'github.com', :repo_id, "
+                        ":installation, :node, :base_ref)"
                     ),
                     {
                         "id": lineage_id,
@@ -339,7 +340,7 @@ def _own_pull_request(
                         "url": _pr_url(pr),
                         "head": HEAD,
                         "status": lineage_status,
-                        "repo_id": REPO_ID,
+                        "repo_id": str(REPO_ID),
                         "installation": INSTALLATION_ID,
                         "node": f"PR_acme_{pr}",
                         "base_ref": BASE_REF,
@@ -379,9 +380,9 @@ def _requests(number: int) -> list[dict[str, Any]]:
         "w.conversation_id AS work_item_conversation "
         "FROM curie.execution_requests r "
         "JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE w.github_repository_id = :repo AND w.github_issue_number = :number "
+        "WHERE w.tracker_scope_id = :repo AND w.tracker_issue_id = :number "
         "ORDER BY r.sequence",
-        {"repo": REPO_ID, "number": number},
+        {"repo": str(REPO_ID), "number": str(number)},
     )
 
 

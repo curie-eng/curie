@@ -60,7 +60,9 @@ def test_0055_relaxes_the_deadline_check_and_downgrade_restores_it(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     config = alembic_config()
-    isolated_migration_db.at("head")
+    # The newest revision that still stores the GitHub WorkItem columns these
+    # seeds write; 0090 replaces them with the tracker identity.
+    isolated_migration_db.at("0089")
     assert _agent_column_exists()
     _insert_running(90)
     _insert_running(10800)

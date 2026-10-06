@@ -20,9 +20,15 @@ function item(overrides: Record<string, unknown> = {}) {
   return {
     id: "wi-1",
     agent_id: AGENT.id,
-    repo_full_name: "acme-corp/acme-bot",
-    github_issue_number: 2577,
-    issue_url: "https://github.com/acme-corp/acme-bot/issues/2577",
+    tracker: {
+      kind: "github",
+      host: "github.com",
+      scope_id: "4401",
+      issue_id: "2577",
+      display_key: null,
+      url: "https://github.com/acme-corp/acme-bot/issues/2577",
+    },
+    repository: { code_host_kind: "github", host: "github.com", project_id: "4401", path: "acme-corp/acme-bot" },
     cancelled_at: null,
     created_at: "2026-09-22T10:00:00Z",
     updated_at: "2026-09-22T10:05:00Z",

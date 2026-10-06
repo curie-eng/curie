@@ -67,7 +67,7 @@ from .config import Settings
 from .forges.capabilities import Operation, Support, supports
 from .forges.config import CiPolicyConfig, RequiredCheckConfig
 from .forges.errors import ForgeError
-from .forges.hosts import code_host_for, repository_ref
+from .forges.hosts import code_host_for, issue_url, repository_ref
 from .forges.ports import CodeHost
 from .forges.types import (
     STATUS_KEY_PREFIX,
@@ -1042,8 +1042,10 @@ async def gate(
     observed_sha = lineage.head_sha
     changed_paths = _publication_changed_paths(facts.publications)
     changed_python_paths = python_paths(changed_paths)
-    python_ci = python_ci_policy(settings, lineage.repo_full_name or work_item.repo_full_name)
-    metadata_ci = metadata_ci_policy(settings, lineage.repo_full_name or work_item.repo_full_name)
+    python_ci = python_ci_policy(settings, lineage.repo_full_name or work_item.repository_path)
+    metadata_ci = metadata_ci_policy(
+        settings, lineage.repo_full_name or work_item.repository_path
+    )
     unselected_path = unselected_python_path(changed_paths, python_ci)
     preflight_verdict: Verdict | None = None
     delegated_checks: tuple[str, ...] = ()
@@ -1092,8 +1094,8 @@ async def gate(
     fresh_after: datetime | None = None
     repository = repository_ref(
         settings,
-        path=lineage.repo_full_name or work_item.repo_full_name,
-        project_id=lineage.github_repository_id,
+        path=lineage.repo_full_name or work_item.repository_path,
+        project_id=lineage.repository_project_id,
     )
     if preflight_verdict is not None:
         verdict = preflight_verdict
@@ -1579,8 +1581,7 @@ async def _consider_flake_rerun(
 
 
 def _issue_url(settings: Settings, work_item: WorkItem) -> str:
-    base = settings.github_clone_base.rstrip("/")
-    return f"{base}/{work_item.repo_full_name}/issues/{work_item.github_issue_number}"
+    return issue_url(settings, work_item.tracker_issue, work_item.repository)
 
 
 async def _continue(

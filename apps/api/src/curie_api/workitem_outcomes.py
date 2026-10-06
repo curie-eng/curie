@@ -29,6 +29,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.forges.errors import ForgeError
+from curie_api.forges.hosts import issue_url as tracker_issue_url
 from curie_api.forges.hosts import repository_ref
 from curie_api.forges.ports import CodeHost
 from curie_api.forges.types import RollupState
@@ -41,8 +42,10 @@ from curie_api.schemas.workitems import (
     WorkItemProgressOut,
     WorkItemPrOut,
     WorkItemPublicationOut,
+    WorkItemRepositoryOut,
     WorkItemRequestOut,
     WorkItemStageOut,
+    WorkItemTrackerOut,
 )
 
 from .config import Settings
@@ -227,7 +230,7 @@ def derive_outcome(
     pending_turn_approval: bool,
     now: datetime,
     *,
-    issue_base: str,
+    issue_url: str,
 ) -> WorkItemOutcomeOut:
     """Derive one operator view. Pure: no I/O. ``ci`` is left null."""
 
@@ -297,11 +300,19 @@ def derive_outcome(
     return WorkItemOutcomeOut(
         id=item.id,
         agent_id=item.agent_id,
-        repo_full_name=item.repo_full_name,
-        github_issue_number=item.github_issue_number,
-        issue_url=(
-            f"{issue_base.rstrip('/')}/{item.repo_full_name}"
-            f"/issues/{item.github_issue_number}"
+        tracker=WorkItemTrackerOut(
+            kind=item.tracker_kind,
+            host=item.tracker_host,
+            scope_id=item.tracker_scope_id,
+            issue_id=item.tracker_issue_id,
+            display_key=item.tracker_display_key,
+            url=issue_url,
+        ),
+        repository=WorkItemRepositoryOut(
+            code_host_kind=item.code_host_kind,
+            host=item.code_host_host,
+            project_id=item.repository_project_id,
+            path=item.repository_path,
         ),
         cancelled_at=item.cancelled_at,
         created_at=item.created_at,
@@ -383,7 +394,7 @@ def _pick_lineage(
         for x in candidates
         if x.agent_id == item.agent_id
         and x.conversation_id == item.conversation_id
-        and x.repo_full_name.lower() == item.repo_full_name.lower()
+        and x.repo_full_name.lower() == item.repository_path.lower()
     ]
     if not matching:
         return None
@@ -535,7 +546,7 @@ async def _views(
             approvals.get(chosen_pub.approval_id) if chosen_pub is not None else None,
             pending_turn,
             now,
-            issue_base=settings.github_clone_base,
+            issue_url=tracker_issue_url(settings, item.tracker_issue, item.repository),
         )
         view.title = _title(comments[item.id], sequences)
         comment_row = latest_comment.get(item.id)
@@ -641,7 +652,7 @@ async def observe_ci(
     repository = repository_ref(
         settings,
         path=lineage.repo_full_name,
-        project_id=lineage.github_repository_id or work_item.github_repository_id,
+        project_id=lineage.repository_project_id or work_item.repository_project_id,
     )
     try:
         rollup = await code_host.observe_ci(repository, head_sha)

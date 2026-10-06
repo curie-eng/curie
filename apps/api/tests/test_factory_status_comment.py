@@ -623,8 +623,8 @@ def test_relabel_while_waiting_finalizes_the_old_comment_and_opens_a_new_one(
     assert again.json()["status"] == "factory_admitted"
     rows = _rows(
         "SELECT r.id FROM curie.execution_requests r JOIN curie.work_items w "
-        "ON w.id = r.work_item_id WHERE w.github_issue_number = :n ORDER BY r.sequence",
-        {"n": number},
+        "ON w.id = r.work_item_id WHERE w.tracker_issue_id = :n ORDER BY r.sequence",
+        {"n": str(number)},
     )
     new_id = rows[1]["id"]
     _reconcile()

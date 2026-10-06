@@ -450,6 +450,10 @@ class InMemoryTracker(_Declared):
             self.apply_label(issue, add, self.identity)
             self.ledger.record()
 
+    def issue_url(self, issue: TrackerIssueRef) -> str:
+        found = self._issue(issue)
+        return f"https://{self.host}/{self.scope_id}/issues/{found.ref.issue_id}"
+
     async def closing_reference(self, issue: TrackerIssueRef, repository: RepositoryRef) -> str:
         self._gate(Operation.CLOSING_REFERENCE)
         found = self._issue(issue)

@@ -54,12 +54,14 @@ def _work_item(agent_id: str, conversation_id: str, number: int, **base: Any) ->
     columns = "".join(f", {name}" for name in base)
     values = "".join(f", :{name}" for name in base)
     _execute(
-        "INSERT INTO curie.work_items (id, github_repository_id, github_issue_number, "
-        f"github_installation_id, agent_id, repo_full_name, conversation_id{columns}) "
-        f"VALUES (:id, 4401, :number, 5501, :agent, :repo, :conversation{values})",
+        "INSERT INTO curie.work_items (id, tracker_kind, tracker_host, tracker_scope_id, "
+        "tracker_issue_id, code_host_kind, code_host_host, repository_project_id, "
+        f"repository_path, code_host_installation_id, agent_id, conversation_id{columns}) "
+        "VALUES (:id, 'github', 'github.com', '4401', :number, 'github', 'github.com', "
+        f"'4401', :repo, 5501, :agent, :conversation{values})",
         {
             "id": uuid.uuid4(),
-            "number": number,
+            "number": str(number),
             "agent": agent_id,
             "repo": REPO,
             "conversation": conversation_id,

@@ -127,9 +127,9 @@ def _all(number: int) -> list[dict[str, Any]]:
         "w.id AS work_item_id, w.readmit_request_id "
         "FROM curie.execution_requests r "
         "JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE w.github_repository_id = :repo AND w.github_issue_number = :number "
+        "WHERE w.tracker_scope_id = :repo AND w.tracker_issue_id = :number "
         "ORDER BY r.sequence",
-        {"repo": REPO_ID, "number": number},
+        {"repo": str(REPO_ID), "number": str(number)},
     )
 
 
@@ -498,7 +498,8 @@ def test_ci_failure_loops_the_same_request_to_the_cap(admitted: Any) -> None:
     turns = _ci_turns(request_id)
     assert [t["event_id"] for t in turns] == [f"work-item-{request_id}-ci-2"]
     lines = turns[0]["text"].split("\n")
-    assert lines[0] == f"https://github.com/{REPO}/issues/{number}"
+    # The tracker links the issue on the HTML base GITHUB_API_URL names.
+    assert lines[0] == f"{get_settings().github_html_base}/{REPO}/issues/{number}"
     assert lines[1] == (
         f"Curie wait_ci round 2 of 3: the checks on {published['pr_url']} failed at {HEAD_A}."
     )
@@ -2319,7 +2320,6 @@ def test_managed_workspace_clones_the_tls_github_origin_through_real_api_and_sto
     )[0]
     credentials = WorkspaceCredentialClient(
         api_url=workspace_api,
-        github_api_url=stub.base_url,
         worker_token="factory-terminus-worker",
     )
     assert (

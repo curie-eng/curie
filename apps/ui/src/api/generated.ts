@@ -3314,20 +3314,15 @@ export interface components {
              * Format: uuid
              */
             agent_id: string;
-            /** Github Installation Id */
-            github_installation_id: number;
-            /** Github Issue Number */
-            github_issue_number: number;
-            /** Github Repository Id */
-            github_repository_id: number;
+            /** Code Host Installation Id */
+            code_host_installation_id?: number | null;
             /** Kind */
             kind: string;
             /** Objective */
             objective: string;
             /** Reply Conversation Id */
             reply_conversation_id: string;
-            /** Repo Full Name */
-            repo_full_name: string;
+            repository: components["schemas"]["RepositoryIn"];
             /**
              * Request Id
              * Format: uuid
@@ -3335,6 +3330,7 @@ export interface components {
             request_id: string;
             /** Requester */
             requester: string;
+            tracker: components["schemas"]["TrackerIssueIn"];
         };
         /**
          * AdmissionIn
@@ -6947,6 +6943,20 @@ export interface components {
             revision?: string | null;
         };
         /**
+         * RepositoryIn
+         * @description The repository frozen on the WorkItem (ADR 0197 identity rules 2 and 3).
+         */
+        RepositoryIn: {
+            /** Code Host Kind */
+            code_host_kind: string;
+            /** Host */
+            host: string;
+            /** Path */
+            path: string;
+            /** Project Id */
+            project_id: string;
+        };
+        /**
          * ResolveTargetRequest
          * @description A bundle's ``deploy.yaml`` text plus the target to resolve (ADR-0089).
          *
@@ -7613,6 +7623,22 @@ export interface components {
             tree: components["schemas"]["ObservationNode"][];
         };
         /**
+         * TrackerIssueIn
+         * @description The tracker issue that keys the WorkItem (ADR 0197 identity rule 1).
+         */
+        TrackerIssueIn: {
+            /** Display Key */
+            display_key?: string | null;
+            /** Host */
+            host: string;
+            /** Issue Id */
+            issue_id: string;
+            /** Kind */
+            kind: string;
+            /** Scope Id */
+            scope_id: string;
+        };
+        /**
          * TurnAccepted
          * @description The ingress receipt. `duplicate` says whether THIS request enqueued.
          *
@@ -7857,15 +7883,11 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
-            /** Github Issue Number */
-            github_issue_number: number;
             /**
              * Id
              * Format: uuid
              */
             id: string;
-            /** Issue Url */
-            issue_url: string;
             /** Objective */
             objective: string | null;
             /** Objective Truncated */
@@ -7873,8 +7895,7 @@ export interface components {
             pr: components["schemas"]["WorkItemPrOut"] | null;
             progress?: components["schemas"]["WorkItemProgressOut"] | null;
             publication: components["schemas"]["WorkItemPublicationOut"] | null;
-            /** Repo Full Name */
-            repo_full_name: string;
+            repository: components["schemas"]["WorkItemRepositoryOut"];
             /** Requester */
             requester: string | null;
             /** Requests */
@@ -7886,6 +7907,7 @@ export interface components {
             state: "queued" | "waiting" | "running" | "cancellation_requested" | "cancelled" | "expired" | "failed" | "awaiting_approval" | "publishing" | "published" | "completed_unpublished";
             /** Title */
             title?: string | null;
+            tracker: components["schemas"]["WorkItemTrackerOut"];
             /**
              * Updated At
              * Format: date-time
@@ -7921,6 +7943,20 @@ export interface components {
             revision_number: number | null;
             /** Status */
             status: string;
+        };
+        /**
+         * WorkItemRepositoryOut
+         * @description The repository frozen on the WorkItem at admission; ``path`` is display.
+         */
+        WorkItemRepositoryOut: {
+            /** Code Host Kind */
+            code_host_kind: string;
+            /** Host */
+            host: string;
+            /** Path */
+            path: string;
+            /** Project Id */
+            project_id: string;
         };
         /**
          * WorkItemRequestOut
@@ -7970,6 +8006,28 @@ export interface components {
              * @enum {string}
              */
             state: "done" | "current" | "redo" | "blocked" | "pending";
+        };
+        /**
+         * WorkItemTrackerOut
+         * @description The tracker issue that keys the WorkItem (ADR 0197).
+         *
+         *     ``scope_id`` and ``issue_id`` are the tracker's immutable ids as text;
+         *     ``display_key`` (a Jira key) is for display only. ``url`` is the tracker's
+         *     own link to the issue.
+         */
+        WorkItemTrackerOut: {
+            /** Display Key */
+            display_key: string | null;
+            /** Host */
+            host: string;
+            /** Issue Id */
+            issue_id: string;
+            /** Kind */
+            kind: string;
+            /** Scope Id */
+            scope_id: string;
+            /** Url */
+            url: string;
         };
         /** WorkItemUsageModel */
         WorkItemUsageModel: {

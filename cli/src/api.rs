@@ -1216,9 +1216,8 @@ pub struct ActionExecution {
 pub struct WorkItemOutcome {
     pub id: String,
     pub agent_id: String,
-    pub repo_full_name: String,
-    pub github_issue_number: u64,
-    pub issue_url: String,
+    pub tracker: WorkItemTracker,
+    pub repository: WorkItemRepository,
     pub cancelled_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -1232,6 +1231,29 @@ pub struct WorkItemOutcome {
     pub correctness: WorkItemCorrectness,
     pub ci: Option<WorkItemCi>,
     pub requests: Vec<WorkItemRequest>,
+}
+
+/// `WorkItemTrackerOut`: the tracker issue that keys the work item (ADR 0197).
+/// `scope_id` and `issue_id` are the tracker's immutable ids as text;
+/// `display_key` (a Jira key) is display only; `url` is the tracker's own link.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemTracker {
+    pub kind: String,
+    pub host: String,
+    pub scope_id: String,
+    pub issue_id: String,
+    pub display_key: Option<String>,
+    pub url: String,
+}
+
+/// `WorkItemRepositoryOut`: the repository frozen on the work item at
+/// admission. `path` is display; `project_id` is the identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemRepository {
+    pub code_host_kind: String,
+    pub host: String,
+    pub project_id: String,
+    pub path: String,
 }
 
 /// `WorkItemPrOut`.

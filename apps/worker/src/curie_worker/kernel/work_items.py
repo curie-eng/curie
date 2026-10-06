@@ -119,7 +119,7 @@ def _work_item_repository(self: Kernel, event_id: str) -> str | None:
     if parsed is None or parsed.kind != "execute":
         return None
     run = self._work_item_runs.get(parsed.request_id)
-    return run.repo_full_name if run is not None else None
+    return run.repository_path if run is not None else None
 
 
 async def _adopt_resumed_work_item(
@@ -156,7 +156,7 @@ async def _adopt_resumed_work_item(
                     work_item_id=found.work_item_id,
                     conversation_id=thread_key,
                     wait_deadline="",
-                    repo_full_name=None,
+                    repository_path=None,
                 ),
                 event_id=event_id,
                 thread_key=thread_key,

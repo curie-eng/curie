@@ -38,6 +38,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from .approval_wording import approval_display
 from .db import SCHEMA, Base
+from .forges.types import RepositoryRef, TrackerIssueRef
 from .repo_full_name import normalize_repo_full_name
 from .sealed_snapshot import is_sealed_envelope
 
@@ -581,6 +582,21 @@ class Approval(Base):
     publication: Mapped[Publication | None] = relationship(back_populates="approval", uselist=False)
 
 
+# The lineage's code host identity: all unset, or complete. Migration 0090
+# carries a frozen copy. IS TRUE because a NULL CHECK expression passes.
+LINEAGE_CODE_HOST_IDENTITY_CHECK = (
+    "((code_host_kind IS NULL AND code_host_host IS NULL AND repository_project_id IS NULL "
+    "AND code_host_installation_id IS NULL AND code_host_pr_id IS NULL AND base_ref IS NULL) "
+    "OR (length(btrim(code_host_kind)) > 0 AND length(btrim(code_host_host)) > 0 "
+    "AND length(btrim(repository_project_id)) > 0 "
+    "AND (code_host_installation_id IS NULL OR code_host_installation_id > 0) "
+    "AND (code_host_kind <> 'github' OR (repository_project_id ~ '^[1-9][0-9]*$' "
+    "AND code_host_installation_id IS NOT NULL)) "
+    "AND length(code_host_pr_id) > 0 AND pr_number IS NOT NULL "
+    "AND length(base_ref) > 0)) IS TRUE"
+)
+
+
 class ThreadPublicationLineage(Base):
     """One durable pull-request identity owned by an agent conversation."""
 
@@ -611,27 +627,24 @@ class ThreadPublicationLineage(Base):
             postgresql_where=text("status = 'open'"),
         ),
         CheckConstraint(
-            "(github_repository_id IS NULL AND github_installation_id IS NULL "
-            "AND github_pr_node_id IS NULL AND base_ref IS NULL) "
-            "OR (github_repository_id IS NOT NULL "
-            "AND github_repository_id > 0 "
-            "AND github_installation_id IS NOT NULL AND github_installation_id > 0 "
-            "AND github_pr_node_id IS NOT NULL "
-            "AND length(github_pr_node_id) > 0 AND pr_number IS NOT NULL "
-            "AND base_ref IS NOT NULL AND length(base_ref) > 0)",
-            name="thread_publication_lineages_github_identity_ck",
+            LINEAGE_CODE_HOST_IDENTITY_CHECK,
+            name="thread_publication_lineages_code_host_identity_ck",
         ),
         Index(
-            "uq_publication_github_pr_owner",
-            "github_repository_id",
+            "uq_publication_code_host_pr_owner",
+            "code_host_kind",
+            "code_host_host",
+            "repository_project_id",
             "pr_number",
             unique=True,
         ),
         Index(
-            "uq_active_publication_github_conversation",
+            "uq_active_publication_code_host_conversation",
             "agent_id",
             "conversation_id",
-            "github_repository_id",
+            "code_host_kind",
+            "code_host_host",
+            "repository_project_id",
             unique=True,
             postgresql_where=text("status = 'open'"),
         ),
@@ -662,39 +675,81 @@ class ThreadPublicationLineage(Base):
     )
     binding_generation: Mapped[int | None] = mapped_column(default=None)
     reply_conversation_id: Mapped[str | None] = mapped_column(default=None)
-    github_repository_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
-    github_installation_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
-    github_pr_node_id: Mapped[str | None] = mapped_column(default=None)
+    # The verified code host identity of the pull request (ADR 0197): the
+    # repository's (kind, host, immutable project id), the GitHub installation
+    # that verified it, and the pull request's own immutable id (a GitHub node
+    # id). All NULL on a lineage created before identity was captured.
+    code_host_kind: Mapped[str | None] = mapped_column(Text, default=None)
+    code_host_host: Mapped[str | None] = mapped_column(Text, default=None)
+    repository_project_id: Mapped[str | None] = mapped_column(Text, default=None)
+    code_host_installation_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    code_host_pr_id: Mapped[str | None] = mapped_column(default=None)
     base_ref: Mapped[str | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
     publications: Mapped[list[Publication]] = relationship(back_populates="lineage")
 
+    @property
+    def repository(self) -> RepositoryRef | None:
+        """The verified repository, or None before identity was captured."""
+
+        if (
+            self.code_host_kind is None
+            or self.code_host_host is None
+            or self.repository_project_id is None
+        ):
+            return None
+        return RepositoryRef(
+            self.code_host_kind,
+            self.code_host_host,
+            self.repository_project_id,
+            self.repo_full_name,
+        )
+
 
 class WorkItem(Base):
-    """Durable execution identity for one canonical GitHub issue."""
+    """Durable execution identity for one tracker issue (ADR 0162, ADR 0197).
+
+    Keyed by (tracker kind, tracker host, scope id, issue id). The repository
+    is chosen at admission and frozen here as (code host kind, host, project
+    id) with its path for display. ``code_host_installation_id`` is the GitHub
+    installation that admitted the work, an authority fence other forges leave
+    NULL.
+    """
 
     __tablename__ = "work_items"
     __table_args__ = (
         CheckConstraint(
-            "github_repository_id > 0",
-            name="work_items_github_repository_id_ck",
+            "length(btrim(tracker_kind)) > 0 AND length(btrim(tracker_host)) > 0 "
+            "AND length(btrim(tracker_scope_id)) > 0 AND length(btrim(tracker_issue_id)) > 0 "
+            "AND (tracker_display_key IS NULL OR length(btrim(tracker_display_key)) > 0) "
+            "AND length(btrim(code_host_kind)) > 0 AND length(btrim(code_host_host)) > 0 "
+            "AND length(btrim(repository_project_id)) > 0 "
+            "AND length(btrim(repository_path)) > 0",
+            name="work_items_identity_text_ck",
+        ),
+        # GitHub ids are positive decimals, which the identity derivations
+        # require, and GitHub work carries the installation that admitted it.
+        CheckConstraint(
+            "(tracker_kind <> 'github' OR (tracker_scope_id ~ '^[1-9][0-9]*$' "
+            "AND tracker_issue_id ~ '^[1-9][0-9]*$')) "
+            "AND (code_host_kind <> 'github' OR (repository_project_id ~ '^[1-9][0-9]*$' "
+            "AND code_host_installation_id IS NOT NULL))",
+            name="work_items_github_identity_ck",
         ),
         CheckConstraint(
-            "github_issue_number > 0",
-            name="work_items_github_issue_number_ck",
-        ),
-        CheckConstraint(
-            "github_installation_id > 0",
-            name="work_items_github_installation_id_ck",
+            "code_host_installation_id IS NULL OR code_host_installation_id > 0",
+            name="work_items_code_host_installation_id_ck",
         ),
         CheckConstraint("version >= 1", name="work_items_version_ck"),
         CheckConstraint("next_sequence >= 1", name="work_items_next_sequence_ck"),
         UniqueConstraint(
-            "github_repository_id",
-            "github_issue_number",
-            name="work_items_github_issue_key",
+            "tracker_kind",
+            "tracker_host",
+            "tracker_scope_id",
+            "tracker_issue_id",
+            name="work_items_tracker_issue_key",
         ),
         UniqueConstraint(
             "publication_lineage_id",
@@ -722,13 +777,19 @@ class WorkItem(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    github_repository_id: Mapped[int] = mapped_column(BigInteger)
-    github_issue_number: Mapped[int]
-    github_installation_id: Mapped[int] = mapped_column(BigInteger)
+    tracker_kind: Mapped[str] = mapped_column(Text)
+    tracker_host: Mapped[str] = mapped_column(Text)
+    tracker_scope_id: Mapped[str] = mapped_column(Text)
+    tracker_issue_id: Mapped[str] = mapped_column(Text)
+    tracker_display_key: Mapped[str | None] = mapped_column(Text, default=None)
+    code_host_kind: Mapped[str] = mapped_column(Text)
+    code_host_host: Mapped[str] = mapped_column(Text)
+    repository_project_id: Mapped[str] = mapped_column(Text)
+    repository_path: Mapped[str]
+    code_host_installation_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
     agent_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
     )
-    repo_full_name: Mapped[str]
     conversation_id: Mapped[str]
     publication_lineage_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey(
@@ -775,6 +836,27 @@ class WorkItem(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+
+    @property
+    def tracker_issue(self) -> TrackerIssueRef:
+        return TrackerIssueRef(
+            self.tracker_kind,
+            self.tracker_host,
+            self.tracker_scope_id,
+            self.tracker_issue_id,
+            self.tracker_display_key,
+        )
+
+    @property
+    def repository(self) -> RepositoryRef:
+        """The repository frozen at admission."""
+
+        return RepositoryRef(
+            self.code_host_kind,
+            self.code_host_host,
+            self.repository_project_id,
+            self.repository_path,
+        )
 
 
 # The typed reply target's shape. Migration 0078 carries a frozen copy.
@@ -2603,22 +2685,24 @@ class PrincipalTeam(Base):
 
 
 class FactoryPollCursor(Base):
-    """One repository's factory poll cursors and conditional-request tags (#3745)."""
+    """One tracker scope's factory poll cursors and conditional-request tags (#3745).
+
+    Keyed by the scope a tracker issue id is unique within (ADR 0197): the
+    repository id on GitHub. ``scope_path`` is for display.
+    """
 
     __tablename__ = "factory_poll_cursors"
     __table_args__ = (
-        CheckConstraint(
-            "repository_id IS NULL OR repository_id > 0",
-            name="factory_poll_cursors_repository_id_ck",
-        ),
         CheckConstraint(
             "jsonb_typeof(etags) = 'object'",
             name="factory_poll_cursors_etags_object_ck",
         ),
     )
 
-    repo_full_name: Mapped[str] = mapped_column(Text, primary_key=True)
-    repository_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    tracker_kind: Mapped[str] = mapped_column(Text, primary_key=True)
+    tracker_host: Mapped[str] = mapped_column(Text, primary_key=True)
+    tracker_scope_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    scope_path: Mapped[str] = mapped_column(Text)
     comments_since: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )

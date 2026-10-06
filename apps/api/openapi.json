@@ -685,20 +685,17 @@
             "title": "Agent Id",
             "type": "string"
           },
-          "github_installation_id": {
-            "exclusiveMinimum": 0.0,
-            "title": "Github Installation Id",
-            "type": "integer"
-          },
-          "github_issue_number": {
-            "exclusiveMinimum": 0.0,
-            "title": "Github Issue Number",
-            "type": "integer"
-          },
-          "github_repository_id": {
-            "exclusiveMinimum": 0.0,
-            "title": "Github Repository Id",
-            "type": "integer"
+          "code_host_installation_id": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code Host Installation Id"
           },
           "kind": {
             "minLength": 1,
@@ -716,10 +713,8 @@
             "title": "Reply Conversation Id",
             "type": "string"
           },
-          "repo_full_name": {
-            "minLength": 1,
-            "title": "Repo Full Name",
-            "type": "string"
+          "repository": {
+            "$ref": "#/components/schemas/RepositoryIn"
           },
           "request_id": {
             "format": "uuid",
@@ -730,6 +725,9 @@
             "minLength": 1,
             "title": "Requester",
             "type": "string"
+          },
+          "tracker": {
+            "$ref": "#/components/schemas/TrackerIssueIn"
           }
         },
         "required": [
@@ -737,10 +735,8 @@
           "kind",
           "address",
           "reply_conversation_id",
-          "repo_full_name",
-          "github_repository_id",
-          "github_issue_number",
-          "github_installation_id",
+          "tracker",
+          "repository",
           "objective",
           "requester",
           "request_id"
@@ -8949,6 +8945,39 @@
         "title": "RepositoryCredentialOut",
         "type": "object"
       },
+      "RepositoryIn": {
+        "description": "The repository frozen on the WorkItem (ADR 0197 identity rules 2 and 3).",
+        "properties": {
+          "code_host_kind": {
+            "minLength": 1,
+            "title": "Code Host Kind",
+            "type": "string"
+          },
+          "host": {
+            "minLength": 1,
+            "title": "Host",
+            "type": "string"
+          },
+          "path": {
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          },
+          "project_id": {
+            "minLength": 1,
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code_host_kind",
+          "host",
+          "project_id",
+          "path"
+        ],
+        "title": "RepositoryIn",
+        "type": "object"
+      },
       "ResolveTargetRequest": {
         "description": "A bundle's ``deploy.yaml`` text plus the target to resolve (ADR-0089).\n\nThe CLI sends the file CONTENT rather than parsing it, so there is exactly\none parser for this format. Two would be a drift hazard on a file whose\nwhole job is to be unambiguous about where a deploy lands -- and the Rust\nYAML ecosystem has no maintained successor to serde_yaml to pick from.",
         "properties": {
@@ -10391,6 +10420,51 @@
         "title": "TraceTree",
         "type": "object"
       },
+      "TrackerIssueIn": {
+        "description": "The tracker issue that keys the WorkItem (ADR 0197 identity rule 1).",
+        "properties": {
+          "display_key": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Key"
+          },
+          "host": {
+            "minLength": 1,
+            "title": "Host",
+            "type": "string"
+          },
+          "issue_id": {
+            "minLength": 1,
+            "title": "Issue Id",
+            "type": "string"
+          },
+          "kind": {
+            "minLength": 1,
+            "title": "Kind",
+            "type": "string"
+          },
+          "scope_id": {
+            "minLength": 1,
+            "title": "Scope Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "host",
+          "scope_id",
+          "issue_id"
+        ],
+        "title": "TrackerIssueIn",
+        "type": "object"
+      },
       "TurnAccepted": {
         "description": "The ingress receipt. `duplicate` says whether THIS request enqueued.\n\n`stream_id` is None only while another request holds the claim and has not\nenqueued yet (the 202 case): there is no id to hand back yet, and the\nadapter's retry loop already knows what \"come back\" means.",
         "properties": {
@@ -11004,17 +11078,9 @@
             "title": "Created At",
             "type": "string"
           },
-          "github_issue_number": {
-            "title": "Github Issue Number",
-            "type": "integer"
-          },
           "id": {
             "format": "uuid",
             "title": "Id",
-            "type": "string"
-          },
-          "issue_url": {
-            "title": "Issue Url",
             "type": "string"
           },
           "objective": {
@@ -11062,9 +11128,8 @@
               }
             ]
           },
-          "repo_full_name": {
-            "title": "Repo Full Name",
-            "type": "string"
+          "repository": {
+            "$ref": "#/components/schemas/WorkItemRepositoryOut"
           },
           "requester": {
             "anyOf": [
@@ -11112,6 +11177,9 @@
             ],
             "title": "Title"
           },
+          "tracker": {
+            "$ref": "#/components/schemas/WorkItemTrackerOut"
+          },
           "updated_at": {
             "format": "date-time",
             "title": "Updated At",
@@ -11121,9 +11189,8 @@
         "required": [
           "id",
           "agent_id",
-          "repo_full_name",
-          "github_issue_number",
-          "issue_url",
+          "tracker",
+          "repository",
           "cancelled_at",
           "created_at",
           "updated_at",
@@ -11240,6 +11307,35 @@
           "approval_status"
         ],
         "title": "WorkItemPublicationOut",
+        "type": "object"
+      },
+      "WorkItemRepositoryOut": {
+        "description": "The repository frozen on the WorkItem at admission; ``path`` is display.",
+        "properties": {
+          "code_host_kind": {
+            "title": "Code Host Kind",
+            "type": "string"
+          },
+          "host": {
+            "title": "Host",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code_host_kind",
+          "host",
+          "project_id",
+          "path"
+        ],
+        "title": "WorkItemRepositoryOut",
         "type": "object"
       },
       "WorkItemRequestOut": {
@@ -11401,6 +11497,52 @@
           "round_label"
         ],
         "title": "WorkItemStageOut",
+        "type": "object"
+      },
+      "WorkItemTrackerOut": {
+        "description": "The tracker issue that keys the WorkItem (ADR 0197).\n\n``scope_id`` and ``issue_id`` are the tracker's immutable ids as text;\n``display_key`` (a Jira key) is for display only. ``url`` is the tracker's\nown link to the issue.",
+        "properties": {
+          "display_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Key"
+          },
+          "host": {
+            "title": "Host",
+            "type": "string"
+          },
+          "issue_id": {
+            "title": "Issue Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "scope_id": {
+            "title": "Scope Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "host",
+          "scope_id",
+          "issue_id",
+          "display_key",
+          "url"
+        ],
+        "title": "WorkItemTrackerOut",
         "type": "object"
       },
       "WorkItemUsageModel": {

@@ -46,7 +46,7 @@ from ..config import get_settings
 from ..deps import SessionDep
 from ..forges.errors import ForgeError, Unauthorized, Unavailable
 from ..forges.hosts import code_host_for, pull_request_ref
-from ..forges.types import CredentialScope
+from ..forges.types import GITHUB, CredentialScope
 from ..models import (
     ExecutionRequest,
     Publication,
@@ -233,7 +233,7 @@ async def _refresh_publication_lineage_from_github(
             pull_request_ref(
                 settings,
                 path=lineage.repo_full_name,
-                project_id=lineage.github_repository_id,
+                project_id=lineage.repository_project_id,
                 number=lineage.pr_number,
             )
         )
@@ -662,14 +662,15 @@ async def _replay_held_review_feedback(
     if (
         not get_settings().github_review_ingress_enabled
         or lineage.status != "open"
-        or lineage.github_repository_id is None
+        or lineage.code_host_kind != GITHUB
+        or lineage.repository_project_id is None
         or lineage.pr_number is None
     ):
         return
     try:
         async with asyncio.timeout(10):
             await request.app.state.github_review_reconciler.replay_held(
-                repository_id=lineage.github_repository_id,
+                repository_id=int(lineage.repository_project_id),
                 pr_number=lineage.pr_number,
             )
     except Exception:  # noqa: BLE001 - existing broad catch retained
@@ -809,7 +810,7 @@ async def redeem_publication_credential(
             request.app.state.http_client,
             repo_full_name=repo,
             project_id=(
-                publication.lineage.github_repository_id
+                publication.lineage.repository_project_id
                 if publication.lineage is not None
                 else None
             ),
@@ -854,9 +855,9 @@ def _review_revision_out(
     lineage: ThreadPublicationLineage,
 ) -> ReviewRevisionOut:
     assert lineage.reply_conversation_id is not None
-    assert lineage.github_repository_id is not None
-    assert lineage.github_installation_id is not None
-    assert lineage.github_pr_node_id is not None
+    assert lineage.repository_project_id is not None
+    assert lineage.code_host_installation_id is not None
+    assert lineage.code_host_pr_id is not None
     assert lineage.pr_number is not None
     assert lineage.base_ref is not None
     return ReviewRevisionOut(
@@ -867,9 +868,9 @@ def _review_revision_out(
         reply_conversation_id=lineage.reply_conversation_id,
         binding_id=row.binding_id,
         binding_generation=row.binding_generation,
-        repository_id=lineage.github_repository_id,
-        installation_id=lineage.github_installation_id,
-        pr_node_id=lineage.github_pr_node_id,
+        repository_id=int(lineage.repository_project_id),
+        installation_id=lineage.code_host_installation_id,
+        pr_node_id=lineage.code_host_pr_id,
         base_ref=lineage.base_ref,
         repo_full_name=lineage.repo_full_name,
         pr_number=lineage.pr_number,
