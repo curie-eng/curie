@@ -1,0 +1,331 @@
+{
+  "comment": "@spec ACTION-EXECUTOR-6 @spec ACTION-EXECUTOR-24. The worker's `execute` client and the runner's `/v1/execute` route ship in different images, as do the writer and reader of the mode variable, so the whole route is frozen here. `mode_variable` is the runner-private boot variable (outside `BootEnv`) the worker sets on an executor claim. Every request carries exactly `request_keys`; a key a phase does not use is null. `phases` gives one request and response per phase; `arguments` is the canonical text (action-canonical-arguments.json), never an object. `sequences` lists the only accepted phase orders within one sandbox (a prefix of one is accepted; any other order, including a second `call`, is refused `phase_out_of_order` without dialing). `refusals` is the closed set of route refusals: HTTP status, body, whether the connector may have been dialed, and the pre-dispatch code the worker reports for it. `absent_route` is a runner image without the route. `status_body` is the executor mode body of `GET /status` and `GET /v1/status`; `other_routes` are refused in executor mode. Read by apps/worker/tests/test_runner_execute_vector.py and runner/tests/test_runner_execute_vector.py, each of which rejects an unknown key.",
+  "mode_variable": {
+    "name": "CURIE_RUNNER_MODE",
+    "value": "execute"
+  },
+  "route": {
+    "method": "POST",
+    "path": "/v1/execute",
+    "auth_header": "Authorization",
+    "auth_scheme": "Bearer"
+  },
+  "serves": [
+    "GET /healthz",
+    "GET /status",
+    "GET /v1/status",
+    "POST /v1/execute"
+  ],
+  "request_keys": [
+    "execution_id",
+    "phase",
+    "connector",
+    "tool",
+    "arguments",
+    "grant",
+    "target"
+  ],
+  "phases": {
+    "list": {
+      "request": {
+        "execution_id": "00000000-0000-4000-8000-000000000001",
+        "phase": "list",
+        "connector": "example-scale",
+        "tool": null,
+        "arguments": null,
+        "grant": null,
+        "target": null
+      },
+      "response": {
+        "phase": "list",
+        "tools": [
+          {
+            "name": "scale",
+            "annotations": {
+              "readOnlyHint": false
+            }
+          },
+          {
+            "name": "restore",
+            "annotations": {
+              "readOnlyHint": false
+            },
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "target": {
+                  "type": "object"
+                },
+                "prior_state": {
+                  "type": "object"
+                },
+                "expected_version": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target",
+                "prior_state"
+              ]
+            }
+          },
+          {
+            "name": "observe_version",
+            "annotations": {
+              "readOnlyHint": true
+            },
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "target": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "target"
+              ]
+            }
+          }
+        ]
+      },
+      "response_keys": [
+        "phase",
+        "tools"
+      ],
+      "tool_keys": [
+        "name",
+        "annotations"
+      ],
+      "schema_tools": [
+        "restore",
+        "observe_version"
+      ]
+    },
+    "observe": {
+      "request": {
+        "execution_id": "00000000-0000-4000-8000-000000000001",
+        "phase": "observe",
+        "connector": "example-scale",
+        "tool": null,
+        "arguments": null,
+        "grant": null,
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "response": {
+        "phase": "observe",
+        "version": "rv-1041"
+      },
+      "response_keys": [
+        "phase",
+        "version"
+      ]
+    },
+    "call": {
+      "request": {
+        "execution_id": "00000000-0000-4000-8000-000000000001",
+        "phase": "call",
+        "connector": "example-scale",
+        "tool": "restore",
+        "arguments": "{\"expected_version\":\"rv-1041\",\"prior_state\":{\"ciphertext\":\"ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE=\",\"kid\":\"example-key-2026-10\",\"sealed\":\"curie.snapshot.v1\"},\"target\":{\"kind\":\"Deployment\",\"name\":\"example-web\",\"namespace\":\"example-ns\"}}",
+        "grant": "ccg.eyJleGFtcGxlIjoidHJ1ZSJ9.ZXhhbXBsZS1zaWduYXR1cmU",
+        "target": null
+      },
+      "response": {
+        "phase": "call",
+        "is_error": false,
+        "structured": {
+          "ok": true,
+          "version": "rv-1043",
+          "target": {
+            "kind": "Deployment",
+            "namespace": "example-ns",
+            "name": "example-web"
+          }
+        }
+      },
+      "response_keys": [
+        "phase",
+        "is_error",
+        "structured"
+      ]
+    }
+  },
+  "sequences": [
+    [
+      "list"
+    ],
+    [
+      "list",
+      "observe",
+      "call"
+    ],
+    [
+      "list",
+      "call"
+    ]
+  ],
+  "refused_sequences": [
+    [
+      "observe"
+    ],
+    [
+      "call"
+    ],
+    [
+      "list",
+      "list"
+    ],
+    [
+      "list",
+      "call",
+      "call"
+    ],
+    [
+      "list",
+      "observe",
+      "observe"
+    ],
+    [
+      "list",
+      "call",
+      "observe"
+    ],
+    [
+      "list",
+      "observe",
+      "call",
+      "call"
+    ]
+  ],
+  "refusal_body_key": "refused",
+  "refusals": [
+    {
+      "code": "phase_out_of_order",
+      "status": 409,
+      "phases": [
+        "list",
+        "observe",
+        "call"
+      ],
+      "dialed": false,
+      "worker_code": "runner_unavailable"
+    },
+    {
+      "code": "invalid_request",
+      "status": 400,
+      "phases": [
+        "list",
+        "observe",
+        "call"
+      ],
+      "dialed": false,
+      "worker_code": "runner_unavailable"
+    },
+    {
+      "code": "tool_not_advertised",
+      "status": 409,
+      "phases": [
+        "call"
+      ],
+      "dialed": false,
+      "worker_code": "tool_not_advertised"
+    },
+    {
+      "code": "restore_not_advertised",
+      "status": 409,
+      "phases": [
+        "call"
+      ],
+      "dialed": false,
+      "worker_code": "restore_not_advertised"
+    },
+    {
+      "code": "restore_schema_mismatch",
+      "status": 409,
+      "phases": [
+        "call"
+      ],
+      "dialed": false,
+      "worker_code": "restore_schema_mismatch"
+    },
+    {
+      "code": "arguments_mismatch",
+      "status": 409,
+      "phases": [
+        "call"
+      ],
+      "dialed": false,
+      "worker_code": "arguments_mismatch"
+    },
+    {
+      "code": "connector_unreachable",
+      "status": 502,
+      "phases": [
+        "list",
+        "observe"
+      ],
+      "dialed": true,
+      "worker_code": "connector_unreachable"
+    }
+  ],
+  "call_transport_failure": {
+    "status": 502,
+    "body": {
+      "refused": "call_outcome_unknown"
+    },
+    "worker_state": "indeterminate",
+    "worker_code": "response_lost"
+  },
+  "absent_route": {
+    "status": 404,
+    "worker_code": "runner_unavailable"
+  },
+  "unauthenticated": {
+    "status": 401
+  },
+  "status_body": {
+    "keys": [
+      "mode",
+      "status",
+      "ready",
+      "turn_active",
+      "history_durable"
+    ],
+    "fixed": {
+      "mode": "execute",
+      "history_durable": false
+    },
+    "booleans": [
+      "ready",
+      "turn_active"
+    ],
+    "attestation_keys_on_v1_status": [
+      "session_id",
+      "sandbox_id",
+      "managed_workspace",
+      "cwd"
+    ],
+    "never": [
+      "turn_epoch",
+      "capacity_admission",
+      "capacity_admission_result"
+    ]
+  },
+  "other_routes": {
+    "status": 409,
+    "body_mode_key": "mode",
+    "routes": [
+      "POST /v1/event",
+      "POST /v1/steer",
+      "POST /v1/interrupt",
+      "POST /v1/timeout",
+      "POST /v1/turn-admit",
+      "POST /v1/reset",
+      "POST /v1/snapshot"
+    ]
+  }
+}

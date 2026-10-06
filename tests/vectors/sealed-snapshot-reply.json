@@ -1,0 +1,965 @@
+{
+  "comment": "@spec ACTION-EXECUTOR-9 @spec ACTION-EXECUTOR-10. The sealed reply convention, read by every image that judges one. `envelope` states the grammar of `reply.prior`. Each vector is a connector's structured reply to a write call (`reply`, the `result` of its `side_effect_flag`) and the runner's held secret literals (`held_secrets`). `expand_ciphertext`, when present, replaces `reply.prior.ciphertext` with `fill` repeated `length` times followed by `suffix`, so a size boundary stays readable. `envelope_valid` is the grammar verdict on `reply.prior` alone (the API's `is_sealed_envelope`). `runner` is what `OutboundRedactor` does to the frame: `replay_inputs` `verbatim` means `prior`, `version` and `target` cross byte-identical, `withheld` means all three cross as null; `redacted` is the frame flag; `scrubbed` names the other `result` fields the redactor changes, and every unnamed field crosses unchanged. `worker` is the worker's recording verdict on the frame the runner emitted: `records_snapshot` true means the completion records `prior_state` as the envelope and `post_version` as `reply.version`; false means `prior_state` is null. Read by apps/api/tests/test_sealed_snapshot_reply_vector.py, apps/worker/tests/test_sealed_snapshot_reply_vector.py and runner/tests/test_sealed_snapshot_reply_vector.py, each of which rejects an unknown key; the reference connector's tests (plan task 7) read it too.",
+  "envelope": {
+    "keys": [
+      "sealed",
+      "kid",
+      "ciphertext"
+    ],
+    "sealed": "curie.snapshot.v1",
+    "kid_pattern": "^[A-Za-z0-9._-]{1,64}$",
+    "ciphertext": "standard base64 alphabet with padding, no line breaks, 1 to 65536 decoded bytes",
+    "version_max_length": 256,
+    "redaction_placeholder_prefix": "[REDACTED:"
+  },
+  "vectors": [
+    {
+      "name": "valid_sealed_reply",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": true
+      }
+    },
+    {
+      "name": "valid_with_summary_and_other_fields",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        },
+        "summary": "scaled example-web to 5"
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": true
+      }
+    },
+    {
+      "name": "max_ciphertext_65536_bytes",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "expand_ciphertext": {
+        "fill": "A",
+        "length": 87382,
+        "suffix": "=="
+      },
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": true
+      }
+    },
+    {
+      "name": "kid_64_characters",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": true
+      }
+    },
+    {
+      "name": "version_256_characters",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": true
+      }
+    },
+    {
+      "name": "extra_envelope_key",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE=",
+          "alg": "example"
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "missing_kid",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "wrong_constant",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v2",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "urlsafe_alphabet",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "-_-_AQID"
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "ciphertext_with_line_break",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "QUJD\nREVG"
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "ciphertext_unpadded",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "QUJDRA"
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "ciphertext_empty",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": ""
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "ciphertext_not_a_string",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": 12
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "oversized_ciphertext_65537_bytes",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "expand_ciphertext": {
+        "fill": "A",
+        "length": 87383,
+        "suffix": "="
+      },
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "kid_empty",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "kid_65_characters",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "kid_outside_alphabet",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "key/1",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "placeholder_in_ciphertext",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "[REDACTED:held_secret]"
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "empty_version",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "version_257_characters",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "version_not_a_string",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": 1041,
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "missing_version",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "placeholder_in_version",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "[REDACTED:jwt]",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "placeholder_in_target",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "name": "[REDACTED:api_key]"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "missing_target",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041"
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "cleartext_prior",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "replicas": 3
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "missing_prior",
+      "reply": {
+        "ok": true,
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": false,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "pattern_match_inside_ciphertext",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "AKIAIOSFODNN7EXAMPLE"
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": true
+      }
+    },
+    {
+      "name": "token_shaped_kid",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "sk-example0000000000000000",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "withheld",
+        "redacted": true
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "pattern_match_in_version",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "token=example0000",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "withheld",
+        "redacted": true
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "pattern_match_in_target",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "name": "example-web",
+          "note": "token=example0000"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "withheld",
+        "redacted": true
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "held_literal_in_ciphertext",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ExampleHeldValue0001"
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [
+        "ExampleHeldValue0001"
+      ],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "withheld",
+        "redacted": true
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "held_literal_in_target",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "name": "ExampleHeldValue0001"
+        }
+      },
+      "held_secrets": [
+        "ExampleHeldValue0001"
+      ],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "withheld",
+        "redacted": true
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "held_literal_in_version",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "ExampleHeldValue0001",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [
+        "ExampleHeldValue0001"
+      ],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "withheld",
+        "redacted": true
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "secret_in_summary_beside_valid_envelope",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        },
+        "summary": "rotated with token=example0000"
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": true,
+        "scrubbed": [
+          "summary"
+        ]
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "held_literal_in_summary_beside_valid_envelope",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        },
+        "summary": "used ExampleHeldValue0001"
+      },
+      "held_secrets": [
+        "ExampleHeldValue0001"
+      ],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": true,
+        "scrubbed": [
+          "summary"
+        ]
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    }
+  ]
+}
