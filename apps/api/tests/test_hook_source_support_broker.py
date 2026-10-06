@@ -933,13 +933,13 @@ def test_first_failing_step_decides_the_reason(
 
 
 @pytest.mark.parametrize("requested", [None, "read-only"])
-def test_fully_valid_tuple_reports_unsupported_with_runtime_members(
+def test_fully_valid_tuple_without_enqueue_file_reports_runtime_unavailable_with_members(
     runtime_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, requested: str | None
 ) -> None:
-    """Every step passes: 503 configuration_unsupported, members from the tuple.
-
-    Ingress does not yet admit protected deliveries, so the probe never claims
-    support; runtime_generation is a canonical decimal string.
+    """Steps 1 through 11 pass but no ``enqueue.json`` exists: step 12 answers 503
+    runtime_unavailable with members from the tuple; the final configuration_unsupported
+    of the base contract is removed. The 200 ``supported`` answer is covered by
+    ``test_hook_source_support_parity.py``; runtime_generation is a canonical decimal string.
     @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-LANE-2/3.
     """
     run_case(
@@ -947,7 +947,7 @@ def test_fully_valid_tuple_reports_unsupported_with_runtime_members(
         tmp_path,
         monkeypatch,
         _valid,
-        "configuration_unsupported",
+        "runtime_unavailable",
         True,
         requested=requested,
     )
