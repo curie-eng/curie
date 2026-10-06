@@ -360,6 +360,64 @@ def test_selection_historical_cli_dry_run_json(
     assert all({"name", "status", "detail"} <= check.keys() for check in report["checks"])
 
 
+def test_dry_run_affected_tests_use_ci_xdist_scheduling(
+    repository: Path, recorded_gh: Path
+) -> None:
+    paths = (FIXTURES / "pr-3332-paths.txt").read_text().splitlines()
+    commit_paths(repository, paths)
+    result = full_preflight(repository, "--dry-run", "--json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    checks = {check["name"]: check for check in json.loads(result.stdout)["checks"]}
+    detail = checks["Affected Python tests"]["detail"]
+    assert "-n 4 --dist loadgroup" in detail
+    assert "apps/api/tests" in detail
+
+
+def load_released_upgrade_gate():
+    path = ROOT / "scripts/check-released-upgrade.py"
+    spec = importlib.util.spec_from_file_location("curie_preflight_released_upgrade_gate", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_private_released_upgrade_environment_satisfies_the_gate_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate = load_released_upgrade_gate()
+    override = tmp_path / "override.yaml"
+    override.write_text("services: {}\n")
+    environment = load_tool().released_upgrade_environment(
+        "curie-preflight-example", f"{ROOT / 'compose.dev.yaml'}{os.pathsep}{override}", 43210
+    )
+    assert environment["CURIE_RELEASED_UPGRADE_INTEGRATION"] == "1"
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    resources = gate._released_upgrade_resources_from_env()
+    assert resources.compose_project == "curie-preflight-example"
+    assert resources.compose_files == (
+        (ROOT / "compose.dev.yaml").resolve(),
+        override.resolve(),
+    )
+    assert resources.postgres_host == "127.0.0.1"
+    assert resources.postgres_port == 43210
+
+
+def test_released_upgrade_gate_rejects_a_base_only_compose_file_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = load_released_upgrade_gate()
+    environment = load_tool().released_upgrade_environment(
+        "curie-preflight-example", str(ROOT / "compose.dev.yaml"), 43210
+    )
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(gate.GateError, match="isolated override"):
+        gate._released_upgrade_resources_from_env()
+
+
 def test_selection_docs_only_ignores_always_list() -> None:
     assert load_tool().select_python_tests(ROOT, ["docs/agents.md", "README.md"]) == []
 
