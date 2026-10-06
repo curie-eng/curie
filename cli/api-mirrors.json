@@ -46,7 +46,16 @@
     {
       "struct": "WorkItemOutcome",
       "schema": "WorkItemOutcomeOut",
-      "omissions": []
+      "omissions": [
+        {
+          "field": "progress",
+          "why": "The console Factory view reads the stage progress; the work-items verbs render state, cause and PR only, and #4102 keeps their --json output unchanged."
+        },
+        {
+          "field": "title",
+          "why": "The console Factory view reads the issue title; the work-items verbs identify an item by repo and issue number, and #4102 keeps their --json output unchanged."
+        }
+      ]
     },
     {
       "struct": "WorkItemPr",

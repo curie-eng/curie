@@ -365,6 +365,15 @@ export type WorkItemOutcome = Schemas["WorkItemOutcomeOut"];
 
 export type WorkItemsList = Schemas["WorkItemOutcomeList"];
 
+// Stage progress (#4102): the same phase_view derivation the GitHub status
+// card draws, so the console and the card always agree.
+export type WorkItemProgress = Schemas["WorkItemProgressOut"];
+
+export type WorkItemStage = Schemas["WorkItemStageOut"];
+
+// Token usage and estimated cost summed over every request of a work item (#3223).
+export type WorkItemUsage = Schemas["WorkItemUsageOut"];
+
 export async function listWorkItems(params: { agentId?: string } = {}): Promise<WorkItemsList> {
   const resp = await request(`/work-items${query({ agent_id: params.agentId })}`);
   return jsonOrThrow<WorkItemsList>(resp);
@@ -373,6 +382,11 @@ export async function listWorkItems(params: { agentId?: string } = {}): Promise<
 export async function getWorkItem(id: string): Promise<WorkItemOutcome> {
   const resp = await request(`/work-items/${encodeURIComponent(id)}`);
   return jsonOrThrow<WorkItemOutcome>(resp);
+}
+
+export async function getWorkItemUsage(id: string): Promise<WorkItemUsage> {
+  const resp = await request(`/work-items/${encodeURIComponent(id)}/usage`);
+  return jsonOrThrow<WorkItemUsage>(resp);
 }
 
 // The open /config endpoint (no credential required) carries the configurable
