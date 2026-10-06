@@ -2470,6 +2470,26 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Pin the reviewer model (forwarded as CURIE_REVIEWER_MODEL at boot)",
+              "id": "reviewer_model",
+              "long": "reviewer-model",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the reviewer model override back to the credential default",
+              "id": "clear_reviewer_model",
+              "long": "clear-reviewer-model",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Pin this thinking depth (e.g. `disabled`, `adaptive`, `enabled:2000`)",
               "id": "thinking",
               "long": "thinking",
@@ -5364,6 +5384,26 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Pin the reviewer model (forwarded as CURIE_REVIEWER_MODEL at boot)",
+              "id": "reviewer_model",
+              "long": "reviewer-model",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the reviewer model override back to the credential default",
+              "id": "clear_reviewer_model",
+              "long": "clear-reviewer-model",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Pin this thinking depth (e.g. `disabled`, `adaptive`, `enabled:2000`)",
               "id": "thinking",
               "long": "thinking",
@@ -7164,11 +7204,8 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "z-ai/glm-5.3-flash"
-              ],
               "global": false,
-              "help": "Model id installed by cluster up",
+              "help": "Model id installed by cluster up. Defaults to Claude Sonnet for Anthropic credentials, or GLM Flash for OpenRouter credentials",
               "id": "model",
               "long": "model",
               "positional": false,

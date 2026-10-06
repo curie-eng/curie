@@ -1093,9 +1093,10 @@ enum FactoryAction {
         /// Kind cluster name used only when no kube context is targeted.
         #[arg(long, default_value = curie::factory_quickstart::DEFAULT_KIND_NAME)]
         kind_name: String,
-        /// Model id installed by cluster up.
-        #[arg(long, default_value = curie::factory_quickstart::DEFAULT_MODEL)]
-        model: String,
+        /// Model id installed by cluster up. Defaults to Claude Sonnet for
+        /// Anthropic credentials, or GLM Flash for OpenRouter credentials.
+        #[arg(long)]
+        model: Option<String>,
         /// Per run execution deadline in seconds for the deployed agent.
         #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_DEADLINE_SECONDS)]
         execution_deadline: u32,
@@ -2473,6 +2474,12 @@ enum LocalAction {
         /// Clear the model override back to the platform default.
         #[arg(long)]
         clear_model: bool,
+        /// Pin the reviewer model (forwarded as CURIE_REVIEWER_MODEL at boot).
+        #[arg(long)]
+        reviewer_model: Option<String>,
+        /// Clear the reviewer model override back to the credential default.
+        #[arg(long)]
+        clear_reviewer_model: bool,
         /// Pin this thinking depth (e.g. `disabled`, `adaptive`, `enabled:2000`).
         #[arg(long)]
         thinking: Option<String>,
@@ -3551,6 +3558,12 @@ enum ClusterAction {
         /// Clear the model override back to the platform default.
         #[arg(long)]
         clear_model: bool,
+        /// Pin the reviewer model (forwarded as CURIE_REVIEWER_MODEL at boot).
+        #[arg(long)]
+        reviewer_model: Option<String>,
+        /// Clear the reviewer model override back to the credential default.
+        #[arg(long)]
+        clear_reviewer_model: bool,
         /// Pin this thinking depth (e.g. `disabled`, `adaptive`, `enabled:2000`).
         #[arg(long)]
         thinking: Option<String>,
@@ -5645,6 +5658,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 agent,
                 model,
                 clear_model,
+                reviewer_model,
+                clear_reviewer_model,
                 thinking,
                 clear_thinking,
                 execution_deadline,
@@ -5664,6 +5679,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                         dry_run,
                     },
                     commands::OverrideChange::resolve("model", model, clear_model)?,
+                    commands::OverrideChange::resolve(
+                        "reviewer-model",
+                        reviewer_model,
+                        clear_reviewer_model,
+                    )?,
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?,
                     commands::OverrideChange::resolve_execution_deadline(
                         execution_deadline,
@@ -6961,6 +6981,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 agent,
                 model,
                 clear_model,
+                reviewer_model,
+                clear_reviewer_model,
                 thinking,
                 clear_thinking,
                 execution_deadline,
@@ -6976,6 +6998,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // operator wait on a cluster lookup to be told so is worse than
                 // telling them immediately.
                 let model = commands::OverrideChange::resolve("model", model, clear_model)?;
+                let reviewer_model = commands::OverrideChange::resolve(
+                    "reviewer-model",
+                    reviewer_model,
+                    clear_reviewer_model,
+                )?;
                 let thinking =
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?;
                 let execution_deadline = commands::OverrideChange::resolve_execution_deadline(
@@ -6997,6 +7024,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             dry_run,
                         },
                         model,
+                        reviewer_model,
                         thinking,
                         execution_deadline,
                         runner_resources,

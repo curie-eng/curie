@@ -276,6 +276,7 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
         ],
         repo_full_name=data.repo_full_name,
         model=data.model,
+        reviewer_model=data.reviewer_model,
         thinking=data.thinking,
         behavior_packs=(
             data.behavior_packs.model_dump() if data.behavior_packs is not None else None
@@ -704,6 +705,15 @@ async def set_allowed_callers(
 
 async def update_agent_model(session: AsyncSession, agent: Agent, model: str | None) -> Agent:
     agent.model = model
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_reviewer_model(
+    session: AsyncSession, agent: Agent, reviewer_model: str | None
+) -> Agent:
+    agent.reviewer_model = reviewer_model
     await session.commit()
     await session.refresh(agent)
     return agent

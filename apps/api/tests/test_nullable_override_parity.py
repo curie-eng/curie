@@ -7,12 +7,14 @@ earlier and it went unguarded, so a blank model booted an eval that the matrix
 then labelled `''`. The old parity test could not see it, because it hardcoded
 the two field names against one endpoint.
 
-So this file does not name any model. It walks the live FastAPI app, collects
-every REQUEST-BODY pydantic model declared in `KNOWN_BODY_MODULES` (response
-DTOs are out of scope by construction: they are never a request body), and
-asserts each nullable `model`/`thinking` override REFUSES "" and "   " while
-still accepting null. A new request body carrying such a field is covered the
-moment it is routed, with no edit here.
+This file walks the live FastAPI app, collects every REQUEST-BODY pydantic
+model declared in `KNOWN_BODY_MODULES` (response DTOs are out of scope by
+construction: they are never a request body), and asserts each nullable
+`model`/`reviewer_model`/`thinking` override REFUSES "" and "   " while still
+accepting null. A new request body carrying such a field is covered the moment
+it is routed, with no edit here. The exact `Declaration.reviewer_model` field
+is display metadata rather than an operator override, per #4120 Decision 4,
+and keeps its own validation contract outside this sweep.
 
 The honest blind spots, so this file does not overclaim. First, the sweep can
 only see a body FastAPI models, i.e. a route with a `body_field`. Five mutating
@@ -27,7 +29,7 @@ Three narrower ones remain, each a deliberate limit rather than an oversight:
    `BaseModel`. FastAPI accepts both, but `_referenced_models` returns an empty
    list for them, so such a body is skipped AND contributes nothing to the
    unknown-module alarm. Nothing in this repo declares one today.
-2. A THIRD override name. `OVERRIDE_FIELDS` is a hardcoded tuple, and it is the
+2. A NEW override name. `OVERRIDE_FIELDS` is a hardcoded tuple, and it is the
    one hardcoded thing left here -- but it is the field VOCABULARY, not the
    endpoint or the model, so a new override name (`reasoning_effort`, `harness`)
    must be added to it or it drifts unguarded.
@@ -45,14 +47,16 @@ from functools import cache
 from typing import Any, get_args, get_origin
 
 import pytest
+from curie_api.factory_progress import Declaration
 from curie_api.main import create_app
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ValidationError
 
-# The two nullable operator overrides this repo forwards into the sandbox as
-# CURIE_MODEL / CURIE_THINKING. Blank means "skip the platform default and take
-# the harness's own behavior", which is never what a caller means.
-OVERRIDE_FIELDS = ("model", "thinking")
+# The three nullable operator overrides this repo forwards into the sandbox as
+# CURIE_MODEL / CURIE_REVIEWER_MODEL / CURIE_THINKING. Blank means "skip the
+# platform default and take the harness's own behavior", which is never what a
+# caller means.
+OVERRIDE_FIELDS = ("model", "reviewer_model", "thinking")
 # Both halves of the refusal `_nullable_override_validator` raises: it names the
 # field as empty AND points the caller at null, and both are part of the shared
 # contract an operator relies on. Asserting the message TEXT proves that shared
@@ -100,8 +104,10 @@ SYNTHETIC_BODY_MODULE_PREFIX = "fastapi."
 REQUIRED_PAIRS = {
     ("EvalTriggerRequest", "model"),
     ("AgentCreate", "model"),
+    ("AgentCreate", "reviewer_model"),
     ("AgentCreate", "thinking"),
     ("AgentUpdate", "model"),
+    ("AgentUpdate", "reviewer_model"),
     ("AgentUpdate", "thinking"),
 }
 
@@ -220,7 +226,11 @@ def _override_pairs() -> list[tuple[type[BaseModel], str]]:
         (model, name)
         for model in _collect_request_models()
         for name, field in model.model_fields.items()
-        if name in OVERRIDE_FIELDS and _is_nullable_string_override(field.annotation)
+        if name in OVERRIDE_FIELDS
+        and _is_nullable_string_override(field.annotation)
+        # #4120 Decision 4: this exact field records reviewer display metadata;
+        # it does not select a model. Every other reviewer_model remains swept.
+        and not (model is Declaration and name == "reviewer_model")
     ]
 
 
@@ -249,7 +259,13 @@ def override_pairs() -> list[tuple[type[BaseModel], str]]:
     assertion in each test.
     """
 
+    assert Declaration in _collect_request_models(), "reviewer display body was not discovered"
+    assert "reviewer_model" in Declaration.model_fields, (
+        "expected reviewer display field is missing"
+    )
+    assert _is_nullable_string_override(Declaration.model_fields["reviewer_model"].annotation)
     pairs = _override_pairs()
+    assert (Declaration, "reviewer_model") not in pairs, "reviewer display field is not an override"
     found = {(model.__name__, field) for model, field in pairs}
     assert REQUIRED_PAIRS <= found, f"discovery missed {REQUIRED_PAIRS - found}"
     return pairs

@@ -11,6 +11,7 @@
     "ledger-error",
     "model-credential-rejected",
     "model-credit-exhausted",
+    "model-usage-limited",
     "approval-not-acted",
     "false-completion",
     "publication-unrecorded",
@@ -52,6 +53,11 @@
       "name": "platform_model_credit_exhausted",
       "input": "model-credit-exhausted",
       "expected": "model-credit-exhausted"
+    },
+    {
+      "name": "platform_model_usage_limited",
+      "input": "model-usage-limited",
+      "expected": "model-usage-limited"
     },
     {
       "name": "platform_rate_limit",

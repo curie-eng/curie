@@ -438,7 +438,7 @@ mod tests {
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         let candidate = source_candidate_window();
         assert_eq!(candidate.schema_min, "0076");
-        assert_eq!(candidate.schema_head, "0080");
+        assert_eq!(candidate.schema_head, "0081");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -448,6 +448,7 @@ mod tests {
             .expect("candidate bounds are catalogued and ordered");
         assert!(live_in_window("0076", &current));
         assert!(live_in_window("0080", &current));
+        assert!(live_in_window("0081", &current));
         assert!(!live_in_window("0075", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
         assert_eq!(retained.schema_min, "0070");
@@ -468,6 +469,7 @@ mod tests {
         assert_eq!(candidate_release.schema_min, candidate.schema_min);
         assert_eq!(candidate_release.schema_head, candidate.schema_head);
         assert!(live_in_window("0080", &candidate_release));
+        assert!(live_in_window("0081", &candidate_release));
         assert!(!live_in_window("0075", &candidate_release));
         let stable = window_for("0.12.0").expect("released window remains catalogued");
         assert_eq!(stable.schema_min, "0070");
@@ -492,9 +494,10 @@ mod tests {
     fn source_control_candidate_0122_requires_ledger_schema() {
         let window = window_for("0.12.2").expect("source control candidate is catalogued");
         assert_eq!(window.schema_min, "0076");
-        assert_eq!(window.schema_head, "0080");
+        assert_eq!(window.schema_head, "0081");
         assert!(live_in_window("0076", &window));
         assert!(live_in_window("0080", &window));
+        assert!(live_in_window("0081", &window));
         assert!(!live_in_window("0075", &window));
     }
 

@@ -1,7 +1,7 @@
 ---
 name: diff-reviewer
 description: Strict read-only review of the working diff in /workspace against the issue's acceptance criteria. Returns a literal VERDICT line. Called by the implement-issue skill in phase review_diff.
-model: anthropic/claude-opus-5.5
+model: opus
 tools: Read, Grep, Glob, Bash
 ---
 
