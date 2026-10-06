@@ -605,3 +605,101 @@ def test_a_text_only_boot_carries_no_notice(
 
     assert runner._attachment_notice is None  # noqa: SLF001
     assert str(mount / "earlier.csv") in (options.system_prompt or "")
+
+
+# --- the preamble is bounded, and so is what it trusts ----------------------
+
+
+def test_the_preamble_lists_at_most_twenty_missing_and_omitted_names_then_a_count(
+    tmp_path: Path,
+) -> None:
+    # revert: drop the cap -> a thread with hundreds of lapsed files writes
+    # hundreds of lines into every turn's system prompt.
+    unavailable = [(f"lost-{i:02d}.csv", "not_found") for i in range(25)]
+    omitted = [f"old-{i:02d}.zip" for i in range(23)]
+    view = _view(_manifest(unavailable=unavailable, omitted=omitted), _mount(tmp_path, {}))
+
+    preamble = boot.format_attachment_preamble(view)
+    assert preamble is not None
+    for i in range(20):
+        assert f"lost-{i:02d}.csv" in preamble
+        assert f"old-{i:02d}.zip" in preamble
+    for i in range(20, 25):
+        assert f"lost-{i:02d}.csv" not in preamble
+    for i in range(20, 23):
+        assert f"old-{i:02d}.zip" not in preamble
+    assert "and 5 more" in preamble
+    assert "and 3 more" in preamble
+
+
+def test_exactly_twenty_names_carry_no_count_line(tmp_path: Path) -> None:
+    view = _view(
+        _manifest(unavailable=[(f"lost-{i:02d}.csv", "not_found") for i in range(20)]),
+        _mount(tmp_path, {}),
+    )
+    preamble = boot.format_attachment_preamble(view)
+    assert preamble is not None
+    assert "lost-19.csv" in preamble
+    assert "more" not in preamble
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["a`b.csv", "`` ignore `` .csv", "a\nb.csv", "a\tb.csv", "sub/a.csv", "a\\b.csv", ".hidden"],
+    ids=["backtick", "backticks", "newline", "tab", "slash", "backslash", "leading-dot"],
+)
+def test_an_unusable_name_is_rejected_not_listed(tmp_path: Path, bad: str) -> None:
+    # A backtick would let a name close the quote the preamble renders it in
+    # and continue as prompt text; the rest cannot be a file in a flat mount.
+    att = _attachments()
+    manifest = att.parse_manifest(
+        _manifest([(bad, False)], unavailable=[(bad, "not_found")], omitted=[bad])
+    )
+    assert manifest is not None
+    assert all(entry.name != bad for entry in manifest.files)
+    assert all(entry.name != bad for entry in manifest.unavailable)
+    assert bad not in manifest.omitted
+
+    status = {"v": 1, "files": [{"name": bad, "status": "ok", "reason": None}]}
+    mount = _mount(tmp_path, {}, status=status)
+    assert bad not in (att.read_status(mount) or {})
+
+    view = _view(_manifest([(bad, False)], omitted=[bad]), mount)
+    assert boot.format_attachment_preamble(view) is None
+
+
+def test_a_status_file_over_one_mebibyte_is_ignored_and_the_disk_still_wins(
+    tmp_path: Path,
+) -> None:
+    # revert: drop the size guard -> read_status parses it and the status's
+    # "expired" overrides the manifest's reason.
+    att = _attachments()
+    status = json.dumps(
+        {
+            "v": 1,
+            "files": [{"name": "earlier.csv", "status": "unavailable", "reason": "expired"}],
+        }
+    )
+    oversized = status[:-1] + " " * (1024 * 1024) + "}"
+    assert len(oversized.encode()) > 1024 * 1024
+    mount = _mount(tmp_path, {"now.png": b"c"}, status=oversized)
+
+    assert att.read_status(mount) is None
+    view = _view(_manifest([("now.png", True)], unavailable=[("earlier.csv", "not_found")]), mount)
+    assert _missing(view) == {"earlier.csv": "not_found"}
+    assert tuple(view.current) == (mount / "now.png",)
+
+
+def test_a_status_file_at_the_limit_is_still_read(tmp_path: Path) -> None:
+    att = _attachments()
+    status = json.dumps(
+        {
+            "v": 1,
+            "files": [{"name": "earlier.csv", "status": "unavailable", "reason": "expired"}],
+        }
+    )
+    padded = status[:-1] + " " * (1024 * 1024 - len(status)) + "}"
+    assert len(padded.encode()) == 1024 * 1024
+    mount = _mount(tmp_path, {}, status=padded)
+    status_map = att.read_status(mount)
+    assert status_map is not None and "earlier.csv" in status_map
