@@ -59,6 +59,8 @@ def support_db(
     }.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("RUNS_STREAM", "test:curie:source-support:" + uuid.uuid4().hex)
+    # No provisioned protected runtime unless a test supplies one (SOURCE-9).
+    monkeypatch.delenv("CURIE_PROTECTED_RUNTIME_DIR", raising=False)
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
@@ -405,11 +407,13 @@ def test_attempt_history_without_row_reports_closed_read_only(
 
 
 @pytest.mark.parametrize("requested", [None, "read-only"])
-def test_protected_row_reports_broker_unavailable_without_echoing_references(
+def test_protected_row_without_runtime_reports_runtime_unavailable(
     support_db: None, requested: str | None
 ) -> None:
-    """Protected row: scoped key, read-only, row generation, broker_unavailable.
+    """Protected row, no provisioned runtime: read-only, row generation, runtime_unavailable.
 
+    With ``CURIE_PROTECTED_RUNTIME_DIR`` unset there is no bootstrap to evaluate,
+    so the reason is ``runtime_unavailable`` (no longer ``broker_unavailable``).
     The row's runtime, qualification and bundle references are writable
     configuration and never appear; neither does any secret.
     @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-SOURCE-4.
@@ -427,7 +431,7 @@ def test_protected_row_reports_broker_unavailable_without_echoing_references(
             )
             assert response.status_code == 503, response.text
             assert response.json() == expected(
-                requested, "read-only", str(GENERATION), "broker_unavailable"
+                requested, "read-only", str(GENERATION), "runtime_unavailable"
             )
             for leaked in (
                 target["runtime_id"],
@@ -801,7 +805,7 @@ def test_waiting_probe_reauthenticates_after_rotation(support_db: None, protecte
                 )
                 assert fresh.status_code == 503, fresh.text
                 assert fresh.json() == (
-                    expected(None, "read-only", str(GENERATION + 1), "broker_unavailable")
+                    expected(None, "read-only", str(GENERATION + 1), "runtime_unavailable")
                     if protected
                     else expected(None, None, None, "source_unconfigured")
                 )

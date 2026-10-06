@@ -25,12 +25,12 @@ from .admission_records import (
     execution_session_key,
     parse_envelope,
     parse_intent,
+    parse_selection,
     parse_state,
 )
 from .admission_scripts import TRANSACTION
 from .authority_records import (
     _BROKER,
-    _canonical,
     _object,
     parse_manifest,
     parse_qualification,
@@ -39,18 +39,6 @@ from .authority_records import (
 )
 from .source_fence import _decode_source
 from .source_policy_records import policy_fingerprint
-
-# @spec PROTECTED-HOOK-ADMISSION-2/4
-_SELECTION = {
-    "schema_version": "version",
-    "runtime_id": "uuid",
-    "runtime_generation": "generation",
-    "manifest_digest": "sha256",
-    "qualification_id": "uuid",
-    "qualification_generation": "generation",
-    "broker_run_id": "run_id",
-    "admission_open": None,
-}
 
 
 class AtomicAdmission:
@@ -121,16 +109,8 @@ class AtomicAdmission:
         raw = self._get(selection_key)
         if raw is None:
             return None
-        selection = _decode(raw, 16384)
-        if type(selection) is not dict or selection.keys() != _SELECTION.keys():
-            raise AdmissionUnavailable()
-        opened = selection.pop("admission_open")
-        if type(opened) is not bool:
-            raise AdmissionUnavailable()
-        _canonical(
-            _encode(selection), {k: v for k, v in _SELECTION.items() if k != "admission_open"}
-        )
-        selection["admission_open"] = opened
+        selection = parse_selection(raw)
+        opened = selection["admission_open"]
         tuples = (
             ("manifest", selection["manifest_digest"]),
             (
