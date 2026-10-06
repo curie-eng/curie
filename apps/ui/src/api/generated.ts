@@ -2354,6 +2354,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/thread-attachments/append": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Append Thread Attachments */
+        post: operations["append_thread_attachments_v1_internal_thread_attachments_append_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/thread-attachments/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Query Thread Attachments */
+        post: operations["query_thread_attachments_v1_internal_thread_attachments_query_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/work-items/admissions": {
         parameters: {
             query?: never;
@@ -6949,6 +6983,95 @@ export interface components {
         TerminationClaimBody: {
             /** Owner */
             owner: string;
+        };
+        /** ThreadAttachmentAppend */
+        ThreadAttachmentAppend: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Event Id */
+            event_id: string;
+            /** Refs */
+            refs: components["schemas"]["ThreadAttachmentRefBody"][];
+            /** Thread Key */
+            thread_key: string;
+        };
+        /** ThreadAttachmentAppendOut */
+        ThreadAttachmentAppendOut: {
+            /** Appended */
+            appended: number;
+        };
+        /** ThreadAttachmentQuery */
+        ThreadAttachmentQuery: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Thread Key */
+            thread_key: string;
+        };
+        /**
+         * ThreadAttachmentRefBody
+         * @description One recorded file. Exactly these fields: never an endpoint, URL or bytes.
+         */
+        ThreadAttachmentRefBody: {
+            /** Disk Name */
+            disk_name: string;
+            /** File Id */
+            file_id: string;
+            /** Mime Type */
+            mime_type?: string | null;
+            /** Name */
+            name: string;
+            /** Ordinal */
+            ordinal: number;
+            /** Route Adapter */
+            route_adapter?: string | null;
+            /** Route Identity */
+            route_identity: string;
+            /** Route Kind */
+            route_kind: string;
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes?: number | null;
+        };
+        /**
+         * ThreadAttachmentRefRow
+         * @description A query row: the appended ref plus the event it was recorded under, so a
+         *     redelivered turn's worker recognises its own rows by (event_id, file_id).
+         */
+        ThreadAttachmentRefRow: {
+            /** Disk Name */
+            disk_name: string;
+            /** Event Id */
+            event_id: string;
+            /** File Id */
+            file_id: string;
+            /** Mime Type */
+            mime_type?: string | null;
+            /** Name */
+            name: string;
+            /** Ordinal */
+            ordinal: number;
+            /** Route Adapter */
+            route_adapter?: string | null;
+            /** Route Identity */
+            route_identity: string;
+            /** Route Kind */
+            route_kind: string;
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes?: number | null;
+        };
+        /** ThreadAttachmentRefsOut */
+        ThreadAttachmentRefsOut: {
+            /** Refs */
+            refs: components["schemas"]["ThreadAttachmentRefRow"][];
         };
         /**
          * ThreadResetState
@@ -12589,6 +12712,76 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    append_thread_attachments_v1_internal_thread_attachments_append_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ThreadAttachmentAppend"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ThreadAttachmentAppendOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    query_thread_attachments_v1_internal_thread_attachments_query_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ThreadAttachmentQuery"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ThreadAttachmentRefsOut"];
+                };
             };
             /** @description Validation Error */
             422: {

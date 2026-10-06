@@ -9365,6 +9365,286 @@
         "title": "TerminationClaimBody",
         "type": "object"
       },
+      "ThreadAttachmentAppend": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "refs": {
+            "items": {
+              "$ref": "#/components/schemas/ThreadAttachmentRefBody"
+            },
+            "maxItems": 1000,
+            "title": "Refs",
+            "type": "array"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "refs"
+        ],
+        "title": "ThreadAttachmentAppend",
+        "type": "object"
+      },
+      "ThreadAttachmentAppendOut": {
+        "properties": {
+          "appended": {
+            "title": "Appended",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "appended"
+        ],
+        "title": "ThreadAttachmentAppendOut",
+        "type": "object"
+      },
+      "ThreadAttachmentQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key"
+        ],
+        "title": "ThreadAttachmentQuery",
+        "type": "object"
+      },
+      "ThreadAttachmentRefBody": {
+        "additionalProperties": false,
+        "description": "One recorded file. Exactly these fields: never an endpoint, URL or bytes.",
+        "properties": {
+          "disk_name": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Disk Name",
+            "type": "string"
+          },
+          "file_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "File Id",
+            "type": "string"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
+          },
+          "name": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "ordinal": {
+            "minimum": 0.0,
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "route_adapter": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Adapter"
+          },
+          "route_identity": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Route Identity",
+            "type": "string"
+          },
+          "route_kind": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Route Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9A-Fa-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          }
+        },
+        "required": [
+          "file_id",
+          "ordinal",
+          "name",
+          "disk_name",
+          "sha256",
+          "route_kind",
+          "route_identity"
+        ],
+        "title": "ThreadAttachmentRefBody",
+        "type": "object"
+      },
+      "ThreadAttachmentRefRow": {
+        "additionalProperties": false,
+        "description": "A query row: the appended ref plus the event it was recorded under, so a\nredelivered turn's worker recognises its own rows by (event_id, file_id).",
+        "properties": {
+          "disk_name": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Disk Name",
+            "type": "string"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "file_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "File Id",
+            "type": "string"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
+          },
+          "name": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "ordinal": {
+            "minimum": 0.0,
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "route_adapter": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Adapter"
+          },
+          "route_identity": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Route Identity",
+            "type": "string"
+          },
+          "route_kind": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Route Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9A-Fa-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          }
+        },
+        "required": [
+          "file_id",
+          "ordinal",
+          "name",
+          "disk_name",
+          "sha256",
+          "route_kind",
+          "route_identity",
+          "event_id"
+        ],
+        "title": "ThreadAttachmentRefRow",
+        "type": "object"
+      },
+      "ThreadAttachmentRefsOut": {
+        "properties": {
+          "refs": {
+            "items": {
+              "$ref": "#/components/schemas/ThreadAttachmentRefRow"
+            },
+            "title": "Refs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "refs"
+        ],
+        "title": "ThreadAttachmentRefsOut",
+        "type": "object"
+      },
       "ThreadResetState": {
         "description": "Whether a thread has a pending forced-sandbox-release request (#713).\n\n``route_existed`` is what the worker found when it drained the reset\n(#3699). None while the reset is pending, and when no outcome is recorded\n(the record expired, or the worker predates this field). False when the\ndrained reset matched no route, so nothing was released -- usually a key\nbuilt by hand that left out a named bot's identity segment. True when a\nroute existed and was released.",
         "properties": {
@@ -20752,6 +21032,124 @@
         "summary": "Release Sandbox Credential",
         "tags": [
           "internal-state"
+        ]
+      }
+    },
+    "/v1/internal/thread-attachments/append": {
+      "post": {
+        "operationId": "append_thread_attachments_v1_internal_thread_attachments_append_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadAttachmentAppend"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadAttachmentAppendOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Append Thread Attachments",
+        "tags": [
+          "internal-thread-attachments"
+        ]
+      }
+    },
+    "/v1/internal/thread-attachments/query": {
+      "post": {
+        "operationId": "query_thread_attachments_v1_internal_thread_attachments_query_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadAttachmentQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadAttachmentRefsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Query Thread Attachments",
+        "tags": [
+          "internal-thread-attachments"
         ]
       }
     },
