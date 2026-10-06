@@ -280,6 +280,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # match the pod selector the connector NetworkPolicy uses.
         "CURIE_CONNECTOR_RECONCILE",
         "CURIE_CONNECTOR_RECONCILE_INTERVAL_S",
+        # The runner's executor mode switch (ACTION-EXECUTOR-5/25, #4067): set by
+        # the worker only on an executor sandbox claim and read by the runner's
+        # _serve before harness resolution. Runner-private by design, so it is
+        # deliberately not a BootEnv key (BootEnv is a frozen contract).
+        "CURIE_RUNNER_MODE",
         # End to end namespace reaper (#3245), read by the worker process only.
         # The test cluster kubeconfig is not among them: the reaper reads it
         # from the connector Secret at sweep time.
