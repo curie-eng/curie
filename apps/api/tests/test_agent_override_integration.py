@@ -3,7 +3,7 @@
 Consolidates the three per-field override suites: `model` (#254, forwarded as
 CURIE_MODEL at sandbox boot), `thinking` (ADR-0098's per-agent half of the
 two-layer operator control, #1182), and `execution_deadline_seconds` (#3071).
-All three share the same three-way PATCH contract: omitted leaves the field
+All nullable overrides share the same three-way PATCH contract: omitted leaves the field
 unchanged, an explicit JSON null clears it back to the platform default, and a
 value sets it. `model` and `thinking` additionally share a blank-string refusal
 contract (#1355, #1392): an empty or whitespace-only string is refused with a
@@ -49,7 +49,7 @@ def _read(client: Any, auth_headers: dict[str, str], agent_id: str) -> dict[str,
 # --- shared shapes: model and thinking are the same nullable-string override ---
 
 
-@pytest.mark.parametrize("field", ["model", "thinking"])
+@pytest.mark.parametrize("field", ["model", "reviewer_model", "thinking"])
 def test_agent_defaults_to_null(
     client: Any, auth_headers: dict[str, str], clean_db: None, field: str
 ) -> None:
@@ -62,6 +62,7 @@ def test_agent_defaults_to_null(
     ("field", "value"),
     [
         pytest.param("model", "glm-5.2", id="model"),
+        pytest.param("reviewer_model", "claude-opus-5-5", id="reviewer_model"),
         pytest.param("thinking", "disabled", id="thinking"),
     ],
 )
@@ -79,6 +80,7 @@ def test_create_with_value_persists(
     ("field", "value"),
     [
         pytest.param("model", "kimi-k2.1", id="model"),
+        pytest.param("reviewer_model", "claude-opus-5-5", id="reviewer_model"),
         pytest.param("thinking", "enabled:2000", id="thinking"),
     ],
 )
@@ -95,6 +97,7 @@ def test_patch_sets_value(
     ("field", "seed"),
     [
         pytest.param("model", "deepseek-v4", id="model"),
+        pytest.param("reviewer_model", "claude-opus-5-5", id="reviewer_model"),
         pytest.param("thinking", "adaptive", id="thinking"),
     ],
 )
@@ -134,6 +137,7 @@ def test_patch_without_field_leaves_it_unchanged(
     ("field", "seed"),
     [
         pytest.param("model", "kimi-k2", id="model"),
+        pytest.param("reviewer_model", "claude-opus-5-5", id="reviewer_model"),
         pytest.param("thinking", "adaptive", id="thinking"),
     ],
 )
@@ -168,7 +172,7 @@ def test_an_empty_value_is_refused_and_the_error_points_at_null(
     assert resp.status_code == 422, resp.text
 
 
-@pytest.mark.parametrize("field", ["model", "thinking"])
+@pytest.mark.parametrize("field", ["model", "reviewer_model", "thinking"])
 def test_a_whitespace_only_value_is_refused_on_both_paths(
     client: Any, auth_headers: dict[str, str], clean_db: None, field: str
 ) -> None:
@@ -201,6 +205,7 @@ def test_a_whitespace_only_value_is_refused_on_both_paths(
     ("field", "seed"),
     [
         pytest.param("model", "kimi-k2", id="model"),
+        pytest.param("reviewer_model", "claude-opus-5-5", id="reviewer_model"),
         pytest.param("thinking", "disabled", id="thinking"),
     ],
 )

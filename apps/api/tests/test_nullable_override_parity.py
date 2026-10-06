@@ -52,7 +52,7 @@ from pydantic import BaseModel, ValidationError
 # The two nullable operator overrides this repo forwards into the sandbox as
 # CURIE_MODEL / CURIE_THINKING. Blank means "skip the platform default and take
 # the harness's own behavior", which is never what a caller means.
-OVERRIDE_FIELDS = ("model", "thinking")
+OVERRIDE_FIELDS = ("model", "reviewer_model", "thinking")
 # Both halves of the refusal `_nullable_override_validator` raises: it names the
 # field as empty AND points the caller at null, and both are part of the shared
 # contract an operator relies on. Asserting the message TEXT proves that shared
@@ -100,8 +100,10 @@ SYNTHETIC_BODY_MODULE_PREFIX = "fastapi."
 REQUIRED_PAIRS = {
     ("EvalTriggerRequest", "model"),
     ("AgentCreate", "model"),
+    ("AgentCreate", "reviewer_model"),
     ("AgentCreate", "thinking"),
     ("AgentUpdate", "model"),
+    ("AgentUpdate", "reviewer_model"),
     ("AgentUpdate", "thinking"),
 }
 

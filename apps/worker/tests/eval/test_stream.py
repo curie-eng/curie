@@ -102,9 +102,11 @@ class _StubRepo:
     """The B1 repo lookup, stubbed: a channel/agent resolves to a GitHub repo."""
 
     def __init__(
-        self, *, model: str | None = None, thinking: str | None = None
+        self, *, model: str | None = None, reviewer_model: str | None = None,
+        thinking: str | None = None
     ) -> None:
         self._model = model
+        self._reviewer_model = reviewer_model
         self._thinking = thinking
         self.model_settings_agent_ids: list[uuid.UUID] = []
 
@@ -121,9 +123,9 @@ class _StubRepo:
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None, dict[str, object] | None]:
+    ) -> tuple[str | None, str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
-        return self._model, self._thinking, None
+        return self._model, self._reviewer_model, self._thinking, None
 
 
 class _ObservedBindingResolver(BindingResolver):
@@ -135,7 +137,7 @@ class _ObservedBindingResolver(BindingResolver):
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None, dict[str, object] | None]:
+    ) -> tuple[str | None, str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
         return await super().model_settings_for(agent_id)
 
@@ -940,7 +942,7 @@ def test_entry_is_acked_after_report_even_when_report_fails(make_eval_harness, b
         ),
     ],
 )
-def test_provisioned_runner_end_to_end(
+def test_provisioned_runner_reviewer_model_end_to_end(
     make_eval_harness,
     bundles,
     platform_model: str | None,
@@ -971,13 +973,14 @@ def test_provisioned_runner_end_to_end(
                 await conn.execute(
                     text(
                         f"INSERT INTO {_DB_SCHEMA}.agents "
-                        "(id, name, model, thinking, repo_full_name) "
-                        "VALUES (:id, :name, :model, :thinking, :repo)"
+                        "(id, name, model, reviewer_model, thinking, repo_full_name) "
+                        "VALUES (:id, :name, :model, :reviewer_model, :thinking, :repo)"
                     ),
                     {
                         "id": agent_id,
                         "name": f"eval_agent_{token}",
                         "model": stored_model,
+                        "reviewer_model": "acme-reviewer-model" if stored_model else None,
                         "thinking": agent_thinking,
                         "repo": "acme-corp/acme-bot",
                     },
@@ -1096,6 +1099,9 @@ def test_provisioned_runner_end_to_end(
                         assert THINKING_ENV not in claim_env
                     else:
                         assert claim_env[THINKING_ENV] == expected_thinking
+                    assert claim_env.get("CURIE_REVIEWER_MODEL") == (
+                        "acme-reviewer-model" if stored_model else None
+                    )
                     assert repo_lookup.model_settings_agent_ids == [agent_id]
                     assert fake_k8s.deleted, "provisioned sandbox was never released"
                     assert not fake_k8s.claims

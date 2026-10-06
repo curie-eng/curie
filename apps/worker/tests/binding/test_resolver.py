@@ -1441,7 +1441,7 @@ def test_resolves_connector_secrets_into_boot_env() -> None:
     asyncio.run(go())
 
 
-def test_reads_model_settings_for_eval_boots_by_agent_id() -> None:
+def test_reads_reviewer_model_settings_for_eval_boots_by_agent_id() -> None:
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
@@ -1460,14 +1460,19 @@ def test_reads_model_settings_for_eval_boots_by_agent_id() -> None:
                     await conn.execute(
                         text(
                             f"UPDATE {_SCHEMA}.agents "
-                            "SET model = :model, thinking = :thinking WHERE id = :id"
+                            "SET model = :model, reviewer_model = :reviewer_model, "
+                            "thinking = :thinking WHERE id = :id"
                         ),
-                        {"model": "agent_model", "thinking": "high", "id": agent_id},
+                        {
+                            "model": "agent_model", "reviewer_model": "acme-reviewer-model",
+                            "thinking": "high", "id": agent_id,
+                        },
                     )
 
                 resolver = _resolver(engine)
                 assert await resolver.model_settings_for(agent_id) == (
                     "agent_model",
+                    "acme-reviewer-model",
                     "high",
                     None,
                 )
@@ -1476,13 +1481,13 @@ def test_reads_model_settings_for_eval_boots_by_agent_id() -> None:
                     await conn.execute(
                         text(
                             f"UPDATE {_SCHEMA}.agents "
-                            "SET model = NULL, thinking = NULL WHERE id = :id"
+                            "SET model = NULL, reviewer_model = NULL, thinking = NULL WHERE id = :id"
                         ),
                         {"id": agent_id},
                     )
 
-                assert await resolver.model_settings_for(agent_id) == (None, None, None)
-                assert await resolver.model_settings_for(uuid.uuid4()) == (None, None, None)
+                assert await resolver.model_settings_for(agent_id) == (None, None, None, None)
+                assert await resolver.model_settings_for(uuid.uuid4()) == (None, None, None, None)
             finally:
                 await _cleanup(engine, [agent_id])
         finally:
@@ -1999,6 +2004,45 @@ def test_one_agent_holding_a_routeless_binding_beside_its_own_route_resolves() -
             finally:
                 await _cleanup(engine, [agent_id])
         finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("reviewer_model", ["acme-reviewer-model", None])
+def test_reviewer_model_resolves_on_channel_and_agent_binding_paths(
+    reviewer_model: str | None,
+) -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        agent_id: uuid.UUID | None = None
+        try:
+            await pg_connect_or_skip(engine)
+            token = uuid.uuid4().hex[:8]
+            channel = f"C-reviewer-{token}"
+            agent_id = await _seed_agent(
+                engine, channel=channel, name=f"acme-reviewer-{token}",
+                max_usd=None, max_tokens=None,
+            )
+            await _seed_deployment(
+                engine, agent_id=agent_id, environment="prod", bundle_ref=f"bundles/{token}.zip"
+            )
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(f"UPDATE {_SCHEMA}.agents SET reviewer_model = :model WHERE id = :id"),
+                    {"model": reviewer_model, "id": agent_id},
+                )
+            resolver = _resolver(engine)
+            channel_bound = await resolver.resolve("slack", None, channel)
+            agent_bound = await resolver.resolve_agent(agent_id)
+            for resolved in (channel_bound, agent_bound):
+                assert resolved is not None
+                env = resolver.boot_env(resolved, "reviewer-thread")
+                assert env.get("CURIE_REVIEWER_MODEL") == reviewer_model
+                assert ("CURIE_REVIEWER_MODEL" in env) is (reviewer_model is not None)
+        finally:
+            if agent_id is not None:
+                await _cleanup(engine, [agent_id])
             await engine.dispose()
 
     asyncio.run(go())
