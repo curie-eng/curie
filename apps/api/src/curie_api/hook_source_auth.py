@@ -1,9 +1,9 @@
-"""@spec PROTECTED-HOOK-SOURCE-2/4/9/10."""
+"""@spec PROTECTED-HOOK-SOURCE-2/4/10."""
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -12,12 +12,11 @@ from curie_protected_hooks.source_policy_sql import (
     SourceGate,
     SourceGateContext,
     SourceGateInvalid,
-    SourceSnapshot,
     SourceSnapshotUnavailable,
     ensure_source_gate_live,
     read_source_snapshot,
 )
-from fastapi import HTTPException, Request, status
+from fastapi import HTTPException, Request
 from sqlalchemy import and_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,11 +27,6 @@ from .config import get_settings
 from .models import Agent, HookSourcePolicy
 
 AUTH_DETAIL = "missing or invalid signature"
-MISSING_DELIVERY_DETAIL = (
-    f"{hook_signing.DELIVERY_HEADER} is required: this ingress is at-least-once, so a "
-    "stable upstream id is what keeps a retried delivery from running the "
-    "agent twice"
-)
 _UNAVAILABLE = "authority_unavailable"
 
 
@@ -83,64 +77,29 @@ async def _current_key(session: AsyncSession, agent_id: uuid.UUID, hook: str) ->
     return hook_signing.derive(api_key, agent_id=str(agent_id), generation=legacy)
 
 
-@dataclass(frozen=True)
-class _SignedRequest:
-    """One request's signed context and its purpose verifier.
-
-    @spec PROTECTED-HOOK-SOURCE-2/4/9.
-    """
-
-    verify: Callable[..., bool]
-    hook: str
-    raw: bytes
-    tool_access: str | None
-    timestamp: str | None
-    delivery_id: str
-    signature: str | None
-
-
-def _authenticate(key: str, signed: _SignedRequest) -> None:
-    """@spec PROTECTED-HOOK-SOURCE-2/4/9."""
-    if signed.signature is not None and not signed.signature.isascii():
+def _authenticate(
+    key: str,
+    *,
+    hook: str,
+    raw: bytes,
+    tool_access: str | None,
+    timestamp: str | None,
+    delivery_id: str,
+    signature: str | None,
+) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2/4."""
+    if signature is not None and not signature.isascii():
         raise HTTPException(401, AUTH_DETAIL)
-    if not signed.verify(
+    if not hook_signing.verify(
         key,
-        timestamp=signed.timestamp,
-        delivery_id=signed.delivery_id,
-        hook=signed.hook,
-        tool_access=signed.tool_access,
-        body=signed.raw,
-        header=signed.signature,
+        timestamp=timestamp,
+        delivery_id=delivery_id,
+        hook=hook,
+        tool_access=tool_access,
+        body=raw,
+        header=signature,
     ):
         raise HTTPException(401, AUTH_DETAIL)
-
-
-async def _preauthenticate(
-    session: AsyncSession, agent_id: uuid.UUID, signed: _SignedRequest
-) -> None:
-    """Ungated check, never admission authority. @spec PROTECTED-HOOK-SOURCE-2/9."""
-    preliminary = await _current_key(session, agent_id, signed.hook)
-    _authenticate(preliminary, signed)
-    del preliminary
-
-
-@asynccontextmanager
-async def _gated_snapshot(
-    request: Request, session: AsyncSession, agent_id: uuid.UUID, signed: _SignedRequest
-) -> AsyncIterator[tuple[SourceGateContext, SourceSnapshot]]:
-    """Gate-held reload and reauthentication before the snapshot read.
-
-    @spec PROTECTED-HOOK-SOURCE-2/4/9.
-    """
-    await session.rollback()
-    gate = getattr(request.app.state, "source_gate", None)
-    if not isinstance(gate, SourceGate):
-        raise SourceSnapshotUnavailable("source_gate_unavailable")
-    async with gate.hold(agent_id) as held:
-        current = await _current_key(session, agent_id, signed.hook)
-        _authenticate(current, signed)
-        del current
-        yield held, await read_source_snapshot(held, await session.connection(), signed.hook)
 
 
 @asynccontextmanager
@@ -157,12 +116,35 @@ async def authenticated_source(
     signature: str | None,
 ) -> AsyncIterator[AuthenticatedHookSource]:
     """@spec PROTECTED-HOOK-SOURCE-2/4/10."""
-    signed = _SignedRequest(
-        hook_signing.verify, hook, raw, tool_access, timestamp, delivery_id, signature
-    )
     try:
-        await _preauthenticate(session, agent_id, signed)
-        async with _gated_snapshot(request, session, agent_id, signed) as (held, snapshot):
+        preliminary = await _current_key(session, agent_id, hook)
+        _authenticate(
+            preliminary,
+            hook=hook,
+            raw=raw,
+            tool_access=tool_access,
+            timestamp=timestamp,
+            delivery_id=delivery_id,
+            signature=signature,
+        )
+        del preliminary
+        await session.rollback()
+        gate = getattr(request.app.state, "source_gate", None)
+        if not isinstance(gate, SourceGate):
+            raise SourceSnapshotUnavailable("source_gate_unavailable")
+        async with gate.hold(agent_id) as held:
+            current = await _current_key(session, agent_id, hook)
+            _authenticate(
+                current,
+                hook=hook,
+                raw=raw,
+                tool_access=tool_access,
+                timestamp=timestamp,
+                delivery_id=delivery_id,
+                signature=signature,
+            )
+            del current
+            snapshot = await read_source_snapshot(held, await session.connection(), hook)
             if not snapshot.never_configured:
                 raise HTTPException(503, snapshot.refusal_reason or _UNAVAILABLE)
             agent: Agent | None = await session.scalar(
@@ -174,42 +156,5 @@ async def authenticated_source(
             if agent is None:
                 raise HTTPException(401, AUTH_DETAIL)
             yield AuthenticatedHookSource(agent, held)
-    except (SourceAgentNotFound, SourceGateInvalid, SourceSnapshotUnavailable, SQLAlchemyError):
-        raise HTTPException(503, _UNAVAILABLE) from None
-
-
-@asynccontextmanager
-async def authenticated_support(
-    request: Request,
-    session: AsyncSession,
-    *,
-    agent_id: uuid.UUID,
-    hook: str,
-    raw: bytes,
-    tool_access: str | None,
-    timestamp: str | None,
-    delivery_id: str | None,
-    signature: str | None,
-) -> AsyncIterator[SourceSnapshot]:
-    """Support-purpose authentication yielding the gate-held snapshot unrefused.
-
-    Verifies only ``hook_source_signing.verify_support``; the caller resolves
-    every source state. @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-SOURCE-2/4.
-    """
-    signed = _SignedRequest(
-        hook_source_signing.verify_support,
-        hook,
-        raw,
-        tool_access,
-        timestamp,
-        delivery_id or "",
-        signature,
-    )
-    try:
-        await _preauthenticate(session, agent_id, signed)
-        if not delivery_id:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, MISSING_DELIVERY_DETAIL)
-        async with _gated_snapshot(request, session, agent_id, signed) as (_held, snapshot):
-            yield snapshot
     except (SourceAgentNotFound, SourceGateInvalid, SourceSnapshotUnavailable, SQLAlchemyError):
         raise HTTPException(503, _UNAVAILABLE) from None

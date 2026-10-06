@@ -330,7 +330,6 @@ _HTTP_OPERATIONS = [
     "/health",
     "/ready",
     "/hooks/{agent_id}/{hook}",
-    "/hooks/{agent_id}/{hook}/support",
     "/langfuse/traces",
     "/langfuse/traces/{trace_id}",
     "/langfuse/traces/{trace_id}/eval-case",

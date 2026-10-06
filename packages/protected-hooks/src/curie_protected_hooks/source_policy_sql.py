@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator, Mapping
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from weakref import WeakKeyDictionary
@@ -74,12 +74,7 @@ class SourceGate:
             raise SourceGateInvalid("nested_source_gate")
         agents.add(agent_id)
         try:
-            async with AsyncExitStack() as stack:
-                try:
-                    connection = await stack.enter_async_context(self.engine.connect())
-                except Exception:
-                    # SQLAlchemy leaves some driver connect errors unwrapped (SOURCE-2).
-                    raise SourceSnapshotUnavailable("source_gate_unavailable") from None
+            async with self.engine.connect() as connection:
                 await connection.execution_options(isolation_level="READ COMMITTED")
                 async with connection.begin() as transaction:
                     await connection.execute(

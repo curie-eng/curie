@@ -350,7 +350,6 @@
           "/health",
           "/ready",
           "/hooks/{agent_id}/{hook}",
-          "/hooks/{agent_id}/{hook}/support",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -425,7 +424,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 952,
+      "cardinality_bound": 944,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -496,7 +495,6 @@
           "/health",
           "/ready",
           "/hooks/{agent_id}/{hook}",
-          "/hooks/{agent_id}/{hook}/support",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -578,7 +576,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 4760,
+      "cardinality_bound": 4720,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -649,7 +647,6 @@
           "/health",
           "/ready",
           "/hooks/{agent_id}/{hook}",
-          "/hooks/{agent_id}/{hook}/support",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -731,7 +728,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 4760,
+      "cardinality_bound": 4720,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",
