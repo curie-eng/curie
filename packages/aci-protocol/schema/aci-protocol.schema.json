@@ -314,6 +314,23 @@
           ],
           "title": "Approval Resumed Kind"
         },
+        "attachments_manifest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_ATTACHMENTS_MANIFEST",
+          "producer": [
+            "kernel",
+            "substrate"
+          ],
+          "title": "Attachments Manifest"
+        },
         "base_url": {
           "anyOf": [
             {
@@ -1945,6 +1962,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.16",
-  "title": "ACI Protocol v0.5.16"
+  "protocolVersion": "0.5.17",
+  "title": "ACI Protocol v0.5.17"
 }
