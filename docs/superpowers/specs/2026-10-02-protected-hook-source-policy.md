@@ -628,8 +628,16 @@ on each evaluation so a provisioner rotation needs no restart, and never logs
 their content. An unset setting, or a missing, unreadable or invalid file,
 evaluates to `runtime_unavailable`.
 
-The probe releases the source gate before any broker I/O: the evaluation is
-observational, and every delivery repeats it. It opens one
+The probe releases the source gate, and ends its request database transaction,
+before any broker I/O: the evaluation is observational, every delivery repeats
+it, and no database connection may wait on the broker. Each API process runs at
+most four broker evaluations at once; a probe beyond that limit reports
+`broker_unavailable` without connecting rather than queueing. One evaluation
+has a five second budget across connection and every read, and exceeding it
+reports `broker_unavailable`. Bootstrap files are read relative to one opened
+directory, must each be a regular file after symlink resolution, are opened
+without blocking on special files, and are bounded in size; anything else makes
+the bootstrap invalid. Validating `ca.pem` takes time linear in its size. It opens one
 `AuthenticatedMetadataReader` from the bootstrap off the event loop, performs
 the reads below on that connection, and closes it. The first failing step
 decides the reason:
@@ -652,8 +660,9 @@ decides the reason:
 8. Broker time from `observe()` is at or after the readiness `expires_at_ms`:
    `evidence_expired`.
 9. `validate_authority` refuses the manifest, qualification and readiness with
-   the bootstrap `max_readiness_ms` and observed broker time, or the selection
-   generations do not match them: `qualification_unavailable`.
+   the bootstrap `max_readiness_ms` and observed broker time, or the
+   selection's runtime identifier, runtime generation, qualification identifier
+   or qualification generation differs from them: `qualification_unavailable`.
 10. The selection's qualification or the manifest's bundle digest differs from
     the policy row's references: `configuration_unsupported`.
 11. The selection has `admission_open: false`: `runtime_unavailable`.
@@ -664,8 +673,9 @@ step 7. Manifest comparisons use canonical bytes, so a parseable but
 non-canonical `manifest.json` matches its canonical control record. Extra files
 in the bootstrap directory are ignored. A `default` control reader username,
 like any credential the reader refuses before connecting, makes the bootstrap
-invalid. Runtime members are reported only once steps 4 through 9 have
-validated the selected tuple. A row that passes every step still reports
+invalid. A committed row whose policy fingerprint cannot be computed returns
+the 503 `authority_unavailable` refusal without this DTO. Runtime members are
+reported only once steps 4 through 9 have validated the selected tuple. A row that passes every step still reports
 `configuration_unsupported`, HTTP 503, until delivery ingress admits protected
 deliveries under LANE-4; the probe must not claim support that ingress cannot
 honor. Unconfigured, tombstoned and pending-history rows never open a reader.
