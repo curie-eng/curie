@@ -311,9 +311,11 @@ credential and live run_id. Wrong CA/name/pin must transmit no authentication.
 A failed named principal must never attempt default authentication. Retained
 connection and forced reconnect cases must verify pin and run_id enforcement,
 and close must prevent reuse. Validated wrong tuple/input refusals precede
-connection attempts. The reader remains unwired: no source administration,
+connection attempts. These tests enable no source administration,
 activation, admission, runtime evidence issuance, protected worker startup or
-qualification is enabled by these tests.
+qualification. The only consumer is the observational support probe under
+[PROTECTED-HOOK-SOURCE-9](2026-10-02-protected-hook-source-policy.md#surface-parity-and-smallest-implementation-task),
+which reads through it and writes nothing.
 
 ## Atomic admission, duplicate receipt and activation
 
