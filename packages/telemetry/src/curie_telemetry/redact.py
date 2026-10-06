@@ -26,9 +26,14 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
     ),
     RedactionRule(
         "url_secret_param",
+        # Presigned object URLs (worker attachments, ``presign_get``) carry
+        # their credential in prefixed parameters: AWS SigV4
+        # ``X-Amz-{Credential,Security-Token,Signature}`` and GCS V4
+        # ``X-Goog-{Credential,Signature}``. The algorithm, date, expiry and
+        # signed-header parameters are not secret and stay visible.
         re.compile(
             r"[?&](?:token|secret|password|passwd|pwd|api_key|apikey|access_token|key|sig"
-            r"|signature)=[^&\s]+",
+            r"|signature|x-(?:amz|goog)-(?:credential|security-token|signature))=[^&\s]+",
             re.IGNORECASE,
         ),
         _placeholder("url_secret_param"),
