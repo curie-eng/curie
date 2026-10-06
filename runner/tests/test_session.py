@@ -1880,6 +1880,71 @@ def test_auth_rejection_fails_fast_not_retried(caplog) -> None:
     )
 
 
+# Observed 2026-10-05 on a staging install (#4104): OpenRouter answers a key
+# that reached its own spend limit with HTTP 403, which the SDK reports as
+# error="authentication_failed". Workspace and key ids replaced with "example".
+_OPENROUTER_KEY_LIMIT_403 = (
+    'API Error: 403 {"error":{"message":"Key limit exceeded (total limit). Manage it '
+    'using https://openrouter.ai/workspaces/example/keys/example","code":403}}'
+)
+
+
+def test_key_limit_403_ends_credit_exhausted_not_credential_rejected() -> None:
+    script = [
+        AssistantMessage(
+            content=[TextBlock(text=_OPENROUTER_KEY_LIMIT_403)],
+            model="<synthetic>",
+            error="authentication_failed",
+        ),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1,
+            is_error=True, num_turns=1, session_id="s",
+            result=_OPENROUTER_KEY_LIMIT_403,
+        ),
+    ]
+    runner, _ = _runner(lambda: script)
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    errors = [e for e in events if e.type == "error"]
+    classifications = [e.classification for e in errors]
+    assert "model-credential-rejected" not in classifications
+    # The worker maps the last ErrorEvent before the Final.
+    assert errors[-1].classification == "model-credit-exhausted"
+    assert "Key limit exceeded" in errors[0].message
+    assert events[-1].type == "final"
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert runner.status == SessionStatus.CLASSIFIED_FAILURE
+
+
+def test_no_auth_credentials_401_still_fails_fast_as_credential_rejected() -> None:
+    sentinel = "SHOULD-NOT-APPEAR-AFTER-AUTH-FAIL"
+    script = [
+        AssistantMessage(
+            content=[
+                TextBlock(
+                    text='API Error: 401 {"error":{"message":"No auth credentials found",'
+                    '"code":401}}'
+                )
+            ],
+            model="<synthetic>",
+            error="authentication_failed",
+        ),
+        AssistantMessage(content=[TextBlock(text=sentinel)], model="m"),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1,
+            is_error=False, num_turns=1, session_id="s", result=sentinel,
+        ),
+    ]
+    runner, fake = _runner(lambda: script)
+    events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
+
+    assert [e.type for e in events] == ["error", "final"]
+    assert events[0].classification == "model-credential-rejected"
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    assert all(sentinel not in getattr(e, "text", "") for e in events)
+    assert fake.interrupts >= 1
+
+
 def test_auth_fast_fail_survives_a_wedged_interrupt(caplog) -> None:
     # Hardening for the fast-fail: if interrupt() itself RAISES (a wedged
     # transport -- the very state a bad credential can cause), the exception must

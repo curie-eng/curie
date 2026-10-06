@@ -16,7 +16,12 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import RateLimitInfo
 from curie_runner import SideEffectClassifier
-from curie_runner.translate import RESULT_MAX_BYTES, TurnState, translate_message
+from curie_runner.translate import (
+    RESULT_MAX_BYTES,
+    TurnState,
+    _is_credit_exhausted,
+    translate_message,
+)
 
 
 def _translate(message: object, state: TurnState | None = None) -> list:
@@ -550,6 +555,24 @@ def test_sdk_billing_error_is_credit_exhausted() -> None:
     msg = AssistantMessage(content=[], model="m", error="billing_error")
     events = _translate(msg)
     assert events[0].classification == "model-credit-exhausted"
+
+
+# Observed 2026-10-05 on a staging install (#4104): an OpenRouter key at its own
+# spend limit answers HTTP 403 with this body, and the SDK reports it as
+# error="authentication_failed". Workspace and key ids replaced with "example".
+_OPENROUTER_KEY_LIMIT_403 = (
+    'API Error: 403 {"error":{"message":"Key limit exceeded (total limit). Manage it '
+    'using https://openrouter.ai/workspaces/example/keys/example","code":403}}'
+)
+
+
+def test_openrouter_key_limit_text_is_credit_exhausted() -> None:
+    assert _is_credit_exhausted("authentication_failed", _OPENROUTER_KEY_LIMIT_403)
+
+
+def test_rate_limit_text_is_not_credit_exhausted() -> None:
+    # A retryable rate limit must stay out of the terminal credit class.
+    assert not _is_credit_exhausted("rate_limit", "API Error: 429 Rate limit exceeded")
 
 
 def test_unknown_error_without_credit_text_stays_unclassified() -> None:

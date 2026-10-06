@@ -99,13 +99,15 @@ def map_error_classification(raw: str | None) -> str:
 # A provider refusing a request for lack of credits (#3073). The SDK names an
 # Anthropic billing refusal ``billing_error``; an OpenAI-compatible provider
 # such as OpenRouter answers HTTP 402, which the SDK reports only as
-# ``unknown`` with the provider's message as the assistant text. Terminal and
-# not retryable: more attempts cannot add credits.
+# ``unknown`` with the provider's message as the assistant text. A key at its
+# own OpenRouter spend limit answers HTTP 403 "Key limit exceeded", which the SDK
+# reports as ``authentication_failed`` (#4104). Terminal and not retryable: more
+# attempts cannot add credits.
 CREDIT_EXHAUSTED_CLASSIFICATION = "model-credit-exhausted"
 _BILLING_SDK_CODE = "billing_error"
 _CREDIT_EXHAUSTED_TEXT = re.compile(
     r"\b402\b|payment required|insufficient (?:credits?|balance|funds)"
-    r"|(?:credit|spend|usage) limit|(?:more|out of|no) credits",
+    r"|(?:credit|spend|usage) limit|key limit exceeded|(?:more|out of|no) credits",
     re.IGNORECASE,
 )
 # Longest provider message carried on the error event.
@@ -155,6 +157,12 @@ def _result_text(content: object) -> str:
 
 def _is_credit_exhausted(error: str, provider_text: str) -> bool:
     return error == _BILLING_SDK_CODE or bool(_CREDIT_EXHAUSTED_TEXT.search(provider_text))
+
+
+def is_credit_refusal(message: AssistantMessage) -> bool:
+    """True when an errored assistant message reports exhausted provider credit."""
+
+    return _is_credit_exhausted(message.error or "", _provider_error_text(message))
 
 
 @dataclass
