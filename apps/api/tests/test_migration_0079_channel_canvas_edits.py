@@ -1,4 +1,4 @@
-"""Migration 0079 adds curie.channel_canvas_edits (ADR 0200, #3819)."""
+"""Migration 0084 adds curie.channel_canvas_edits (ADR 0200, #3819)."""
 
 from __future__ import annotations
 
@@ -91,28 +91,28 @@ def _index_columns(index: str) -> list[str]:
     return [row["name"] for row in rows]
 
 
-def test_0079_revises_0078() -> None:
+def test_0084_revises_0083() -> None:
     script = ScriptDirectory.from_config(_config())
-    revision = script.get_revision("0079")
+    revision = script.get_revision("0084")
     assert revision is not None
-    assert revision.down_revision == "0078"
+    assert revision.down_revision == "0083"
 
 
-def test_0079_upgrade_creates_the_table_check_and_index(isolated_migration_db: None) -> None:
+def test_0084_upgrade_creates_the_table_check_and_index(isolated_migration_db: None) -> None:
     config = _config()
-    command.upgrade(config, "0079")
+    command.upgrade(config, "0084")
     assert _regclass("channel_canvas_edits") is not None
     assert _columns() == EXPECTED_COLUMNS
     assert STATUS_CHECK in _constraint_names()
     assert _index_columns(CANVAS_INDEX) == ["canvas_id", "created_at"]
 
 
-def test_0079_downgrade_drops_the_table(isolated_migration_db: None) -> None:
+def test_0084_downgrade_drops_the_table(isolated_migration_db: None) -> None:
     config = _config()
-    command.upgrade(config, "0079")
+    command.upgrade(config, "0084")
     assert _regclass("channel_canvas_edits") is not None
     try:
-        command.downgrade(config, "0078")
+        command.downgrade(config, "0083")
         assert _regclass("channel_canvas_edits") is None
         # The agents FK target must outlive the downgrade.
         assert _regclass("agents") is not None

@@ -43,7 +43,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 CONTRACT = "0041"
 # @spec PROTECTED-HOOK-SOURCE-2 and DEPLOY-NOTICE-RELEASE-1.
 # Agent reads require deploy notifications after the published source-control ledger.
-APP_SCHEMA_MIN = "0077"
+APP_SCHEMA_MIN = "0082"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 

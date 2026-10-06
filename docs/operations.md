@@ -609,6 +609,11 @@ install of Curie on the same cluster (which normally means two releases
 sharing the default name `curie` in different namespaces), tearing one down
 never touches the other's namespaces.
 
+The sweep waits at most 300 seconds. If an owned namespace is still present,
+the command exits 3 and names the namespace, its phase, its conditions, and
+the remaining objects. It does not remove finalizers or finalize the
+namespace. Rerunning is safe.
+
 It's also safe to re-run if something goes wrong. If the underlying
 uninstall fails (say, a brief Kubernetes API-server hiccup), teardown doesn't just
 stop -- it keeps going and cleans up whatever it safely can, so you're not
@@ -1031,7 +1036,14 @@ run publishes, it waits on the pull request's checks inside its execution
 deadline; the request completes only when CI is green. A failure resumes the
 same run to fix the code and push to the same pull request, for at most 3
 rounds, then the issue gets `Could not complete:` with the failing checks and
-what each round tried. No checks within 120 s of the push completes with a
+what each round tried. A failing check or commit status that is also failing
+on the commit the pull request's base branch points to is not counted against
+the change: it neither fails the run nor reaches a fix round, and a run that is
+otherwise green completes with the note `Also failing on the base branch, not
+caused by this change: <names>`. The required Python check and any check a
+sandbox check delegated to are the exception: failing on the base too leaves
+the run `ci_unverified`. When the base branch cannot be read, every failure
+counts. No checks within 120 s of the push completes with a
 note only when no required check applies. A factory Python publication needs
 in-sandbox verification evidence; beyond that it is judged on the repository's
 own checks unless the repository has a required Python CI policy (below).
@@ -1276,8 +1288,8 @@ A last `Cause:` line names the platform cause code
 `owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
 `no_pull_request`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
-classified run failure: `model_credit_exhausted`, `model_credential_rejected`,
-`model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`,
+classified run failure: `model_credit_exhausted`, `model_usage_limited`,
+`model_credential_rejected`, `model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`,
 `sandbox_terminated`, `workspace_error`, or `history_capacity`). A sandbox
 termination includes the Kubernetes reason and, for an EmptyDir eviction, the
 volume limit in a `Details:` line. When the cause has a runner failure
@@ -1292,8 +1304,14 @@ Other escalations use that same first line with their own token
 A history capacity result tells the
 operator to inspect work already done and retry. A model provider that answers
 HTTP 402 or reports exhausted
-credits ends the run as `model_credit_exhausted` without retrying. A run that a
-relabel replaced ends with `Stopped: the label was added again, so a new run
+credits, including an OpenRouter key's HTTP 403 spend limit, ends the run as
+`model_credit_exhausted` without retrying. An SDK `rate_limit` error or a
+subscription session, weekly or model usage limit ends the run as
+`model_usage_limited` with failure class `model-usage-limited`, without retrying.
+The status comment says that the model provider's usage limit for the credential
+was reached; re-add the factory label after the limit resets. Ordinary usage
+warnings and rejected rate-limit events keep their existing behavior. A run that
+a relabel replaced ends with `Stopped: the label was added again, so a new run
 replaced this one.`, and the new run gets its own status comment. The
 work item reconciler writes the result after the terminal row and any
 publication lineage commit. A refused create or edit is recorded on the status
@@ -1432,6 +1450,7 @@ Every identity is an operator input. Nothing names a specific App or account:
 | `CURIE_FACTORY_CURIE_BIN` | `curie` binary that deploys the bundle (default `curie` on PATH) |
 | `CURIE_FACTORY_BUNDLE_DIR` | Bundle to deploy (default `examples/dark-factory`) |
 | `CURIE_FACTORY_MODEL_API_KEY` | Model credential. Set, the install runs a real model with the worker budget raised to the execution bound; unset, the model is fake |
+| `CURIE_FACTORY_MODEL_BASE_URL` or `--model-base-url` | Anthropic-compatible base URL. The worker receives it as `CURIE_MODEL_BASE_URL` through `worker.extraEnv`. The host must be the model proxy pod IP; sandbox egress allows that `/32` and port. `curie dev model-script record` is the proxy that writes a transcript while it forwards to `https://openrouter.ai/api`. `curie dev model-script serve` replays that transcript and fails if a request, including a plan or diff reviewer call, was not recorded |
 | `CURIE_FACTORY_MODEL` | Model name (default `z-ai/glm-5.3-flash`) |
 | `CURIE_FACTORY_MODEL_CONTEXT_TOKENS` | The model's context window, passed to the sandbox as `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (default 128000 for the default model, unset for any other) |
 
@@ -2112,9 +2131,10 @@ The boot env tokens (`CURIE_HISTORY_TOKEN`, `CURIE_MEMORY_TOKEN`, and
 `CURIE_STATE_TOKEN`) expire at the turn's stream deadline plus 60 seconds,
 and no later than 24 hours. When the worker deletes the sandbox claim, it
 tells the API, and the API refuses that credential immediately (403, "this
-sandbox credential has been released") even though it has not expired. The
-report is best effort. A failed report stays in Valkey until a later
-cleanup pass lands it, or until that record expires with the token. A warm
+sandbox credential has been released") even though it has not expired. Each
+claim gets its own credential id, so a retry after a failed claim boots with a
+credential the API still accepts. The report is best effort. A failed report
+stays in Valkey until a later cleanup pass lands it, or until that record expires with the token. A warm
 sandbox keeps the token it booted with only while that token still covers the
 next turn. Otherwise the next new turn replaces the sandbox. A token minted before this change has no
 credential id. It stays valid until its own expiry. Upgrade the worker with

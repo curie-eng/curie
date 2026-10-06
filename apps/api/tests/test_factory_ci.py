@@ -90,7 +90,17 @@ def _detail(
     statuses: tuple[dict[str, Any], ...] = (),
     annotations: dict[int, list[dict[str, Any]]] | None = None,
     reason: str | None = None,
+    base_runs: tuple[dict[str, Any], ...] | None = None,
+    base_statuses: tuple[dict[str, Any], ...] | None = None,
 ) -> CiDetail:
+    # The base fields are passed only when a test reads a base head, so every
+    # other detail is built exactly as before #4105.
+    base: dict[str, Any] = {}
+    if base_runs is not None or base_statuses is not None:
+        base = {
+            "base_check_runs": list(base_runs or ()),
+            "base_statuses": list(base_statuses or ()),
+        }
     return CiDetail(
         state="unavailable" if reason is not None else "observed",
         reason=reason,
@@ -98,6 +108,7 @@ def _detail(
         check_runs=list(runs),
         statuses=list(statuses),
         annotations=annotations or {},
+        **base,
     )
 
 
@@ -1451,3 +1462,188 @@ def test_every_delegated_check_must_be_present() -> None:
 )
 def test_no_delegated_checks_keeps_todays_verdicts(detail: CiDetail, seconds: float) -> None:
     assert _decide(detail, seconds, delegated_checks=()) == _decide(detail, seconds)
+
+
+# --- decide: failures already failing on the base branch (#4105) ------------------------
+#
+# A failing check on the PR head whose name (or status context) is also failing on
+# the commit the base branch points to now is pre-existing, not caused by the change.
+
+PREEXISTING_NOTE = "Also failing on the base branch, not caused by this change: pip-audit"
+
+
+def _report(text: str) -> dict[str, Any]:
+    report: dict[str, Any] = json.loads(text.splitlines()[-1])
+    return report
+
+
+def test_a_failure_also_failing_on_the_base_is_green_with_a_note() -> None:
+    detail = _detail(
+        _run("lint"),
+        _run("pip-audit", conclusion="failure", run_id=2),
+        _run("unit-tests", run_id=3),
+        base_runs=(_run("pip-audit", conclusion="failure", run_id=90), _run("lint", run_id=91)),
+    )
+
+    verdict = _decide(detail, 30)
+
+    assert verdict.kind == "green"
+    assert verdict.failing == []
+    assert verdict.note == PREEXISTING_NOTE
+
+
+def test_a_failure_passing_on_the_base_is_caused_by_the_change() -> None:
+    detail = _detail(
+        _run("lint"),
+        _run("pip-audit", conclusion="failure", run_id=2),
+        _run("unit-tests", run_id=3),
+        base_runs=(_run("pip-audit", run_id=90),),
+    )
+
+    verdict = _decide(detail, 30)
+
+    assert verdict.kind == "failing"
+    assert _names(verdict.failing) == {"pip-audit"}
+    text = factory_ci.continuation_text(ISSUE_URL, PR_URL, HEAD, 2, detail)
+    assert [entry["name"] for entry in _report(text)["failing_checks"]] == ["pip-audit"]
+
+
+def test_only_the_caused_failure_fails_and_reaches_the_fix_turn() -> None:
+    detail = _detail(
+        _run("lint"),
+        _run("pip-audit", conclusion="failure", run_id=2, summary="multidict advisory"),
+        _run("unit-tests", conclusion="failure", run_id=3, summary="2 failed"),
+        base_runs=(
+            _run("pip-audit", conclusion="failure", run_id=90),
+            _run("unit-tests", run_id=91),
+        ),
+    )
+
+    verdict = _decide(detail, 30)
+
+    assert verdict.kind == "failing"
+    assert verdict.failing == [{"name": "unit-tests", "conclusion": "failure"}]
+    text = factory_ci.continuation_text(ISSUE_URL, PR_URL, HEAD, 2, detail)
+    report = _report(text)
+    assert [entry["name"] for entry in report["failing_checks"]] == ["unit-tests"]
+    assert "pip-audit" not in text
+    assert "multidict advisory" not in text
+
+
+def test_an_unread_base_counts_every_failure_as_caused() -> None:
+    detail = _detail(_run("lint"), _run("pip-audit", conclusion="failure", run_id=2))
+    assert detail.base_check_runs is None and detail.base_statuses is None
+
+    verdict = _decide(detail, 30)
+
+    assert verdict.kind == "failing"
+    assert _names(verdict.failing) == {"pip-audit"}
+    text = factory_ci.continuation_text(ISSUE_URL, PR_URL, HEAD, 2, detail)
+    assert [entry["name"] for entry in _report(text)["failing_checks"]] == ["pip-audit"]
+
+
+def test_a_half_read_base_counts_every_failure_as_caused() -> None:
+    detail = CiDetail(
+        state="observed",
+        reason=None,
+        head_sha=HEAD,
+        check_runs=[_run("pip-audit", conclusion="failure")],
+        base_check_runs=[_run("pip-audit", conclusion="failure", run_id=90)],
+        base_statuses=None,
+    )
+
+    assert _decide(detail, 30).kind == "failing"
+
+
+def test_a_status_also_failing_on_the_base_is_green_with_a_note() -> None:
+    detail = _detail(
+        _run("lint"),
+        statuses=(_status("ci/audit", "failure"), _status("ci/build", "success")),
+        base_statuses=(_status("ci/audit", "error"),),
+    )
+
+    verdict = _decide(detail, 30)
+
+    assert verdict.kind == "green"
+    assert verdict.note == "Also failing on the base branch, not caused by this change: ci/audit"
+    text = factory_ci.continuation_text(ISSUE_URL, PR_URL, HEAD, 2, detail)
+    assert _report(text)["failing_statuses"] == []
+
+
+def test_a_preexisting_failure_still_waits_for_a_pending_check() -> None:
+    detail = _detail(
+        _run("pip-audit", conclusion="failure"),
+        _run("unit-tests", status="in_progress", run_id=2),
+        base_runs=(_run("pip-audit", conclusion="failure", run_id=90),),
+    )
+
+    verdict = _decide(detail, 30)
+
+    assert verdict.kind == "pending"
+    assert verdict.failing == []
+    assert verdict.pending == [{"name": "unit-tests", "status": "in_progress"}]
+
+
+def test_a_required_python_check_failing_on_the_base_is_unverified() -> None:
+    detail = _detail(
+        _actions_run(_PYTHON_AGGREGATE, conclusion="failure"),
+        _run("lint", run_id=2),
+        base_runs=(_actions_run(_PYTHON_AGGREGATE, conclusion="failure", run_id=90),),
+    )
+
+    verdict = _decide(detail, 30, changed_paths=[_PYTHON_PATH], python_ci=conversion_python_ci())
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_python_ci_failed_on_base"
+
+
+def test_a_delegated_check_failing_on_the_base_is_unverified() -> None:
+    detail = _detail(
+        _run("lint"),
+        _delegated_run(conclusion="failure"),
+        base_runs=(_run(DELEGATED, conclusion="failure", run_id=90),),
+    )
+
+    verdict = _decide(detail, 30, delegated_checks=(DELEGATED,))
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "delegated_ci_failed_on_base"
+
+
+def test_a_delegated_status_failing_on_the_base_is_unverified() -> None:
+    detail = _detail(
+        _run("lint"),
+        statuses=(_status(DELEGATED, "failure"),),
+        base_statuses=(_status(DELEGATED, "failure"),),
+    )
+
+    verdict = _decide(detail, 30, delegated_checks=(DELEGATED,))
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "delegated_ci_failed_on_base"
+
+
+def test_a_preexisting_failure_cannot_skip_the_metadata_rerun_wait() -> None:
+    audit = _run("pip-audit", conclusion="failure")
+    audit["started_at"] = "2026-09-24T11:00:00Z"
+    body_before = _run("Publication description guard", conclusion="failure", run_id=2)
+    body_before["started_at"] = "2026-09-24T11:00:00Z"
+    base = (_run("pip-audit", conclusion="failure", run_id=90),)
+
+    verdict = _decide(
+        _detail(audit, body_before, base_runs=base),
+        30,
+        fresh_after=PUBLISHED,
+        metadata_ci=conversion_metadata_ci(),
+    )
+
+    assert verdict.kind == "pending"
+    assert verdict.reason == "checks_awaiting_metadata_rerun"
+    # Without the base read the same unchanged failure ends the wait at once.
+    unread = _decide(
+        _detail(audit, body_before),
+        30,
+        fresh_after=PUBLISHED,
+        metadata_ci=conversion_metadata_ci(),
+    )
+    assert unread.kind == "failing"

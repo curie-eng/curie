@@ -192,6 +192,7 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
         "ledger-error",
         "model-credential-rejected",
         "model-credit-exhausted",
+        "model-usage-limited",
         "approval-not-acted",
         "false-completion",
         "publication-unrecorded",
@@ -228,6 +229,7 @@ _ESCALATION_DETAIL_MAX = 300
 # ``runner_escalated``.
 _ESCALATION_CAUSES = {
     "model-credit-exhausted": "model_credit_exhausted",
+    "model-usage-limited": "model_usage_limited",
     "model-credential-rejected": "model_credential_rejected",
     "rate-limit": "model_rate_limited",
     "server-error": "model_error",

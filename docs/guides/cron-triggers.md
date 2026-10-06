@@ -54,8 +54,9 @@ bounds how late a run starts.
 
 Each slot is recorded as one row in the `hook_runs` table, unique on agent,
 trigger name and slot. Every replica computes the same slots and only one
-insert wins, so a slot runs once however many workers are running. The row's
-outcome is one of:
+insert wins, so a slot runs once however many workers are running. Each row
+persists `source`: `schedule` for worker-created slots and `manual` for an
+operator fire. The row's outcome is one of:
 
 - `ran`: the turn completed.
 - `failed`: the turn failed, or `target` does not match exactly one channel
@@ -157,27 +158,48 @@ run as `ran`, and the sweep does not continue after the approval resumes it.
 
 `curie local schedules` and `curie cluster schedules` list every cron hook on
 the in force deployment of each agent. Pass `--agent` to limit the list to one
-agent. Each hook shows its trigger, schedule, zone, newest slot, and how that
-slot ended. A missing `timezone` is reported as `UTC`. `GET /schedules` is the
-same list. `curie skill schedules` is refused, because that tier has no
+agent. Each hook shows its trigger, schedule, zone, and two independent
+histories: the newest scheduled slot and the newest manual fire. Scheduled
+`last_fire_at`, `last_outcome`, and `last_reason` read only rows whose `source`
+is `schedule`. `last_manual_fire_at`, `last_manual_outcome`, and
+`last_manual_reason` read only `manual` rows. A newer manual fire cannot replace
+the scheduled result. Missing history is null in JSON and shown as a dash in
+human output. A missing `timezone` is reported as `UTC`. `GET /schedules` is
+the same list. `curie skill schedules` is refused, because that tier has no
 platform API and no run record.
+
+Read one persisted run with `curie local hook record <agent> <name> <id>` or
+`curie cluster hook record <agent> <name> <id>`. Both print the current record
+and exit 0 when it is found, including a non-`ran` outcome or an in-flight row
+whose outcome is null. They do not wait for the turn to settle. `--json`
+includes the persisted `source` and `reason`.
 
 ## Firing a hook now
 
 `curie local hook fire <agent> <name>` and `curie cluster hook fire <agent> <name>`
 run that hook immediately. The schedule is skipped. An in-flight run of the
 same hook is not: the new fire is recorded `skipped` and no second turn is
-queued. The command prints the run record once the turn settles.
+queued. The fire persists `source=manual` and prints the run record once the
+turn settles. If waiting times out, use the run id from the error with
+`curie local hook record <agent> <name> <id>` or the corresponding cluster
+command to read its current state.
 
 `curie skill hook fire <name>` runs the hook's prompt against the local runner
 and prints that turn's outcome. It does not write a run record. `curie skill
 hook schedule` and `curie skill hook record` are refused, because that tier
-has no scheduler and no run table.
+has no scheduler and no run table. `curie skill hook record` exits 4.
 
-A hook that failed on its newest slot is visible in that one response,
-including when the three newest slots all failed. A slot that has not ended
+A hook that failed on its newest scheduled slot remains visible in schedules,
+including when the three newest scheduled slots all failed. A newer manual
+fire appears in its separate history. A slot that has not ended
 yet has no outcome. The scheduler records `ran`, `failed`, `blocked`, `deferred`,
-`skipped`, and `reclaimed`.
+`skipped`, and `reclaimed`. A row that is not `ran` and not still in flight
+also carries a `reason` code, such as `agent_killed` or `target_unbound`.
+`ran`, an open row, and a row written before the column existed leave `reason`
+empty. Human output prints the reason after the outcome on a hook fire or
+record and on the scheduled history when it is present. `--json` includes
+`reason` on a hook fire or record, and `last_reason` and `last_manual_reason`
+on a schedule. The manual history reason is included only in JSON.
 
 A fire aimed at a thread that holds a live session does not steer that
 session or open a second one. It records `deferred`, and the scheduler fires

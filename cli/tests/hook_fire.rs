@@ -65,14 +65,23 @@ fn assert_schema(value: &Value) {
 }
 
 fn record(outcome: Option<&str>) -> Value {
+    record_with_reason(outcome, None)
+}
+
+fn record_with_reason(outcome: Option<&str>, reason: Option<&str>) -> Value {
+    // Wire shape and allowed outcomes/reasons come from the API producer:
+    // apps/api/openapi.json components.schemas.HookFireOut and
+    // apps/api/src/curie_api/routers/hook_fire.py::_record.
     json!({
         "id": "22222222-2222-4222-8222-222222222222",
         "agent_id": "11111111-1111-4111-8111-111111111111",
         "agent": "acme-bot",
         "name": "nightly-cleanup",
         "trigger": "cron",
+        "source": "manual",
         "slot_utc": "2026-09-26T12:00:00Z",
         "outcome": outcome,
+        "reason": reason,
         "started_at": "2026-09-26T12:00:00Z",
         "ended_at": if outcome.is_some() { json!("2026-09-26T12:00:01Z") } else { Value::Null }
     })
@@ -95,6 +104,79 @@ fn fire_server(settle: bool) -> MockServer {
         }
         Response::json(500, r#"{"detail":"unexpected"}"#)
     })
+}
+
+fn fire_command(tier: &str, server: &MockServer, flags: &[&str], wait_secs: &str) -> Output {
+    let mut args = flags.to_vec();
+    args.extend([
+        tier,
+        "hook",
+        "fire",
+        "acme-bot",
+        "nightly-cleanup",
+        "--api-url",
+        &server.base_url,
+        "--api-key",
+        TEST_API_KEY,
+        "--wait-secs",
+        wait_secs,
+    ]);
+    run_in(&args, &[("KUBECONFIG", MISSING_KUBECONFIG)])
+}
+
+fn assert_terminal_outcome(outcome: &str, reason: Option<&str>, expected_exit: i32) {
+    let expected = record_with_reason(Some(outcome), reason);
+    let body = expected.to_string();
+    let server = serve(move |req| {
+        if req.method == "POST" && req.path.ends_with("/fire") {
+            return Response::json(200, &body);
+        }
+        Response::json(500, r#"{"detail":"unexpected"}"#)
+    });
+    for tier in ["local", "cluster"] {
+        let output = fire_command(tier, &server, &["--json"], "5");
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "{tier}: {}",
+            describe(&output)
+        );
+        let value = one_object(&output);
+        assert_eq!(value, expected, "{tier}: raw API record must be preserved");
+        assert_schema(&value);
+
+        for flags in [&[][..], &["-q"][..]] {
+            let human = fire_command(tier, &server, flags, "5");
+            assert_eq!(
+                human.status.code(),
+                Some(expected_exit),
+                "{tier} {flags:?}: {}",
+                describe(&human)
+            );
+            let text = stdout(&human);
+            for field in ["acme-bot", "nightly-cleanup", outcome] {
+                assert!(text.contains(field), "{tier} {flags:?}: {text}");
+            }
+            assert!(
+                text.contains(expected["id"].as_str().unwrap()),
+                "{tier} {flags:?}: {text}"
+            );
+            if expected_exit != 0 {
+                let stderr = String::from_utf8_lossy(&human.stderr);
+                let message = format!("hook nightly-cleanup ran and recorded {outcome}");
+                if let Some(reason) = reason {
+                    assert!(text.contains(reason), "{tier} {flags:?}: {text}");
+                    assert!(
+                        stderr.contains(&format!("{message}: {reason}")),
+                        "{tier} {flags:?}: {stderr}"
+                    );
+                } else {
+                    assert!(stderr.contains(&message), "{tier} {flags:?}: {stderr}");
+                }
+            }
+        }
+    }
+    assert!(server.recorded().iter().all(|req| req.method == "POST"));
 }
 
 #[test]
@@ -127,26 +209,99 @@ fn local_fire_waits_until_the_record_settles() {
 }
 
 #[test]
-fn skipped_fire_is_printed_without_waiting() {
-    let server = fire_server(false);
-    let output = run_in(
-        &[
-            "--json",
-            "local",
-            "hook",
-            "fire",
-            "acme-bot",
-            "nightly-cleanup",
-            "--api-url",
-            &server.base_url,
-            "--api-key",
-            TEST_API_KEY,
-        ],
-        &[],
-    );
-    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
-    assert_eq!(one_object(&output)["outcome"], json!("skipped"));
-    assert!(server.recorded().iter().all(|req| req.method != "GET"));
+fn ran_fire_succeeds_at_both_tiers() {
+    assert_terminal_outcome("ran", None, 0);
+}
+
+#[test]
+fn failed_fire_preserves_the_record_and_fails_at_both_tiers() {
+    assert_terminal_outcome("failed", Some("turn_error"), 1);
+}
+
+#[test]
+fn blocked_fire_preserves_the_record_and_reason_at_both_tiers() {
+    assert_terminal_outcome("blocked", Some("agent_killed"), 1);
+}
+
+#[test]
+fn skipped_fire_preserves_the_record_and_fails_without_polling_at_both_tiers() {
+    assert_terminal_outcome("skipped", Some("run_in_flight"), 1);
+}
+
+#[test]
+fn reclaimed_fire_preserves_the_record_and_fails_at_both_tiers() {
+    assert_terminal_outcome("reclaimed", Some("claim_expired"), 1);
+}
+
+#[test]
+fn failed_fire_without_a_reason_still_reports_the_outcome_at_both_tiers() {
+    assert_terminal_outcome("failed", None, 1);
+}
+
+#[test]
+fn deferred_fire_waits_until_ran_at_both_tiers() {
+    let deferred = record_with_reason(Some("deferred"), Some("live_session")).to_string();
+    let ran = record(Some("ran"));
+    let body = ran.to_string();
+    let server = serve(move |req| {
+        if req.method == "POST" && req.path.ends_with("/fire") {
+            return Response::json(200, &deferred);
+        }
+        if req.method == "GET" && req.path.contains("/runs/") {
+            return Response::json(200, &body);
+        }
+        Response::json(500, r#"{"detail":"unexpected"}"#)
+    });
+    for tier in ["local", "cluster"] {
+        let before = server.recorded().len();
+        let output = fire_command(tier, &server, &["--json"], "5");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{tier}: {}",
+            describe(&output)
+        );
+        let value = one_object(&output);
+        assert_eq!(value, ran, "{tier}: deferred must not be the final result");
+        assert_schema(&value);
+        assert!(server.recorded()[before..]
+            .iter()
+            .any(|req| req.method == "GET"));
+    }
+}
+
+#[test]
+fn deferred_fire_times_out_at_both_tiers() {
+    let deferred = record_with_reason(Some("deferred"), Some("live_session")).to_string();
+    let server = serve(move |req| {
+        if (req.method == "POST" && req.path.ends_with("/fire"))
+            || (req.method == "GET" && req.path.contains("/runs/"))
+        {
+            return Response::json(200, &deferred);
+        }
+        Response::json(500, r#"{"detail":"unexpected"}"#)
+    });
+    for tier in ["local", "cluster"] {
+        let before = server.recorded().len();
+        let output = fire_command(tier, &server, &["--json"], "1");
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{tier}: {}",
+            describe(&output)
+        );
+        let value = one_object(&output);
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("did not settle within 1s"),
+            "{tier}: {value}"
+        );
+        assert!(server.recorded()[before..]
+            .iter()
+            .any(|req| req.method == "GET"));
+    }
 }
 
 #[test]
@@ -281,7 +436,7 @@ fn cluster_fire_uses_the_explicit_api() {
         ],
         &[("KUBECONFIG", MISSING_KUBECONFIG)],
     );
-    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
     assert_eq!(one_object(&output)["outcome"], json!("skipped"));
 }
 
@@ -300,8 +455,10 @@ fn skill_schedule_and_record_are_unavailable() {
             stdout(&output),
             String::from_utf8_lossy(&output.stderr)
         );
+        let alternative = if verb == "record" { "record" } else { "fire" };
         assert!(
-            all.contains("local hook fire") || all.contains("cluster hook fire"),
+            all.contains(&format!("local hook {alternative}"))
+                || all.contains(&format!("cluster hook {alternative}")),
             "{verb}: {all}"
         );
     }
@@ -335,4 +492,263 @@ fn skill_fire_refuses_an_unknown_hook_without_a_runner() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(all.contains("missing"), "{all}");
+}
+
+#[test]
+fn local_and_cluster_record_report_every_outcome_without_polling_or_judgment() {
+    for tier in ["local", "cluster"] {
+        for outcome in [
+            None,
+            Some("ran"),
+            Some("blocked"),
+            Some("skipped"),
+            Some("failed"),
+            Some("deferred"),
+            Some("reclaimed"),
+        ] {
+            let expected = record(outcome);
+            let body = expected.to_string();
+            let server = serve(move |req| {
+                if req.method == "GET"
+                    && req.path.ends_with(
+                        "/hooks/nightly-cleanup/runs/22222222-2222-4222-8222-222222222222",
+                    )
+                {
+                    Response::json(200, &body)
+                } else {
+                    Response::json(500, r#"{"detail":"unexpected request"}"#)
+                }
+            });
+            let output = run_in(
+                &[
+                    "--json",
+                    tier,
+                    "hook",
+                    "record",
+                    "acme-bot",
+                    "nightly-cleanup",
+                    "22222222-2222-4222-8222-222222222222",
+                    "--api-url",
+                    &server.base_url,
+                    "--api-key",
+                    TEST_API_KEY,
+                ],
+                &[("KUBECONFIG", MISSING_KUBECONFIG)],
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{tier} {outcome:?}: {}",
+                describe(&output)
+            );
+            let value = one_object(&output);
+            assert_eq!(value, expected, "{tier} {outcome:?}");
+            assert_schema(&value);
+            let requests = server.recorded();
+            assert_eq!(requests.len(), 1, "{tier} {outcome:?}: {requests:?}");
+            assert_eq!(requests[0].method, "GET");
+            assert_eq!(requests[0].header("x-api-key"), Some(TEST_API_KEY));
+        }
+    }
+}
+
+#[test]
+fn hook_record_human_output_preserves_the_fire_record_line() {
+    let body = record_with_reason(Some("blocked"), Some("agent_killed")).to_string();
+    let server = serve(move |_| Response::json(200, &body));
+    let output = run_in(
+        &[
+            "local",
+            "hook",
+            "record",
+            "acme-bot",
+            "nightly-cleanup",
+            "22222222-2222-4222-8222-222222222222",
+            "--api-url",
+            &server.base_url,
+            "--api-key",
+            TEST_API_KEY,
+        ],
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    assert_eq!(
+        stdout(&output).trim(),
+        "acme-bot nightly-cleanup 2026-09-26T12:00:00Z blocked agent_killed 22222222-2222-4222-8222-222222222222",
+    );
+}
+
+#[test]
+fn hook_record_encodes_every_segment_and_dry_run_uses_the_same_get() {
+    let body = record(None).to_string();
+    for tier in ["local", "cluster"] {
+        let expected_path = "/agents/a%23b/hooks/nightly%3Fx=1/runs/run%2Fone";
+        let expected_body = body.clone();
+        let server = serve(move |req| {
+            if req.method == "GET" && req.path == expected_path {
+                Response::json(200, &expected_body)
+            } else {
+                Response::json(404, r#"{"detail":"wrong path"}"#)
+            }
+        });
+        let output = run_in(
+            &[
+                "--json",
+                tier,
+                "hook",
+                "record",
+                "a#b",
+                "nightly?x=1",
+                "run/one",
+                "--api-url",
+                &server.base_url,
+                "--api-key",
+                TEST_API_KEY,
+            ],
+            &[],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{tier}: {}",
+            describe(&output)
+        );
+        let requests = server.recorded();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, expected_path);
+
+        let server = serve(|_| Response::json(500, r#"{"detail":"dry run touched API"}"#));
+        let output = run_in(
+            &[
+                "--json",
+                tier,
+                "hook",
+                "record",
+                "a#b",
+                "nightly?x=1",
+                "run/one",
+                "--dry-run",
+                "--api-url",
+                &server.base_url,
+                "--api-key",
+                TEST_API_KEY,
+            ],
+            &[],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{tier}: {}",
+            describe(&output)
+        );
+        let value = one_object(&output);
+        assert_eq!(value["dry_run"], json!(true));
+        assert_eq!(
+            value["plan"],
+            json!([format!("GET {}{expected_path}", server.base_url)])
+        );
+        assert_schema(&value);
+        assert!(server.recorded().is_empty());
+    }
+}
+
+#[test]
+fn hook_record_missing_agent_hook_or_run_is_an_error() {
+    for detail in ["agent not found", "hook not found", "hook run not found"] {
+        let server = serve(move |_| Response::json(404, &json!({"detail": detail}).to_string()));
+        let output = run_in(
+            &[
+                "--json",
+                "local",
+                "hook",
+                "record",
+                "acme-bot",
+                "nightly-cleanup",
+                "22222222-2222-4222-8222-222222222222",
+                "--api-url",
+                &server.base_url,
+                "--api-key",
+                TEST_API_KEY,
+            ],
+            &[],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{detail}: {}",
+            describe(&output)
+        );
+        assert!(describe(&output).contains(detail), "{}", describe(&output));
+        assert_eq!(server.recorded().len(), 1);
+    }
+}
+
+#[test]
+fn hook_record_rejects_a_missing_source_instead_of_defaulting_it() {
+    let mut body = record(Some("ran"));
+    body.as_object_mut().unwrap().remove("source");
+    let encoded = body.to_string();
+    let server = serve(move |_| Response::json(200, &encoded));
+    let output = run_in(
+        &[
+            "--json",
+            "local",
+            "hook",
+            "record",
+            "acme-bot",
+            "nightly-cleanup",
+            "22222222-2222-4222-8222-222222222222",
+            "--api-url",
+            &server.base_url,
+            "--api-key",
+            TEST_API_KEY,
+        ],
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(
+        describe(&output).contains("decoding hook run"),
+        "{}",
+        describe(&output)
+    );
+}
+
+#[test]
+fn hook_fire_timeout_names_the_record_command_at_the_same_tier() {
+    for tier in ["local", "cluster"] {
+        let body = record(None).to_string();
+        let server = serve(move |_| Response::json(200, &body));
+        let output = run_in(
+            &[
+                "--json",
+                tier,
+                "hook",
+                "fire",
+                "acme-bot",
+                "nightly-cleanup",
+                "--wait-secs",
+                "0",
+                "--api-url",
+                &server.base_url,
+                "--api-key",
+                TEST_API_KEY,
+            ],
+            &[],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{tier}: {}",
+            describe(&output)
+        );
+        let remedy = format!(
+            "curie {tier} hook record acme-bot nightly-cleanup 22222222-2222-4222-8222-222222222222",
+        );
+        assert!(
+            describe(&output).contains(&remedy),
+            "{tier}: {}",
+            describe(&output)
+        );
+        assert_eq!(server.recorded().len(), 1);
+    }
 }
