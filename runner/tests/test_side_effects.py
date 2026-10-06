@@ -103,3 +103,41 @@ def test_default_is_the_claude_declaration_plus_platform_tools() -> None:
     for tool in CLAUDE_READONLY_TOOLS:
         assert not default_classifier.is_side_effecting(tool)
         assert not claude_classifier.is_side_effecting(tool)
+
+
+def test_curie_state_reads_are_idempotent_as_the_runner_builds_the_classifier() -> None:
+    """A ``curie-state`` read changes nothing, so it is not a side effect.
+
+    Classifying ``get`` and ``list`` as side effects put every state read on the
+    turn's receipt as a change that "cannot be undone" and disarmed the retry of
+    any run that only read state. The writes (``set``, ``append``, ``delete``)
+    really do change the store and must keep flagging. The classifier here is
+    built the way ``build_runner`` builds it, and the names come from the tools
+    the state server actually registers, so neither can drift from the test.
+    """
+
+    from curie_runner.__main__ import _readonly_tools
+    from curie_runner.harness.claude import get_contribution
+    from curie_runner.state import STATE_SERVER_NAME, STATE_TOOL_NAMES
+
+    classifier = SideEffectClassifier(
+        readonly_tools=_readonly_tools(get_contribution(), frozenset(), None)
+    )
+
+    def name(tool: str) -> str:
+        return f"mcp__{STATE_SERVER_NAME}__{tool}"
+
+    reads = {name("get"), name("list")}
+    writes = {name("set"), name("append"), name("delete")}
+    assert reads | writes == STATE_TOOL_NAMES
+    for tool in reads:
+        assert not classifier.is_side_effecting(tool), tool
+    for tool in writes:
+        assert classifier.is_side_effecting(tool), tool
+
+    # Platform-injected, so a harness declaration that omits them changes nothing.
+    other_harness = SideEffectClassifier(["read"])
+    for tool in reads:
+        assert not other_harness.is_side_effecting(tool), tool
+    for tool in writes:
+        assert other_harness.is_side_effecting(tool), tool

@@ -339,30 +339,42 @@ async def op_delete(client: StateApiClient, args: dict[str, Any]) -> dict[str, A
 
 # Every tool this server publishes, declared ONCE (#2286 adversarial round).
 #
-# One list, three consumers: ``build_state_server`` registers exactly these with
+# One list, four consumers: ``build_state_server`` registers exactly these with
 # the SDK, ``STATE_TOOL_NAMES`` below renders their live ``mcp__curie-state__*``
-# names, and ``approval.py`` exempts those live names from a bundle ``toolPolicy``.
+# names, ``approval.py`` exempts those live names from a bundle ``toolPolicy``,
+# and ``side_effects.py`` treats the read-only ones as idempotent.
 # Hand-maintaining the exemption set beside the registration is what the first
 # #2286 fix was written to avoid -- publication exempted two literal names and
 # every channel-memory tool added afterwards was denied on arrival -- and a
 # second copy here would reopen it at the next tool. Adding a sixth tool means
 # adding one row, and the exemption follows for free.
-_STATE_TOOL_SPECS: tuple[tuple[str, str, dict[str, Any], _StateOp], ...] = (
-    ("get", "Read a durable state value by namespace and key.", _GET_SCHEMA, op_get),
+_STATE_TOOL_SPECS: tuple[tuple[str, str, dict[str, Any], _StateOp, bool], ...] = (
+    # The last field says whether the tool only reads the store. It feeds the
+    # side-effect classifier (``STATE_READ_TOOL_NAMES`` below), so a new tool
+    # declares in the same row whether a call to it can change anything.
+    ("get", "Read a durable state value by namespace and key.", _GET_SCHEMA, op_get, True),
     (
         "set",
         "Write a durable state value, optionally with a compare-and-set version.",
         _SET_SCHEMA,
         op_set,
+        False,
     ),
     (
         "append",
         "Append an item to a durable JSON-array state value.",
         _APPEND_SCHEMA,
         op_append,
+        False,
     ),
-    ("list", "List every key and value in a state namespace.", _LIST_SCHEMA, op_list),
-    ("delete", "Delete a durable state value by namespace and key.", _DELETE_SCHEMA, op_delete),
+    ("list", "List every key and value in a state namespace.", _LIST_SCHEMA, op_list, True),
+    (
+        "delete",
+        "Delete a durable state value by namespace and key.",
+        _DELETE_SCHEMA,
+        op_delete,
+        False,
+    ),
 )
 
 # The live SDK names the tools above are published under, which is the ONLY form
@@ -374,7 +386,17 @@ _STATE_TOOL_SPECS: tuple[tuple[str, str, dict[str, Any], _StateOp], ...] = (
 # an ambient project/user server could once load beside the ones the runner
 # mounts. ``strict_mcp_config`` (#2899) now stops that; exactness is the second line.
 STATE_TOOL_NAMES: frozenset[str] = frozenset(
-    f"mcp__{STATE_SERVER_NAME}__{tool_name}" for tool_name, _, _, _ in _STATE_TOOL_SPECS
+    f"mcp__{STATE_SERVER_NAME}__{tool_name}" for tool_name, _, _, _, _ in _STATE_TOOL_SPECS
+)
+
+# The subset of those live names that only read the store (``get``, ``list``).
+# ``side_effects.py`` treats them as idempotent under every harness: a read
+# changes nothing, so it must not mark the run side-effecting (which disarms the
+# retry) or appear on the turn's receipt as a change. The writes stay out.
+STATE_READ_TOOL_NAMES: frozenset[str] = frozenset(
+    f"mcp__{STATE_SERVER_NAME}__{tool_name}"
+    for tool_name, _, _, _, read_only in _STATE_TOOL_SPECS
+    if read_only
 )
 
 
@@ -414,7 +436,7 @@ def build_state_server(client: StateApiClient) -> McpSdkServerConfig:
         version="1.0.0",
         tools=[
             _bind_state_tool(tool_name, description, schema, op, client)
-            for tool_name, description, schema, op in _STATE_TOOL_SPECS
+            for tool_name, description, schema, op, _ in _STATE_TOOL_SPECS
         ],
     )
 
