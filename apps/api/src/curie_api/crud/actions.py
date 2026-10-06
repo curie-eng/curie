@@ -109,28 +109,3 @@ async def list_action_audit(session: AsyncSession, action_id: uuid.UUID) -> list
         .order_by(ActionAuditEntry.created_at)
     )
     return list(result.scalars().all())
-
-
-async def claim_action_undo(
-    session: AsyncSession, action: AgentAction, *, actor: str
-) -> AgentAction | None:
-    """Mark the undo claimed so a second ruling cannot authorize a second restore.
-
-    Claimed at ruling time rather than on completion, because nothing reports
-    completion yet: the executor ADR-0117 leaves undecided is what would. The
-    honest consequence is that a restore which never runs leaves a record saying
-    it was, and closing that is the executor's job -- authorizing two restores of
-    one action is the worse failure of the two.
-    """
-
-    result = await session.execute(
-        update(AgentAction)
-        .where(AgentAction.id == action.id, AgentAction.undone_at.is_(None))
-        .values(undone_at=datetime.now(UTC).replace(tzinfo=None), undone_by=actor)
-        .returning(AgentAction.id)
-        .execution_options(synchronize_session=False)
-    )
-    if result.scalar_one_or_none() is None:
-        return None
-    await session.refresh(action)
-    return action

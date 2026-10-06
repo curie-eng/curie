@@ -40,6 +40,7 @@ from typing import Any
 
 import pytest
 from _migration_support import sql_rows
+from _sealed_actions import operator_headers
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -755,8 +756,9 @@ def _assert_refused_without_a_grant(
 
     response = client.post(
         f"/actions/{action_id}/undo",
-        json={"actor": "U-operator", "observed_state": LEFT},
-        headers=headers,
+        json={"observed_state": LEFT},
+        # The actor is the authenticated principal (executor route decisions).
+        headers=operator_headers(),
     )
 
     assert response.status_code in {409, 412, 503}, response.text
@@ -767,6 +769,14 @@ def _assert_refused_without_a_grant(
     after = client.get(f"/actions/{action_id}", headers=headers).json()
     assert after["undone_at"] is None
     assert after["undone_by"] is None
+    # @spec ACTION-EXECUTOR-3: every ruling refusal creates no execution.
+    assert (
+        sql_rows(
+            "SELECT count(*) FROM curie.action_executions WHERE subject_action_id = :id",
+            {"id": uuid.UUID(action_id)},
+        )[0][0]
+        == 0
+    )
 
 
 def test_the_undo_route_refuses_a_legacy_cleartext_row_as_unsealed(

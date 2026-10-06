@@ -94,6 +94,17 @@ class Settings(BaseSettings):
             "CURIE_APPROVAL_RECOVERY_ENABLED", "approval_recovery_enabled"
         ),
     )
+    # @spec ACTION-EXECUTOR-1: the action executor is closed by default. The
+    # chart value ``actionExecutor.enabled`` and the matching compose value
+    # render this one setting into both the API and the worker. Off, the undo
+    # ruling refuses ``executor_disabled`` before it creates any execution and
+    # the claim route hands out no work.
+    action_executor_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "CURIE_ACTION_EXECUTOR_ENABLED", "action_executor_enabled"
+        ),
+    )
 
     # Separate trust boundary for credential redemption. The operator/CLI API
     # key can administer deployments but cannot redeem the GitHub identity.
