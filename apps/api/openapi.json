@@ -5431,6 +5431,358 @@
         "title": "HookSecretOut",
         "type": "object"
       },
+      "HookSourcePolicyMutation": {
+        "additionalProperties": false,
+        "description": "@spec PROTECTED-HOOK-SOURCE-3.",
+        "properties": {
+          "expected_generation": {
+            "title": "Expected Generation",
+            "type": "string"
+          },
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_generation",
+          "operation_id"
+        ],
+        "title": "HookSourcePolicyMutation",
+        "type": "object"
+      },
+      "HookSourcePolicyOut": {
+        "additionalProperties": false,
+        "description": "@spec PROTECTED-HOOK-SOURCE-3.",
+        "properties": {
+          "activation": {
+            "enum": [
+              "closed",
+              "active"
+            ],
+            "title": "Activation",
+            "type": "string"
+          },
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "bundle_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bundle Digest"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "string"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          },
+          "legacy_generation": {
+            "title": "Legacy Generation",
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "ordinary",
+              "protected"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "qualification_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qualification Id"
+          },
+          "refusal_reason": {
+            "anyOf": [
+              {
+                "pattern": "^[a-z][a-z0-9_]{0,62}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refusal Reason"
+          },
+          "runtime_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Id"
+          },
+          "tool_access": {
+            "anyOf": [
+              {
+                "const": "read-only",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Access"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "agent_id",
+          "hook",
+          "generation",
+          "mode",
+          "tool_access",
+          "runtime_id",
+          "qualification_id",
+          "bundle_digest",
+          "legacy_generation",
+          "activation",
+          "updated_at"
+        ],
+        "title": "HookSourcePolicyOut",
+        "type": "object"
+      },
+      "HookSourcePolicyWrite": {
+        "additionalProperties": false,
+        "description": "@spec PROTECTED-HOOK-SOURCE-3.",
+        "properties": {
+          "bundle_digest": {
+            "title": "Bundle Digest",
+            "type": "string"
+          },
+          "expected_generation": {
+            "title": "Expected Generation",
+            "type": "string"
+          },
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "qualification_id": {
+            "title": "Qualification Id",
+            "type": "string"
+          },
+          "runtime_id": {
+            "title": "Runtime Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_generation",
+          "operation_id",
+          "runtime_id",
+          "qualification_id",
+          "bundle_digest"
+        ],
+        "title": "HookSourcePolicyWrite",
+        "type": "object"
+      },
+      "HookSourceRefusal": {
+        "additionalProperties": false,
+        "description": "@spec PROTECTED-HOOK-SOURCE-3.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/HookSourceRefusalDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "HookSourceRefusal",
+        "type": "object"
+      },
+      "HookSourceRefusalDetail": {
+        "additionalProperties": false,
+        "description": "A source service refusal: a stable code and, only after a confirmed commit, its generation.\n\n@spec PROTECTED-HOOK-SOURCE-3.",
+        "properties": {
+          "code": {
+            "pattern": "^[a-z][a-z0-9_]{0,62}$",
+            "title": "Code",
+            "type": "string"
+          },
+          "committed_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Committed Generation"
+          }
+        },
+        "required": [
+          "code",
+          "committed_generation"
+        ],
+        "title": "HookSourceRefusalDetail",
+        "type": "object"
+      },
+      "HookSourceSecretOut": {
+        "additionalProperties": false,
+        "description": "@spec PROTECTED-HOOK-SOURCE-3.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "string"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          },
+          "secret": {
+            "minLength": 1,
+            "title": "Secret",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "hook",
+          "generation",
+          "secret"
+        ],
+        "title": "HookSourceSecretOut",
+        "type": "object"
+      },
+      "HookSupportOut": {
+        "additionalProperties": false,
+        "description": "Safe support resolution. @spec PROTECTED-HOOK-SOURCE-9.",
+        "properties": {
+          "effective_tool_access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolAccess"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "qualification_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qualification Id"
+          },
+          "reason": {
+            "enum": [
+              "supported",
+              "source_unconfigured",
+              "source_closed",
+              "runtime_unavailable",
+              "qualification_unavailable",
+              "evidence_missing",
+              "evidence_expired",
+              "broker_unavailable",
+              "broker_identity_mismatch",
+              "configuration_unsupported"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "requested_tool_access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolAccess"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "runtime_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Generation"
+          },
+          "runtime_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Id"
+          },
+          "source_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Generation"
+          },
+          "supported": {
+            "title": "Supported",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "requested_tool_access",
+          "effective_tool_access",
+          "source_generation",
+          "runtime_id",
+          "runtime_generation",
+          "qualification_id",
+          "supported",
+          "reason"
+        ],
+        "title": "HookSupportOut",
+        "type": "object"
+      },
       "IssueReadComment": {
         "properties": {
           "author": {
@@ -11561,6 +11913,534 @@
         ]
       }
     },
+    "/agents/{agent_id}/hooks/{hook}/source-policy": {
+      "delete": {
+        "description": "Commit and publish the ordinary tombstone.\n\nPending history without a row commits a fresh tombstone above every\nattempt without rotating the legacy counter; an absent row without history\nis 409 ``source_not_configured``.",
+        "operationId": "delete_source_policy_agents__agent_id__hooks__hook__source_policy_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_generation",
+            "required": true,
+            "schema": {
+              "title": "Expected Generation",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "title": "Operation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourcePolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          }
+        },
+        "summary": "Delete Source Policy",
+        "tags": [
+          "hook-source-policy"
+        ]
+      },
+      "get": {
+        "description": "Committed source policy and its publication activation.",
+        "operationId": "get_source_policy_agents__agent_id__hooks__hook__source_policy_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourcePolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          }
+        },
+        "summary": "Get Source Policy",
+        "tags": [
+          "hook-source-policy"
+        ]
+      },
+      "put": {
+        "description": "Target mandatory read-only protected delivery under the deployment's runtime.\n\nA committed protected PUT answers 503 ``source_publication_deferred`` with\nits committed generation: the commit happened, the agent's legacy counter\nmay have advanced, and the source stays closed until the LANE-4 change.",
+        "operationId": "put_source_policy_agents__agent_id__hooks__hook__source_policy_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HookSourcePolicyWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourcePolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/HookSourceRefusal"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Validation error or unknown source reference"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          }
+        },
+        "summary": "Put Source Policy",
+        "tags": [
+          "hook-source-policy"
+        ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{hook}/source-policy/rotate": {
+      "post": {
+        "description": "Allocate a fresh generation for the current protected target.",
+        "operationId": "rotate_source_policy_agents__agent_id__hooks__hook__source_policy_rotate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HookSourcePolicyMutation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourcePolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/HookSourceRefusal"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Validation error or unknown source reference"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          }
+        },
+        "summary": "Rotate Source Policy",
+        "tags": [
+          "hook-source-policy"
+        ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{hook}/source-policy/secret": {
+      "get": {
+        "description": "Refuses every state in this slice and writes nothing.",
+        "operationId": "get_source_secret_agents__agent_id__hooks__hook__source_policy_secret_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceSecretOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          }
+        },
+        "summary": "Get Source Secret",
+        "tags": [
+          "hook-source-policy"
+        ]
+      }
+    },
     "/agents/{agent_id}/hooks/{name}/fire": {
       "post": {
         "description": "Run one named cron hook now and return its run record.",
@@ -16652,6 +17532,142 @@
           }
         },
         "summary": "Ingest Hook",
+        "tags": [
+          "hooks"
+        ]
+      }
+    },
+    "/hooks/{agent_id}/{hook}/support": {
+      "post": {
+        "description": "Report the current protected support resolution for one hook; write nothing.\n\nThe JSON body is ``HookSupportIn``, read raw because its exact bytes are\nsigned. Order follows the spec: hook name, bounded body, strict parse,\nungated support signature, delivery id, gate-held reauthentication, snapshot,\ngate release, then broker evaluation of a protected row only.\nThe delivery id is signed context only and reserves nothing.",
+        "operationId": "probe_hook_support_hooks__agent_id___hook__support_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-curie-signature-256",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Signature-256"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-curie-delivery-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Delivery-Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-curie-timestamp",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Timestamp"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Signed requested policy, not configuration. @spec PROTECTED-HOOK-SOURCE-9.",
+                "properties": {
+                  "tool_access": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ToolAccess"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "title": "HookSupportIn",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSupportOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSupportOut"
+                }
+              }
+            },
+            "description": "Authenticated, protected support unavailable (supported=false). Without this DTO, {\"detail\": \"authority_unavailable\"} when no current server resolution could be read."
+          }
+        },
+        "summary": "Probe Hook Support",
         "tags": [
           "hooks"
         ]
