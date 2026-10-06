@@ -468,16 +468,17 @@ policy is governed by its exact current binding and private-receipt rules;
 older pending history does not supersede it, although its UUID remains unusable.
 
 Runtime selection is one immutable provisioner-owned deployment input, not a
-platform-writable registry. Unknown references or another runtime ID are 422;
+platform-writable registry. Unknown references or another runtime ID are 422,
+before any broker call, ledger registration or SQL write;
 missing trusted broker identity, epoch or readiness is 503. Separate control
 read and source-writer authority. Default resolution is unavailable. Missing
 source keys do not prove a fresh epoch; require independently established
 source-floor recovery, including pending ledger allocations. A new broker
 epoch never permits reuse of a durably allocated source generation. A positive
 pending generation grants no source key, activation or readiness authority.
-Protected publication remains unavailable until the actual atomic authority
-path is implemented. Pure record matching or a local
-clock check cannot establish activation.
+Protected publication remains unavailable until the LANE-4 ingress
+admission change, per [administrative route exposure](#administrative-route-exposure).
+Pure record matching or a local clock check cannot establish activation.
 
 ## Receipt and duplicate contract
 
@@ -616,9 +617,12 @@ follows `supported`.
 
 Broker evaluation of a protected row uses the API protected runtime bootstrap.
 The setting `CURIE_PROTECTED_RUNTIME_DIR` names a directory that only the out of
-band provisioner writes and mounts read only into the API. It holds exactly
+band provisioner writes and mounts read only into the API. It holds
 `manifest.json` (the trusted runtime manifest bytes), `ca.pem` (the broker CA
-certificates) and `bootstrap.json`, a strict object containing exactly
+certificates), `bootstrap.json` and, for administration, the
+`source_writer.json` defined under
+[administrative route exposure](#administrative-route-exposure); the probe
+reads only the first three. `bootstrap.json` is a strict object containing exactly
 `schema_version: 1`, `max_readiness_ms` (a positive canonical decimal string)
 and `control_reader: {username, password}` for the control reader principal.
 No route, CLI verb or chart default creates, returns or mounts this directory
@@ -698,6 +702,285 @@ Build order is specification commit, committed failing tests observed failing,
 then implementation commit. No frozen ACI/plugin-format fields change: outer
 private metadata binds the existing `QueuedTurn.tool_access`.
 
+## Administrative route exposure
+
+One service path serves every caller. The administrative service exposes only
+the operations these routes define; earlier internal methods whose answers this
+section changes (absent-row removal without history, unrestricted reads) are
+removed rather than kept beside the new ones, so a later CLI or console caller
+cannot inherit a retired answer.
+
+This section realizes the SOURCE-3 routes and the SOURCE-6/7/10 broker path
+for the API. The [route exposure plan](../plans/2026-10-06-source-admin-routes.md)
+orders the work. It extends the criteria above without changing their IDs and
+applies the base SOURCE-10 rule that unknown references or another runtime ID
+are 422.
+
+The base below was inspected on origin/main `bcb2d3161`. A statement marked
+pinned is asserted by an existing test against real Postgres and Valkey. The
+two pinning suites, `apps/api/tests/test_hook_source_mutation.py` and
+`apps/api/tests/test_hook_source_admin.py`, were rerun on 2026-10-05 against
+local disposable stores: 59 passed and none skipped. Every other statement is
+code inspection and is not a runtime observation.
+
+* `apps/api/src/curie_api/hook_source_mutation.py::SourceMutationCoordinator`
+  checks replay, operation history, stale CAS and exhaustion before resolving
+  authority, then registers the pending generation, reserves, commits policy,
+  counter and ledger together, releases the gate and publishes. Its publication
+  branch refuses every protected row with 503 and the committed generation and
+  publishes only ordinary tombstones. Pinned by
+  `apps/api/tests/test_hook_source_mutation.py::test_enable_rotate_remove_reenable_preserves_counter_and_closed_authority`.
+  No production `SourceAuthorityResolver` exists; tests supply a fake external
+  authority over unauthenticated role clients. The resolver protocol carries
+  no replay signal.
+* The coordinator's `remove` accepts an absent policy with expected generation
+  zero and creates a tombstone above every attempted generation. Pinned with
+  pending history by
+  `apps/api/tests/test_hook_source_mutation.py::test_all_pending_attempts_bound_fresh_generation_after_fake_external_recovery`.
+  Four tests also start from an absent row with no history:
+  `apps/api/tests/test_hook_source_mutation.py::test_current_ordinary_replay_bypasses_stale_cas_without_new_sql`,
+  `apps/api/tests/test_hook_source_mutation.py::test_delayed_ordinary_cas_loses_after_new_operation_and_gate_is_released`,
+  `apps/api/tests/test_hook_source_mutation.py::test_boundary_wait_cancellation_or_actual_gate_loss_precedes_registration`
+  and
+  `apps/api/tests/test_hook_source_mutation_commit_loss.py::test_authoritative_ordinary_commit_response_loss_never_publishes_until_exact_replay`.
+* `apps/api/src/curie_api/hook_source_admin.py::SourceAdminService` reports
+  closed activation for every row and refuses every mutation and secret read
+  with 503. No route constructs it or the coordinator.
+  `apps/api/src/curie_api/protected_support.py` imports the coordinator module,
+  which imports the admin module, so the admin side cannot import the probe
+  module's private bootstrap loader without a cycle.
+* `packages/protected-hooks/src/curie_protected_hooks/source_fence.py::SourceFence`
+  exposes `reserve_and_revoke`, `read` and `publish_ordinary` over a caller
+  supplied synchronous client. No protected publication script exists.
+* `packages/protected-hooks/src/curie_protected_hooks/broker_metadata.py::metadata_acl_rules`
+  gives the source writer GET, SET and script operations on
+  `protected:source:*` and neither INFO nor TIME.
+  `packages/protected-hooks/src/curie_protected_hooks/broker_transport.py::AuthenticatedMetadataReader`
+  sends INFO server on every connection and before every read and reports any
+  run_id mismatch only as its single safe unavailable error. A connection's
+  budget watchdog is fixed when the connection is created.
+* `apps/api/src/curie_api/protected_support.py::_load_bootstrap` opens exactly
+  `manifest.json`, `ca.pem` and `bootstrap.json` and accepts exactly three
+  bootstrap members with `schema_version` 1.
+* `apps/api/src/curie_api/hook_source_auth.py::authenticated_source` refuses,
+  after authentication, every hook with a policy row or attempt history with
+  503 before any claim, so delivery ingress admits nothing for a protected or
+  tombstoned source.
+* `apps/api/src/curie_api/routers/agents.py::get_hook_secret` serves the legacy
+  agent key under the agents router's `apps/api/src/curie_api/auth.py::require_api_key`
+  dependency, which accepts the platform key or a live console session with
+  console origin enforcement; the session check reads the work database.
+* The API source gate pool from
+  `apps/api/src/curie_api/db.py::create_source_gate_engine` has four
+  connections and no overflow, shared with ingress and the legacy secret route.
+
+<!-- @spec PROTECTED-HOOK-SOURCE-3 -->
+A new source policy router under the `/agents` prefix serves `GET`, `PUT` and
+`DELETE` on `/agents/{agent_id}/hooks/{hook}/source-policy`,
+`POST .../rotate` and `GET .../secret`. It uses the same `require_api_key`
+dependency as the legacy secret route, so a platform key or a live console
+session with console origin enforcement authenticates, as the console sibling
+[#4054](https://github.com/curie-eng/curie/issues/4054) requires; a hook
+signature never does. Authentication runs first and may read the console
+session table. Request shape violations (agent UUID, hook name pattern, strict
+body, strict query) then return FastAPI's ordinary 422 validation list before
+any source database read. Handlers take no request database session; every
+source database connection comes from the gate pool first and the work pool
+second. Every refusal raised by the source services has the body
+`{"detail": {"code": <stable code>, "committed_generation": <decimal string or null>}}`.
+`committed_generation` is non null only after a confirmed authoritative commit
+of the requested operation. It names a generation, never a key.
+
+Protected publication stays unavailable in this slice. It moves to the LANE-4
+ingress admission change tracked with
+[#4075](https://github.com/curie-eng/curie/issues/4075), which owns the
+publication evidence check, its shared evaluation with the probe, protected
+and tombstone ingress admission under SOURCE-8, and the secret's active path.
+This slice never produces an active protected source and never reopens
+delivery for a configured hook.
+
+Mutations follow one order. (1) Authentication and request shape 422. (2) An
+unset runtime directory setting is 503 `runtime_unavailable`. (3) An
+administrative executor slot, else 503 `broker_unavailable`. (4) The runtime
+files, read once on that slot for the whole request, else 503
+`runtime_unavailable`. (5) For PUT, any reference other than the deployment's
+one runtime, meaning a `runtime_id`, `qualification_id` or `bundle_digest`
+different from the manifest's `runtime_id`, `qualification_id` or bundle
+`sha256`, is 422 `unknown_source_reference`. (6) The agent gate and locked
+snapshot: unknown agent 404; then the coordinator's replay, operation history,
+stale CAS and exhaustion checks; DELETE of an absent row without attempt
+history is 409 `source_not_configured` immediately after the agent lookup;
+rotate of an ordinary or absent row is 409 `source_rotation_conflict`, then the
+current row's references get the step 5 check. (7) Registration, broker and
+SQL effects. Every reference refusal therefore precedes any broker call,
+ledger registration or SQL write, and applies equally to an exact replay whose
+manifest has since changed; GET still shows that committed generation. DELETE
+carries no reference, so it may tombstone a row that names another runtime.
+
+PUT targets mandatory read-only with the body references. It registers,
+reserves and revokes, commits the protected row with any SOURCE-5 counter
+bump, and answers 503 `source_publication_deferred` with the committed
+generation. That code means the commit happened, the agent's legacy counter
+may have advanced, and the source stays closed until the LANE-4 change; it is
+not a transient failure. Rotate keeps the current protected target and answers
+the same way. After the LANE-4 change, an exact replay of that committed
+operation publishes it when its reservation still matches; otherwise a fresh
+rotation does. DELETE targets the ordinary tombstone. With pending history and
+no row it commits a tombstone through the normal SOURCE-10 path, a fresh
+operation at a generation above every attempt, without rotating the legacy
+counter. A successful DELETE or exact DELETE replay publishes the tombstone and
+returns 200 with `HookSourcePolicyOut` built from the committed row with
+`activation: active` and null `refusal_reason`; its `legacy_generation` is the
+row's committed counter. A tombstone is the state that restores ordinary
+delivery under the current legacy key once tombstone ingress admission lands
+in the LANE-4 change; until then ingress refuses it. The existing 404, 409 and
+422 codes keep their meaning.
+
+GET runs steps 1 and 6 for reading, releases the gate and ends its
+transaction, then evaluates activation on an administrative slot without
+database connections. Its 503 is `source_state_unavailable` and arises only
+from gate or SQL failure. A hook with no row opens no broker connection: its
+reason is null, or `pending_history` with attempt history. A protected row is
+closed with `publication_deferred` and opens no broker connection. An ordinary
+tombstone row is `active`, with null `refusal_reason`, only when one
+authenticated reader session reads a source record whose floor and operation
+equal the row's generation and operation and whose active record has that
+generation, operation, mode `ordinary` and the SOURCE-6 fingerprint of the
+committed row. Otherwise it is closed with the first applicable reason:
+`authority_unavailable` (the fingerprint cannot be computed),
+`runtime_unavailable` (setting unset or a file invalid), `broker_unavailable`
+(connection, identity or read failure, a full executor or an exhausted budget)
+or `source_closed` (any record mismatch). `activation` reports source
+publication only, never delivery support; the support probe owns that question.
+
+The secret route refuses in this slice and writes nothing: after steps 1 and
+6, an absent row, attempt history alone or a tombstone is 409
+`source_not_protected`, and a protected row is 503
+`source_publication_deferred` with a null committed generation. Every handler
+response carries `Cache-Control: no-store`. Authentication 401 and request
+shape 422 come from dependencies before the handler and carry no source data.
+No response, log, metric, trace attribute or error detail contains a source
+key.
+
+<!-- @spec PROTECTED-HOOK-SOURCE-6 -->
+The API obtains the source writer principal from one additional provisioner
+written file, `source_writer.json`, in the SOURCE-9 runtime directory. It is a
+strict object with exactly `schema_version: 1` and
+`source_writer: {username, password}`, read under the same descriptor, regular
+file, size and duplicate member rules as `bootstrap.json`. The username must be
+nonempty, differ from `default` and differ from the control reader username;
+otherwise the file is invalid. It parses into a new frozen, slotted
+`SourceWriterCredential(username, password)` whose representation redacts both
+fields. Extending `bootstrap.json` was rejected: its strict v1 grammar refuses
+another member or version, and a reader only deployment would then have to
+carry writer credentials. One new API module owns loading the runtime files
+for administration and the probe alike. It imports no source service or probe
+module, which removes the import cycle; the probe module imports its loader
+from it unchanged in behavior, and
+[#4076](https://github.com/curie-eng/curie/issues/4076) later moves that
+grammar into the shared package. The probe, GET and secret route never open
+the writer file. No route, CLI verb, chart default, environment variable or
+platform key creates, returns or derives it, and it is never mounted into an
+ordinary worker or runner. Its absence leaves GET, secret and probe behavior
+unchanged and makes every mutation unavailable at step 4.
+
+A new `AuthenticatedSourceWriter.connect(manifest, credential, ca_pem)` beside
+the metadata reader applies the same input validation, TLS, CA, hostname, SPKI
+pin, RESP3 HELLO AUTH, two second timeouts, disabled retries, redaction and
+`metadata_reader_budget` watchdog. It sends no INFO, because the writer role
+has none, and it never reconnects: any connection loss makes it permanently
+unusable. It exports only `reserve_and_revoke`, `publish_ordinary` and
+`close`. Since the writer cannot see the live run_id, every writer effect is
+bracketed by the control reader on the same pinned endpoint. A reader read
+precedes it, and a reader read follows it and must show the effect. Because
+the reader reports a changed run_id only as its safe unavailable error, a
+broker restart or identity change detected around a writer effect is 503
+`broker_unavailable` on this path; the support probe's reasons are unchanged.
+A readable confirmation that does not show the effect is an uncertain effect.
+The bootstrap control reader supplies those reads and `read_reconciled_floor`.
+That floor is the validated source floor from a connection whose live run_id
+equals the manifest's. Allocation above every durable ledger generation is the
+independently established floor recovery that SOURCE-10 requires for
+reservation. A missing key reading as floor zero therefore never reuses a
+generation, and it never authorizes publication. Ordinary tombstone
+publication needs no runtime tuple: it confirms revocation and SQL removal and
+opens nothing while ingress refuses configured hooks.
+
+Administrative broker work runs on its own executor of two threads, separate
+from the probe's, and fails rather than queueing when no slot is free. A
+mutation keeps its slot through publication; GET takes one only after
+releasing the gate. A slot is released when its thread finishes, not when the
+request ends. The gate phase has one five second deadline applied to the
+reader and writer connections opened for it, covering their connect, floor
+read, reservation and confirmation calls. SQL registration and the
+authoritative commit run on work connections and are never cancelled by that
+deadline; a deadline that passes during registration makes the following
+broker call fail, leaving the pending generation consumed. Tombstone
+publication after gate release opens fresh reader and writer connections under
+its own five second deadline; a new connection is not a reconnect.
+Cancellation never releases the gate while a writer call is in flight: the
+gate waits until that call returns or its deadline ends.
+
+The two slots bound administrative broker latency but not gate pool use.
+While a mutation holds an agent gate for its deadline plus SQL time, ingress,
+secret and legacy secret requests for that agent each hold a gate connection
+waiting on the advisory lock, which no checkout timeout bounds. Two slow
+mutations plus two such waiters can exhaust the four connection pool and stall
+gated ingress for every agent for that long. This slice accepts that bound and
+proves it with a paused owned broker; a bounded lock wait for ingress gate
+waiters belongs to the ingress owner. Administrative requests bound their own
+waits: a mutation, GET or secret request that has not acquired the agent gate
+within five seconds answers 503 `source_state_unavailable` without registering,
+reserving or writing, and a mutation releases its administrative slot when it
+gives up.
+
+<!-- @spec PROTECTED-HOOK-SOURCE-7 -->
+Recovery uses the existing coordinator unchanged in order. An exact replay of
+the current committed operation with the same intent, even with stale expected
+generation, allocates nothing: a tombstone resumes its idempotent publication,
+and a protected row answers 503 `source_publication_deferred` with its
+committed generation again, decided from SQL alone without opening a broker
+connection, so the answer does not depend on broker reachability. Different intent under that operation, any
+historical operation and any pending operation are 409
+`source_operation_conflict` with no broker call. A crash or failure before
+reservation leaves pending history only; the source closes, and recovery is a
+fresh operation, including a DELETE that commits a tombstone. A failed or
+unconfirmed reservation returns 503 before the SQL commit with a null
+committed generation. An uncertain authoritative commit also returns 503 with
+a null committed generation; a later GET or exact replay decides it. After a
+confirmed tombstone commit, publication failure returns 503 with the committed
+generation and the first failing reason. When a readable reader record shows
+that the committed tombstone's reservation is gone, through broker reset,
+restored snapshot or a provisioner change, the reason is
+`source_reservation_lost` and only a fresh DELETE operation recovers,
+allocating above every durable attempt. A delayed publisher loses its CAS to
+any later reservation. This slice adds no automatic reconciliation loop.
+
+<!-- @spec PROTECTED-HOOK-SOURCE-10 -->
+While no runtime is provisioned, meaning the directory setting is unset, a
+file is missing or invalid, or the writer file is absent, routes stay closed
+without history. GET reports the closed resolution above. Every mutation
+returns 503 `runtime_unavailable` at step 2 or 4, before the gate, any SQL
+read, pending registration or broker call, with a null committed generation;
+it therefore precedes the 404, 409 and reference checks, which need the gate
+or the manifest. Request shape 422 still comes first. A full administrative
+executor is 503 `broker_unavailable` at step 3; with the setting unset no slot
+is taken. Failed reader or writer connection and an exhausted deadline refuse
+before registration when they occur before it.
+
+Out of scope here: protected publication, the secret's active path, LANE-4
+protected and tombstone ingress admission and the probe's `supported` answer,
+all in the change tracked with
+[#4075](https://github.com/curie-eng/curie/issues/4075); the worker lane;
+provisioning, bootstrap writing and the shared bootstrap grammar
+([#4076](https://github.com/curie-eng/curie/issues/4076), LANE-8); automatic
+floor reconciliation; and the CLI and console siblings
+([#4053](https://github.com/curie-eng/curie/issues/4053),
+[#4054](https://github.com/curie-eng/curie/issues/4054)). The parity seam rule
+is met by naming those siblings: no CLI structure mirrors these DTOs and no
+console action is added, so no gate requires them in this slice. OpenAPI is
+regenerated by its existing generator.
+
 ## Acceptance cases and commands
 
 Each test/implementation unit cites its corresponding ID above. Required cases:
@@ -733,6 +1016,17 @@ Each test/implementation unit cites its corresponding ID above. Required cases:
   authenticated support returns safe unavailable 503; proof expiry, broker
   `run_id` mismatch and unsupported selection return safe false DTOs, with no
   state writes or execution. Fresh valid support signs exact raw JSON bytes.
+* Route exposure (SOURCE-3/6/7/10): over real HTTP, real Postgres and a
+  disposable TLS broker with distinct writer and reader principals, PUT and
+  rotate commit and answer 503 `source_publication_deferred` with the
+  committed generation while GET stays closed; DELETE publishes a tombstone,
+  including from pending history without a counter change; replay and
+  recovery leave exact durable state; writer and reader credentials cannot do
+  each other's work; no runtime, a missing writer file and a foreign reference
+  refuse before any SQL or broker effect; a broker restart around a writer
+  effect is `broker_unavailable`; lost reservation refuses with the committed
+  generation; DELETE of an absent row without history is 409; the secret route
+  refuses every state and no response or log contains a source key.
 
 Run `uv run pytest apps/api/tests/test_hook_tool_access.py
 apps/api/tests/test_hooks.py -q` plus the

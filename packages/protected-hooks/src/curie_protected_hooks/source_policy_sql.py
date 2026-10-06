@@ -63,10 +63,23 @@ class SourceGate:
         self._contexts: set[SourceGateContext] = set()
 
     @asynccontextmanager
-    async def hold(self, agent_id: uuid.UUID) -> AsyncIterator[SourceGateContext]:
-        """@spec PROTECTED-HOOK-SOURCE-2."""
+    async def hold(
+        self, agent_id: uuid.UUID, *, wait_seconds: float | None = None
+    ) -> AsyncIterator[SourceGateContext]:
+        """Hold one agent's source gate.
+
+        ``wait_seconds`` bounds the advisory lock wait server side: a gate not
+        acquired in time raises ``SourceSnapshotUnavailable`` before the body
+        runs, and the bound is lifted once the lock is held. Without it the
+        wait is unbounded, as ingress uses it.
+        @spec PROTECTED-HOOK-SOURCE-2 @spec PROTECTED-HOOK-SOURCE-10.
+        """
         task = asyncio.current_task()
         if type(agent_id) is not uuid.UUID or task is None:
+            raise SourceGateInvalid("invalid_source_gate")
+        if wait_seconds is not None and (
+            type(wait_seconds) not in (int, float) or not 0 < wait_seconds <= 60
+        ):
             raise SourceGateInvalid("invalid_source_gate")
         tasks = _HELD.setdefault(self.engine.pool, WeakKeyDictionary())
         agents = tasks.setdefault(task, set())
@@ -82,10 +95,19 @@ class SourceGate:
                     raise SourceSnapshotUnavailable("source_gate_unavailable") from None
                 await connection.execution_options(isolation_level="READ COMMITTED")
                 async with connection.begin() as transaction:
+                    if wait_seconds is not None:
+                        await connection.execute(
+                            text("SELECT set_config('lock_timeout', :bound, true)"),
+                            {"bound": f"{max(1, int(wait_seconds * 1000))}ms"},
+                        )
                     await connection.execute(
                         text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
                         {"lock_key": "hook-source:" + str(agent_id)},
                     )
+                    if wait_seconds is not None:
+                        await connection.execute(
+                            text("SELECT set_config('lock_timeout', '0', true)")
+                        )
                     context = SourceGateContext(agent_id, self, task, connection, transaction)
                     self._contexts.add(context)
                     try:

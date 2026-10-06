@@ -23,13 +23,9 @@ ordered steps over what it read. A fully valid tuple still reports
 from __future__ import annotations
 
 import asyncio
-import json
-import os
-import re
-import stat
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from curie_protected_hooks.admission_records import parse_selection
@@ -46,27 +42,18 @@ from curie_protected_hooks.authority_records import (
 from curie_protected_hooks.broker_metadata import BrokerMetadataUnavailable, BrokerObservation
 from curie_protected_hooks.broker_transport import (
     AuthenticatedMetadataReader,
-    MetadataReaderCredential,
     metadata_reader_budget,
-    trusted_ca_pem,
 )
 from curie_protected_hooks.source_fence import SourceState
 from curie_protected_hooks.source_policy_sql import SourcePolicySnapshot
 
 from .hook_source_mutation import committed_policy_fingerprint
 from .hook_source_policy_schemas import HookSupportReason
+from .protected_runtime_files import RuntimeBootstrap as _Bootstrap
+from .protected_runtime_files import RuntimeFilesInvalid as _BootstrapInvalid
+from .protected_runtime_files import load_bootstrap as _load_bootstrap
 
 # @spec PROTECTED-HOOK-SOURCE-9
-_MANIFEST_FILE = "manifest.json"
-_CA_FILE = "ca.pem"
-_BOOTSTRAP_FILE = "bootstrap.json"
-_MAX_FILE_BYTES = 65536
-_MAX_MILLISECOND = 9007199254740991
-_POSITIVE_DECIMAL = re.compile(r"[1-9][0-9]{0,15}", re.ASCII)
-_BOOTSTRAP_FIELDS = frozenset({"schema_version", "max_readiness_ms", "control_reader"})
-_READER_FIELDS = frozenset({"username", "password"})
-_FILE_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC
-_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK | os.O_CLOEXEC
 _CONCURRENCY = 4
 _BUDGET_SECONDS = 5.0
 _SLOTS = threading.BoundedSemaphore(_CONCURRENCY)
@@ -77,10 +64,6 @@ _EXECUTOR = ThreadPoolExecutor(
 
 class SupportAuthorityUnavailable(Exception):
     """The committed row's fingerprint cannot be computed, @spec PROTECTED-HOOK-SOURCE-9."""
-
-
-class _BootstrapInvalid(Exception):
-    """A missing, unreadable or invalid bootstrap, @spec PROTECTED-HOOK-SOURCE-9."""
 
 
 @dataclass(frozen=True)
@@ -107,16 +90,6 @@ class ProtectedSupport:
 
 
 @dataclass(frozen=True)
-class _Bootstrap:
-    """Parsed provisioner bootstrap; never echoed, @spec PROTECTED-HOOK-SOURCE-9."""
-
-    manifest: Manifest = field(repr=False)
-    ca_pem: str = field(repr=False)
-    credential: MetadataReaderCredential = field(repr=False)
-    max_readiness_ms: int = field(repr=False)
-
-
-@dataclass(frozen=True)
 class _BrokerReads:
     """Everything one reader session read, @spec PROTECTED-HOOK-SOURCE-9."""
 
@@ -126,83 +99,6 @@ class _BrokerReads:
     qualification: bytes | None
     readiness: bytes | None
     observation: BrokerObservation
-
-
-def _require(condition: bool) -> None:
-    """@spec PROTECTED-HOOK-SOURCE-9."""
-    if not condition:
-        raise _BootstrapInvalid()
-
-
-def _read_file(directory_fd: int, name: str) -> bytes:
-    """One bounded regular bootstrap file relative to the opened directory.
-
-    Symlinks are followed (a secret volume links through ``..data``); the
-    opened file must be regular, so a FIFO, device or directory is refused
-    without blocking. @spec PROTECTED-HOOK-SOURCE-9.
-    """
-    descriptor = os.open(name, _FILE_FLAGS, dir_fd=directory_fd)
-    try:
-        status = os.fstat(descriptor)
-        _require(stat.S_ISREG(status.st_mode) and status.st_size <= _MAX_FILE_BYTES)
-        chunks: list[bytes] = []
-        total = 0
-        while chunk := os.read(descriptor, _MAX_FILE_BYTES + 1 - total):
-            chunks.append(chunk)
-            total += len(chunk)
-            _require(total <= _MAX_FILE_BYTES)
-        return b"".join(chunks)
-    finally:
-        os.close(descriptor)
-
-
-def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """@spec PROTECTED-HOOK-SOURCE-9."""
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        _require(key not in result)
-        result[key] = value
-    return result
-
-
-def _reject_number(_value: str) -> Any:
-    """@spec PROTECTED-HOOK-SOURCE-9."""
-    raise _BootstrapInvalid()
-
-
-def _load_bootstrap(directory: str) -> _Bootstrap:
-    """Strict bootstrap files, read afresh; any defect is one refusal.
-
-    A credential the reader would refuse before connecting (``default`` among
-    them) makes the bootstrap invalid. @spec PROTECTED-HOOK-SOURCE-9.
-    """
-    try:
-        directory_fd = os.open(directory, _DIRECTORY_FLAGS)
-        try:
-            manifest_raw = _read_file(directory_fd, _MANIFEST_FILE)
-            ca_raw = _read_file(directory_fd, _CA_FILE)
-            bootstrap_raw = _read_file(directory_fd, _BOOTSTRAP_FILE)
-        finally:
-            os.close(directory_fd)
-        manifest = parse_manifest(manifest_raw)
-        ca_pem = trusted_ca_pem(ca_raw.decode("ascii"))
-        config = json.loads(
-            bootstrap_raw.decode("utf-8"),
-            object_pairs_hook=_unique_pairs,
-            parse_float=_reject_number,
-            parse_constant=_reject_number,
-        )
-        _require(type(config) is dict and config.keys() == _BOOTSTRAP_FIELDS)
-        _require(type(config["schema_version"]) is int and config["schema_version"] == 1)
-        maximum = config["max_readiness_ms"]
-        _require(type(maximum) is str and _POSITIVE_DECIMAL.fullmatch(maximum) is not None)
-        _require(int(maximum) <= _MAX_MILLISECOND)
-        reader = config["control_reader"]
-        _require(type(reader) is dict and reader.keys() == _READER_FIELDS)
-        credential = MetadataReaderCredential(reader["username"], reader["password"])
-        return _Bootstrap(manifest, ca_pem, credential, int(maximum))
-    except Exception:
-        raise _BootstrapInvalid() from None
 
 
 def _parsed(parse: Any, raw: bytes | None) -> Any:
