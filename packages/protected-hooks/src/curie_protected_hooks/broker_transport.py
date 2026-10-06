@@ -30,15 +30,7 @@ from curie_protected_hooks.broker_metadata import (
     BrokerMetadataUnavailable,
     BrokerObservation,
 )
-from curie_protected_hooks.source_fence import (
-    SourceFence,
-    SourceFenceConflict,
-    SourceFenceExhausted,
-    SourceFenceInvalid,
-    SourceState,
-    _decode_source,
-    _source_key,
-)
+from curie_protected_hooks.source_fence import SourceState, _decode_source, _source_key
 
 # @spec PROTECTED-HOOK-LANE-2/3 @spec PROTECTED-HOOK-SOURCE-9
 _BEGIN = "-----BEGIN CERTIFICATE-----"
@@ -205,33 +197,11 @@ class MetadataReaderCredential:
             raise BrokerMetadataUnavailable() from None
 
 
-@dataclass(frozen=True, slots=True)
-class SourceWriterCredential:
-    """Provisioner supplied source writer principal, @spec PROTECTED-HOOK-SOURCE-6."""
-
-    username: str = field(repr=False)
-    password: str = field(repr=False)
-
-    def __post_init__(self) -> None:
-        """@spec PROTECTED-HOOK-SOURCE-6 @spec PROTECTED-HOOK-LANE-3."""
-        if (
-            not isinstance(self.username, str)
-            or not self.username
-            or self.username == "default"
-            or not isinstance(self.password, str)
-            or not self.password
-        ):
-            raise BrokerMetadataUnavailable() from None
-
-
 class _PinnedConnection(SSLConnection):
     """Socket identity enforcement, @spec PROTECTED-HOOK-LANE-2/3."""
 
     def __init__(
-        self,
-        identity: dict[str, Any],
-        credential: MetadataReaderCredential | SourceWriterCredential,
-        ca_pem: str,
+        self, identity: dict[str, Any], credential: MetadataReaderCredential, ca_pem: str
     ) -> None:
         """@spec PROTECTED-HOOK-LANE-2/3."""
         self._expected_pin = identity["tls_spki_sha256"]
@@ -431,164 +401,6 @@ class AuthenticatedMetadataReader:
 
     def close(self) -> None:
         """@spec PROTECTED-HOOK-LANE-2/3."""
-        with self.__lock:
-            if self.__closed:
-                return
-            self.__closed = True
-            try:
-                self.__connection.disconnect()
-            except Exception:
-                raise BrokerMetadataUnavailable() from None
-
-
-class _PinnedWriterConnection(_PinnedConnection):
-    """Writer socket: same pinning and budget, no INFO and never a second connect.
-
-    The source writer role has no INFO authority, so the live run_id is left to
-    the control reader that brackets every writer effect.
-    @spec PROTECTED-HOOK-SOURCE-6 @spec PROTECTED-HOOK-LANE-3.
-    """
-
-    _connected_once = False
-
-    def connect_check_health(self, *args: Any, **kwargs: Any) -> None:
-        """Connect exactly once; a lost connection stays lost, @spec PROTECTED-HOOK-SOURCE-6."""
-        if self._sock:
-            return
-        if self._connected_once:
-            raise ConnectionError("Broker metadata unavailable")
-        self._connected_once = True
-        super().connect_check_health(*args, **kwargs)
-
-    def on_connect_check_health(self, check_health: bool = True) -> None:
-        """Handshake and authentication only, @spec PROTECTED-HOOK-SOURCE-6."""
-        try:
-            SSLConnection.on_connect_check_health(self, check_health=check_health)
-        except Exception:
-            self.disconnect()
-            raise ConnectionError("Broker metadata unavailable") from None
-
-
-class _FenceClient:
-    """The one EVAL surface SourceFence needs, over the pinned writer socket.
-
-    @spec PROTECTED-HOOK-SOURCE-6.
-    """
-
-    __slots__ = ("_connection",)
-
-    def __init__(self, connection: _PinnedWriterConnection) -> None:
-        """@spec PROTECTED-HOOK-SOURCE-6."""
-        self._connection = connection
-
-    def eval(self, script: str, numkeys: int, *args: Any) -> Any:
-        """@spec PROTECTED-HOOK-SOURCE-6."""
-        self._connection.send_command("EVAL", script, numkeys, *args, check_health=False)
-        return self._connection.read_response()
-
-
-_FENCE_REFUSALS = (SourceFenceConflict, SourceFenceExhausted, SourceFenceInvalid)
-
-
-class AuthenticatedSourceWriter:
-    """Closed source writer: reserve, ordinary publication and close only.
-
-    It validates input, pins TLS and authenticates exactly as the metadata
-    reader does and honors ``metadata_reader_budget``, but sends no INFO and
-    never reconnects: any connection loss leaves it permanently unusable. A
-    fence refusal (floor or operation mismatch, exhaustion, malformed record)
-    is raised as the fence raises it; every other failure is the single safe
-    error. @spec PROTECTED-HOOK-SOURCE-6 @spec PROTECTED-HOOK-SOURCE-7
-    @spec PROTECTED-HOOK-LANE-3.
-    """
-
-    __slots__ = ("__connection", "__fence", "__lock", "__closed")
-    __connection: _PinnedWriterConnection
-    __fence: SourceFence
-    __lock: Lock
-    __closed: bool
-
-    def __new__(cls) -> AuthenticatedSourceWriter:
-        """@spec PROTECTED-HOOK-SOURCE-6."""
-        raise BrokerMetadataUnavailable() from None
-
-    def __repr__(self) -> str:
-        """@spec PROTECTED-HOOK-SOURCE-6."""
-        return "AuthenticatedSourceWriter()"
-
-    @classmethod
-    def connect(
-        cls, manifest: Manifest, credential: SourceWriterCredential, ca_pem: str
-    ) -> AuthenticatedSourceWriter:
-        """@spec PROTECTED-HOOK-SOURCE-6 @spec PROTECTED-HOOK-LANE-3."""
-        connection: _PinnedWriterConnection | None = None
-        try:
-            if type(manifest) is not Manifest or type(credential) is not SourceWriterCredential:
-                raise BrokerMetadataUnavailable()
-            credential.__post_init__()
-            identity = Manifest(manifest.canonical_bytes).as_dict()["broker_identity"]
-            if identity["endpoint"]["host"] != identity["tls_server_name"]:
-                raise BrokerMetadataUnavailable()
-            trusted_ca_pem(ca_pem)
-            connection = _PinnedWriterConnection(identity, credential, ca_pem)
-            connection.connect()  # type: ignore[no-untyped-call]
-            writer = object.__new__(cls)
-            writer.__connection = connection
-            writer.__fence = SourceFence(_FenceClient(connection))  # type: ignore[arg-type]
-            writer.__lock = Lock()
-            writer.__closed = False
-            return writer
-        except Exception:
-            if connection is not None:
-                connection.disconnect()
-            raise BrokerMetadataUnavailable() from None
-
-    def reserve_and_revoke(
-        self,
-        agent_id: str,
-        hook: str,
-        expected_floor: int,
-        operation_id: str,
-        min_generation: int,
-    ) -> int:
-        """@spec PROTECTED-HOOK-SOURCE-6/7."""
-        with self.__lock:
-            if self.__closed:
-                raise BrokerMetadataUnavailable()
-            try:
-                return self.__fence.reserve_and_revoke(
-                    agent_id, hook, expected_floor, operation_id, min_generation
-                )
-            except _FENCE_REFUSALS:
-                raise
-            except Exception:
-                self.__connection.disconnect()
-                raise BrokerMetadataUnavailable() from None
-
-    def publish_ordinary(
-        self,
-        agent_id: str,
-        hook: str,
-        generation: int,
-        operation_id: str,
-        policy_fingerprint: str,
-    ) -> bool:
-        """@spec PROTECTED-HOOK-SOURCE-3/6/7."""
-        with self.__lock:
-            if self.__closed:
-                raise BrokerMetadataUnavailable()
-            try:
-                return self.__fence.publish_ordinary(
-                    agent_id, hook, generation, operation_id, policy_fingerprint
-                )
-            except _FENCE_REFUSALS:
-                raise
-            except Exception:
-                self.__connection.disconnect()
-                raise BrokerMetadataUnavailable() from None
-
-    def close(self) -> None:
-        """@spec PROTECTED-HOOK-SOURCE-6."""
         with self.__lock:
             if self.__closed:
                 return

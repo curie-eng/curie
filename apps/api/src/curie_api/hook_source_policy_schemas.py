@@ -88,22 +88,6 @@ class HookSourcePolicyOut(_SourceModel):
         return self
 
 
-class HookSourceRefusalDetail(_SourceModel):
-    """A source service refusal: a stable code and, only after a confirmed commit, its generation.
-
-    @spec PROTECTED-HOOK-SOURCE-3.
-    """
-
-    code: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,62}$")]
-    committed_generation: SourceDecimal | None
-
-
-class HookSourceRefusal(_SourceModel):
-    """@spec PROTECTED-HOOK-SOURCE-3."""
-
-    detail: HookSourceRefusalDetail
-
-
 class HookSourceSecretOut(_SourceModel):
     """@spec PROTECTED-HOOK-SOURCE-3."""
 

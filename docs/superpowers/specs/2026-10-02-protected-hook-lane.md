@@ -205,10 +205,8 @@ The source writer grants GET, SET and the script operations used by the
 existing SourceFence only on `protected:source:*`, plus connection handshake
 commands. It has no control, admission, execution stream, consumption, INFO,
 TIME or broker administration authority. Existing reservation and ordinary
-publication retain their SOURCE-6/7 semantics, and the
-[route exposure contract](2026-10-02-protected-hook-source-policy.md#administrative-route-exposure)
-brackets every writer effect with control reader identity reads. Protected
-publication remains unavailable until the LANE-4 ingress admission change.
+publication retain their SOURCE-6/7 semantics. Protected publication remains
+unavailable.
 
 The control reader grants GET on `protected:source:*` and
 `protected:control:*`, INFO server and TIME, plus connection handshake and
@@ -239,11 +237,8 @@ operations. Do not change a shared backing service's ACLs to run them.
 These subsets are not the complete enqueue, worker or verifier inventories.
 They issue no authority, authenticate no TLS or provisioning boundary and
 do not enable source administration, runtime qualification or protected
-delivery. The resolver remains unavailable unless the provisioner supplies
-the runtime directory, including its source writer file, under that route
-exposure contract, and then serves only reservation and ordinary publication;
-protected publication and delivery still await the separate admission,
-provisioning and execution requirements.
+delivery. The default resolver remains unavailable until the separate
+authority, admission, provisioning and execution requirements pass.
 
 ## Authenticated metadata reader transport
 
@@ -318,11 +313,9 @@ connection and forced reconnect cases must verify pin and run_id enforcement,
 and close must prevent reuse. Validated wrong tuple/input refusals precede
 connection attempts. These tests enable no source administration,
 activation, admission, runtime evidence issuance, protected worker startup or
-qualification. Its consumers are the observational support probe under
+qualification. The only consumer is the observational support probe under
 [PROTECTED-HOOK-SOURCE-9](2026-10-02-protected-hook-source-policy.md#surface-parity-and-smallest-implementation-task),
-which reads through it and writes nothing, and the administrative source
-routes, which use it for tombstone activation reads and to bracket source
-writer effects without writing through it.
+which reads through it and writes nothing.
 
 ## Atomic admission, duplicate receipt and activation
 
