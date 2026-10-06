@@ -114,7 +114,8 @@ def metadata_reader_budget(seconds: float) -> Iterator[None]:
     if type(seconds) not in (int, float) or not 0 < seconds <= 3600:
         raise ValueError("invalid metadata reader budget")
     previous = getattr(_BUDGET, "deadline", None)
-    _BUDGET.deadline = time.monotonic() + seconds
+    deadline = time.monotonic() + seconds
+    _BUDGET.deadline = deadline if previous is None else min(previous, deadline)
     try:
         yield
     finally:
