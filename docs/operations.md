@@ -974,7 +974,14 @@ run publishes, it waits on the pull request's checks inside its execution
 deadline; the request completes only when CI is green. A failure resumes the
 same run to fix the code and push to the same pull request, for at most 3
 rounds, then the issue gets `Could not complete:` with the failing checks and
-what each round tried. No checks within 120 s of the push completes with a
+what each round tried. A failing check or commit status that is also failing
+on the commit the pull request's base branch points to is not counted against
+the change: it neither fails the run nor reaches a fix round, and a run that is
+otherwise green completes with the note `Also failing on the base branch, not
+caused by this change: <names>`. The required Python check and any check a
+sandbox check delegated to are the exception: failing on the base too leaves
+the run `ci_unverified`. When the base branch cannot be read, every failure
+counts. No checks within 120 s of the push completes with a
 note only when no required check applies. A factory Python publication needs
 in-sandbox verification evidence; beyond that it is judged on the repository's
 own checks unless the repository has a required Python CI policy (below).
