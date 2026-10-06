@@ -718,6 +718,19 @@ one stage; only ruling and pre-dispatch codes are provable non-writes.
 
 An unknown code from a runner or connector is normalized to `connector_error`
 or `response_lost` by stage, never passed through.
+The ruling route answers `executor_disabled` with HTTP 503 and every other
+ruling refusal with the status its existing refusal used.
+
+API route decisions the worker relies on: the worker reports the version it
+observed through `observe_version` to the API's observation route, and the API
+compares it with the recorded `post_version` and records `version_conflict`
+with its audit row, so the ledger owner makes the comparison. The claim route
+reclaims an execution whose lease has expired, with the next attempt number; a
+report fenced by a stale attempt or lease owner is refused. These internal
+routes use the platform API key the worker already holds. A finished probe
+records one `connector_capabilities` row for its agent, connector and digest,
+with `restore_capable` true only when the probe observed both `restore` and
+`observe_version` (ACTION-EXECUTOR-8).
 
 Acceptance: a table-driven test drives each code through its real producer and
 asserts the terminal state; an injected unknown code is normalized.
