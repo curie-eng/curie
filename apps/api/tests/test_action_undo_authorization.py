@@ -14,14 +14,22 @@ this ADR-0117 action-undo seam. Undo preserves ADR-0117's existing approver-set
 check over the request's actor and actor channel without adding a
 distinct-requester rule. Adding that rule would be MORE authorization than the
 forward action needed, which is the half of decision 3 that says "and no more".
+
+Every record here is fully undoable under the connector action executor rule
+(ACTION-EXECUTOR-11, ``_sealed_actions``) unless a test says otherwise, so the
+verdict each test observes is the authorizer's and not the snapshot rule's.
+Authorization still runs first (ACTION-EXECUTOR-3 keeps the refusal ordering):
+an actor who may not undo learns nothing about the record's reversibility.
 """
 
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from typing import Any
 
 import pytest
+from _sealed_actions import sealed_action, undoable_agent
 from curie_api.approvers import MembershipVerdict
 from curie_api.deps import get_approver_sets
 from curie_api.main import create_app
@@ -30,8 +38,6 @@ from fastapi.testclient import TestClient
 pytestmark = pytest.mark.usefixtures("clean_db")
 
 LEFT = {"spec": {"replicas": 10}}
-PRIOR = {"spec": {"replicas": 3}}
-TARGET = {"kind": "Deployment", "namespace": "public", "name": "api"}
 
 
 class _Set:
@@ -85,32 +91,13 @@ def _seed_approval(client: Any, headers: Any) -> str:
     return str(created.json()["id"])
 
 
-def _gated_action(client: Any, headers: Any, approval_id: str | None) -> dict[str, Any]:
-    opened = client.post(
-        "/actions",
-        json={
-            "conversation_id": "C1",
-            "call_id": "toolu_01",
-            "tool": "scale_deployment",
-            "arguments": {"replicas": 10},
-            "gate_approval_id": approval_id,
-            "dedupe_key": f"event-{uuid.uuid4()}:toolu_01",
-        },
-        headers=headers,
-    ).json()
-    return dict(
-        client.post(
-            f"/actions/{opened['id']}/complete",
-            json={
-                "failed": False,
-                "result": {"ok": True},
-                "prior_state": PRIOR,
-                "post_state": LEFT,
-                "target": TARGET,
-            },
-            headers=headers,
-        ).json()
-    )
+def _gated_action(
+    client: Any, headers: Any, approval_id: str | None, tmp_path: Path, **overrides: Any
+) -> dict[str, Any]:
+    """A fully undoable record of a sealed, probed agent, gated by ``approval_id``."""
+
+    agent_id = undoable_agent(client, headers, tmp_path)
+    return sealed_action(client, headers, agent_id, gate_approval_id=approval_id, **overrides)
 
 
 def _undo(client: Any, headers: Any, action_id: str, actor: str = "U-operator") -> Any:
@@ -122,11 +109,11 @@ def _undo(client: Any, headers: Any, action_id: str, actor: str = "U-operator") 
 
 
 def test_an_ungated_action_is_not_gated_on_the_way_back(
-    client: Any, auth_headers: Any
+    client: Any, auth_headers: Any, tmp_path: Path
 ) -> None:
     """Nobody approved the change, so nobody has to approve putting it back."""
 
-    action = _gated_action(client, auth_headers, None)
+    action = _gated_action(client, auth_headers, None, tmp_path)
 
     response = _undo(client, auth_headers, action["id"])
 
@@ -136,13 +123,38 @@ def test_an_ungated_action_is_not_gated_on_the_way_back(
     assert audit[0]["authorized"] is True
 
 
+def test_an_ungated_action_that_is_not_undoable_is_refused_with_its_code(
+    client: Any, auth_headers: Any, tmp_path: Path
+) -> None:
+    """@spec ACTION-EXECUTOR-11: ungated is not unconditional.
+
+    The authorizer allows it, and the ruling then follows ``undoable``: a
+    cleartext prior state is refused ``refused_unsealed`` and no granted-undo
+    audit row is written.
+    """
+
+    action = _gated_action(
+        client, auth_headers, None, tmp_path, prior_state={"spec": {"replicas": 3}}
+    )
+    assert action["undoable"] is False
+
+    response = _undo(client, auth_headers, action["id"])
+
+    assert response.status_code == 409
+    audit = client.get(f"/actions/{action['id']}/audit", headers=auth_headers).json()
+    assert [entry["action"] for entry in audit] == ["refused_unsealed"]
+    assert not any(entry["authorized"] for entry in audit)
+
+
 @pytest.mark.parametrize("gated_client", [MembershipVerdict(member=True)], indirect=True)
 def test_a_member_of_the_gating_route_may_undo(
-    gated_client: Any, auth_headers: Any
+    gated_client: Any, auth_headers: Any, tmp_path: Path
 ) -> None:
     """Someone who could have permitted the change may put it back."""
 
-    action = _gated_action(gated_client, auth_headers, _seed_approval(gated_client, auth_headers))
+    action = _gated_action(
+        gated_client, auth_headers, _seed_approval(gated_client, auth_headers), tmp_path
+    )
 
     response = _undo(gated_client, auth_headers, action["id"])
 
@@ -155,11 +167,13 @@ def test_a_member_of_the_gating_route_may_undo(
     "gated_client", [MembershipVerdict(member=False, reason="not in #sre")], indirect=True
 )
 def test_a_non_member_is_refused_with_the_set_s_own_reason(
-    gated_client: Any, auth_headers: Any
+    gated_client: Any, auth_headers: Any, tmp_path: Path
 ) -> None:
     """The set explains itself: only it knows whether it refused on a list or a group."""
 
-    action = _gated_action(gated_client, auth_headers, _seed_approval(gated_client, auth_headers))
+    action = _gated_action(
+        gated_client, auth_headers, _seed_approval(gated_client, auth_headers), tmp_path
+    )
 
     response = _undo(gated_client, auth_headers, action["id"])
 
@@ -175,25 +189,31 @@ def test_a_non_member_is_refused_with_the_set_s_own_reason(
     [MembershipVerdict(member=True, undetermined=True, reason="Slack unreachable")],
     indirect=True,
 )
-def test_an_undetermined_set_fails_closed(gated_client: Any, auth_headers: Any) -> None:
+def test_an_undetermined_set_fails_closed(
+    gated_client: Any, auth_headers: Any, tmp_path: Path
+) -> None:
     """`member` is meaningless when the set could not establish membership.
 
     Failing open here would let a Slack outage authorize a write into a
     customer's infrastructure.
     """
 
-    action = _gated_action(gated_client, auth_headers, _seed_approval(gated_client, auth_headers))
+    action = _gated_action(
+        gated_client, auth_headers, _seed_approval(gated_client, auth_headers), tmp_path
+    )
 
     assert _undo(gated_client, auth_headers, action["id"]).status_code == 403
 
 
 @pytest.mark.parametrize("gated_client", [MembershipVerdict(member=True)], indirect=True)
 def test_a_refused_authorization_leaves_the_record_untouched(
-    gated_client: Any, auth_headers: Any
+    gated_client: Any, auth_headers: Any, tmp_path: Path
 ) -> None:
     """Same invariant as the conflict rule: a refusal changes nothing."""
 
-    action = _gated_action(gated_client, auth_headers, _seed_approval(gated_client, auth_headers))
+    action = _gated_action(
+        gated_client, auth_headers, _seed_approval(gated_client, auth_headers), tmp_path
+    )
     gated_client.app.dependency_overrides[get_approver_sets] = lambda: (
         lambda approval, binding: _Set(MembershipVerdict(member=False, reason="no"))
     )
@@ -202,28 +222,58 @@ def test_a_refused_authorization_leaves_the_record_untouched(
 
     after = gated_client.get(f"/actions/{action['id']}", headers=auth_headers).json()
     assert after["undone_at"] is None
+    assert after["undoable"] is True
+
+
+@pytest.mark.parametrize(
+    "gated_client", [MembershipVerdict(member=False, reason="not in #sre")], indirect=True
+)
+def test_authorization_is_ruled_before_reversibility(
+    gated_client: Any, auth_headers: Any, tmp_path: Path
+) -> None:
+    """@spec ACTION-EXECUTOR-3 @spec ACTION-EXECUTOR-11: the refusal ordering is kept.
+
+    A non-member asking to undo a record that is also not undoable is told it
+    may not undo, not which ingredient the record lacks.
+    """
+
+    action = _gated_action(
+        gated_client,
+        auth_headers,
+        _seed_approval(gated_client, auth_headers),
+        tmp_path,
+        prior_state={"spec": {"replicas": 3}},
+    )
+
+    response = _undo(gated_client, auth_headers, action["id"])
+
+    assert response.status_code == 403
+    audit = gated_client.get(f"/actions/{action['id']}/audit", headers=auth_headers).json()
+    assert [entry["action"] for entry in audit] == ["refused_unauthorized"]
 
 
 def test_the_gating_approval_is_recorded_from_the_worker(
-    client: Any, auth_headers: Any
+    client: Any, auth_headers: Any, tmp_path: Path
 ) -> None:
     """The record carries which approval gated the call, or None when none did."""
 
     approval_id = str(uuid.uuid4())
 
-    action = _gated_action(client, auth_headers, approval_id)
+    action = _gated_action(client, auth_headers, approval_id, tmp_path)
 
     assert action["gate_approval_id"] == approval_id
 
 
-def test_a_gate_that_cannot_be_read_fails_closed(client: Any, auth_headers: Any) -> None:
+def test_a_gate_that_cannot_be_read_fails_closed(
+    client: Any, auth_headers: Any, tmp_path: Path
+) -> None:
     """A deleted approval is an unreadable gate, not an absent one.
 
     Reading it as absent would let the approval sweeper turn a gated action into
     a freely undoable one -- a permission check quietly deleting itself.
     """
 
-    action = _gated_action(client, auth_headers, str(uuid.uuid4()))
+    action = _gated_action(client, auth_headers, str(uuid.uuid4()), tmp_path)
 
     response = _undo(client, auth_headers, action["id"])
 

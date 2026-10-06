@@ -13,15 +13,23 @@ importantly, whenever the platform cannot tell.
 
 Every refusal writes an audit entry before it raises. A refusal nobody can read
 afterwards is a bug report the operator never gets.
+
+Under the connector action executor contract the ruling follows the derived
+``undoable`` (ACTION-EXECUTOR-11): an action that is not undoable is refused
+with its code, and no granted-undo audit row is written. So the tests about the
+conflict rule, observation and claiming once start from a fully undoable sealed
+record (``_sealed_actions``), and the snapshot refusals are tested as such.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
+from pathlib import Path
 from typing import Any
 
 import pytest
+from _sealed_actions import ENVELOPE, sealed_action, undoable_agent
 from curie_api.config import get_settings
 from curie_api.crud import actions as crud_actions
 from curie_api.models import AgentAction
@@ -64,6 +72,12 @@ def _record(client: Any, headers: Any, **complete: Any) -> dict[str, Any]:
     return dict(client.post(f"/actions/{opened['id']}/complete", json=body, headers=headers).json())
 
 
+def _sealed(client: Any, headers: Any, tmp_path: Path, **overrides: Any) -> dict[str, Any]:
+    """One fully undoable record of a sealed, probed agent, minus any overrides."""
+
+    return sealed_action(client, headers, undoable_agent(client, headers, tmp_path), **overrides)
+
+
 def _undo(client: Any, headers: Any, action_id: str, **body: Any) -> Any:
     payload: dict[str, Any] = {"actor": "U-operator", "observed_state": LEFT}
     payload.update(body)
@@ -74,10 +88,13 @@ def _audit(client: Any, headers: Any, action_id: str) -> list[dict[str, Any]]:
     return list(client.get(f"/actions/{action_id}/audit", headers=headers).json())
 
 
-def test_an_untouched_world_authorizes_the_restore(client: Any, auth_headers: Any) -> None:
+def test_an_untouched_world_authorizes_the_restore(
+    client: Any, auth_headers: Any, tmp_path: Path
+) -> None:
     """The live state still matches what the action left, so putting it back is safe."""
 
-    action = _record(client, auth_headers)
+    action = _sealed(client, auth_headers, tmp_path)
+    assert action["undoable"] is True
 
     response = _undo(client, auth_headers, action["id"])
 
@@ -86,16 +103,16 @@ def test_an_untouched_world_authorizes_the_restore(client: Any, auth_headers: An
     # The ruling hands back the call to make. The API cannot reach a connector,
     # so naming the restore IS the output.
     assert ruling["restore"]["target"] == TARGET
-    assert ruling["restore"]["prior_state"] == PRIOR
+    assert ruling["restore"]["prior_state"] == ENVELOPE
     assert [e["action"] for e in _audit(client, auth_headers, action["id"])] == ["authorized"]
 
 
 def test_a_moved_world_is_refused_with_both_states_named(
-    client: Any, auth_headers: Any
+    client: Any, auth_headers: Any, tmp_path: Path
 ) -> None:
     """The rule the feature lives on: a human set it to 7 by hand after the agent acted."""
 
-    action = _record(client, auth_headers)
+    action = _sealed(client, auth_headers, tmp_path)
 
     response = _undo(client, auth_headers, action["id"], observed_state={"spec": {"replicas": 7}})
 
@@ -108,16 +125,16 @@ def test_a_moved_world_is_refused_with_both_states_named(
     assert entry["evidence"] == {"left": LEFT, "observed": {"spec": {"replicas": 7}}}
 
 
-def test_a_refused_undo_changes_nothing(client: Any, auth_headers: Any) -> None:
+def test_a_refused_undo_changes_nothing(client: Any, auth_headers: Any, tmp_path: Path) -> None:
     """`an undo either restores the recorded state or changes nothing at all`.
 
-    @spec ACTION-EXECUTOR-11: this record's ``prior_state`` is cleartext, so it
-    is not ``undoable`` under the sealed rule before or after the refusal. What
-    the refusal must not move is the whole record as the API reads it, so the
-    read after is compared with the read before, field for field.
+    @spec ACTION-EXECUTOR-11: the record is fully undoable, and a refusal (here
+    the conflict rule) must leave it so. What the refusal must not move is the
+    whole record as the API reads it, so the read after is compared with the
+    read before, field for field.
     """
 
-    action = _record(client, auth_headers)
+    action = _sealed(client, auth_headers, tmp_path)
     before = client.get(f"/actions/{action['id']}", headers=auth_headers).json()
 
     refused = _undo(
@@ -131,12 +148,12 @@ def test_a_refused_undo_changes_nothing(client: Any, auth_headers: Any) -> None:
     assert after == before
     assert after["undone_at"] is None
     assert after["undone_by"] is None
-    assert after["prior_state"] == PRIOR
-    assert after["undoable"] is False
+    assert after["prior_state"] == ENVELOPE
+    assert after["undoable"] is True
 
 
 def test_an_unseen_world_is_refused_rather_than_assumed(
-    client: Any, auth_headers: Any
+    client: Any, auth_headers: Any, tmp_path: Path
 ) -> None:
     """No live state supplied means the platform cannot tell, which is not consent.
 
@@ -144,7 +161,7 @@ def test_an_unseen_world_is_refused_rather_than_assumed(
     the rule needs is simply absent.
     """
 
-    action = _record(client, auth_headers)
+    action = _sealed(client, auth_headers, tmp_path)
 
     response = _undo(client, auth_headers, action["id"], observed_state=None)
 
@@ -153,30 +170,40 @@ def test_an_unseen_world_is_refused_rather_than_assumed(
 
 
 def test_a_call_that_never_reported_what_it_left_is_refused(
-    client: Any, auth_headers: Any
+    client: Any, auth_headers: Any, tmp_path: Path
 ) -> None:
     """Deny-by-default reaches the comparison too, not just the snapshot.
 
-    A connector that reports `prior` but not `post` leaves the platform holding a
-    state to restore and no way to know whether restoring it is safe.
+    @spec ACTION-EXECUTOR-11: a sealed record that never reported the version it
+    left gives the platform a state to restore and nothing to compare the live
+    version against, so it is refused ``refused_unversioned`` and no
+    granted-undo audit row is written.
     """
 
-    action = _record(client, auth_headers, post_state=None)
+    action = _sealed(client, auth_headers, tmp_path, post_version=None)
+    assert action["undoable"] is False
 
     response = _undo(client, auth_headers, action["id"])
 
     assert response.status_code == 409
-    assert _audit(client, auth_headers, action["id"])[0]["action"] == "refused_uncomparable"
+    assert [e["action"] for e in _audit(client, auth_headers, action["id"])] == [
+        "refused_unversioned"
+    ]
+    assert response.json().get("restore") is None
 
 
 def test_a_prose_reply_is_refused_with_the_reason_it_carried(
-    client: Any, auth_headers: Any
+    client: Any, auth_headers: Any, tmp_path: Path
 ) -> None:
-    """The receipt's stated reason and the refusal's reason are the same sentence."""
+    """The receipt's stated reason and the refusal's reason are the same sentence.
 
-    action = _record(
+    @spec ACTION-EXECUTOR-11: no envelope at all is ``refused_unsealed``.
+    """
+
+    action = _sealed(
         client,
         auth_headers,
+        tmp_path,
         prior_state=None,
         post_state=None,
         target=None,
@@ -188,20 +215,26 @@ def test_a_prose_reply_is_refused_with_the_reason_it_carried(
 
     assert response.status_code == 409
     assert response.json()["detail"] == "restarting pods cannot be undone"
+    assert [e["action"] for e in _audit(client, auth_headers, action["id"])] == [
+        "refused_unsealed"
+    ]
 
 
-def test_a_failed_call_is_refused(client: Any, auth_headers: Any) -> None:
+def test_a_failed_call_is_refused(client: Any, auth_headers: Any, tmp_path: Path) -> None:
     """Undoing a call that did not happen would be a write, not a restore."""
 
-    action = _record(client, auth_headers, failed=True)
+    action = _sealed(client, auth_headers, tmp_path, failed=True)
 
     assert _undo(client, auth_headers, action["id"]).status_code == 409
+    entries = _audit(client, auth_headers, action["id"])
+    assert len(entries) == 1
+    assert entries[0]["authorized"] is False
 
 
-def test_an_undo_is_authorized_once(client: Any, auth_headers: Any) -> None:
+def test_an_undo_is_authorized_once(client: Any, auth_headers: Any, tmp_path: Path) -> None:
     """A second ruling on a claimed record must not authorize a second restore."""
 
-    action = _record(client, auth_headers)
+    action = _sealed(client, auth_headers, tmp_path)
     _undo(client, auth_headers, action["id"])
 
     second = _undo(client, auth_headers, action["id"])
@@ -255,11 +288,11 @@ def test_two_sessions_with_a_stale_unclaimed_record_cannot_both_claim_undo(
 
 
 def test_stale_undo_request_gets_a_refusal_not_a_second_restore(
-    client: Any, auth_headers: Any
+    client: Any, auth_headers: Any, tmp_path: Path
 ) -> None:
     """The API route must turn a lost CAS into an audited 409 without a payload."""
 
-    action_id = uuid.UUID(_record(client, auth_headers)["id"])
+    action_id = uuid.UUID(_sealed(client, auth_headers, tmp_path)["id"])
 
     async def contend() -> tuple[dict[str, Any], int]:
         engine = create_async_engine(get_settings().database_url)
@@ -292,12 +325,36 @@ def test_stale_undo_request_gets_a_refusal_not_a_second_restore(
             await engine.dispose()
 
     restore, status_code = asyncio.run(contend())
-    assert restore == {"target": TARGET, "prior_state": PRIOR}
+    assert restore == {"target": TARGET, "prior_state": ENVELOPE}
     assert status_code == 409
     assert [entry["action"] for entry in _audit(client, auth_headers, str(action_id))] == [
         "authorized",
         "refused_already_undone",
     ]
+
+
+def test_a_legacy_cleartext_row_is_refused_unsealed_and_granted_nothing(
+    client: Any, auth_headers: Any
+) -> None:
+    """@spec ACTION-EXECUTOR-11: "a legacy cleartext row is refused ``refused_unsealed``".
+
+    The cleartext rule would have authorized this one: the observation matches
+    what the call left. The ruling now follows ``undoable``, so it refuses with
+    the code and writes no granted-undo audit row, and the record is not claimed.
+    """
+
+    action = _record(client, auth_headers)
+    assert action["undoable"] is False
+
+    response = _undo(client, auth_headers, action["id"])
+
+    assert response.status_code == 409
+    entries = _audit(client, auth_headers, action["id"])
+    assert [e["action"] for e in entries] == ["refused_unsealed"]
+    assert not any(e["authorized"] for e in entries)
+    after = client.get(f"/actions/{action['id']}", headers=auth_headers).json()
+    assert after["undone_at"] is None
+    assert after["undone_by"] is None
 
 
 def test_an_unknown_action_is_a_404(client: Any, auth_headers: Any) -> None:

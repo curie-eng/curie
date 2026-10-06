@@ -141,7 +141,9 @@ def _insert_agent(name: str = "restorer-agent") -> uuid.UUID:
     return agent_id
 
 
-def _insert_legacy_action(agent_id: uuid.UUID, *, call_id: str = "toolu_legacy") -> uuid.UUID:
+def _insert_legacy_action(
+    agent_id: uuid.UUID | None, *, call_id: str = "toolu_legacy"
+) -> uuid.UUID:
     """A succeeded row with a cleartext snapshot, as written before this change."""
 
     action_id = uuid.uuid4()
@@ -452,11 +454,13 @@ def test_the_index_covers_restores_only(isolated_migration_db: IsolatedMigration
 def test_a_replayed_idempotency_key_cannot_create_a_second_row(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    """@spec ACTION-EXECUTOR-2: ``idempotency_key`` is unique in the database.
+    """@spec ACTION-EXECUTOR-2: ``idempotency_key`` is unique within one agent.
 
     The constraint, not a writer-side check, is what lets a replayed creation
     adopt the existing row: two concurrent creators race a read, never a unique
-    index. Exercised with probes so the restore index plays no part.
+    index. The conflict target is (``agent_id``, ``idempotency_key``), so the
+    adoption a creator performs is scoped to its own agent. Exercised with
+    probes so the restore index plays no part.
     """
 
     _require_revision()
@@ -474,11 +478,128 @@ def test_a_replayed_idempotency_key_cannot_create_a_second_row(
         "idempotency_key, state, attempt, created_at) "
         "VALUES (:id, 'probe', :agent_id, 'k8s', :digest, 'capability_probe', 'pass-2', "
         ":key, 'requested', 0, now()) "
-        "ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
+        "ON CONFLICT (agent_id, idempotency_key) DO NOTHING RETURNING id",
         {"id": uuid.uuid4(), "agent_id": agent_id, "digest": DIGEST, "key": key},
     )
     assert adopted == []
     assert len(sql_rows("SELECT 1 FROM curie.action_executions")) == 1
+
+
+def test_the_same_idempotency_key_under_another_agent_is_a_distinct_row(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    """@spec ACTION-EXECUTOR-2: "the same key under another agent creates a distinct row".
+
+    One agent's key can never adopt another agent's execution: a forward
+    authority owner supplies its own keys, and two agents may well choose the
+    same one.
+    """
+
+    _require_revision()
+    isolated_migration_db.at(REVISION)
+    first = _insert_agent("restorer-a")
+    second = _insert_agent("restorer-b")
+    key = "forward:nightly-scale-down"
+
+    _insert_execution(first, kind="probe", tool=None, idempotency_key=key)
+    _insert_execution(second, kind="probe", tool=None, idempotency_key=key)
+
+    rows = sql_dicts(
+        "SELECT agent_id FROM curie.action_executions WHERE idempotency_key = :key",
+        {"key": key},
+    )
+    assert sorted(str(row["agent_id"]) for row in rows) == sorted([str(first), str(second)])
+
+
+def test_a_replay_under_another_agent_does_not_adopt_the_first_agents_row(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    """@spec ACTION-EXECUTOR-2: adoption on a replayed key stays inside one agent.
+
+    The creator's conflict target is (``agent_id``, ``idempotency_key``): a
+    second agent presenting the first agent's key inserts its own row instead of
+    being handed the first agent's id.
+    """
+
+    _require_revision()
+    isolated_migration_db.at(REVISION)
+    first = _insert_agent("restorer-a")
+    second = _insert_agent("restorer-b")
+    key = "forward:nightly-scale-down"
+    _insert_execution(first, kind="probe", tool=None, idempotency_key=key)
+
+    created = sql_dicts(
+        "INSERT INTO curie.action_executions "
+        "(id, kind, agent_id, connector, connector_digest, authority_kind, authority_ref, "
+        "idempotency_key, state, attempt, created_at) "
+        "VALUES (:id, 'probe', :agent_id, 'k8s', :digest, 'capability_probe', 'pass-2', "
+        ":key, 'requested', 0, now()) "
+        "ON CONFLICT (agent_id, idempotency_key) DO NOTHING RETURNING id",
+        {"id": uuid.uuid4(), "agent_id": second, "digest": DIGEST, "key": key},
+    )
+
+    assert len(created) == 1
+    assert len(sql_rows("SELECT 1 FROM curie.action_executions")) == 2
+
+
+def test_an_execution_under_another_agent_than_its_action_violates_the_foreign_key(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    """@spec ACTION-EXECUTOR-2: "an execution whose ``agent_id`` differs from its
+    subject action's agent violates the foreign key".
+
+    The composite key (``subject_action_id``, ``agent_id``) to the action's
+    (``id``, ``agent_id``) means an execution always runs under the binding of
+    the agent whose action it concerns. The same insert under the right agent
+    succeeds, so the refusal is about the agent and nothing else.
+    """
+
+    _require_revision()
+    isolated_migration_db.at(REVISION)
+    owner = _insert_agent("restorer-a")
+    other = _insert_agent("restorer-b")
+    action_id = _insert_legacy_action(owner)
+
+    with pytest.raises(IntegrityError):
+        _insert_execution(other, subject_action_id=action_id, state="requested")
+
+    _insert_execution(owner, subject_action_id=action_id, state="requested")
+    assert len(sql_rows("SELECT 1 FROM curie.action_executions")) == 1
+
+
+def test_a_forward_execution_under_another_agent_violates_the_foreign_key(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    """@spec ACTION-EXECUTOR-2: the composite key binds every kind that names an action."""
+
+    _require_revision()
+    isolated_migration_db.at(REVISION)
+    owner = _insert_agent("restorer-a")
+    other = _insert_agent("restorer-b")
+    action_id = _insert_legacy_action(owner)
+
+    with pytest.raises(IntegrityError):
+        _insert_execution(
+            other, kind="forward", tool="scale", subject_action_id=action_id, state="confirmed"
+        )
+
+
+def test_an_action_without_an_agent_cannot_be_the_subject_of_an_execution(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    """@spec ACTION-EXECUTOR-2 @spec ACTION-EXECUTOR-3: refused_no_agent, held by the schema.
+
+    An action with no agent has no (``id``, ``agent_id``) pair any execution's
+    agent can match, so no execution can ever run against it.
+    """
+
+    _require_revision()
+    isolated_migration_db.at(REVISION)
+    agent_id = _insert_agent()
+    orphan = _insert_legacy_action(None)
+
+    with pytest.raises(IntegrityError):
+        _insert_execution(agent_id, subject_action_id=orphan, state="requested")
 
 
 def test_executions_die_with_their_agent(isolated_migration_db: IsolatedMigrationDb) -> None:

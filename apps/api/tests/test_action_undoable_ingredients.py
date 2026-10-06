@@ -727,3 +727,142 @@ def test_the_forward_execution_that_created_a_record_does_not_block_its_undo(
     _execution(sealed_agent, action_id, state="confirmed", kind="forward")
 
     assert _undoable(client, auth_headers, action_id) is True
+
+
+# --------------------------------------------------------------------------- #
+# The undo route follows the derivation (ACTION-EXECUTOR-11)
+# --------------------------------------------------------------------------- #
+
+# What the forward call left, as a pre-sealing record stored it. The ruling is
+# sent the same value as its observation, so the only rule that can refuse
+# these undos is the derivation of ``undoable``: under the cleartext rule each
+# of them would be authorized.
+LEFT = {"spec": {"replicas": 10}}
+
+
+def _audit(client: Any, headers: dict[str, str], action_id: str) -> list[dict[str, Any]]:
+    response = client.get(f"/actions/{action_id}/audit", headers=headers)
+    assert response.status_code == 200, response.text
+    return list(response.json())
+
+
+def _assert_refused_without_a_grant(
+    client: Any, headers: dict[str, str], action_id: str, code: str
+) -> None:
+    """The ruling refused with ``code``, wrote that refusal, and granted nothing."""
+
+    assert _undoable(client, headers, action_id) is False
+
+    response = client.post(
+        f"/actions/{action_id}/undo",
+        json={"actor": "U-operator", "observed_state": LEFT},
+        headers=headers,
+    )
+
+    assert response.status_code in {409, 412, 503}, response.text
+    entries = _audit(client, headers, action_id)
+    assert [entry["action"] for entry in entries] == [code]
+    assert entries[0]["authorized"] is False
+    assert not any(entry["authorized"] for entry in entries)
+    after = client.get(f"/actions/{action_id}", headers=headers).json()
+    assert after["undone_at"] is None
+    assert after["undone_by"] is None
+
+
+def test_the_undo_route_refuses_a_legacy_cleartext_row_as_unsealed(
+    client: Any, auth_headers: dict[str, str], sealed_agent: str
+) -> None:
+    """@spec ACTION-EXECUTOR-11: "a legacy cleartext row is refused ``refused_unsealed``".
+
+    Shaped like a row written before this change: cleartext prior and post
+    state, no version, connector or digest. The read already calls it not
+    undoable; the ruling must agree, refuse it with the first missing
+    ingredient's code, and write no granted-undo audit row.
+    """
+
+    _capability(sealed_agent)
+    legacy = _action(
+        sealed_agent,
+        prior_state={"spec": {"replicas": 3}},
+        post_state=LEFT,
+        post_version=None,
+        connector=None,
+        connector_digest=None,
+    )
+
+    _assert_refused_without_a_grant(client, auth_headers, legacy, "refused_unsealed")
+
+
+def test_the_undo_route_refuses_a_cleartext_row_that_carries_every_other_ingredient(
+    client: Any, auth_headers: dict[str, str], sealed_agent: str
+) -> None:
+    """@spec ACTION-EXECUTOR-11: a cleartext ``prior_state`` alone is ``refused_unsealed``."""
+
+    _capability(sealed_agent)
+    cleartext = _action(sealed_agent, prior_state={"spec": {"replicas": 3}}, post_state=LEFT)
+
+    _assert_refused_without_a_grant(client, auth_headers, cleartext, "refused_unsealed")
+
+
+_RULING_CODE_FOR_MISSING_RECORD_INGREDIENT: dict[str, tuple[dict[str, Any], str]] = {
+    "no post_version": ({"post_version": None}, "refused_unversioned"),
+    "no connector_digest": ({"connector_digest": None}, "refused_no_digest"),
+}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "code"),
+    list(_RULING_CODE_FOR_MISSING_RECORD_INGREDIENT.values()),
+    ids=list(_RULING_CODE_FOR_MISSING_RECORD_INGREDIENT),
+)
+def test_the_undo_route_refuses_each_missing_record_ingredient_with_its_code(
+    client: Any,
+    auth_headers: dict[str, str],
+    sealed_agent: str,
+    overrides: dict[str, Any],
+    code: str,
+) -> None:
+    """@spec ACTION-EXECUTOR-11: "the undo route refuses the same action with that code"."""
+
+    _capability(sealed_agent)
+    action_id = _action(sealed_agent, post_state=LEFT, **overrides)
+
+    _assert_refused_without_a_grant(client, auth_headers, action_id, code)
+
+
+def test_the_undo_route_refuses_a_record_without_a_capability_row(
+    client: Any, auth_headers: dict[str, str], sealed_agent: str
+) -> None:
+    """@spec ACTION-EXECUTOR-11 @spec ACTION-EXECUTOR-13: ``refused_not_restore_capable``."""
+
+    action_id = _action(sealed_agent, post_state=LEFT)
+
+    _assert_refused_without_a_grant(client, auth_headers, action_id, "refused_not_restore_capable")
+
+
+def test_the_undo_route_refuses_a_record_without_key_custody(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec ACTION-EXECUTOR-11 @spec ACTION-EXECUTOR-16: ``refused_key_custody``.
+
+    The in-force version declares no ``SNAPSHOT_SEALING_KEY`` SecretRef on the
+    connector, so custody fails at ruling time exactly as it does at read time.
+    """
+
+    agent_id = _agent(client, auth_headers, name="uncustodied-bot")
+    _deploy(client, auth_headers, tmp_path, agent_id, UNSEALED)
+    _capability(agent_id)
+    action_id = _action(agent_id, post_state=LEFT)
+
+    _assert_refused_without_a_grant(client, auth_headers, action_id, "refused_key_custody")
+
+
+def test_the_undo_route_refuses_a_record_without_an_agent(
+    client: Any, auth_headers: dict[str, str], sealed_agent: str
+) -> None:
+    """@spec ACTION-EXECUTOR-11 @spec ACTION-EXECUTOR-3: ``refused_no_agent``."""
+
+    _capability(sealed_agent)
+    orphan = _action(None, post_state=LEFT)
+
+    _assert_refused_without_a_grant(client, auth_headers, orphan, "refused_no_agent")
