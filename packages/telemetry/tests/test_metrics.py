@@ -1088,3 +1088,38 @@ def test_e2e_reaper_health_gauges_are_declared_with_one_worker_series_each() -> 
 
     restart = manifest["curie.worker.supervised.restart"]["attributes"]["operation"]
     assert "e2e-reaper" in restart
+
+
+def test_thread_attachment_ledger_append_is_a_closed_worker_counter() -> None:
+    """ADR 0205 (#4141): a failed append after install loses that message's
+    files from later boots without failing the turn, so it is counted.
+
+    Closed on purpose: no thread, agent or event label, only the outcome.
+    """
+
+    definition = _read(_MANIFEST)["metrics"]["curie.attachments.ledger.append"]
+    assert definition["type"] == "counter"
+    assert definition["monotonic"] is True
+    assert set(definition["attributes"]) == {"service.name", "outcome"}
+    assert definition["attributes"]["service.name"] == ["curie-worker"]
+    assert "failure" in definition["attributes"]["outcome"]
+    assert definition["cardinality_bound"] <= 2
+
+
+def test_thread_attachment_ledger_append_rejects_a_thread_label_by_execution(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    del metrics
+    record_metric(
+        "curie.attachments.ledger.append",
+        attributes={"service.name": "curie-worker", "outcome": "failure"},
+    )
+    with pytest.raises(ValueError, match="undeclared attribute"):
+        record_metric(
+            "curie.attachments.ledger.append",
+            attributes={
+                "service.name": "curie-worker",
+                "outcome": "failure",
+                "thread_key": "slack:C1:1700000000.000100",
+            },
+        )

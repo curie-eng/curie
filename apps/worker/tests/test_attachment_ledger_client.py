@@ -31,6 +31,17 @@ Contract pinned here (the implementer follows these names):
         conflict, 413 thread full, 422) is not retried. An empty ``refs`` makes
         no request and returns 0. Redirects are never followed.
 
+Round 2 (#4141):
+
+* ``ThreadAttachmentRef`` gains ``event_id: str | None = None``: the query
+  answers each row with the event that recorded it, and ``from_wire`` reads it
+  when present. ``to_wire`` never sends it (the append names the event once,
+  and the API refuses an extra ref field with 422).
+* ``LedgerNotDeployed(LedgerUnavailable)``: ``query`` answered 404, an API that
+  does not have the routes yet. The kernel treats it as "no ledger".
+* A refused append's ``LedgerUnavailable`` message names the API's error code
+  (for example ``thread_attachment.name_mismatch``), so the WARNING says why.
+
 Only the API is faked (``httpx.MockTransport``); nothing else is mocked.
 """
 
@@ -299,3 +310,85 @@ def test_the_client_refuses_to_exist_without_the_worker_token(ledger: Any) -> No
 
     with pytest.raises(ValueError):
         asyncio.run(go())
+
+
+# --- round 2 (#4141) -------------------------------------------------------------
+
+
+def test_query_rows_carry_the_event_that_recorded_them_and_append_never_sends_it(
+    ledger: Any,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "refs": [
+                    {**_wire("F1", 0), "event_id": "ev-1"},
+                    {**_wire("F2", 0), "event_id": "ev-2"},
+                ]
+            },
+        )
+
+    async def go() -> Any:
+        client, http = _client(ledger, handler)
+        async with http:
+            return await client.query(agent_id=AGENT, thread_key=THREAD)
+
+    refs = asyncio.run(go())
+
+    assert [(ref.event_id, ref.file_id) for ref in refs] == [("ev-1", "F1"), ("ev-2", "F2")]
+    assert "event_id" not in refs[0].to_wire()
+    assert _ref(ledger).event_id is None
+
+
+def test_a_404_query_means_the_api_has_no_ledger_yet(ledger: Any) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    async def go() -> None:
+        client, http = _client(ledger, handler)
+        async with http:
+            await client.query(agent_id=AGENT, thread_key=THREAD)
+
+    with pytest.raises(ledger.LedgerNotDeployed) as raised:
+        asyncio.run(go())
+    assert isinstance(raised.value, ledger.LedgerUnavailable)
+
+
+@pytest.mark.parametrize("status", [500, 401])
+def test_other_query_failures_are_not_mistaken_for_a_missing_ledger(
+    ledger: Any, status: int
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"detail": "nope"})
+
+    async def go() -> None:
+        client, http = _client(ledger, handler)
+        async with http:
+            await client.query(agent_id=AGENT, thread_key=THREAD)
+
+    with pytest.raises(ledger.LedgerUnavailable) as raised:
+        asyncio.run(go())
+    assert not isinstance(raised.value, ledger.LedgerNotDeployed)
+
+
+def test_a_name_mismatch_append_names_the_code_and_is_not_retried(ledger: Any) -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            409, json={"detail": {"code": "thread_attachment.name_mismatch", "message": "x"}}
+        )
+
+    async def go() -> None:
+        client, http = _client(ledger, handler, append_attempts=3, retry_backoff_s=0.0)
+        async with http:
+            await client.append(
+                agent_id=AGENT, thread_key=THREAD, event_id="ev-1", refs=[_ref(ledger)]
+            )
+
+    with pytest.raises(ledger.LedgerUnavailable) as raised:
+        asyncio.run(go())
+    assert "thread_attachment.name_mismatch" in str(raised.value)
+    assert len(calls) == 1

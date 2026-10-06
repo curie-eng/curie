@@ -40,6 +40,26 @@ pinned in ``tests/test_attachment_thread_set.py``):
   ``prepare_thread_set(ledger_refs=(), ledger_unavailable=True)``. A turn that
   adopts a live route, steers it, or continues a sweep queries nothing and
   prepares nothing.
+
+Round 2 (#4141):
+
+* Stale route: a text turn whose locked lookup still names a live route but
+  whose sandbox is gone by the time it is claimed (``docker rm``, a pod no
+  longer Running) boots a fresh sandbox, and that boot carries the thread set.
+  A genuinely live adopt still carries nothing.
+* Ledger rows carry ``event_id``; the kernel passes ``event_id=qevent.event_id``
+  to ``prepare_thread_set``. A row with the same (event_id, file_id) is this
+  message's file under its recorded name; the same file id on a later event is
+  a new file with a new name, and its earlier row is an earlier file.
+* An append answered 409 ``thread_attachment.name_mismatch`` logs a WARNING
+  naming the code and the thread, and the turn completes.
+* Mixed rollout: a query answered 404 (an API without the routes) means "no
+  ledger": the file turn proceeds with its own files only and appends nothing,
+  a text boot carries no attachment env, and a WARNING is logged. Any other
+  query failure keeps the ADR behavior.
+* A failed append counts ``curie.attachments.ledger.append`` with
+  ``outcome=failure`` (``service.name=curie-worker``), declared in
+  ``packages/telemetry``.
 """
 
 from __future__ import annotations
@@ -53,16 +73,19 @@ import threading
 import time
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
+import pytest
 from aci_protocol import Attachment, Final, QueuedTurn, SessionStatus, TextDelta
 from curie_worker.attachments import AttachmentCoordinator, AttachmentLimits
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.kernel import routing
 from curie_worker.kernel.core import Kernel
+from curie_worker.ledger_client import ThreadAttachmentLedgerClient
 
 # importlib import mode does not add the test root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -173,7 +196,11 @@ class _FakeLedger:
         self.query_calls.append({"agent_id": agent_id, "thread_key": thread_key})
         if self.fail_query:
             raise _LedgerDown("ledger read refused")
-        return tuple(ref for _event_id, ref in self.rows.get((agent_id, thread_key), []))
+        # The API answers every row with the event that recorded it (#4141).
+        return tuple(
+            replace(ref, event_id=event_id)
+            for event_id, ref in self.rows.get((agent_id, thread_key), [])
+        )
 
     async def append(
         self, *, agent_id: str, thread_key: str, event_id: str, refs: Sequence[Any]
@@ -208,13 +235,19 @@ class _Ref:
 
     file_id: str
     disk_name: str
+    event_id: str | None = None
 
 
 class _FakeThreadSet:
     def __init__(self, call: dict[str, Any]) -> None:
         current = list(call.get("current") or ())
         current_ids = {item.id for item in current}
-        earlier = [ref for ref in call["ledger_refs"] if ref.file_id not in current_ids]
+        event_id = call.get("event_id")
+        earlier = [
+            ref
+            for ref in call["ledger_refs"]
+            if not (ref.event_id == event_id and ref.file_id in current_ids)
+        ]
         self.names = [ref.disk_name for ref in earlier] + [item.name for item in current]
         self.append_refs = tuple(_Ref(item.id, item.name) for item in current)
         self.ledger_unavailable = bool(call.get("ledger_unavailable"))
@@ -342,6 +375,7 @@ def test_a_file_turn_prepares_the_thread_set_and_appends_after_install(make_harn
             assert call["thread_key"] == thread_key
             assert call["agent_id"] == AGENT
             assert [item.id for item in call["current"]] == ["F1"]
+            assert call["event_id"] == event.event_id
             assert list(call["ledger_refs"]) == []
             assert call["ledger_unavailable"] is False
             assert call["deadline_epoch"] is not None
@@ -775,5 +809,317 @@ def test_a_sweep_continuation_reads_nothing_and_prepares_nothing(
             assert len(h.fake_k8s.claim_envs) == 1, "the continuation created a claim"
             assert ledger.query_calls == []
             assert lane.prepare_calls == []
+
+    asyncio.run(go())
+
+
+# --- round 2 (#4141) -------------------------------------------------------------------
+
+
+def _kill_after_next_lookup(
+    h: Any, monkeypatch: pytest.MonkeyPatch, thread_key: str, shape: str
+) -> list[int]:
+    """Let the kernel's next lookup see the live route, then take the sandbox away.
+
+    ``docker``: the container is removed, ``get_sandbox`` answers None, as
+    ``DockerSandboxClient`` does for a removed runner. ``k8s``: the sandbox is
+    no longer Running. Either way the route is still recorded when the kernel
+    decided, and the claim that follows has to cold-create.
+    """
+
+    fired: list[int] = []
+    hidden: set[str] = set()
+    real_lookup = h.substrate.lookup
+    real_get_sandbox = h.fake_k8s.get_sandbox
+
+    def get_sandbox(name: str, *, request_timeout_seconds: float) -> Any:
+        if name in hidden:
+            return None
+        return real_get_sandbox(name, request_timeout_seconds=request_timeout_seconds)
+
+    def lookup(key: str) -> Any:
+        handle = real_lookup(key)
+        if key == thread_key and handle is not None and not fired:
+            fired.append(1)
+            if shape == "docker":
+                hidden.add(handle.sandbox_name)
+            else:
+                h.fake_k8s.set_sandbox_mode(handle.sandbox_name, "Suspended")
+        return handle
+
+    monkeypatch.setattr(h.fake_k8s, "get_sandbox", get_sandbox)
+    monkeypatch.setattr(h.substrate, "lookup", lookup)
+    return fired
+
+
+@pytest.mark.parametrize("shape", ["docker", "k8s"])
+def test_a_dead_sandbox_behind_a_live_route_boots_with_the_whole_thread_set(
+    make_harness, monkeypatch, shape: str
+) -> None:
+    async def go() -> None:
+        async with make_harness(binding=_Binding(), per_sandbox_runners=2) as h:
+            lane, ledger = _wire(h)
+            _answer_everywhere(h)
+            thread = f"tStale{shape}"
+            thread_key = _thread_key(thread)
+            ledger.seed(thread_key, [_Ref("F1", "a.txt"), _Ref("F2", "b.txt")])
+
+            await h.kernel.process_event(_event("first", thread=thread))
+            await h.kernel.process_event(_event("second", thread=thread))
+            assert len(_claim_envs(h)) == 1, "a genuinely live route is adopted"
+            assert len(lane.prepare_calls) == 1, "and the adopt carries nothing"
+            old = h.substrate.lookup(thread_key)
+            assert old is not None
+
+            fired = _kill_after_next_lookup(h, monkeypatch, thread_key, shape)
+            await h.kernel.process_event(_event("third", thread=thread))
+
+            assert fired, "the kernel never looked the route up"
+            envs = _claim_envs(h)
+            assert len(envs) == 2, "the dead sandbox was replaced by a fresh claim"
+            assert envs[-1].get(REF_ENV) == "thread-set:a.txt,b.txt", (
+                "the fresh sandbox booted without the thread's earlier files"
+            )
+            new = h.substrate.lookup(thread_key)
+            assert new is not None and new.claim_name != old.claim_name
+            assert h.runners[h.fake_k8s.assigned_ports[new.sandbox_name]].opened == ["third"]
+
+    asyncio.run(go())
+
+
+def test_the_same_file_on_a_later_message_is_a_new_file_with_a_new_name(
+    make_harness,
+) -> None:
+    """Real coordinator: only (event_id, file_id) identifies a redelivery."""
+
+    async def go() -> None:
+        async with make_harness(binding=_Binding(), per_sandbox_runners=2) as h:
+            lane, _store = _real_lane({"F1": [b"report"]})
+            _lane, ledger = _wire(h, lane=lane)
+            _answer_everywhere(h)
+            thread = "tReattached"
+            for event_id in ("first-message", "later-message"):
+                await h.kernel.process_event(
+                    _event(
+                        "look",
+                        thread=thread,
+                        event_id=event_id,
+                        attachments=[Attachment(id="F1", name="report.pdf")],
+                    )
+                )
+
+            envs = _claim_envs(h)
+            assert [(e["n"], e["c"]) for e in _ref_entries(envs[-1])] == [
+                ("report.pdf", 0),
+                ("report-2.pdf", 1),
+            ]
+            held = ledger.rows[(AGENT, _thread_key(thread))]
+            assert [(event_id, ref.disk_name) for event_id, ref in held] == [
+                ("first-message", "report.pdf"),
+                ("later-message", "report-2.pdf"),
+            ]
+
+    asyncio.run(go())
+
+
+class _Api:
+    """The API's two internal routes, answered over ``httpx.MockTransport``."""
+
+    def __init__(
+        self,
+        *,
+        query_status: int = 200,
+        append_status: int = 200,
+        append_body: dict[str, Any] | None = None,
+    ) -> None:
+        self.query_status = query_status
+        self.append_status = append_status
+        self.append_body = append_body
+        self.queries: list[dict[str, Any]] = []
+        self.appends: list[dict[str, Any]] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.path.endswith("/query"):
+            self.queries.append(body)
+            if self.query_status != 200:
+                return httpx.Response(self.query_status, json={"detail": "Not Found"})
+            return httpx.Response(200, json={"refs": []})
+        self.appends.append(body)
+        if self.append_status != 200:
+            return httpx.Response(self.append_status, json=self.append_body or {})
+        return httpx.Response(200, json={"appended": len(body["refs"])})
+
+    def client(self) -> tuple[ThreadAttachmentLedgerClient, httpx.AsyncClient]:
+        http = httpx.AsyncClient(transport=httpx.MockTransport(self.handler))
+        return (
+            ThreadAttachmentLedgerClient(
+                api_base_url="http://curie-api:8000",
+                worker_token="worker-token",
+                client=http,
+                retry_backoff_s=0.0,
+            ),
+            http,
+        )
+
+
+def test_a_name_mismatch_on_append_is_logged_and_the_turn_completes(
+    make_harness, caplog
+) -> None:
+    async def go() -> None:
+        api = _Api(
+            append_status=409,
+            append_body={
+                "detail": {
+                    "code": "thread_attachment.name_mismatch",
+                    "message": "disk_name differs from the recorded one",
+                }
+            },
+        )
+        client, http = api.client()
+        async with http, make_harness(binding=_Binding()) as h:
+            lane, _store = _real_lane({"F1": [b"bytes"]})
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.kernel._attachment_ledger = client  # type: ignore[attr-defined]
+            _answer_everywhere(h, "read it")
+            event = _event(
+                "read", thread="tNameMismatch", attachments=[Attachment(id="F1", name="a.txt")]
+            )
+
+            with caplog.at_level("WARNING", logger="curie_worker"):
+                await h.kernel.process_event(event)
+
+            assert len(api.appends) == 1
+            assert h.sink.last_text == "read it"
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            warnings = [
+                record.getMessage()
+                for record in caplog.records
+                if record.levelname == "WARNING" and "name_mismatch" in record.getMessage()
+            ]
+            assert warnings and _thread_key("tNameMismatch") in warnings[0]
+
+    asyncio.run(go())
+
+
+def test_an_api_without_the_ledger_routes_leaves_a_file_turn_as_it_was(
+    make_harness, caplog
+) -> None:
+    """Mixed rollout: a 404 is "no ledger", never a refusal of the person's file."""
+
+    async def go() -> None:
+        api = _Api(query_status=404)
+        client, http = api.client()
+        async with http, make_harness(binding=_Binding()) as h:
+            lane, _store = _real_lane({"F1": [b"bytes"]})
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.kernel._attachment_ledger = client  # type: ignore[attr-defined]
+            _answer_everywhere(h, "read it")
+            event = _event(
+                "read", thread="tNoRoutesFile", attachments=[Attachment(id="F1", name="a.txt")]
+            )
+
+            with caplog.at_level("WARNING", logger="curie_worker"):
+                await h.kernel.process_event(event)
+
+            envs = _claim_envs(h)
+            assert len(envs) == 1, "the file turn was refused"
+            assert [entry["n"] for entry in _ref_entries(envs[0])] == ["a.txt"]
+            assert MANIFEST_ENV not in envs[0] or not json.loads(envs[0][MANIFEST_ENV]).get(
+                "ledger_unavailable"
+            )
+            assert api.appends == [], "with no ledger there is nothing to append to"
+            assert h.sink.last_text == "read it"
+            assert any(
+                record.levelname == "WARNING" and "ledger" in record.getMessage().lower()
+                for record in caplog.records
+            )
+
+    asyncio.run(go())
+
+
+def test_an_api_without_the_ledger_routes_boots_a_text_turn_without_attachment_env(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        api = _Api(query_status=404)
+        client, http = api.client()
+        async with http, make_harness(binding=_Binding()) as h:
+            lane, _store = _real_lane({})
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.kernel._attachment_ledger = client  # type: ignore[attr-defined]
+            _answer_everywhere(h)
+
+            await h.kernel.process_event(_event("hello", thread="tNoRoutesText"))
+
+            env = _claim_envs(h)[-1]
+            assert REF_ENV not in env
+            assert MANIFEST_ENV not in env, "a missing route is not an unavailable ledger"
+
+    asyncio.run(go())
+
+
+def test_any_other_ledger_failure_still_refuses_a_file_turn(make_harness, caplog) -> None:
+    async def go() -> None:
+        api = _Api(query_status=503)
+        client, http = api.client()
+        async with http, make_harness(binding=_Binding()) as h:
+            lane, _store = _real_lane({"F1": [b"bytes"]})
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.kernel._attachment_ledger = client  # type: ignore[attr-defined]
+            _answer_everywhere(h)
+            event = _event(
+                "read", thread="tLedger503", attachments=[Attachment(id="F1", name="a.txt")]
+            )
+
+            with caplog.at_level("WARNING", logger="curie_worker.kernel"):
+                await h.kernel.process_event(event)
+
+            assert h.fake_k8s.claim_envs == []
+            assert "stage=ledger" in caplog.text
+
+    asyncio.run(go())
+
+
+def _record_metrics(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, str]]]:
+    """Wrap ``record_metric`` everywhere the kernel can reach it; the real
+    declaration check still runs on every point."""
+
+    import curie_telemetry
+    from curie_worker.kernel import attachments as kernel_attachments
+    from curie_worker.kernel import claim as kernel_claim
+    from curie_worker.kernel import log as kernel_log
+
+    points: list[tuple[str, dict[str, str]]] = []
+    real = curie_telemetry.record_metric
+
+    def recording(
+        name: str, value: float = 1, *, attributes: dict[str, str] | None = None
+    ) -> None:
+        points.append((name, dict(attributes or {})))
+        real(name, value, attributes=attributes)
+
+    for module in (curie_telemetry, kernel_log, kernel_attachments, kernel_claim):
+        if hasattr(module, "record_metric"):
+            monkeypatch.setattr(module, "record_metric", recording)
+    return points
+
+
+def test_a_failed_append_is_counted(make_harness, monkeypatch) -> None:
+    async def go() -> None:
+        points = _record_metrics(monkeypatch)
+        async with make_harness(binding=_Binding()) as h:
+            _lane, ledger = _wire(h)
+            ledger.fail_append = True
+            _answer_everywhere(h)
+
+            await h.kernel.process_event(
+                _event("read", thread="tCounted", attachments=[Attachment(id="F1", name="a")])
+            )
+
+            appended = [
+                attrs for name, attrs in points if name == "curie.attachments.ledger.append"
+            ]
+            assert appended == [{"service.name": "curie-worker", "outcome": "failure"}]
 
     asyncio.run(go())

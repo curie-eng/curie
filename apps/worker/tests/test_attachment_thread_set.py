@@ -33,11 +33,15 @@ pinned in ``tests/kernel/test_thread_attachment_rebuild.py``):
         with the same two refusals (no endpoint: stage ``wiring``; no secret for
         the adapter: stage ``credential``).
     ``AttachmentCoordinator.prepare_thread_set(*, thread_key, agent_id,
-        ledger_refs, current=(), identity=DEFAULT_IDENTITY, handle=None,
+        ledger_refs, current=(), event_id=None, identity=DEFAULT_IDENTITY, handle=None,
         routes=(), deadline_epoch=None, ledger_unavailable=False)
         -> PreparedThreadSet``.
         ``ledger_refs`` are ``curie_worker.ledger_client.ThreadAttachmentRef``
-        in arrival order. ``current`` is the message's ``Attachment`` list.
+        in arrival order. ``event_id`` (round 2, #4141) is the current
+        message's event: a row with the same (event_id, file_id) is this
+        message's file under its recorded name; the same file id on another
+        event is an earlier file, and the current one gets a new name.
+        ``current`` is the message's ``Attachment`` list.
         ``deadline_epoch`` is measured on the coordinator's ``clock``. The
         current message's files are fetched first and any failure raises (and
         leaves no object or owner record behind). Earlier files are then taken
@@ -81,6 +85,7 @@ conforming ``RetainingObjectStore`` from ``attachment_fixtures.py``.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import importlib
 import json
@@ -205,8 +210,11 @@ def _prepare(
     identity: str = "default",
     deadline_epoch: float | None = None,
     ledger_unavailable: bool = False,
+    event_id: str | None = None,
 ) -> Any:
+    extra = {} if event_id is None else {"event_id": event_id}
     return coordinator.prepare_thread_set(
+        **extra,
         thread_key=THREAD_KEY,
         agent_id=AGENT_ID,
         ledger_refs=list(ledger_refs),
@@ -217,6 +225,12 @@ def _prepare(
         deadline_epoch=deadline_epoch,
         ledger_unavailable=ledger_unavailable,
     )
+
+
+def _as_rows(refs: Sequence[Any], event_id: str) -> list[Any]:
+    """Refs as the ledger query answers them: each row names its event (#4141)."""
+
+    return [dataclasses.replace(ref, event_id=event_id) for ref in refs]
 
 
 def _ref_entries(env: dict[str, str]) -> list[dict[str, Any]]:
@@ -404,11 +418,14 @@ def test_a_redelivered_current_file_keeps_its_recorded_name_and_appears_once(
 
     files = FakeSlackFiles({"C1": [b"same"]})
     coordinator, _store, _clock = _coordinator(attachments, files=files)
-    first = _prepare(coordinator, current=[Attachment(id="C1", name="report.pdf")])
+    first = _prepare(
+        coordinator, event_id="ev-1", current=[Attachment(id="C1", name="report.pdf")]
+    )
 
     again = _prepare(
         coordinator,
-        ledger_refs=first.append_refs,
+        event_id="ev-1",
+        ledger_refs=_as_rows(first.append_refs, "ev-1"),
         current=[Attachment(id="C1", name="report.pdf")],
     )
 
@@ -417,6 +434,33 @@ def test_a_redelivered_current_file_keeps_its_recorded_name_and_appears_once(
     ]
     assert [ref.disk_name for ref in again.append_refs] == ["report.pdf"]
     assert [entry["n"] for entry in _ref_entries(again.claim_env())] == ["report.pdf"]
+
+
+def test_the_same_file_id_on_a_later_message_is_a_new_file_with_a_new_name(
+    attachments: Any, ledger: Any
+) -> None:
+    """#4141: only the same (event_id, file_id) is a redelivery. The same file
+    re-attached on a later message is a new file, and its earlier row is an
+    earlier file."""
+
+    files = FakeSlackFiles({"C1": [b"same"]})
+    coordinator, _store, _clock = _coordinator(attachments, files=files)
+    first = _prepare(
+        coordinator, event_id="ev-1", current=[Attachment(id="C1", name="report.pdf")]
+    )
+
+    later = _prepare(
+        coordinator,
+        event_id="ev-2",
+        ledger_refs=_as_rows(first.append_refs, "ev-1"),
+        current=[Attachment(id="C1", name="report.pdf")],
+    )
+
+    assert [(entry.disk_name, entry.current) for entry in later.entries] == [
+        ("report.pdf", False),
+        ("report-2.pdf", True),
+    ]
+    assert [ref.disk_name for ref in later.append_refs] == ["report-2.pdf"]
 
 
 # --- what is recorded for the current message --------------------------------------
