@@ -83,9 +83,18 @@ The chart gains `testInstallation.enabled` (default `false`) and
 (`B…`) and that bot's user id (`U…`). It is validated like a
 `threadedBotAllowlist` pair.
 
+A driver may run in another installation, or in this one as a sibling identity
+([ADR 0168](0168-one-installation-hosts-several-bot-identities.md)). A sibling
+driver's entry also names the one agent that identity serves, for example
+`mean-tester`. Running the tester beside its target lets it use that
+installation's model credential and repository workspace, instead of carrying
+its own.
+
 - **Turning it on is the operator's statement** that every credential this
   installation's agents hold reaches only test accounts. It is also a statement
-  that no driver's Slack token is reachable by those agents.
+  that a driver's Slack token is reachable by no agent other than the driver
+  itself. For a sibling driver, that token is in its own agent's connector
+  secrets and in no other agent's.
 - **The chart refuses to render it** in three cases. The check is in
   `values.schema.json` and a template `fail`.
   - when `api.environment` is `prod`, as a tripwire, not as evidence;
@@ -97,10 +106,17 @@ The chart gains `testInstallation.enabled` (default `false`) and
 - **The API and the dispatcher receive the setting explicitly** and check it at
   boot. Whenever it is on, each one also refuses to boot on a published default
   secret. The chart cannot see a secret supplied through `existingSecret`, and
-  a local compose stack never renders the chart. The dispatcher's preflight refuses any driver whose bot id or user id
-  is one of this installation's own identities (`auth.test` and ADR 0168's
-  sibling identities). Otherwise the agent under test could answer its own
-  approval cards.
+  a local compose stack never renders the chart.
+- **The dispatcher's preflight keeps a driver identity to its own agent.** The
+  risk it guards is an agent under test posting as a driver and answering its
+  own approval cards. The preflight therefore refuses:
+  - a driver that is the installation's authorized identity (`auth.test`);
+  - a sibling driver whose entry names no agent;
+  - a sibling driver whose identity is bound to any agent other than the one
+    its entry names.
+
+  Every other agent replies through its own identity, so none of them can post
+  as the driver.
 - **The setting comes only from the chart.** It is never derived from a channel
   name, a deployment's `env`, a bundle, or anything an agent or a message says.
 - **A test installation owns its Slack app exclusively.** Admission is per
@@ -118,7 +134,8 @@ on every installation.
 
 - **On a test installation, a marked message from a listed driver in its listed
   channel is admitted**, at root and inside threads, with no
-  `threadedBotAllowlist` pair. Where an ADR 0175 caller list is configured, the
+  `threadedBotAllowlist` pair. A sibling driver's thread mentions are already
+  admitted as an own identity's. Where an ADR 0175 caller list is configured, the
   driver must be on it as well. The chart sets a per-thread cap on driver-started
   turns. A driver is itself an agent that reads the target's replies, and the
   cap bounds a loop between them.
@@ -202,6 +219,10 @@ and snapshots in
 
 - **A tester can drive the whole flow** on a test installation: ask for an
   action, answer its approval card, and check the result.
+- **A sibling driver shares its target's installation.** It uses the same model
+  credential, sandbox capacity and platform. It cannot report an outage that
+  takes the platform down with it, and its turns compete with real users for
+  sandboxes.
 - **Production behavior does not change for people.** A marked bot message is
   dropped there before a turn, so a misdirected driver learns at its first ping
   that it may not act.
@@ -252,6 +273,11 @@ and snapshots in
 - **Trust a target that says it is a test installation.** Rejected, as in ADR
   0181: the claim would come from the component under test. The admission reply
   comes from the dispatcher, without a turn.
+- **Forbid every own identity as a driver.** An earlier revision did, to keep the
+  agent under test from answering its own cards. That also forbade a tester
+  placed beside its target, which is the cheapest way to give it a model
+  credential and repository access. What has to be prevented is posting as the
+  driver, and binding the driver identity to one agent prevents it.
 - **Gate only in the dispatcher.** Rejected: a dispatcher and an API whose
   settings drift apart would let a driver resolve on a non-test installation.
   The API checks independently (decision 5).
@@ -267,7 +293,8 @@ Nothing implements this Draft. On acceptance, one issue tracks each path:
    - `apps/api/src/curie_api/config.py`;
    - `apps/dispatcher/src/curie_dispatcher/config.py`;
    - the boot-time default-secret refusal in both;
-   - the dispatcher's preflight identity check.
+   - the dispatcher's preflight identity check, including the agent binding of
+     a sibling driver.
 2. **Admission and refusal:**
    - `apps/dispatcher/src/curie_dispatcher/relevance.py` (`TEST_ACTION_REFUSED`
      and the driver admission);
