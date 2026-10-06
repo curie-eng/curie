@@ -199,6 +199,16 @@ returns conflict. A preparing retry must match that same original tuple and
 exact payload/envelope digests before recovery; it cannot choose a new event,
 selection or reserved stream ID. Failed never becomes new admission. Invalid
 or missing original evidence closes, rather than inferring success from stream.
+Intent, State, commit, recovery, source and binding are read by separate GETs,
+not one atomic snapshot, so a concurrent admission of the same delivery that
+commits between those reads can present an internally inconsistent view, such
+as State or commit without Intent. Before refusing on such a view, the facade
+re-reads every admission record it read. If any changed, the view was torn and
+the attempt is retried within the existing bounded attempt loop; exhausting
+that loop is unavailable. Only a view confirmed consistent by an unchanged
+re-read that still violates these invariants refuses as unavailable. A retry
+authorizes nothing by itself: EVAL still compares the exact raw snapshots it
+receives before any write.
 HTTP current authentication and cross-store ordinary receipt exclusion remain
 mandatory caller responsibilities in the parent SOURCE-8 integration.
 

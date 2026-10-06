@@ -9,6 +9,7 @@ from . import admission_broker as broker_helpers
 from .admission_broker import (
     SOURCE,
     canonical,
+    client,
     facade,
     install,
     module,
@@ -83,6 +84,69 @@ def test_concurrent_delivery_has_one_intent_member_and_entry(admission_broker):
     assert all(o["receipt"] == outputs[0]["receipt"] for o in outputs)
     assert len(b.command("KEYS", "protected:admission:intent:*")) == 1
     assert b.command("ZCARD", "protected:admission:quota") == b.command("XLEN", "curie:runs") == 1
+
+
+class CompetingClient:
+    """Caller supplied client that lets a real competing admission of the same delivery
+    commit between the facade's separate GETs, @spec PROTECTED-HOOK-ADMISSION-4."""
+
+    def __init__(self, inner, compete=None):
+        self._inner = inner
+        self._compete = compete
+        self.gets = []
+
+    def get(self, key):
+        self.gets.append(key)
+        if self._compete is not None and key.startswith("protected:admission:state:"):
+            compete, self._compete = self._compete, None
+            compete()
+        return self._inner.get(key)
+
+    def eval(self, *args):
+        return self._inner.eval(*args)
+
+
+def proxied(broker, atomic, proxy):
+    """Same trusted tuple as facade over the wrapped client, @spec PROTECTED-HOOK-ADMISSION-1."""
+    return atomic.AtomicAdmission(
+        proxy,
+        broker_identity=broker.manifest().as_dict()["broker_identity"],
+        trusted_max_readiness_ms=60000,
+        backlog_limit=1,
+    )
+
+
+def test_commit_between_reads_returns_original_duplicate(admission_broker):
+    """A torn view from a concurrent commit is retried, @spec PROTECTED-HOOK-ADMISSION-4/7."""
+    b = admission_broker
+    r, competitor, _ = setup_product(b, 1)
+    atomic = module("atomic_admission")
+    req = request(r)
+    won = []
+    proxy = CompetingClient(client(b), lambda: won.append(competitor.admit(req).as_dict()))
+    out = proxied(b, atomic, proxy).admit(req).as_dict()
+    assert won and won[0]["status"] == "accepted"
+    assert out == dict(status="duplicate", reason=None, receipt=won[0]["receipt"])
+    assert len(b.command("KEYS", "protected:admission:intent:*")) == 1
+    assert b.command("ZCARD", "protected:admission:quota") == b.command("XLEN", "curie:runs") == 1
+
+
+def test_stable_orphan_combination_still_refuses_without_retry(admission_broker):
+    """A re-read that confirms the view refuses, @spec PROTECTED-HOOK-ADMISSION-4/7."""
+    b = admission_broker
+    r, f, _ = setup_product(b, 1)
+    atomic = module("atomic_admission")
+    req = request(r)
+    assert f.admit(req).as_dict()["status"] == "accepted"
+    d = r.delivery_digest(req.identity)
+    b.command("DEL", "protected:admission:intent:" + d)
+    before = snapshot(b)
+    proxy = CompetingClient(client(b))
+    with pytest.raises(r.AdmissionUnavailable) as caught:
+        proxied(b, atomic, proxy).admit(req)
+    safe_error(caught.value, b)
+    assert snapshot(b) == before
+    assert proxy.gets.count("protected:admission:intent:" + d) <= 2
 
 
 @pytest.mark.parametrize("closed", ["readiness", "selection", "manifest", "quota", "trim"])
