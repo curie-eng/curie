@@ -193,8 +193,10 @@ The platform does not:
 
 A driver can read what a tool reports it changed
 ([ADR 0117](0117-a-tool-that-changes-the-world-reports-what-it-changed.md)).
-Restore remains the subject of Draft
-[ADR 0121](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md).
+Restore is decided in
+[ADR 0121](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md),
+and snapshots in
+[ADR 0124](0124-a-snapshot-is-sealed-to-the-connector-that-wrote-it.md).
 
 ## Consequences
 
