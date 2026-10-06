@@ -32,7 +32,7 @@ def test_candidate_requires_exact_ledger_schema(resource: str) -> None:
         if resource == "api"
         else catalog()["candidate"]
     )
-    assert window == {"schema_min": "0076", "schema_head": "0080"}
+    assert window == {"schema_min": "0076", "schema_head": "0081"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -50,8 +50,8 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
     data = catalog()
     assert data["windows"].get("0.12.1") == {"schema_min": "0076", "schema_head": "0076"}
-    assert data["windows"].get("0.12.2") == {"schema_min": "0076", "schema_head": "0080"}
-    assert data["revisions"][-3:] == ["0076", "0079", "0080"]
+    assert data["windows"].get("0.12.2") == {"schema_min": "0076", "schema_head": "0081"}
+    assert data["revisions"][-4:] == ["0076", "0079", "0080", "0081"]
     assert (
         json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())["0076"]
         == "expand"
