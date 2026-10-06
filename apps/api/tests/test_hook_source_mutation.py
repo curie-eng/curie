@@ -10,7 +10,6 @@ import asyncio
 import hashlib
 import importlib
 import importlib.util
-import inspect
 import json
 import uuid
 from collections.abc import AsyncIterator
@@ -443,19 +442,14 @@ def test_enable_rotate_remove_reenable_preserves_counter_and_closed_authority(
 def test_current_ordinary_replay_bypasses_stale_cas_without_new_sql(
     mechanics: Any, method: str
 ) -> None:
-    """Starts from pending history: an absent row without history is 409.
-
-    @spec PROTECTED-HOOK-SOURCE-3/6/7/10.
-    """
+    """@spec PROTECTED-HOOK-SOURCE-3/6/10."""
     module = product()
-    seed(mechanics, generation=4, pending=True, policy=False)
 
     async def scenario() -> None:
         """@spec PROTECTED-HOOK-SOURCE-3/6/10."""
         async with coordinator(module, mechanics) as (service, authority, _, _):
             operation = str(uuid.uuid4())
             first = await service.remove(mechanics["agent"], HOOK, "0", operation)
-            assert first.generation == 5
             before = await observe(mechanics)
             args = (mechanics["agent"], HOOK, "0", operation)
             second = await (
@@ -566,12 +560,8 @@ def test_actual_phase_failures_preserve_exact_durable_boundary(mechanics: Any, f
 def test_delayed_ordinary_cas_loses_after_new_operation_and_gate_is_released(
     mechanics: Any,
 ) -> None:
-    """Starts from pending history: an absent row without history is 409.
-
-    @spec PROTECTED-HOOK-SOURCE-2/6/7/10.
-    """
+    """@spec PROTECTED-HOOK-SOURCE-2/6/7/10."""
     module = product()
-    seed(mechanics, generation=4, pending=True, policy=False)
 
     async def scenario() -> None:
         """@spec PROTECTED-HOOK-SOURCE-2/6/7/10."""
@@ -589,15 +579,15 @@ def test_delayed_ordinary_cas_loses_after_new_operation_and_gate_is_released(
                         pass
                 async with coordinator(module, mechanics) as (new, _, _, _):
                     await rejected(
-                        new.mutate(mechanics["agent"], HOOK, "5", str(uuid.uuid4()), PROTECTED),
+                        new.mutate(mechanics["agent"], HOOK, "1", str(uuid.uuid4()), PROTECTED),
                         503,
-                        "6",
+                        "2",
                     )
                 before = await observe(mechanics)
                 authority.publish_release.set()
-                await rejected(task, 503, "5")
+                await rejected(task, 503, "1")
                 assert await observe(mechanics) == before
-                assert json.loads(before[1])["floor"] == "6"
+                assert json.loads(before[1])["floor"] == "2"
                 assert json.loads(before[1])["active"] is None
             finally:
                 task.cancel()
@@ -610,12 +600,8 @@ def test_delayed_ordinary_cas_loses_after_new_operation_and_gate_is_released(
 def test_boundary_wait_cancellation_or_actual_gate_loss_precedes_registration(
     mechanics: Any, fault: str
 ) -> None:
-    """Starts from pending history: an absent row without history is 409.
-
-    @spec PROTECTED-HOOK-SOURCE-2/10.
-    """
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
     module = product()
-    seed(mechanics, generation=4, pending=True, policy=False)
 
     async def scenario() -> None:
         """@spec PROTECTED-HOOK-SOURCE-2/10."""
@@ -657,44 +643,6 @@ def test_boundary_wait_cancellation_or_actual_gate_loss_precedes_registration(
                 await asyncio.gather(task, return_exceptions=True)
 
     run(scenario())
-
-
-@pytest.mark.parametrize("composed", [True, False], ids=["resolver", "no-resolver"])
-@pytest.mark.parametrize("expected", ["0", "7"])
-def test_remove_of_absent_row_without_history_is_409_source_not_configured(
-    mechanics: Any, expected: str, composed: bool
-) -> None:
-    """One service path: the coordinator's own remove refuses, no caller flag needed.
-
-    Right after the agent lookup and before CAS, with no resolution,
-    registration, broker call or write; pending history alone still commits a
-    tombstone (see the replay and recovery tests). An unknown agent stays 404.
-    @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-10.
-    """
-    module = product()
-
-    async def scenario() -> None:
-        """@spec PROTECTED-HOOK-SOURCE-3/10."""
-        before = await observe(mechanics)
-        async with coordinator(module, mechanics, unavailable=not composed) as (
-            service,
-            authority,
-            _,
-            _,
-        ):
-            error = await rejected(
-                service.remove(mechanics["agent"], HOOK, expected, str(uuid.uuid4())), 409
-            )
-            assert error.code == "source_not_configured"
-            await rejected(
-                service.remove(str(uuid.uuid4()), HOOK, expected, str(uuid.uuid4())), 404
-            )
-            assert authority.resolve_calls == 0 and authority.publish_calls == 0
-        assert await observe(mechanics) == before
-
-    run(scenario())
-    parameters = inspect.signature(module.SourceMutationCoordinator.remove).parameters
-    assert list(parameters) == ["self", "agent_id", "hook", "expected_generation", "operation_id"]
 
 
 def test_constructor_rejects_same_underlying_pool_alias_before_checkout(mechanics: Any) -> None:

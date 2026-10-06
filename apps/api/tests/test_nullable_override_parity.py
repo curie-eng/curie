@@ -78,7 +78,6 @@ KNOWN_BODY_MODULES = frozenset(
     {
         "curie_api.factory_progress",
         "curie_api.factory_usage",
-        "curie_api.hook_source_policy_schemas",
         "curie_api.schemas",
         "curie_api.turn_progress",
         "aci_protocol.turn",

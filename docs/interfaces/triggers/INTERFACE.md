@@ -145,26 +145,6 @@ another handler that mints a `QueuedTurn` with the right `source`. The eight tha
   restart its signer. The [Alert source installation](../../../examples/sre-bot/README.md#alert-source-opt-in)
   documents the existing ConfigMap update steps.
 
-  **Source policy administration (operator note, #3603):** the routes
-  `GET`, `PUT` and `DELETE /agents/{agent_id}/hooks/{hook}/source-policy`,
-  `POST .../rotate` and `GET .../secret` take the platform key or a live console
-  session, never a hook signature. Every mutation needs the provisioner's
-  runtime directory, including its `source_writer.json`; without it each one
-  answers 503 `runtime_unavailable` and changes nothing. A protected `PUT` or
-  `rotate` that answers 503 `source_publication_deferred` with a
-  `committed_generation` has committed: the policy row is durable, the first
-  protected policy of an agent advanced its legacy hook counter, which
-  invalidates every ordinary hook key of that agent, and the source stays
-  closed until the LANE-4 ingress admission change (#4075). It is not a
-  transient failure; do not retry it with a new operation. Reissue the
-  agent's ordinary keys through the legacy `GET /agents/{agent_id}/hook-secret`
-  route. `DELETE` commits and publishes an ordinary tombstone without moving
-  the counter, but ingress keeps refusing a tombstoned hook until the same
-  LANE-4 change admits tombstones. After that change, an exact replay of a
-  deferred protected operation publishes it when its broker reservation still
-  matches, and otherwise a fresh `rotate` does. The `secret` route refuses
-  every state until then.
-
 The eight share no abstraction: a Slack Bolt event listener, three paths through a
 FastAPI GitHub HMAC route, three asyncio timers, and a FastAPI generic HMAC route. The GitHub push
 and commit poll converge one step earlier than the others -- both call
