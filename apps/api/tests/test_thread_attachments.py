@@ -274,6 +274,37 @@ def test_a_redelivered_append_records_nothing_twice_and_keeps_the_order(
     assert len(_stored(aid)) == 3
 
 
+def test_a_redelivery_that_renames_a_recorded_file_is_refused_whole(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """A disk name is fixed when it is recorded (ADR 0205 decision 4). A
+    redelivery naming a recorded (event, file) differently must not be
+    swallowed as a no-op: the worker would then tell the agent a path the
+    ledger never holds."""
+    aid = _agent(client, auth_headers)
+    assert _appended(client, aid, "evt-1", [_ref("F0A", 0), _ref("F0B", 1)]) == 2
+
+    renamed = _append(
+        client,
+        aid,
+        "evt-1",
+        [_ref("F0A", 0), _ref("F0B", 1, disk_name="renamed.pdf"), _ref("F0C", 2)],
+    )
+    _refused(renamed, 409, "thread_attachment.name_mismatch")
+    body = renamed.text.lower()
+    for leaked in ("http://", "https://", "endpoint", "url"):
+        assert leaked not in body, renamed.text
+
+    # Nothing written: no F0C, and F0B keeps its recorded name.
+    refs = _query(client, aid)
+    assert _file_ids(refs) == ["F0A", "F0B"]
+    assert [ref["disk_name"] for ref in refs] == ["F0A.pdf", "F0B.pdf"]
+    assert len(_stored(aid)) == 2
+
+    # An identical redelivery is still an idempotent no-op.
+    assert _appended(client, aid, "evt-1", [_ref("F0A", 0), _ref("F0B", 1)]) == 0
+
+
 def test_the_same_file_on_a_later_event_is_a_new_reference(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
