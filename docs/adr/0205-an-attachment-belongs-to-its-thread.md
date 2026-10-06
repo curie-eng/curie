@@ -170,9 +170,12 @@ becomes a turn, and this ADR does not change that.
   what keeps a restarted pod from failing on a file it no longer needs.
 - The per-turn `max_files` cap still applies to one message. The per-thread
   budget is separate.
-- The worker writes a second kind of thread state through the API, so API
-  unavailability during a file-carrying turn now fails that turn before the
-  claim, the same way a failed resolve does today.
+- The worker reads a second kind of thread state through the API before it
+  names a message's files, so a failed ledger read refuses a file-carrying
+  turn before the claim, the same way a failed resolve does today. The append
+  happens after install, so a failed append does not fail the turn the person
+  is waiting on. It is logged and counted, and that message's files are
+  missing from later boots.
 - The #4086 stopgap's `carry` is replaced by the ledger read and is removed when
   this lands on the stable line.
 
