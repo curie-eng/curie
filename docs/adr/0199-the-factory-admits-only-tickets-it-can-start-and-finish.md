@@ -4,6 +4,13 @@ Date: 2026-10-05
 
 Status: Accepted
 
+**Partially amended by [ADR 0204](0204-the-factory-checks-its-environment-before-it-admits-a-ticket.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+decision 2's "can it start" gains an environment half (model credit, base
+branch health, runner toolchain, and a sandbox canary), checked before the
+ticket checks, and a failing environment check is decision 6's `unknown`, never
+a rejection. Everything else in this ADR stands.
+
 Accepted 2026-10-05 with explicit maintainer approval from Brian Conn
 (TheConnMan), given after the Draft merged in
 [#4020](https://github.com/curie-eng/curie/pull/4020).

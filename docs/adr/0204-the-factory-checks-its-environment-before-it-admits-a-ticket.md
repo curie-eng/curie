@@ -2,15 +2,18 @@
 
 Date: 2026-10-06
 
-Status: Draft
+Status: Accepted
 
-This Draft proposes to amend [ADR 0199](0199-the-factory-admits-only-tickets-it-can-start-and-finish.md)
-(Accepted). It adds an environment half to that ADR's "can it start" question
-and routes an environment failure to its internal `unknown` verdict, never to a
-ticket rejection. Everything else in ADR 0199 stands. If accepted, ADR 0199
-gains the back link that
-[ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)
-allows.
+Accepted 2026-10-06 with explicit maintainer approval from Brian Conn
+(TheConnMan), given after the Draft merged in
+[#4106](https://github.com/curie-eng/curie/pull/4106).
+
+This ADR partially amends [ADR 0199](0199-the-factory-admits-only-tickets-it-can-start-and-finish.md)
+(Accepted), back-linked there under
+[ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md).
+It adds an environment half to that ADR's "can it start" question and routes
+an environment failure to its internal `unknown` verdict, never to a ticket
+rejection. Everything else in ADR 0199 stands.
 
 ## Context
 
@@ -191,8 +194,8 @@ agent's own template tests the path a run uses.
 
 ## Implementation
 
-Not authorized while Draft. On acceptance, the work splits into: the four
-environment checks and their reason codes in the ADR 0199 gate; the canary
-scheduler, result table, and pod event capture; the manifest's registry host
-declaration and `curie build` probes; and the CLI admission read, metric, and
-alert for environment reasons.
+Acceptance authorizes implementation, tracked in linked GitHub issues. The work
+splits into: the four environment checks and their reason codes in the ADR 0199
+gate; the canary scheduler, result table, and pod event capture; the manifest's
+registry host declaration and `curie build` probes; and the CLI admission read,
+metric, and alert for environment reasons.
