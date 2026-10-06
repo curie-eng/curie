@@ -863,10 +863,16 @@ async def heartbeat(
             status=request.status,
         )
     now = await _database_now(session)
-    if (
+    late = (
         request.runtime_heartbeat_expires_at is not None
         and now >= request.runtime_heartbeat_expires_at
-    ):
+    )
+    past_deadline = (
+        request.execution_deadline is not None and now >= request.execution_deadline
+    )
+    # The matching epoch still owns a running request, so a late heartbeat
+    # can renew its lease before the execution deadline.
+    if late and (request.status != "running" or past_deadline):
         return await _refuse(
             session,
             "stale_owner",
