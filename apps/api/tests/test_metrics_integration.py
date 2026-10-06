@@ -45,6 +45,17 @@ def _lf_metric(query: dict[str, Any]) -> list[dict[str, Any]]:
     return data
 
 
+# The summary counts agent runs only (traces whose name contains `curie-run:`)
+# and excludes eval traces (#547), so every reference aggregate below applies
+# the same two name filters or the counts diverge on a Langfuse that also holds
+# platform or eval traces.
+def _run_scope(name_col: str) -> list[dict[str, Any]]:
+    return [
+        {"column": name_col, "operator": "contains", "value": "curie-run:", "type": "string"},
+        {"column": name_col, "operator": "does not contain", "value": "eval:", "type": "string"},
+    ]
+
+
 def _window() -> tuple[str, str]:
     now = datetime.datetime.now(datetime.UTC)
     return (now - datetime.timedelta(days=90)).isoformat(), now.isoformat()
@@ -61,7 +72,8 @@ def _seed_cost_bearing_trace() -> tuple[str, float]:
 
     settings = get_settings()
     ts = datetime.datetime.now(datetime.UTC).isoformat()
-    name = f"metrics-cost-seed-{uuid.uuid4().hex}"
+    # Named like a runner trace: the summary counts only `curie-run:` traces.
+    name = f"curie-run:metrics-cost-seed-{uuid.uuid4().hex}"
     trace_id = str(uuid.uuid4())
     total_cost = 0.0424242
     batch = {
@@ -152,17 +164,7 @@ def test_summary_matches_langfuse_aggregates(
         {
             "view": "traces",
             "metrics": [{"measure": "count", "aggregation": "count"}],
-            # The summary excludes eval traces (#547), so the reference aggregate
-            # must exclude them too or the counts diverge when the shared Langfuse
-            # holds eval traces in the window.
-            "filters": [
-                {
-                    "column": "name",
-                    "operator": "does not contain",
-                    "value": "eval:",
-                    "type": "string",
-                }
-            ],
+            "filters": _run_scope("name"),
             "fromTimestamp": start,
             "toTimestamp": end,
         }
@@ -173,16 +175,8 @@ def test_summary_matches_langfuse_aggregates(
         {
             "view": "observations",
             "metrics": [{"measure": "totalCost", "aggregation": "sum"}],
-            # Same eval exclusion as the summary (#547); observations key on
-            # traceName.
-            "filters": [
-                {
-                    "column": "traceName",
-                    "operator": "does not contain",
-                    "value": "eval:",
-                    "type": "string",
-                }
-            ],
+            # Observations key the trace name on traceName.
+            "filters": _run_scope("traceName"),
             "fromTimestamp": start,
             "toTimestamp": end,
         }
@@ -196,7 +190,11 @@ def test_summary_matches_langfuse_aggregates(
 def test_runs_series_sums_to_the_summary(
     client: Any, auth_headers: dict[str, str]
 ) -> None:
+    # Seed one run so the window has at least one bucket on a fresh instance;
+    # platform traces no longer count as runs.
+    seed_name, seeded_cost = _seed_cost_bearing_trace()
     start, end = _window()
+    _await_seeded_cost(seed_name, start, end, seeded_cost)
     summary = client.get(
         "/observability/metrics/summary",
         params={"start": start, "end": end},
@@ -229,13 +227,7 @@ def test_environment_filter_passes_through(
             "metrics": [{"measure": "count", "aggregation": "count"}],
             "filters": [
                 {"column": "environment", "operator": "=", "value": "default", "type": "string"},
-                # The summary excludes eval traces (#547); match it here too.
-                {
-                    "column": "name",
-                    "operator": "does not contain",
-                    "value": "eval:",
-                    "type": "string",
-                },
+                *_run_scope("name"),
             ],
             "fromTimestamp": start,
             "toTimestamp": end,
