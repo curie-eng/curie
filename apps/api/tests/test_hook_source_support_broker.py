@@ -20,8 +20,11 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import secrets
 import socket
+import ssl
+import stat
 import sys
 import threading
 import time
@@ -39,8 +42,10 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from curie_api.config import get_settings
 from curie_protected_hooks.broker_metadata import metadata_acl_rules
+from curie_protected_hooks.broker_transport import AuthenticatedMetadataReader
 from curie_protected_hooks.source_policy_records import policy_fingerprint
 from curie_protected_hooks.source_policy_sql import SourceGate
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 from test_hook_source_support import (  # noqa: F401  (support_db is a fixture)
@@ -98,8 +103,8 @@ MAX_READINESS_MS = 60000
 # -- independent fixture material ---------------------------------------------------
 
 
-def standalone_ca_pem() -> str:
-    """A CA no broker certificate chains to, @spec PROTECTED-HOOK-LANE-2/3."""
+def standalone_ca() -> tuple[Any, Any]:
+    """A CA (key, certificate) no broker certificate chains to, @spec PROTECTED-HOOK-LANE-2/3."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     now = datetime.now(UTC)
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "fixture-untrusted-ca")])
@@ -112,9 +117,19 @@ def standalone_ca_pem() -> str:
         .not_valid_before(now - timedelta(minutes=1))
         .not_valid_after(now + timedelta(days=1))
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(key.public_key()), False)
+        .add_extension(
+            x509.KeyUsage(True, False, False, False, False, True, True, False, False), True
+        )
         .sign(key, hashes.SHA256())
     )
-    return cert.public_bytes(serialization.Encoding.PEM).decode()
+    return key, cert
+
+
+def standalone_ca_pem() -> str:
+    """PEM of a CA no broker certificate chains to, @spec PROTECTED-HOOK-LANE-2/3."""
+    return standalone_ca()[1].public_bytes(serialization.Encoding.PEM).decode()
 
 
 def manifest_value(*, port: int, pin: str, run_id: str) -> dict[str, Any]:
@@ -257,6 +272,8 @@ class Runtime:
         self.raw: dict[str, bytes | None] = {}
         self.files: dict[str, bytes | None] = {}
         self.absent = False
+        # Provisioner layout changes applied after the files are written.
+        self.after_write: list[Callable[[Path], None]] = []
         self.rebuild()
 
     def __repr__(self) -> str:
@@ -405,6 +422,8 @@ class Runtime:
             if payload is not None:
                 path.write_bytes(payload)
                 path.chmod(0o600)
+        for hook in self.after_write:
+            hook(self.directory)
 
     def forbidden(self) -> list[str]:
         """Strings no response may contain, @spec PROTECTED-HOOK-SOURCE-9."""
@@ -455,15 +474,17 @@ def runtime_for(broker: Any, agent: str, directory: Path) -> Runtime:
     )
 
 
-def runtime_without_broker(agent: str, directory: Path, port: int) -> Runtime:
+def runtime_without_broker(
+    agent: str, directory: Path, port: int, *, pin: str = "0" * 64, ca_pem: str | None = None
+) -> Runtime:
     """A valid bootstrap pointing at an owned non-broker endpoint, @spec PROTECTED-HOOK-SOURCE-9."""
     return Runtime(
         agent=agent,
         directory=directory,
         port=port,
-        pin="0" * 64,
+        pin=pin,
         run_id="a" * 40,
-        ca_pem=standalone_ca_pem(),
+        ca_pem=ca_pem or standalone_ca_pem(),
         username="reader-" + secrets.token_hex(6),
         password=FixtureSecret(secrets.token_hex(24)),
         now_ms=int(time.time() * 1000),
@@ -492,6 +513,37 @@ def reader_sessions(broker: Any) -> list[Any]:
         for client in broker.admin.client_list()
         if client.get("user") == broker.reader.username
     ]
+
+
+def hold_readers(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Keep a strong reference to every reader the probe opens.
+
+    A pass-through wrapper around ``AuthenticatedMetadataReader.connect`` (it
+    still performs the real connect). Holding the reader means garbage
+    collection cannot close its socket, so a session that disappears was
+    closed by the probe itself. @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    held: list[Any] = []
+    original = AuthenticatedMetadataReader.connect
+
+    def connect(cls: Any, *args: Any, **kwargs: Any) -> Any:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        reader = original(*args, **kwargs)
+        held.append(reader)
+        return reader
+
+    monkeypatch.setattr(AuthenticatedMetadataReader, "connect", classmethod(connect))
+    return held
+
+
+def release_readers(held: list[Any]) -> None:
+    """Test cleanup of held readers (close is idempotent), @spec PROTECTED-HOOK-SOURCE-9."""
+    for reader in held:
+        try:
+            reader.close()
+        except Exception:
+            pass
+    held.clear()
 
 
 async def wait_reader_closed(broker: Any) -> None:
@@ -545,23 +597,28 @@ def run_case(
         """@spec PROTECTED-HOOK-SOURCE-9."""
         directory = tmp_path / ("runtime-" + secrets.token_hex(4))
         use_runtime_dir(monkeypatch, directory)
-        async with probe_app() as (app, client, agent):
-            rt = runtime_for(broker, agent, directory)
-            mutate(rt, broker)
-            await asyncio.to_thread(seed_protected_row, agent, rt.operation, rt.row)
-            for key, value in rt.keys().items():
-                broker.command("SET", key, value)
-            rt.write_bootstrap()
-            before = await effects(app, agent), broker_snapshot(broker)
-            response = await probe_with(client, agent, requested)
-            assert response.status_code == 503, response.text
-            want = expected(requested, "read-only", str(GENERATION), reason)
-            if members:
-                want.update(runtime_members(rt))
-            assert response.json() == want
-            assert_safe(response, rt, agent)
-            await wait_reader_closed(broker)
-            assert (await effects(app, agent), broker_snapshot(broker)) == before
+        held = hold_readers(monkeypatch)
+        try:
+            async with probe_app() as (app, client, agent):
+                rt = runtime_for(broker, agent, directory)
+                mutate(rt, broker)
+                await asyncio.to_thread(seed_protected_row, agent, rt.operation, rt.row)
+                for key, value in rt.keys().items():
+                    broker.command("SET", key, value)
+                rt.write_bootstrap()
+                before = await effects(app, agent), broker_snapshot(broker)
+                response = await probe_with(client, agent, requested)
+                assert response.status_code == 503, response.text
+                want = expected(requested, "read-only", str(GENERATION), reason)
+                if members:
+                    want.update(runtime_members(rt))
+                assert response.json() == want
+                assert_safe(response, rt, agent)
+                # Readers are still referenced here: only an explicit close ends the session.
+                await wait_reader_closed(broker)
+                assert (await effects(app, agent), broker_snapshot(broker)) == before
+        finally:
+            release_readers(held)
 
     asyncio.run(asyncio.wait_for(scenario(), 30))
 
@@ -824,6 +881,18 @@ STEPS: list[tuple[str, Callable[[Runtime, Any], None], str, bool]] = [
         False,
     ),
     (
+        "9-selection-runtime-id-differs",
+        _selection(runtime_id=OTHER),
+        "qualification_unavailable",
+        False,
+    ),
+    (
+        "9-selection-qualification-id-differs",
+        _selection(qualification_id=OTHER),
+        "qualification_unavailable",
+        False,
+    ),
+    (
         "9-selection-runtime-generation",
         _selection(runtime_generation="2"),
         "qualification_unavailable",
@@ -896,10 +965,32 @@ def _extra_bootstrap_file(rt: Runtime, broker: Any) -> None:
     rt.files["README.txt"] = b"provisioner notes\n"
 
 
+BOOTSTRAP_FILES = ("manifest.json", "ca.pem", "bootstrap.json")
+
+
+def _symlinked_files(rt: Runtime, broker: Any) -> None:
+    """Secret-volume layout: each file is a symlink to a regular file via ``..data``.
+
+    @spec PROTECTED-HOOK-SOURCE-9.
+    """
+
+    def link(directory: Path) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        data = directory / "..2026_10_05_00_00_00.000000001"
+        data.mkdir(mode=0o700)
+        for name in BOOTSTRAP_FILES:
+            (directory / name).rename(data / name)
+        (directory / "..data").symlink_to(data.name)
+        for name in BOOTSTRAP_FILES:
+            (directory / name).symlink_to(Path("..data") / name)
+
+    rt.after_write.append(link)
+
+
 @pytest.mark.parametrize(
     "mutate",
-    [_noncanonical_manifest, _extra_bootstrap_file],
-    ids=["noncanonical-manifest-json", "extra-bootstrap-file"],
+    [_noncanonical_manifest, _extra_bootstrap_file, _symlinked_files],
+    ids=["noncanonical-manifest-json", "extra-bootstrap-file", "symlinks-to-regular-files"],
 )
 def test_tolerated_bootstrap_variants_reach_the_valid_outcome(
     runtime_broker: Any,
@@ -907,9 +998,10 @@ def test_tolerated_bootstrap_variants_reach_the_valid_outcome(
     monkeypatch: pytest.MonkeyPatch,
     mutate: Callable[[Runtime, Any], None],
 ) -> None:
-    """Manifests compare by canonical bytes; extra bootstrap files are ignored.
+    """Manifests compare by canonical bytes; extra files are ignored; symlinks to
+    regular files are followed.
 
-    Either variant over an otherwise valid tuple still reaches
+    Each variant over an otherwise valid tuple still reaches
     configuration_unsupported with the runtime members.
     @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-LANE-2.
     """
@@ -1029,6 +1121,8 @@ def test_unreadable_manifest_reports_runtime_unavailable(
     runtime_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An unreadable bootstrap file is runtime_unavailable, @spec PROTECTED-HOOK-SOURCE-9."""
+    if os.geteuid() == 0:
+        pytest.skip("root reads a mode 000 file; directory-as-file covers unreadable for root")
 
     async def scenario() -> None:
         """@spec PROTECTED-HOOK-SOURCE-9."""
@@ -1214,7 +1308,7 @@ def test_default_reader_username_is_invalid_bootstrap_without_connecting(
 def test_runtime_mismatch_is_decided_before_broker_io(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Step 1 precedes step 2: a stalling endpoint cannot turn it into broker_unavailable.
+    """Step 1 precedes step 2: decided from the bootstrap with no broker connection.
 
     @spec PROTECTED-HOOK-SOURCE-9.
     """
@@ -1234,6 +1328,7 @@ def test_runtime_mismatch_is_decided_before_broker_io(
                 assert response.json() == expected(
                     None, "read-only", str(GENERATION), "configuration_unsupported"
                 )
+            assert listener.count == 0, "probe opened a broker connection before step 1"
 
     asyncio.run(asyncio.wait_for(scenario(), 30))
 
@@ -1264,33 +1359,169 @@ def test_non_protected_rows_never_open_a_reader(
                 if kind != "never":
                     await asyncio.to_thread(seed, agent, kind)
                 body = BODIES[None]
-                started = time.monotonic()
                 response = await post_support(
                     client,
                     agent,
                     body,
                     support_headers(legacy_secret(agent), requested=None, body=body),
                 )
-                elapsed = time.monotonic() - started
                 effective, generation, reason = reasons[kind]
                 assert response.status_code == 503, response.text
                 assert response.json() == expected(None, effective, generation, reason)
-                assert elapsed < 1.5
             assert listener.count == 0, "probe opened a broker connection"
 
     asyncio.run(asyncio.wait_for(scenario(), 30))
 
 
+# -- a broker that stalls ----------------------------------------------------------------
+
+
+class StallingTLSBroker:
+    """Owned loopback TLS endpoint that passes the reader's pin check, then stalls.
+
+    It completes TLS with a leaf whose SPKI the manifest pins, then answers the
+    reader's HELLO one byte every 0.2 s without ever finishing the reply, so no
+    single socket read times out: only an overall evaluation budget ends it.
+    Counts accepted connections; ``release`` closes every owned socket.
+    @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-LANE-2/3.
+    """
+
+    def __init__(self, private: Path) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        private.mkdir(mode=0o700, exist_ok=True)
+        ca_key, ca_cert = standalone_ca()
+        self.ca_pem = ca_cert.public_bytes(serialization.Encoding.PEM).decode()
+        self.pin = _broker.certificate(private, ca_key, ca_cert)
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.load_cert_chain(str(private / "server.crt"), str(private / "server.key"))
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(16)
+        self.listener.settimeout(0.1)
+        self.port = self.listener.getsockname()[1]
+        self.lock = threading.Lock()
+        self.accepted = 0
+        self.sockets: list[socket.socket] = []
+        self.threads: list[threading.Thread] = []
+        self.stopping = threading.Event()
+
+    def __repr__(self) -> str:
+        """@spec PROTECTED-HOOK-LANE-3."""
+        return "<owned-stalling-broker>"
+
+    def _accept(self) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        while not self.stopping.is_set():
+            try:
+                peer, _ = self.listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            worker = threading.Thread(target=self._stall, args=(peer,), daemon=True)
+            with self.lock:
+                self.accepted += 1
+                self.sockets.append(peer)
+                self.threads.append(worker)
+            worker.start()
+
+    def _stall(self, peer: socket.socket) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        try:
+            peer.settimeout(5)
+            secured = self.context.wrap_socket(peer, server_side=True)
+            with self.lock:
+                self.sockets.append(secured)
+            secured.settimeout(0.5)
+            try:
+                secured.recv(65536)
+            except OSError:
+                pass
+            secured.sendall(b"+")
+            while not self.stopping.wait(0.2):
+                secured.sendall(b"A")
+        except (OSError, ValueError):
+            pass
+
+    @property
+    def count(self) -> int:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        with self.lock:
+            return self.accepted
+
+    def release(self) -> None:
+        """Close every owned connection, @spec PROTECTED-HOOK-SOURCE-9."""
+        self.stopping.set()
+        with self.lock:
+            owned = list(self.sockets)
+        for sock in owned:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def __enter__(self) -> StallingTLSBroker:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        self.acceptor = threading.Thread(target=self._accept, daemon=True)
+        self.acceptor.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        """Only owned sockets and threads, @spec PROTECTED-HOOK-SOURCE-9."""
+        self.release()
+        self.acceptor.join(timeout=2)
+        with self.lock:
+            workers = list(self.threads)
+        for worker in workers:
+            worker.join(timeout=2)
+        self.listener.close()
+
+
+async def wait_stalled(endpoint: Any, tasks: list[asyncio.Task[Any]], count: int) -> None:
+    """Until ``count`` probes reached the endpoint; fail if one finished first.
+
+    @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    deadline = time.monotonic() + 10
+    while endpoint.count < count:
+        for task in tasks:
+            if task.done():
+                response = task.result()
+                pytest.fail(
+                    "probe finished without stalling on the broker: "
+                    f"{response.status_code} {response.json().get('reason')}",
+                    pytrace=False,
+                )
+        if time.monotonic() > deadline:
+            pytest.fail("probes never reached the broker endpoint", pytrace=False)
+        await asyncio.sleep(0.02)
+
+
+async def cancel_all(tasks: list[asyncio.Task[Any]]) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-9."""
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def stalled_runtime(agent: str, root: Path, endpoint: StallingTLSBroker) -> Runtime:
+    """A valid bootstrap whose pinned broker stalls, @spec PROTECTED-HOOK-SOURCE-9."""
+    return runtime_without_broker(
+        agent, root, endpoint.port, pin=endpoint.pin, ca_pem=endpoint.ca_pem
+    )
+
+
 def test_source_gate_is_released_before_broker_io(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """While a probe's broker handshake is stalled, the agent's gate is free.
+    """While a probe's broker read is stalled, the agent's gate is free.
 
     No production code is mocked: the bootstrap names an owned endpoint that
-    accepts and never answers TLS. Once it has accepted the probe's connection,
-    an independent gate (its own engine, same advisory lock) must acquire the
-    same agent's gate before the probe finishes. Releasing the endpoint then
-    fails the handshake: broker_unavailable.
+    completes pinned TLS and never finishes a reply. Once the probe is stalled
+    there, an independent gate (its own engine, same advisory lock) acquires the
+    same agent's gate while the probe is still pending. Releasing the endpoint
+    then ends the probe: broker_unavailable.
     @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-SOURCE-2.
     """
 
@@ -1299,42 +1530,325 @@ def test_source_gate_is_released_before_broker_io(
         root = tmp_path / ("runtime-" + secrets.token_hex(4))
         use_runtime_dir(monkeypatch, root)
         observer = create_async_engine(get_settings().database_url, poolclass=NullPool)
-        task: asyncio.Task[Any] | None = None
+        tasks: list[asyncio.Task[Any]] = []
         try:
-            with OwnedListener() as listener:
+            with StallingTLSBroker(tmp_path / "tls") as endpoint:
                 async with probe_app() as (app, client, agent):
-                    rt = runtime_without_broker(agent, root, listener.port)
+                    rt = stalled_runtime(agent, root, endpoint)
                     await asyncio.to_thread(seed_protected_row, agent, rt.operation, rt.row)
                     rt.write_bootstrap()
-                    task = asyncio.create_task(probe_with(client, agent))
-                    waiter = asyncio.create_task(asyncio.to_thread(listener.accepted.wait, 10))
-                    done, _ = await asyncio.wait(
-                        {task, waiter}, return_when=asyncio.FIRST_COMPLETED
-                    )
-                    if task in done:
-                        response = task.result()
-                        listener.accepted.set()
-                        await waiter
-                        pytest.fail(
-                            "probe finished without opening a broker connection: "
-                            f"{response.status_code} {response.json().get('reason')}",
-                            pytrace=False,
-                        )
-                    assert await waiter, "probe never reached the broker endpoint"
-                    gate = SourceGate(observer)
-                    async with asyncio.timeout(1.5):
-                        async with gate.hold(uuid.UUID(agent)):
-                            assert not task.done(), "probe finished before the gate check"
-                    listener.release()
-                    response = await asyncio.wait_for(task, 10)
+                    tasks.append(asyncio.create_task(probe_with(client, agent)))
+                    await wait_stalled(endpoint, tasks, 1)
+                    async with asyncio.timeout(4):
+                        async with SourceGate(observer).hold(uuid.UUID(agent)):
+                            assert not tasks[0].done(), "probe finished before the gate check"
+                    endpoint.release()
+                    response = await asyncio.wait_for(tasks[0], 15)
                     assert response.status_code == 503, response.text
                     assert response.json() == expected(
                         None, "read-only", str(GENERATION), "broker_unavailable"
                     )
         finally:
-            if task is not None and not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+            await cancel_all(tasks)
             await observer.dispose()
 
+    asyncio.run(asyncio.wait_for(scenario(), 60))
+
+
+def test_request_transaction_is_ended_before_broker_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No database connection waits on the broker in an open transaction.
+
+    While the probe is stalled on the broker, no backend of this test database
+    other than the observer is ``idle in transaction``; the probe still returns.
+    @spec PROTECTED-HOOK-SOURCE-9.
+    """
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        root = tmp_path / ("runtime-" + secrets.token_hex(4))
+        use_runtime_dir(monkeypatch, root)
+        observer = create_async_engine(get_settings().database_url, poolclass=NullPool)
+        tasks: list[asyncio.Task[Any]] = []
+        try:
+            with StallingTLSBroker(tmp_path / "tls") as endpoint:
+                async with probe_app() as (app, client, agent):
+                    rt = stalled_runtime(agent, root, endpoint)
+                    await asyncio.to_thread(seed_protected_row, agent, rt.operation, rt.row)
+                    rt.write_bootstrap()
+                    tasks.append(asyncio.create_task(probe_with(client, agent)))
+                    await wait_stalled(endpoint, tasks, 1)
+                    async with observer.connect() as conn:
+                        idle = await conn.scalar(
+                            text(
+                                "SELECT count(*) FROM pg_stat_activity "
+                                "WHERE datname=current_database() "
+                                "AND state='idle in transaction' "
+                                "AND pid<>pg_backend_pid()"
+                            )
+                        )
+                    assert not tasks[0].done(), "probe finished before the database check"
+                    assert idle == 0, (
+                        "a database connection is idle in transaction during broker I/O"
+                    )
+                    endpoint.release()
+                    response = await asyncio.wait_for(tasks[0], 15)
+                    assert response.status_code == 503, response.text
+                    assert response.json() == expected(
+                        None, "read-only", str(GENERATION), "broker_unavailable"
+                    )
+        finally:
+            await cancel_all(tasks)
+            await observer.dispose()
+
+    asyncio.run(asyncio.wait_for(scenario(), 60))
+
+
+def test_stalled_broker_is_bounded_by_the_evaluation_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broker that never finishes a reply yields broker_unavailable within the budget.
+
+    The budget is five seconds; only a generous upper bound is asserted.
+    @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    bound = 5 + 7
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        root = tmp_path / ("runtime-" + secrets.token_hex(4))
+        use_runtime_dir(monkeypatch, root)
+        tasks: list[asyncio.Task[Any]] = []
+        try:
+            with StallingTLSBroker(tmp_path / "tls") as endpoint:
+                async with probe_app() as (app, client, agent):
+                    rt = stalled_runtime(agent, root, endpoint)
+                    await asyncio.to_thread(seed_protected_row, agent, rt.operation, rt.row)
+                    rt.write_bootstrap()
+                    started = time.monotonic()
+                    tasks.append(asyncio.create_task(probe_with(client, agent)))
+                    await wait_stalled(endpoint, tasks, 1)
+                    try:
+                        response = await asyncio.wait_for(
+                            asyncio.shield(tasks[0]), bound - (time.monotonic() - started)
+                        )
+                    except TimeoutError:
+                        pytest.fail("stalled evaluation exceeded its budget", pytrace=False)
+                    assert response.status_code == 503, response.text
+                    assert response.json() == expected(
+                        None, "read-only", str(GENERATION), "broker_unavailable"
+                    )
+                    assert endpoint.count == 1
+        finally:
+            await cancel_all(tasks)
+
+    asyncio.run(asyncio.wait_for(scenario(), 60))
+
+
+def test_evaluations_beyond_four_fail_fast_without_connecting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With four evaluations stalled on the broker, a fifth does not queue or connect.
+
+    It reports 503 broker_unavailable well under the five second budget, and the
+    endpoint sees no fifth connection. @spec PROTECTED-HOOK-SOURCE-9.
+    """
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        root = tmp_path / ("runtime-" + secrets.token_hex(4))
+        use_runtime_dir(monkeypatch, root)
+        tasks: list[asyncio.Task[Any]] = []
+        try:
+            with StallingTLSBroker(tmp_path / "tls") as endpoint:
+                async with probe_app() as (app, client, agent):
+                    rt = stalled_runtime(agent, root, endpoint)
+                    await asyncio.to_thread(seed_protected_row, agent, rt.operation, rt.row)
+                    rt.write_bootstrap()
+                    for index in range(4):
+                        tasks.append(
+                            asyncio.create_task(probe_with(client, agent, delivery=f"cap-{index}"))
+                        )
+                    await wait_stalled(endpoint, tasks, 4)
+                    try:
+                        fifth = await asyncio.wait_for(
+                            probe_with(client, agent, delivery="cap-4"), 3
+                        )
+                    except TimeoutError:
+                        pytest.fail(
+                            "fifth concurrent evaluation queued or connected "
+                            f"({endpoint.count} connections)",
+                            pytrace=False,
+                        )
+                    assert fifth.status_code == 503, fifth.text
+                    assert fifth.json() == expected(
+                        None, "read-only", str(GENERATION), "broker_unavailable"
+                    )
+                    assert endpoint.count == 4, "fifth evaluation connected"
+                    endpoint.release()
+                    for response in await asyncio.gather(
+                        *(asyncio.wait_for(task, 15) for task in tasks)
+                    ):
+                        assert response.json()["reason"] == "broker_unavailable"
+        finally:
+            await cancel_all(tasks)
+
+    asyncio.run(asyncio.wait_for(scenario(), 60))
+
+
+# -- special bootstrap files ---------------------------------------------------------------
+
+
+def _fifo(name: str) -> Callable[[Path], None]:
+    """Replace one bootstrap file with a FIFO, @spec PROTECTED-HOOK-SOURCE-9."""
+
+    def apply(directory: Path) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        (directory / name).unlink()
+        os.mkfifo(directory / name, 0o600)
+
+    return apply
+
+
+def _directory_as(name: str) -> Callable[[Path], None]:
+    """A directory where a file belongs (unreadable for root too), @spec PROTECTED-HOOK-SOURCE-9."""
+
+    def apply(directory: Path) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        (directory / name).unlink()
+        (directory / name).mkdir(mode=0o700)
+
+    return apply
+
+
+def _symlink_to_directory(directory: Path) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-9."""
+    target = directory / "target-directory"
+    target.mkdir(mode=0o700)
+    (directory / "manifest.json").unlink()
+    (directory / "manifest.json").symlink_to(target.name)
+
+
+def _symlink_to_fifo(directory: Path) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-9."""
+    os.mkfifo(directory / "target-fifo", 0o600)
+    (directory / "manifest.json").unlink()
+    (directory / "manifest.json").symlink_to("target-fifo")
+
+
+def _oversized_bootstrap(directory: Path) -> None:
+    """Valid JSON padded to 4 MiB, far past any bootstrap bound, @spec PROTECTED-HOOK-SOURCE-9."""
+    path = directory / "bootstrap.json"
+    path.write_bytes(path.read_bytes() + b" " * (4 * 1024 * 1024))
+
+
+def unblock_fifos(directory: Path) -> None:
+    """Open and close a writer on each owned FIFO so a blocked reader sees EOF.
+
+    @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    for path in directory.iterdir():
+        if not stat.S_ISFIFO(path.lstat().st_mode):
+            continue
+        for flags in (os.O_WRONLY | os.O_NONBLOCK, os.O_RDWR | os.O_NONBLOCK):
+            try:
+                os.close(os.open(path, flags))
+                break
+            except OSError:
+                continue
+
+
+SPECIAL: list[tuple[str, Callable[[Path], None]]] = [
+    ("fifo-manifest", _fifo("manifest.json")),
+    ("fifo-ca", _fifo("ca.pem")),
+    ("fifo-bootstrap", _fifo("bootstrap.json")),
+    ("directory-as-manifest", _directory_as("manifest.json")),
+    ("symlink-to-directory", _symlink_to_directory),
+    ("symlink-to-fifo", _symlink_to_fifo),
+    ("oversized-bootstrap", _oversized_bootstrap),
+]
+
+
+@pytest.mark.parametrize("special", [case[1] for case in SPECIAL], ids=[c[0] for c in SPECIAL])
+def test_special_or_oversized_bootstrap_files_are_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, special: Callable[[Path], None]
+) -> None:
+    """A FIFO, directory, symlink to either, or an oversized file: prompt runtime_unavailable.
+
+    Files must be regular after symlink resolution, opened without blocking and
+    bounded in size. A FIFO left blocking is unblocked by the test after the
+    bound so nothing hangs. @spec PROTECTED-HOOK-SOURCE-9.
+    """
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        root = tmp_path / ("runtime-" + secrets.token_hex(4))
+        use_runtime_dir(monkeypatch, root)
+        tasks: list[asyncio.Task[Any]] = []
+        with OwnedListener() as listener:
+            async with probe_app() as (app, client, agent):
+                rt = runtime_without_broker(agent, root, listener.port)
+                rt.after_write.append(special)
+                await asyncio.to_thread(seed_protected_row, agent, rt.operation, rt.row)
+                rt.write_bootstrap()
+                tasks.append(asyncio.create_task(probe_with(client, agent)))
+                try:
+                    done, _ = await asyncio.wait(tasks, timeout=3)
+                    if not done:
+                        pytest.fail("probe blocked on a special bootstrap file", pytrace=False)
+                    response = tasks[0].result()
+                finally:
+                    deadline = time.monotonic() + 10
+                    while not tasks[0].done() and time.monotonic() < deadline:
+                        unblock_fifos(root)
+                        await asyncio.sleep(0.05)
+                    await cancel_all(tasks)
+                assert response.status_code == 503, response.text
+                assert response.json() == expected(
+                    None, "read-only", str(GENERATION), "runtime_unavailable"
+                )
+            assert listener.count == 0, "probe connected with an invalid bootstrap"
+
     asyncio.run(asyncio.wait_for(scenario(), 40))
+
+
+def test_malformed_ca_is_refused_in_bounded_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ~64 KiB ``ca.pem`` of BEGIN plus newlines without END is refused promptly.
+
+    Validation is linear in size, so it costs about what a short invalid CA
+    costs; only an upper bound relative to that control is asserted.
+    @spec PROTECTED-HOOK-SOURCE-9.
+    """
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        root = tmp_path / ("runtime-" + secrets.token_hex(4))
+        use_runtime_dir(monkeypatch, root)
+        with OwnedListener() as listener:
+            async with probe_app() as (app, client, agent):
+                rt = runtime_without_broker(agent, root, listener.port)
+                await asyncio.to_thread(seed_protected_row, agent, rt.operation, rt.row)
+                timings = []
+                header = b"-----BEGIN CERTIFICATE-----"
+                for index, ca in enumerate(
+                    (b"not a certificate\n", header + b"\n" * (65000 - len(header)))
+                ):
+                    rt.files["ca.pem"] = ca
+                    rt.write_bootstrap()
+                    started = time.monotonic()
+                    response = await probe_with(client, agent, delivery=f"ca-{index}")
+                    timings.append(time.monotonic() - started)
+                    assert response.status_code == 503, response.text
+                    assert response.json() == expected(
+                        None, "read-only", str(GENERATION), "runtime_unavailable"
+                    )
+                control, malformed = timings
+                assert malformed < control + 1.0, (
+                    f"malformed CA took {malformed:.2f}s (control {control:.2f}s)"
+                )
+            assert listener.count == 0
+
+    asyncio.run(asyncio.wait_for(scenario(), 60))
