@@ -478,7 +478,7 @@ existing redaction suites still pass.
 
 The held-literal check applies to the decoded ciphertext bytes as well as to
 the envelope text, so a plaintext secret wrapped in base64 withholds the replay
-inputs exactly as an unwrapped one does. `post_version` is at most 512 bytes of
+inputs exactly as an unwrapped one does. `post_version` is at most 256 characters of
 printable ASCII without placeholders; the worker and the API both refuse a
 longer or malformed value rather than truncating it.
 
