@@ -28,6 +28,8 @@ STUB_ROOT = Path(__file__).resolve().parents[1]
 REPO = "acme-corp/acme-bot"
 RECORDING = STUB_ROOT / "recordings" / "curie-pr-3400.json"
 PYTHON_CHECK = "Python (ruff + mypy + pytest)"
+SEED_TREE = STUB_ROOT.parent / "factory-e2e" / "fixtures" / "unitconv"
+ISSUE_BODY = "Add Kelvin (`k`) temperature conversions and tests in unitconv.\n"
 
 
 def _stub_type() -> Any:
@@ -57,8 +59,15 @@ def recording() -> dict[str, Any]:
 
 
 @pytest.fixture
-def stub(tmp_path: Path, recording: dict[str, Any]) -> Iterator[Any]:
-    server = _stub_type()(tmp_path, recording)
+def issue_file(tmp_path: Path) -> Path:
+    issue = tmp_path / "issue.md"
+    issue.write_text(ISSUE_BODY)
+    return issue
+
+
+@pytest.fixture
+def stub(tmp_path: Path, recording: dict[str, Any], issue_file: Path) -> Iterator[Any]:
+    server = _stub_type()(tmp_path, recording, seed_tree=SEED_TREE, issue_file=issue_file)
     try:
         server.start()
         yield server
@@ -112,10 +121,13 @@ def test_tls_requires_the_generated_ca(stub: Any) -> None:
 
 
 def test_advertised_service_dns_uses_a_trusted_certificate_and_separate_bind_address(
-    tmp_path: Path, recording: dict[str, Any]
+    tmp_path: Path, recording: dict[str, Any], issue_file: Path
 ) -> None:
     hostname = "github-stub.test-3815.svc.cluster.local"
-    server = _stub_type()(tmp_path, recording, host=hostname, bind="127.0.0.1")
+    server = _stub_type()(
+        tmp_path, recording, seed_tree=SEED_TREE, issue_file=issue_file,
+        host=hostname, bind="127.0.0.1",
+    )
     try:
         server.start()
         response = subprocess.run(
@@ -146,10 +158,40 @@ def test_advertised_service_dns_uses_a_trusted_certificate_and_separate_bind_add
 
 @pytest.mark.parametrize("host", ["user@github.example.com", "github.example.com/path"])
 def test_advertised_host_refuses_userinfo_and_paths(
-    tmp_path: Path, recording: dict[str, Any], host: str
+    tmp_path: Path, recording: dict[str, Any], issue_file: Path, host: str
 ) -> None:
     with pytest.raises(ValueError):
-        _stub_type()(tmp_path, recording, host=host, bind="127.0.0.1")
+        _stub_type()(
+            tmp_path, recording, seed_tree=SEED_TREE, issue_file=issue_file,
+            host=host, bind="127.0.0.1",
+        )
+
+
+def test_seed_tree_and_issue_are_required_constructor_inputs(
+    tmp_path: Path, recording: dict[str, Any], issue_file: Path
+) -> None:
+    with pytest.raises(TypeError, match="seed_tree|issue_file"):
+        _stub_type()(tmp_path, recording)
+    with pytest.raises(TypeError, match="seed_tree"):
+        _stub_type()(tmp_path, recording, issue_file=issue_file)
+    with pytest.raises(TypeError, match="issue_file"):
+        _stub_type()(tmp_path, recording, seed_tree=SEED_TREE)
+
+
+def test_seeded_issue_uses_the_required_input_and_a_human_label_event(
+    github: httpx.Client, stub: Any
+) -> None:
+    issues = _ok(github.get(f"/repos/{REPO}/issues", params={"labels": "factory"}))
+    assert len(issues) == 1
+    issue = issues[0]
+    assert issue["body"] == ISSUE_BODY
+    assert issue["user"]["type"] == "User"
+    events = _ok(github.get(f"/repos/{REPO}/issues/{issue['number']}/events"))
+    assert len(events) == 1
+    assert events[0]["event"] == "labeled"
+    assert events[0]["label"]["name"] == "factory"
+    assert events[0]["actor"]["type"] == "User"
+    assert stub.unknown_requests == []
 
 
 def test_app_discovery_and_token_scope_use_real_credentials(
@@ -274,6 +316,9 @@ def test_git_smart_http_clones_pushes_and_exposes_the_pushed_ref(
 
     checkout = tmp_path / "checkout"
     git("clone", stub.clone_url, str(checkout))
+    assert not (checkout / "example.py").exists()
+    for relative in ("unitconv/convert.py", "unitconv/tests/test_convert.py", "README.md"):
+        assert (checkout / relative).read_bytes() == (SEED_TREE / relative).read_bytes()
     git("checkout", "-b", "factory/example", cwd=checkout)
     (checkout / "example.txt").write_text("A real Git object pushed over HTTPS.\n")
     git("add", "example.txt", cwd=checkout)
