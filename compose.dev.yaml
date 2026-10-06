@@ -102,6 +102,7 @@ services:
       interval: 3s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   valkey:
     # Must equal charts/curie/values.yaml `valkey.image` (compose/tests).
@@ -119,6 +120,7 @@ services:
       interval: 3s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   clickhouse:
     # Pinned to 24.8.14.39: newer ClickHouse needs AVX and crashes (exit 132)
@@ -144,6 +146,7 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+    restart: unless-stopped
 
   # RustFS runs as UID 10001. Its named volumes are prepared by rustfs-perms
   # before this service starts, matching RustFS's documented Compose pattern.
@@ -173,6 +176,7 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+    restart: unless-stopped
 
   # Creates every first-party bucket so no service races a missing store.
   rustfs-init:
@@ -229,6 +233,7 @@ services:
       timeout: 10s
       retries: 24
       start_period: 10s
+    restart: unless-stopped
 
   ollama-pull:
     image: ollama/ollama:0.24.0
