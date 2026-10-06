@@ -1244,7 +1244,7 @@ fn factory_quickstart_direct_anthropic_credentials_select_native_sonnet_and_skip
         assert_eq!(ready["phase"], "ready");
         assert_eq!(ready["credit_remaining_usd"], Value::Null);
         // The settled display value remains the OpenRouter reviewer id.
-        assert_eq!(ready["reviewer_model"], "anthropic/claude-opus-5.5");
+        assert_eq!(ready["reviewer_model"], "openai/gpt-6.1-sol");
         let values: Value =
             serde_json::from_slice(&fs::read(fixture.dir.path().join("values")).unwrap()).unwrap();
         assert_eq!(
