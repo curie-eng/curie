@@ -163,6 +163,26 @@ class WorkItemUsageOut(BaseModel):
     pr_url: str | None = None
 
 
+WorkItemStageState = Literal["done", "current", "redo", "blocked", "pending"]
+
+
+class WorkItemStageOut(BaseModel):
+    """One stage of the factory progress strip, as the status card shows it."""
+
+    id: str
+    label: str
+    state: WorkItemStageState
+    round_label: str | None
+
+
+class WorkItemProgressOut(BaseModel):
+    """The latest execution's progress, derived by ``factory_progress.phase_view``."""
+
+    current: str | None
+    note: str | None
+    stages: list[WorkItemStageOut]
+
+
 class WorkItemOutcomeOut(BaseModel):
     id: uuid.UUID
     agent_id: uuid.UUID
@@ -183,6 +203,10 @@ class WorkItemOutcomeOut(BaseModel):
     # Null on the list route: CI is observed live on the detail route only.
     ci: WorkItemCiOut | None
     requests: list[WorkItemRequestOut]
+    # ``derive_outcome`` stays pure and leaves these null; ``_views`` fills
+    # them from the factory status comment rows and phase reports.
+    title: str | None = None
+    progress: WorkItemProgressOut | None = None
 
 
 class WorkItemOutcomeList(BaseModel):

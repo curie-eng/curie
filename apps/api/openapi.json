@@ -9451,6 +9451,16 @@
               }
             ]
           },
+          "progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkItemProgressOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "publication": {
             "anyOf": [
               {
@@ -9499,6 +9509,17 @@
             ],
             "title": "State",
             "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
           },
           "updated_at": {
             "format": "date-time",
@@ -9550,6 +9571,47 @@
           "status"
         ],
         "title": "WorkItemPrOut",
+        "type": "object"
+      },
+      "WorkItemProgressOut": {
+        "description": "The latest execution's progress, derived by ``factory_progress.phase_view``.",
+        "properties": {
+          "current": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/WorkItemStageOut"
+            },
+            "title": "Stages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "current",
+          "note",
+          "stages"
+        ],
+        "title": "WorkItemProgressOut",
         "type": "object"
       },
       "WorkItemPublicationOut": {
@@ -9705,6 +9767,49 @@
           "last_deferral_reason"
         ],
         "title": "WorkItemRequestOut",
+        "type": "object"
+      },
+      "WorkItemStageOut": {
+        "description": "One stage of the factory progress strip, as the status card shows it.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "round_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Round Label"
+          },
+          "state": {
+            "enum": [
+              "done",
+              "current",
+              "redo",
+              "blocked",
+              "pending"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "state",
+          "round_label"
+        ],
+        "title": "WorkItemStageOut",
         "type": "object"
       },
       "WorkItemUsageModel": {
