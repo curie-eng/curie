@@ -64,6 +64,7 @@ Real router, real Postgres. Nothing mocked.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import uuid
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -138,7 +139,7 @@ def _ref(
         "disk_name": disk_name or name,
         "mime_type": "application/pdf",
         "size_bytes": 1024,
-        "sha256": f"{file_id:0<64}"[:64],
+        "sha256": hashlib.sha256(file_id.encode()).hexdigest(),
         "route_kind": "slack",
         "route_adapter": None,
         "route_identity": "default",
@@ -289,7 +290,7 @@ def test_threads_and_agents_do_not_share_a_ledger(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     aid = _agent(client, auth_headers)
-    stranger = _agent(client, auth_headers)
+    stranger = _agent(client, auth_headers, {"kind": "slack", "address": "C0EXAMPLE2"})
     assert _appended(client, aid, "evt-1", [_ref("F0A")]) == 1
 
     assert _query(client, aid, OTHER_THREAD) == []
