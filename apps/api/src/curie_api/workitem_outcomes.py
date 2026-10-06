@@ -3,8 +3,11 @@
 The single home of outcome semantics: ``derive_outcome`` is the only place an
 outcome ``state`` and ``actionable_cause`` are computed, and the CLI and the
 console render those strings verbatim. The module reads canonical WorkItem,
-ExecutionRequest, publication-lineage, Publication and Approval rows; it
-writes nothing and adds no store.
+ExecutionRequest, publication-lineage, Publication, Approval, factory status
+comment and execution phase report rows; it writes nothing and adds no store.
+The title and progress strip come from the status comment rows and the phase
+reports through ``factory_progress.phase_view``, the same derivation the
+GitHub status card uses (#4102).
 
 Output is an allowlist: every view is built from explicit fields below, never
 from an ORM row, so a runtime-owner token, a reply transport address, a patch,
@@ -38,16 +41,21 @@ from curie_api.schemas.workitems import (
     WorkItemCorrectnessOut,
     WorkItemOutcomeOut,
     WorkItemOutcomeState,
+    WorkItemProgressOut,
     WorkItemPrOut,
     WorkItemPublicationOut,
     WorkItemRequestOut,
+    WorkItemStageOut,
 )
 
 from .config import Settings
+from .factory_progress import phase_view
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .models import (
     Approval,
     ExecutionRequest,
+    ExecutionRequestPhaseReport,
+    FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
     WorkItem,
@@ -503,6 +511,34 @@ async def _views(
             )
         )
 
+    sequences = {req.id: req.sequence for rows in requests.values() for req in rows}
+    comments: dict[uuid.UUID, list[FactoryStatusComment]] = defaultdict(list)
+    for comment in (
+        await session.scalars(
+            select(FactoryStatusComment).where(FactoryStatusComment.work_item_id.in_(ids))
+        )
+    ).all():
+        comments[comment.work_item_id].append(comment)
+    latest: dict[uuid.UUID, ExecutionRequest] = {
+        item_id: max(rows, key=lambda r: r.sequence) for item_id, rows in requests.items() if rows
+    }
+    latest_comment: dict[uuid.UUID, FactoryStatusComment] = {}
+    for item_id, req in latest.items():
+        row = next((c for c in comments[item_id] if c.execution_request_id == req.id), None)
+        if row is not None:
+            latest_comment[item_id] = row
+    reports: dict[uuid.UUID, list[ExecutionRequestPhaseReport]] = defaultdict(list)
+    progressed = {latest[item_id].id for item_id in latest_comment}
+    if progressed:
+        for report in (
+            await session.scalars(
+                select(ExecutionRequestPhaseReport)
+                .where(ExecutionRequestPhaseReport.execution_request_id.in_(progressed))
+                .order_by(ExecutionRequestPhaseReport.id)
+            )
+        ).all():
+            reports[report.execution_request_id].append(report)
+
     views = []
     for item in items:
         item_requests = requests.get(item.id, [])
@@ -522,20 +558,64 @@ async def _views(
         )
         lineage = chosen[item.id]
         chosen_pub = latest_pub.get(lineage.id) if lineage is not None else None
-        views.append((
-            derive_outcome(
-                item,
-                item_requests,
-                lineage,
-                chosen_pub,
-                approvals.get(chosen_pub.approval_id) if chosen_pub is not None else None,
-                pending_turn,
-                now,
-                issue_base=settings.github_clone_base,
-            ),
+        view = derive_outcome(
+            item,
+            item_requests,
             lineage,
-        ))
+            chosen_pub,
+            approvals.get(chosen_pub.approval_id) if chosen_pub is not None else None,
+            pending_turn,
+            now,
+            issue_base=settings.github_clone_base,
+        )
+        view.title = _title(comments[item.id], sequences)
+        comment_row = latest_comment.get(item.id)
+        if comment_row is not None:
+            req = latest[item.id]
+            view.progress = _progress(comment_row, reports[req.id], req)
+        views.append((view, lineage))
     return views
+
+
+def _title(rows: Sequence[FactoryStatusComment], sequences: dict[uuid.UUID, int]) -> str | None:
+    """The subject title of the work item's most recent status comment row."""
+
+    if not rows:
+        return None
+    newest = max(
+        rows,
+        key=lambda row: (row.created_at, sequences.get(row.execution_request_id, 0)),
+    )
+    return newest.subject_title
+
+
+def _progress(
+    row: FactoryStatusComment,
+    reports: Sequence[ExecutionRequestPhaseReport],
+    req: ExecutionRequest,
+) -> WorkItemProgressOut:
+    """The status card's phase view for one request, as explicit fields."""
+
+    view = phase_view(
+        row.declaration or {"phases": [], "loops": []},
+        reports,
+        req.status,
+        req.terminal_cause,
+    )
+    slots = view.stages if view.staged else view.phases
+    return WorkItemProgressOut(
+        current=view.current,
+        note=next((report.note for report in reversed(reports) if report.note), None),
+        stages=[
+            WorkItemStageOut(
+                id=slot.id,
+                label=slot.label,
+                state=slot.state,
+                round_label=slot.round_label,
+            )
+            for slot in slots
+        ],
+    )
 
 
 async def load_outcomes(
