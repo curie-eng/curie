@@ -2457,18 +2457,6 @@ jobs:
         env:
           CURIE_BIN: cli/target/release/curie
         run: bash cli/scripts/credential-free-redeploy-cluster.sh
-      # #3814: the dark factory on this kind cluster, only when a factory path
-      # changed. The GitHub stub and the scripted model replace github.com and
-      # the live provider. The ladder release above is left in place.
-      - name: Scripted factory scenario
-        if: needs.changes.outputs.factory == 'true'
-        env:
-          CURIE_BIN: cli/target/release/curie
-        run: |
-          set -euo pipefail
-          CURIE_FACTORY_SCRIPTED_PLAN=1 python3 tools/factory-e2e/factory_e2e.py scripted \
-            --context kind-curie-e2e \
-            --model-base-url http://10.1.2.3:8080
       # Surface why on any failure above: pod states, recent events, and the
       # worker/runner logs are what localize a reachability or scheduling break.
       - name: Dump cluster diagnostics on failure
@@ -2496,6 +2484,70 @@ jobs:
           name: runtime-assertion-receipts-${{ github.job }}
           path: ${{ runner.temp }}/runtime-assertion-receipts
           if-no-files-found: ignore
+
+  # The factory driver owns its kind cluster, registry, and local endpoints.
+  # Replay drives the production factory from one labelled fixture issue to
+  # its pull request and final comment without a provider key.
+  e2e-scripted-factory:
+    name: E2E scripted factory scenario (kind, scripted model)
+    runs-on: ubuntu-latest
+    needs: [rust-build, changes, ci-images]
+    if: ${{ needs.changes.outputs.factory == 'true' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Download the curie binary built by the Rust job
+        uses: actions/download-artifact@v8
+        with:
+          name: curie-x86_64-linux-${{ github.sha }}
+          path: cli/target/release
+      - name: Make the binary executable
+        run: chmod +x cli/target/release/curie
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Install kind and kubectl without creating a cluster
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          install_only: true
+      # This ubuntu-latest job owns a disposable hosted runner. The Android,
+      # .NET and Haskell SDKs are unused here; remove only those preinstalled
+      # SDK trees before downloading images to preserve the driver's 30 GB floor.
+      - name: Free disk for the disposable factory cluster
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+      - name: Load the four images built by the ci-images job
+        uses: ./.github/actions/load-ci-images
+        with:
+          images: "{api,worker,ui,runner}"
+      - name: Tag the images for the factory driver
+        run: |
+          set -euo pipefail
+          docker tag curie-ci/api:candidate curie-api:local
+          docker tag curie-ci/worker:candidate curie-worker:local
+          docker tag curie-ci/ui:candidate curie-ui:local
+          docker tag curie-ci/runner:candidate curie-runner:latest
+      - name: Run the scripted factory scenario
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          BUILDX_BUILDER: default
+        run: python3 tools/factory-e2e/factory_e2e.py scripted
+      - name: Upload scripted factory evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scripted-factory-evidence-${{ github.sha }}
+          path: target/factory-e2e/scripted-*.json
+          if-no-files-found: warn
 
   # CHART RUNTIME REGRESSIONS, in parallel with the cluster rung. Most
   # regression proofs that need an enforcing Calico cluster but neither the
@@ -4031,7 +4083,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
+    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-scripted-factory, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
     # selected results other than success.
@@ -4048,12 +4100,14 @@ jobs:
           RELEASED_UPGRADE_SELECTED: ${{ needs.changes.outputs.released_upgrade }}
           RELEASED_UPGRADE_FULL: ${{ needs.changes.outputs.released_upgrade_full }}
           APPROVAL_RESUME_SELECTED: ${{ needs.changes.outputs.approval_resume }}
+          FACTORY_SELECTED: ${{ needs.changes.outputs.factory }}
           SKILL_LOCAL_RESULT: ${{ needs.e2e-ladder.result }}
           LOCAL_RELEASE_RESULT: ${{ needs.e2e-ladder-release.result }}
           CLUSTER_RESULT: ${{ needs.e2e-ladder-cluster.result }}
           CLUSTER_CHART_RESULT: ${{ needs.e2e-cluster-chart-regressions.result }}
           ROLLOUT_RECOVERY_RESULT: ${{ needs.e2e-cluster-rollout-recovery.result }}
           APPROVAL_RESUME_RESULT: ${{ needs.e2e-cluster-approval-resume-restarts.result }}
+          FACTORY_RESULT: ${{ needs.e2e-scripted-factory.result }}
           RELEASED_UPGRADE_RESULT: ${{ needs.e2e-released-upgrade.result }}
           RELEASED_UPGRADE_NEGATIVE_RESULT: ${{ needs.e2e-released-upgrade-negative.result }}
           UPGRADE_MATRIX_SHARDS_RESULT: ${{ needs.e2e-cluster-upgrade-matrix-shards.result }}
@@ -4068,6 +4122,7 @@ jobs:
                   "$CLUSTER_CHART_RESULT" != "$cluster_expected" ||
                   "$ROLLOUT_RECOVERY_RESULT" != "$rollout_recovery_expected" ||
                   "$APPROVAL_RESUME_RESULT" != "$approval_resume_expected" ||
+                  "$FACTORY_RESULT" != "$factory_expected" ||
                   "$RELEASED_UPGRADE_RESULT" != "$released_upgrade_expected" ||
                   "$RELEASED_UPGRADE_NEGATIVE_RESULT" != "$released_upgrade_expected" ||
                   "$UPGRADE_MATRIX_RESULT" != "$upgrade_matrix_expected" ]]; then
@@ -4085,6 +4140,7 @@ jobs:
                 ( "$RELEASED_UPGRADE_SELECTED" != "true" && "$RELEASED_UPGRADE_SELECTED" != "false" ) ||
                 ( "$RELEASED_UPGRADE_FULL" != "true" && "$RELEASED_UPGRADE_FULL" != "false" ) ||
                 ( "$APPROVAL_RESUME_SELECTED" != "true" && "$APPROVAL_RESUME_SELECTED" != "false" ) ||
+                ( "$FACTORY_SELECTED" != "true" && "$FACTORY_SELECTED" != "false" ) ||
                 ( "$RELEASED_UPGRADE_FULL" == "true" && "$RELEASED_UPGRADE_SELECTED" != "true" ) ]]; then
             echo "E2E required failed" >&2
             exit 1
@@ -4112,6 +4168,11 @@ jobs:
           if [[ "$APPROVAL_RESUME_SELECTED" == "true" ]]; then
             approval_resume_expected="success"
           fi
+          # Mirrors the scripted factory job's if, pull requests included.
+          factory_expected="skipped"
+          if [[ "$FACTORY_SELECTED" == "true" ]]; then
+            factory_expected="success"
+          fi
           # Full runs include pushes, dispatches, and PRs editing an upgrade
           # job. Ordinary PRs selecting released-upgrade run one smoke shard.
           # The matrix reports success only when all selected shards succeed.
@@ -4133,6 +4194,7 @@ jobs:
           # rejected, so no dependency can drop out of the validator unnoticed.
           for name in SKILL_LOCAL_RESULT LOCAL_RELEASE_RESULT CLUSTER_RESULT \
             CLUSTER_CHART_RESULT ROLLOUT_RECOVERY_RESULT APPROVAL_RESUME_RESULT \
+            FACTORY_RESULT \
             RELEASED_UPGRADE_RESULT \
             RELEASED_UPGRADE_NEGATIVE_RESULT UPGRADE_MATRIX_RESULT; do
             flipped="success"

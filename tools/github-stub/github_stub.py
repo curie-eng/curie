@@ -52,10 +52,18 @@ class GithubStub:
         host: str = "127.0.0.1",
         port: int = 0,
         *,
+        seed_tree: Path,
+        issue_file: Path,
         bind: str | None = None,
     ) -> None:
         if recording.get("version") != 1:
             raise ValueError("unsupported GitHub recording version")
+        if not seed_tree.is_dir():
+            raise ValueError("GitHub stub seed_tree must be an existing directory")
+        if not issue_file.is_file():
+            raise ValueError("GitHub stub issue_file must be an existing Markdown file")
+        self.seed_tree = seed_tree.resolve()
+        self.issue_body = issue_file.read_text()
         try:
             advertised_ip = ipaddress.ip_address(host)
         except ValueError:
@@ -187,22 +195,28 @@ class GithubStub:
         self._repository.parent.mkdir(parents=True, exist_ok=True)
         self._run("git", "init", "--bare", "--initial-branch=main", str(self._repository))
         self._run("git", "--git-dir", str(self._repository), "config", "http.receivepack", "true")
-        blob = self._run(
+        seed_env = dict(os.environ)
+        seed_env["GIT_INDEX_FILE"] = str(self.root / "seed.index")
+        self._run(
             "git",
             "--git-dir",
             str(self._repository),
-            "hash-object",
-            "-w",
-            "--stdin",
-            input_=b"def example():\n    return 'example'\n",
-        ).strip()
+            "--work-tree",
+            str(self.seed_tree),
+            "add",
+            "--all",
+            "--",
+            ".",
+            cwd=self.seed_tree,
+            env=seed_env,
+        )
         tree = (
             self._run(
                 "git",
                 "--git-dir",
                 str(self._repository),
-                "mktree",
-                input_=b"100644 blob " + blob + b"\texample.py\n",
+                "write-tree",
+                env=seed_env,
             )
             .strip()
             .decode()
@@ -260,7 +274,7 @@ class GithubStub:
         self._put(
             "issue",
             3815,
-            self._issue(3815, "Example factory change", "Update example.py.", ["factory"]),
+            self._issue(3815, "Example factory change", self.issue_body, ["factory"]),
         )
         self._label_event(3815, "factory", "labeled", HUMAN)
         self._thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -761,6 +775,8 @@ def main() -> int:
     serve.add_argument(
         "--recording", type=Path, default=Path(__file__).parent / "recordings/curie-pr-3400.json"
     )
+    serve.add_argument("--seed-tree", type=Path, required=True)
+    serve.add_argument("--issue-file", type=Path, required=True)
     serve.add_argument("--host", default="127.0.0.1", help="Advertised DNS name or IP address")
     serve.add_argument("--bind", help="Listening IP address, defaults to the advertised host")
     serve.add_argument("--port", type=int, default=0)
@@ -780,6 +796,8 @@ def main() -> int:
             json.loads(args.recording.read_text()),
             args.host,
             args.port,
+            seed_tree=args.seed_tree,
+            issue_file=args.issue_file,
             bind=args.bind,
         )
         stop = threading.Event()
