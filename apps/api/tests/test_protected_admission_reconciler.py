@@ -595,3 +595,96 @@ def test_tick_log_carries_counts_and_no_identity_payload_or_credential(
                 assert value not in line, "a tick log carries an identity, payload or credential"
 
     run(scenario)
+
+
+# -- review round: tick ending and shutdown cancellation -----------------------------------
+
+
+def test_a_connection_lost_during_recover_ends_the_tick(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A connection loss inside ``recover`` ends the tick: no further recover on that tick,
+    and the tick is logged as broker_unavailable, never ``outcome=ok``.
+
+    Real fault: the owned broker pauses writes, so the first recover's script
+    waits, and the fixture then kills the enqueue principal's connection. The
+    recover count is a test side pass-through spy. No app runs, so no other
+    reconciler races this one. @spec PROTECTED-HOOK-LANE-4 @spec PROTECTED-HOOK-ADMISSION-5.
+    """
+    import threading
+
+    from curie_api.protected_reconciler import ProtectedAdmissionReconciler
+
+    broker = ingress_broker
+    agent = str(uuid.uuid4())
+    directory = tmp_path / "runtime-tick"
+    rt = provision(broker, agent, directory)
+    install(broker, rt)
+    for index in range(3):
+        interrupt(broker, rt, agent, f"lost-{index}")
+    calls: list[int] = []
+    entered = threading.Event()
+    original = AtomicAdmission.recover
+
+    def counted(self: Any, identity: Any) -> Any:
+        """@spec PROTECTED-HOOK-LANE-4."""
+        calls.append(1)
+        entered.set()
+        return original(self, identity)
+
+    monkeypatch.setattr(AtomicAdmission, "recover", counted)
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-LANE-4."""
+        reconciler = ProtectedAdmissionReconciler(lambda: str(directory))
+        broker.command("CLIENT", "PAUSE", "4000", "WRITE")
+        try:
+            async with captured_logs() as logs:
+                tick = asyncio.create_task(reconciler.tick())
+                await asyncio.to_thread(entered.wait, 3)
+                await asyncio.sleep(0.5)
+                broker.command("CLIENT", "KILL", "USER", broker.enqueue.username)
+                result = await asyncio.wait_for(tick, 10)
+        finally:
+            broker.command("CLIENT", "UNPAUSE")
+            await reconciler.stop()
+        assert len(calls) == 1, f"the tick kept calling recover on a lost connection: {len(calls)}"
+        outcomes = [line for line in logs.lines if "reconciler tick outcome=" in line]
+        assert not any("outcome=ok" in line for line in outcomes), outcomes
+        assert any("outcome=broker_unavailable" in line for line in outcomes), outcomes
+        assert result is None
+
+    run(scenario)
+
+
+def test_cancelling_shutdown_while_the_reconciler_stops_propagates(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancellation of the lifespan's own shutdown is not swallowed by ``stop``.
+
+    @spec PROTECTED-HOOK-LANE-4.
+    """
+    from curie_api.protected_reconciler import ProtectedAdmissionReconciler
+
+    broker = ingress_broker
+    agent = str(uuid.uuid4())
+    directory = tmp_path / "runtime-stop"
+    install(broker, provision(broker, agent, directory))
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-LANE-4."""
+        reconciler = ProtectedAdmissionReconciler(lambda: str(directory))
+        reconciler.start()
+        await asyncio.sleep(0)
+        stopping = asyncio.create_task(reconciler.stop())
+        # Let stop() reach its join of the reconciler task, then cancel the shutdown.
+        for _ in range(3):
+            await asyncio.sleep(0)
+        stopping.cancel()
+        try:
+            await asyncio.wait_for(stopping, 15)
+        except asyncio.CancelledError:
+            return
+        pytest.fail("stop() swallowed the cancellation of the shutdown", pytrace=False)
+
+    run(scenario)

@@ -892,3 +892,40 @@ def test_history_without_a_row_stays_closed(
             assert (broker_snapshot(broker), await ordinary_state(app, agent)) == before
 
     run(scenario)
+
+
+def test_unexpected_tombstone_check_exception_answers_503_broker_unavailable(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any exception from the tombstone broker read is 503 broker_unavailable, never a 500.
+
+    Every real broker fault already arrives as the transport's single safe
+    error, so no store operation can produce another exception type; the fault
+    is a test side raise from the package transport's intent check (a state
+    shape the transport did not anticipate). @spec PROTECTED-HOOK-SOURCE-8
+    @spec PROTECTED-HOOK-SOURCE-2.
+    """
+    from curie_protected_hooks.broker_transport import AuthenticatedEnqueueClient
+
+    broker = ingress_broker
+
+    def unexpected(self: Any, identity: Any) -> bool:
+        """@spec PROTECTED-HOOK-SOURCE-8."""
+        raise KeyError("unexpected state shape")
+
+    async def scenario() -> None:
+        """@spec PROTECTED-HOOK-SOURCE-8."""
+        async with ingress_app(tmp_path, monkeypatch) as (app, client, agent, directory):
+            rt = provision(broker, agent, directory, source=False)
+            install(broker, rt)
+            await asyncio.to_thread(_seed_tombstone, broker, agent, True)
+            monkeypatch.setattr(AuthenticatedEnqueueClient, "intent_present", unexpected)
+            before = broker_snapshot(broker), await ordinary_state(app, agent)
+            try:
+                response = await deliver(client, agent, signed(legacy_secret(agent)))
+            except KeyError:
+                pytest.fail("the tombstone check let an unexpected exception escape", pytrace=False)
+            assert_detail(response, 503, "broker_unavailable")
+            assert (broker_snapshot(broker), await ordinary_state(app, agent)) == before
+
+    run(scenario)
