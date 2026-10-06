@@ -587,19 +587,31 @@ class AtomicAdmission:
         )
 
 
-def quota_occupancy(admission: AtomicAdmission) -> int:
-    """Members of the global quota set on the facade's connection, a count only.
+def quota_census(admission: AtomicAdmission) -> tuple[int, int]:
+    """Quota occupancy and committed (parked) members, counts only; writes nothing.
 
-    For the trusted reconciler's tick log: committed deliveries park in the set
-    until the protected worker releases them. Writes nothing and leaves the
-    facade's closed operations unchanged. @spec PROTECTED-HOOK-LANE-4.
+    For the trusted reconciler's tick log. A member counts as parked only when
+    its intent and commit records both exist, so failed and orphan members are
+    excluded. Leaves the facade's closed operations unchanged.
+    @spec PROTECTED-HOOK-LANE-4 @spec PROTECTED-HOOK-ADMISSION-5.
     """
     if type(admission) is not AtomicAdmission:
         raise ValueError("invalid protected admission facade")
     try:
-        count: Any = admission._client.zcard("protected:admission:quota")
+        prefix = "protected:admission:"
+        members: Any = admission._client.zrange(prefix + "quota", 0, admission._limit - 1)
+        if type(members) is not list:
+            raise AdmissionUnavailable()
+        parked = 0
+        for member in members:
+            if type(member) is not bytes or _DIGEST.fullmatch(member) is None:
+                continue
+            digest = member.decode("ascii")
+            if (
+                admission._get(prefix + "intent:" + digest) is not None
+                and admission._get(prefix + "commit:" + digest) is not None
+            ):
+                parked += 1
+        return len(members), parked
     except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
         raise AdmissionUnavailable() from None
-    if type(count) is not int or count < 0:
-        raise AdmissionUnavailable()
-    return count

@@ -36,7 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from curie_protected_hooks.admission_records import AdmissionUnavailable
-from curie_protected_hooks.atomic_admission import quota_occupancy
+from curie_protected_hooks.atomic_admission import quota_census
 from curie_protected_hooks.broker_metadata import BrokerMetadataUnavailable
 from curie_protected_hooks.broker_transport import (
     AuthenticatedEnqueueClient,
@@ -85,15 +85,19 @@ def _tick(runtime: IngressRuntime) -> TickCounts:
                 backlog_limit=BACKLOG_LIMIT,
             )
             identities = facade.preparing(BACKLOG_LIMIT)
-            counts.quota = quota_occupancy(facade)
+            counts.quota, counts.parked = quota_census(facade)
             counts.preparing = len(identities)
-            counts.parked = max(0, counts.quota - counts.preparing)
             for identity in identities:
                 if time.monotonic() >= deadline:
                     break
                 try:
                     result = facade.recover(identity)
                 except AdmissionUnavailable:
+                    # One intent's refusal is skipped only while the connection
+                    # and budget survive; otherwise the tick ends here.
+                    if time.monotonic() >= deadline:
+                        raise BrokerMetadataUnavailable() from None
+                    client.observe()
                     counts.skipped += 1
                     continue
                 if result.status in ("accepted", "duplicate"):
@@ -139,8 +143,14 @@ class ProtectedAdmissionReconciler:
             task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(task), JOIN_SECONDS)
-            except (TimeoutError, asyncio.CancelledError):
+            except TimeoutError:
                 pass
+            except asyncio.CancelledError:
+                # The reconciler's own cancellation ends the join; a cancellation
+                # of this shutdown itself propagates.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
             except Exception:  # noqa: BLE001  Shutdown never fails on a reconciler fault.
                 logger.warning("protected admission reconciler stopped with an error")
         remaining = max(0.0, JOIN_SECONDS - (time.monotonic() - started))
@@ -188,6 +198,7 @@ class ProtectedAdmissionReconciler:
         try:
             counts = await loop.run_in_executor(self._executor, _tick, runtime)
         except (AdmissionUnavailable, BrokerMetadataUnavailable):
+            # A connection or budget failure, including one inside recover.
             logger.info("protected admission reconciler tick outcome=broker_unavailable")
             return None
         busy = counts.quota or counts.preparing or counts.skipped

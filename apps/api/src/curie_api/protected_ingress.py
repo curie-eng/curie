@@ -229,7 +229,7 @@ def _tombstone(
             if identity is not None and client.intent_present(identity):
                 return "delivery_conflict"
             return "open"
-    except BrokerMetadataUnavailable:
+    except Exception:  # noqa: BLE001  Any broker read failure, expected or not, is unavailable.
         raise IngressBrokerUnavailable() from None
     finally:
         _close(client)
@@ -242,5 +242,8 @@ async def tombstone_check(
 
     @spec PROTECTED-HOOK-SOURCE-8.
     """
-    fingerprint = committed_policy_fingerprint(policy)
+    try:
+        fingerprint = committed_policy_fingerprint(policy)
+    except Exception:  # noqa: BLE001  A row whose fingerprint fails admits nothing.
+        raise IngressBrokerUnavailable() from None
     return await slot.run(_tombstone, runtime, policy, fingerprint, delivery_id)
