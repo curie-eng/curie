@@ -109,7 +109,8 @@ that does not exist yet is authorized as a create, so a Role with only `patch`
 lets the reconciler update existing connectors while failing to create any --
 the first-run path, and the one most likely to be exercised. Verified with
 `kubectl apply --server-side --as=<the worker SA>`, which is forbidden without
-it. No `get` (nothing reads a single object), no cluster scope, no other kinds.
+it. No `get` unless the action executor is enabled, when one separate rule adds
+only `get` on Deployments for digest attribution; no cluster scope, no other kinds.
 
 This is a genuine privilege increase over the CRD-only rules above -- it
 includes delete on Secrets -- which is why it renders only when the reconciler
