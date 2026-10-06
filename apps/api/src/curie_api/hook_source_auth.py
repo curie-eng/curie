@@ -1,4 +1,14 @@
-"""@spec PROTECTED-HOOK-SOURCE-2/4/9/10."""
+"""Signed hook authentication under the agent source gate.
+
+@spec PROTECTED-HOOK-SOURCE-2/4/9/10.
+
+Ingress yields the gate-held snapshot for never configured, tombstoned and
+protected rows; pending history stays closed here. When the ungated
+authentication found a protected row, signed delivery ingress waits for the
+gate at most ``PROTECTED_GATE_WAIT_SECONDS`` and answers 503
+``authority_unavailable`` past it; every other signed delivery keeps the
+unbounded wait. The gate-held reload still decides the path.
+"""
 
 from __future__ import annotations
 
@@ -34,6 +44,8 @@ MISSING_DELIVERY_DETAIL = (
     "agent twice"
 )
 _UNAVAILABLE = "authority_unavailable"
+PROTECTED_GATE_WAIT_SECONDS = 5.0
+"""Protected ingress gives up on the agent gate after this long, @spec PROTECTED-HOOK-SOURCE-2."""
 
 
 @dataclass(frozen=True)
@@ -41,6 +53,7 @@ class AuthenticatedHookSource:
     """@spec PROTECTED-HOOK-SOURCE-2."""
 
     agent: Agent
+    snapshot: SourceSnapshot
     _gate: SourceGateContext
 
     async def ensure_live(self) -> None:
@@ -51,8 +64,10 @@ class AuthenticatedHookSource:
             raise HTTPException(503, _UNAVAILABLE) from None
 
 
-async def _current_key(session: AsyncSession, agent_id: uuid.UUID, hook: str) -> str:
-    """@spec PROTECTED-HOOK-SOURCE-2/4."""
+async def _current_key(
+    session: AsyncSession, agent_id: uuid.UUID, hook: str
+) -> tuple[str, str | None]:
+    """The current key and the row mode it was selected by, @spec PROTECTED-HOOK-SOURCE-2/4."""
     row = (
         await session.execute(
             select(Agent.hook_generation, HookSourcePolicy.mode, HookSourcePolicy.generation)
@@ -77,10 +92,13 @@ async def _current_key(session: AsyncSession, agent_id: uuid.UUID, hook: str) ->
         raise SourceSnapshotUnavailable("invalid_source_state")
     api_key = get_settings().api_key
     if mode == "protected":
-        return hook_source_signing.derive(
-            api_key, agent_id=str(agent_id), hook=hook, generation=generation
+        return (
+            hook_source_signing.derive(
+                api_key, agent_id=str(agent_id), hook=hook, generation=generation
+            ),
+            mode,
         )
-    return hook_signing.derive(api_key, agent_id=str(agent_id), generation=legacy)
+    return hook_signing.derive(api_key, agent_id=str(agent_id), generation=legacy), mode
 
 
 @dataclass(frozen=True)
@@ -117,16 +135,24 @@ def _authenticate(key: str, signed: _SignedRequest) -> None:
 
 async def _preauthenticate(
     session: AsyncSession, agent_id: uuid.UUID, signed: _SignedRequest
-) -> None:
-    """Ungated check, never admission authority. @spec PROTECTED-HOOK-SOURCE-2/9."""
-    preliminary = await _current_key(session, agent_id, signed.hook)
+) -> str | None:
+    """Ungated check, never admission authority; returns the row mode it saw.
+
+    @spec PROTECTED-HOOK-SOURCE-2/9.
+    """
+    preliminary, mode = await _current_key(session, agent_id, signed.hook)
     _authenticate(preliminary, signed)
     del preliminary
+    return mode
 
 
 @asynccontextmanager
 async def _gated_snapshot(
-    request: Request, session: AsyncSession, agent_id: uuid.UUID, signed: _SignedRequest
+    request: Request,
+    session: AsyncSession,
+    agent_id: uuid.UUID,
+    signed: _SignedRequest,
+    wait_seconds: float | None = None,
 ) -> AsyncIterator[tuple[SourceGateContext, SourceSnapshot]]:
     """Gate-held reload and reauthentication before the snapshot read.
 
@@ -136,8 +162,8 @@ async def _gated_snapshot(
     gate = getattr(request.app.state, "source_gate", None)
     if not isinstance(gate, SourceGate):
         raise SourceSnapshotUnavailable("source_gate_unavailable")
-    async with gate.hold(agent_id) as held:
-        current = await _current_key(session, agent_id, signed.hook)
+    async with gate.hold(agent_id, wait_seconds=wait_seconds) as held:
+        current, _mode = await _current_key(session, agent_id, signed.hook)
         _authenticate(current, signed)
         del current
         yield held, await read_source_snapshot(held, await session.connection(), signed.hook)
@@ -156,15 +182,29 @@ async def authenticated_source(
     delivery_id: str,
     signature: str | None,
 ) -> AsyncIterator[AuthenticatedHookSource]:
-    """@spec PROTECTED-HOOK-SOURCE-2/4/10."""
+    """Yield the agent and the gate-held snapshot of a deliverable source state.
+
+    Pending history is refused with its reason; never configured, tombstoned
+    and protected rows are yielded with the gate held, and the caller decides
+    their path. @spec PROTECTED-HOOK-SOURCE-2/4/10.
+    """
     signed = _SignedRequest(
         hook_signing.verify, hook, raw, tool_access, timestamp, delivery_id, signature
     )
     try:
-        await _preauthenticate(session, agent_id, signed)
-        async with _gated_snapshot(request, session, agent_id, signed) as (held, snapshot):
-            if not snapshot.never_configured:
+        mode = await _preauthenticate(session, agent_id, signed)
+        wait = PROTECTED_GATE_WAIT_SECONDS if mode == "protected" else None
+        async with _gated_snapshot(request, session, agent_id, signed, wait) as (
+            held,
+            snapshot,
+        ):
+            if snapshot.policy is None and not snapshot.never_configured:
                 raise HTTPException(503, snapshot.refusal_reason or _UNAVAILABLE)
+            if snapshot.policy is not None and snapshot.policy.mode not in (
+                "ordinary",
+                "protected",
+            ):
+                raise HTTPException(503, _UNAVAILABLE)
             agent: Agent | None = await session.scalar(
                 select(Agent)
                 .where(Agent.id == agent_id)
@@ -173,9 +213,21 @@ async def authenticated_source(
             )
             if agent is None:
                 raise HTTPException(401, AUTH_DETAIL)
-            yield AuthenticatedHookSource(agent, held)
+            yield AuthenticatedHookSource(agent, snapshot, held)
     except (SourceAgentNotFound, SourceGateInvalid, SourceSnapshotUnavailable, SQLAlchemyError):
         raise HTTPException(503, _UNAVAILABLE) from None
+
+
+@dataclass(frozen=True)
+class SupportSnapshot:
+    """The gate-held snapshot and the agent's source bindings, read in one gate hold.
+
+    ``source_bound`` is whether the agent declares any source binding (step 0).
+    @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-LANE-4.
+    """
+
+    snapshot: SourceSnapshot
+    source_bound: bool
 
 
 @asynccontextmanager
@@ -190,7 +242,7 @@ async def authenticated_support(
     timestamp: str | None,
     delivery_id: str | None,
     signature: str | None,
-) -> AsyncIterator[SourceSnapshot]:
+) -> AsyncIterator[SupportSnapshot]:
     """Support-purpose authentication yielding the gate-held snapshot unrefused.
 
     Verifies only ``hook_source_signing.verify_support``; the caller resolves
@@ -210,6 +262,9 @@ async def authenticated_support(
         if not delivery_id:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, MISSING_DELIVERY_DETAIL)
         async with _gated_snapshot(request, session, agent_id, signed) as (_held, snapshot):
-            yield snapshot
+            bindings = await session.scalar(
+                select(Agent.source_bindings).where(Agent.id == agent_id)
+            )
+            yield SupportSnapshot(snapshot, bool(bindings))
     except (SourceAgentNotFound, SourceGateInvalid, SourceSnapshotUnavailable, SQLAlchemyError):
         raise HTTPException(503, _UNAVAILABLE) from None

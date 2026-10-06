@@ -16,9 +16,12 @@ evaluation opens one ``AuthenticatedMetadataReader`` under a five second budget,
 reads the source record, the selected control records and one broker
 observation on that connection, always closes it, and then decides over what
 it read with the shared ``authority_evaluation`` in its admission phase, the
-same decision atomic admission takes. A fully valid tuple still reports
-``configuration_unsupported`` until ingress admits protected deliveries
-(LANE-4). @spec PROTECTED-HOOK-LANE-2/3.
+same decision atomic admission takes. Step 0 (declared source bindings) is the
+caller's, decided under the gate before any file is read. When the evaluation
+accepts, step 12 parses ``enqueue.json`` through ``load_ingress`` and requires
+it bound to the same manifest; the credential is discarded unused and never
+connected with. Only then is the answer ``supported``.
+@spec PROTECTED-HOOK-LANE-2/3 @spec PROTECTED-HOOK-SOURCE-9.
 """
 
 from __future__ import annotations
@@ -51,6 +54,7 @@ from .hook_source_policy_schemas import HookSupportReason
 from .protected_runtime_files import RuntimeBootstrap as _Bootstrap
 from .protected_runtime_files import RuntimeFilesInvalid as _BootstrapInvalid
 from .protected_runtime_files import load_bootstrap as _load_bootstrap
+from .protected_runtime_files import load_ingress as _load_ingress
 
 # @spec PROTECTED-HOOK-SOURCE-9
 _CONCURRENCY = 4
@@ -150,11 +154,11 @@ def _read_session(bootstrap: _Bootstrap, runtime: str, agent_id: str, hook: str)
 
 
 # @spec PROTECTED-HOOK-SOURCE-9: the one to one outcome to probe reason map. A
-# closed selection stays the probe's runtime_unavailable, and an accepted tuple
-# still reports configuration_unsupported until ingress admits (LANE-4).
+# closed selection stays the probe's runtime_unavailable; an accepted tuple is
+# supported once step 12 also passes.
 _PROBE_REASONS: Mapping[AuthorityOutcome, HookSupportReason] = MappingProxyType(
     {
-        "accept": "configuration_unsupported",
+        "accept": "supported",
         "source_closed": "source_closed",
         "runtime_unavailable": "runtime_unavailable",
         "broker_identity_mismatch": "broker_identity_mismatch",
@@ -217,7 +221,19 @@ def _evaluate(policy: SourcePolicySnapshot, fingerprint: str, directory: str) ->
         reads = _read_broker(bootstrap, str(policy.agent_id), policy.hook)
     except BrokerMetadataUnavailable:
         return ProtectedSupport("broker_unavailable")
-    return _decide(policy, fingerprint, bootstrap, reads)
+    decided = _decide(policy, fingerprint, bootstrap, reads)
+    if decided.reason != "supported":
+        return decided
+    # 12. The enqueue file is valid and bound to this manifest; parsed, never used.
+    try:
+        ingress = _load_ingress(directory)
+    except _BootstrapInvalid:
+        return ProtectedSupport("runtime_unavailable", decided.runtime)
+    bound = ingress.bootstrap.manifest.canonical_bytes == bootstrap.manifest.canonical_bytes
+    del ingress
+    if not bound:
+        return ProtectedSupport("runtime_unavailable", decided.runtime)
+    return decided
 
 
 async def evaluate_protected_support(

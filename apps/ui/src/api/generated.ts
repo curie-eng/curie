@@ -466,9 +466,10 @@ export interface paths {
          * Put Source Policy
          * @description Target mandatory read-only protected delivery under the deployment's runtime.
          *
-         *     A committed protected PUT answers 503 ``source_publication_deferred`` with
-         *     its committed generation: the commit happened, the agent's legacy counter
-         *     may have advanced, and the source stays closed until the LANE-4 change.
+         *     The commit happens and the agent's legacy counter may advance; the row is
+         *     then published once current runtime evidence is confirmed, answering 200
+         *     ``active``. A refusal after the commit answers 503 with the committed
+         *     generation and the source stays closed.
          */
         put: operations["put_source_policy_agents__agent_id__hooks__hook__source_policy_put"];
         post?: never;
@@ -497,7 +498,7 @@ export interface paths {
         put?: never;
         /**
          * Rotate Source Policy
-         * @description Allocate a fresh generation for the current protected target.
+         * @description Allocate and publish a fresh generation for the current protected target.
          */
         post: operations["rotate_source_policy_agents__agent_id__hooks__hook__source_policy_rotate_post"];
         delete?: never;
@@ -515,7 +516,12 @@ export interface paths {
         };
         /**
          * Get Source Secret
-         * @description Refuses every state in this slice and writes nothing.
+         * @description The scoped source key of an active protected source; writes nothing.
+         *
+         *     Served only when one reader session, after the gate is released, shows the
+         *     row's active protected record; that attests publication, not current
+         *     readiness. A rotation committing after that read makes the returned key
+         *     already revoked. Every other state is refused with no key.
          */
         get: operations["get_source_secret_agents__agent_id__hooks__hook__source_policy_secret_get"];
         put?: never;
@@ -1780,6 +1786,12 @@ export interface paths {
          *     7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),
          *        after both of those and before anything is claimed;
          *     8. routability, then the claim, quota and enqueue.
+         *
+         *     The gate-held snapshot decides the path. A committed protected row is
+         *     admitted atomically onto the private broker (``_ingest_protected``) and
+         *     never touches the ordinary store. A tombstone first requires its ordinary
+         *     publication to be active and no private intent for the delivery, then
+         *     runs the ordinary path; pending history stays closed.
          */
         post: operations["ingest_hook_hooks__agent_id___hook__post"];
         delete?: never;
@@ -1803,8 +1815,10 @@ export interface paths {
          *
          *     The JSON body is ``HookSupportIn``, read raw because its exact bytes are
          *     signed. Order follows the spec: hook name, bounded body, strict parse,
-         *     ungated support signature, delivery id, gate-held reauthentication, snapshot,
-         *     gate release, then broker evaluation of a protected row only.
+         *     ungated support signature, delivery id, gate-held reauthentication, snapshot
+         *     and source bindings, gate release, then broker evaluation of a protected
+         *     row without source bindings only. ``supported`` (200) is answered exactly
+         *     when admission would accept, outside the per delivery exclusions.
          *     The delivery id is signed context only and reserves nothing.
          */
         post: operations["probe_hook_support_hooks__agent_id___hook__support_post"];
@@ -5228,14 +5242,33 @@ export interface components {
          *
          *     ``tool_access`` is the queued policy, not proof of worker support, runner
          *     execution or delivery. A completed duplicate must match the original policy.
+         *
+         *     ``requested_tool_access`` is the policy as signed and ``effective_tool_access``
+         *     the policy the source resolved; ``tool_access`` is the effective alias. An
+         *     ordinary answer reports the requested policy as both. ``source_generation``
+         *     is the committed source generation that admitted the delivery, as a
+         *     canonical decimal string: null for a never configured hook and for any
+         *     ordinary duplicate (the ordinary store never recorded one).
+         *     ``acceptance_status`` is ``accepted``, ``pending`` (an ordinary 202) or
+         *     ``preparing`` (a protected 202). @spec PROTECTED-HOOK-SOURCE-8.
          */
         HookAccepted: {
+            /**
+             * Acceptance Status
+             * @default accepted
+             * @enum {string}
+             */
+            acceptance_status?: "accepted" | "pending" | "preparing";
             /** Conversation Id */
             conversation_id: string | null;
             /** Duplicate */
             duplicate: boolean;
+            effective_tool_access?: components["schemas"]["ToolAccess"] | null;
             /** Event Id */
             event_id: string;
+            requested_tool_access?: components["schemas"]["ToolAccess"] | null;
+            /** Source Generation */
+            source_generation?: string | null;
             /** Stream Id */
             stream_id: string | null;
             tool_access?: components["schemas"]["ToolAccess"] | null;

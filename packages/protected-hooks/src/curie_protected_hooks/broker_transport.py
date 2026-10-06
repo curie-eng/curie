@@ -20,11 +20,12 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from redis._parsers.helpers import parse_info
 from redis.backoff import NoBackoff
 from redis.connection import SSLConnection
-from redis.exceptions import ConnectionError
+from redis.exceptions import ConnectionError, ResponseError
 from redis.maint_notifications import MaintNotificationsConfig
 from redis.retry import Retry
 
 from curie_protected_hooks.admission_records import DeliveryIdentity, delivery_digest
+from curie_protected_hooks.atomic_admission import AtomicAdmission
 from curie_protected_hooks.authority_records import Manifest
 from curie_protected_hooks.broker_metadata import (
     _CONTROL_KEY,
@@ -527,7 +528,7 @@ _FENCE_REFUSALS = (SourceFenceConflict, SourceFenceExhausted, SourceFenceInvalid
 
 
 class AuthenticatedSourceWriter:
-    """Closed source writer: reserve, ordinary publication and close only.
+    """Closed source writer: reserve, ordinary and protected publication and close only.
 
     It validates input, pins TLS and authenticates exactly as the metadata
     reader does and honors ``metadata_reader_budget``, but sends no INFO and
@@ -617,6 +618,28 @@ class AuthenticatedSourceWriter:
                 self.__connection.disconnect()
                 raise BrokerMetadataUnavailable() from None
 
+    def publish_protected(
+        self,
+        agent_id: str,
+        hook: str,
+        generation: int,
+        operation_id: str,
+        policy_fingerprint: str,
+    ) -> bool:
+        """@spec PROTECTED-HOOK-SOURCE-6/7."""
+        with self.__lock:
+            if self.__closed:
+                raise BrokerMetadataUnavailable()
+            try:
+                return self.__fence.publish_protected(
+                    agent_id, hook, generation, operation_id, policy_fingerprint
+                )
+            except _FENCE_REFUSALS:
+                raise
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+                self.__connection.disconnect()
+                raise BrokerMetadataUnavailable() from None
+
     def close(self) -> None:
         """@spec PROTECTED-HOOK-SOURCE-6."""
         with self.__lock:
@@ -649,6 +672,71 @@ class _PinnedEnqueueConnection(_PinnedConnection):
 
 _INTENT_PREFIX = "protected:admission:intent:"
 _INTENT_TYPES = {b"none": False, b"string": True}
+
+
+class _AdmissionCommands:
+    """The commands the admission facade issues, over the pinned enqueue socket only.
+
+    Private: the facade receives it as its client and nothing exports it. Each
+    command holds the enqueue client's lock; any failure other than a command
+    error reply drops the connection for good, so a lost socket is never
+    reopened. @spec PROTECTED-HOOK-ADMISSION-1 @spec PROTECTED-HOOK-LANE-3.
+    """
+
+    __slots__ = ("_connection", "_lock")
+
+    def __init__(self, connection: _PinnedEnqueueConnection, lock: Lock) -> None:
+        """@spec PROTECTED-HOOK-ADMISSION-1."""
+        self._connection = connection
+        self._lock = lock
+
+    def __repr__(self) -> str:
+        """@spec PROTECTED-HOOK-ADMISSION-1."""
+        return "<admission commands>"
+
+    def _call(self, *args: Any) -> Any:
+        """@spec PROTECTED-HOOK-ADMISSION-1 @spec PROTECTED-HOOK-LANE-3."""
+        with self._lock:
+            try:
+                self._connection.send_command(*args, check_health=False)
+                return self._connection.read_response()
+            except ResponseError:
+                raise
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+                self._connection.disconnect()
+                raise BrokerMetadataUnavailable() from None
+
+    def get(self, key: str) -> Any:
+        """@spec PROTECTED-HOOK-ADMISSION-4."""
+        return self._call("GET", key)
+
+    def eval(self, script: str, numkeys: int, *args: Any) -> Any:
+        """@spec PROTECTED-HOOK-ADMISSION-4/5."""
+        return self._call("EVAL", script, numkeys, *args)
+
+    def zrange(self, key: str, start: int, end: int) -> Any:
+        """@spec PROTECTED-HOOK-ADMISSION-5 @spec PROTECTED-HOOK-ADMISSION-6."""
+        return self._call("ZRANGE", key, start, end)
+
+    def zcard(self, key: str) -> Any:
+        """@spec PROTECTED-HOOK-LANE-4."""
+        return self._call("ZCARD", key)
+
+    def info(self, section: str) -> Any:
+        """@spec PROTECTED-HOOK-ADMISSION-4 @spec PROTECTED-HOOK-LANE-2."""
+        return parse_info(self._call("INFO", section))  # type: ignore[no-untyped-call]
+
+    def time(self) -> tuple[int, int]:
+        """@spec PROTECTED-HOOK-ADMISSION-4 @spec PROTECTED-HOOK-LANE-2."""
+        clock: Any = self._call("TIME")
+        if (
+            type(clock) is not list
+            or len(clock) != 2
+            or any(type(value) is not bytes for value in clock)
+            or any(re.fullmatch(rb"[0-9]+", value) is None for value in clock)
+        ):
+            raise BrokerMetadataUnavailable()
+        return int(clock[0]), int(clock[1])
 
 
 class AuthenticatedEnqueueClient:
@@ -763,6 +851,28 @@ class AuthenticatedEnqueueClient:
             except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
                 self.__connection.disconnect()
                 raise BrokerMetadataUnavailable() from None
+
+    def admission(
+        self, trusted_manifest: Manifest, *, trusted_max_readiness_ms: int, backlog_limit: int
+    ) -> AtomicAdmission:
+        """The admission facade bound to this connection, which this client owns.
+
+        The facade constructs and closes no connection; closing this client
+        ends it. It first confirms the live run_id. @spec PROTECTED-HOOK-ADMISSION-1
+        @spec PROTECTED-HOOK-LANE-3.
+        """
+        with self.__lock:
+            try:
+                self.__identity()
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+                self.__connection.disconnect()
+                raise BrokerMetadataUnavailable() from None
+        return AtomicAdmission(
+            _AdmissionCommands(self.__connection, self.__lock),  # type: ignore[arg-type]
+            trusted_manifest=trusted_manifest,
+            trusted_max_readiness_ms=trusted_max_readiness_ms,
+            backlog_limit=backlog_limit,
+        )
 
     def close(self) -> None:
         """@spec PROTECTED-HOOK-LANE-3."""

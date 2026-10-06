@@ -585,3 +585,21 @@ class AtomicAdmission:
                 )
             )
         )
+
+
+def quota_occupancy(admission: AtomicAdmission) -> int:
+    """Members of the global quota set on the facade's connection, a count only.
+
+    For the trusted reconciler's tick log: committed deliveries park in the set
+    until the protected worker releases them. Writes nothing and leaves the
+    facade's closed operations unchanged. @spec PROTECTED-HOOK-LANE-4.
+    """
+    if type(admission) is not AtomicAdmission:
+        raise ValueError("invalid protected admission facade")
+    try:
+        count: Any = admission._client.zcard("protected:admission:quota")
+    except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+        raise AdmissionUnavailable() from None
+    if type(count) is not int or count < 0:
+        raise AdmissionUnavailable()
+    return count

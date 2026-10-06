@@ -8,6 +8,7 @@ from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontext
 from dataclasses import dataclass
 from typing import Protocol
 
+from curie_protected_hooks.authority_evaluation import AuthorityTarget
 from curie_protected_hooks.source_fence import (
     SourceFenceConflict,
     SourceFenceExhausted,
@@ -130,6 +131,13 @@ class SourceControlWriter(Protocol):
         """@spec PROTECTED-HOOK-SOURCE-6/7."""
         ...
 
+    async def publish_protected(self, *, target: AuthorityTarget) -> bool:
+        """Reader bracketed protected publication once evidence is current.
+
+        @spec PROTECTED-HOOK-SOURCE-6/7.
+        """
+        ...
+
 
 @dataclass(frozen=True)
 class SourceControlSession:
@@ -162,16 +170,6 @@ def _unavailable(policy: SourcePolicySnapshot | None = None) -> SourceAdminError
     return error
 
 
-def _deferred(policy: SourcePolicySnapshot) -> SourceAdminError:
-    """Protected publication waits for the LANE-4 ingress admission change.
-
-    @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-7.
-    """
-    error = SourceAdminError("source_publication_deferred", 503)
-    error.committed_generation = str(policy.generation)
-    return error
-
-
 def _policy_target(policy: SourcePolicySnapshot) -> DesiredSourceTarget:
     """@spec PROTECTED-HOOK-SOURCE-3/10."""
     return DesiredSourceTarget(
@@ -194,6 +192,21 @@ def committed_policy_fingerprint(policy: SourcePolicySnapshot) -> str:
             "operation_id": str(policy.operation_id),
             "legacy_generation": str(policy.legacy_generation),
         }
+    )
+
+
+def committed_authority_target(policy: SourcePolicySnapshot) -> AuthorityTarget:
+    """The shared evaluation's target for a committed protected row.
+
+    @spec PROTECTED-HOOK-SOURCE-6 @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    return AuthorityTarget(
+        generation=policy.generation,
+        operation_id=str(policy.operation_id),
+        policy_fingerprint=committed_policy_fingerprint(policy),
+        runtime_id=policy.runtime_id or "",
+        qualification_id=policy.qualification_id or "",
+        bundle_digest=policy.bundle_digest or "",
     )
 
 
@@ -438,9 +451,6 @@ class SourceMutationCoordinator:
                             raise SourceAdminError("legacy_generation_exhausted", 409)
                     if self._target_check is not None and target.mode == "protected":
                         self._target_check(target)
-                    if committed is not None and committed.mode != "ordinary":
-                        # An exact protected replay is decided from SQL alone.
-                        raise _deferred(committed)
                     if self._resolver is None:
                         raise _unavailable(committed)
                     session = await authority_scope.enter_async_context(
@@ -483,13 +493,19 @@ class SourceMutationCoordinator:
                             held, source, snapshot, operation, generation, target, intent
                         )
                 assert committed is not None
-                if committed.mode != "ordinary":
-                    raise _deferred(committed)
-                published = await session.writer.publish_ordinary(
-                    generation=committed.generation,
-                    operation_id=str(committed.operation_id),
-                    fingerprint=committed_policy_fingerprint(committed),
-                )
+                # After gate release, on fresh connections: an exact replay of a
+                # committed unpublished operation publishes too while its
+                # reservation still matches.
+                if committed.mode == "protected":
+                    published = await session.writer.publish_protected(
+                        target=committed_authority_target(committed)
+                    )
+                else:
+                    published = await session.writer.publish_ordinary(
+                        generation=committed.generation,
+                        operation_id=str(committed.operation_id),
+                        fingerprint=committed_policy_fingerprint(committed),
+                    )
                 if published is not True:
                     raise _unavailable(committed)
             return committed
