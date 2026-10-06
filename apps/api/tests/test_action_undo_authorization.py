@@ -38,6 +38,7 @@ from _sealed_actions import (
     POST_VERSION,
     executions_of,
     executor_enabled,  # noqa: F401 - fixture, requested by name
+    operator_headers,
     sealed_action,
     undoable_agent,
 )
@@ -110,11 +111,12 @@ def _gated_action(
 
 
 def _undo(client: Any, headers: Any, action_id: str, actor: str = "U-operator") -> Any:
-    return client.post(
-        f"/actions/{action_id}/undo",
-        json={"actor": actor},
-        headers=headers,
-    )
+    """Rule as the authenticated operator ``actor`` (ADR 0106 principal).
+
+    ``headers`` is kept for call sites; the principal replaces the platform key.
+    """
+
+    return client.post(f"/actions/{action_id}/undo", json={}, headers=operator_headers(actor))
 
 
 def test_an_ungated_action_is_not_gated_on_the_way_back(
@@ -297,3 +299,167 @@ def test_a_gate_that_cannot_be_read_fails_closed(
 
     assert response.status_code == 403
     assert "can no longer be read" in response.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# The actor is an authenticated principal (executor route decisions, ADR 0106)
+# --------------------------------------------------------------------------- #
+
+CONSOLE_COOKIE = "__Host-curie_console_session"
+
+
+def _console_headers(client: Any, auth_headers: dict[str, str], subject: str) -> dict[str, str]:
+    """A live console session for ``subject``, presented as a same-origin browser would."""
+
+    minted = client.post("/console/login-codes", json={"subject": subject}, headers=auth_headers)
+    assert minted.status_code == 201, minted.text
+    exchanged = client.post("/console/session", json={"code": minted.json()["code"]})
+    assert exchanged.status_code == 200, exchanged.text
+    token = client.cookies.get(CONSOLE_COOKIE)
+    assert token
+    client.cookies.clear()
+    return {"Cookie": f"{CONSOLE_COOKIE}={token}", "Origin": "http://testserver"}
+
+
+def _authorized_rows(client: Any, headers: dict[str, str], action_id: str) -> list[dict[str, Any]]:
+    audit = client.get(f"/actions/{action_id}/audit", headers=headers).json()
+    return [entry for entry in audit if entry["authorized"]]
+
+
+@pytest.mark.parametrize("body", [{"actor": "U-operator"}, {}], ids=["body actor", "no body actor"])
+def test_the_platform_key_alone_cannot_rule_an_undo(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, body: dict[str, Any]
+) -> None:
+    """@spec ACTION-EXECUTOR-3, route decisions: "a self-asserted ``actor`` in the
+    request body is not authority ... a platform key alone cannot impersonate an
+    approver". The ruling now causes a real restore, so it is refused and
+    requests nothing.
+    """
+
+    action = _gated_action(client, auth_headers, None, tmp_path)
+
+    response = client.post(f"/actions/{action['id']}/undo", json=body, headers=auth_headers)
+
+    assert response.status_code == 401, response.text
+    assert executions_of(action["id"]) == []
+    assert _authorized_rows(client, auth_headers, action["id"]) == []
+
+
+def test_an_operator_principal_rules_and_is_recorded_as_the_actor(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec ACTION-EXECUTOR-3: the actor is derived from the authenticated
+    operator principal and recorded on the execution and the audit row.
+    """
+
+    action = _gated_action(client, auth_headers, None, tmp_path)
+
+    response = client.post(
+        f"/actions/{action['id']}/undo", json={}, headers=operator_headers("U-principal")
+    )
+
+    assert response.status_code == 202, response.text
+    assert [row["requested_by"] for row in executions_of(action["id"])] == ["U-principal"]
+    rows = _authorized_rows(client, auth_headers, action["id"])
+    assert [row["actor"] for row in rows] == ["U-principal"]
+
+
+def test_a_console_principal_rules_and_is_recorded_as_the_actor(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec ACTION-EXECUTOR-3: a console session is an authenticated principal."""
+
+    action = _gated_action(client, auth_headers, None, tmp_path)
+    headers = _console_headers(client, auth_headers, "U-console")
+
+    response = client.post(f"/actions/{action['id']}/undo", json={}, headers=headers)
+
+    assert response.status_code == 202, response.text
+    assert [row["requested_by"] for row in executions_of(action["id"])] == ["U-console"]
+    rows = _authorized_rows(client, auth_headers, action["id"])
+    assert [row["actor"] for row in rows] == ["U-console"]
+
+
+def test_a_body_actor_that_matches_the_principal_is_accepted(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec ACTION-EXECUTOR-3: only a body actor that differs is refused."""
+
+    action = _gated_action(client, auth_headers, None, tmp_path)
+
+    response = client.post(
+        f"/actions/{action['id']}/undo",
+        json={"actor": "U-principal"},
+        headers=operator_headers("U-principal"),
+    )
+
+    assert response.status_code == 202, response.text
+    assert [row["requested_by"] for row in executions_of(action["id"])] == ["U-principal"]
+
+
+def test_a_body_actor_that_differs_from_the_principal_is_refused(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec ACTION-EXECUTOR-3: "a body actor that differs from the principal is
+    refused", and nothing is requested under either name.
+    """
+
+    action = _gated_action(client, auth_headers, None, tmp_path)
+
+    response = client.post(
+        f"/actions/{action['id']}/undo",
+        json={"actor": "U-somebody-else"},
+        headers=operator_headers("U-principal"),
+    )
+
+    assert response.status_code in {401, 403, 422}, response.text
+    assert executions_of(action["id"]) == []
+    assert _authorized_rows(client, auth_headers, action["id"]) == []
+
+
+def test_two_principal_credentials_together_are_ambiguous(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec ACTION-EXECUTOR-3: "exactly as the approval resolver does": any two
+    principal credentials together fail closed rather than choosing one.
+    """
+
+    action = _gated_action(client, auth_headers, None, tmp_path)
+    headers = {
+        **_console_headers(client, auth_headers, "U-console"),
+        **operator_headers("U-principal"),
+    }
+
+    response = client.post(f"/actions/{action['id']}/undo", json={}, headers=headers)
+
+    assert response.status_code == 401, response.text
+    assert executions_of(action["id"]) == []
+
+
+def test_the_gating_set_is_asked_about_the_principal_not_a_body_actor(
+    _disposable_db: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec ACTION-EXECUTOR-3: membership is resolved for the authenticated
+    principal's subject and channel evidence, as for an approval.
+    """
+
+    asked: list[tuple[str, str | None]] = []
+
+    class _Recording(_Set):
+        async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
+            asked.append((actor, actor_channel))
+            return MembershipVerdict(member=True)
+
+    app = create_app()
+    app.dependency_overrides[get_approver_sets] = lambda: (
+        lambda approval, binding: _Recording(MembershipVerdict(member=True))
+    )
+    with TestClient(app) as gated:
+        action = _gated_action(gated, auth_headers, _seed_approval(gated, auth_headers), tmp_path)
+
+        response = gated.post(
+            f"/actions/{action['id']}/undo", json={}, headers=operator_headers("U-principal")
+        )
+
+    assert response.status_code == 202, response.text
+    assert asked == [("U-principal", None)]

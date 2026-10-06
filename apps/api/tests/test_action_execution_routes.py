@@ -30,9 +30,13 @@ and an empty queue answers ``204``; an outcome body is the fence plus
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import types
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -45,10 +49,13 @@ from _sealed_actions import (
     EXECUTOR_SETTING,
     LEFT,
     POST_VERSION,
+    TARGET,
     executions_of,
     executor_enabled,  # noqa: F401 - fixture, requested by name
+    operator_headers,
     sealed_action,
     undoable_agent,
+    worker_headers,
 )
 from curie_api.config import get_settings
 from curie_api.main import create_app
@@ -111,7 +118,8 @@ def _undoable_action(client: Any, headers: dict[str, str], tmp_path: Path) -> di
 
 
 def _undo(client: Any, headers: dict[str, str], action_id: str) -> Any:
-    return client.post(f"/actions/{action_id}/undo", json={"actor": ACTOR}, headers=headers)
+    # The actor is the authenticated principal, not a body field (route decisions).
+    return client.post(f"/actions/{action_id}/undo", json={}, headers=operator_headers(ACTOR))
 
 
 def _requested(client: Any, headers: dict[str, str], tmp_path: Path) -> tuple[str, str]:
@@ -129,7 +137,7 @@ def _claim(
     return client.post(
         "/action-executions/claim",
         json={"lease_owner": owner, "lease_seconds": lease_seconds},
-        headers=headers,
+        headers=worker_headers(),
     )
 
 
@@ -154,14 +162,16 @@ def _observe(
     return client.post(
         f"/action-executions/{execution_id}/observation",
         json={**fence, "version": version},
-        headers=headers,
+        headers=worker_headers(),
     )
 
 
 def _dispatch(
     client: Any, headers: dict[str, str], execution_id: str, fence: dict[str, Any]
 ) -> Any:
-    return client.post(f"/action-executions/{execution_id}/dispatch", json=fence, headers=headers)
+    return client.post(
+        f"/action-executions/{execution_id}/dispatch", json=fence, headers=worker_headers()
+    )
 
 
 def _report(
@@ -175,7 +185,7 @@ def _report(
     return client.post(
         f"/action-executions/{execution_id}/outcome",
         json={**fence, "state": state, "code": code},
-        headers=headers,
+        headers=worker_headers(),
     )
 
 
@@ -231,7 +241,7 @@ def _agent(client: Any, headers: dict[str, str]) -> str:
 
 
 def _probe(client: Any, headers: dict[str, str], body: dict[str, Any]) -> Any:
-    return client.post("/connector-capabilities/probes", json=body, headers=headers)
+    return client.post("/connector-capabilities/probes", json=body, headers=worker_headers())
 
 
 # --------------------------------------------------------------------------- #
@@ -527,8 +537,8 @@ def test_a_probe_for_an_unknown_agent_creates_nothing(
     assert len(_all_executions()) == 1
 
 
-def test_the_probe_route_requires_the_api_key(client: Any) -> None:
-    """@spec ACTION-EXECUTOR-1: worker API key only."""
+def test_the_probe_route_requires_a_credential(client: Any) -> None:
+    """@spec ACTION-EXECUTOR-1: worker credential only."""
 
     response = client.post(
         "/connector-capabilities/probes",
@@ -585,7 +595,7 @@ def test_every_execution_route_rejects_a_tool_or_arguments(
         payload.update({"state": "refused", "code": "tool_not_advertised"})
 
     response = client.post(
-        f"/action-executions/{execution_id}/{route}", json=payload, headers=auth_headers
+        f"/action-executions/{execution_id}/{route}", json=payload, headers=worker_headers()
     )
 
     assert response.status_code == 422, response.text
@@ -607,7 +617,7 @@ def test_the_claim_route_rejects_a_tool_or_arguments(
     response = client.post(
         "/action-executions/claim",
         json={"lease_owner": "worker-a", "lease_seconds": 60, **extra},
-        headers=auth_headers,
+        headers=worker_headers(),
     )
 
     assert response.status_code == 422, response.text
@@ -624,8 +634,8 @@ def test_the_claim_route_rejects_a_tool_or_arguments(
         ("post", "/action-executions/{id}/outcome"),
     ],
 )
-def test_the_execution_routes_require_the_api_key(client: Any, method: str, path: str) -> None:
-    """@spec ACTION-EXECUTOR-18: API-key routes."""
+def test_the_execution_routes_require_a_credential(client: Any, method: str, path: str) -> None:
+    """@spec ACTION-EXECUTOR-18: no route answers an unauthenticated caller."""
 
     response = getattr(client, method)(
         path.format(id=uuid.uuid4()), **({"json": {}} if method == "post" else {})
@@ -1159,7 +1169,7 @@ def _finish_probe(
     return client.post(
         f"/action-executions/{execution_id}/outcome",
         json={**fence, "state": "confirmed", "code": None, "advertised": advertised},
-        headers=headers,
+        headers=worker_headers(),
     )
 
 
@@ -1252,3 +1262,495 @@ def test_a_capable_probe_makes_an_earlier_action_undoable(
 
     assert reported.status_code == 200, reported.text
     assert _action(client, auth_headers, action["id"])["undoable"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Route decisions: worker-only internal routes (security review F2)
+# --------------------------------------------------------------------------- #
+
+
+def _internal_request(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, route: str
+) -> tuple[str, dict[str, Any], str | None]:
+    """The path and body of one internal route, against a real claimed restore."""
+
+    if route == "probe":
+        agent_id = _agent(client, auth_headers)
+        return (
+            "/connector-capabilities/probes",
+            {"agent_id": agent_id, "connector": CONNECTOR, "digest": DIGEST},
+            None,
+        )
+    if route == "claim":
+        _, execution_id = _requested(client, auth_headers, tmp_path)
+        return "/action-executions/claim", {"lease_owner": "w-x", "lease_seconds": 60}, execution_id
+    _, execution_id = _requested(client, auth_headers, tmp_path)
+    fence = _claimed(client, auth_headers, execution_id)
+    body: dict[str, Any] = dict(fence)
+    if route == "observation":
+        body["version"] = POST_VERSION
+    if route == "outcome":
+        body.update({"state": "refused", "code": "agent_stopped"})
+    return f"/action-executions/{execution_id}/{route}", body, execution_id
+
+
+@pytest.mark.parametrize("route", ["probe", "claim", "observation", "dispatch", "outcome"])
+@pytest.mark.parametrize("credential", ["platform key", "operator principal"])
+def test_the_internal_routes_refuse_the_platform_and_operator_keys(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, route: str, credential: str
+) -> None:
+    """Route decisions: "The internal probe, claim, observation, report and
+    dispatch routes require the internal worker token, not the platform or
+    operator key, so a key holder cannot forge a confirmed restore or a
+    ``restore_capable`` capability row".
+    """
+
+    path, body, execution_id = _internal_request(client, auth_headers, tmp_path, route)
+    before = _all_executions()
+    headers = auth_headers if credential == "platform key" else operator_headers()
+
+    response = client.post(path, json=body, headers=headers)
+
+    assert response.status_code in {401, 403}, response.text
+    assert _all_executions() == before
+
+
+def test_the_internal_routes_accept_the_worker_token(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """Route decisions: the internal worker token is the credential they take."""
+
+    _, execution_id = _requested(client, auth_headers, tmp_path)
+
+    response = client.post(
+        "/action-executions/claim",
+        json={"lease_owner": "worker-a", "lease_seconds": 60},
+        headers=worker_headers(),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["id"] == execution_id
+
+
+def test_the_receipt_stays_readable_with_the_platform_key(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec ACTION-EXECUTOR-18: ``GET /action-executions/{id}`` is the receipt the
+    CLI reads (ACTION-EXECUTOR-23); only the writing routes moved to the token.
+    """
+
+    _, execution_id = _requested(client, auth_headers, tmp_path)
+
+    response = client.get(f"/action-executions/{execution_id}", headers=auth_headers)
+
+    assert response.status_code == 200, response.text
+
+
+# --------------------------------------------------------------------------- #
+# Route decisions: the executor off hands out nothing (security review F5)
+# --------------------------------------------------------------------------- #
+
+
+@contextmanager
+def _executor_off() -> Iterator[None]:
+    """Turn the executor setting off for the app already running, then back on."""
+
+    os.environ[EXECUTOR_SETTING] = "false"
+    get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        os.environ[EXECUTOR_SETTING] = "true"
+        get_settings.cache_clear()
+
+
+def test_with_the_executor_off_claim_hands_out_nothing(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """Route decisions: "With the executor disabled, claim and dispatch hand out nothing"."""
+
+    _, execution_id = _requested(client, auth_headers, tmp_path)
+
+    with _executor_off():
+        response = _claim(client, auth_headers)
+
+    assert response.status_code == 204, response.text
+    assert _execution(client, auth_headers, execution_id)["state"] == "requested"
+
+
+def test_with_the_executor_off_a_held_lease_cannot_dispatch(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """Route decisions: the setting is a stop for a lease already held, not only
+    for new claims: a ``claimed`` restore with an unchanged observation does not
+    enter ``dispatched`` while the executor is off.
+    """
+
+    _, execution_id = _requested(client, auth_headers, tmp_path)
+    fence = _claimed(client, auth_headers, execution_id)
+    assert _observe(client, auth_headers, execution_id, fence, POST_VERSION).status_code == 200
+
+    with _executor_off():
+        response = _dispatch(client, auth_headers, execution_id, fence)
+
+    assert response.status_code in {409, 503}, response.text
+    stored = _execution(client, auth_headers, execution_id)
+    assert stored["state"] != "dispatched"
+    assert stored["dispatched_at"] is None
+
+
+# --------------------------------------------------------------------------- #
+# Route decisions: the ruling stores the restore's arguments digest (AE-7)
+# --------------------------------------------------------------------------- #
+
+
+def _canonical_sha256(arguments: dict[str, Any]) -> str:
+    """ACTION-EXECUTOR-7's canonical form: sorted keys, ``,``/``:``, non-ASCII kept."""
+
+    text = json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_the_ruling_stores_the_restore_arguments_digest(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """Route decisions: "The ruling stores ``arguments_sha256`` for the restore call
+    it authorizes, as ACTION-EXECUTOR-7 requires of the creator".
+
+    The restore call is ``{"target", "prior_state"}``, plus ``expected_version``
+    only when the connector's schema declares it (ACTION-EXECUTOR-15), so the
+    stored digest is the canonical digest of one of those two argument objects.
+    """
+
+    action_id, _ = _requested(client, auth_headers, tmp_path)
+
+    stored = executions_of(action_id)[0]["arguments_sha256"]
+
+    assert stored is not None
+    digest = stored.removeprefix("sha256:")
+    base = {"target": TARGET, "prior_state": ENVELOPE}
+    assert digest in {
+        _canonical_sha256(base),
+        _canonical_sha256({**base, "expected_version": POST_VERSION}),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Route decisions: a refused or failed probe does not block a later probe
+# --------------------------------------------------------------------------- #
+
+
+def _probe_rows(agent_id: str) -> list[dict[str, Any]]:
+    return sql_dicts(
+        "SELECT id, state, idempotency_key, authority_ref FROM curie.action_executions "
+        "WHERE agent_id = :agent_id AND kind = 'probe' ORDER BY created_at, id",
+        {"agent_id": uuid.UUID(agent_id)},
+    )
+
+
+def _probe_body(agent_id: str) -> dict[str, Any]:
+    return {"agent_id": agent_id, "connector": CONNECTOR, "digest": DIGEST}
+
+
+def _end_probe(client: Any, auth_headers: dict[str, str], agent_id: str, how: str) -> str:
+    """Probe once and end it ``refused`` (through the route) or ``failed`` (SQL)."""
+
+    execution_id, fence = _probed(client, auth_headers, agent_id)
+    if how == "refused":
+        ended = _report(
+            client, auth_headers, execution_id, fence, "refused", "connector_unreachable"
+        )
+        assert ended.status_code == 200, ended.text
+    else:
+        # No route ends a probe ``failed`` today; the decision still covers it.
+        sql_rows(
+            "UPDATE curie.action_executions SET state = 'failed', "
+            "failure_code = 'connector_error', finished_at = now() WHERE id = :id",
+            {"id": uuid.UUID(execution_id)},
+        )
+    return execution_id
+
+
+@pytest.mark.parametrize("how", ["refused", "failed"])
+def test_a_probe_that_ended_refused_or_failed_is_followed_by_a_new_probe(
+    client: Any, auth_headers: dict[str, str], how: str
+) -> None:
+    """Route decisions: "A probe that ended ``refused`` or ``failed`` does not block
+    a later probe of the same agent, connector and digest: the next probe is a
+    new execution whose key carries the next probe attempt number". A probe's
+    ``authority_ref`` is its probe key.
+    """
+
+    agent_id = _agent(client, auth_headers)
+    first = _end_probe(client, auth_headers, agent_id, how)
+
+    again = _probe(client, auth_headers, _probe_body(agent_id))
+
+    assert again.status_code == 201, again.text
+    assert again.json()["execution_id"] != first
+    assert again.json()["state"] == "requested"
+    rows = _probe_rows(agent_id)
+    assert [str(row["id"]) for row in rows] == [first, again.json()["execution_id"]]
+    base = f"probe:{agent_id}:{CONNECTOR}:{DIGEST}"
+    keys = [row["idempotency_key"] for row in rows]
+    assert all(key.startswith(base) for key in keys)
+    assert keys[0] != keys[1]
+    assert all(row["authority_ref"] == row["idempotency_key"] for row in rows)
+
+
+def test_each_failed_probe_attempt_gets_its_own_key(
+    client: Any, auth_headers: dict[str, str]
+) -> None:
+    """Route decisions: the key carries the next probe attempt number each time."""
+
+    agent_id = _agent(client, auth_headers)
+    _end_probe(client, auth_headers, agent_id, "refused")
+    _end_probe(client, auth_headers, agent_id, "refused")
+
+    third = _probe(client, auth_headers, _probe_body(agent_id))
+
+    assert third.status_code == 201, third.text
+    keys = [row["idempotency_key"] for row in _probe_rows(agent_id)]
+    assert len(keys) == 3
+    assert len(set(keys)) == 3
+
+
+@pytest.mark.parametrize("stage", ["requested", "claimed", "confirmed"])
+def test_a_pending_or_confirmed_probe_is_adopted(
+    client: Any, auth_headers: dict[str, str], stage: str
+) -> None:
+    """Route decisions: "only a non-terminal or confirmed probe is adopted"."""
+
+    agent_id = _agent(client, auth_headers)
+    created = _probe(client, auth_headers, _probe_body(agent_id))
+    assert created.status_code == 201, created.text
+    execution_id = str(created.json()["execution_id"])
+    if stage != "requested":
+        fence = _claimed(client, auth_headers, execution_id)
+        if stage == "confirmed":
+            finished = _finish_probe(
+                client, auth_headers, execution_id, fence, ["restore", "observe_version"]
+            )
+            assert finished.status_code == 200, finished.text
+
+    replay = _probe(client, auth_headers, _probe_body(agent_id))
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["execution_id"] == execution_id
+    assert len(_probe_rows(agent_id)) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Route decisions: lease expiry (ACTION-EXECUTOR-17)
+# --------------------------------------------------------------------------- #
+
+
+def _expire(execution_id: str) -> None:
+    sql_rows(
+        "UPDATE curie.action_executions SET lease_expires_at = now() - interval '1 minute' "
+        "WHERE id = :id",
+        {"id": uuid.UUID(execution_id)},
+    )
+
+
+def _exhausted(client: Any, auth_headers: dict[str, str], tmp_path: Path) -> tuple[str, str]:
+    """A restore whose claim expired three times, then one more claim pass."""
+
+    action_id, execution_id = _requested(client, auth_headers, tmp_path)
+    attempts = []
+    for owner in ("worker-a", "worker-b", "worker-c"):
+        attempts.append(_claimed(client, auth_headers, execution_id, owner)["attempt"])
+        _expire(execution_id)
+    assert attempts == sorted(set(attempts))
+    assert attempts[-1] - attempts[0] == 2
+    after = _claim(client, auth_headers, "worker-d")
+    assert after.status_code == 204, after.text
+    return action_id, execution_id
+
+
+def test_a_claim_is_attempted_three_times_then_refused_runner_unavailable(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """Route decisions: "a claim is attempted at most three times; an expired
+    claim before dispatch is reclaimed with the next attempt, the third expiry
+    ends ``refused`` with ``runner_unavailable``". A refusal releases the action.
+    """
+
+    action_id, execution_id = _exhausted(client, auth_headers, tmp_path)
+
+    stored = _execution(client, auth_headers, execution_id)
+    assert (stored["state"], stored["refusal_code"]) == ("refused", "runner_unavailable")
+    assert _action(client, auth_headers, action_id)["undoable"] is True
+
+
+def _expired_dispatch(client: Any, auth_headers: dict[str, str], tmp_path: Path) -> tuple[str, str]:
+    action_id, execution_id, _ = _dispatched(client, auth_headers, tmp_path)
+    _expire(execution_id)
+    assert _claim(client, auth_headers, "worker-b").status_code == 204
+    return action_id, execution_id
+
+
+def test_an_expired_dispatched_execution_ends_indeterminate_response_lost(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """Route decisions: "an expired dispatched execution ends ``indeterminate``
+    with ``response_lost``"; it may have written, so it is never reclaimed and
+    still holds the action.
+    """
+
+    action_id, execution_id = _expired_dispatch(client, auth_headers, tmp_path)
+
+    stored = _execution(client, auth_headers, execution_id)
+    assert (stored["state"], stored["failure_code"]) == ("indeterminate", "response_lost")
+    after = _action(client, auth_headers, action_id)
+    assert after["undone_at"] is None
+    assert after["undoable"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Route decisions: one closing audit row per terminal restore outcome
+# --------------------------------------------------------------------------- #
+
+
+def _ends_confirmed(client: Any, h: dict[str, str], tmp_path: Path) -> tuple[str, str, str | None]:
+    action_id, execution_id, fence = _dispatched(client, h, tmp_path)
+    assert _report(client, h, execution_id, fence, "confirmed").status_code == 200
+    assert _report(client, h, execution_id, fence, "confirmed").status_code == 200  # replay
+    return action_id, "confirmed", None
+
+
+def _ends_failed(client: Any, h: dict[str, str], tmp_path: Path) -> tuple[str, str, str | None]:
+    action_id, execution_id, fence = _dispatched(client, h, tmp_path)
+    assert _report(client, h, execution_id, fence, "failed", "connector_error").status_code == 200
+    return action_id, "failed", "connector_error"
+
+
+def _ends_indeterminate(
+    client: Any, h: dict[str, str], tmp_path: Path
+) -> tuple[str, str, str | None]:
+    action_id, execution_id, fence = _dispatched(client, h, tmp_path)
+    reported = _report(client, h, execution_id, fence, "indeterminate", "deadline_exceeded")
+    assert reported.status_code == 200
+    return action_id, "indeterminate", "deadline_exceeded"
+
+
+def _ends_refused(client: Any, h: dict[str, str], tmp_path: Path) -> tuple[str, str, str | None]:
+    action_id, execution_id = _requested(client, h, tmp_path)
+    fence = _claimed(client, h, execution_id)
+    reported = _report(client, h, execution_id, fence, "refused", "connector_digest_unavailable")
+    assert reported.status_code == 200
+    return action_id, "refused", "connector_digest_unavailable"
+
+
+def _ends_conflict(client: Any, h: dict[str, str], tmp_path: Path) -> tuple[str, str, str | None]:
+    action_id, execution_id = _requested(client, h, tmp_path)
+    fence = _claimed(client, h, execution_id)
+    _observe(client, h, execution_id, fence, MOVED_VERSION)
+    return action_id, "refused", "version_conflict"
+
+
+def _ends_exhausted(client: Any, h: dict[str, str], tmp_path: Path) -> tuple[str, str, str | None]:
+    action_id, _ = _exhausted(client, h, tmp_path)
+    return action_id, "refused", "runner_unavailable"
+
+
+def _ends_expired_dispatch(
+    client: Any, h: dict[str, str], tmp_path: Path
+) -> tuple[str, str, str | None]:
+    action_id, _ = _expired_dispatch(client, h, tmp_path)
+    return action_id, "indeterminate", "response_lost"
+
+
+_TERMINAL_PATHS = {
+    "confirmed": _ends_confirmed,
+    "failed": _ends_failed,
+    "indeterminate": _ends_indeterminate,
+    "refused pre-dispatch": _ends_refused,
+    "version conflict": _ends_conflict,
+    "claim exhausted": _ends_exhausted,
+    "dispatch expired": _ends_expired_dispatch,
+}
+
+
+@pytest.mark.parametrize("path", list(_TERMINAL_PATHS.values()), ids=list(_TERMINAL_PATHS))
+def test_every_terminal_restore_writes_one_closing_audit_row(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, path: Any
+) -> None:
+    """Route decisions: "Every terminal restore outcome writes one closing audit
+    row naming its state and code, with versions only" -- including a refusal
+    before dispatch, so an action's trail never ends at ``authorized``.
+    """
+
+    action_id, state, code = path(client, auth_headers, tmp_path)
+
+    entries = _audit(client, auth_headers, action_id)
+    assert entries[0]["action"] == "authorized"
+    closing = entries[1:]
+    assert len(closing) == 1, [e["action"] for e in closing]
+    row = closing[0]
+    text = json.dumps(row)
+    assert state in text
+    if code is not None:
+        assert code in text
+    _assert_no_snapshot(text)
+    for key, value in (row["evidence"] or {}).items():
+        assert key in {"execution_id", "state", "code"} or key.endswith("version"), key
+        assert value is None or isinstance(value, str), key
+
+
+# --------------------------------------------------------------------------- #
+# Route decisions: uniqueness violations mapped by constraint
+# --------------------------------------------------------------------------- #
+
+
+def test_only_the_live_restore_index_maps_to_restore_in_flight(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Route decisions: "A database uniqueness violation is mapped to the
+    constraint it names; only the live restore index maps to
+    ``refused_restore_in_flight``".
+
+    The ruling's identifiers are pinned so its idempotency key collides with a
+    ``refused`` restore already holding that key: a violation of
+    ``uq_action_executions_agent_idempotency_key``, not of the live restore
+    index (a refused restore is outside it). The ruling must not call that an
+    in-flight restore, must not fail with a server error, and must leave one
+    row under the key.
+    """
+
+    action = _undoable_action(client, auth_headers, tmp_path)
+    pinned = uuid.uuid4()
+    key = f"restore:{action['id']}:{pinned}"
+    sql_rows(
+        "INSERT INTO curie.action_executions "
+        "(id, kind, agent_id, connector, tool, subject_action_id, connector_digest, "
+        "authority_kind, authority_ref, requested_by, idempotency_key, state, attempt, "
+        "refusal_code, created_at) "
+        "VALUES (:id, 'restore', :agent_id, :connector, 'restore', :subject, :digest, "
+        "'undo_ruling', :ref, :actor, :key, 'refused', 1, 'connector_unreachable', now())",
+        {
+            "id": uuid.uuid4(),
+            "agent_id": uuid.UUID(action["agent_id"]),
+            "connector": CONNECTOR,
+            "subject": uuid.UUID(action["id"]),
+            "digest": DIGEST,
+            "ref": str(pinned),
+            "actor": ACTOR,
+            "key": key,
+        },
+    )
+    monkeypatch.setattr(
+        "curie_api.routers.actions.uuid",
+        types.SimpleNamespace(uuid4=lambda: pinned, UUID=uuid.UUID),
+    )
+
+    response = _undo(client, auth_headers, action["id"])
+
+    assert response.status_code < 500, response.text
+    assert "refused_restore_in_flight" not in [
+        e["action"] for e in _audit(client, auth_headers, action["id"])
+    ]
+    rows = sql_dicts(
+        "SELECT id FROM curie.action_executions WHERE idempotency_key = :key", {"key": key}
+    )
+    assert len(rows) == 1

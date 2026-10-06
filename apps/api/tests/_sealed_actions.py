@@ -26,6 +26,7 @@ import io
 import json
 import os
 import tarfile
+import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -33,6 +34,7 @@ from typing import Any
 
 import pytest
 from _migration_support import sql_dicts, sql_rows
+from curie_api import approval_principal
 from curie_api.config import get_settings
 
 AGENT_NAME = "restorer-bot"
@@ -83,6 +85,39 @@ def executor_enabled() -> Iterator[None]:
         else:
             os.environ[EXECUTOR_SETTING] = before
         get_settings.cache_clear()
+
+
+# The ADR 0106 resolver credential header, and the internal worker credential.
+PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
+WORKER_TOKEN_HEADER = "X-Curie-Worker-Token"
+OPERATOR = "U-operator"
+
+
+def operator_headers(subject: str = OPERATOR) -> dict[str, str]:
+    """An authenticated operator principal, as the approval resolver accepts one.
+
+    The executor route decisions: the undo ruling derives its actor from an
+    authenticated chat, console, operator or adapter principal, never from a
+    body ``actor`` under the platform key. Minted with the platform key, as
+    ``POST /approvals/principals/operator`` does.
+    """
+
+    token = approval_principal.mint(
+        get_settings().api_key,
+        subject=subject,
+        kind="operator",
+        scope=approval_principal.APPROVE_SCOPE,
+        exp=int(time.time()) + 300,
+    )
+    return {PRINCIPAL_HEADER: token}
+
+
+def worker_headers() -> dict[str, str]:
+    """The internal worker token the probe, claim, observation, dispatch and
+    outcome routes require (executor route decisions), never the platform key.
+    """
+
+    return {WORKER_TOKEN_HEADER: get_settings().internal_worker_token}
 
 
 def executions_of(action_id: str) -> list[dict[str, Any]]:

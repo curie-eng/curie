@@ -40,6 +40,7 @@ from typing import Any
 
 import pytest
 from _migration_support import sql_rows
+from _sealed_actions import operator_headers
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -755,8 +756,9 @@ def _assert_refused_without_a_grant(
 
     response = client.post(
         f"/actions/{action_id}/undo",
-        json={"actor": "U-operator", "observed_state": LEFT},
-        headers=headers,
+        json={"observed_state": LEFT},
+        # The actor is the authenticated principal (executor route decisions).
+        headers=operator_headers(),
     )
 
     assert response.status_code in {409, 412, 503}, response.text

@@ -38,9 +38,11 @@ from _sealed_actions import (
     POST_VERSION,
     executions_of,
     executor_enabled,  # noqa: F401 - fixture, requested by name
+    operator_headers,
     sealed_action,
     undoable_agent,
 )
+from curie_api.approval_auth import AuthenticatedApprovalPrincipal
 from curie_api.config import get_settings
 from curie_api.models import AgentAction
 from curie_api.routers.actions import undo_action
@@ -89,9 +91,23 @@ def _sealed(client: Any, headers: Any, tmp_path: Path, **overrides: Any) -> dict
 
 
 def _undo(client: Any, headers: Any, action_id: str, **body: Any) -> Any:
-    payload: dict[str, Any] = {"actor": "U-operator"}
-    payload.update(body)
-    return client.post(f"/actions/{action_id}/undo", json=payload, headers=headers)
+    """Rule as the authenticated operator ``U-operator``.
+
+    The executor route decisions: the actor is derived from an authenticated
+    principal, as the approval resolver derives it (ADR 0106), never from a
+    body field under the platform key. ``headers`` is kept for call sites; the
+    principal replaces it.
+    """
+
+    return client.post(
+        f"/actions/{action_id}/undo", json=dict(body), headers=operator_headers("U-operator")
+    )
+
+
+def _operator(subject: str) -> AuthenticatedApprovalPrincipal:
+    """The authenticated principal an in-process ruling is called with."""
+
+    return AuthenticatedApprovalPrincipal(subject=subject, kind="operator", actor_channel=None)
 
 
 def _audit(client: Any, headers: Any, action_id: str) -> list[dict[str, Any]]:
@@ -384,16 +400,18 @@ def test_two_stale_concurrent_rulings_request_one_restore(
                 assert first is not None and second is not None
                 ruling = await undo_action(
                     action_id,
-                    ActionUndo(actor="U-first"),
+                    ActionUndo(),
                     first_session,
                     lambda approval, binding: None,
+                    principal=_operator("U-first"),
                 )
                 with pytest.raises(HTTPException) as refused:
                     await undo_action(
                         action_id,
-                        ActionUndo(actor="U-second"),
+                        ActionUndo(),
                         second_session,
                         lambda approval, binding: None,
+                        principal=_operator("U-second"),
                     )
                 return (
                     ruling.model_dump(mode="json"),
@@ -448,5 +466,5 @@ def test_an_unknown_action_is_a_404(client: Any, auth_headers: Any) -> None:
     assert response.json()["detail"] == "action not found"
 
 
-def test_undoing_requires_the_api_key(client: Any) -> None:
-    assert client.post(f"/actions/{uuid.uuid4()}/undo", json={"actor": "U1"}).status_code == 401
+def test_undoing_requires_a_principal(client: Any) -> None:
+    assert client.post(f"/actions/{uuid.uuid4()}/undo", json={}).status_code == 401
