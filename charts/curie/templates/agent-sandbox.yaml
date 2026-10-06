@@ -618,15 +618,20 @@ spec:
         refused. Each name is written exactly as the worker recorded it (ADR
         0205 decision 4); one that is not a clean leaf, sits in the reserved
         `.curie-` prefix or repeats refuses the boot rather than being repaired.
+        A payload with no "c" on any entry comes from a worker that predates
+        ADR 0205 and keeps the old rules whole (basename cleaning, a numeric
+        suffix for a repeat, all-or-nothing, no status file), so a new chart
+        never regresses an old worker mid-rollout.
         A refusal leaves NOTHING visible: files are staged under a hidden
         directory and revealed only once the whole set verified, because a
         partial set reads to an agent exactly like a complete one. No reference
         at all -- the overwhelming majority of turns -- is a clean no-op.
 
         ADR 0205 decision 6: the payload also carries the thread's earlier files
-        ("c": 0). The current message's files ("c": 1, or no "c") are fetched
-        first and stay all-or-nothing. An earlier file that has expired, is
-        answered with an HTTP error, times out, or is reached after the overall
+        ("c": 0). The current message's files ("c": 1) are fetched first and
+        stay all-or-nothing. An earlier file that has expired, is answered with
+        an HTTP error or a redirect, outgrows the size cap, has a name the
+        filesystem cannot hold, times out, or is reached after the overall
         fetchTimeoutSeconds deadline is skipped, never failing the boot; a
         digest mismatch is fatal either way, because that is integrity, not
         availability. The outcome of every entry lands in the hidden
@@ -662,9 +667,10 @@ spec:
               if not ref:
                   sys.exit(0)
               # One overall fetch deadline on a monotonic clock (ADR 0205 decision 6).
-              # Each fetch's socket timeout is what is left of it, so a stalled store
-              # costs one entry, not the pod: a process-wide alarm used to kill the
-              # whole init container, current files and all.
+              # Before every read the socket timeout is set to what is left of it, and
+              # the deadline is checked after every read, so neither a stalled nor a
+              # dripping store holds the pod past it. A process-wide alarm used to kill
+              # the whole init container, current files and all.
               deadline = time.monotonic() + {{ $af.fetchTimeoutSeconds }}
               # An init-container restart must never leave a partial prior
               # materialization visible; every reference is fetched again.
@@ -678,56 +684,96 @@ spec:
                   entries = json.loads(raw)
                   if not isinstance(entries, list):
                       raise TypeError("attachment reference payload is not a list")
+                  # A payload with no "c" anywhere is from a worker that predates ADR
+                  # 0205 (a mixed-version rollout) and keeps the old rules whole: every
+                  # entry current, the name cleaned to a basename, a repeat renamed.
+                  legacy = not any("c" in entry for entry in entries)
                   plan, names = [], set()
                   for index, entry in enumerate(entries):
                       name = entry["n"]
                       url, expected, expires = str(entry["u"]), str(entry["s"]).lower(), int(entry["e"])
-                      # "c": 1 is the current message, 0 an earlier one; a payload from a
-                      # worker that predates the field is all current.
-                      plan.append((index, name, url, expected, expires, entry.get("c", 1) != 0))
+                      # "c": 1 is the current message, 0 an earlier one.
+                      plan.append([index, name, url, expected, expires, legacy or entry.get("c", 1) != 0])
               except Exception as exc:
                   raise SystemExit(f"attachments-init: invalid attachment reference: {exc}")
-              # Every name is checked before anything is fetched. The worker fixed each
-              # name against the thread's whole ledger (ADR 0205 decision 4), so it is
-              # written exactly; one that is not already a clean leaf, sits in the
-              # reserved .curie- prefix, or repeats is a broken payload, never repaired.
-              for index, name, url, expected, expires, current in plan:
-                  if (
-                      not isinstance(name, str)
-                      or name in ("", ".", "..")
-                      or os.path.basename(name) != name
-                      or "\0" in name
-                      or name.startswith(".curie-")
-                  ):
-                      raise SystemExit("attachments-init: attachment name %r is unusable" % (name,))
-                  if name in names:
-                      raise SystemExit("attachments-init: attachment name %r is duplicated" % (name,))
-                  names.add(name)
+              # Every name is checked before anything is fetched.
+              for item in plan:
+                  index, name, url, expected, expires, current = item
+                  if legacy:
+                      name = os.path.basename(str(name).replace("\\", "/").strip())
+                      if not name or name in (".", ".."):
+                          raise SystemExit("attachments-init: attachment name is unusable")
+                      # Two uploads sharing a name both survive: a numeric suffix before
+                      # the extension, the first keeping the name the person sent. The
+                      # twin of curie_worker.attachments.unique_attachment_leaf.
+                      if name in names:
+                          stem, extension = os.path.splitext(name)
+                          bump = 2
+                          while "%s-%d%s" % (stem, bump, extension) in names:
+                              bump += 1
+                          name = "%s-%d%s" % (stem, bump, extension)
+                      item[1] = name
+                  else:
+                      # The worker fixed each name against the thread's whole ledger
+                      # (decision 4), so it is written exactly; one that is not already a
+                      # clean leaf, sits in the reserved .curie- prefix, or repeats is a
+                      # broken payload, never repaired.
+                      if (
+                          not isinstance(name, str)
+                          or not name.strip()
+                          or name in (".", "..")
+                          or os.path.basename(name) != name
+                          or "\0" in name
+                          or name.startswith(".curie-")
+                      ):
+                          raise SystemExit("attachments-init: attachment name %r is unusable" % (name,))
+                      if name in names:
+                          raise SystemExit("attachments-init: attachment name %r is duplicated" % (name,))
+                  names.add(item[1])
                   if not url.startswith(("http://", "https://")):
                       raise SystemExit("attachments-init: signed reference is not HTTP(S)")
                   if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
                       raise SystemExit("attachments-init: signed reference digest is invalid")
               stage.mkdir(mode=0o700)
               opener = urllib.request.build_opener(NoRedirect())
+              def bound(source):
+                  # The socket timeout for the next read: what is left of the deadline.
+                  remaining = deadline - time.monotonic()
+                  if remaining <= 0:
+                      raise TimeoutError("past the fetch deadline")
+                  sock = getattr(getattr(getattr(source, "fp", None), "raw", None), "_sock", None)
+                  if sock is not None:
+                      sock.settimeout(remaining)
               def fetch(index, name, url, expected, expires):
                   if expires <= int(time.time()):
                       raise Unavailable("expired")
                   remaining = deadline - time.monotonic()
                   if remaining <= 0:
                       raise Unavailable("deadline")
+                  # A name the filesystem cannot hold is a file that cannot be delivered.
+                  if len(name.encode("utf-8", "surrogateescape")) > 255:
+                      raise Unavailable("fetch_failed")
                   target = stage / ("%03d.part" % index)
                   digest, size = hashlib.sha256(), 0
                   try:
                       with opener.open(url, timeout=remaining) as source, target.open("wb") as sink:
-                          while chunk := source.read(1024 * 1024):
+                          while True:
+                              bound(source)
+                              # read1, not read: read(n) waits for n bytes, so a store
+                              # dripping a byte at a time would hold it past the deadline.
+                              chunk = source.read1(1024 * 1024)
+                              if not chunk:
+                                  break
                               size += len(chunk)
                               if size > {{ .Values.worker.attachments.maxFileBytes }}:
-                                  raise SystemExit("attachments-init: %r exceeds the size limit" % (name,))
+                                  raise Unavailable("fetch_failed")
                               digest.update(chunk)
                               sink.write(chunk)
-                              if time.monotonic() > deadline:
-                                  raise TimeoutError("past the fetch deadline")
+                  except Unavailable:
+                      target.unlink(missing_ok=True)
+                      raise
                   except urllib.error.HTTPError as exc:
+                      # A refused redirect lands here as its 3xx: fetch_failed.
                       target.unlink(missing_ok=True)
                       raise Unavailable({404: "not_found", 403: "forbidden"}.get(exc.code, "fetch_failed"))
                   except TimeoutError:
@@ -735,8 +781,7 @@ spec:
                       raise Unavailable("timeout")
                   except urllib.error.URLError as exc:
                       target.unlink(missing_ok=True)
-                      timed_out = isinstance(exc.reason, TimeoutError)
-                      raise Unavailable("timeout" if timed_out else "fetch_failed")
+                      raise Unavailable("timeout" if isinstance(exc.reason, TimeoutError) else "fetch_failed")
                   except (OSError, http.client.HTTPException):
                       target.unlink(missing_ok=True)
                       raise Unavailable("fetch_failed")
@@ -763,13 +808,15 @@ spec:
                           raise SystemExit("attachments-init: attachment name escapes the mount")
                       os.replace(target, destination)
                   # The outcome of every reference, for the runner to reconcile against
-                  # the manifest and the disk (ADR 0205 decision 8). Written beside the
-                  # staged files and renamed, so it is either whole or absent.
-                  rows = [{"name": p[1], "status": outcome[p[1]][0], "reason": outcome[p[1]][1]} for p in plan]
-                  pending = stage / "status.part"
-                  pending.write_text(json.dumps({"v": 1, "files": rows}))
-                  pending.chmod(0o644)
-                  os.replace(pending, root / status_name)
+                  # the manifest and the disk (decision 8). Written beside the staged
+                  # files and renamed, so it is either whole or absent. A legacy payload
+                  # has no manifest to reconcile, so it gets none, as before.
+                  if not legacy:
+                      rows = [{"name": p[1], "status": outcome[p[1]][0], "reason": outcome[p[1]][1]} for p in plan]
+                      pending = stage / "status.part"
+                      pending.write_text(json.dumps({"v": 1, "files": rows}))
+                      pending.chmod(0o644)
+                      os.replace(pending, root / status_name)
               except BaseException:
                   for target, name in staged:
                       (root / name).unlink(missing_ok=True)

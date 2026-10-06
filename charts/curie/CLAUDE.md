@@ -176,7 +176,8 @@ component and rail detail in `charts/curie/README.md`.
   `CURIE_ATTACHMENTS_REF` payload and must agree on every outcome: names written
   exactly, current files first and all-or-nothing, earlier files skipped with a
   reason in `.curie-attachments-status.json`, a digest mismatch fatal either
-  way (ADR 0205). Change one and you change the other in the same PR;
+  way (ADR 0205); a payload with no "c" keeps the pre-ADR rules, so a new
+  chart never regresses an old worker. Change one and you change the other in the same PR;
   `tests/vectors/attachment-init-outcomes.json` is run through both by
   `ci/attachment-init-behavior-assertions.sh` and
   `test_docker_attachment_claim.py`. The worker's `threadMaxBytes` must fit the

@@ -698,7 +698,8 @@ as a whole; remembered only):
   docker driver (`apps/worker/src/curie_worker/sandbox/docker.py`) reimplements
   it: exact names, current files first and all-or-nothing, earlier files best
   effort with a recorded reason, digest mismatch always fatal, and the hidden
-  `.curie-attachments-status.json`. Both run one payload-to-outcome corpus
+  `.curie-attachments-status.json`, and the pre-ADR rules for a payload
+  without "c" (mixed-version rollout). Both run one payload-to-outcome corpus
   (`charts/curie/ci/attachment-init-behavior-assertions.sh` and
   `apps/worker/tests/sandbox/test_docker_attachment_claim.py`).
   [vector: `tests/vectors/attachment-init-outcomes.json`]

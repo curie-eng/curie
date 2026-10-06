@@ -72,6 +72,7 @@ from ..attachments import (
     AttachmentResolutionError,
     AttachmentTooLargeError,
     decode_attachment_refs,
+    unique_attachment_leaf,
 )
 from ..binding import (
     BASE_URL_ENV,
@@ -104,19 +105,22 @@ from .types import (
 )
 
 #: The overall deadline for redeeming one boot's attachment references,
-#: current and earlier files together, measured on ``time.monotonic``. Each
-#: fetch's socket timeout is what is left of it. The twin of the chart's
+#: current and earlier files together, measured on ``time.monotonic``. Before
+#: every read the socket timeout is what is left of it, and the deadline is
+#: checked after every read. The twin of the chart's
 #: ``agentSandbox.runner.attachments.fetchTimeoutSeconds`` default, which the
-#: ``attachments-init`` program applies the same way (ADR 0205 decision 6). A
-#: local constant rather than an AttachmentLimits field: the docker tiers have
-#: no operator envelope for it and nobody has asked to tune it.
-_ATTACHMENT_FETCH_DEADLINE_S = 120.0
+#: ``attachments-init`` program applies the same way (ADR 0205 decision 6), and
+#: inside the worker's claim timeout. A local constant rather than an
+#: AttachmentLimits field: the docker tiers have no operator envelope for it.
+_ATTACHMENT_FETCH_DEADLINE_S = 45.0
 
 #: The hidden file in the mount root recording every reference's outcome, read
 #: by the runner (ADR 0205 decision 8). The ``.curie-`` prefix is reserved: no
 #: attachment may be named into it.
 _ATTACHMENT_STATUS_FILE = ".curie-attachments-status.json"
 _ATTACHMENT_RESERVED_PREFIX = ".curie-"
+#: The longest leaf a Linux filesystem holds, in bytes.
+_ATTACHMENT_NAME_MAX_BYTES = 255
 
 
 class _AttachmentUnavailable(Exception):
@@ -127,27 +131,68 @@ class _AttachmentUnavailable(Exception):
         self.reason = reason
 
 
-def _attachment_currency(encoded_refs: str) -> tuple[bool, ...]:
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect, as the ``attachments-init`` opener does.
+
+    A redirect carries the fetch to a host the store named rather than one the
+    worker chose, so it surfaces as the 3xx ``HTTPError`` instead.
+    """
+
+    def redirect_request(  # type: ignore[override]
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Mapping[str, str],
+        newurl: str,
+    ) -> None:
+        return None
+
+
+def _attachment_currency(encoded_refs: str) -> tuple[bool, ...] | None:
     """Per entry, whether it is on the current message (``"c"`` on the wire).
 
     ``decode_attachment_refs`` has already validated the payload, so this only
-    reads the flag it does not carry: ``"c": 0`` is an earlier file, and a
-    missing ``"c"`` (a worker that predates ADR 0205) is current.
+    reads the flag it does not carry: ``"c": 0`` is an earlier file. ``None``
+    means no entry carries ``"c"``: the payload is from a worker that predates
+    ADR 0205, and the whole of it keeps the pre-ADR rules.
     """
 
     raw = base64.urlsafe_b64decode(encoded_refs + "=" * (-len(encoded_refs) % 4))
-    return tuple(entry.get("c", 1) != 0 for entry in json.loads(raw))
+    entries = json.loads(raw)
+    if not any("c" in entry for entry in entries):
+        return None
+    return tuple(entry.get("c", 1) != 0 for entry in entries)
 
 
 def _attachment_name_is_clean(name: str) -> bool:
     """The same rule the ``attachments-init`` program applies, name for name."""
 
     return (
-        name not in ("", ".", "..")
+        bool(name.strip())
+        and name not in (".", "..")
         and os.path.basename(name) == name
         and "\0" not in name
         and not name.startswith(_ATTACHMENT_RESERVED_PREFIX)
     )
+
+
+def _legacy_attachment_leaf(name: str) -> str:
+    """The pre-ADR 0205 cleaning, the twin of the init program's legacy branch."""
+
+    return os.path.basename(name.replace("\\", "/").strip())
+
+
+def _bound_read(response: Any, deadline: float) -> None:
+    """Set the next read's socket timeout to what is left of the deadline."""
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("past the attachment fetch deadline")
+    sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+    if sock is not None:
+        sock.settimeout(remaining)
 
 
 class _NoAttachments(Exception):
@@ -806,18 +851,24 @@ class DockerSandboxClient:
         What is left (ADR 0205 decisions 4, 6 and 8):
 
         * every name is written exactly as the worker recorded it; one that is
-          not a clean leaf, sits in the reserved ``.curie-`` prefix, or repeats
-          refuses the boot, before anything is fetched;
+          blank, not a clean leaf, in the reserved ``.curie-`` prefix, or a
+          repeat refuses the boot before anything is fetched;
         * the current message's files are fetched first and are all or
           nothing, matching ``AttachmentCoordinator.resolve``: a partial set is
           indistinguishable to the agent from a complete one;
-        * an earlier file that has expired, is answered with an HTTP error,
+        * an earlier file that has expired, is answered with an HTTP error or a
+          redirect, outgrows the cap, has a name the filesystem cannot hold,
           times out, or is reached after the overall deadline is skipped and
           recorded unavailable with its reason;
-        * a digest mismatch or an over-cap body refuses the boot either way,
-          because that is integrity, not availability;
+        * a digest mismatch refuses the boot either way, because that is
+          integrity, not availability;
         * the outcome of every entry lands in the hidden status file, renamed
           into the root before the root is mounted read-only.
+
+        A payload with no ``"c"`` on any entry is from a worker that predates
+        ADR 0205 and keeps the pre-ADR rules whole: every entry current, the
+        name cleaned to its basename, a repeat given a numeric suffix
+        (``unique_attachment_leaf``), and no status file.
 
         Every refusal is an ``AttachmentResolutionError`` and removes the whole
         staged directory.
@@ -830,19 +881,31 @@ class DockerSandboxClient:
             currency = _attachment_currency(encoded_refs)
         except (TypeError, ValueError, AttributeError) as exc:
             raise AttachmentResolutionError("reference", "invalid attachment reference") from exc
-        seen: set[str] = set()
+        legacy = currency is None
+        current = (True,) * len(refs) if currency is None else currency
+        leaves: list[str] = []
         for ref in refs:
-            if not _attachment_name_is_clean(ref.name):
-                raise AttachmentResolutionError(
-                    "attachments-fetch",
-                    f"name {ref.name!r} is unusable as a filename",
-                )
-            if ref.name in seen:
-                raise AttachmentResolutionError(
-                    "attachments-fetch",
-                    f"name {ref.name!r} is duplicated",
-                )
-            seen.add(ref.name)
+            if legacy:
+                leaf = _legacy_attachment_leaf(ref.name)
+                if not leaf or leaf in (".", ".."):
+                    raise AttachmentResolutionError(
+                        "attachments-fetch",
+                        f"name {ref.name!r} is unusable as a filename",
+                    )
+                leaf = unique_attachment_leaf(leaf, leaves)
+            else:
+                leaf = ref.name
+                if not _attachment_name_is_clean(leaf):
+                    raise AttachmentResolutionError(
+                        "attachments-fetch",
+                        f"name {ref.name!r} is unusable as a filename",
+                    )
+                if leaf in leaves:
+                    raise AttachmentResolutionError(
+                        "attachments-fetch",
+                        f"name {ref.name!r} is duplicated",
+                    )
+            leaves.append(leaf)
         deadline = time.monotonic() + _ATTACHMENT_FETCH_DEADLINE_S
         tmp = tempfile.mkdtemp(prefix="curie-attachments-")
         root = Path(tmp) / "attachments"
@@ -850,44 +913,48 @@ class DockerSandboxClient:
         outcome: dict[str, tuple[str, str | None]] = {}
         # The current message's files first, whatever the payload order, so a
         # slow earlier file can never starve the ones the person just sent.
-        order = sorted(range(len(refs)), key=lambda index: not currency[index])
+        order = sorted(range(len(refs)), key=lambda index: not current[index])
         try:
             for index in order:
-                ref = refs[index]
+                ref, leaf = refs[index], leaves[index]
                 try:
-                    self._fetch_attachment(ref, root, deadline)
+                    self._fetch_attachment(ref, root / leaf, deadline, current=current[index])
                 except _AttachmentUnavailable as exc:
-                    if currency[index]:
+                    if current[index]:
                         raise AttachmentResolutionError(
                             "attachments-fetch",
                             f"{ref.name!r} is unavailable: {exc.reason}",
                         ) from exc
-                    outcome[ref.name] = ("unavailable", exc.reason)
+                    outcome[leaf] = ("unavailable", exc.reason)
                 else:
-                    outcome[ref.name] = ("ok", None)
-            rows = [
-                {"name": ref.name, "status": outcome[ref.name][0], "reason": outcome[ref.name][1]}
-                for ref in refs
-            ]
-            # Written outside the root and renamed in, so the runner reads it
-            # whole or not at all; o+r because the runner is uid 1000.
-            pending = Path(tmp) / "status.part"
-            pending.write_text(json.dumps({"v": 1, "files": rows}))
-            os.chmod(pending, 0o644)
-            os.replace(pending, root / _ATTACHMENT_STATUS_FILE)
+                    outcome[leaf] = ("ok", None)
+            if not legacy:
+                rows = [
+                    {"name": leaf, "status": outcome[leaf][0], "reason": outcome[leaf][1]}
+                    for leaf in leaves
+                ]
+                # Written beside the root and renamed in, so the runner reads it
+                # whole or not at all; o+r because the runner is uid 1000.
+                pending = Path(tmp) / "status.part"
+                pending.write_text(json.dumps({"v": 1, "files": rows}))
+                os.chmod(pending, 0o644)
+                os.replace(pending, root / _ATTACHMENT_STATUS_FILE)
         except Exception:
             shutil.rmtree(tmp, ignore_errors=True)
             raise
         self._attachment_dirs[name] = tmp
         return str(root)
 
-    def _fetch_attachment(self, ref: AttachmentRef, root: Path, deadline: float) -> None:
-        """Fetch one reference into ``root``, verified, or say why it is unavailable.
+    def _fetch_attachment(
+        self, ref: AttachmentRef, destination: Path, deadline: float, *, current: bool
+    ) -> None:
+        """Fetch one reference to ``destination``, verified, or say why it is unavailable.
 
         Raises ``_AttachmentUnavailable`` for what decision 6 lets an earlier
         file be skipped for, and ``AttachmentResolutionError`` for what refuses
-        any boot (an over-cap body, a digest mismatch, a name escaping the root).
-        Nothing partial is left behind either way.
+        any boot (a digest mismatch, a name escaping the root, and for a current
+        file the size cap, kept as ``AttachmentTooLargeError``). Nothing partial
+        is left behind either way.
         """
 
         if ref.expires_in_seconds <= 0:
@@ -895,7 +962,10 @@ class DockerSandboxClient:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise _AttachmentUnavailable("deadline")
-        destination = root / ref.name
+        # A name the filesystem cannot hold is a file that cannot be delivered.
+        if len(destination.name.encode("utf-8", "surrogateescape")) > _ATTACHMENT_NAME_MAX_BYTES:
+            raise _AttachmentUnavailable("fetch_failed")
+        root = destination.parent
         if destination.resolve().parent != root.resolve():
             raise AttachmentResolutionError(
                 "attachments-fetch",
@@ -904,23 +974,33 @@ class DockerSandboxClient:
         digest = hashlib.sha256()
         total = 0
         request = urllib.request.Request(ref.url, method="GET")
+        opener = urllib.request.build_opener(_NoRedirect())
         try:
             try:
                 with (
-                    urllib.request.urlopen(request, timeout=remaining) as response,
+                    opener.open(request, timeout=remaining) as response,
                     destination.open("wb") as output,
                 ):
-                    while chunk := response.read(self._attachment_limits.read_chunk_bytes):
+                    # read1 where the response has it: read(n) waits for n
+                    # bytes, so a store dripping a byte at a time would hold it
+                    # past the deadline.
+                    read = getattr(response, "read1", None) or response.read
+                    while True:
+                        _bound_read(response, deadline)
+                        chunk = read(self._attachment_limits.read_chunk_bytes)
+                        if not chunk:
+                            break
                         total += len(chunk)
                         if total > self._attachment_limits.max_file_bytes:
-                            raise AttachmentTooLargeError(
-                                ref.name, self._attachment_limits.max_file_bytes
-                            )
+                            if current:
+                                raise AttachmentTooLargeError(
+                                    ref.name, self._attachment_limits.max_file_bytes
+                                )
+                            raise _AttachmentUnavailable("fetch_failed")
                         digest.update(chunk)
                         output.write(chunk)
-                        if time.monotonic() > deadline:
-                            raise TimeoutError("past the attachment fetch deadline")
             except urllib.error.HTTPError as exc:
+                # A refused redirect lands here as its 3xx: fetch_failed.
                 reason = {404: "not_found", 403: "forbidden"}.get(exc.code, "fetch_failed")
                 raise _AttachmentUnavailable(reason) from exc
             except TimeoutError as exc:

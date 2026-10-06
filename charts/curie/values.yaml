@@ -2734,11 +2734,12 @@ agentSandbox:
       # the chart refuses a budget this volume cannot hold).
       sizeLimit: 512Mi
       # The overall deadline for one boot's fetches, current and earlier
-      # files together, on a monotonic clock. Each fetch's socket timeout is
+      # files together, on a monotonic clock. Each read's socket timeout is
       # what is left of it. A current file that misses it refuses the boot; an
       # earlier one is skipped and named to the agent as unavailable (ADR 0205
-      # decision 6). Sized for a thread's earlier files, not one message's.
-      fetchTimeoutSeconds: 120
+      # decision 6), so a thread's history never lengthens a boot past it. It
+      # must stay inside worker.claimTimeoutSeconds (90 by default).
+      fetchTimeoutSeconds: 45
     # Extra env for the runner container, list of {name, value}.
     # Per-workload OTEL_EXPORTER_OTLP_* overrides still win over the
     # chart-owned collector endpoint.
