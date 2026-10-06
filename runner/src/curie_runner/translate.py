@@ -515,7 +515,10 @@ def _translate_user(
                         )
                 elif _CREDIT_EXHAUSTED_TEXT.search(sub_text):
                     state.credit_exhausted = True
-                    if state.error_classification != CREDIT_EXHAUSTED_CLASSIFICATION:
+                    if (
+                        not state.usage_limited
+                        and state.error_classification != CREDIT_EXHAUSTED_CLASSIFICATION
+                    ):
                         state.error_classification = CREDIT_EXHAUSTED_CLASSIFICATION
                         events.append(
                             ErrorEvent(
