@@ -1922,7 +1922,8 @@ def test_no_auth_credentials_401_still_fails_fast_as_credential_rejected() -> No
         AssistantMessage(
             content=[
                 TextBlock(
-                    text='API Error: 401 {"error":{"message":"No auth credentials found","code":401}}'
+                    text='API Error: 401 {"error":{"message":"No auth credentials found",'
+                    '"code":401}}'
                 )
             ],
             model="<synthetic>",

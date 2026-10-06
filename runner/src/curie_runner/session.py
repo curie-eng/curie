@@ -85,7 +85,7 @@ from .tool_access import (
     TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
     TurnToolAccess,
 )
-from .translate import TurnState, translate_message
+from .translate import TurnState, is_credit_refusal, translate_message
 from .turn_progress import ProgressCapability, TurnProgress
 from .usage_report import UsageSink
 
@@ -167,11 +167,16 @@ def _tool_result_origin(tool_name: str) -> str:
 
 
 def _is_auth_rejection(message: object) -> bool:
-    """True when an SDK message reports a provider credential rejection (401/403)."""
+    """True when an SDK message reports a provider credential rejection (401/403).
+
+    A 403 whose text is a credit refusal, such as an OpenRouter key at its own
+    spend limit, is not one: translation classifies it credit-exhausted (#4104).
+    """
 
     return (
         isinstance(message, AssistantMessage)
         and getattr(message, "error", None) == _AUTH_REJECTION_SDK_CODE
+        and not is_credit_refusal(message)
     )
 
 
