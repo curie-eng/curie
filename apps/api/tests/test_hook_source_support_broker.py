@@ -1001,11 +1001,12 @@ def test_tolerated_bootstrap_variants_reach_the_valid_outcome(
     """Manifests compare by canonical bytes; extra files are ignored; symlinks to
     regular files are followed.
 
-    Each variant over an otherwise valid tuple still reaches
-    configuration_unsupported with the runtime members.
+    Each variant over an otherwise valid tuple passes steps 1 through 11 and,
+    with no ``enqueue.json`` in this suite's runtime, reaches step 12's
+    runtime_unavailable with the runtime members, as ``_valid`` does.
     @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-LANE-2.
     """
-    run_case(runtime_broker, tmp_path, monkeypatch, mutate, "configuration_unsupported", True)
+    run_case(runtime_broker, tmp_path, monkeypatch, mutate, "runtime_unavailable", True)
 
 
 # -- bootstrap directory -----------------------------------------------------------------
@@ -1152,7 +1153,9 @@ def test_bootstrap_is_read_afresh_on_each_evaluation(
 ) -> None:
     """A provisioner rotation is seen without restarting the API.
 
-    @spec PROTECTED-HOOK-SOURCE-9.
+    The restored bootstrap passes steps 1 through 11, so the second answer
+    carries the runtime members; without ``enqueue.json`` step 12 reports
+    runtime_unavailable. @spec PROTECTED-HOOK-SOURCE-9.
     """
 
     async def scenario() -> None:
@@ -1175,7 +1178,7 @@ def test_bootstrap_is_read_afresh_on_each_evaluation(
             rt.write_bootstrap()
             second = await probe_with(client, agent, delivery="second")
             assert second.status_code == 503, second.text
-            want = expected(None, "read-only", str(GENERATION), "configuration_unsupported")
+            want = expected(None, "read-only", str(GENERATION), "runtime_unavailable")
             want.update(runtime_members(rt))
             assert second.json() == want
 

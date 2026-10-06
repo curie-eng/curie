@@ -220,10 +220,12 @@ def test_changed_body_policy_or_generation_conflicts(
                 requested = "read-only"
             else:
                 await asyncio.to_thread(rotate_protected, agent, target, GENERATION + 1)
-                operation = sql_dicts(
+                rows = await asyncio.to_thread(
+                    sql_dicts,
                     "SELECT operation_id FROM curie.hook_source_policies WHERE agent_id=:a",
                     {"a": agent},
-                )[0]["operation_id"]
+                )
+                operation = rows[0]["operation_id"]
                 rt.operation = str(operation)
                 fresh = rt.source_record(floor=str(GENERATION + 1))
                 # The rotated row's fingerprint, published as the writer would.
@@ -736,6 +738,30 @@ def test_never_configured_hook_keeps_its_answers_and_opens_no_broker(
     run(scenario)
 
 
+def count_metadata_connects(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every control reader or source writer connection opened from now on.
+
+    Pass-through wrappers around the real ``connect``; the support probe could
+    only reach the broker through these principals. @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    from curie_protected_hooks.broker_transport import (
+        AuthenticatedMetadataReader,
+        AuthenticatedSourceWriter,
+    )
+
+    opened: list[str] = []
+    for cls in (AuthenticatedMetadataReader, AuthenticatedSourceWriter):
+        original = cls.connect
+
+        def connect(klass: Any, *args: Any, _original: Any = original, **kwargs: Any) -> Any:
+            """@spec PROTECTED-HOOK-SOURCE-9."""
+            opened.append(klass.__name__)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(cls, "connect", classmethod(connect))
+    return opened
+
+
 def _seed_tombstone(broker: Any, agent: str, published: bool) -> None:
     """Committed ordinary row at GENERATION, optionally published, @spec PROTECTED-HOOK-SOURCE-6."""
     seed(agent, "ordinary")
@@ -781,7 +807,9 @@ def test_published_tombstone_restores_ordinary_delivery(
             assert duplicate.status_code == 200, duplicate.text
             assert duplicate.json()["duplicate"] is True
             assert duplicate.json()["source_generation"] is None
-            opened = connections(broker)
+            # Count the probe's own principals (reader and writer) rather than every
+            # broker connection: the reconciler's enqueue tick may open one at any time.
+            opened = count_metadata_connects(monkeypatch)
             probe = await post_support(
                 client,
                 agent,
@@ -790,7 +818,7 @@ def test_published_tombstone_restores_ordinary_delivery(
             )
             assert probe.status_code == 503, probe.text
             assert probe.json() == expected(requested, requested, str(GENERATION), "source_closed")
-            assert connections(broker) == opened, "the probe read the broker for a tombstone"
+            assert opened == [], "the probe read the broker for a tombstone"
 
     run(scenario)
 

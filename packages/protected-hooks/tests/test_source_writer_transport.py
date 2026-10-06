@@ -180,14 +180,20 @@ def wrong_ca():
 
 
 def test_closed_surface_and_redacted_credential():
-    """Sibling class: reserve, ordinary publish, close, @spec PROTECTED-HOOK-SOURCE-6."""
+    """Sibling class: reserve, both publications, close, @spec PROTECTED-HOOK-SOURCE-6."""
     credential = transport.SourceWriterCredential("unique-writer", "unique-password")
     assert "unique-writer" not in repr(credential) and "unique-password" not in repr(credential)
     assert not hasattr(credential, "__dict__")
     with pytest.raises((AttributeError, TypeError)):
         credential.password = "changed"
     public = {name for name in dir(transport.AuthenticatedSourceWriter) if not name.startswith("_")}
-    assert public == {"connect", "reserve_and_revoke", "publish_ordinary", "close"}
+    assert public == {
+        "connect",
+        "reserve_and_revoke",
+        "publish_ordinary",
+        "publish_protected",
+        "close",
+    }
     assert list(inspect.signature(transport.AuthenticatedSourceWriter.connect).parameters) == [
         "manifest",
         "credential",
