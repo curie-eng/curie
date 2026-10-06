@@ -37,7 +37,7 @@ pub const PERMISSIONS: [(&str, &str); 7] = [
     ("pull_requests", "write"),
     ("checks", "read"),
     ("statuses", "write"),
-    ("actions", "read"),
+    ("actions", "write"),
 ];
 
 /// `curie-factory-<8 lowercase hex>`: unique enough that the GitHub-wide App
