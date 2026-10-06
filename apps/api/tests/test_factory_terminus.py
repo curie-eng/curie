@@ -1244,10 +1244,15 @@ def test_owner_lost_posts_one_comment(admitted: Any) -> None:
                     text(
                         "UPDATE curie.execution_requests "
                         "SET runtime_heartbeat_expires_at = clock_timestamp() "
-                        "- interval '1 second' "
+                        "- CAST(:elapsed AS interval) "
                         "WHERE id = :id AND status = 'running'"
                     ),
-                    {"id": row["id"]},
+                    {
+                        "id": row["id"],
+                        "elapsed": timedelta(
+                            seconds=get_settings().work_item_runtime_ttl_seconds + 5
+                        ),
+                    },
                 )
                 assert changed.rowcount == 1
         finally:

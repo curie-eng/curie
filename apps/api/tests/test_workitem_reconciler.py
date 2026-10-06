@@ -6,7 +6,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from types import SimpleNamespace
 from typing import Any
@@ -121,7 +121,8 @@ def test_work_item_enqueue_carrier_names_the_recorded_producer_span(
     spans = exporter.get_finished_spans()
     ingress = next(span for span in spans if span.name == "test.ingress")
     enqueue = next(
-        span for span in spans
+        span
+        for span in spans
         if span.name == "curie.queue.enqueue" and span.context.span_id == int(carrier[2], 16)
     )
     assert enqueue.kind is SpanKind.PRODUCER
@@ -138,9 +139,7 @@ def test_work_item_enqueue_without_a_tracer_preserves_the_payload_only(
     monkeypatch: pytest.MonkeyPatch,
     marked: bool,
 ) -> None:
-    monkeypatch.setattr(
-        telemetry_tracing, "_tracer", trace.NoOpTracerProvider().get_tracer("test")
-    )
+    monkeypatch.setattr(telemetry_tracing, "_tracer", trace.NoOpTracerProvider().get_tracer("test"))
     turn = QueuedTurn(
         event_id=f"work-item-{uuid.uuid4()}-terminate-1",
         conversation_id=WIRE_CONVERSATION,
@@ -282,9 +281,7 @@ class _SessionTracker:
 
 
 class _TrackingSessionmaker:
-    def __init__(
-        self, inner: async_sessionmaker[AsyncSession], tracker: _SessionTracker
-    ) -> None:
+    def __init__(self, inner: async_sessionmaker[AsyncSession], tracker: _SessionTracker) -> None:
         self.inner = inner
         self.tracker = tracker
 
@@ -318,9 +315,7 @@ class _XaddSpy:
 
     async def xadd(self, *args: Any, **kwargs: Any) -> Any:
         current = self.tracker.current
-        self.in_transaction.append(
-            False if current is None else bool(current.in_transaction())
-        )
+        self.in_transaction.append(False if current is None else bool(current.in_transaction()))
         return await self.inner.xadd(*args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
@@ -349,10 +344,7 @@ async def _now(session: AsyncSession) -> datetime:
 async def _agent_with_channel(session: AsyncSession) -> uuid.UUID:
     agent_id = uuid.uuid4()
     await session.execute(
-        text(
-            "INSERT INTO curie.agents (id, name, repo_full_name) "
-            "VALUES (:id, :name, :repo)"
-        ),
+        text("INSERT INTO curie.agents (id, name, repo_full_name) VALUES (:id, :name, :repo)"),
         {
             "id": agent_id,
             "name": f"acme-bot-{agent_id.hex[:8]}",
@@ -390,18 +382,22 @@ def _facts(agent_id: uuid.UUID, **overrides: Any) -> SimpleNamespace:
 
 async def _request_row(session: AsyncSession, request_id: uuid.UUID) -> Any:
     return (
-        await session.execute(
-            text(
-                "SELECT r.status, r.terminal_cause, r.execution_attempts, "
-                "r.capacity_deferrals, r.dispatch_generation, "
-                "r.published_generation, r.wait_deadline, r.started_at, "
-                "r.terminate_published_at, r.objective, r.reply_kind, "
-                "r.reply_address, r.reply_conversation_id "
-                "FROM curie.execution_requests r WHERE r.id = :id"
-            ),
-            {"id": request_id},
+        (
+            await session.execute(
+                text(
+                    "SELECT r.status, r.terminal_cause, r.execution_attempts, "
+                    "r.capacity_deferrals, r.dispatch_generation, "
+                    "r.published_generation, r.wait_deadline, r.started_at, "
+                    "r.terminate_published_at, r.objective, r.reply_kind, "
+                    "r.reply_address, r.reply_conversation_id "
+                    "FROM curie.execution_requests r WHERE r.id = :id"
+                ),
+                {"id": request_id},
+            )
         )
-    ).mappings().one()
+        .mappings()
+        .one()
+    )
 
 
 def _run(
@@ -418,9 +414,7 @@ def _run(
         maker = async_sessionmaker(engine, expire_on_commit=False)
         tracker = _SessionTracker()
         tracked = _TrackingSessionmaker(maker, tracker)
-        client = aioredis.Redis(
-            host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None
-        )
+        client = aioredis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
         valkey: aioredis.Redis = _XaddSpy(client, tracker) if spy_xadd else client
         settings = get_settings()
         assert settings.runs_stream == stream
@@ -678,12 +672,8 @@ def test_crash_between_xadd_and_fence_republishes_the_same_event_id(
             raise RuntimeError("injected fence failure")
         return await fence_published(*args, **kwargs)
 
-    monkeypatch.setattr(
-        "curie_api.workitem_dispatch.fence_published", fail_once
-    )
-    monkeypatch.setattr(
-        "curie_api.workitem_reconciler.fence_published", fail_once
-    )
+    monkeypatch.setattr("curie_api.workitem_dispatch.fence_published", fail_once)
+    monkeypatch.setattr("curie_api.workitem_reconciler.fence_published", fail_once)
 
     async def steps(
         maker: async_sessionmaker[AsyncSession],
@@ -753,9 +743,7 @@ def test_lost_xadd_leaves_the_row_due_for_the_next_pass(
 
     request_id = _run(steps, runs_stream)
     payloads = _payloads(valkey, runs_stream)
-    assert [payload["event_id"] for payload in payloads] == [
-        f"work-item-{request_id}-execute-1"
-    ]
+    assert [payload["event_id"] for payload in payloads] == [f"work-item-{request_id}-execute-1"]
 
 
 def test_expire_waiting_records_capacity_wait_expired(
@@ -836,12 +824,16 @@ def test_deadline_and_owner_lost_cancellation_are_requested(
                     "execution_attempts = 1, "
                     "runtime_owner = 'worker-a', "
                     "runtime_epoch = 1, "
-                    "runtime_heartbeat_expires_at = s.ts + interval '59 seconds', "
+                    "runtime_heartbeat_expires_at = :expired, "
                     "version = version + 1 "
                     "FROM (SELECT clock_timestamp() - interval '60 seconds' AS ts) s "
                     "WHERE e.id = :id"
                 ),
-                {"id": owner_facts.request_id},
+                {
+                    "id": owner_facts.request_id,
+                    "expired": await _now(session)
+                    - timedelta(seconds=get_settings().work_item_runtime_ttl_seconds + 5),
+                },
             )
             await session.commit()
             deadline_id = deadline_facts.request_id
@@ -860,6 +852,76 @@ def test_deadline_and_owner_lost_cancellation_are_requested(
             ) == ("cancellation_requested", "owner_lost")
 
     _run(steps, runs_stream)
+
+
+@pytest.mark.parametrize("runtime_ttl_seconds", [15, 45])
+def test_owner_lost_waits_one_runtime_ttl_after_heartbeat_expiry(
+    clean_db: None,
+    allowlisted: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_ttl_seconds: int,
+) -> None:
+    monkeypatch.setenv("CURIE_WORK_ITEM_RUNTIME_TTL_SECONDS", str(runtime_ttl_seconds))
+    get_settings.cache_clear()
+
+    async def steps(
+        maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        _client: aioredis.Redis,
+    ) -> tuple[uuid.UUID, uuid.UUID]:
+        async with maker() as session:
+            agent_id = await _agent_with_channel(session)
+            grace = _facts(agent_id)
+            lost = _facts(agent_id, github_issue_number=2574)
+            absent = _facts(agent_id, github_issue_number=2575)
+            now = await _now(session)
+            ttl = get_settings().work_item_runtime_ttl_seconds
+            assert ttl == runtime_ttl_seconds
+            for facts, owner, expiry in (
+                (grace, "worker-a", now - timedelta(seconds=5)),
+                (lost, "worker-a", now - timedelta(seconds=ttl + 5)),
+                (absent, None, now + timedelta(seconds=ttl)),
+            ):
+                await admit(session, facts)
+                started_at = now - timedelta(seconds=ttl + 10)
+                await session.execute(
+                    text(
+                        "UPDATE curie.execution_requests SET status = 'running', "
+                        "started_at = :started, execution_deadline = :deadline, "
+                        "execution_attempts = 1, runtime_owner = :owner, "
+                        "runtime_epoch = 1, runtime_heartbeat_expires_at = :expiry, "
+                        "version = version + 1 WHERE id = :id"
+                    ),
+                    {
+                        "id": facts.request_id,
+                        "started": started_at,
+                        "deadline": started_at + timedelta(seconds=1800),
+                        "owner": owner,
+                        "expiry": expiry,
+                    },
+                )
+            await session.commit()
+        await reconciler.run_once()
+        async with maker() as session:
+            grace_row = await _request_row(session, grace.request_id)
+            assert (grace_row.status, grace_row.terminal_cause) == ("running", None)
+            assert grace_row.terminate_published_at is None
+            for request_id in (lost.request_id, absent.request_id):
+                row = await _request_row(session, request_id)
+                assert (row.status, row.terminal_cause) == (
+                    "cancellation_requested",
+                    "owner_lost",
+                )
+                assert row.terminate_published_at is not None
+        return lost.request_id, absent.request_id
+
+    lost_id, absent_id = _run(steps, runs_stream)
+    assert {payload["event_id"] for payload in _payloads(valkey, runs_stream)} == {
+        f"work-item-{lost_id}-terminate",
+        f"work-item-{absent_id}-terminate",
+    }
 
 
 def test_terminate_wake_uses_the_sql_snapshot_without_an_agent_channel(

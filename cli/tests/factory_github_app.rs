@@ -448,10 +448,16 @@ fn assert_registration_params(url: &str) {
         "pull_requests=write",
         "checks=read",
         "statuses=write",
-        "actions=read",
+        // Failed-job reruns require Actions write permission:
+        // https://docs.github.com/en/rest/actions/workflow-runs#re-run-failed-jobs-from-a-workflow-run
+        "actions=write",
     ] {
         assert!(has(kv), "registration URL lacks {kv}: {url}");
     }
+    assert!(
+        !has("actions=read"),
+        "registration URL must not request Actions read-only access: {url}"
+    );
     assert!(
         !pairs.iter().any(|p| p.starts_with("events")),
         "registration URL must subscribe to no events: {url}"
@@ -487,6 +493,18 @@ fn without_an_app_the_registration_link_is_printed_and_nothing_applied() {
     assert_eq!(output.status.code(), Some(0), "output: {text}");
     let url = find_url(&text, "https://github.com/settings/apps/new");
     assert_registration_params(&url);
+    let actions: Vec<&str> = url
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or("")
+        .split('&')
+        .filter(|pair| pair.starts_with("actions="))
+        .collect();
+    assert_eq!(
+        actions,
+        ["actions=write"],
+        "registration URL must request Actions write exactly once: {url}"
+    );
     let lower = text.to_lowercase();
     for step in ["1.", "2.", "3.", "4."] {
         assert!(text.contains(step), "four numbered steps expected: {text}");

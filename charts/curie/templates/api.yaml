@@ -263,6 +263,8 @@ spec:
               value: {{ .Values.api.githubFactoryPythonCi | default dict | toJson | quote }}
             - name: GITHUB_FACTORY_BASES
               value: {{ .Values.api.githubFactoryBases | default dict | toJson | quote }}
+            - name: GITHUB_FACTORY_METADATA_CI
+              value: {{ .Values.api.githubFactoryMetadataCi | default dict | toJson | quote }}
             - name: GITHUB_API_URL
               value: {{ .Values.api.githubApiUrl | quote }}
             # Outbound GitHub credential: the eval commit status AND the

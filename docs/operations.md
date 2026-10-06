@@ -966,8 +966,12 @@ installation discovery.
 
 Give the App **Checks: Read** and **Commit statuses: Read** (the factory
 preflight names whichever of those two the installation does not grant), and
-**Actions: Read**.
-The Actions permission lets repair rounds include the failing job's log tail.
+**Actions: Read and write**.
+The Actions permission lets the factory rerun failed jobs once before entering
+a repair round and include the failing job's log tail.
+Existing App owners must raise Actions to **Read and write** in the App's
+permissions settings, then have the updated permissions accepted on every
+installation.
 Without it, CI verdicts still use checks and commit statuses; the repair prompt
 keeps the check summary and says `Job log unavailable.` After a factory
 run publishes, it waits on the pull request's checks inside its execution
@@ -1017,8 +1021,9 @@ api:
 ```
 
 Checks that must rerun after a pull request metadata edit are configured per
-repository with API env `GITHUB_FACTORY_METADATA_CI`, a JSON object, default
-`{}`, checked at boot. Each `owner/name` key is matched case insensitively.
+repository with `api.githubFactoryMetadataCi` (API env
+`GITHUB_FACTORY_METADATA_CI`, a JSON object, default `{}`, checked at boot).
+Each `owner/name` key is matched case insensitively.
 Each value supplies `checks` for check run names and `statuses` for commit
 status contexts. An omitted list is empty, but at least one name is required.
 Every configured guard must appear with a timestamp after the metadata edit;
@@ -1027,8 +1032,11 @@ Checks on the unchanged commit retain their passing, pending or failing evidence
 Without a repository policy, a metadata revision ends as `ci_unverified` with
 reason `metadata_ci_not_configured`. Ordinary commit revisions are unaffected.
 
-Set this environment value through the chart's existing `api.extraEnv` or in
-the Compose environment. For Curie's own repository, the value is:
+Set the chart value with a values file or `--set-json`. Installs that previously
+set `GITHUB_FACTORY_METADATA_CI` through `api.extraEnv` must move the JSON object
+to `api.githubFactoryMetadataCi` and remove that extraEnv entry; the chart now
+reserves the environment variable. Compose installs set it in the environment.
+For Curie's own repository, the value is:
 
 ```json
 {"curie-eng/curie":{"checks":["PR body (real newlines)","Fix pin verification"],"statuses":[]}}
