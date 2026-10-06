@@ -597,6 +597,60 @@ def test_a_string_api_refusal_keeps_its_message_on_the_factory_run(
     asyncio.run(exercise())
 
 
+def test_a_snapshot_base_mismatch_names_both_commits_on_the_factory_run(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #4121: the real validator's message reaches the work item's detail.
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    snapshot_sha = "0123456789abcdef0123456789abcdef01234567"
+    retained_sha = "fedcba9876543210fedcba9876543210fedcba98"
+
+    class RetainedBaseWorkspace(_Workspace):
+        def current(self, _thread_key: str) -> object:
+            return SimpleNamespace(repo_full_name=WORK_ITEM_REPO, base_sha=retained_sha)
+
+    async def exercise() -> None:
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=RetainedBaseWorkspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+
+            async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+                return RunnerWorkspaceSnapshot(
+                    repo_full_name=WORK_ITEM_REPO,
+                    base_sha=snapshot_sha,
+                    patch=b"diff --git a/src/widget.py b/src/widget.py\n",
+                    changed_paths=("src/widget.py",),
+                    contains_workflow_files=False,
+                    publication_title="Fix the widget parser",
+                    publication_body="Fixes the parser.",
+                )
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            )
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "approval_create_failed"
+            detail = finish["detail"]
+            assert isinstance(detail, str)
+            assert detail
+            assert "snapshot commit" in detail
+            assert snapshot_sha[:12] in detail
+            assert retained_sha[:12] in detail
+            assert publications.creates == []
+
+    asyncio.run(exercise())
+
+
 # --- W4: bounded to one ------------------------------------------------------------
 
 

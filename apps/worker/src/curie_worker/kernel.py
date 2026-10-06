@@ -8247,9 +8247,12 @@ class Kernel:
                 assert publication_creator is not None
                 snapshot = outcome.publication_snapshot
                 if outcome.publication_snapshot_error is not None:
-                    raise ApprovalBackendError(
+                    # #4121: carry the message as the refusal so the factory run
+                    # shows why the snapshot failed, not only the cause.
+                    snapshot_failure = (
                         f"publication snapshot failed: {outcome.publication_snapshot_error}"
                     )
+                    raise ApprovalBackendError(snapshot_failure, refusal=snapshot_failure)
                 if deployment_id is None or snapshot is None:
                     raise ApprovalBackendError(
                         "publication requires a deployment-managed repository workspace"
