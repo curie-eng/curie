@@ -38,7 +38,9 @@ the substrate's resume path retires the paused container and claims a fresh one.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import http.client
 import json
 import logging
 import os
@@ -66,10 +68,10 @@ from ..attachments import (
     ATTACHMENTS_MOUNT_PATH,
     ATTACHMENTS_REF_ENV,
     AttachmentLimits,
+    AttachmentRef,
     AttachmentResolutionError,
     AttachmentTooLargeError,
     decode_attachment_refs,
-    unique_attachment_leaf,
 )
 from ..binding import (
     BASE_URL_ENV,
@@ -101,12 +103,51 @@ from .types import (
     filter_agent_child_env,
 )
 
-#: Per-object read deadline when redeeming an attachment capability. A local
-#: constant rather than an AttachmentLimits field: the reference already
-#: expires, the size cap already bounds the transfer, and widening the operator
-#: envelope for a value nobody asked to tune would add a knob and a chart value
-#: that mean nothing to them.
-_ATTACHMENT_FETCH_TIMEOUT_S = 30.0
+#: The overall deadline for redeeming one boot's attachment references,
+#: current and earlier files together, measured on ``time.monotonic``. Each
+#: fetch's socket timeout is what is left of it. The twin of the chart's
+#: ``agentSandbox.runner.attachments.fetchTimeoutSeconds`` default, which the
+#: ``attachments-init`` program applies the same way (ADR 0205 decision 6). A
+#: local constant rather than an AttachmentLimits field: the docker tiers have
+#: no operator envelope for it and nobody has asked to tune it.
+_ATTACHMENT_FETCH_DEADLINE_S = 120.0
+
+#: The hidden file in the mount root recording every reference's outcome, read
+#: by the runner (ADR 0205 decision 8). The ``.curie-`` prefix is reserved: no
+#: attachment may be named into it.
+_ATTACHMENT_STATUS_FILE = ".curie-attachments-status.json"
+_ATTACHMENT_RESERVED_PREFIX = ".curie-"
+
+
+class _AttachmentUnavailable(Exception):
+    """One reference could not be fetched; ``reason`` is the status code."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _attachment_currency(encoded_refs: str) -> tuple[bool, ...]:
+    """Per entry, whether it is on the current message (``"c"`` on the wire).
+
+    ``decode_attachment_refs`` has already validated the payload, so this only
+    reads the flag it does not carry: ``"c": 0`` is an earlier file, and a
+    missing ``"c"`` (a worker that predates ADR 0205) is current.
+    """
+
+    raw = base64.urlsafe_b64decode(encoded_refs + "=" * (-len(encoded_refs) % 4))
+    return tuple(entry.get("c", 1) != 0 for entry in json.loads(raw))
+
+
+def _attachment_name_is_clean(name: str) -> bool:
+    """The same rule the ``attachments-init`` program applies, name for name."""
+
+    return (
+        name not in ("", ".", "..")
+        and os.path.basename(name) == name
+        and "\0" not in name
+        and not name.startswith(_ATTACHMENT_RESERVED_PREFIX)
+    )
 
 
 class _NoAttachments(Exception):
@@ -759,60 +800,114 @@ class DockerSandboxClient:
         """Redeem the signed references and materialize a read-only mount root.
 
         The Kubernetes twin of this is the ``attachments-init`` container, and
-        the refusals are deliberately the same set: ``decode_attachment_refs``
-        has already rejected a non-HTTP(S) url and a digest that is not real
-        hex, and what is left to refuse here is an expired capability, a file
-        that outgrows the cap mid-stream, a digest that does not match the bytes
-        that arrived, and a name that would land outside the mount root.
+        the two are held to one outcome per payload by
+        ``tests/vectors/attachment-init-outcomes.json``. ``decode_attachment_refs``
+        has already refused a non-HTTP(S) url and a digest that is not real hex.
+        What is left (ADR 0205 decisions 4, 6 and 8):
 
-        All or nothing, matching ``AttachmentCoordinator.resolve``: a partial set
-        is indistinguishable to the agent from a complete one, so one refusal
-        discards the whole directory rather than mounting the survivors.
+        * every name is written exactly as the worker recorded it; one that is
+          not a clean leaf, sits in the reserved ``.curie-`` prefix, or repeats
+          refuses the boot, before anything is fetched;
+        * the current message's files are fetched first and are all or
+          nothing, matching ``AttachmentCoordinator.resolve``: a partial set is
+          indistinguishable to the agent from a complete one;
+        * an earlier file that has expired, is answered with an HTTP error,
+          times out, or is reached after the overall deadline is skipped and
+          recorded unavailable with its reason;
+        * a digest mismatch or an over-cap body refuses the boot either way,
+          because that is integrity, not availability;
+        * the outcome of every entry lands in the hidden status file, renamed
+          into the root before the root is mounted read-only.
+
+        Every refusal is an ``AttachmentResolutionError`` and removes the whole
+        staged directory.
         """
 
         refs = decode_attachment_refs(encoded_refs)
         if not refs:
             raise _NoAttachments
+        try:
+            currency = _attachment_currency(encoded_refs)
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise AttachmentResolutionError("reference", "invalid attachment reference") from exc
+        seen: set[str] = set()
+        for ref in refs:
+            if not _attachment_name_is_clean(ref.name):
+                raise AttachmentResolutionError(
+                    "attachments-fetch",
+                    f"name {ref.name!r} is unusable as a filename",
+                )
+            if ref.name in seen:
+                raise AttachmentResolutionError(
+                    "attachments-fetch",
+                    f"name {ref.name!r} is duplicated",
+                )
+            seen.add(ref.name)
+        deadline = time.monotonic() + _ATTACHMENT_FETCH_DEADLINE_S
         tmp = tempfile.mkdtemp(prefix="curie-attachments-")
         root = Path(tmp) / "attachments"
         root.mkdir(mode=0o755)
-        # Two files named `report.pdf` in one message used to land on the same
-        # path and the second silently destroyed the first. `unique_attachment_leaf`
-        # is the same scheme the rendered `attachments-init` program applies, in
-        # the same order, so a set materializes identically on both substrates.
-        taken: set[str] = set()
+        outcome: dict[str, tuple[str, str | None]] = {}
+        # The current message's files first, whatever the payload order, so a
+        # slow earlier file can never starve the ones the person just sent.
+        order = sorted(range(len(refs)), key=lambda index: not currency[index])
         try:
-            for ref in refs:
-                if ref.expires_in_seconds <= 0:
-                    raise AttachmentResolutionError(
-                        "attachments-fetch",
-                        f"reference for {ref.name!r} expired",
-                    )
-                # Refused before the join, not after: `Path("   ").name` is
-                # `"   "`, and `Path("..").name` is `""`, so a containment check
-                # alone would let a blank file through or silently target the
-                # root itself. The init container makes the same refusal.
-                leaf = Path(ref.name.strip()).name.strip()
-                if not leaf or leaf in {".", ".."}:
-                    raise AttachmentResolutionError(
-                        "attachments-fetch",
-                        f"name {ref.name!r} is unusable as a filename",
-                    )
-                leaf = unique_attachment_leaf(leaf, taken)
-                taken.add(leaf)
-                destination = root / leaf
-                if destination.resolve().parent != root.resolve():
-                    raise AttachmentResolutionError(
-                        "attachments-fetch",
-                        f"name {ref.name!r} escapes the mount root",
-                    )
-                digest = hashlib.sha256()
-                total = 0
-                request = urllib.request.Request(ref.url, method="GET")
+            for index in order:
+                ref = refs[index]
+                try:
+                    self._fetch_attachment(ref, root, deadline)
+                except _AttachmentUnavailable as exc:
+                    if currency[index]:
+                        raise AttachmentResolutionError(
+                            "attachments-fetch",
+                            f"{ref.name!r} is unavailable: {exc.reason}",
+                        ) from exc
+                    outcome[ref.name] = ("unavailable", exc.reason)
+                else:
+                    outcome[ref.name] = ("ok", None)
+            rows = [
+                {"name": ref.name, "status": outcome[ref.name][0], "reason": outcome[ref.name][1]}
+                for ref in refs
+            ]
+            # Written outside the root and renamed in, so the runner reads it
+            # whole or not at all; o+r because the runner is uid 1000.
+            pending = Path(tmp) / "status.part"
+            pending.write_text(json.dumps({"v": 1, "files": rows}))
+            os.chmod(pending, 0o644)
+            os.replace(pending, root / _ATTACHMENT_STATUS_FILE)
+        except Exception:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        self._attachment_dirs[name] = tmp
+        return str(root)
+
+    def _fetch_attachment(self, ref: AttachmentRef, root: Path, deadline: float) -> None:
+        """Fetch one reference into ``root``, verified, or say why it is unavailable.
+
+        Raises ``_AttachmentUnavailable`` for what decision 6 lets an earlier
+        file be skipped for, and ``AttachmentResolutionError`` for what refuses
+        any boot (an over-cap body, a digest mismatch, a name escaping the root).
+        Nothing partial is left behind either way.
+        """
+
+        if ref.expires_in_seconds <= 0:
+            raise _AttachmentUnavailable("expired")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _AttachmentUnavailable("deadline")
+        destination = root / ref.name
+        if destination.resolve().parent != root.resolve():
+            raise AttachmentResolutionError(
+                "attachments-fetch",
+                f"name {ref.name!r} escapes the mount root",
+            )
+        digest = hashlib.sha256()
+        total = 0
+        request = urllib.request.Request(ref.url, method="GET")
+        try:
+            try:
                 with (
-                    urllib.request.urlopen(
-                        request, timeout=_ATTACHMENT_FETCH_TIMEOUT_S
-                    ) as response,
+                    urllib.request.urlopen(request, timeout=remaining) as response,
                     destination.open("wb") as output,
                 ):
                     while chunk := response.read(self._attachment_limits.read_chunk_bytes):
@@ -823,20 +918,30 @@ class DockerSandboxClient:
                             )
                         digest.update(chunk)
                         output.write(chunk)
-                if digest.hexdigest() != ref.sha256:
-                    raise AttachmentResolutionError(
-                        "attachments-fetch",
-                        f"{ref.name!r} digest mismatch",
-                    )
-                # The runner runs as uid 1000 and the mount is read-only, so the
-                # bytes only need to be readable; unlike the workspace they are
-                # never written back.
-                os.chmod(destination, 0o644)
-        except Exception:
-            shutil.rmtree(tmp, ignore_errors=True)
+                        if time.monotonic() > deadline:
+                            raise TimeoutError("past the attachment fetch deadline")
+            except urllib.error.HTTPError as exc:
+                reason = {404: "not_found", 403: "forbidden"}.get(exc.code, "fetch_failed")
+                raise _AttachmentUnavailable(reason) from exc
+            except TimeoutError as exc:
+                raise _AttachmentUnavailable("timeout") from exc
+            except urllib.error.URLError as exc:
+                timed_out = isinstance(exc.reason, TimeoutError)
+                raise _AttachmentUnavailable("timeout" if timed_out else "fetch_failed") from exc
+            except (OSError, http.client.HTTPException) as exc:
+                raise _AttachmentUnavailable("fetch_failed") from exc
+            if digest.hexdigest() != ref.sha256.lower():
+                raise AttachmentResolutionError(
+                    "attachments-fetch",
+                    f"{ref.name!r} digest mismatch",
+                )
+        except BaseException:
+            destination.unlink(missing_ok=True)
             raise
-        self._attachment_dirs[name] = tmp
-        return str(root)
+        # The runner runs as uid 1000 and the mount is read-only, so the bytes
+        # only need to be readable; unlike the workspace they are never written
+        # back.
+        os.chmod(destination, 0o644)
 
     def _cleanup_attachments(self, name: str) -> None:
         tmp = self._attachment_dirs.pop(name, None)

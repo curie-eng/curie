@@ -169,6 +169,19 @@ component and rail detail in `charts/curie/README.md`.
   canonical overlay for that shape (all four stores off, Secret references,
   three buckets, narrow S3 egress). Pin it with
   `ci/external-values-profile-assertions.sh`.
+- **`attachments-init` has a docker twin, held by a shared vector.** The
+  program `templates/agent-sandbox.yaml` renders into the sandbox's
+  `attachments-init` container and the docker driver's `_prepare_attachments`
+  (`apps/worker/src/curie_worker/sandbox/docker.py`) redeem the same
+  `CURIE_ATTACHMENTS_REF` payload and must agree on every outcome: names written
+  exactly, current files first and all-or-nothing, earlier files skipped with a
+  reason in `.curie-attachments-status.json`, a digest mismatch fatal either
+  way (ADR 0205). Change one and you change the other in the same PR;
+  `tests/vectors/attachment-init-outcomes.json` is run through both by
+  `ci/attachment-init-behavior-assertions.sh` and
+  `test_docker_attachment_claim.py`. The worker's `threadMaxBytes` must fit the
+  attachments emptyDir's `sizeLimit`; the worker template refuses to render
+  otherwise.
 - **Values keys are camelCase, not hyphenated.** Go templates cannot
   dot-index a hyphenated key. Keep this consistent across any new values
   additions.
@@ -275,7 +288,10 @@ component and rail detail in `charts/curie/README.md`.
   file can disagree with it; the template reads it through `dig` for a
   retained release without the block) and the new
   `e2eConnectorIdentity` block, whose prefix and label patterns keep its
-  values safe to embed in the admission policy's CEL (#3243). Adding a `required` or
+  values safe to embed in the admission policy's CEL (#3243), and the new
+  `worker.attachments.threadMaxFiles` / `threadMaxBytes` thread budget (ADR
+  0205; new keys, read in the template with a default so a `--reuse-values`
+  upgrade from a release without them still renders). Adding a `required` or
   `additionalProperties: false` constraint, or typing any other existing
   key, would fail every install whose values file happens not to match the
   new shape -- broaden the schema only for a key you are prepared to

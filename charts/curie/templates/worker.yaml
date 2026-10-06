@@ -285,6 +285,28 @@ spec:
               value: {{ .Values.worker.attachments.referenceTtlSeconds | quote }}
             - name: CURIE_ATTACHMENT_RETENTION_TTL_SECONDS
               value: {{ .Values.worker.attachments.retentionTtlSeconds | quote }}
+            {{- /*
+            ADR 0205 decision 7: the per-thread file count and byte budget one
+            boot materializes. The byte budget has to fit the attachments
+            emptyDir the init container writes into, or the thread's files
+            overflow it and the pod is evicted mid-boot; the chart refuses the
+            values instead. Defaulted here as well as in values.yaml: under
+            `helm upgrade --reuse-values` from a release that predates the keys
+            they are nil, and a nil budget would render "0".
+            */}}
+            {{- $threadMaxFiles := .Values.worker.attachments.threadMaxFiles | default 20 | int64 }}
+            {{- $threadMaxBytes := .Values.worker.attachments.threadMaxBytes | default 268435456 | int64 }}
+            {{- $runnerAttachments := .Values.agentSandbox.runner.attachments | default dict }}
+            {{- if and .Values.worker.attachments.enabled $runnerAttachments.enabled }}
+            {{- $volumeBytes := include "curie.capacity.memBytes" $runnerAttachments.sizeLimit | int64 }}
+            {{- if gt $threadMaxBytes $volumeBytes }}
+            {{- fail (printf "worker.attachments.threadMaxBytes (%d) exceeds agentSandbox.runner.attachments.sizeLimit (%s, %d bytes): one boot of a thread's files would overflow the sandbox's attachments volume. Lower threadMaxBytes or raise sizeLimit (ADR 0205 decision 7)." $threadMaxBytes (toString $runnerAttachments.sizeLimit) $volumeBytes) }}
+            {{- end }}
+            {{- end }}
+            - name: CURIE_ATTACHMENT_THREAD_MAX_FILES
+              value: {{ $threadMaxFiles | quote }}
+            - name: CURIE_ATTACHMENT_THREAD_MAX_BYTES
+              value: {{ $threadMaxBytes | quote }}
             - name: CURIE_PUBLICATION_ENABLED
               value: {{ .Values.worker.publication.enabled | quote }}
             - name: CURIE_PUBLICATION_NAMESPACE
