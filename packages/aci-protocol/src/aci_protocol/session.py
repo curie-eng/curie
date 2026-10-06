@@ -415,7 +415,7 @@ class BootEnv(_AciModel):
     # in the thread. ``unavailable`` names earlier files that could not be
     # fetched, ``omitted`` earlier files left out by the thread budget, and
     # ``ledger_unavailable`` says the ledger itself could not be read.
-    # ``reason`` is one fixed code, never error text: ``no_route``,
+    # ``reason`` is one fixed code, never error text: ``no_route``, ``no_credential``,
     # ``not_found``, ``forbidden``, ``rate_limited``, ``timeout``,
     # ``digest_changed``, ``expired``, ``deadline`` or ``fetch_failed``. Names
     # only: never a URL, a file id, or a capability. Absent or blank means no
