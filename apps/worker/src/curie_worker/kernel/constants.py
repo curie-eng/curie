@@ -36,6 +36,15 @@ _SESSION_APPROVAL_EXPIRES_IN_SECONDS = 24 * 60 * 60
 
 _ATTACHMENT_HANDOFF_PROBE_TIMEOUT_S = 5.0
 
+# ADR 0205: how far past its own deadline a text boot waits for the thread set
+# under the route lock before booting without it. The lane checks the deadline
+# before every earlier fetch, so this only absorbs one in-flight fetch's tail.
+_THREAD_SET_PREPARE_GRACE_S = 5.0
+
+# ADR 0205: the ledger append after install, retries included. It runs after
+# the route lock is released but before the turn's stream is consumed.
+_THREAD_ATTACHMENT_APPEND_TIMEOUT_S = 10.0
+
 _ACTIVE_ATTACHMENT_REPLY = (
     "I cannot add a file while the current reply is still running. "
     "Please send the whole message again after that reply finishes. "

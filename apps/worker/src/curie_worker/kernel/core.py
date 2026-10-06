@@ -19,6 +19,7 @@ from ..bundle_store import BundleReader
 from ..config import WorkerConfig
 from ..hook_runs import HookRunRecorder
 from ..killswitch import KillSwitch
+from ..ledger_client import ThreadAttachmentLedgerClient
 from ..markers import Markers
 from ..progress import ProgressStore
 from ..reply_sink import (
@@ -76,6 +77,7 @@ class Kernel:
         binding: BindingResolver | None = None,
         workspace: WorkspaceClaimCoordinator | None = None,
         attachments: AttachmentCoordinator | None = None,
+        attachment_ledger: ThreadAttachmentLedgerClient | None = None,
         killswitch: KillSwitch | None = None,
         approvals: ApprovalCreator | None = None,
         publication_creator: PublicationCreator | None = None,
@@ -128,6 +130,12 @@ class Kernel:
         # the claim env is how that capability is delivered -- and its sibling
         # retention ledger is swept from the same reap tick as the workspace's.
         self._attachments = attachments
+        # The thread attachment ledger (ADR 0205). Optional on top of the lane:
+        # with none wired every turn behaves exactly as before (a file turn
+        # resolves only its own files, a text turn reads nothing). Wired, every
+        # boot for a thread rebuilds the thread's whole file set from it, and a
+        # file turn appends its files once they are installed.
+        self._attachment_ledger = attachment_ledger
         self._killswitch = killswitch
         # The approval-record backend (#244). When absent (unwired tests, a
         # deployment without the API), an awaiting-approval run degrades to an
@@ -234,6 +242,10 @@ class Kernel:
     _route_attachment_and_start = attachments._route_attachment_and_start
     _discard_prepared_attachments = attachments._discard_prepared_attachments
     _resolve_attachments = attachments._resolve_attachments
+    _prepare_thread_attachments = attachments._prepare_thread_attachments
+    _prepare_boot_thread_set = attachments._prepare_boot_thread_set
+    _append_thread_attachments = attachments._append_thread_attachments
+    _discard_unclaimed_thread_set = attachments._discard_unclaimed_thread_set
     _attempt = attempt._attempt
     _attempt_turn = attempt._attempt_turn
     _require_tool_access = attempt._require_tool_access

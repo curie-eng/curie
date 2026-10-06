@@ -1208,6 +1208,51 @@ disabled, the existing workspaces disabled refusal takes precedence before the
 file is resolved. Fresh workspace claims and suspended workspace resumes still
 receive attachments. Retained workspace replacement is tracked in #2728.
 
+### Every boot rebuilds the thread's files (ADR 0205)
+
+With the attachment lane on and `CURIE_INTERNAL_WORKER_TOKEN` set, the worker
+wires the API's thread attachment ledger
+(`curie_worker.ledger_client.ThreadAttachmentLedgerClient`, the
+`/v1/internal/thread-attachments` routes behind `X-Curie-Worker-Token`). Without
+the token no ledger is wired and attachments behave exactly as above: a file
+turn resolves only its own files and a text turn reads nothing.
+
+- **A file turn** reads the ledger outside the route lock, then
+  `AttachmentCoordinator.prepare_thread_set` fetches the message's files all or
+  nothing and the thread's earlier files best effort. A failed ledger read
+  refuses the turn before any claim (`stage=ledger`). Once the files are
+  installed and the turn has opened, the worker appends the message's refs to
+  the ledger, outside the lock and idempotent per event and file. A failed append is
+  logged at WARNING and the turn goes on. A turn refused after preparing
+  appends nothing and discards what it wrote.
+- **A text turn that boots** (fresh claim, suspended resume, turn budget or
+  workspace handoff) reads the ledger and prepares the earlier files under the
+  route lock. The ledger read is bounded by
+  `CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS` (default 30) and the
+  delivery's remaining budget. The prepare has the same deadline plus a short
+  grace. A failed read boots with `ledger_unavailable` in the manifest. An
+  adopt, a steer and a sweep continuation read nothing.
+- **Names are fixed when recorded.** A current file's disk name is cleaned with
+  the init container's rules (a leading `.` becomes `_`) and disambiguated
+  against every name the ledger holds, then stored on its ref and never
+  recomputed.
+- **Bytes stay short lived.** An earlier file whose parked copy outlives the
+  capability by a margin is re-minted, and a new owner record (still
+  `"version": 1`, with optional `agent` and `shas` fields) keeps it from the
+  reaper. Otherwise it is fetched again through the agent's current bindings
+  (`BindingResolver.routes_for_agent`), never a recorded endpoint, and its
+  digest must match. One that cannot be had is named unavailable (`no_route`,
+  `no_credential`, `not_found`, `forbidden`, `rate_limited`, `timeout`,
+  `digest_changed`, `deadline`, `fetch_failed`) and never fails the boot.
+- **The per-thread budget** (`CURIE_ATTACHMENT_THREAD_MAX_FILES`, default 20,
+  never below the per-message cap; `CURIE_ATTACHMENT_THREAD_MAX_BYTES`, default
+  256 MiB) keeps the current files and then the newest earlier files. The rest
+  are named as omitted.
+- Capabilities are presigned only after every fetch. The claim env carries
+  `CURIE_ATTACHMENTS_REF` (each entry with its exact name `n` and `c` 1 for
+  current, 0 for earlier) and `CURIE_ATTACHMENTS_MANIFEST` for the runner
+  (names and reasons only, no URL).
+
 Approval metadata references follow the same sentence boundary rules across API,
 worker, runner and the UI fallback for older API responses. A tool identifier
 followed by a sentence-ending period (including whitespace or closing punctuation)

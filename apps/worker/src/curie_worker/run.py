@@ -62,6 +62,7 @@ from .kernel.channel_read import drain_pending_channel_read_closes
 from .kernel.core import Kernel
 from .kernel.memory import drain_pending_memory_closes
 from .killswitch import KillSwitch
+from .ledger_client import ThreadAttachmentLedgerClient
 from .markers import Markers
 from .progress import ProgressStore
 from .publication_clients import (
@@ -317,6 +318,8 @@ def _attachment_limits(config: WorkerConfig) -> AttachmentLimits:
         max_file_bytes=config.attachment_max_file_bytes,
         reference_ttl_seconds=config.attachment_reference_ttl_seconds,
         retention_ttl_seconds=config.attachment_retention_ttl_seconds,
+        thread_max_files=config.attachment_thread_max_files,
+        thread_max_bytes=config.attachment_thread_max_bytes,
     )
 
 
@@ -624,6 +627,18 @@ def build(
         binding=binding,
         workspace=workspace,
         attachments=attachments,
+        # ADR 0205: the thread attachment ledger, behind the internal worker
+        # token and nothing else. Without the token (or without the lane) no
+        # ledger is wired and every turn's attachments behave as before.
+        attachment_ledger=(
+            ThreadAttachmentLedgerClient(
+                api_base_url=config.api_base_url,
+                worker_token=config.internal_worker_token,
+                client=eval_http,
+            )
+            if attachments is not None and config.internal_worker_token
+            else None
+        ),
         approvals=approval_client,
         # Publication is cluster-only in v1. A local request sees an actionable
         # refusal in the kernel before either durable row is created.
