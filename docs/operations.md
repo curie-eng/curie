@@ -966,8 +966,12 @@ installation discovery.
 
 Give the App **Checks: Read** and **Commit statuses: Read** (the factory
 preflight names whichever of those two the installation does not grant), and
-**Actions: Read**.
-The Actions permission lets repair rounds include the failing job's log tail.
+**Actions: Read and write**.
+The Actions permission lets the factory rerun failed jobs once before entering
+a repair round and include the failing job's log tail.
+Existing App owners must raise Actions to **Read and write** in the App's
+permissions settings, then have the updated permissions accepted on every
+installation.
 Without it, CI verdicts still use checks and commit statuses; the repair prompt
 keeps the check summary and says `Job log unavailable.` After a factory
 run publishes, it waits on the pull request's checks inside its execution
