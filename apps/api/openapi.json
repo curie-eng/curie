@@ -443,77 +443,41 @@
         "title": "ActionRecord",
         "type": "object"
       },
-      "ActionRestore": {
-        "description": "The call an authorized undo permits: put this state back on that target.",
-        "properties": {
-          "prior_state": {
-            "additionalProperties": true,
-            "title": "Prior State",
-            "type": "object"
-          },
-          "target": {
-            "additionalProperties": true,
-            "title": "Target",
-            "type": "object"
-          }
-        },
-        "required": [
-          "target",
-          "prior_state"
-        ],
-        "title": "ActionRestore",
-        "type": "object"
-      },
       "ActionUndo": {
-        "description": "A request to put back what an action changed.\n\n``observed_state`` is the resource as it looks NOW, read by whoever will\nperform the restore. The platform cannot read it itself -- nothing here can\nreach a connector -- and it will not assume: an absent observation is refused\nrather than treated as \"unchanged\".",
+        "description": "A request to put back what an action changed.\n\n@spec ACTION-EXECUTOR-3: the actor is the authenticated principal, never\nthis body. ``actor`` is accepted only as a cross-check: one that differs\nfrom the principal is refused. Channel evidence likewise comes from the\nprincipal. The platform observes the live version itself through the\npinned connector (ACTION-EXECUTOR-15), so a caller-supplied observation is\nno longer evidence; an ``observed_state`` sent by an older caller is\nignored as an unknown field, never compared.",
         "properties": {
           "actor": {
-            "title": "Actor",
-            "type": "string"
-          },
-          "actor_channel": {
             "anyOf": [
               {
+                "maxLength": 256,
                 "type": "string"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Actor Channel"
-          },
-          "observed_state": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Observed State"
+            "title": "Actor"
           }
         },
-        "required": [
-          "actor"
-        ],
         "title": "ActionUndo",
         "type": "object"
       },
       "ActionUndoOut": {
-        "description": "An authorization, not a receipt.\n\nThe API rules and returns; something else performs the restore (ADR-0117\nleaves where that executor lives undecided). So this names the call to make\nrather than claiming it was made.",
+        "description": "A requested restore, not a receipt and not the call to make.\n\n@spec ACTION-EXECUTOR-3: the ruling answers with the execution it created\nand that execution's state. It never carries the ``target``, the sealed\n``prior_state`` or a version; the receipt is the execution's own read.",
         "properties": {
-          "action": {
-            "$ref": "#/components/schemas/ActionOut"
+          "execution_id": {
+            "format": "uuid",
+            "title": "Execution Id",
+            "type": "string"
           },
-          "restore": {
-            "$ref": "#/components/schemas/ActionRestore"
+          "state": {
+            "title": "State",
+            "type": "string"
           }
         },
         "required": [
-          "action",
-          "restore"
+          "execution_id",
+          "state"
         ],
         "title": "ActionUndoOut",
         "type": "object"
@@ -5088,6 +5052,323 @@
         "title": "EvalTriggerResult",
         "type": "object"
       },
+      "ExecutionClaim": {
+        "additionalProperties": false,
+        "description": "@spec ACTION-EXECUTOR-17: who claims, and for how long the lease holds.",
+        "properties": {
+          "lease_owner": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Lease Owner",
+            "type": "string"
+          },
+          "lease_seconds": {
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Lease Seconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "lease_owner",
+          "lease_seconds"
+        ],
+        "title": "ExecutionClaim",
+        "type": "object"
+      },
+      "ExecutionCreated": {
+        "description": "A created or adopted execution: its identity and state, nothing else.",
+        "properties": {
+          "execution_id": {
+            "format": "uuid",
+            "title": "Execution Id",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "execution_id",
+          "state"
+        ],
+        "title": "ExecutionCreated",
+        "type": "object"
+      },
+      "ExecutionFence": {
+        "additionalProperties": false,
+        "description": "@spec ACTION-EXECUTOR-17: the fence every later transition presents.",
+        "properties": {
+          "attempt": {
+            "minimum": 0.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "lease_owner": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Lease Owner",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_owner",
+          "attempt"
+        ],
+        "title": "ExecutionFence",
+        "type": "object"
+      },
+      "ExecutionObservation": {
+        "additionalProperties": false,
+        "description": "@spec ACTION-EXECUTOR-15: the version ``observe_version`` reported now.\n\nAbsent, empty or malformed is accepted here and answered as a conflict by\nthe route, never as a 422: the spec refuses the restore in that case, and a\nrejected request would leave the execution waiting instead.",
+        "properties": {
+          "attempt": {
+            "minimum": 0.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "lease_owner": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Lease Owner",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "lease_owner",
+          "attempt"
+        ],
+        "title": "ExecutionObservation",
+        "type": "object"
+      },
+      "ExecutionOut": {
+        "description": "One execution as the worker and the receipt read it.\n\n@spec ACTION-EXECUTOR-18. Deliberately without ``outcome``,\n``arguments_sha256`` or ``forward_arguments``: the read names what ran and\nhow it ended, never a version, an argument or a state.",
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "attempt": {
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "connector": {
+            "title": "Connector",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "dispatched_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dispatched At"
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Code"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "lease_expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Expires At"
+          },
+          "lease_owner": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Owner"
+          },
+          "refusal_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refusal Code"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "subject_action_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject Action Id"
+          },
+          "tool": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "state",
+          "agent_id",
+          "connector",
+          "tool",
+          "subject_action_id",
+          "requested_by",
+          "attempt",
+          "lease_owner",
+          "lease_expires_at",
+          "refusal_code",
+          "failure_code",
+          "dispatched_at",
+          "finished_at",
+          "created_at"
+        ],
+        "title": "ExecutionOut",
+        "type": "object"
+      },
+      "ExecutionOutcome": {
+        "additionalProperties": false,
+        "description": "@spec ACTION-EXECUTOR-18 @spec ACTION-EXECUTOR-20: the terminal report.\n\n``state`` is one of ``refused``, ``confirmed``, ``failed`` or\n``indeterminate``; ``code`` is checked against its stage by the route.\n``advertised`` is a probe's report only: the verbs whose ``tools/list``\nentry met ACTION-EXECUTOR-13's rule.",
+        "properties": {
+          "advertised": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 256,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Advertised"
+          },
+          "attempt": {
+            "minimum": 0.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "lease_owner": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Lease Owner",
+            "type": "string"
+          },
+          "state": {
+            "maxLength": 32,
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_owner",
+          "attempt",
+          "state"
+        ],
+        "title": "ExecutionOutcome",
+        "type": "object"
+      },
       "FinishBody": {
         "properties": {
           "cause": {
@@ -6655,6 +6936,36 @@
           "logs"
         ],
         "title": "PodLogs",
+        "type": "object"
+      },
+      "ProbeCreate": {
+        "additionalProperties": false,
+        "description": "@spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13: exactly these three keys.",
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "connector": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+            "title": "Connector",
+            "type": "string"
+          },
+          "digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "connector",
+          "digest"
+        ],
+        "title": "ProbeCreate",
         "type": "object"
       },
       "ProgressReport": {
@@ -10535,6 +10846,339 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/action-executions/claim": {
+      "post": {
+        "description": "Claim the oldest claimable execution under a lease, or ``204``.\n\n@spec ACTION-EXECUTOR-17 and the ACTION-EXECUTOR-20 amendment: a\n``requested`` row is claimable, and so is a ``claimed`` row whose lease\nexpired, which is reclaimed with the next attempt so the earlier holder's\nfence is stale. A reclaim forgets the earlier attempt's observation, so the\nnew holder must observe again. After ``MAX_ATTEMPTS`` the row is refused.\n@spec ACTION-EXECUTOR-1: with the executor off, nothing is handed out.",
+        "operationId": "claim_execution_action_executions_claim_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecutionClaim"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "204": {
+            "description": "Nothing is claimable."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Claim Execution",
+        "tags": [
+          "action-executions"
+        ]
+      }
+    },
+    "/action-executions/{execution_id}": {
+      "get": {
+        "description": "@spec ACTION-EXECUTOR-18: the execution's receipt.",
+        "operationId": "get_execution_action_executions__execution_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Execution Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Execution",
+        "tags": [
+          "action-executions"
+        ]
+      }
+    },
+    "/action-executions/{execution_id}/dispatch": {
+      "post": {
+        "description": "Commit ``dispatched``, the last step before a write call.\n\n@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-15: only a ``claimed``\nrestore whose observed version equalled the recorded one dispatches. A\nprobe never does (ACTION-EXECUTOR-1). A forward execution dispatches only\nonce the API creates its ledger row at dispatch (ACTION-EXECUTOR-19), which\nis not built yet, so it is refused here too.",
+        "operationId": "dispatch_execution_action_executions__execution_id__dispatch_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Execution Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecutionFence"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dispatch Execution",
+        "tags": [
+          "action-executions"
+        ]
+      }
+    },
+    "/action-executions/{execution_id}/observation": {
+      "post": {
+        "description": "Compare the version observed now with the version the action left.\n\n@spec ACTION-EXECUTOR-15. Equal: recorded, the execution stays ``claimed``\nand may dispatch. Any difference, or an absent or malformed version: the\nexecution ends ``refused`` with ``version_conflict`` and the action is\nreleased, with the ``refused_conflict`` audit row naming both versions.",
+        "operationId": "record_observation_action_executions__execution_id__observation_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Execution Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecutionObservation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Observation",
+        "tags": [
+          "action-executions"
+        ]
+      }
+    },
+    "/action-executions/{execution_id}/outcome": {
+      "post": {
+        "description": "Record how an execution ended.\n\n@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-18 @spec ACTION-EXECUTOR-20.\n``refused`` lands only on a ``claimed`` row, with a pre-dispatch code:\npast ``dispatched`` the call may have reached the connector. ``confirmed``,\n``failed`` and ``indeterminate`` land only on a ``dispatched`` row, except\na probe, which never dispatches and is ``confirmed`` from ``claimed`` with\nthe verbs it observed. An unknown post-dispatch code is normalized by stage.\nA replay of the stored outcome returns the row unchanged; a different one\nis refused and the first stands.",
+        "operationId": "report_outcome_action_executions__execution_id__outcome_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Execution Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecutionOutcome"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Outcome",
+        "tags": [
+          "action-executions"
+        ]
+      }
+    },
     "/actions": {
       "get": {
         "description": "A conversation's actions, oldest first -- the order a receipt lists them.",
@@ -10885,7 +11529,7 @@
     },
     "/actions/{action_id}/undo": {
       "post": {
-        "description": "Rule on putting back what this action changed.\n\nA 200 authorizes a restore and names the call that performs it; every other\noutcome is a refusal that changed nothing. The refusals are ordered from the\nrecord's own state outward to the world, so the most specific true reason is\nthe one the operator is told.\n\nAuthorization runs first, before any of the record's own state is examined:\nwhether an actor may undo at all precedes whether this particular undo is\nsafe, and it keeps a refused actor from learning the resource's state through\na conflict message.",
+        "description": "Rule on putting back what this action changed, and request the restore.\n\n@spec ACTION-EXECUTOR-3. A 202 means a ``requested`` restore execution and\nits ``authorized`` audit row were written together; every other outcome is\na refusal that wrote one audit row and no execution. The refusals are\nordered from the record's own state outward, so the most specific true\nreason is the one the operator is told.\n\nThe actor is ``principal``, authenticated as the approval resolver\nauthenticates one; a body ``actor`` is not authority, and one that differs\nfrom the principal is refused before anything else is examined.\n\nAuthorization runs first, before any of the record's own state is examined:\nwhether an actor may undo at all precedes whether this particular undo is\npossible, and it keeps a refused actor from learning anything about the\nrecord, its versions included.\n\nThe caller no longer supplies the live state: the executor observes the\nversion through the pinned connector and the API compares it before any\nwrite (ACTION-EXECUTOR-15).",
         "operationId": "undo_action_actions__action_id__undo_post",
         "parameters": [
           {
@@ -10900,7 +11544,7 @@
           },
           {
             "in": "header",
-            "name": "x-api-key",
+            "name": "X-Curie-Approval-Principal",
             "required": false,
             "schema": {
               "anyOf": [
@@ -10911,7 +11555,55 @@
                   "type": "null"
                 }
               ],
-              "title": "X-Api-Key"
+              "title": "X-Curie-Approval-Principal"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Adapter-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Adapter-Principal"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Actor"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "__Host-curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "  Host-Curie Console Session"
             }
           }
         ],
@@ -10926,7 +11618,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "202": {
             "content": {
               "application/json": {
                 "schema": {
@@ -16580,6 +17272,66 @@
         "summary": "Get Config",
         "tags": [
           "config"
+        ]
+      }
+    },
+    "/connector-capabilities/probes": {
+      "post": {
+        "description": "Request a capability probe of one connector image for one agent.\n\n@spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13 and the route decisions.\nThe first probe is keyed ``probe:<agent>:<connector>:<digest>``; a request\nwhile the latest probe is pending or confirmed adopts it (``200``). After a\nprobe that ended ``refused`` or ``failed``, the next one is a new execution\nwhose key carries the next probe attempt number (``...:<digest>:2`` and\nso on). A probe's ``authority_ref`` is its key: the body is exactly three\nkeys, so no reconcile pass id can reach it.",
+        "operationId": "create_probe_connector_capabilities_probes_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProbeCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionCreated"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Probe",
+        "tags": [
+          "action-executions"
         ]
       }
     },

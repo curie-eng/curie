@@ -58,7 +58,8 @@ authorizes first (`_authorize_undo`, ADR 0117 decision 3), then refuses on
 already undone, unsuccessful, irreversible, unobserved (`observed_state`
 absent), uncomparable and conflict (`observed_state != post_state`). Every
 refusal goes through `_refuse`, which commits an audit row. On success
-`apps/api/src/curie_api/crud/actions.py::claim_action_undo` sets `undone_at` at
+the former `claim_action_undo` helper in `apps/api/src/curie_api/crud/actions.py` (removed when task 4
+made the ruling create an execution) set `undone_at` at
 authorization time, an audit row records `{"restoring": prior_state}`, and
 `apps/api/src/curie_api/schemas/actions.py::ActionUndoOut` returns the cleartext
 `target` and `prior_state`. The conflict refusal stores both states in
@@ -563,8 +564,9 @@ unchanged. In one executor sandbox, after `list`:
 
 1. `observe` calls the pinned connector's `observe_version` with the recorded
    `target`. This is the version observed now.
-2. The worker compares it with the recorded `post_version`. On any difference,
-   or an absent or malformed version, it writes audit `refused_conflict` naming
+2. The worker reports it to the API's observation route, and the API compares
+   it with the recorded `post_version`. On any difference, or an absent or
+   malformed version, the API writes audit `refused_conflict` naming
    both versions, ends the execution `refused` with `version_conflict`, and
    makes no `restore` call.
 3. Only on equality does it commit `dispatched` and run `call` with
@@ -711,13 +713,61 @@ one stage; only ruling and pre-dispatch codes are provable non-writes.
 
 | Stage | Codes |
 | --- | --- |
-| Ruling (HTTP 409, 412 or 503; audit row, no execution) | `executor_disabled`, `refused_restore_in_flight`, `refused_no_agent`, `refused_unsealed`, `refused_unversioned`, `refused_no_digest`, `refused_not_restore_capable`, `refused_key_custody`, `refused_authority_unresolved`, plus the existing ruling refusals |
+| Ruling (HTTP 409, 412 or 503; audit row, no execution) | `executor_disabled`, `refused_restore_in_flight`, `refused_no_agent`, `refused_unsealed`, `refused_unversioned`, `refused_no_digest`, `refused_not_restore_capable`, `refused_key_custody`, `refused_authority_unresolved`, `refused_actor_mismatch` (HTTP 403), `refused_duplicate_ruling` (HTTP 409), plus the existing ruling refusals |
 | Pre-dispatch (`refused`) | `agent_stopped`, `authority_unavailable`, `reserved_verb_via_forward`, `arguments_mismatch`, `tool_not_grant_bound`, `connector_not_hosted`, `connector_digest_unavailable`, `restore_not_advertised`, `restore_schema_mismatch`, `tool_not_advertised`, `version_conflict`, `sandbox_unavailable`, `runner_unavailable`, `connector_unreachable` |
 | Connector refusal during `call` (`failed`) | `version_conflict_at_write`, `sealing_key_unavailable`, `snapshot_unopenable` |
 | Post-dispatch (`failed` or `indeterminate`) | `connector_error`, `unstructured_reply`, `response_lost`, `deadline_exceeded` |
 
 An unknown code from a runner or connector is normalized to `connector_error`
 or `response_lost` by stage, never passed through.
+The ruling route answers `executor_disabled` with HTTP 503 and every other
+ruling refusal with the status its existing refusal used.
+
+API route decisions the worker relies on: the worker reports the version it
+observed through `observe_version` to the API's observation route, and the API
+compares it with the recorded `post_version` and records `version_conflict`
+with its audit row, so the ledger owner makes the comparison. The claim route
+reclaims an execution whose lease has expired, with the next attempt number; a
+report fenced by a stale attempt or lease owner is refused. These internal
+routes use the platform API key the worker already holds. A finished probe
+records one `connector_capabilities` row for its agent, connector and digest,
+with `restore_capable` true only when the probe observed both `restore` and
+`observe_version` (ACTION-EXECUTOR-8).
+
+Review decisions for the routes, which the worker and later tasks rely on:
+
+* A chat principal may undo only an action whose gating approval its token
+  names, an adapter principal only an action whose gating approval it serves
+  (anything else reads as not found), and an ungated action accepts no chat
+  credential.
+* The undo ruling derives its actor and channel evidence from an authenticated
+  chat, console, operator or adapter principal, exactly as the approval resolver
+  does under ADR 0106; a self-asserted `actor` in the request body is not
+  authority, and a body actor that differs from the principal is refused. A
+  ruling now causes a real restore, so a bare platform key with a body actor no
+  longer rules. Operator and adapter principals are signed with that key, so
+  its holder can still mint an operator principal naming any approver; that is
+  the same trust ADR 0106 places in approving, not a stronger guarantee. The
+  undo route authenticates the principal before it looks up the action, so an
+  unauthenticated caller cannot learn which action identifiers exist.
+* The internal probe, claim, observation, report and dispatch routes require
+  the internal worker token, not the platform or operator key, so a key holder
+  cannot forge a confirmed restore or a `restore_capable` capability row. With
+  the executor disabled, claim and dispatch hand out nothing.
+* The ruling stores `arguments_sha256` for the restore call it authorizes, as
+  ACTION-EXECUTOR-7 requires of the creator.
+* A probe's `authority_ref` is its probe key. A probe that ended `refused` or
+  `failed` does not block a later probe of the same agent, connector and digest:
+  the next probe is a new execution whose key carries the next probe attempt
+  number, and only a non-terminal or confirmed probe is adopted.
+* Lease expiry: a claim is attempted at most three times; an expired claim
+  before dispatch is reclaimed with the next attempt, the third expiry ends
+  `refused` with `runner_unavailable`, and an expired dispatched execution ends
+  `indeterminate` with `response_lost`.
+* Every terminal restore outcome writes one closing audit row naming its state
+  and code, with versions only. A database uniqueness violation is mapped to
+  the constraint it names; only the live restore index maps to
+  `refused_restore_in_flight`.
 
 Acceptance: a table-driven test drives each code through its real producer and
 asserts the terminal state; an injected unknown code is normalized.

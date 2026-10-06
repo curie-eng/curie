@@ -271,6 +271,11 @@ _REPLY_RETRY_ATTRIBUTES = {
     "retry_class": ["block-fallback", "rate-limit", "transport-fallback"],
 }
 _HTTP_OPERATIONS = [
+    "/action-executions/claim",
+    "/action-executions/{execution_id}",
+    "/action-executions/{execution_id}/dispatch",
+    "/action-executions/{execution_id}/observation",
+    "/action-executions/{execution_id}/outcome",
     "/actions",
     "/actions/{action_id}",
     "/actions/{action_id}/audit",
@@ -325,6 +330,7 @@ _HTTP_OPERATIONS = [
     "/channels/turns",
     "/cluster-message-replies/{reply_ref}",
     "/config",
+    "/connector-capabilities/probes",
     "/console/login-codes",
     "/console/session",
     "/deploy-targets/list",
