@@ -5,6 +5,14 @@ latency, tokens, cost, error rate) and assembles them into a summary or a time
 series, filterable by environment and by agent (a trace-name match; see the note
 below). Every number is a faithful proxy of a Langfuse aggregate.
 
+Runs, latency and error rate count agent runs only: traces whose name contains
+`curie-run:`, the prefix the runner gives each run's trace. Langfuse also holds
+the platform's own traces (API requests, turn ingress, background jobs, sandbox
+cleanup), and those are not runs. Without this scope the summary with no agent
+filter counted every one of them, reporting tens of thousands of "runs" a day
+with a p95 of a few milliseconds on a quiet install. Tokens and cost are not
+narrowed this way; see `_RUN_SCOPED`.
+
 Agent filtering matches the Langfuse trace name (`name` on traces, `traceName`
 on observations) with a `contains` operator. The runner names traces
 `curie-run:agent-<agent_id>-thread-<ts>`, so an agent's runs are exactly the
@@ -70,21 +78,62 @@ def resolve_window(
 # filter shape is introduced.
 _EVAL_TRACE_PREFIX = "eval:"
 
+# The runner names every agent run's trace `curie-run:<session_id>`
+# (runner/src/curie_runner/__main__.py). Langfuse also receives platform traces
+# that are not agent runs (`http.server.request`, `curie.turn.ingress`,
+# `curie.background.*`, `curie.sandbox.cleanup`). Every metric is scoped to the
+# run traces so runs, latency, tokens, cost and error rate all describe the same
+# set of runs, with or without an agent filter.
+_AGENT_RUN_TRACE_PREFIX = "curie-run:"
 
-def _filters(view: str, environment: str | None, agent: str | None) -> list[dict[str, Any]]:
+# Which scalar metrics are narrowed to agent-run traces. Runs and latency are
+# per-trace aggregates, so a platform trace is a phantom run with a millisecond
+# latency. Tokens and cost are sums over generations, and only model calls carry
+# them, so platform traces add nothing to either; narrowing them would only drop
+# real model spend when a run's generations land in a trace under another root
+# name (a turn whose runner spans were parented to the worker's ingress span has
+# been seen named `curie.turn.ingress`). The error-rate level query is always
+# narrowed, since platform spans would otherwise dilute it (see _level_query).
+_RUN_SCOPED: dict[str, bool] = {
+    "runs": True,
+    "latency_p95_ms": True,
+    "tokens": False,
+    "cost_usd": False,
+}
+
+
+def _filters(
+    view: str,
+    environment: str | None,
+    agent: str | None,
+    agent_runs_only: bool = True,
+) -> list[dict[str, Any]]:
     name_col = "name" if view == "traces" else "traceName"
     filters: list[dict[str, Any]] = []
     if environment:
         filters.append(
             {"column": "environment", "operator": "=", "value": environment, "type": "string"}
         )
+    # Count agent runs only, never the platform's own traces. Redundant with an
+    # agent filter (an agent's token only appears inside run trace names) but
+    # load-bearing when `agent` is None.
+    if agent_runs_only:
+        filters.append(
+            {
+                "column": name_col,
+                "operator": "contains",
+                "value": _AGENT_RUN_TRACE_PREFIX,
+                "type": "string",
+            }
+        )
     if agent:
         filters.append(
             {"column": name_col, "operator": "contains", "value": agent, "type": "string"}
         )
-    # Drop eval traces from the aggregate (#547). Harmless when `agent` is set (an
-    # agent's `curie-run:` traces never carry the eval name), load-bearing on the
-    # summary tab where `agent` is None and every trace in the window is counted.
+    # Drop eval traces from the aggregate (#547). Eval traces are named
+    # `eval:<suite>:<case_id>`, so the run scope above already leaves them out;
+    # the explicit exclusion stays so an eval trace can never be counted even if
+    # an eval name ever carried the run prefix.
     filters.append(
         {
             "column": name_col,
@@ -113,7 +162,7 @@ def _scalar_query(
     query: dict[str, Any] = {
         "view": view,
         "metrics": [{"measure": measure, "aggregation": aggregation}],
-        "filters": _filters(view, environment, agent),
+        "filters": _filters(view, environment, agent, _RUN_SCOPED[metric]),
         "fromTimestamp": start,
         "toTimestamp": end,
     }
@@ -133,7 +182,9 @@ def _level_query(
         "view": "observations",
         "metrics": [{"measure": "count", "aggregation": "count"}],
         "dimensions": [{"field": "level"}],
-        "filters": _filters("observations", environment, agent),
+        # Narrowed to agent runs: the rate is errors over all observations, so
+        # the platform's own spans would otherwise swamp the denominator.
+        "filters": _filters("observations", environment, agent, agent_runs_only=True),
         "fromTimestamp": start,
         "toTimestamp": end,
     }
