@@ -59,7 +59,7 @@ def test_reply_placeholders_are_required_nullable_strings() -> None:
 
 def test_publication_context_is_an_optional_event_field_with_required_contents() -> None:
     schema = build_schema()
-    assert schema["protocolVersion"] == "0.5.16"
+    assert schema["protocolVersion"] == "0.5.17"
 
     definitions = schema["$defs"]
     event = definitions["Event"]
@@ -104,3 +104,16 @@ def test_channel_bound_is_optional_on_boot_env_and_absent_from_session_config() 
     assert "channel_bound" in boot_env["properties"]
     assert "channel_bound" not in boot_env.get("required", [])
     assert "channel_bound" not in definitions["SessionConfig"]["properties"]
+
+
+def test_attachments_manifest_is_an_optional_boot_env_string() -> None:
+    """ADR 0205: a runner-local boot input outside the frozen SessionConfig."""
+    definitions = build_schema()["$defs"]
+    boot_env = definitions["BootEnv"]
+    assert "attachments_manifest" not in boot_env.get("required", [])
+    field = boot_env["properties"]["attachments_manifest"]
+    assert {variant["type"] for variant in field["anyOf"]} == {"string", "null"}
+    assert field["default"] is None
+    assert field["env"] == "CURIE_ATTACHMENTS_MANIFEST"
+    assert field["producer"] == ["kernel", "substrate"]
+    assert "attachments_manifest" not in definitions["SessionConfig"]["properties"]
