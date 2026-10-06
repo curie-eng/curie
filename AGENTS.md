@@ -293,7 +293,17 @@ or older worktree does not automatically acquire newer instructions; read this
 section from the updated base when resuming. Do not edit a live claimed Bonus
 Drain task or launch a second copy to apply the guidance.
 
-### Fast push checks
+### Preflight checks
+
+Before opening or updating a pull request, run the full tier from the source
+checkout: `curie dev preflight --pr-body <file> --title <text>`. The full tier
+is the default. It fetches the base and refuses a head that does not contain
+its current tip, printing `git merge origin/<base>` without merging for you.
+Failing required checks on the base produce a warning. It runs the PR body and
+Fix pin guards, then tests the changed Python workspace members and their
+transitive dependents in a private Compose project that it tears down on exit.
+Without `--pr-body`, the body and Fix pin checks are reported as skipped.
+Selected end to end tiers and kind jobs are listed as runs in CI only.
 
 After committing and before pushing, run `curie dev preflight --fast` from the
 source checkout. It selects the cheap PR gates for the committed change and

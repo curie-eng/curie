@@ -1241,17 +1241,23 @@ enum SreBotAction {
 
 #[derive(Subcommand)]
 enum DevAction {
-    /// Run the cheap pull request gates selected for the committed change.
+    /// Check the committed change before opening or updating a pull request.
     Preflight {
-        /// Run the fast tier. Required; no full tier is provided.
+        /// Run only the fast tier; the full tier is the default.
         #[arg(long)]
         fast: bool,
         /// Origin branch to compare against (for example, main or next).
         #[arg(long, default_value = "main")]
         base: String,
-        /// Print the selected CI commands without running them.
+        /// Print the selected checks without running them.
         #[arg(long)]
         dry_run: bool,
+        /// File containing the proposed pull request body.
+        #[arg(long, conflicts_with = "fast")]
+        pr_body: Option<PathBuf>,
+        /// Proposed pull request title used by the body guard.
+        #[arg(long, requires = "pr_body")]
+        title: Option<String>,
     },
     /// Manage hooks for this source checkout.
     Hooks {
@@ -4834,7 +4840,12 @@ async fn run(command: Option<Command>) -> Result<()> {
                 fast,
                 base,
                 dry_run,
-            } => emit(commands::dev_preflight(fast, &base, dry_run).await?),
+                pr_body,
+                title,
+            } => emit(
+                commands::dev_preflight(fast, &base, dry_run, pr_body.as_deref(), title.as_deref())
+                    .await?,
+            ),
             DevAction::Hooks { action } => match action {
                 HooksAction::Install => commands::dev_hooks_install(),
             },

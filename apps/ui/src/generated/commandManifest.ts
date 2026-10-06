@@ -7807,11 +7807,11 @@ export const commandManifest = {
       "name": "dev",
       "subcommands": [
         {
-          "about": "Run the cheap pull request gates selected for the committed change",
+          "about": "Check the committed change before opening or updating a pull request",
           "args": [
             {
               "global": false,
-              "help": "Run the fast tier. Required; no full tier is provided",
+              "help": "Run only the fast tier; the full tier is the default",
               "id": "fast",
               "long": "fast",
               "positional": false,
@@ -7834,7 +7834,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Print the selected CI commands without running them",
+              "help": "Print the selected checks without running them",
               "id": "dry_run",
               "long": "dry-run",
               "positional": false,
@@ -7842,6 +7842,22 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "File containing the proposed pull request body",
+              "id": "pr_body",
+              "long": "pr-body",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Proposed pull request title used by the body guard",
+              "id": "title",
+              "long": "title",
+              "positional": false,
               "required": false
             }
           ],

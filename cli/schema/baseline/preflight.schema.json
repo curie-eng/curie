@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/preflight/v1.json",
-  "title": "curie dev preflight --fast --json",
-  "description": "The selected cheap pull request gates and their results, or the same command plan without execution under --dry-run.",
+  "$id": "https://schemas.curietech.ai/cli/preflight/v2.json",
+  "title": "curie dev preflight --json",
+  "description": "The selected pull request gates for the fast or full tier, their results, base freshness and health, and selected CI-only work. Under --dry-run the executable gates are planned without execution.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -12,6 +12,21 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "passed",
+              "failed",
+              "skipped"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          },
           "workflow": {
             "type": "string"
           },
@@ -32,12 +47,9 @@
           }
         },
         "required": [
-          "workflow",
-          "job",
-          "step",
-          "command",
-          "cwd",
-          "group"
+          "name",
+          "status",
+          "detail"
         ]
       }
     },
@@ -71,7 +83,27 @@
       "type": "boolean"
     },
     "base": {
-      "type": "string"
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ref": {
+          "type": "string"
+        },
+        "contains_tip": {
+          "type": "boolean"
+        },
+        "failing_required_checks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "ref",
+        "contains_tip",
+        "failing_required_checks"
+      ]
     },
     "head": {
       "type": "string"
@@ -81,6 +113,19 @@
     },
     "fix": {
       "type": "string"
+    },
+    "tier": {
+      "type": "string",
+      "enum": [
+        "fast",
+        "full"
+      ]
+    },
+    "ci_only": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     }
   },
   "required": [
@@ -89,6 +134,8 @@
     "passed",
     "dry_run",
     "base",
-    "head"
+    "head",
+    "tier",
+    "ci_only"
   ]
 }

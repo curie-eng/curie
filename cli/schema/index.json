@@ -313,7 +313,7 @@
       "result": "PreflightOutput",
       "kind": "CliOutput",
       "schema": "preflight.schema.json",
-      "version": "1.0"
+      "version": "2.0"
     },
     {
       "result": "PublicationPolicyOutput",
