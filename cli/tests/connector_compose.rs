@@ -1017,6 +1017,26 @@ fn every_overlay_service_carries_the_teardown_labels() {
     }
 }
 
+/// A hosted connector comes back after the Docker daemon restarts (host sleep,
+/// a Docker Desktop update), the same as the stack it serves. Without a restart
+/// policy it stayed Exited and the agent lost its tools until a manual
+/// `docker start`. `unless-stopped` leaves `local down`'s `docker rm -f` reap
+/// and a deliberate `docker stop` in charge.
+#[test]
+fn every_overlay_service_restarts_after_a_docker_restart() {
+    let dir = TempDir::new().expect("a scratch bundle");
+    let overlay = overlay_fixture("sre-bot", dir.path());
+
+    let services = overlay["services"].as_object().expect("services");
+    assert!(
+        !services.is_empty(),
+        "the fixture hosts at least one connector"
+    );
+    for (name, service) in services {
+        assert_eq!(service["restart"], "unless-stopped", "{name}: {service}");
+    }
+}
+
 /// The overlay's command, environment and mounts are the same rendered
 /// contract the start spec emits: one set of semantics, two emitters.
 #[test]
