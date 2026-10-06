@@ -1068,6 +1068,39 @@ def test_a_relabelled_request_defers_to_its_own_in_flight_publication(
     assert rows[second["id"]]["status"] == "running"
 
 
+def test_a_relabelled_request_defers_to_an_earlier_in_flight_publication_on_its_lineage(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9299
+    second = _relabelled_after_publication(client, github, number)
+    first_id = _requests(number)[0]["id"]
+
+    async def reopen() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                changed = await conn.execute(
+                    text(
+                        "UPDATE curie.publications SET status = 'running', terminal_at = NULL "
+                        "WHERE execution_request_id = :id"
+                    ),
+                    {"id": first_id},
+                )
+                assert changed.rowcount == 1
+        finally:
+            await engine.dispose()
+
+    asyncio.run(reopen())
+
+    finished = _finish_unpublished(client, second["id"])
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    rows = {row["id"]: row for row in _requests(number)}
+    assert rows[second["id"]]["status"] == "running"
+
+
 def test_a_request_whose_own_publication_succeeded_defers_an_unpublished_finish(
     admitted: Any,
 ) -> None:
