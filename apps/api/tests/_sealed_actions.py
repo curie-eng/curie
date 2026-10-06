@@ -24,12 +24,16 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import tarfile
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from _migration_support import sql_rows
+import pytest
+from _migration_support import sql_dicts, sql_rows
+from curie_api.config import get_settings
 
 AGENT_NAME = "restorer-bot"
 CONNECTOR = "k8s"
@@ -53,6 +57,42 @@ SEALED_CONNECTORS = f"""connectors:
 """
 
 _LEDGER_COLUMNS = ("post_version", "connector", "connector_digest")
+
+# @spec ACTION-EXECUTOR-1: the one setting the chart and compose render into
+# both the API and the worker. Off by default.
+EXECUTOR_SETTING = "CURIE_ACTION_EXECUTOR_ENABLED"
+
+
+@pytest.fixture
+def executor_enabled() -> Iterator[None]:
+    """Turn the action executor on for one test's app, then put the setting back.
+
+    Requested before ``client`` (through ``usefixtures``), so the app the test
+    talks to is built with the setting on. A module that wants it imports this
+    name; ``conftest`` does not make it global, because the default is off.
+    """
+
+    before = os.environ.get(EXECUTOR_SETTING)
+    os.environ[EXECUTOR_SETTING] = "true"
+    get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop(EXECUTOR_SETTING, None)
+        else:
+            os.environ[EXECUTOR_SETTING] = before
+        get_settings.cache_clear()
+
+
+def executions_of(action_id: str) -> list[dict[str, Any]]:
+    """Every execution row naming ``action_id``, oldest first."""
+
+    return sql_dicts(
+        "SELECT * FROM curie.action_executions WHERE subject_action_id = :id "
+        "ORDER BY created_at, id",
+        {"id": uuid.UUID(action_id)},
+    )
 
 
 def _archive(tmp_path: Path, name: str) -> bytes:

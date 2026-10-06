@@ -15,6 +15,10 @@ check over the request's actor and actor channel without adding a
 distinct-requester rule. Adding that rule would be MORE authorization than the
 forward action needed, which is the half of decision 3 that says "and no more".
 
+A granted undo now answers ``202`` with a requested restore execution
+(ACTION-EXECUTOR-3); the executor setting is on for this module, since it is
+off by default (ACTION-EXECUTOR-1).
+
 Every record here is fully undoable under the connector action executor rule
 (ACTION-EXECUTOR-11, ``_sealed_actions``) unless a test says otherwise, so the
 verdict each test observes is the authorizer's and not the snapshot rule's.
@@ -29,15 +33,20 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _sealed_actions import sealed_action, undoable_agent
+from _sealed_actions import (
+    ENVELOPE,
+    POST_VERSION,
+    executions_of,
+    executor_enabled,  # noqa: F401 - fixture, requested by name
+    sealed_action,
+    undoable_agent,
+)
 from curie_api.approvers import MembershipVerdict
 from curie_api.deps import get_approver_sets
 from curie_api.main import create_app
 from fastapi.testclient import TestClient
 
-pytestmark = pytest.mark.usefixtures("clean_db")
-
-LEFT = {"spec": {"replicas": 10}}
+pytestmark = pytest.mark.usefixtures("clean_db", "executor_enabled")
 
 
 class _Set:
@@ -61,7 +70,7 @@ def gated_client(_disposable_db: Any, request: Any) -> Any:
 
     verdict = getattr(request, "param", MembershipVerdict(member=True))
     app = create_app()
-    app.dependency_overrides[get_approver_sets] = lambda: (lambda approval, binding: _Set(verdict))
+    app.dependency_overrides[get_approver_sets] = lambda: lambda approval, binding: _Set(verdict)
     with TestClient(app) as client:
         yield client
 
@@ -103,7 +112,7 @@ def _gated_action(
 def _undo(client: Any, headers: Any, action_id: str, actor: str = "U-operator") -> Any:
     return client.post(
         f"/actions/{action_id}/undo",
-        json={"actor": actor, "observed_state": LEFT},
+        json={"actor": actor},
         headers=headers,
     )
 
@@ -117,7 +126,8 @@ def test_an_ungated_action_is_not_gated_on_the_way_back(
 
     response = _undo(client, auth_headers, action["id"])
 
-    assert response.status_code == 200
+    assert response.status_code == 202, response.text
+    assert len(executions_of(action["id"])) == 1
     audit = client.get(f"/actions/{action['id']}/audit", headers=auth_headers).json()
     assert audit[0]["authorizer"] == "ungated"
     assert audit[0]["authorized"] is True
@@ -144,6 +154,7 @@ def test_an_ungated_action_that_is_not_undoable_is_refused_with_its_code(
     audit = client.get(f"/actions/{action['id']}/audit", headers=auth_headers).json()
     assert [entry["action"] for entry in audit] == ["refused_unsealed"]
     assert not any(entry["authorized"] for entry in audit)
+    assert executions_of(action["id"]) == []
 
 
 @pytest.mark.parametrize("gated_client", [MembershipVerdict(member=True)], indirect=True)
@@ -158,7 +169,8 @@ def test_a_member_of_the_gating_route_may_undo(
 
     response = _undo(gated_client, auth_headers, action["id"])
 
-    assert response.status_code == 200
+    assert response.status_code == 202, response.text
+    assert len(executions_of(action["id"])) == 1
     audit = gated_client.get(f"/actions/{action['id']}/audit", headers=auth_headers).json()
     assert audit[0]["authorizer"] == "explicit-users"
 
@@ -182,6 +194,12 @@ def test_a_non_member_is_refused_with_the_set_s_own_reason(
     entry = gated_client.get(f"/actions/{action['id']}/audit", headers=auth_headers).json()[0]
     assert entry["action"] == "refused_unauthorized"
     assert entry["authorized"] is False
+    # @spec ACTION-EXECUTOR-3: every refusal creates no execution, and "an
+    # unauthorized actor learns no version" -- nor the snapshot.
+    assert executions_of(action["id"]) == []
+    assert POST_VERSION not in response.text
+    assert ENVELOPE["ciphertext"] not in response.text
+    assert POST_VERSION not in str(entry["evidence"])
 
 
 @pytest.mark.parametrize(
