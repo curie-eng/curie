@@ -88,7 +88,6 @@ class CardInput:
     note: str | None
     phase_view: PhaseView
     cause_text: str | None
-    needs_human: bool
 
 
 def _text(value: object, limit: int | None = None) -> str:
@@ -186,8 +185,6 @@ def render_card(card: CardInput) -> str:
     """Render the WIDTH x HEIGHT status card as a standalone SVG document."""
 
     label, color, live = pill_for(card.status, card.publishing)
-    if card.status == "failed" and card.needs_human:
-        label, color, live = "NEEDS HUMAN", "#bf8700", False
     subject = f"{card.repo} #{card.issue_number}"
     if card.revision_pr is not None:
         subject += f" (PR #{card.revision_pr})"

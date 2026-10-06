@@ -18,6 +18,7 @@ import asyncio
 import sys
 import uuid
 import xml.etree.ElementTree as ET
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from curie_api.config import get_settings
 from curie_api.factory_notices import FINAL_MARKER, marker_for
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from test_factory_progress import DECLARATION, STAGED_DECLARATION, report
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     _LABELS,
@@ -116,6 +117,42 @@ def _finish_failed(
         f"/v1/internal/work-items/requests/{request_id}/finish", headers=WORKER, json=body
     )
     assert finished.status_code == 200, finished.text
+
+
+def _reconcile_later(seconds: int) -> None:
+    """Advance only the reconciler clock. Stored deadlines stay write-once."""
+
+    import curie_api.workitems as workitems
+
+    original = workitems._database_now
+
+    async def later(session: AsyncSession) -> Any:
+        real = await original(session)
+        return real + timedelta(seconds=seconds)
+
+    workitems._database_now = later
+    try:
+        _reconcile()
+    finally:
+        workitems._database_now = original
+
+
+def _observe_termination(client: Any, request_id: uuid.UUID) -> None:
+    claimed = client.post(
+        f"/v1/internal/work-items/requests/{request_id}/termination/claim",
+        headers=WORKER,
+        json={"owner": "factory-owner"},
+    )
+    assert claimed.status_code == 200, claimed.text
+    recorded = client.post(
+        f"/v1/internal/work-items/requests/{request_id}/termination",
+        headers=WORKER,
+        json={
+            "runtime_epoch": claimed.json()["runtime_epoch"],
+            "observation": "runtime stopped",
+        },
+    )
+    assert recorded.status_code == 200, recorded.text
 
 
 # --- 1: created at admission ------------------------------------------------------
@@ -286,7 +323,8 @@ def test_diff_review_failure_keeps_completed_phases_after_renewed_plan_review(
         assert f"[x] {label}" in body
     assert "[ ] **Review diff** (in progress)" in body
     assert "[ ] Publish PR" in body
-    assert "Status: FAILED" in body
+    assert "Status: NEEDS HUMAN" in body
+    assert "Status: FAILED" not in body
     assert FINAL_MARKER in body
 
     token = _notices(request_id)[0]["card_token"]
@@ -429,7 +467,8 @@ def test_a_failure_patches_the_plain_reason_and_needs_a_human(admitted: Any) -> 
     assert body.startswith("Could not complete:")
     assert "Provider message: the tool call kept failing" in body
     assert "Cause: runner_escalated" in body
-    assert "Status: FAILED" in body
+    assert "Status: NEEDS HUMAN" in body
+    assert "Status: FAILED" not in body
     assert FINAL_MARKER in body
     assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
     assert sink.posts == 1
@@ -459,13 +498,89 @@ def test_sandbox_termination_comment_shows_kubernetes_reason(admitted: Any) -> N
     assert "Provider message:" not in body
     assert "Cause: sandbox_terminated" in body
     assert "Failure class: sandbox-terminated" in body
-    assert "Status: FAILED" in body
+    assert "Status: NEEDS HUMAN" in body
+    assert "Status: FAILED" not in body
     assert FINAL_MARKER in body
     assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
     token = _notices(request_id)[0]["card_token"]
     card = client.get(f"/v1/factory/cards/{token}.svg")
     assert card.status_code == 200, card.text
     assert "NEEDS HUMAN" in card.text
+
+
+@pytest.mark.parametrize(
+    ("number", "cause"),
+    [
+        (9930, "publication_failed"),
+        (9931, "approval_create_failed"),
+        (9933, "no_pull_request"),
+        (9934, "runner_escalated"),
+    ],
+)
+def test_every_terminal_failure_cause_shows_needs_human_status(
+    admitted: Any, number: int, cause: str  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+    epoch = _start_running(request_id)
+    _finish_failed(client, request_id, epoch, cause)
+    _reconcile()
+
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"]
+    assert "Status: NEEDS HUMAN" in body
+    assert "Status: FAILED" not in body
+    assert FINAL_MARKER in body
+    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
+
+
+def test_owner_lost_shows_needs_human_status(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9932
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+    _start_running(request_id)
+    _execute(
+        "UPDATE curie.execution_requests "
+        "SET runtime_heartbeat_expires_at = clock_timestamp() - CAST(:elapsed AS interval) "
+        "WHERE id = :id AND status = 'running'",
+        {
+            "id": request_id,
+            "elapsed": timedelta(seconds=get_settings().work_item_runtime_ttl_seconds + 5),
+        },
+    )
+    _reconcile()
+    assert (_request(number)["status"], _request(number)["terminal_cause"]) == (
+        "cancellation_requested",
+        "owner_lost",
+    )
+    _observe_termination(client, request_id)
+    _reconcile()
+
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"]
+    assert "Cause: owner_lost" in body
+    assert "Status: NEEDS HUMAN" in body
+    assert "Status: FAILED" not in body
+    assert FINAL_MARKER in body
+    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
+
+
+def test_an_expired_run_shows_needs_human_status(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9935
+    request_id = _admit(client, github, sink, number)
+    _reconcile_later(31)
+    row = _request(number)
+    assert (row["status"], row["terminal_cause"]) == ("expired", "capacity_wait_expired")
+
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"]
+    assert "Status: NEEDS HUMAN" in body
+    assert "Status: EXPIRED" not in body
+    assert FINAL_MARKER in body
+    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
 
 
 @pytest.mark.parametrize(
@@ -527,7 +642,8 @@ def test_budget_failure_comment_identifies_the_limit_or_admits_it_is_unknown(
         assert other_remedy not in body
     assert f"Provider message: {detail}" in body
     assert "Cause: budget_exceeded" in body
-    assert "Status: FAILED" in body
+    assert "Status: NEEDS HUMAN" in body
+    assert "Status: FAILED" not in body
     assert FINAL_MARKER in body
     assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
     assert sink.posts == 1
@@ -556,7 +672,8 @@ def test_history_capacity_failure_notice_explains_retry(admitted: Any) -> None: 
     assert "provider message:" not in body
     assert "retry" in body
     assert "cause: history_capacity" in body
-    assert "status: failed" in body
+    assert "status: needs human" in body
+    assert "status: failed" not in body
     assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
 
 

@@ -160,19 +160,6 @@ _AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})
 # Wire classification a text-only consumer reads off the status comment (#3401).
 # Same tokens as the channel reply's ``curie-turn-failure:`` line. Causes with
 # no entry stay unlabeled rather than inventing a class.
-# Failed runs that still need a person, including the classes that used to
-# collapse into runner_escalated (#3401). The status card reads this set.
-NEEDS_HUMAN_CAUSES = frozenset(
-    {"runner_escalated", "sandbox_terminated", "unclassified", "max_turns", "ci_failed"}
-)
-
-
-def needs_human(status: str, terminal: str | None) -> bool:
-    """Whether a failed run should show the needs-human card state."""
-
-    return status == "failed" and terminal in NEEDS_HUMAN_CAUSES
-
-
 _FAILURE_CLASS_BY_CAUSE = {
     "unclassified": "unclassified",
     "max_turns": "max-turns",
