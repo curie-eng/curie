@@ -2003,10 +2003,23 @@ mod tests {
     }
 
     #[test]
-    fn an_openrouter_key_is_required_and_other_shapes_are_refused() {
-        assert!(validate_openrouter_key("sk-or-test-key").is_ok());
-        assert!(validate_openrouter_key("sk-ant-test").is_err());
-        assert!(validate_openrouter_key("sk-or-").is_err());
+    fn factory_quickstart_accepts_direct_anthropic_and_openrouter_credentials() {
+        // These are synthetic prefix shapes accepted by the runner's
+        // sdk_auth.py, including the subscription OAuth shape it supports.
+        for key in [
+            "sk-or-PLACEHOLDER",
+            "sk-ant-api03-PLACEHOLDER",
+            "sk-ant-oat01-PLACEHOLDER",
+        ] {
+            assert!(validate_openrouter_key(key).is_ok());
+        }
+    }
+
+    #[test]
+    fn factory_quickstart_rejects_invalid_and_empty_credential_prefixes() {
+        for key in ["", "sk-or-", "sk-ant-", "sk-ant", "invalid-credential"] {
+            assert!(validate_openrouter_key(key).is_err());
+        }
     }
 
     #[test]
