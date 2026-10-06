@@ -9,7 +9,9 @@ autogenerate unsafe against the shared database.
 
 * @spec ACTION-EXECUTOR-2: ``action_executions``, one row per restore, forward
   action or capability probe the platform runs without a model. ``kind`` and
-  ``state`` are checked, ``idempotency_key`` is unique, and a partial unique
+  ``state`` are checked, ``idempotency_key`` is unique within one agent, a
+  composite key binds an execution to its subject action's agent (backed by a
+  new unique (``id``, ``agent_id``) on ``agent_actions``), and a partial unique
   index allows at most one restore that is not ``refused`` per recorded action.
 * @spec ACTION-EXECUTOR-11: ``post_version``, ``connector``,
   ``connector_digest``, ``authority_kind`` and ``authority_ref`` on
@@ -45,6 +47,11 @@ _ACTION_COLUMNS = (
 def upgrade() -> None:
     for name in _ACTION_COLUMNS:
         op.add_column("agent_actions", sa.Column(name, sa.Text(), nullable=True), schema="curie")
+    # The target of the composite key below. ``id`` is the primary key, so the
+    # pair is already unique on every existing row: additive, nothing rejected.
+    op.create_unique_constraint(
+        "uq_agent_actions_id_agent_id", "agent_actions", ["id", "agent_id"], schema="curie"
+    )
 
     op.create_table(
         "action_executions",
@@ -58,12 +65,7 @@ def upgrade() -> None:
         ),
         sa.Column("connector", sa.Text(), nullable=False),
         sa.Column("tool", sa.Text(), nullable=True),
-        sa.Column(
-            "subject_action_id",
-            postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("curie.agent_actions.id", ondelete="CASCADE"),
-            nullable=True,
-        ),
+        sa.Column("subject_action_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("arguments_sha256", sa.Text(), nullable=True),
         sa.Column("forward_arguments", postgresql.JSONB(), nullable=True),
         sa.Column("connector_digest", sa.Text(), nullable=False),
@@ -91,7 +93,20 @@ def upgrade() -> None:
             "'indeterminate', 'refused')",
             name="action_executions_state_ck",
         ),
-        sa.UniqueConstraint("idempotency_key", name="uq_action_executions_idempotency_key"),
+        # A replayed creation adopts on (agent_id, key): one agent's key never
+        # adopts another agent's execution.
+        sa.UniqueConstraint(
+            "agent_id", "idempotency_key", name="uq_action_executions_agent_idempotency_key"
+        ),
+        # An execution runs under the agent whose action it concerns. MATCH
+        # SIMPLE leaves a probe (no subject) unconstrained, and an action with
+        # no agent matches no pair, so it can never be a subject.
+        sa.ForeignKeyConstraint(
+            ["subject_action_id", "agent_id"],
+            ["curie.agent_actions.id", "curie.agent_actions.agent_id"],
+            ondelete="CASCADE",
+            name="fk_action_executions_subject_agent",
+        ),
         schema="curie",
     )
     op.create_index(
@@ -137,5 +152,8 @@ def downgrade() -> None:
     op.drop_index("ix_action_executions_state", table_name="action_executions", schema="curie")
     op.drop_index("ix_action_executions_agent_id", table_name="action_executions", schema="curie")
     op.drop_table("action_executions", schema="curie")
+    op.drop_constraint(
+        "uq_agent_actions_id_agent_id", "agent_actions", type_="unique", schema="curie"
+    )
     for name in reversed(_ACTION_COLUMNS):
         op.drop_column("agent_actions", name, schema="curie")

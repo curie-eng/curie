@@ -3,7 +3,7 @@
 @spec ACTION-EXECUTOR-11. ``undoable`` is true exactly when every ingredient a
 pinned, sealed restore needs is present:
 
-* the record itself (``AgentAction.holds_restore_record``): succeeded, an agent,
+* the record itself (``AgentAction.restore_record_refusal``): succeeded, an agent,
   a valid sealed envelope in ``prior_state``, a ``post_version``, a ``target``,
   a ``connector`` and its ``connector_digest``;
 * a ``restore_capable`` capability row for that agent, connector and digest
@@ -14,8 +14,12 @@ pinned, sealed restore needs is present:
 
 Nothing here is stored. A capability row landing, a new version dropping the
 ``SecretRef`` or a restore being refused changes the answer on the next read,
-and every API read of an action goes through ``undoable_action_ids`` so the
-single and list reads cannot disagree.
+and every API read of an action goes through ``undoable_action_ids`` while the
+undo ruling goes through ``undo_refusal``. Both answer from one derivation, so
+the single read, the list read and the ruling cannot disagree. Each missing
+ingredient maps to its ruling code (``refused_no_agent``, ``refused_unsealed``,
+``refused_unversioned``, ``refused_no_digest``, ``refused_restore_in_flight``,
+``refused_not_restore_capable``, ``refused_key_custody``).
 
 The checks run cheapest first and only for records still in the running, so a
 read of rows that are not sealed (every legacy row) never touches the database
@@ -116,23 +120,32 @@ async def sealing_custody(
         try:
             data = await store.get(str(bundle_ref))
             custody[row["agent_id"]] = await run_in_threadpool(_sealed_connectors, data)
-        except Exception:  # noqa: BLE001 - an unreadable bundle is no custody
+        except Exception as exc:  # noqa: BLE001 - an unreadable bundle is no custody
+            # The exception type only: a parser error could echo bundle input.
             logger.warning(
                 "in-force bundle unreadable; treating sealing key custody as absent",
-                extra={"agent_id": str(row["agent_id"])},
-                exc_info=True,
+                extra={"agent_id": str(row["agent_id"]), "error": type(exc).__name__},
             )
     return custody
 
 
-async def undoable_action_ids(
+async def _refusals(
     session: AsyncSession, store: ObjectStore, actions: Sequence[AgentAction]
-) -> set[uuid.UUID]:
-    """The ids among ``actions`` that are undoable now. @spec ACTION-EXECUTOR-11."""
+) -> dict[uuid.UUID, str | None]:
+    """Per action, the ruling code for its first missing ingredient, or None.
 
-    candidates = [action for action in actions if action.holds_restore_record]
+    @spec ACTION-EXECUTOR-11. The one derivation both the reads and the undo
+    ruling use, so a read and a ruling can never disagree. Ingredients are
+    checked cheapest first, and each later query runs only for the actions
+    still in the running.
+    """
+
+    refusals: dict[uuid.UUID, str | None] = {
+        action.id: action.restore_record_refusal() for action in actions
+    }
+    candidates = [action for action in actions if refusals[action.id] is None]
     if not candidates:
-        return set()
+        return refusals
 
     # A restore in any state but ``refused`` may have written or is about to,
     # so it holds the record. A forward execution naming the record does not:
@@ -148,9 +161,12 @@ async def undoable_action_ids(
             )
         ).scalars()
     )
-    candidates = [action for action in candidates if action.id not in held]
+    for action in candidates:
+        if action.id in held:
+            refusals[action.id] = "refused_restore_in_flight"
+    candidates = [action for action in candidates if refusals[action.id] is None]
     if not candidates:
-        return set()
+        return refusals
 
     # @spec ACTION-EXECUTOR-13: a capable row for this agent, connector AND
     # digest. A missing row, a probe that found no pair, or a row for another
@@ -169,20 +185,39 @@ async def undoable_action_ids(
             )
         ).tuples()
     )
-    candidates = [
-        action
-        for action in candidates
-        if (action.agent_id, action.connector, action.connector_digest) in capable
-    ]
+    for action in candidates:
+        if (action.agent_id, action.connector, action.connector_digest) not in capable:
+            refusals[action.id] = "refused_not_restore_capable"
+    candidates = [action for action in candidates if refusals[action.id] is None]
     if not candidates:
-        return set()
+        return refusals
 
     custody = await sealing_custody(
         session, store, (a.agent_id for a in candidates if a.agent_id is not None)
     )
-    return {
-        action.id
-        for action in candidates
-        if action.agent_id is not None
-        and action.connector in custody.get(action.agent_id, frozenset())
-    }
+    for action in candidates:
+        sealed = custody.get(action.agent_id, frozenset()) if action.agent_id else frozenset()
+        if action.connector not in sealed:
+            refusals[action.id] = "refused_key_custody"
+    return refusals
+
+
+async def undoable_action_ids(
+    session: AsyncSession, store: ObjectStore, actions: Sequence[AgentAction]
+) -> set[uuid.UUID]:
+    """The ids among ``actions`` that are undoable now. @spec ACTION-EXECUTOR-11."""
+
+    refusals = await _refusals(session, store, actions)
+    return {action_id for action_id, code in refusals.items() if code is None}
+
+
+async def undo_refusal(
+    session: AsyncSession, store: ObjectStore, action: AgentAction
+) -> str | None:
+    """The ruling code that refuses an undo of ``action``, or None when undoable.
+
+    @spec ACTION-EXECUTOR-11: the undo route applies the same derivation as
+    the reads, and refuses with this code before writing any granted undo.
+    """
+
+    return (await _refusals(session, store, [action]))[action.id]

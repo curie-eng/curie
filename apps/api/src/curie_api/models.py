@@ -1628,6 +1628,12 @@ class AgentAction(Base):
     """
 
     __tablename__ = "agent_actions"
+    __table_args__ = (
+        # @spec ACTION-EXECUTOR-2: the target of the composite key that binds an
+        # execution to its subject action's agent. ``id`` alone is already
+        # unique, so this adds no restriction on the ledger itself.
+        UniqueConstraint("id", "agent_id", name="uq_agent_actions_id_agent_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # Nullable for the same reason ``Approval.agent_id`` is: a run without a
@@ -1695,31 +1701,45 @@ class AgentAction(Base):
     authority_kind: Mapped[str | None] = mapped_column(Text, default=None)
     authority_ref: Mapped[str | None] = mapped_column(Text, default=None)
 
-    @property
-    def holds_restore_record(self) -> bool:
-        """The record-level half of ``undoable`` (ACTION-EXECUTOR-11).
+    def restore_record_refusal(self) -> str | None:
+        """The ruling code for the first record ingredient missing, or None.
 
-        Derived, never stored: succeeded, attributed to an agent, a valid sealed
-        envelope in ``prior_state`` (ACTION-EXECUTOR-9), a ``post_version``, a
-        ``target``, a ``connector`` and its ``connector_digest``. A cleartext
-        ``prior_state`` is history, not a snapshot, so a legacy row fails here.
-        ``post_state`` is no longer read for a sealed record.
+        @spec ACTION-EXECUTOR-11. The record-level half of ``undoable``,
+        derived and never stored: not yet undone, succeeded, a valid sealed
+        envelope in ``prior_state`` (ACTION-EXECUTOR-9), attributed to an agent,
+        a ``post_version``, a ``target``, and a ``connector`` with its
+        ``connector_digest``. A cleartext ``prior_state`` is history, not a
+        snapshot, so a legacy row is ``refused_unsealed``. ``post_state`` is no
+        longer read for a sealed record.
 
-        The other half -- capability, key custody and no live restore -- needs
-        the database and the in-force bundle; ``curie_api.action_undoable``
-        combines both and is the only place ``undoable`` is answered.
+        The other half (no live restore, capability and key custody) needs the
+        database and the in-force bundle. ``curie_api.action_undoable`` combines
+        both and is the only place ``undoable`` and its refusal are answered.
         """
 
-        return (
-            self.status == ActionStatus.succeeded
-            and self.agent_id is not None
-            and is_sealed_envelope(self.prior_state)
-            and bool(self.post_version)
-            and self.target is not None
-            and bool(self.connector)
-            and bool(self.connector_digest)
-            and self.undone_at is None
-        )
+        if self.undone_at is not None:
+            return "refused_already_undone"
+        if self.status != ActionStatus.succeeded:
+            return "refused_unsuccessful"
+        # A record without a sealed snapshot holds nothing to restore under any
+        # agent, so that is the most specific reason and comes first.
+        if not is_sealed_envelope(self.prior_state):
+            return "refused_unsealed"
+        if self.agent_id is None:
+            return "refused_no_agent"
+        if not self.post_version:
+            return "refused_unversioned"
+        if self.target is None:
+            return "refused_irreversible"
+        if not self.connector or not self.connector_digest:
+            return "refused_no_digest"
+        return None
+
+    @property
+    def holds_restore_record(self) -> bool:
+        """Whether every record-level ingredient is present (ACTION-EXECUTOR-11)."""
+
+        return self.restore_record_refusal() is None
 
 
 class ActionAuditEntry(Base):
@@ -1789,9 +1809,11 @@ class ActionExecution(Base):
     whose authority its owner verified, or a read-only capability probe, each
     run under the target connector's own binding. Created only by the undo
     ruling, the forward creation function and the probe route
-    (ACTION-EXECUTOR-1); ``idempotency_key`` is unique so a replayed creation
-    adopts the existing row. At most one restore that is not ``refused`` may
-    name one action, enforced by a partial unique index rather than a writer.
+    (ACTION-EXECUTOR-1). ``idempotency_key`` is unique within one agent, so a
+    replayed creation adopts that agent's existing row and no other's, and a
+    composite key ties ``agent_id`` to the subject action's agent. At most one
+    restore that is not ``refused`` may name one action, enforced by a partial
+    unique index rather than a writer.
     ``outcome`` carries version strings, a key identifier and codes only, never
     an envelope, a state or a result.
     """
@@ -1802,7 +1824,19 @@ class ActionExecution(Base):
         CheckConstraint(
             f"state IN ({_sql_in(ExecutionState)})", name="action_executions_state_ck"
         ),
-        UniqueConstraint("idempotency_key", name="uq_action_executions_idempotency_key"),
+        # A replayed creation adopts the existing row on (agent_id, key), so one
+        # agent's key can never adopt another agent's execution.
+        UniqueConstraint(
+            "agent_id", "idempotency_key", name="uq_action_executions_agent_idempotency_key"
+        ),
+        # An execution always runs under the agent whose action it concerns. An
+        # action with no agent matches no pair, so it can never be a subject.
+        ForeignKeyConstraint(
+            ["subject_action_id", "agent_id"],
+            [f"{SCHEMA}.agent_actions.id", f"{SCHEMA}.agent_actions.agent_id"],
+            ondelete="CASCADE",
+            name="fk_action_executions_subject_agent",
+        ),
         Index(
             "uq_action_executions_live_restore",
             "subject_action_id",
@@ -1821,7 +1855,7 @@ class ActionExecution(Base):
     tool: Mapped[str | None] = mapped_column(Text, default=None)
     # Restore: the action put back. Forward: the record created at dispatch.
     subject_action_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey(f"{SCHEMA}.agent_actions.id", ondelete="CASCADE"), default=None
+        UUID(as_uuid=True), default=None
     )
     arguments_sha256: Mapped[str | None] = mapped_column(Text, default=None)
     forward_arguments: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)

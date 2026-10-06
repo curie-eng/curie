@@ -23,7 +23,7 @@ the connector's address.
 import logging
 import uuid
 from collections.abc import Sequence
-from typing import NoReturn
+from typing import Annotated, NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import func
@@ -41,10 +41,12 @@ from curie_api.schemas.actions import (
     ActionUndoOut,
 )
 
-from ..action_undoable import undoable_action_ids
+from ..action_undoable import undo_refusal, undoable_action_ids
 from ..auth import require_api_key
-from ..deps import ApproverSetSelectorDep, SessionDep, StoreDep
+from ..config import get_settings
+from ..deps import ApproverSetSelectorDep, SessionDep, StoreDep, get_store
 from ..models import ActionAuditEntry, ActionStatus, AgentAction, Approval
+from ..storage import BundleStore, ObjectStore
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +155,28 @@ async def get_action_audit(action_id: uuid.UUID, session: SessionDep) -> list[Ac
     return [ActionAuditOut.model_validate(e) for e in entries]
 
 
+# The request's bundle store, or None when the ruling is called outside a
+# request (an in-process caller); the ruling then opens the configured store.
+_RulingStoreDep = Annotated[ObjectStore | None, Depends(get_store)]
+
+# @spec ACTION-EXECUTOR-11: the stated reason for each missing ingredient. Each
+# names what is missing and never a state, an envelope or a version value.
+_INGREDIENT_REASONS = {
+    "refused_no_agent": "this action ran under no agent, so no binding can restore it",
+    "refused_unsealed": "no sealed snapshot was recorded, so this cannot be undone",
+    "refused_unversioned": (
+        "this call never reported the version it left, so whether the world has "
+        "moved since cannot be determined"
+    ),
+    "refused_irreversible": "no target was recorded, so there is nowhere to restore to",
+    "refused_no_digest": "the connector image this call ran under was not recorded",
+    "refused_restore_in_flight": "a restore of this action already exists",
+    "refused_not_restore_capable": "this connector image is not known to restore",
+    "refused_key_custody": (
+        "the agent's in-force version does not hold the sealing key for this connector"
+    ),
+}
+
 # The authorizer name recorded when nothing gated the forward call. Not "none":
 # the audit row is read by a human asking who permitted a write into their
 # infrastructure, and "ungated" answers that question where a blank does not.
@@ -247,6 +271,7 @@ async def undo_action(
     data: ActionUndo,
     session: SessionDep,
     approver_sets: ApproverSetSelectorDep,
+    store: _RulingStoreDep = None,
 ) -> ActionUndoOut:
     """Rule on putting back what this action changed.
 
@@ -298,17 +323,18 @@ async def undo_action(
             ),
             code=status.HTTP_409_CONFLICT,
         )
-    if action.prior_state is None or action.target is None:
-        # The stated reason and the receipt's reason are the same sentence: the
-        # connector's own words when it had them, and an honest fallback when it
-        # did not.
+    # @spec ACTION-EXECUTOR-11: the ruling follows the derived ``undoable``. A
+    # record missing any ingredient is refused with that ingredient's code,
+    # before any granted-undo audit row could be written.
+    code = await undo_refusal(session, store or BundleStore(get_settings()), action)
+    if code is not None:
+        reason = _INGREDIENT_REASONS.get(code, "this action cannot be undone")
+        if code == "refused_unsealed" and action.detail:
+            # The connector's own words when it had them: the receipt and the
+            # refusal state the same sentence.
+            reason = action.detail
         await _refuse(
-            session,
-            action,
-            data,
-            kind="refused_irreversible",
-            reason=action.detail or "no recorded prior state, so this cannot be undone",
-            code=status.HTTP_409_CONFLICT,
+            session, action, data, kind=code, reason=reason, code=status.HTTP_409_CONFLICT
         )
     if data.observed_state is None:
         # Not an assumption of "unchanged". The platform cannot read the resource
@@ -367,7 +393,9 @@ async def undo_action(
             actor_channel=data.actor_channel,
             authorizer=authorizer,
             authorized=True,
-            evidence={"restoring": action.prior_state},
+            # Never the envelope or a state (ACTION-EXECUTOR-11): the key
+            # identifier and the recorded version only.
+            evidence={"kid": action.prior_state.get("kid"), "version": action.post_version},
             created_at=func.clock_timestamp(),
         )
     )
