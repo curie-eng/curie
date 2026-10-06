@@ -44,7 +44,12 @@ from ..config import get_settings
 from ..deps import SessionDep
 from ..models import ExecutionRequest, Publication, ThreadPublicationLineage, WorkItem
 
-router = APIRouter(dependencies=[Depends(require_internal_worker_token)])
+# The worker's pull request, branch and commit calls (ADR 0197, "Two ports" item 6).
+router = APIRouter(
+    prefix="/v1/internal/publications",
+    tags=["internal-publications"],
+    dependencies=[Depends(require_internal_worker_token)],
+)
 
 _ACTIVE = frozenset({"approved", "launching", "running"})
 

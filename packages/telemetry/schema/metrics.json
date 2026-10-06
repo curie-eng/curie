@@ -526,6 +526,10 @@
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
           "/v1/internal/publications/{publication_id}/credential",
+          "/v1/internal/publications/{publication_id}/pull-request",
+          "/v1/internal/publications/{publication_id}/pull-request/metadata",
+          "/v1/internal/publications/{publication_id}/branch-head",
+          "/v1/internal/publications/{publication_id}/revision-commit",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
           "/v1/internal/work-items/admissions",
@@ -578,7 +582,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1128,
+      "cardinality_bound": 1160,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -694,6 +698,10 @@
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
           "/v1/internal/publications/{publication_id}/credential",
+          "/v1/internal/publications/{publication_id}/pull-request",
+          "/v1/internal/publications/{publication_id}/pull-request/metadata",
+          "/v1/internal/publications/{publication_id}/branch-head",
+          "/v1/internal/publications/{publication_id}/revision-commit",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
           "/v1/internal/work-items/admissions",
@@ -753,7 +761,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 5640,
+      "cardinality_bound": 5800,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -869,6 +877,10 @@
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
           "/v1/internal/publications/{publication_id}/credential",
+          "/v1/internal/publications/{publication_id}/pull-request",
+          "/v1/internal/publications/{publication_id}/pull-request/metadata",
+          "/v1/internal/publications/{publication_id}/branch-head",
+          "/v1/internal/publications/{publication_id}/revision-commit",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
           "/v1/internal/work-items/admissions",
@@ -928,7 +940,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 5640,
+      "cardinality_bound": 5800,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

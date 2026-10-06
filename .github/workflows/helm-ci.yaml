@@ -865,6 +865,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/worker-object-store-assertions.sh
 
+      # Prove the optional code host CA bundle mounts at one path in the api,
+      # worker, sandbox runner and publication Job, and renders nothing unset.
+      - name: helm render assertions (code host CA bundle)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/code-host-trust-assertions.sh
+
       # A default worker missing these values runs eval suites that cannot
       # record or report results.
       - name: helm render assertions (worker eval wiring)

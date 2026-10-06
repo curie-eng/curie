@@ -74,6 +74,7 @@ from .routers import (
     memory,
     observability,
     provider_installations,
+    publication_code_host,
     publication_precheck,
     publications,
     remediation_nominations,
@@ -518,6 +519,7 @@ def create_app() -> FastAPI:
     app.include_router(publication_precheck.router)
     app.include_router(publications.router)
     app.include_router(publications.internal_router)
+    app.include_router(publication_code_host.router)
     app.include_router(work_item_issue.router)
     app.include_router(work_item_issue.internal_router)
     app.include_router(channel_read.router)

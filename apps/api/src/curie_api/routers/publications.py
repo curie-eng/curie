@@ -70,7 +70,6 @@ from ..publication_truth import (
 )
 from ..repository_access import issue_repository_credential
 from ..workspace_policy import credential_mode, repository_is_allowed
-from . import publication_code_host
 from .publication_precheck import precheck_error
 
 logger = logging.getLogger(__name__)
@@ -947,6 +946,3 @@ async def cancel_review_revision(
         ) from None
     return _review_revision_out(row, lineage)
 
-
-# The worker's pull request, branch and commit calls (ADR 0197, "Two ports" item 6).
-internal_router.include_router(publication_code_host.router)
