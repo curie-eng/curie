@@ -729,6 +729,17 @@ as a whole; remembered only):
   inbox stream the API appends to (`apps/api/src/curie_api/turn_progress.py`)
   and the worker's pump reads, cross three images, so they are frozen together.
   [vector: `tests/vectors/turn-progress-capability.json`]
+- attachments-init vs docker `_prepare_attachments` (ADR 0205) -- the program
+  the chart renders into the sandbox's `attachments-init` container
+  (`charts/curie/templates/agent-sandbox.yaml`) cannot import the worker, so the
+  docker driver (`apps/worker/src/curie_worker/sandbox/docker.py`) reimplements
+  it: exact names, current files first and all-or-nothing, earlier files best
+  effort with a recorded reason, digest mismatch always fatal, and the hidden
+  `.curie-attachments-status.json`, and the pre-ADR rules for a payload
+  without "c" (mixed-version rollout). Both run one payload-to-outcome corpus
+  (`charts/curie/ci/attachment-init-behavior-assertions.sh` and
+  `apps/worker/tests/sandbox/test_docker_attachment_claim.py`).
+  [vector: `tests/vectors/attachment-init-outcomes.json`]
 
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR

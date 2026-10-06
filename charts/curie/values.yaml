@@ -783,6 +783,17 @@ connectorCaller:
   signingKeyKey: signingKey
   verifyKeyKey: verifyKey
 
+# The connector action executor (ACTION-EXECUTOR-1). One switch, rendered as
+# CURIE_ACTION_EXECUTOR_ENABLED into both the API and the worker so the two can
+# never disagree. Off: the worker claims no execution and the API refuses an undo
+# that would authorize a restore with `executor_disabled`. On, with
+# worker.connectorReconciler.enabled, the worker Role also gains a single-object
+# `get` on Deployments so it can read the digest a connector ran at
+# (ACTION-EXECUTOR-12, -14); with the executor off that grant is absent and
+# actions record no digest, so they are not undoable.
+actionExecutor:
+  enabled: false
+
 rustfs:
   deploy: true
   image: rustfs/rustfs:1.0.0-beta.12
@@ -2021,6 +2032,15 @@ worker:
     # How long the parked bytes are retained so a redelivery of the same turn can
     # still fetch them. Swept by the worker's existing reap_orphans tick.
     retentionTtlSeconds: 3600
+    # ADR 0205 decision 7: every boot of a thread rebuilds the thread's whole
+    # file set, so it is bounded per thread, separately from the per-message
+    # cap. Over either bound the newest files are kept and the omitted ones are
+    # named to the agent. threadMaxBytes must fit
+    # agentSandbox.runner.attachments.sizeLimit (the chart refuses to render
+    # otherwise), and the set has to arrive within that block's
+    # fetchTimeoutSeconds.
+    threadMaxFiles: 20
+    threadMaxBytes: 268435456
   publication:
     enabled: true
     # Short-lived Jobs and their scoped token Secret live outside the platform
@@ -2727,8 +2747,16 @@ agentSandbox:
       mountPath: /attachments
       # ADR-0059 decision 2: every writable emptyDir in the sandbox pod carries
       # a ceiling, so a hostile or broken store cannot fill the node. Sized
-      # above worker.attachments.maxFileBytes x the lane's 10-file set cap.
+      # above worker.attachments.maxFileBytes x the lane's 10-file set cap,
+      # and at least worker.attachments.threadMaxBytes (ADR 0205 decision 7;
+      # the chart refuses a budget this volume cannot hold).
       sizeLimit: 512Mi
+      # The overall deadline for one boot's fetches, current and earlier
+      # files together, on a monotonic clock. Each read's socket timeout is
+      # what is left of it. A current file that misses it refuses the boot; an
+      # earlier one is skipped and named to the agent as unavailable (ADR 0205
+      # decision 6), so a thread's history never lengthens a boot past it. It
+      # must stay inside worker.claimTimeoutSeconds (90 by default).
       fetchTimeoutSeconds: 45
     # Extra env for the runner container, list of {name, value}.
     # Per-workload OTEL_EXPORTER_OTLP_* overrides still win over the

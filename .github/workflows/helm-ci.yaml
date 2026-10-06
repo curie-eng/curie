@@ -604,6 +604,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/connector-reconciler-rbac-assertions.sh
 
+      # Prove the action executor switch (ACTION-EXECUTOR-1, -12, -14): one
+      # value renders CURIE_ACTION_EXECUTOR_ENABLED identically into the API and
+      # the worker, default off, and the worker Role gains only a single-object
+      # `get` on Deployments, and only with the executor and the reconciler on.
+      - name: helm render assertions (action executor config)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/action-executor-config-assertions.sh
+
       # Pin the end to end connector's test cluster identity (ADR 0176
       # decision 4, #3243): off by default, no cluster scoped write beyond
       # namespace create and delete, the per namespace role never bound cluster

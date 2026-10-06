@@ -620,13 +620,31 @@ spec:
         the bytes that actually landed in the store is VERIFIED before anything
         becomes visible, the operator's own size cap is enforced while
         streaming, redirects are refused (a redirect carries the fetch to a host
-        the store named rather than one we chose), a non-HTTP(S) url and a
-        closed expiry window are refused, and an uploader-supplied filename is
-        reduced to a basename so it cannot escape the mount. A refusal leaves
-        NOTHING visible: files are staged under a hidden directory and revealed
-        only once the whole set verified, because a partial set reads to an
-        agent exactly like a complete one. No reference at all -- the
-        overwhelming majority of turns -- is a clean no-op.
+        the store named rather than one we chose), and a non-HTTP(S) url is
+        refused. Each name is written exactly as the worker recorded it (ADR
+        0205 decision 4); one that is not a clean leaf, sits in the reserved
+        `.curie-` prefix or repeats refuses the boot rather than being repaired.
+        A payload with no "c" on any entry comes from a worker that predates
+        ADR 0205 and keeps the old rules whole (basename cleaning, a numeric
+        suffix for a repeat, all-or-nothing, no status file), so a new chart
+        never regresses an old worker mid-rollout.
+        A refusal leaves NOTHING visible: files are staged under a hidden
+        directory and revealed only once the whole set verified, because a
+        partial set reads to an agent exactly like a complete one. No reference
+        at all -- the overwhelming majority of turns -- is a clean no-op.
+
+        ADR 0205 decision 6: the payload also carries the thread's earlier files
+        ("c": 0). The current message's files ("c": 1) are fetched first and
+        stay all-or-nothing. An earlier file that has expired, is answered with
+        an HTTP error or a redirect, outgrows the size cap, has a name the
+        filesystem cannot hold, times out, or is reached after the overall
+        fetchTimeoutSeconds deadline is skipped, never failing the boot; a
+        digest mismatch is fatal either way, because that is integrity, not
+        availability. The outcome of every entry lands in the hidden
+        `.curie-attachments-status.json` the runner reconciles (decision 8).
+        The docker driver's `_prepare_attachments` is the twin of this program;
+        tests/vectors/attachment-init-outcomes.json pins both to one outcome
+        per payload (ci/attachment-init-behavior-assertions.sh runs this one).
         */}}
         - name: attachments-init
           image: {{ $runnerImageRef | quote }}
@@ -642,15 +660,24 @@ spec:
             - python
             - -c
             - |
-              import base64, hashlib, json, os, pathlib, shutil, signal, sys, time, urllib.request
+              import base64, hashlib, http.client, json, os, pathlib, shutil, sys, time, urllib.error, urllib.request
               class NoRedirect(urllib.request.HTTPRedirectHandler):
                   def redirect_request(self, request, fp, code, message, headers, new_url):
                       return None
+              class Unavailable(Exception):
+                  """An entry that could not be fetched; the reason is a status code."""
               ref = os.environ.get("CURIE_ATTACHMENTS_REF", "")
               root = pathlib.Path("{{ $af.mountPath }}")
               stage = root / ".curie-attachments-stage"
+              status_name = ".curie-attachments-status.json"
               if not ref:
                   sys.exit(0)
+              # One overall fetch deadline on a monotonic clock (ADR 0205 decision 6).
+              # Before every read the socket timeout is set to what is left of it, and
+              # the deadline is checked after every read, so neither a stalled nor a
+              # dripping store holds the pod past it. A process-wide alarm used to kill
+              # the whole init container, current files and all.
+              deadline = time.monotonic() + {{ $af.fetchTimeoutSeconds }}
               # An init-container restart must never leave a partial prior
               # materialization visible; every reference is fetched again.
               for child in root.iterdir():
@@ -663,62 +690,145 @@ spec:
                   entries = json.loads(raw)
                   if not isinstance(entries, list):
                       raise TypeError("attachment reference payload is not a list")
+                  # A payload with no "c" anywhere is from a worker that predates ADR
+                  # 0205 (a mixed-version rollout) and keeps the old rules whole: every
+                  # entry current, the name cleaned to a basename, a repeat renamed.
+                  legacy = not any("c" in entry for entry in entries)
+                  plan, names = [], set()
+                  for index, entry in enumerate(entries):
+                      name = entry["n"]
+                      url, expected, expires = str(entry["u"]), str(entry["s"]).lower(), int(entry["e"])
+                      # "c": 1 is the current message, 0 an earlier one.
+                      plan.append([index, name, url, expected, expires, legacy or entry.get("c", 1) != 0])
               except Exception as exc:
                   raise SystemExit(f"attachments-init: invalid attachment reference: {exc}")
-              stage.mkdir(mode=0o700)
-              opener = urllib.request.build_opener(NoRedirect())
-              staged = []
-              taken = set()
-              try:
-                  signal.alarm({{ $af.fetchTimeoutSeconds }})
-                  for index, entry in enumerate(entries):
-                      name = os.path.basename(str(entry["n"]).replace("\\", "/").strip())
-                      url, expected, expires = str(entry["u"]), str(entry["s"]), int(entry["e"])
+              # Every name is checked before anything is fetched.
+              for item in plan:
+                  index, name, url, expected, expires, current = item
+                  if legacy:
+                      name = os.path.basename(str(name).replace("\\", "/").strip())
                       if not name or name in (".", ".."):
                           raise SystemExit("attachments-init: attachment name is unusable")
-                      if not url.startswith(("http://", "https://")):
-                          raise SystemExit("attachments-init: signed reference is not HTTP(S)")
-                      if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected.lower()):
-                          raise SystemExit("attachments-init: signed reference digest is invalid")
-                      if expires <= int(time.time()):
-                          raise SystemExit("attachments-init: signed reference expired")
-                      target = stage / ("%03d.part" % index)
-                      digest, size = hashlib.sha256(), 0
-                      with opener.open(url, timeout={{ $af.fetchTimeoutSeconds }}) as source, target.open("wb") as sink:
-                          while chunk := source.read(1024 * 1024):
-                              size += len(chunk)
-                              if size > {{ .Values.worker.attachments.maxFileBytes }}:
-                                  raise SystemExit("attachments-init: attachment exceeds the size limit")
-                              digest.update(chunk)
-                              sink.write(chunk)
-                      if digest.hexdigest() != expected:
-                          raise SystemExit("attachments-init: attachment digest mismatch")
-                      staged.append((target, name))
-                  signal.alarm(0)
-                  # Two uploads sharing a filename must both survive: `os.replace`
-                  # onto the same path destroyed one of them silently, which is
-                  # the bug this lane exists to close. The twin of
-                  # curie_worker.attachments.unique_attachment_leaf -- a numeric
-                  # suffix before the extension, first file keeping the person's
-                  # own name -- reimplemented because a rendered program cannot
-                  # import the worker. ci/attachment-init-behavior-assertions.sh
-                  # executes this copy on the case the worker's is tested on.
-                  for target, name in staged:
-                      if name in taken:
+                      # Two uploads sharing a name both survive: a numeric suffix before
+                      # the extension, the first keeping the name the person sent. The
+                      # twin of curie_worker.attachments.unique_attachment_leaf.
+                      if name in names:
                           stem, extension = os.path.splitext(name)
                           bump = 2
-                          while "%s-%d%s" % (stem, bump, extension) in taken:
+                          while "%s-%d%s" % (stem, bump, extension) in names:
                               bump += 1
                           name = "%s-%d%s" % (stem, bump, extension)
-                      taken.add(name)
+                      item[1] = name
+                  else:
+                      # The worker fixed each name against the thread's whole ledger
+                      # (decision 4), so it is written exactly; one that is not already a
+                      # clean leaf, sits in the reserved .curie- prefix, or repeats is a
+                      # broken payload, never repaired.
+                      if (
+                          not isinstance(name, str)
+                          or not name.strip()
+                          or name in (".", "..")
+                          or os.path.basename(name) != name
+                          or "\0" in name
+                          or name.startswith(".curie-")
+                      ):
+                          raise SystemExit("attachments-init: attachment name %r is unusable" % (name,))
+                      if name in names:
+                          raise SystemExit("attachments-init: attachment name %r is duplicated" % (name,))
+                  names.add(item[1])
+                  if not url.startswith(("http://", "https://")):
+                      raise SystemExit("attachments-init: signed reference is not HTTP(S)")
+                  if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+                      raise SystemExit("attachments-init: signed reference digest is invalid")
+              stage.mkdir(mode=0o700)
+              opener = urllib.request.build_opener(NoRedirect())
+              def bound(source):
+                  # The socket timeout for the next read: what is left of the deadline.
+                  remaining = deadline - time.monotonic()
+                  if remaining <= 0:
+                      raise TimeoutError("past the fetch deadline")
+                  sock = getattr(getattr(getattr(source, "fp", None), "raw", None), "_sock", None)
+                  if sock is not None:
+                      sock.settimeout(remaining)
+              def fetch(index, name, url, expected, expires):
+                  if expires <= int(time.time()):
+                      raise Unavailable("expired")
+                  remaining = deadline - time.monotonic()
+                  if remaining <= 0:
+                      raise Unavailable("deadline")
+                  # A name the filesystem cannot hold is a file that cannot be delivered.
+                  if len(name.encode("utf-8", "surrogateescape")) > 255:
+                      raise Unavailable("fetch_failed")
+                  target = stage / ("%03d.part" % index)
+                  digest, size = hashlib.sha256(), 0
+                  try:
+                      with opener.open(url, timeout=remaining) as source, target.open("wb") as sink:
+                          while True:
+                              bound(source)
+                              # read1, not read: read(n) waits for n bytes, so a store
+                              # dripping a byte at a time would hold it past the deadline.
+                              chunk = source.read1(1024 * 1024)
+                              if not chunk:
+                                  break
+                              size += len(chunk)
+                              if size > {{ .Values.worker.attachments.maxFileBytes }}:
+                                  raise Unavailable("fetch_failed")
+                              digest.update(chunk)
+                              sink.write(chunk)
+                  except Unavailable:
+                      target.unlink(missing_ok=True)
+                      raise
+                  except urllib.error.HTTPError as exc:
+                      # A refused redirect lands here as its 3xx: fetch_failed.
+                      target.unlink(missing_ok=True)
+                      raise Unavailable({404: "not_found", 403: "forbidden"}.get(exc.code, "fetch_failed"))
+                  except TimeoutError:
+                      target.unlink(missing_ok=True)
+                      raise Unavailable("timeout")
+                  except urllib.error.URLError as exc:
+                      target.unlink(missing_ok=True)
+                      raise Unavailable("timeout" if isinstance(exc.reason, TimeoutError) else "fetch_failed")
+                  except (OSError, http.client.HTTPException):
+                      target.unlink(missing_ok=True)
+                      raise Unavailable("fetch_failed")
+                  # An integrity failure, never an availability one: fatal for an
+                  # earlier file too.
+                  if digest.hexdigest() != expected:
+                      raise SystemExit("attachments-init: %r digest mismatch" % (name,))
+                  return target
+              staged, outcome = [], {}
+              try:
+                  # The current message's files first, all or nothing: the person just
+                  # sent them. Then the earlier ones, each best effort with a reason.
+                  for index, name, url, expected, expires, current in sorted(plan, key=lambda p: not p[5]):
+                      try:
+                          staged.append((fetch(index, name, url, expected, expires), name))
+                          outcome[name] = ("ok", None)
+                      except Unavailable as exc:
+                          if current:
+                              raise SystemExit("attachments-init: %r is unavailable: %s" % (name, exc))
+                          outcome[name] = ("unavailable", str(exc))
+                  for target, name in staged:
                       destination = root / name
                       if destination.resolve().parent != root.resolve():
                           raise SystemExit("attachments-init: attachment name escapes the mount")
                       os.replace(target, destination)
+                  # The outcome of every reference, for the runner to reconcile against
+                  # the manifest and the disk (decision 8). Written beside the staged
+                  # files and renamed, so it is either whole or absent. A legacy payload
+                  # has no manifest to reconcile, so it gets none, as before.
+                  if not legacy:
+                      rows = [{"name": p[1], "status": outcome[p[1]][0], "reason": outcome[p[1]][1]} for p in plan]
+                      pending = stage / "status.part"
+                      pending.write_text(json.dumps({"v": 1, "files": rows}))
+                      pending.chmod(0o644)
+                      os.replace(pending, root / status_name)
               except BaseException:
+                  for target, name in staged:
+                      (root / name).unlink(missing_ok=True)
                   shutil.rmtree(stage, ignore_errors=True)
                   raise
-              stage.rmdir()
+              shutil.rmtree(stage)
               print("attachments-init: materialized %d attachment(s) into %s" % (len(staged), root))
           env:
             - name: CURIE_ATTACHMENTS_REF
@@ -821,6 +931,17 @@ spec:
                   name: {{ include "curie.runnerTokenSecretName" . }}
                   key: runnerToken
                   optional: false
+            {{- if $af.enabled }}
+            # ADR 0205 decision 8: which on-disk files are the current
+            # message's, which are earlier, and which are unavailable or
+            # omitted. Names and outcomes only, no capability, so unlike
+            # CURIE_ATTACHMENTS_REF it is the RUNNER's. Baked empty because the
+            # claim's Overrides injection only fills env the template declares;
+            # empty means no manifest, and the runner treats every file on disk
+            # as current.
+            - name: CURIE_ATTACHMENTS_MANIFEST
+              value: ""
+            {{- end }}
             {{- if $wf.enabled }}
             # Kubernetes owns the emptyDir mount root; make the intended checkout
             # explicit without mutating repository config or carrying a secret.
