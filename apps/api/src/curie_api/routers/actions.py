@@ -317,10 +317,12 @@ async def require_undo_principal(
     principal_credentials_presented(
         x_curie_approval_principal, console_session, x_curie_adapter_principal
     )
+    # The action is read only for the approval a chat credential is bound to.
+    # Authentication answers first: a missing action is reported only to an
+    # authenticated caller, so action identifiers are no oracle (and a chat
+    # credential for a missing action, bound to nothing, never authenticates).
     action = await crud_actions.get_action(session, action_id)
-    if action is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "action not found")
-    gate_id = action.gate_approval_id
+    gate_id = action.gate_approval_id if action is not None else None
     principal = await authenticate_principal(
         approval_id=gate_id,
         request=request,
@@ -330,6 +332,8 @@ async def require_undo_principal(
         x_curie_adapter_principal=x_curie_adapter_principal,
         x_curie_approval_actor=x_curie_approval_actor,
     )
+    if action is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "action not found")
     if principal.kind == "adapter":
         approval = await session.get(Approval, gate_id) if gate_id is not None else None
         if approval is None or not await crud_approvals.approval_served_by(
