@@ -2,16 +2,20 @@
 
 Date: 2026-10-05
 
-Status: Draft
+Status: Accepted
 
-On acceptance this ADR supersedes in part
+Accepted on 2026-10-06 with explicit maintainer approval from Junwon Jung
+(jw3329), before any implementation. The issues under "Realizing code paths"
+track the work.
+
+This ADR supersedes in part
 [ADR 0181](0181-every-mean-tester-probe-only-reads-or-asks.md): its words "on
 every installation" stop applying to a test installation as defined below.
 Everywhere else, read-or-ask stays the rule, and decision 2 now enforces it for
 marked messages.
 [ADR 0172](0172-the-mean-tester-is-one-bundle-on-off-the-shelf-mcp-servers.md)
 decision 5's exception for an operator-listed test installation stays removed.
-On acceptance, back-links go on both under
+Back-links are on both, and on ADR 0106, under
 [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md).
 
 This ADR also amends
@@ -284,7 +288,7 @@ and snapshots in
 
 ## Realizing code paths
 
-Nothing implements this Draft. On acceptance, one issue tracks each path:
+Nothing implements this yet. One issue tracks each path, in order: #4133, #4134, #4135 and #4136.
 
 1. **Declaration:**
    - `charts/curie/values.yaml`;
