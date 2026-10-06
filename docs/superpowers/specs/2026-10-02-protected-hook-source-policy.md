@@ -634,7 +634,9 @@ it, and no database connection may wait on the broker. Each API process runs at
 most four broker evaluations at once; a probe beyond that limit reports
 `broker_unavailable` without connecting rather than queueing. One evaluation
 has a five second budget across connection and every read, and exceeding it
-reports `broker_unavailable`. Bootstrap files are read relative to one opened
+reports `broker_unavailable`. The budget starts after address resolution of the
+manifest endpoint; name resolution is bounded by the host resolver, not by this
+budget. A nested budget can only shorten an enclosing one. Bootstrap files are read relative to one opened
 directory, must each be a regular file after symlink resolution, are opened
 without blocking on special files, and are bounded in size; anything else makes
 the bootstrap invalid. Validating `ca.pem` takes time linear in its size. It opens one
