@@ -54,6 +54,7 @@ from claude_agent_sdk.types import (
     SessionStoreEntry,
     SettingSource,
 )
+from plugin_format.approval_policy import connector_tool_prefix
 
 from .history import (
     ConversationMessage,
@@ -493,6 +494,38 @@ class McpServerReconnector(Protocol):
         ...
 
 
+def hidden_restore_tools(
+    connectors: Iterable[str],
+    observed_tools: frozenset[str],
+    failed_connectors: frozenset[str],
+    *,
+    probe_complete: bool,
+) -> tuple[str, ...]:
+    """The connector ``restore`` tools to keep out of the model catalogue.
+
+    @spec ACTION-EXECUTOR-8. A connector that advertises both ``restore`` and
+    ``observe_version`` (from the boot ``tools/list``) has its
+    ``mcp__<connector>__restore`` hidden, since the executor alone calls it.
+    Hiding fails closed: a connector whose boot probe failed, or that an
+    incomplete probe never observed, has it hidden too, because a paired
+    ``restore`` must never be visible while the proxy may not yet gate it. A
+    lone ``restore`` on a probed connector stays an ordinary tool, and
+    ``observe_version`` is never hidden.
+    """
+
+    hidden: list[str] = []
+    for connector in sorted(set(connectors)):
+        prefix = connector_tool_prefix(connector)
+        restore = f"{prefix}restore"
+        paired = restore in observed_tools and f"{prefix}observe_version" in observed_tools
+        unobserved = not probe_complete and not any(
+            tool.startswith(prefix) for tool in observed_tools
+        )
+        if paired or connector in failed_connectors or unobserved:
+            hidden.append(restore)
+    return tuple(hidden)
+
+
 def build_options(
     *,
     plugins: list[SdkPluginConfig],
@@ -514,6 +547,7 @@ def build_options(
     policy_disallowed_tools: Iterable[str] = (),
     disallowed_tools: list[str] | tuple[str, ...] | None = None,
     skills: list[str] | None = None,
+    hidden_restore_tools: Iterable[str] = (),
 ) -> ClaudeAgentOptions:
     """Assemble ClaudeAgentOptions for the session.
 
@@ -555,9 +589,11 @@ def build_options(
     # both sources deny without changing the operator's declared order.
     explicit_disallowed = list(dict.fromkeys(disallowed_tools or ()))
     explicit_names = set(explicit_disallowed)
+    # @spec ACTION-EXECUTOR-8: a paired (or unprobed) connector ``restore`` is
+    # the executor's verb, never the model's; it joins the sorted policy tail.
     disallowed_tools = [
         *explicit_disallowed,
-        *sorted(set(policy_disallowed_tools) - explicit_names),
+        *sorted((set(policy_disallowed_tools) | set(hidden_restore_tools)) - explicit_names),
     ]
     if not web_search_enabled:
         disallowed_tools = [

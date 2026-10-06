@@ -383,13 +383,17 @@ def _bundle_server_configs(
 
 
 @asynccontextmanager
-async def _server_streams(
+async def server_streams(
     config: Mapping[str, Any],
     *,
     plugin_dir: Path | None,
     inherited_env: Mapping[str, str],
 ) -> AsyncIterator[tuple[Any, Any]]:
-    """Open one stdio, SSE, or streamable-HTTP MCP transport."""
+    """Open one stdio, SSE, or streamable-HTTP MCP transport.
+
+    @spec ACTION-EXECUTOR-6: the standalone client the boot probe dials, public
+    so the executor route opens each connector session the same way.
+    """
 
     interpolation_env = dict(inherited_env)
     if plugin_dir is not None:
@@ -444,6 +448,10 @@ async def _server_streams(
         async with streamable_http_client(expanded_url, http_client=http_client) as streams:
             read_stream, write_stream = streams
             yield read_stream, write_stream
+
+
+# The probe dials through this module name, which existing tests replace.
+_server_streams = server_streams
 
 
 async def _probe_server_once(

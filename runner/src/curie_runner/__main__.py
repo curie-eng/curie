@@ -8,10 +8,11 @@ or connect failure fails the process visibly rather than after the port is up.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from .adapter import (
     ModelSession,
     build_options,
     build_structured_resume,
+    hidden_restore_tools,
 )
 from .approval import (
     APPROVAL_SERVER_NAME,
@@ -54,6 +56,7 @@ from .connectors import (
     materialize_connector_caller_headers,
     materialize_hosted_bearer_headers,
 )
+from .executor import EXECUTOR_MODE, RUNNER_MODE_ENV
 from .fake import FakeModelSession
 from .harness.claude.approval import (
     build_approval_hook,
@@ -118,8 +121,15 @@ from .progress import (
 )
 from .publication_precheck import PublicationPrecheck
 from .redact import collect_held_secrets, install_stdout_redaction
-from .sdk_auth import DEFAULT_CREDENTIAL_ENV_KEYS, UnsupportedCredentialError
-from .server import bind_status_attestation, create_app
+from .sdk_auth import (
+    CREDENTIALS_ENV,
+    DEFAULT_CREDENTIAL_ENV_KEYS,
+    MODEL_ENV_KEY_ENV,
+    InvalidEnvKeyError,
+    UnsupportedCredentialError,
+    parse_env_keys,
+)
+from .server import bind_status_attestation, create_app, create_executor_app
 from .session import ConnectorReprobe, SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import (
@@ -1105,6 +1115,13 @@ def build_runner(
             web_search_enabled=web_search_enabled,
             policy_disallowed_tools=policy_hidden_tools,
             disallowed_tools=config.catalogue_disallowed_tools,
+            hidden_restore_tools=hidden_restore_tools(
+                derived_mcp_servers,
+                capability.observed_tools,
+                frozenset(capability.failures)
+                | frozenset(failure.connector for failure in boot_connector_failures),
+                probe_complete=capability.complete,
+            ),
         )
 
     sdk_generation = 0
@@ -1511,6 +1528,78 @@ async def _load_boot_fetches(
     )
 
 
+# @spec ACTION-EXECUTOR-4: the model credential names an executor boot refuses.
+_EXECUTOR_REFUSED_CREDENTIALS = (
+    CREDENTIALS_ENV,
+    MODEL_ENV_KEY_ENV,
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+
+
+class ExecutorModelCredentialError(RuntimeError):
+    """An executor-mode boot found a model credential in its env."""
+
+
+def executor_model_credentials(env: Mapping[str, str]) -> tuple[str, ...]:
+    """The model credential names present in ``env`` (names only, never values)."""
+
+    names = set(_EXECUTOR_REFUSED_CREDENTIALS)
+    declared = env.get(MODEL_ENV_KEY_ENV, "").strip()
+    if declared:
+        # The declaration itself is refused above; an unparsable one adds no names.
+        with contextlib.suppress(InvalidEnvKeyError):
+            names.update(parse_env_keys(declared))
+    return tuple(sorted(name for name in names if env.get(name)))
+
+
+def _serve_executor(config: RunnerConfig, serving_token: str | None) -> None:
+    """Serve the executor route (ACTION-EXECUTOR-6) with no model in the path.
+
+    @spec ACTION-EXECUTOR-4: a model credential in the env refuses the boot.
+    The connector entries are derived exactly as an ordinary boot derives them,
+    with hosted Bearer and caller headers materialized in memory.
+    """
+
+    present = executor_model_credentials(os.environ)
+    if present:
+        logger.error(
+            "runner refused to boot in executor mode: model credential present names=%s",
+            ",".join(present),
+        )
+        raise ExecutorModelCredentialError(
+            f"executor mode carries no model credential; found {', '.join(present)}"
+        )
+    logger.info(
+        "runner configured mode=%s session=%s port=%d",
+        EXECUTOR_MODE,
+        config.session.session_id,
+        config.port,
+    )
+    connectors = derive_mcp_servers(
+        config.session.plugin_dir,
+        release=config.connector_release,
+        agent=config.connector_agent,
+        namespace=config.connector_namespace,
+        caller_header=config.connector_caller_token is not None,
+        env=os.environ,
+    )
+    materialize_hosted_bearer_headers(connectors, os.environ)
+    materialize_connector_caller_headers(connectors, os.environ)
+    app = create_executor_app(
+        connectors,
+        token=serving_token,
+        attestation={
+            "session_id": config.session.session_id,
+            "sandbox_id": config.session.sandbox_id,
+            "managed_workspace": False,
+            "cwd": None,
+        },
+    )
+    web.run_app(app, host="0.0.0.0", port=config.port)
+
+
 def _serve() -> None:
     # The NAME comes from the one declaration (#488); the parse deliberately does
     # not. BootEnv reads any non-"0" value as true, while this boot has always
@@ -1540,6 +1629,12 @@ def _serve() -> None:
             "is set; local development only",
             ALLOW_TOKENLESS_ENV,
         )
+    if os.environ.get(RUNNER_MODE_ENV) == EXECUTOR_MODE:
+        # @spec ACTION-EXECUTOR-4 @spec ACTION-EXECUTOR-6: before the harness,
+        # credential resolution and every boot fetch. Executor mode loads no
+        # model session, history, memory, state or progress.
+        _serve_executor(config, serving_token)
+        return
     logger.info(
         "runner configured session=%s model=%s port=%d harness=%s",
         config.session.session_id,
