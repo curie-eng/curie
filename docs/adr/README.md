@@ -218,4 +218,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0195 | [A version-only delta reuses its parent's checks](0195-a-version-only-delta-reuses-its-parents-checks.md) | Accepted |
 | 0196 | [Combined preparation PR checks can prove an unchanged release merge](0196-combined-preparation-pr-checks.md) | Draft |
 | 0203 | [Automated remediation is a pre-qualified action the platform executes and verifies](0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md) | Accepted |
+| 0207 | [A delivery owner rides through an ownership store outage shorter than its lease](0207-a-delivery-owner-rides-through-an-ownership-store-outage-shorter-than-its-lease.md) | Draft |
 <!-- END GENERATED: adr-index -->
