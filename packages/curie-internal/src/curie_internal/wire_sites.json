@@ -270,7 +270,7 @@
       "value": "curie:runs",
       "reason": "Protected admission broker transaction uses the runs stream for initial and recovered enqueue"
     },
-    "packages/protected-hooks/src/curie_protected_hooks/atomic_admission.py:AtomicAdmission._operate:2": {
+    "packages/protected-hooks/src/curie_protected_hooks/atomic_admission.py:AtomicAdmission._prepare:1": {
       "value": "curie:runs",
       "reason": "Protected admission recovery verifies the reserved runs stream entry and envelope with an exact XRANGE"
     }
