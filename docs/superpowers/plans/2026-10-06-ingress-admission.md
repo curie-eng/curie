@@ -182,7 +182,7 @@ test, which drives the same seeded broker states through the probe over HTTP
 and through a real signed delivery and asserts that the delivery is accepted
 exactly when the probe answered `supported`, outside the stated per delivery
 exclusions. Update
-`apps/api/tests/test_hook_source_support_broker.py::test_fully_valid_tuple_reports_unsupported_with_runtime_members`.
+`apps/api/tests/test_hook_source_support_broker.py::test_fully_valid_tuple_without_enqueue_file_reports_runtime_unavailable_with_members`.
 
 **Task 7.** Add the reconciler and its lifespan wiring. Failing first tests:
 with no caller retry, an interrupted intent commits once authority opens; a
