@@ -28,6 +28,8 @@ an actor who may not undo learns nothing about the record's reversibility.
 
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -42,10 +44,14 @@ from _sealed_actions import (
     sealed_action,
     undoable_agent,
 )
+from curie_api import adapter_principal, approval_principal
 from curie_api.approvers import MembershipVerdict
+from curie_api.config import get_settings
 from curie_api.deps import get_approver_sets
 from curie_api.main import create_app
 from fastapi.testclient import TestClient
+from sqlalchemy import text as sql_text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 pytestmark = pytest.mark.usefixtures("clean_db", "executor_enabled")
 
@@ -463,3 +469,249 @@ def test_the_gating_set_is_asked_about_the_principal_not_a_body_actor(
 
     assert response.status_code == 202, response.text
     assert asked == [("U-principal", None)]
+
+
+# --------------------------------------------------------------------------- #
+# Chat and adapter principals (route decisions, review round 2 N2)
+# --------------------------------------------------------------------------- #
+
+CHAT_SUBJECT = "U0CHATTER1"
+CARD_CHANNEL = "C0EXAMPLE9"
+
+
+def _chat_headers(approval_id: str, subject: str = CHAT_SUBJECT) -> dict[str, str]:
+    """A dispatcher chat attestation bound to ``approval_id`` (ADR 0106)."""
+
+    token = approval_principal.mint(
+        get_settings().approval_chat_attester_secret,
+        subject=subject,
+        kind="chat",
+        actor_channel=CARD_CHANNEL,
+        approval_id=approval_id,
+        scope=approval_principal.APPROVE_SCOPE,
+        exp=int(time.time()) + 300,
+    )
+    return {"X-Curie-Approval-Principal": token}
+
+
+@pytest.mark.parametrize("gated_client", [MembershipVerdict(member=True)], indirect=True)
+def test_a_chat_principal_may_undo_the_action_its_approval_gated(
+    gated_client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """Route decisions: "A chat principal may undo only an action whose gating
+    approval its token names"; its subject is the recorded actor.
+    """
+
+    gate = _seed_approval(gated_client, auth_headers)
+    action = _gated_action(gated_client, auth_headers, gate, tmp_path)
+
+    response = gated_client.post(
+        f"/actions/{action['id']}/undo", json={}, headers=_chat_headers(gate)
+    )
+
+    assert response.status_code == 202, response.text
+    assert [row["requested_by"] for row in executions_of(action["id"])] == [CHAT_SUBJECT]
+
+
+@pytest.mark.parametrize("gated_client", [MembershipVerdict(member=True)], indirect=True)
+def test_a_chat_principal_for_another_approval_is_refused(
+    gated_client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """Route decisions: a chat token naming a different approval is no credential
+    for this action, even when the set would admit its subject.
+    """
+
+    gate = _seed_approval(gated_client, auth_headers)
+    other = _seed_approval(gated_client, auth_headers)
+    action = _gated_action(gated_client, auth_headers, gate, tmp_path)
+
+    response = gated_client.post(
+        f"/actions/{action['id']}/undo", json={}, headers=_chat_headers(other)
+    )
+
+    assert response.status_code in {401, 403}, response.text
+    assert executions_of(action["id"]) == []
+
+
+@pytest.mark.parametrize("gated_client", [MembershipVerdict(member=True)], indirect=True)
+def test_an_ungated_action_accepts_no_chat_credential(
+    gated_client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """Route decisions: a chat credential is bound to an approval, so an action
+    no approval gated admits none, whichever approval the token names.
+    """
+
+    some_approval = _seed_approval(gated_client, auth_headers)
+    action = _gated_action(gated_client, auth_headers, None, tmp_path)
+
+    response = gated_client.post(
+        f"/actions/{action['id']}/undo", json={}, headers=_chat_headers(some_approval)
+    )
+
+    assert response.status_code in {401, 403}, response.text
+    assert executions_of(action["id"]) == []
+
+
+def _binding_id(agent_id: str) -> str:
+    async def run() -> str:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    sql_text("SELECT id FROM curie.agent_channels WHERE agent_id = :aid"),
+                    {"aid": agent_id},
+                )
+                return str(result.scalar_one())
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(run())
+
+
+def _routed_approval(client: Any, auth_headers: dict[str, str]) -> tuple[str, str]:
+    """An approval whose route resolves on a binding: (approval id, binding id)."""
+
+    channel = f"C0ADP{uuid.uuid4().hex[:8].upper()}"
+    route = f"route-{uuid.uuid4().hex[:8]}"
+    agent = client.post(
+        "/agents",
+        json={
+            "name": f"adapter-route-{uuid.uuid4().hex[:8]}",
+            "channel": {"kind": "slack", "address": channel},
+            "approval_routes": {
+                route: {
+                    "resolution": {"kind": "slack", "address": channel},
+                    "approvers": {"users": ["U0SENDER01"]},
+                }
+            },
+        },
+        headers=auth_headers,
+    )
+    assert agent.status_code == 201, agent.text
+    agent_id = str(agent.json()["id"])
+    approval = client.post(
+        "/approvals",
+        json={
+            "conversation_id": f"th-{uuid.uuid4().hex[:8]}",
+            "author": "U-author",
+            "summary": "scale public/api to 10",
+            "reply_kind": "slack",
+            "reply_channel": channel,
+            "reply_placeholder": "p-1",
+            "dedupe_key": uuid.uuid4().hex,
+            "agent_id": agent_id,
+            "route": route,
+            "card_channel": channel,
+            "gate_kind": "policy",
+        },
+        headers=auth_headers,
+    )
+    assert approval.status_code == 201, approval.text
+    return str(approval.json()["id"]), _binding_id(agent_id)
+
+
+def _adapter_headers(bindings: list[str], actor: str = "U0SENDER01") -> dict[str, str]:
+    token = adapter_principal.mint(
+        get_settings().api_key,
+        subject="mail-adapter-test",
+        bindings=bindings,
+        exp=int(time.time()) + 600,
+    )
+    return {"X-Curie-Adapter-Principal": token, "X-Curie-Approval-Actor": actor}
+
+
+@pytest.mark.parametrize("gated_client", [MembershipVerdict(member=True)], indirect=True)
+def test_an_adapter_may_undo_an_action_whose_gating_approval_it_serves(
+    gated_client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """Route decisions: "an adapter principal only an action whose gating approval
+    it serves"; the sender it vouches for is the recorded actor.
+    """
+
+    gate, binding = _routed_approval(gated_client, auth_headers)
+    action = _gated_action(gated_client, auth_headers, gate, tmp_path)
+
+    response = gated_client.post(
+        f"/actions/{action['id']}/undo", json={}, headers=_adapter_headers([binding])
+    )
+
+    assert response.status_code == 202, response.text
+    assert [row["requested_by"] for row in executions_of(action["id"])] == ["U0SENDER01"]
+
+
+@pytest.mark.parametrize("gated_client", [MembershipVerdict(member=True)], indirect=True)
+@pytest.mark.parametrize("gating", ["unserved approval", "ungated"])
+def test_an_adapter_reads_an_action_it_does_not_serve_as_not_found(
+    gated_client: Any, auth_headers: dict[str, str], tmp_path: Path, gating: str
+) -> None:
+    """Route decisions: an action whose gating approval the adapter does not serve,
+    or that no approval gated, "reads as a missing action" -- the same 404 as an
+    action that does not exist, so an adapter learns nothing beyond its bindings.
+    """
+
+    _, served_binding = _routed_approval(gated_client, auth_headers)
+    unserved_gate, _ = _routed_approval(gated_client, auth_headers)
+    gate = unserved_gate if gating == "unserved approval" else None
+    action = _gated_action(gated_client, auth_headers, gate, tmp_path)
+    headers = _adapter_headers([served_binding])
+
+    response = gated_client.post(f"/actions/{action['id']}/undo", json={}, headers=headers)
+    missing = gated_client.post(f"/actions/{uuid.uuid4()}/undo", json={}, headers=headers)
+
+    assert response.status_code == 404, response.text
+    assert response.json() == missing.json()
+    assert executions_of(action["id"]) == []
+
+
+# --------------------------------------------------------------------------- #
+# Authentication before lookup (route decisions, review round 2 N4)
+# --------------------------------------------------------------------------- #
+
+
+def _junk_operator() -> dict[str, str]:
+    return {"X-Curie-Approval-Principal": "not-a-principal"}
+
+
+def _wrong_key_operator() -> dict[str, str]:
+    token = approval_principal.mint(
+        "not-the-platform-key",
+        subject="U-operator",
+        kind="operator",
+        scope=approval_principal.APPROVE_SCOPE,
+        exp=int(time.time()) + 300,
+    )
+    return {"X-Curie-Approval-Principal": token}
+
+
+@pytest.mark.parametrize(
+    "credential",
+    ["none", "platform key", "junk principal", "wrongly signed operator", "expired cookie"],
+)
+def test_an_unauthenticated_undo_cannot_tell_existing_actions_from_missing_ones(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, credential: str
+) -> None:
+    """Route decisions: "The undo route authenticates the principal before it looks
+    up the action, so an unauthenticated caller cannot learn which action
+    identifiers exist": an existing and a nonexistent action answer the same
+    authentication refusal, never a 404 for one of them.
+    """
+
+    action = _gated_action(client, auth_headers, None, tmp_path)
+    headers = {
+        "none": {},
+        "platform key": auth_headers,
+        "junk principal": _junk_operator(),
+        "wrongly signed operator": _wrong_key_operator(),
+        "expired cookie": {
+            "Cookie": f"{CONSOLE_COOKIE}=not-a-live-session",
+            "Origin": "http://testserver",
+        },
+    }[credential]
+
+    existing = client.post(f"/actions/{action['id']}/undo", json={}, headers=headers)
+    missing = client.post(f"/actions/{uuid.uuid4()}/undo", json={}, headers=headers)
+
+    assert existing.status_code == 401, existing.text
+    assert missing.status_code == 401, missing.text
+    assert missing.json() == existing.json()
+    assert executions_of(action["id"]) == []

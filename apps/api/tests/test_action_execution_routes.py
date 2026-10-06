@@ -1754,3 +1754,50 @@ def test_only_the_live_restore_index_maps_to_restore_in_flight(
         "SELECT id FROM curie.action_executions WHERE idempotency_key = :key", {"key": key}
     )
     assert len(rows) == 1
+
+
+def test_an_unknown_constraint_violation_is_re_raised_not_mapped(
+    auth_headers: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Route decisions, review round 2 N5: a uniqueness violation is mapped only
+    when it names a known constraint; any other is re-raised, never reported as
+    a refusal it is not.
+
+    The ruling's identifiers are pinned (only the identifier source is
+    replaced, no ruling logic) so its execution collides on the primary key of
+    a ``refused`` restore of the same action under another key: a violation of
+    ``action_executions_pkey``, which names no ruling refusal. The request ends
+    in a server error with no refusal audit row and no new execution.
+    """
+
+    with TestClient(create_app(), raise_server_exceptions=False) as client:
+        action = _undoable_action(client, auth_headers, tmp_path)
+        pinned = uuid.uuid4()
+        sql_rows(
+            "INSERT INTO curie.action_executions "
+            "(id, kind, agent_id, connector, tool, subject_action_id, connector_digest, "
+            "authority_kind, authority_ref, requested_by, idempotency_key, state, attempt, "
+            "refusal_code, created_at) "
+            "VALUES (:id, 'restore', :agent_id, :connector, 'restore', :subject, :digest, "
+            "'undo_ruling', 'earlier', :actor, :key, 'refused', 1, "
+            "'connector_unreachable', now())",
+            {
+                "id": pinned,
+                "agent_id": uuid.UUID(action["agent_id"]),
+                "connector": CONNECTOR,
+                "subject": uuid.UUID(action["id"]),
+                "digest": DIGEST,
+                "actor": ACTOR,
+                "key": f"restore:{action['id']}:earlier",
+            },
+        )
+        monkeypatch.setattr(
+            "curie_api.routers.actions.uuid",
+            types.SimpleNamespace(uuid4=lambda: pinned, UUID=uuid.UUID),
+        )
+
+        response = _undo(client, auth_headers, action["id"])
+
+        assert response.status_code == 500, response.text
+        assert [e["action"] for e in _audit(client, auth_headers, action["id"])] == []
+    assert [str(row["id"]) for row in executions_of(action["id"])] == [str(pinned)]
