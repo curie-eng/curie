@@ -37,7 +37,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from .hook_source_admin import SourceAdminError
+from .hook_source_admin import GATE_WAIT_SECONDS, SourceAdminError
 
 
 @dataclass(frozen=True)
@@ -159,6 +159,16 @@ def _unavailable(policy: SourcePolicySnapshot | None = None) -> SourceAdminError
     error = SourceAdminError("source_authority_unavailable", 503)
     if policy is not None:
         error.committed_generation = str(policy.generation)
+    return error
+
+
+def _deferred(policy: SourcePolicySnapshot) -> SourceAdminError:
+    """Protected publication waits for the LANE-4 ingress admission change.
+
+    @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-7.
+    """
+    error = SourceAdminError("source_publication_deferred", 503)
+    error.committed_generation = str(policy.generation)
     return error
 
 
@@ -378,8 +388,6 @@ class SourceMutationCoordinator:
         expected_generation: str,
         operation_id: str,
         target: DesiredSourceTarget | None,
-        *,
-        refuse_unconfigured: bool = False,
     ) -> SourcePolicySnapshot:
         """@spec PROTECTED-HOOK-SOURCE-2/3/5/6/7/10."""
         try:
@@ -391,17 +399,22 @@ class SourceMutationCoordinator:
         committed: SourcePolicySnapshot | None = None
         try:
             async with AsyncExitStack() as authority_scope:
-                async with self._gate.hold(uuid.UUID(source.agent_id)) as held:
+                async with self._gate.hold(
+                    uuid.UUID(source.agent_id), wait_seconds=GATE_WAIT_SECONDS
+                ) as held:
                     snapshot, seen = await self._initial(held, source, operation)
                     previous = snapshot.policy
-                    if refuse_unconfigured and snapshot.never_configured:
+                    if (
+                        target is not None
+                        and target.mode == "ordinary"
+                        and snapshot.never_configured
+                    ):
+                        # Removal of a hook never configured: nothing to tombstone.
                         raise SourceAdminError("source_not_configured", 409)
                     if target is None:
                         if previous is None or previous.mode != "protected":
                             raise SourceAdminError("source_rotation_conflict", 409)
                         target = _policy_target(previous)
-                    if self._target_check is not None and target.mode == "protected":
-                        self._target_check(target)
                     intent = target_intent_sha256(target.as_dict())
                     replay = previous is not None and previous.operation_id == operation
                     if replay:
@@ -423,6 +436,11 @@ class SourceMutationCoordinator:
                             and snapshot.legacy_generation == 2147483647
                         ):
                             raise SourceAdminError("legacy_generation_exhausted", 409)
+                    if self._target_check is not None and target.mode == "protected":
+                        self._target_check(target)
+                    if committed is not None and committed.mode != "ordinary":
+                        # An exact protected replay is decided from SQL alone.
+                        raise _deferred(committed)
                     if self._resolver is None:
                         raise _unavailable(committed)
                     session = await authority_scope.enter_async_context(
@@ -466,10 +484,7 @@ class SourceMutationCoordinator:
                         )
                 assert committed is not None
                 if committed.mode != "ordinary":
-                    # Protected publication waits for the LANE-4 ingress admission change.
-                    deferred = SourceAdminError("source_publication_deferred", 503)
-                    deferred.committed_generation = str(committed.generation)
-                    raise deferred
+                    raise _deferred(committed)
                 published = await session.writer.publish_ordinary(
                     generation=committed.generation,
                     operation_id=str(committed.operation_id),
@@ -484,10 +499,13 @@ class SourceMutationCoordinator:
             raise
         except SourceAgentNotFound:
             raise SourceAdminError("source_agent_not_found", 404) from None
+        except (SourceGateInvalid, SourceSnapshotUnavailable, SQLAlchemyError):
+            # Gate wait bound, gate loss or SQL failure, including an uncertain commit.
+            state_error = SourceAdminError("source_state_unavailable", 503)
+            if committed is not None:
+                state_error.committed_generation = str(committed.generation)
+            raise state_error from None
         except (
-            SourceGateInvalid,
-            SourceSnapshotUnavailable,
-            SQLAlchemyError,
             SourceFenceConflict,
             SourceFenceExhausted,
             SourceFenceInvalid,
@@ -513,27 +531,19 @@ class SourceMutationCoordinator:
         return await self._execute(source, expected_generation, operation_id, target)
 
     async def remove(
-        self,
-        agent_id: str,
-        hook: str,
-        expected_generation: str,
-        operation_id: str,
-        *,
-        refuse_unconfigured: bool = False,
+        self, agent_id: str, hook: str, expected_generation: str, operation_id: str
     ) -> SourcePolicySnapshot:
         """Target the ordinary tombstone.
 
-        With ``refuse_unconfigured`` an absent row without attempt history is
-        409 ``source_not_configured`` right after the agent lookup, while
-        pending history alone still commits a fresh tombstone.
-        @spec PROTECTED-HOOK-SOURCE-3/6/10.
+        An absent row without attempt history is 409 ``source_not_configured``
+        right after the agent lookup; pending history alone still commits a
+        fresh tombstone. @spec PROTECTED-HOOK-SOURCE-3/6/10.
         """
         return await self._execute(
             SourceIdentity(agent_id, hook),
             expected_generation,
             operation_id,
             DesiredSourceTarget("ordinary", None, None, None, None),
-            refuse_unconfigured=refuse_unconfigured,
         )
 
     async def rotate(
