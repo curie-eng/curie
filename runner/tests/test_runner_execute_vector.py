@@ -129,7 +129,7 @@ def _request(phase: str, **overrides: Any) -> dict[str, Any]:
 
 def _forward_call(**overrides: Any) -> dict[str, Any]:
     scale = next(case for case in _CANONICAL["vectors"] if case["name"] == "flat_object")
-    return _request("call", tool="scale", arguments=scale["canonical"], **overrides)
+    return _request("call", **{"tool": "scale", "arguments": scale["canonical"], **overrides})
 
 
 async def _post(client: TestClient, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
