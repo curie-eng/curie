@@ -361,6 +361,13 @@
         "sourceHosts": {"type": "array", "items": {"type": "string"}, "minItems": 1}
       }
     },
+    "actionExecutor": {
+      "type": "object",
+      "description": "The connector action executor switch (ACTION-EXECUTOR-1), rendered into both the API and the worker. A boolean, so a quoted \"false\" cannot turn it on.",
+      "properties": {
+        "enabled": {"type": "boolean"}
+      }
+    },
     "e2eConnectorIdentity": {
       "type": "object",
       "description": "End to end connector identity on a test cluster (ADR 0176 decision 4, issue #3243).",

@@ -118,6 +118,19 @@ is actually enabled.
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["create", "list", "patch", "delete"]
+{{- if eq (include "curie.actionExecutorEnabled" .) "true" }}
+{{/*
+ACTION-EXECUTOR-12/-14: the action executor reads the connector's owned
+Deployment by name to record the digest it ran at and to check a pinned digest.
+A single-object `get` on Deployments only, in its own rule so it cannot spill
+onto another kind; granted only with the executor and this reconciler both
+enabled. With the executor off this Role is unchanged and actions record no
+digest. No `watch`, no other kind.
+*/}}
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+{{- end }}
   - apiGroups: [""]
     resources: ["services", "secrets"]
     verbs: ["create", "list", "patch", "delete"]
@@ -358,6 +371,10 @@ spec:
               valueFrom:
                 secretKeyRef:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" (get (.Values.connectorCaller | default dict) "existingSecret") "existingSecretKey" ((get (.Values.connectorCaller | default dict) "signingKeyKey") | default "signingKey") "defaultKey" "connectorCallerSigningKey") | nindent 18 }}
+            # The action executor switch (ACTION-EXECUTOR-1). The API renders
+            # the same value from the same helper; the two must never differ.
+            - name: CURIE_ACTION_EXECUTOR_ENABLED
+              value: {{ include "curie.actionExecutorEnabled" . | quote }}
             # Substrate wiring: which namespace to claim sandboxes in, the warm
             # pool to claim from, and the ACI port on each claimed sandbox.
             - name: CURIE_NAMESPACE

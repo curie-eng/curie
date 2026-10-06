@@ -178,6 +178,11 @@ spec:
                   name: {{ include "curie.secretName" . }}
                   key: installationId
                   optional: false
+            # The action executor switch (ACTION-EXECUTOR-1). The worker
+            # renders the same value from the same helper; the two must never
+            # differ.
+            - name: CURIE_ACTION_EXECUTOR_ENABLED
+              value: {{ include "curie.actionExecutorEnabled" . | quote }}
             # The connector caller public keys and the proxy image (ADR-0168
             # decision 7). The API renders a caller proxy into every hosted
             # connector it renders when the current key is set; the worker
