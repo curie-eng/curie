@@ -399,6 +399,33 @@ class BootEnv(_AciModel):
     issue_read_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_ISSUE_READ_TOKEN", "kernel")
     )
+    # Which attachment files are this message's (ADR 0205, decision 8). The
+    # kernel builds it per turn from the thread's attachment ledger; the runner
+    # reconciles it against the init container's status file and the disk, and
+    # the disk wins. Carried as a raw JSON string the runner parses, so the
+    # contract stays a single optional field. Shape, version 1:
+    #
+    #   {"v": 1,
+    #    "files": [{"name": "<on-disk name>", "current": <bool>}],
+    #    "unavailable": [{"name": "<on-disk name>", "reason": "<reason>"}],
+    #    "omitted": ["<on-disk name>"],
+    #    "ledger_unavailable": <bool>}
+    #
+    # ``current`` marks a file that arrived on this message rather than earlier
+    # in the thread. ``unavailable`` names earlier files that could not be
+    # fetched, ``omitted`` earlier files left out by the thread budget, and
+    # ``ledger_unavailable`` says the ledger itself could not be read.
+    # ``reason`` is one fixed code, never error text: ``no_route``, ``no_credential``,
+    # ``not_found``, ``forbidden``, ``rate_limited``, ``timeout``,
+    # ``digest_changed``, ``expired``, ``deadline`` or ``fetch_failed``. Names
+    # only: never a URL, a file id, or a capability. Absent or blank means no
+    # manifest, and the runner treats every file on disk as current. Not part
+    # of SessionConfig. The runner pod template and the docker substrate
+    # declare it empty so claim env injection can set it; the kernel's
+    # per-turn value wins.
+    attachments_manifest: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_ATTACHMENTS_MANIFEST", "kernel", "substrate")
+    )
     # Per-agent permission gates (#245, ADR-0010).
     approval_required_tools: list[str] | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_REQUIRED_TOOLS", "worker")
@@ -781,6 +808,8 @@ class BootEnv(_AciModel):
             env[self.env_key("issue_read_url")] = self.issue_read_url
         if self.issue_read_token is not None:
             env[self.env_key("issue_read_token")] = self.issue_read_token
+        if self.attachments_manifest is not None:
+            env[self.env_key("attachments_manifest")] = self.attachments_manifest
         if self.approval_required_tools:
             env[self.env_key("approval_required_tools")] = ",".join(self.approval_required_tools)
         if self.approval_grant_tool is not None:
@@ -861,6 +890,7 @@ class BootEnv(_AciModel):
             progress_token=_str_or_none(env.get("CURIE_PROGRESS_TOKEN")),
             issue_read_url=_str_or_none(env.get("CURIE_ISSUE_READ_URL")),
             issue_read_token=_str_or_none(env.get("CURIE_ISSUE_READ_TOKEN")),
+            attachments_manifest=_stripped_or_none(env.get("CURIE_ATTACHMENTS_MANIFEST")),
             approval_required_tools=_list_or_none(env.get("CURIE_APPROVAL_REQUIRED_TOOLS")),
             approval_grant_tool=_stripped_or_none(env.get("CURIE_APPROVAL_GRANT_TOOL")),
             approval_grant_arguments=(
