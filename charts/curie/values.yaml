@@ -783,6 +783,17 @@ connectorCaller:
   signingKeyKey: signingKey
   verifyKeyKey: verifyKey
 
+# The connector action executor (ACTION-EXECUTOR-1). One switch, rendered as
+# CURIE_ACTION_EXECUTOR_ENABLED into both the API and the worker so the two can
+# never disagree. Off: the worker claims no execution and the API refuses an undo
+# that would authorize a restore with `executor_disabled`. On, with
+# worker.connectorReconciler.enabled, the worker Role also gains a single-object
+# `get` on Deployments so it can read the digest a connector ran at
+# (ACTION-EXECUTOR-12, -14); with the executor off that grant is absent and
+# actions record no digest, so they are not undoable.
+actionExecutor:
+  enabled: false
+
 rustfs:
   deploy: true
   image: rustfs/rustfs:1.0.0-beta.12

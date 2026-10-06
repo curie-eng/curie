@@ -1269,6 +1269,13 @@ class WorkerConfig(BaseSettings):
     connector_reconcile_interval_s: float = Field(
         default=60.0, gt=0, validation_alias="CURIE_CONNECTOR_RECONCILE_INTERVAL_S"
     )
+    # The action executor switch (ACTION-EXECUTOR-1). The chart and compose
+    # render this one name into the API and the worker from one value, so the
+    # two cannot disagree. Off: the worker claims no execution, and the chart
+    # withholds the Role's `get` on Deployments the digest reads need.
+    action_executor_enabled: bool = Field(
+        default=False, validation_alias="CURIE_ACTION_EXECUTOR_ENABLED"
+    )
     # The cron scheduler (ADR-0099, #268) is always on; this is only its tick.
     # A slot fires on the first tick at or after it, so the tick bounds lateness.
     cron_tick_interval_s: float = Field(

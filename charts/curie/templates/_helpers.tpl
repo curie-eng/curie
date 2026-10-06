@@ -2274,3 +2274,14 @@ and every string in agentSandbox.poolAgents.
 {{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) $extra -}}
 {{- $agents | uniq | sortAlpha | toJson -}}
 {{- end -}}
+
+{{/*
+The action executor switch (ACTION-EXECUTOR-1): one value, rendered as "true"
+or "false" into both the API and the worker, so the two processes can never
+disagree about whether executions are created and claimed. Read through
+`default dict` because `actionExecutor` is a top level key a release that
+predates it does not carry under --reuse-values (#3505, #3544).
+*/}}
+{{- define "curie.actionExecutorEnabled" -}}
+{{- if (get (.Values.actionExecutor | default dict) "enabled") -}}true{{- else -}}false{{- end -}}
+{{- end -}}
