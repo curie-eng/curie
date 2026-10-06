@@ -70,7 +70,7 @@ is not `refused` per recorded action. The `connector_capabilities` table
 (`apps/api/src/curie_api/models.py::ConnectorCapability`) records whether a
 connector image can restore, keyed on the agent, connector and digest.
 
-Migration `0082_thread_attachment_refs.py` (#4079) is additive. The
+Migration `0082_thread_attachment_refs.py` ([ADR 0205](../../adr/0205-an-attachment-belongs-to-its-thread.md)) is additive. The
 `thread_attachment_refs` table (`apps/api/src/curie_api/models.py::ThreadAttachmentRef`)
 holds one row per file a thread's agent was given, keyed like `thread_transcripts`
 (agent, binding scope, thread key) and removed with the transcript. Each row
