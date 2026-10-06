@@ -12,7 +12,7 @@ from typing import Any, ClassVar
 from aci_protocol.ndjson import parse_queued_turn
 from aci_protocol.turn import TurnSource
 
-from .authority_records import _scalar
+from .authority_records import _canonical, _scalar
 from .source_policy_records import canonical_hook, canonical_uuid, policy_fingerprint
 
 # @spec PROTECTED-HOOK-ADMISSION-2/3
@@ -91,6 +91,17 @@ _STATE = {
     "recovery_attempts": "attempts",
     "reason": "terminal",
     "receipt": "receipt",
+}
+# @spec PROTECTED-HOOK-ADMISSION-2/4
+_SELECTION = {
+    "schema_version": "version",
+    "runtime_id": "uuid",
+    "runtime_generation": "generation",
+    "manifest_digest": "sha256",
+    "qualification_id": "uuid",
+    "qualification_generation": "generation",
+    "broker_run_id": "run_id",
+    "admission_open": None,
 }
 _TERMINAL = frozenset({"deadline", "attempts_exhausted", "stream_id_unappendable"})
 _REFUSALS = frozenset(
@@ -296,6 +307,25 @@ def parse_state(raw: bytes) -> State:
 def parse_receipt(raw: bytes) -> Receipt:
     """@spec PROTECTED-HOOK-ADMISSION-3."""
     return Receipt(raw)
+
+
+def parse_selection(raw: bytes) -> dict[str, Any]:
+    """Closed runtime selection record, refused with ``ValueError``.
+
+    The one Selection grammar admission and the support probe both read.
+    @spec PROTECTED-HOOK-ADMISSION-2/4 @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    try:
+        selection = _decode(raw, _MAX_METADATA)
+        _require(type(selection) is dict and selection.keys() == _SELECTION.keys())
+        opened = selection.pop("admission_open")
+        _require(type(opened) is bool)
+        fields = {k: v for k, v in _SELECTION.items() if k != "admission_open"}
+        _canonical(_encode(selection), fields)
+        selection["admission_open"] = opened
+        return dict(selection)
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        raise ValueError("invalid protected admission record") from None
 
 
 @dataclass(frozen=True, slots=True, repr=False, kw_only=True)

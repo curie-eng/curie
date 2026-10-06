@@ -314,6 +314,82 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/{agent_id}/hooks/{hook}/source-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Source Policy
+         * @description Committed source policy and its publication activation.
+         */
+        get: operations["get_source_policy_agents__agent_id__hooks__hook__source_policy_get"];
+        /**
+         * Put Source Policy
+         * @description Target mandatory read-only protected delivery under the deployment's runtime.
+         *
+         *     A committed protected PUT answers 503 ``source_publication_deferred`` with
+         *     its committed generation: the commit happened, the agent's legacy counter
+         *     may have advanced, and the source stays closed until the LANE-4 change.
+         */
+        put: operations["put_source_policy_agents__agent_id__hooks__hook__source_policy_put"];
+        post?: never;
+        /**
+         * Delete Source Policy
+         * @description Commit and publish the ordinary tombstone.
+         *
+         *     Pending history without a row commits a fresh tombstone above every
+         *     attempt without rotating the legacy counter; an absent row without history
+         *     is 409 ``source_not_configured``.
+         */
+        delete: operations["delete_source_policy_agents__agent_id__hooks__hook__source_policy_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/source-policy/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate Source Policy
+         * @description Allocate a fresh generation for the current protected target.
+         */
+        post: operations["rotate_source_policy_agents__agent_id__hooks__hook__source_policy_rotate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/source-policy/secret": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Source Secret
+         * @description Refuses every state in this slice and writes nothing.
+         */
+        get: operations["get_source_secret_agents__agent_id__hooks__hook__source_policy_secret_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/hooks/{name}/fire": {
         parameters: {
             query?: never;
@@ -1542,6 +1618,32 @@ export interface paths {
          *     8. routability, then the claim, quota and enqueue.
          */
         post: operations["ingest_hook_hooks__agent_id___hook__post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/hooks/{agent_id}/{hook}/support": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Probe Hook Support
+         * @description Report the current protected support resolution for one hook; write nothing.
+         *
+         *     The JSON body is ``HookSupportIn``, read raw because its exact bytes are
+         *     signed. Order follows the spec: hook name, bounded body, strict parse,
+         *     ungated support signature, delivery id, gate-held reauthentication, snapshot,
+         *     gate release, then broker evaluation of a protected row only.
+         *     The delivery id is signed context only and reserves nothing.
+         */
+        post: operations["probe_hook_support_hooks__agent_id___hook__support_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4935,6 +5037,124 @@ export interface components {
             /** Secret */
             secret: string;
         };
+        /**
+         * HookSourcePolicyMutation
+         * @description @spec PROTECTED-HOOK-SOURCE-3.
+         */
+        HookSourcePolicyMutation: {
+            /** Expected Generation */
+            expected_generation: string;
+            /** Operation Id */
+            operation_id: string;
+        };
+        /**
+         * HookSourcePolicyOut
+         * @description @spec PROTECTED-HOOK-SOURCE-3.
+         */
+        HookSourcePolicyOut: {
+            /**
+             * Activation
+             * @enum {string}
+             */
+            activation: "closed" | "active";
+            /** Agent Id */
+            agent_id: string;
+            /** Bundle Digest */
+            bundle_digest: string | null;
+            /** Generation */
+            generation: string;
+            /** Hook */
+            hook: string;
+            /** Legacy Generation */
+            legacy_generation: string;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "ordinary" | "protected";
+            /** Qualification Id */
+            qualification_id: string | null;
+            /** Refusal Reason */
+            refusal_reason?: string | null;
+            /** Runtime Id */
+            runtime_id: string | null;
+            /** Tool Access */
+            tool_access: "read-only" | null;
+            /** Updated At */
+            updated_at: string | null;
+        };
+        /**
+         * HookSourcePolicyWrite
+         * @description @spec PROTECTED-HOOK-SOURCE-3.
+         */
+        HookSourcePolicyWrite: {
+            /** Bundle Digest */
+            bundle_digest: string;
+            /** Expected Generation */
+            expected_generation: string;
+            /** Operation Id */
+            operation_id: string;
+            /** Qualification Id */
+            qualification_id: string;
+            /** Runtime Id */
+            runtime_id: string;
+        };
+        /**
+         * HookSourceRefusal
+         * @description @spec PROTECTED-HOOK-SOURCE-3.
+         */
+        HookSourceRefusal: {
+            detail: components["schemas"]["HookSourceRefusalDetail"];
+        };
+        /**
+         * HookSourceRefusalDetail
+         * @description A source service refusal: a stable code and, only after a confirmed commit, its generation.
+         *
+         *     @spec PROTECTED-HOOK-SOURCE-3.
+         */
+        HookSourceRefusalDetail: {
+            /** Code */
+            code: string;
+            /** Committed Generation */
+            committed_generation: string | null;
+        };
+        /**
+         * HookSourceSecretOut
+         * @description @spec PROTECTED-HOOK-SOURCE-3.
+         */
+        HookSourceSecretOut: {
+            /** Agent Id */
+            agent_id: string;
+            /** Generation */
+            generation: string;
+            /** Hook */
+            hook: string;
+            /** Secret */
+            secret: string;
+        };
+        /**
+         * HookSupportOut
+         * @description Safe support resolution. @spec PROTECTED-HOOK-SOURCE-9.
+         */
+        HookSupportOut: {
+            effective_tool_access: components["schemas"]["ToolAccess"] | null;
+            /** Qualification Id */
+            qualification_id: string | null;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "supported" | "source_unconfigured" | "source_closed" | "runtime_unavailable" | "qualification_unavailable" | "evidence_missing" | "evidence_expired" | "broker_unavailable" | "broker_identity_mismatch" | "configuration_unsupported";
+            requested_tool_access: components["schemas"]["ToolAccess"] | null;
+            /** Runtime Generation */
+            runtime_generation: string | null;
+            /** Runtime Id */
+            runtime_id: string | null;
+            /** Source Generation */
+            source_generation: string | null;
+            /** Supported */
+            supported: boolean;
+        };
         /** IssueReadComment */
         IssueReadComment: {
             /** Author */
@@ -6770,6 +6990,7 @@ export interface components {
             /** Objective Truncated */
             objective_truncated: boolean;
             pr: components["schemas"]["WorkItemPrOut"] | null;
+            progress?: components["schemas"]["WorkItemProgressOut"] | null;
             publication: components["schemas"]["WorkItemPublicationOut"] | null;
             /** Repo Full Name */
             repo_full_name: string;
@@ -6782,6 +7003,8 @@ export interface components {
              * @enum {string}
              */
             state: "queued" | "waiting" | "running" | "cancellation_requested" | "cancelled" | "expired" | "failed" | "awaiting_approval" | "publishing" | "published" | "completed_unpublished";
+            /** Title */
+            title?: string | null;
             /**
              * Updated At
              * Format: date-time
@@ -6796,6 +7019,18 @@ export interface components {
             status: string;
             /** Url */
             url: string;
+        };
+        /**
+         * WorkItemProgressOut
+         * @description The latest execution's progress, derived by ``factory_progress.phase_view``.
+         */
+        WorkItemProgressOut: {
+            /** Current */
+            current: string | null;
+            /** Note */
+            note: string | null;
+            /** Stages */
+            stages: components["schemas"]["WorkItemStageOut"][];
         };
         /** WorkItemPublicationOut */
         WorkItemPublicationOut: {
@@ -6837,6 +7072,23 @@ export interface components {
             termination_observation: string | null;
             /** Wait Deadline */
             wait_deadline: string | null;
+        };
+        /**
+         * WorkItemStageOut
+         * @description One stage of the factory progress strip, as the status card shows it.
+         */
+        WorkItemStageOut: {
+            /** Id */
+            id: string;
+            /** Label */
+            label: string;
+            /** Round Label */
+            round_label: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "done" | "current" | "redo" | "blocked" | "pending";
         };
         /** WorkItemUsageModel */
         WorkItemUsageModel: {
@@ -7741,6 +7993,313 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_source_policy_agents__agent_id__hooks__hook__source_policy_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourcePolicyOut"];
+                };
+            };
+            /** @description Source refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Source refusal */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+        };
+    };
+    put_source_policy_agents__agent_id__hooks__hook__source_policy_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HookSourcePolicyWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourcePolicyOut"];
+                };
+            };
+            /** @description Source refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Source refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Validation error or unknown source reference */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Source refusal */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+        };
+    };
+    delete_source_policy_agents__agent_id__hooks__hook__source_policy_delete: {
+        parameters: {
+            query: {
+                expected_generation: string;
+                operation_id: string;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourcePolicyOut"];
+                };
+            };
+            /** @description Source refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Source refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Source refusal */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+        };
+    };
+    rotate_source_policy_agents__agent_id__hooks__hook__source_policy_rotate_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HookSourcePolicyMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourcePolicyOut"];
+                };
+            };
+            /** @description Source refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Source refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Validation error or unknown source reference */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Source refusal */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+        };
+    };
+    get_source_secret_agents__agent_id__hooks__hook__source_policy_secret_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceSecretOut"];
+                };
+            };
+            /** @description Source refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Source refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Source refusal */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
                 };
             };
         };
@@ -10313,6 +10872,57 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    probe_hook_support_hooks__agent_id___hook__support_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-curie-signature-256"?: string | null;
+                "x-curie-delivery-id"?: string | null;
+                "x-curie-timestamp"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    tool_access?: components["schemas"]["ToolAccess"] | null;
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSupportOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Authenticated, protected support unavailable (supported=false). Without this DTO, {"detail": "authority_unavailable"} when no current server resolution could be read. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSupportOut"];
                 };
             };
         };
