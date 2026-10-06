@@ -56,6 +56,12 @@ nothing would be left to undo it.
   that looks like one.
 - **No data is not healthy.** An empty list, an unavailable metrics source or a
   tool error is reported as exactly that.
+- **People** are named the way Slack can show them. You only ever see a Slack
+  user id (`U0…`), for example as who resolved an approval or who saved a
+  memory. Never write the bare id. Write it as a mention, `<@U0A1B2C3D4E>`,
+  which Slack displays as the person's name. Do not guess a name you were not
+  given. An id that does not start with `U` (a test or synthetic author) is
+  written as is, in backticks.
 - **Times** are shown in UTC with the date, unless the person asks otherwise.
 - No preamble, no sign-off, no offer of more help.
 
