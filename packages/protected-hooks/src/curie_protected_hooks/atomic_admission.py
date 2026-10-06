@@ -209,256 +209,14 @@ class AtomicAdmission:
                 authority_reason="source_unavailable",
                 entry=None,
             )
-            raws = [self._get(keys[i], 262144 if i == 3 else 16384) for i in range(5)]
-            for i, raw in enumerate(raws):
-                params["snapshots"].append(
-                    dict(index=i + 1, raw=raw.decode("utf-8") if raw is not None else None)
-                )
-            original = parse_intent(raws[0]).as_dict() if raws[0] is not None else None
-            state = parse_state(raws[1]).as_dict() if raws[1] is not None else None
-            commit = parse_state(raws[2]).as_dict() if raws[2] is not None else None
-            if state is not None and state["status"] == "committed":
-                raise AdmissionUnavailable()
-            if original is None and (
-                state is not None or commit is not None or raws[3] is not None
-            ):
-                raise AdmissionUnavailable()
-            source: Any = None
-            if raws[4] is not None:
-                source_value = _decode(raws[4], 16384)
-                if (
-                    type(source_value) is not dict
-                    or set(source_value) != {"floor", "operation_id", "active"}
-                    or (
-                        source_value["active"] is not None
-                        and (
-                            type(source_value["active"]) is not dict
-                            or set(source_value["active"])
-                            != {"generation", "operation_id", "mode", "policy_fingerprint"}
-                        )
-                    )
-                ):
-                    raise AdmissionUnavailable()
-                source = _decode_source(raws[4])
-            policy: Any = request.source_policy if request is not None else None
-            match = source is not None and source["active"] is not None
-            active: Any = source["active"] if match else None
-            expected = (
-                dict(
-                    generation=policy["generation"],
-                    operation_id=policy["operation_id"],
-                    policy_fingerprint=policy_fingerprint(policy),
-                )
-                if policy is not None
-                else (
-                    dict(
-                        generation=original["source_generation"],
-                        operation_id=original["source_operation_id"],
-                        policy_fingerprint=original["policy_fingerprint"],
-                    )
-                    if original
-                    else None
-                )
-            )
-            match = bool(
-                match
-                and expected
-                and active
-                and active["mode"] == "protected"
-                and all(str(active[k]) == expected[k] for k in expected)
-            )
-            envelope_raw: bytes = b""
-            payload: bytes = request.queued_payload if request is not None else (raws[3] or b"")
-            if original is not None:
-                if original["identity"] != identity.as_dict():
-                    raise AdmissionUnavailable()
-                keys[6] = prefix + "binding:" + original["event_id"]
-                binding = self._get(keys[6])
-                params["snapshots"].append(
-                    dict(index=7, raw=binding.decode("utf-8") if binding is not None else None)
-                )
-                if binding is not None:
-                    envelope = parse_envelope(binding)
-                    if hashlib.sha256(binding).hexdigest() != original["envelope_sha256"]:
-                        raise AdmissionUnavailable()
-                    ed = envelope.as_dict()
-                    if (
-                        any(
-                            ed[k] != original[k]
-                            for k in (
-                                "event_id",
-                                "runtime_id",
-                                "runtime_generation",
-                                "manifest_digest",
-                                "qualification_id",
-                                "payload_sha256",
-                            )
-                        )
-                        or ed["source_revision"] != original["source_generation"]
-                        or ed["logical_conversation_key"] != original["conversation_id"]
-                    ):
-                        raise AdmissionUnavailable()
-                    envelope_raw = binding
-                if commit is not None:
-                    if (
-                        state is not None
-                        and state["status"] == "failed"
-                        or binding is None
-                        or commit["status"] != "committed"
-                    ):
-                        raise AdmissionUnavailable()
-                    receipt = {
-                        k: v
-                        for k, v in original.items()
-                        if k
-                        not in {
-                            "created_at_ms",
-                            "deadline_ms",
-                            "reserved_stream_id",
-                            "envelope_sha256",
-                        }
-                    }
-                    receipt.update(
-                        stream_id=original["reserved_stream_id"],
-                        acceptance_status="accepted",
-                        tool_access="read-only",
-                    )
-                    if commit["receipt"] != receipt:
-                        raise AdmissionUnavailable()
-                conflict = request is not None and any(
-                    (
-                        original["requested_tool_access"] != request.requested_tool_access,
-                        original["request_body_sha256"] != request.request_body_sha256,
-                        original["source_generation"] != policy["generation"],
-                        original["source_operation_id"] != policy["operation_id"],
-                        original["policy_fingerprint"] != policy_fingerprint(policy),
-                    )
-                )
-                if conflict:
-                    params.update(
-                        mode="read",
-                        result=AdmissionResult(
-                            status="conflict", reason="delivery_conflict"
-                        ).as_dict(),
-                    )
-                elif commit is not None:
-                    params.update(
-                        mode="read",
-                        result=AdmissionResult(
-                            status="duplicate", receipt=commit["receipt"]
-                        ).as_dict()
-                        if (request is None or match)
-                        else AdmissionResult(
-                            status="refused", reason="source_unavailable"
-                        ).as_dict(),
-                    )
-                elif state is not None and state["status"] == "failed":
-                    params.update(
-                        mode="read",
-                        result=AdmissionResult(status="failed", reason=state["reason"]).as_dict(),
-                    )
-                elif (
-                    request is not None
-                    and hashlib.sha256(payload).hexdigest() != original["payload_sha256"]
-                ):
-                    params.update(
-                        mode="read",
-                        result=AdmissionResult(
-                            status="conflict", reason="delivery_conflict"
-                        ).as_dict(),
-                    )
-                else:
-                    params.update(
-                        mode="recover",
-                        intent=original,
-                        attempts=state["recovery_attempts"] if state else 0,
-                    )
-                    manifest = (
-                        self._authority(original["runtime_id"], policy, original, keys, params)
-                        if match
-                        else None
-                    )
-                    if not match:
-                        params["authority_reason"] = "source_unavailable"
-                    if not envelope_raw and manifest:
-                        envelope_raw = self._envelope(original, manifest).canonical_bytes
-                        if hashlib.sha256(envelope_raw).hexdigest() != original["envelope_sha256"]:
-                            raise AdmissionUnavailable()
-                    if (
-                        payload
-                        and hashlib.sha256(payload).hexdigest() != original["payload_sha256"]
-                    ):
-                        raise AdmissionUnavailable()
-                    if (
-                        raws[3] is not None
-                        and hashlib.sha256(raws[3]).hexdigest() != original["payload_sha256"]
-                    ):
-                        raise AdmissionUnavailable()
-                    entry = self._client.eval(
-                        "-- @spec PROTECTED-HOOK-ADMISSION-5\n"
-                        "return redis.call('XRANGE',KEYS[1],ARGV[1],ARGV[1],'COUNT',1)",
-                        1,
-                        "curie:runs",
-                        original["reserved_stream_id"],
-                    )
-                    # Raw response avoids dict conversion hiding duplicate stream fields.
-                    if entry:
-                        fields = entry[0][1]
-                        if (
-                            len(entry) != 1
-                            or entry[0][0] != original["reserved_stream_id"].encode()
-                            or len(fields) != 4
-                            or fields[::2] != [b"payload", b"protected_envelope"]
-                            or hashlib.sha256(fields[1]).hexdigest() != original["payload_sha256"]
-                            or hashlib.sha256(fields[3]).hexdigest() != original["envelope_sha256"]
-                            or fields[3] != envelope_raw
-                        ):
-                            raise AdmissionUnavailable()
-                        params["entry"] = [part.decode("utf-8") for part in fields]
-            else:
-                if request is None:
-                    raise AdmissionUnavailable()
-                turn = parse_queued_turn(request.queued_payload)
-                keys[6] = prefix + "binding:" + turn.event_id
-                if not match:
-                    params.update(
-                        mode="read",
-                        result=AdmissionResult(
-                            status="refused", reason="source_unavailable"
-                        ).as_dict(),
-                    )
-                else:
-                    manifest = self._authority(policy["runtime_id"], policy, None, keys, params)
-                    if manifest is None:
-                        params.update(
-                            mode="read",
-                            result=AdmissionResult(
-                                status="refused", reason=params["authority_reason"]
-                            ).as_dict(),
-                        )
-                    else:
-                        original = dict(
-                            schema_version=1,
-                            identity=identity.as_dict(),
-                            requested_tool_access=request.requested_tool_access,
-                            effective_tool_access="read-only",
-                            request_body_sha256=request.request_body_sha256,
-                            source_generation=policy["generation"],
-                            source_operation_id=policy["operation_id"],
-                            policy_fingerprint=policy_fingerprint(policy),
-                            manifest_digest=json.loads(params["controls"][0]["raw"])[
-                                "manifest_digest"
-                            ],
-                            runtime_id=manifest["runtime_id"],
-                            runtime_generation=manifest["runtime_generation"],
-                            qualification_id=manifest["qualification_id"],
-                            event_id=turn.event_id,
-                            conversation_id=turn.conversation_id,
-                            payload_sha256=hashlib.sha256(payload).hexdigest(),
-                        )
-                        envelope_raw = self._envelope(original, manifest).canonical_bytes
-                        original["envelope_sha256"] = hashlib.sha256(envelope_raw).hexdigest()
-                        params.update(mode="new", intent=original)
+            observed: list[tuple[str, int, bytes | None]] = []
+            try:
+                payload, envelope_raw = self._prepare(identity, request, keys, params, observed)
+            except Exception:
+                # Separate GETs can straddle a concurrent commit; refuse only a stable view.
+                if any(self._get(key, limit) != raw for key, limit, raw in observed):
+                    continue
+                raise
             raw_result = self._client.eval(
                 TRANSACTION, len(keys), *keys, _encode(params), payload, envelope_raw
             )
@@ -469,6 +227,270 @@ class AtomicAdmission:
                 raise AdmissionUnavailable()
             return AdmissionResult(**value)
         raise AdmissionUnavailable()
+
+    def _prepare(
+        self,
+        identity: DeliveryIdentity,
+        request: AdmissionRequest | None,
+        keys: list[str],
+        params: dict[str, Any],
+        observed: list[tuple[str, int, bytes | None]],
+    ) -> tuple[bytes, bytes]:
+        """Validate one multi-key read, @spec PROTECTED-HOOK-ADMISSION-4/5."""
+        prefix = "protected:admission:"
+        raws = [self._get(keys[i], 262144 if i == 3 else 16384) for i in range(5)]
+        observed.extend((keys[i], 262144 if i == 3 else 16384, raws[i]) for i in range(5))
+        for i, raw in enumerate(raws):
+            params["snapshots"].append(
+                dict(index=i + 1, raw=raw.decode("utf-8") if raw is not None else None)
+            )
+        original = parse_intent(raws[0]).as_dict() if raws[0] is not None else None
+        state = parse_state(raws[1]).as_dict() if raws[1] is not None else None
+        commit = parse_state(raws[2]).as_dict() if raws[2] is not None else None
+        if state is not None and state["status"] == "committed":
+            raise AdmissionUnavailable()
+        if original is None and (
+            state is not None or commit is not None or raws[3] is not None
+        ):
+            raise AdmissionUnavailable()
+        source: Any = None
+        if raws[4] is not None:
+            source_value = _decode(raws[4], 16384)
+            if (
+                type(source_value) is not dict
+                or set(source_value) != {"floor", "operation_id", "active"}
+                or (
+                    source_value["active"] is not None
+                    and (
+                        type(source_value["active"]) is not dict
+                        or set(source_value["active"])
+                        != {"generation", "operation_id", "mode", "policy_fingerprint"}
+                    )
+                )
+            ):
+                raise AdmissionUnavailable()
+            source = _decode_source(raws[4])
+        policy: Any = request.source_policy if request is not None else None
+        match = source is not None and source["active"] is not None
+        active: Any = source["active"] if match else None
+        expected = (
+            dict(
+                generation=policy["generation"],
+                operation_id=policy["operation_id"],
+                policy_fingerprint=policy_fingerprint(policy),
+            )
+            if policy is not None
+            else (
+                dict(
+                    generation=original["source_generation"],
+                    operation_id=original["source_operation_id"],
+                    policy_fingerprint=original["policy_fingerprint"],
+                )
+                if original
+                else None
+            )
+        )
+        match = bool(
+            match
+            and expected
+            and active
+            and active["mode"] == "protected"
+            and all(str(active[k]) == expected[k] for k in expected)
+        )
+        envelope_raw: bytes = b""
+        payload: bytes = request.queued_payload if request is not None else (raws[3] or b"")
+        if original is not None:
+            if original["identity"] != identity.as_dict():
+                raise AdmissionUnavailable()
+            keys[6] = prefix + "binding:" + original["event_id"]
+            binding = self._get(keys[6])
+            observed.append((keys[6], 16384, binding))
+            params["snapshots"].append(
+                dict(index=7, raw=binding.decode("utf-8") if binding is not None else None)
+            )
+            if binding is not None:
+                envelope = parse_envelope(binding)
+                if hashlib.sha256(binding).hexdigest() != original["envelope_sha256"]:
+                    raise AdmissionUnavailable()
+                ed = envelope.as_dict()
+                if (
+                    any(
+                        ed[k] != original[k]
+                        for k in (
+                            "event_id",
+                            "runtime_id",
+                            "runtime_generation",
+                            "manifest_digest",
+                            "qualification_id",
+                            "payload_sha256",
+                        )
+                    )
+                    or ed["source_revision"] != original["source_generation"]
+                    or ed["logical_conversation_key"] != original["conversation_id"]
+                ):
+                    raise AdmissionUnavailable()
+                envelope_raw = binding
+            if commit is not None:
+                if (
+                    state is not None
+                    and state["status"] == "failed"
+                    or binding is None
+                    or commit["status"] != "committed"
+                ):
+                    raise AdmissionUnavailable()
+                receipt = {
+                    k: v
+                    for k, v in original.items()
+                    if k
+                    not in {
+                        "created_at_ms",
+                        "deadline_ms",
+                        "reserved_stream_id",
+                        "envelope_sha256",
+                    }
+                }
+                receipt.update(
+                    stream_id=original["reserved_stream_id"],
+                    acceptance_status="accepted",
+                    tool_access="read-only",
+                )
+                if commit["receipt"] != receipt:
+                    raise AdmissionUnavailable()
+            conflict = request is not None and any(
+                (
+                    original["requested_tool_access"] != request.requested_tool_access,
+                    original["request_body_sha256"] != request.request_body_sha256,
+                    original["source_generation"] != policy["generation"],
+                    original["source_operation_id"] != policy["operation_id"],
+                    original["policy_fingerprint"] != policy_fingerprint(policy),
+                )
+            )
+            if conflict:
+                params.update(
+                    mode="read",
+                    result=AdmissionResult(
+                        status="conflict", reason="delivery_conflict"
+                    ).as_dict(),
+                )
+            elif commit is not None:
+                params.update(
+                    mode="read",
+                    result=AdmissionResult(
+                        status="duplicate", receipt=commit["receipt"]
+                    ).as_dict()
+                    if (request is None or match)
+                    else AdmissionResult(
+                        status="refused", reason="source_unavailable"
+                    ).as_dict(),
+                )
+            elif state is not None and state["status"] == "failed":
+                params.update(
+                    mode="read",
+                    result=AdmissionResult(status="failed", reason=state["reason"]).as_dict(),
+                )
+            elif (
+                request is not None
+                and hashlib.sha256(payload).hexdigest() != original["payload_sha256"]
+            ):
+                params.update(
+                    mode="read",
+                    result=AdmissionResult(
+                        status="conflict", reason="delivery_conflict"
+                    ).as_dict(),
+                )
+            else:
+                params.update(
+                    mode="recover",
+                    intent=original,
+                    attempts=state["recovery_attempts"] if state else 0,
+                )
+                manifest = (
+                    self._authority(original["runtime_id"], policy, original, keys, params)
+                    if match
+                    else None
+                )
+                if not match:
+                    params["authority_reason"] = "source_unavailable"
+                if not envelope_raw and manifest:
+                    envelope_raw = self._envelope(original, manifest).canonical_bytes
+                    if hashlib.sha256(envelope_raw).hexdigest() != original["envelope_sha256"]:
+                        raise AdmissionUnavailable()
+                if (
+                    payload
+                    and hashlib.sha256(payload).hexdigest() != original["payload_sha256"]
+                ):
+                    raise AdmissionUnavailable()
+                if (
+                    raws[3] is not None
+                    and hashlib.sha256(raws[3]).hexdigest() != original["payload_sha256"]
+                ):
+                    raise AdmissionUnavailable()
+                entry = self._client.eval(
+                    "-- @spec PROTECTED-HOOK-ADMISSION-5\n"
+                    "return redis.call('XRANGE',KEYS[1],ARGV[1],ARGV[1],'COUNT',1)",
+                    1,
+                    "curie:runs",
+                    original["reserved_stream_id"],
+                )
+                # Raw response avoids dict conversion hiding duplicate stream fields.
+                if entry:
+                    fields = entry[0][1]
+                    if (
+                        len(entry) != 1
+                        or entry[0][0] != original["reserved_stream_id"].encode()
+                        or len(fields) != 4
+                        or fields[::2] != [b"payload", b"protected_envelope"]
+                        or hashlib.sha256(fields[1]).hexdigest() != original["payload_sha256"]
+                        or hashlib.sha256(fields[3]).hexdigest() != original["envelope_sha256"]
+                        or fields[3] != envelope_raw
+                    ):
+                        raise AdmissionUnavailable()
+                    params["entry"] = [part.decode("utf-8") for part in fields]
+        else:
+            if request is None:
+                raise AdmissionUnavailable()
+            turn = parse_queued_turn(request.queued_payload)
+            keys[6] = prefix + "binding:" + turn.event_id
+            if not match:
+                params.update(
+                    mode="read",
+                    result=AdmissionResult(
+                        status="refused", reason="source_unavailable"
+                    ).as_dict(),
+                )
+            else:
+                manifest = self._authority(policy["runtime_id"], policy, None, keys, params)
+                if manifest is None:
+                    params.update(
+                        mode="read",
+                        result=AdmissionResult(
+                            status="refused", reason=params["authority_reason"]
+                        ).as_dict(),
+                    )
+                else:
+                    original = dict(
+                        schema_version=1,
+                        identity=identity.as_dict(),
+                        requested_tool_access=request.requested_tool_access,
+                        effective_tool_access="read-only",
+                        request_body_sha256=request.request_body_sha256,
+                        source_generation=policy["generation"],
+                        source_operation_id=policy["operation_id"],
+                        policy_fingerprint=policy_fingerprint(policy),
+                        manifest_digest=json.loads(params["controls"][0]["raw"])[
+                            "manifest_digest"
+                        ],
+                        runtime_id=manifest["runtime_id"],
+                        runtime_generation=manifest["runtime_generation"],
+                        qualification_id=manifest["qualification_id"],
+                        event_id=turn.event_id,
+                        conversation_id=turn.conversation_id,
+                        payload_sha256=hashlib.sha256(payload).hexdigest(),
+                    )
+                    envelope_raw = self._envelope(original, manifest).canonical_bytes
+                    original["envelope_sha256"] = hashlib.sha256(envelope_raw).hexdigest()
+                    params.update(mode="new", intent=original)
+        return payload, envelope_raw
 
     @staticmethod
     def _envelope(intent: dict[str, Any], manifest: dict[str, Any]) -> Envelope:
