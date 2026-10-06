@@ -311,8 +311,27 @@ def test_registration_commit_response_loss_consumes_pending_without_broker_conti
 def test_authoritative_ordinary_commit_response_loss_never_publishes_until_exact_replay(
     wire_source: Any,
 ) -> None:
-    """@spec PROTECTED-HOOK-SOURCE-3/6/10."""
+    """Starts from pending history: an absent row without history is 409.
+
+    @spec PROTECTED-HOOK-SOURCE-3/6/10.
+    """
     module = product()
+    pending = str(uuid.uuid4())
+    sql_dicts(
+        "INSERT INTO curie.hook_source_operations "
+        "(agent_id,hook,operation_id,generation,intent_sha256,status) "
+        "VALUES (:a,:h,:o,4,:intent,'pending')",
+        {
+            "a": uuid.UUID(wire_source["agent"]),
+            "h": HOOK,
+            "o": uuid.UUID(pending),
+            "intent": "b" * 64,
+        },
+    )
+    # @spec PROTECTED-HOOK-SOURCE-7/10: fake EXTERNAL record of that pending reservation.
+    wire_source["admin"].set(
+        wire_source["key"], json.dumps(dict(floor="4", operation_id=pending, active=None))
+    )
 
     async def scenario() -> None:
         """@spec PROTECTED-HOOK-SOURCE-3/6/10."""
@@ -328,15 +347,18 @@ def test_authoritative_ordinary_commit_response_loss_never_publishes_until_exact
             await asyncio.wait_for(relay.dropped.wait(), 2)
             before = await state(observer, wire_source)
             counter, policy, ledger = before
-            assert counter == 3 and policy[0]["generation"] == 1 and policy[0]["mode"] == "ordinary"
-            assert ledger[0]["status"] == "committed" and len(ledger) == 1
+            assert counter == 3 and policy[0]["generation"] == 5 and policy[0]["mode"] == "ordinary"
+            assert [(row["generation"], row["status"]) for row in ledger] == [
+                (4, "pending"),
+                (5, "committed"),
+            ]
             broker = await asyncio.to_thread(boundary.reader.read, wire_source["agent"], HOOK)
-            assert broker == dict(floor=1, operation_id=operation, active=None)
+            assert broker == dict(floor=5, operation_id=operation, active=None)
             assert (
                 boundary.reserve_calls == 1 and boundary.publish_calls == 0 and boundary.closed == 1
             )
             replay = await service.remove(wire_source["agent"], HOOK, "0", operation)
-            assert isinstance(replay, SourcePolicySnapshot) and replay.generation == 1
+            assert isinstance(replay, SourcePolicySnapshot) and replay.generation == 5
             assert await state(observer, wire_source) == before
             assert boundary.reserve_calls == 1 and boundary.publish_calls == 1
             broker = await asyncio.to_thread(boundary.reader.read, wire_source["agent"], HOOK)
@@ -344,7 +366,7 @@ def test_authoritative_ordinary_commit_response_loss_never_publishes_until_exact
             for field in ("agent_id", "operation_id", "generation", "legacy_generation"):
                 record[field] = str(record[field])
             assert broker["active"] == dict(
-                generation=1,
+                generation=5,
                 operation_id=operation,
                 mode="ordinary",
                 policy_fingerprint=policy_fingerprint(record),

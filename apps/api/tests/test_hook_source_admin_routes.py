@@ -1671,7 +1671,7 @@ async def second_agent(client: httpx.AsyncClient) -> str:
             "name": "acme-admin-" + uuid.uuid4().hex,
             "channel": {
                 "kind": "email",
-                "address": "admin@example.test",
+                "address": "admin-" + uuid.uuid4().hex[:12] + "@example.test",
                 "endpoint": "http://adapter.example.test",
                 "adapter": "mail",
             },
