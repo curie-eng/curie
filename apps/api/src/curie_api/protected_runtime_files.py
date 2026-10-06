@@ -170,7 +170,7 @@ def load_bootstrap(directory: str) -> RuntimeBootstrap:
         finally:
             os.close(directory_fd)
         return _parse_bootstrap(manifest_raw, ca_raw, bootstrap_raw)
-    except Exception:
+    except Exception:  # noqa: BLE001  Any read or parse failure is the one invalid runtime refusal.
         raise RuntimeFilesInvalid() from None
 
 
@@ -191,5 +191,5 @@ def load_administration(directory: str) -> AdministrationRuntime:
             os.close(directory_fd)
         bootstrap = _parse_bootstrap(manifest_raw, ca_raw, bootstrap_raw)
         return AdministrationRuntime(bootstrap, _parse_writer(writer_raw, bootstrap.credential))
-    except Exception:
+    except Exception:  # noqa: BLE001  Any read or parse failure is the one invalid runtime refusal.
         raise RuntimeFilesInvalid() from None

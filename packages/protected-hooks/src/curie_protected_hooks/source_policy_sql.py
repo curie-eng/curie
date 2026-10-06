@@ -90,7 +90,7 @@ class SourceGate:
             async with AsyncExitStack() as stack:
                 try:
                     connection = await stack.enter_async_context(self.engine.connect())
-                except Exception:
+                except Exception:  # noqa: BLE001  SQLAlchemy leaves some driver connect errors unwrapped (SOURCE-2).
                     # SQLAlchemy leaves some driver connect errors unwrapped (SOURCE-2).
                     raise SourceSnapshotUnavailable("source_gate_unavailable") from None
                 await connection.execution_options(isolation_level="READ COMMITTED")

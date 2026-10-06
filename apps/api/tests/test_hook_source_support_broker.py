@@ -541,7 +541,7 @@ def release_readers(held: list[Any]) -> None:
     for reader in held:
         try:
             reader.close()
-        except Exception:
+        except Exception:  # noqa: BLE001  Cleanup of held readers must not mask the test result.
             pass
     held.clear()
 

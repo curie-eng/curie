@@ -101,7 +101,7 @@ def trusted_ca_pem(ca_pem: str) -> str:
             raise BrokerMetadataUnavailable()
         if not x509.load_pem_x509_certificates(ca_pem.encode("ascii")):
             raise BrokerMetadataUnavailable()
-    except Exception:
+    except Exception:  # noqa: BLE001  Any certificate parse failure is the one unavailable refusal.
         raise BrokerMetadataUnavailable() from None
     return ca_pem
 
@@ -266,7 +266,7 @@ class _PinnedConnection(SSLConnection):
         if self._watchdog is not None:
             try:
                 self._watchdog.watch(sock)
-            except Exception:
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
                 raise ConnectionError("Broker metadata unavailable") from None
         secured: ssl.SSLSocket = super()._wrap_socket_with_ssl(sock)  # type: ignore[no-untyped-call]
         try:
@@ -464,7 +464,7 @@ class _PinnedWriterConnection(_PinnedConnection):
         """Handshake and authentication only, @spec PROTECTED-HOOK-SOURCE-6."""
         try:
             SSLConnection.on_connect_check_health(self, check_health=check_health)
-        except Exception:
+        except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
             self.disconnect()
             raise ConnectionError("Broker metadata unavailable") from None
 
@@ -538,7 +538,7 @@ class AuthenticatedSourceWriter:
             writer.__lock = Lock()
             writer.__closed = False
             return writer
-        except Exception:
+        except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
             if connection is not None:
                 connection.disconnect()
             raise BrokerMetadataUnavailable() from None
@@ -561,7 +561,7 @@ class AuthenticatedSourceWriter:
                 )
             except _FENCE_REFUSALS:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
                 self.__connection.disconnect()
                 raise BrokerMetadataUnavailable() from None
 
@@ -583,7 +583,7 @@ class AuthenticatedSourceWriter:
                 )
             except _FENCE_REFUSALS:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
                 self.__connection.disconnect()
                 raise BrokerMetadataUnavailable() from None
 
@@ -595,5 +595,5 @@ class AuthenticatedSourceWriter:
             self.__closed = True
             try:
                 self.__connection.disconnect()
-            except Exception:
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
                 raise BrokerMetadataUnavailable() from None

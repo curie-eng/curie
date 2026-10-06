@@ -137,7 +137,7 @@ class AdminSlot:
                     await asyncio.shield(waiting)
                 except asyncio.CancelledError:
                     continue
-                except BaseException:
+                except BaseException:  # noqa: BLE001  A cancelled wait drains on any outcome before cancellation re-raises.
                     break
             raise
 
@@ -423,7 +423,7 @@ async def tombstone_activation(
     """
     try:
         fingerprint = committed_policy_fingerprint(policy)
-    except Exception:
+    except Exception:  # noqa: BLE001  Any fingerprint failure fails the probe closed.
         return "closed", "authority_unavailable"
     if not directory:
         return "closed", "runtime_unavailable"

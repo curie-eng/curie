@@ -507,7 +507,7 @@ class Captured(logging.Handler):
         """@spec PROTECTED-HOOK-SOURCE-3."""
         try:
             self.lines.append(record.getMessage() + repr(record.__dict__))
-        except Exception:
+        except Exception:  # noqa: BLE001  A capturing log handler must never raise.
             self.lines.append(repr(record.__dict__))
 
 

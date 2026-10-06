@@ -110,7 +110,7 @@ def _parsed(parse: Any, raw: bytes | None) -> Any:
         return None
     try:
         return parse(raw)
-    except Exception:
+    except Exception:  # noqa: BLE001  A malformed record reads as absent.
         return None
 
 
@@ -265,7 +265,7 @@ async def evaluate_protected_support(
     """
     try:
         fingerprint = committed_policy_fingerprint(policy)
-    except Exception:
+    except Exception:  # noqa: BLE001  Any fingerprint failure fails the probe closed.
         raise SupportAuthorityUnavailable() from None
     if not directory:
         return ProtectedSupport("runtime_unavailable")
