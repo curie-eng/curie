@@ -2486,7 +2486,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Pin the reviewer model (forwarded as CURIE_REVIEWER_MODEL at boot)",
+              "help": "Pin the reviewer model used at boot",
               "id": "reviewer_model",
               "long": "reviewer-model",
               "positional": false,
@@ -2494,7 +2494,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Clear the reviewer model override back to the credential default",
+              "help": "Clear the reviewer model override",
               "id": "clear_reviewer_model",
               "long": "clear-reviewer-model",
               "positional": false,
@@ -5400,7 +5400,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Pin the reviewer model (forwarded as CURIE_REVIEWER_MODEL at boot)",
+              "help": "Pin the reviewer model used at boot",
               "id": "reviewer_model",
               "long": "reviewer-model",
               "positional": false,
@@ -5408,7 +5408,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Clear the reviewer model override back to the credential default",
+              "help": "Clear the reviewer model override",
               "id": "clear_reviewer_model",
               "long": "clear-reviewer-model",
               "positional": false,
