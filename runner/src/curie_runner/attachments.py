@@ -16,7 +16,8 @@ file ids and reason codes from the manifest never reach the model.
 
 No manifest (a worker older than ADR 0205, or a malformed env value) reads as
 "every file on disk arrived with this message", which is the behavior before
-the manifest existed.
+the manifest existed, and the status file is then ignored. With a manifest,
+status entries for names it does not list are ignored too.
 """
 
 from __future__ import annotations
@@ -28,11 +29,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from aci_protocol import BootEnv
+
 logger = logging.getLogger("curie_runner")
 
-# The optional boot env key the worker sets. It is runner-local, outside the
-# frozen ``SessionConfig``; absent means "no manifest", never "no files".
-MANIFEST_ENV = "CURIE_ATTACHMENTS_MANIFEST"
+# The optional boot env key the worker sets, declared once on ``BootEnv``. It is
+# outside the frozen ``SessionConfig``; absent means "no manifest", never "no
+# files".
+MANIFEST_ENV = BootEnv.env_key("attachments_manifest")
 
 # Written by ``attachments-init`` inside the mount. Hidden, so the directory
 # probe that discovers attachments never announces it as a file a person sent.
@@ -76,6 +80,9 @@ _GENERIC_PHRASE = "it could not be brought into this sandbox"
 _UNRECORDED = "unrecorded"
 
 _MAX_NAME_LENGTH = 255
+# The init container writes one short entry per file; anything far larger is
+# not its output.
+_MAX_STATUS_BYTES = 1024 * 1024
 
 
 def describe_reason(code: str) -> str:
@@ -90,11 +97,13 @@ def _safe_name(value: object) -> str | None:
     The mount is flat, so a name with a separator, a dot-prefix (hidden, never
     discovered) or a control character cannot be a file this sandbox holds.
     Rejecting rather than repairing keeps a crafted name from reaching a prompt.
+    A backtick is rejected too, so a name rendered as quoted data cannot close
+    its own quote.
     """
 
     if not isinstance(value, str) or not value or len(value) > _MAX_NAME_LENGTH:
         return None
-    if value.startswith(".") or "/" in value or "\\" in value:
+    if value.startswith(".") or any(ch in value for ch in "/\\`"):
         return None
     if any(not ch.isprintable() for ch in value):
         return None
@@ -220,8 +229,16 @@ def read_status(mount: Path | None) -> dict[str, FileStatus] | None:
     if mount is None:
         return None
     try:
-        raw = (mount / STATUS_FILE).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+        with (mount / STATUS_FILE).open("rb") as handle:
+            payload = handle.read(_MAX_STATUS_BYTES + 1)
+    except OSError:
+        return None
+    if len(payload) > _MAX_STATUS_BYTES:
+        logger.warning("attachment status file is over %d bytes; ignoring it", _MAX_STATUS_BYTES)
+        return None
+    try:
+        raw = payload.decode("utf-8")
+    except UnicodeDecodeError:
         return None
     data = _versioned(raw)
     entries = _dicts(data.get("files")) if data is not None else None
@@ -266,8 +283,10 @@ def reconcile(
     on_disk = [by_name[name] for name in expected if name in by_name]
     listed = {path.name for path in on_disk}
     # A file on disk that neither record names is still a file the agent can
-    # open; it is listed after the ones whose arrival order is known.
-    on_disk.extend(path for path in disk if path.name not in listed)
+    # open. It is listed after the manifested ones, so "current last" holds only
+    # among files whose arrival order the manifest records.
+    extras = [path for path in disk if path.name not in listed]
+    on_disk.extend(extras)
 
     current = tuple(
         by_name[name]
@@ -285,6 +304,16 @@ def reconcile(
         else:
             reason = unavailable_reason.get(name, _UNRECORDED)
         missing.append(MissingAttachment(name=name, reason=reason))
+    if missing and extras:
+        # Decision 4 makes the manifest name the on-disk name. A file reported
+        # missing beside an unmanifested one on disk usually means the two
+        # disagree (normalization, a renaming substrate), not a lost file.
+        logger.warning(
+            "attachment manifest names %d file(s) absent from disk while %d "
+            "unmanifested file(s) are present; the names may disagree",
+            len(missing),
+            len(extras),
+        )
 
     accounted = set(expected) | set(by_name)
     omitted = tuple(name for name in _dedupe(manifest.omitted) if name not in accounted)
