@@ -144,6 +144,22 @@ def test_approval_create_failure_renders_the_refusal_as_details() -> None:
     assert "```" not in body
 
 
+def test_approval_create_snapshot_mismatch_renders_one_details_line() -> None:
+    # #4121: the kernel's snapshot-failure detail names both commits.
+    detail = (
+        "publication snapshot failed: workspace publication-validation failed: "
+        "snapshot commit 0123456789ab does not match sanitized base fedcba987654"
+    )
+    body = result_section("approval_create_failed", pr_url=None, detail=detail)
+    details = [line for line in body.splitlines() if line.startswith("Details:")]
+    assert len(details) == 1
+    assert "snapshot commit" in details[0]
+    assert "0123456789ab" in details[0]
+    assert "fedcba987654" in details[0]
+    assert "does not match sanitized base" in details[0]
+    assert body.endswith("Cause: approval_create_failed\n")
+
+
 def test_approval_create_refusal_with_hostile_characters_is_inert() -> None:
     refusal = (
         "publication.required_python_ci_unselected: path acme/a.py\n"
