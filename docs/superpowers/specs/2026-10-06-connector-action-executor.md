@@ -58,7 +58,8 @@ authorizes first (`_authorize_undo`, ADR 0117 decision 3), then refuses on
 already undone, unsuccessful, irreversible, unobserved (`observed_state`
 absent), uncomparable and conflict (`observed_state != post_state`). Every
 refusal goes through `_refuse`, which commits an audit row. On success
-`apps/api/src/curie_api/crud/actions.py::claim_action_undo` sets `undone_at` at
+the former `claim_action_undo` helper in `apps/api/src/curie_api/crud/actions.py` (removed when task 4
+made the ruling create an execution) set `undone_at` at
 authorization time, an audit row records `{"restoring": prior_state}`, and
 `apps/api/src/curie_api/schemas/actions.py::ActionUndoOut` returns the cleartext
 `target` and `prior_state`. The conflict refusal stores both states in
