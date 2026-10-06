@@ -18,7 +18,7 @@ from curie_worker.binding import (
     ResolvedDeployment,
 )
 from curie_worker.config import WorkerConfig
-from curie_worker.sandbox_token import verify
+from curie_internal.sandbox_token import verify
 
 _AGENT = uuid.UUID("11111111-1111-4111-8111-111111111111")
 _KEY = "test-api-key"
