@@ -78,6 +78,7 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
     "cause",
     [
         "model_credit_exhausted",
+        "model_usage_limited",
         "model_credential_rejected",
         "model_rate_limited",
         "model_error",
@@ -1798,3 +1799,33 @@ def test_an_issue_originated_notice_still_comments_on_the_issue(admitted: Any) -
     posts = _posts(sink)
     assert [path for path, _ in posts] == [f"/repos/{REPO}/issues/{number}/comments"]
     assert marker_for(row["id"]) in (posts[0][1] or "")
+
+
+
+def test_factory_notices_usage_limited_finish_posts_the_reset_remedy_once(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9214
+    _label(client, github, number)
+    row = _request(number)
+    epoch = _start_running(row["id"])
+    finished = client.post(
+        f"/v1/internal/work-items/requests/{row['id']}/finish",
+        headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
+        json={
+            "runtime_epoch": epoch, "outcome": "failed", "cause": "model_usage_limited",
+            "detail": "You've hit your session limit · resets 3pm (UTC)",
+        },
+    )
+    assert finished.status_code == 200, finished.text
+    assert _request(number)["terminal_cause"] == "model_usage_limited"
+    _reconcile()
+    _reconcile()
+    assert sink.posts == 1
+    body = sink.comments[0]["body"]
+    assert "the model provider's usage limit for this credential was reached" in body
+    assert "re-add the label after the limit resets" in body
+    assert "add credits" not in body
+    assert "Cause: model_usage_limited" in body
+    assert "Failure class: model-usage-limited" in body
