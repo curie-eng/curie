@@ -351,7 +351,11 @@ fn reviewer_model_set_inspect_clear_and_sibling_write_round_trip_at_both_tiers()
         assert_eq!(inspected["reviewer_model"], REVIEWER_MODEL_SENTINEL);
         assert_eq!(inspected["changed"], false);
         assert_eq!(
-            server.recorded().iter().filter(|r| r.method == "PATCH").count(),
+            server
+                .recorded()
+                .iter()
+                .filter(|r| r.method == "PATCH")
+                .count(),
             1,
             "inspection must not write"
         );

@@ -84,6 +84,10 @@ _CAUSE_TEXT = {
         "the model provider refused the request because the account has run "
         "out of credits. Add credits or raise the key's limit, then retry."
     ),
+    "model_usage_limited": (
+        "the model provider's usage limit for this credential was reached; "
+        "re-add the label after the limit resets."
+    ),
     "model_credential_rejected": (
         "the model provider rejected the configured API key. Check the model "
         "credential, then retry."
@@ -174,6 +178,7 @@ _FAILURE_CLASS_BY_CAUSE = {
     "max_turns": "max-turns",
     "history_capacity": "history-persistence-error",
     "model_credit_exhausted": "model-credit-exhausted",
+    "model_usage_limited": "model-usage-limited",
     "model_credential_rejected": "model-credential-rejected",
     "model_rate_limited": "rate-limit",
     "model_error": "server-error",

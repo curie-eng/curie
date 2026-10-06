@@ -1,7 +1,7 @@
 ---
 name: plan-reviewer
 description: Strict read-only review of an implementation plan for one GitHub issue. Returns a literal VERDICT line. Called by the implement-issue skill in phase plan_review.
-model: anthropic/claude-opus-5.5
+model: opus
 tools: Read, Grep, Glob
 ---
 

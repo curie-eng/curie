@@ -1464,8 +1464,10 @@ def test_reads_reviewer_model_settings_for_eval_boots_by_agent_id() -> None:
                             "thinking = :thinking WHERE id = :id"
                         ),
                         {
-                            "model": "agent_model", "reviewer_model": "acme-reviewer-model",
-                            "thinking": "high", "id": agent_id,
+                            "model": "agent_model",
+                            "reviewer_model": "acme-reviewer-model",
+                            "thinking": "high",
+                            "id": agent_id,
                         },
                     )
 
@@ -1481,7 +1483,8 @@ def test_reads_reviewer_model_settings_for_eval_boots_by_agent_id() -> None:
                     await conn.execute(
                         text(
                             f"UPDATE {_SCHEMA}.agents "
-                            "SET model = NULL, reviewer_model = NULL, thinking = NULL WHERE id = :id"
+                            "SET model = NULL, reviewer_model = NULL, "
+                            "thinking = NULL WHERE id = :id"
                         ),
                         {"id": agent_id},
                     )

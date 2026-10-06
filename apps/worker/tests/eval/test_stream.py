@@ -102,8 +102,11 @@ class _StubRepo:
     """The B1 repo lookup, stubbed: a channel/agent resolves to a GitHub repo."""
 
     def __init__(
-        self, *, model: str | None = None, reviewer_model: str | None = None,
-        thinking: str | None = None
+        self,
+        *,
+        model: str | None = None,
+        reviewer_model: str | None = None,
+        thinking: str | None = None,
     ) -> None:
         self._model = model
         self._reviewer_model = reviewer_model
@@ -1447,7 +1450,7 @@ def test_eval_boot_env_mints_runner_token() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert env.get(RUNNER_TOKEN_ENV), "_boot_env must mint a non-empty runner token"
 
 
@@ -1468,7 +1471,7 @@ def test_eval_lane_boot_env_omits_memory_ref() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert "CURIE_MEMORY_REF" not in env
     assert "CURIE_MEMORY_TOKEN" not in env
     assert "CURIE_HISTORY_REF" not in env
@@ -1492,7 +1495,7 @@ def test_eval_boot_env_forwards_sha_as_bundle_version() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert env["CURIE_BUNDLE_VERSION"] == "deadbeef"
     assert env[BUNDLE_REF_ENV] == "bundles/x.zip"
 
@@ -1514,14 +1517,16 @@ def test_eval_requested_model_boots_and_tags_that_model() -> None:
     item = _item(
         suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None, model="claude-x"
     )
-    env = consumer._boot_env(item, None, None, model="claude-x")
+    env = consumer._boot_env(item, None, None, model="claude-x", reviewer_model=None)
     assert env[MODEL_ENV] == "claude-x"  # requested model wins over worker default
     assert consumer._eval_model(item, "claude-x") == "claude-x"
 
     # No requested model: the worker default is booted and tagged, as before.
     default_item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
     assert (
-        consumer._boot_env(default_item, None, None, model="worker-default")[MODEL_ENV]
+        consumer._boot_env(
+            default_item, None, None, model="worker-default", reviewer_model=None
+        )[MODEL_ENV]
         == "worker-default"
     )
     assert consumer._eval_model(default_item, "worker-default") == "worker-default"
@@ -1582,7 +1587,9 @@ def test_eval_fake_model_install_refuses_to_label_a_model_never_called(
     # A fake run with no requested model is unlabelled too (not the worker default,
     # which the fake session never calls either).
     default_item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    default_env = consumer._boot_env(default_item, None, None, model="stored_model")
+    default_env = consumer._boot_env(
+        default_item, None, None, model="stored_model", reviewer_model=None
+    )
     assert default_env[MODEL_ENV] == "stored_model"
     assert consumer._eval_model(default_item, "stored_model") is None
 
@@ -1643,7 +1650,10 @@ def test_eval_claim_creation_is_bounded_to_one_by_default() -> None:
 
     async def go() -> None:
         await asyncio.gather(
-            *(consumer._acquire_target(item, model=None, thinking=None) for item in items)
+            *(
+                consumer._acquire_target(item, model=None, reviewer_model=None, thinking=None)
+                for item in items
+            )
         )
 
     asyncio.run(go())
@@ -1672,7 +1682,10 @@ def test_eval_claim_creation_bound_admits_configured_parallelism() -> None:
 
     async def go() -> None:
         await asyncio.gather(
-            *(consumer._acquire_target(item, model=None, thinking=None) for item in items)
+            *(
+                consumer._acquire_target(item, model=None, reviewer_model=None, thinking=None)
+                for item in items
+            )
         )
 
     asyncio.run(go())
@@ -1939,6 +1952,7 @@ def test_eval_boot_env_drops_reserved_connector_secret() -> None:
         },
         None,
         model=None,
+        reviewer_model=None,
     )
     # The reserved model-credential key never carries the injected value.
     assert env.get("ANTHROPIC_BASE_URL") != "http://evil"

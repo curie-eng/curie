@@ -547,11 +547,12 @@ class EvalStreamConsumer(StreamConsumer):
             )
 
         suite = loaded.suite
+        reviewer_model: str | None = None
         thinking: str | None = None
         runner_resources: dict[str, Any] | None = None
         if item.target_url is None:
-            stored_model, thinking, runner_resources = await self._repo_lookup.model_settings_for(
-                item.agent_id
+            stored_model, reviewer_model, thinking, runner_resources = (
+                await self._repo_lookup.model_settings_for(item.agent_id)
             )
             resolved_model = (
                 item.model
@@ -589,6 +590,7 @@ class EvalStreamConsumer(StreamConsumer):
         base_url, release_key, token = await self._acquire_target(
             item,
             model=resolved_model,
+            reviewer_model=reviewer_model,
             thinking=thinking,
             runner_resources=runner_resources,
         )
@@ -708,6 +710,7 @@ class EvalStreamConsumer(StreamConsumer):
         item: EvalJob,
         *,
         model: str | None,
+        reviewer_model: str | None,
         thinking: str | None,
         runner_resources: dict[str, Any] | None = None,
     ) -> tuple[str | None, str | None, str | None]:
@@ -720,7 +723,9 @@ class EvalStreamConsumer(StreamConsumer):
             connector_secrets = await self._repo_lookup.secrets_for(item.agent_id)
             name_for = getattr(self._repo_lookup, "name_for", None)
             agent_name = await name_for(item.agent_id) if name_for is not None else None
-            env = self._boot_env(item, connector_secrets, thinking, model=model)
+            env = self._boot_env(
+                item, connector_secrets, thinking, model=model, reviewer_model=reviewer_model
+            )
             # Hold a claim slot only across creation/binding (the flood source),
             # not the whole suite run: the semaphore is released the moment the
             # claim binds, so the bound sandbox runs its cases while the next
@@ -773,6 +778,7 @@ class EvalStreamConsumer(StreamConsumer):
         thinking: str | None,
         *,
         model: str | None,
+        reviewer_model: str | None,
     ) -> dict[str, str]:
         budget = Budget(
             max_output_tokens_per_run=self._config.default_max_output_tokens_per_run,
@@ -802,6 +808,7 @@ class EvalStreamConsumer(StreamConsumer):
             env,
             self._config,
             model_override=model,
+            reviewer_model_override=reviewer_model,
             thinking_override=thinking,
         )
         return env

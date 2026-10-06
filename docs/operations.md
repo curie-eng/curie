@@ -1226,8 +1226,8 @@ A last `Cause:` line names the platform cause code
 `owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
 `no_pull_request`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
-classified run failure: `model_credit_exhausted`, `model_credential_rejected`,
-`model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`,
+classified run failure: `model_credit_exhausted`, `model_usage_limited`,
+`model_credential_rejected`, `model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`,
 `sandbox_terminated`, `workspace_error`, or `history_capacity`). A sandbox
 termination includes the Kubernetes reason and, for an EmptyDir eviction, the
 volume limit in a `Details:` line. When the cause has a runner failure
@@ -1242,8 +1242,14 @@ Other escalations use that same first line with their own token
 A history capacity result tells the
 operator to inspect work already done and retry. A model provider that answers
 HTTP 402 or reports exhausted
-credits ends the run as `model_credit_exhausted` without retrying. A run that a
-relabel replaced ends with `Stopped: the label was added again, so a new run
+credits, including an OpenRouter key's HTTP 403 spend limit, ends the run as
+`model_credit_exhausted` without retrying. An SDK `rate_limit` error or a
+subscription session, weekly or model usage limit ends the run as
+`model_usage_limited` with failure class `model-usage-limited`, without retrying.
+The status comment says that the model provider's usage limit for the credential
+was reached; re-add the factory label after the limit resets. Ordinary usage
+warnings and rejected rate-limit events keep their existing behavior. A run that
+a relabel replaced ends with `Stopped: the label was added again, so a new run
 replaced this one.`, and the new run gets its own status comment. The
 work item reconciler writes the result after the terminal row and any
 publication lineage commit. A refused create or edit is recorded on the status

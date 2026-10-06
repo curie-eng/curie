@@ -924,6 +924,17 @@
             ],
             "title": "Repo Full Name"
           },
+          "reviewer_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewer Model"
+          },
           "secrets": {
             "anyOf": [
               {
@@ -1120,6 +1131,17 @@
             ],
             "title": "Repo Full Name"
           },
+          "reviewer_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewer Model"
+          },
           "runner_resources": {
             "anyOf": [
               {
@@ -1179,6 +1201,7 @@
           "repo_full_name",
           "behavior_packs",
           "model",
+          "reviewer_model",
           "thinking",
           "approval_required_tools",
           "approval_routes",
@@ -1372,6 +1395,17 @@
               }
             ],
             "title": "Repo Full Name"
+          },
+          "reviewer_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewer Model"
           },
           "runner_resources": {
             "anyOf": [

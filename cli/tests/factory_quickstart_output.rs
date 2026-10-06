@@ -1283,7 +1283,10 @@ fn factory_quickstart_direct_anthropic_keeps_every_explicit_model_including_the_
         assert_eq!(ready["phase"], "ready");
         let values: Value =
             serde_json::from_slice(&fs::read(fixture.dir.path().join("values")).unwrap()).unwrap();
-        assert_eq!(values.pointer("/agentSandbox/runner/model"), Some(&json!(model)));
+        assert_eq!(
+            values.pointer("/agentSandbox/runner/model"),
+            Some(&json!(model))
+        );
         assert!(fixture.openrouter.recorded().is_empty());
     }
 }
@@ -1318,7 +1321,11 @@ fn factory_quickstart_invalid_model_credential_never_installs_or_checks_credit()
             .stdin(Stdio::null())
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(2), "invalid credential is a usage error");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "invalid credential is a usage error"
+        );
         assert!(helm_upgrade_calls(&fixture).is_empty());
         assert!(namespace_mutations(&fixture).is_empty());
         assert!(fixture.openrouter.recorded().is_empty());
@@ -1439,6 +1446,54 @@ fn a_saved_key_is_not_checked_when_the_release_keeps_its_recorded_credential() {
             .any(|bearer| bearer == &format!("Bearer {SAVED_KEY}")),
         "the saved key was checked although the release keeps its own: {bearers:?}"
     );
+}
+
+#[test]
+fn factory_quickstart_rerun_preserves_the_recorded_native_model_without_a_local_credential() {
+    let fixture = Fixture::new();
+    let mut values: Value =
+        serde_json::from_slice(&fs::read(fixture.dir.path().join("values")).unwrap()).unwrap();
+    values["agentSandbox"]["runner"]["fakeModel"] = json!(false);
+    values["agentSandbox"]["runner"]["model"] = json!("claude-sonnet-5-5");
+    fixture.record_values(values);
+
+    let output = fixture
+        .command(true, &["--context", "acme-cluster", "--json"])
+        .env_remove("CURIE_CREDENTIALS")
+        .env_remove("CURIE_MODEL_CREDENTIALS")
+        .env("CURIE_CONFIG_DIR", fixture.dir.path().join("cfg"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ready: Value = serde_json::from_slice(&output.stdout).expect("one ready JSON object");
+    assert_eq!(ready["phase"], "ready");
+    let upgrades = helm_upgrade_calls(&fixture);
+    assert_eq!(
+        upgrades.len(),
+        1,
+        "only the merged intake upgrade is needed"
+    );
+    assert!(
+        upgrades[0].iter().any(|arg| arg == "--reuse-values"),
+        "the existing release must be reused: {upgrades:?}"
+    );
+    assert!(
+        !upgrades[0].iter().any(|arg| arg == "--install"),
+        "a credential-free rerun must not replace the native model: {upgrades:?}"
+    );
+    let recorded: Value =
+        serde_json::from_slice(&fs::read(fixture.dir.path().join("values")).unwrap()).unwrap();
+    assert_eq!(
+        recorded.pointer("/agentSandbox/runner/model"),
+        Some(&json!("claude-sonnet-5-5"))
+    );
+    assert!(fixture.openrouter.recorded().is_empty());
 }
 
 #[test]

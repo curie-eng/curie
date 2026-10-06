@@ -71,6 +71,7 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
         "ledger-error",
         "model-credential-rejected",
         "model-credit-exhausted",
+        "model-usage-limited",
         "approval-not-acted",
         "false-completion",
         "publication-unrecorded",
@@ -110,6 +111,17 @@ _CREDIT_EXHAUSTED_TEXT = re.compile(
     r"|(?:credit|spend|usage) limit|key limit exceeded|(?:more|out of|no) credits",
     re.IGNORECASE,
 )
+# SDK 0.2.159 bundles Claude Code 2.1.281. Its nFn/oFn/_h formatters emit
+# these terminal subscription refusals, optionally with reset/progress text.
+# Match the emitted phrase, not advisory usage percentages or financial limits.
+USAGE_LIMITED_CLASSIFICATION = "model-usage-limited"
+_USAGE_LIMITED_TEXT = re.compile(
+    r"\b(?:You've hit your (?:(?:session|weekly|Opus|Sonnet|Fable|usage) )?limit"
+    r"|You've reached your Fable limit\."
+    r"|Usage limit reached)"
+    r"(?: · resets [^\n·]+)?(?: · progress saved)?\s*$",
+    re.IGNORECASE,
+)
 # Longest provider message carried on the error event.
 _PROVIDER_TEXT_MAX = 600
 
@@ -135,9 +147,8 @@ def _redact_and_clip(text: str) -> str:
     return text
 
 
-# Tools that run a subagent. Its model errors never reach the runner as an
-# errored AssistantMessage (forward_subagent_text is off); they surface only as
-# this call's error result (#3935).
+# Tools that run a subagent. Provider refusals can surface as either a forwarded
+# errored AssistantMessage or this call's error result (#3935/#3937).
 _SUBAGENT_TOOLS = frozenset({"Agent", "Task"})
 
 
@@ -159,6 +170,18 @@ def _is_credit_exhausted(error: str, provider_text: str) -> bool:
     return error == _BILLING_SDK_CODE or bool(_CREDIT_EXHAUSTED_TEXT.search(provider_text))
 
 
+def _is_usage_limited(error: str, provider_text: str) -> bool:
+    return error == "rate_limit" or bool(_USAGE_LIMITED_TEXT.search(provider_text))
+
+
+def is_usage_refusal(message: AssistantMessage) -> bool:
+    """True when an errored assistant message reports a terminal usage limit."""
+
+    return bool(message.error) and _is_usage_limited(
+        message.error or "", _provider_error_text(message)
+    )
+
+
 def is_credit_refusal(message: AssistantMessage) -> bool:
     """True when an errored assistant message reports exhausted provider credit."""
 
@@ -178,6 +201,9 @@ class TurnState:
     # Runner-internal latch, not a wire field (#3935): set once credit
     # exhaustion is classified so a later recoverable error cannot mask it.
     credit_exhausted: bool = False
+    # Subscription windows cannot be fixed by retrying. This latch outranks
+    # credit and recoverable failures until the terminal result (#4120).
+    usage_limited: bool = False
     # The summary passed to the approval-request tool (ADR-0010), captured off
     # the ToolUseBlock so the session can end the turn awaiting-approval. None
     # when no approval was requested this turn.
@@ -333,7 +359,10 @@ def _translate_assistant(
     error = getattr(message, "error", None)
     if error:
         provider_text = _provider_error_text(message)
-        if _is_credit_exhausted(error, provider_text):
+        if _is_usage_limited(error, provider_text):
+            mapped = USAGE_LIMITED_CLASSIFICATION
+            state.usage_limited = True
+        elif _is_credit_exhausted(error, provider_text):
             mapped = CREDIT_EXHAUSTED_CLASSIFICATION
             state.credit_exhausted = True
         else:
@@ -470,12 +499,21 @@ def _translate_user(
                 (block.tool_use_id, called, block.is_error is True, unknown_marker)
             )
             if called in _SUBAGENT_TOOLS and block.is_error is True:
-                # A subagent's provider 402 is terminal for the turn even when
-                # the parent recovers from it (#3935). It overrides an earlier
-                # recoverable classification, but a second credit result emits
-                # no duplicate ErrorEvent.
+                # A reviewer refusal is terminal even if the parent recovers.
+                # Subscription limits take precedence over financial limits,
+                # and repeat results do not emit duplicate refusal events.
                 sub_text = _result_text(block.content)
-                if _CREDIT_EXHAUSTED_TEXT.search(sub_text):
+                if _is_usage_limited("", sub_text):
+                    state.usage_limited = True
+                    if state.error_classification != USAGE_LIMITED_CLASSIFICATION:
+                        state.error_classification = USAGE_LIMITED_CLASSIFICATION
+                        events.append(
+                            ErrorEvent(
+                                message=f"subagent model error: {_redact_and_clip(sub_text)}",
+                                classification=USAGE_LIMITED_CLASSIFICATION,
+                            )
+                        )
+                elif _CREDIT_EXHAUSTED_TEXT.search(sub_text):
                     state.credit_exhausted = True
                     if state.error_classification != CREDIT_EXHAUSTED_CLASSIFICATION:
                         state.error_classification = CREDIT_EXHAUSTED_CLASSIFICATION
@@ -545,20 +583,28 @@ def _loads_object(raw: object) -> tuple[dict[str, object] | None, bool]:
     return (parsed if isinstance(parsed, dict) else None), False
 
 
-def _restore_credit_error(state: TurnState) -> list[OutboundEvent]:
-    """Re-emit the credit classification when a later error replaced it (#3935).
+def _restore_provider_error(state: TurnState) -> list[OutboundEvent]:
+    """Re-emit a latched provider refusal when a later error replaced it.
 
     The worker keeps the classification of the last ErrorEvent, so a latched
-    credit refusal must be the last one before the Final.
+    refusal must be the last one before the Final. Usage outranks credit.
     """
 
-    if not state.credit_exhausted or state.error_classification == CREDIT_EXHAUSTED_CLASSIFICATION:
+    if state.usage_limited:
+        classification = USAGE_LIMITED_CLASSIFICATION
+        message = "model usage limit reached earlier in the turn"
+    elif state.credit_exhausted:
+        classification = CREDIT_EXHAUSTED_CLASSIFICATION
+        message = "model credit exhausted earlier in the turn"
+    else:
         return []
-    state.error_classification = CREDIT_EXHAUSTED_CLASSIFICATION
+    if state.error_classification == classification:
+        return []
+    state.error_classification = classification
     return [
         ErrorEvent(
-            message="model credit exhausted earlier in the turn",
-            classification=CREDIT_EXHAUSTED_CLASSIFICATION,
+            message=message,
+            classification=classification,
         )
     ]
 
@@ -571,7 +617,17 @@ def _translate_result(
     if message.is_error or subtype.startswith("error"):
         text = message.result or "run failed"
         events: list[OutboundEvent] = []
-        if state.error_classification is None:
+        if _is_usage_limited(subtype, text):
+            state.usage_limited = True
+            if state.error_classification != USAGE_LIMITED_CLASSIFICATION:
+                state.error_classification = USAGE_LIMITED_CLASSIFICATION
+                events.append(
+                    ErrorEvent(
+                        message=_redact_and_clip(text),
+                        classification=USAGE_LIMITED_CLASSIFICATION,
+                    )
+                )
+        elif state.error_classification is None:
             raw = subtype or "server-error"
             known = _RESULT_SUBTYPE_CLASSIFICATIONS.get(raw)
             mapped = known or map_error_classification(raw)
@@ -583,16 +639,15 @@ def _translate_result(
                     classification=mapped,
                 )
             )
-        events.extend(_restore_credit_error(state))
+        events.extend(_restore_provider_error(state))
         events.append(Final(text=text, status=SessionStatus.CLASSIFIED_FAILURE))
         return events
 
-    if state.credit_exhausted:
-        # #3935: a credit refusal anywhere in the turn, including a reviewer
-        # subagent the parent recovered from, is terminal. The worker maps
-        # the last ErrorEvent to model_credit_exhausted.
+    if state.usage_limited or state.credit_exhausted:
+        # A provider refusal anywhere in the turn, including a reviewer the
+        # parent recovered from, is terminal. Keep its last ErrorEvent truthful.
         return [
-            *_restore_credit_error(state),
+            *_restore_provider_error(state),
             Final(
                 text=message.result or state.assistant_text,
                 status=SessionStatus.CLASSIFIED_FAILURE,

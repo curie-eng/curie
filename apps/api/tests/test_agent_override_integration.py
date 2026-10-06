@@ -404,3 +404,21 @@ def test_patch_rejects_out_of_range_and_keeps_the_stored_value(
     resp = _patch(client, auth_headers, agent["id"], {"execution_deadline_seconds": value})
     assert resp.status_code == 422, resp.text
     assert _read(client, auth_headers, agent["id"])["execution_deadline_seconds"] == 90
+
+
+
+def test_reviewer_model_omission_and_clear_preserve_the_implementer_override(
+    client: Any, auth_headers: dict[str, str], clean_db: None,
+) -> None:
+    agent = _create_agent(
+        client, auth_headers, name="acme-reviewer-override", address="C0EXAMPLE1",
+        model="acme-implementer-model", reviewer_model="acme-reviewer-model",
+    )
+    renamed = _patch(client, auth_headers, agent["id"], {"name": "acme-renamed"})
+    assert renamed.status_code == 200, renamed.text
+    assert _read(client, auth_headers, agent["id"])["reviewer_model"] == "acme-reviewer-model"
+    cleared = _patch(client, auth_headers, agent["id"], {"reviewer_model": None})
+    assert cleared.status_code == 200, cleared.text
+    stored = _read(client, auth_headers, agent["id"])
+    assert stored["reviewer_model"] is None
+    assert stored["model"] == "acme-implementer-model"

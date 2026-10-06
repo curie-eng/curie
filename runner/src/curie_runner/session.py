@@ -85,7 +85,7 @@ from .tool_access import (
     TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
     TurnToolAccess,
 )
-from .translate import TurnState, is_credit_refusal, translate_message
+from .translate import TurnState, is_credit_refusal, is_usage_refusal, translate_message
 from .turn_progress import ProgressCapability, TurnProgress
 from .usage_report import UsageSink
 
@@ -171,11 +171,13 @@ def _is_auth_rejection(message: object) -> bool:
 
     A 403 whose text is a credit refusal, such as an OpenRouter key at its own
     spend limit, is not one: translation classifies it credit-exhausted (#4104).
+    Subscription usage refusals also keep their own terminal classification.
     """
 
     return (
         isinstance(message, AssistantMessage)
         and getattr(message, "error", None) == _AUTH_REJECTION_SDK_CODE
+        and not is_usage_refusal(message)
         and not is_credit_refusal(message)
     )
 
@@ -1573,6 +1575,25 @@ class SessionRunner:
                     self._primary_model = getattr(message, "model", None) or None
                 if self._usage_reporter is not None:
                     self._usage_reporter.observe(message)
+            if state.usage_limited and not isinstance(message, ResultMessage):
+                # Stop on the refusal's own iteration, before the SDK retries
+                # or the parent continues after a failed reviewer. Interrupt
+                # failure cannot turn a terminal usage refusal into runner-error.
+                with contextlib.suppress(Exception):
+                    await self._session.interrupt()
+                self._set_failed(gen)
+                self._turn_open = False
+                self._turn_ready = False
+                self._status = SessionStatus.CLASSIFIED_FAILURE
+                for outbound in events:
+                    yield to_ndjson_line(outbound)
+                yield to_ndjson_line(
+                    Final(
+                        text="run failed: model provider usage limit reached",
+                        status=SessionStatus.CLASSIFIED_FAILURE,
+                    )
+                )
+                return
             if isinstance(message, ResultMessage):
                 terminal_reason = getattr(message, "terminal_reason", None)
                 cancelled = self._interrupt_requested and not self._timeout_requested

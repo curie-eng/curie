@@ -21,13 +21,14 @@ use crate::ui::DryRunPlan;
 
 pub const DEFAULT_KIND_NAME: &str = "curie-factory";
 pub const DEFAULT_MODEL: &str = "z-ai/glm-5.3-flash";
+pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-5-5";
 pub const DEFAULT_DEADLINE_SECONDS: u32 = 3600;
 pub const DEFAULT_BUDGET_USD: f64 = 5.0;
 pub const AGENT_NAME: &str = "dark-factory";
 pub const GVISOR_OFF_SET: &str = "security.gvisor.mode=off";
 pub const POLL_INTAKE: &str = "poll";
-/// The model the factory's plan and diff reviewers run. It must match the
-/// dark-factory bundle's `progress/phases.json` and agent frontmatter.
+/// Display model matching the dark-factory bundle's `progress/phases.json`.
+/// The runner resolves the reviewers' Opus alias from the credential and override.
 pub const REVIEWER_MODEL: &str = "anthropic/claude-opus-5.5";
 /// The OpenRouter credit one factory run should have available (#3935).
 pub const RUN_CREDIT_USD: f64 = 5.0;
@@ -42,7 +43,7 @@ pub struct QuickstartOpts {
     pub release: String,
     pub org: Option<String>,
     pub kind_name: String,
-    pub model: String,
+    pub model: Option<String>,
     pub execution_deadline_seconds: u32,
     pub budget_usd: f64,
     pub chart: String,
@@ -296,15 +297,31 @@ pub fn validate_repo(repo: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_openrouter_key(key: &str) -> Result<()> {
-    if key.starts_with("sk-or-") && key.len() > "sk-or-".len() {
+pub fn validate_model_credential(key: &str) -> Result<()> {
+    if ["sk-or-", "sk-ant-"]
+        .iter()
+        .any(|prefix| key.starts_with(*prefix) && key.len() > prefix.len())
+    {
         return Ok(());
     }
     Err(
-        CliError::usage("the model credential is not an OpenRouter key")
-            .with_fix("set CURIE_CREDENTIALS to an OpenRouter key starting with sk-or-")
+        CliError::usage("the model credential is not an Anthropic or OpenRouter credential")
+            .with_fix("set CURIE_CREDENTIALS to an Anthropic API key starting with sk-ant- or an OpenRouter key starting with sk-or-")
             .into(),
     )
+}
+
+/// Preserve an explicit model, otherwise select the effective credential's default.
+pub fn quickstart_model(model: Option<&str>, credential: Option<&str>) -> String {
+    model
+        .unwrap_or_else(|| {
+            if credential.is_some_and(|key| key.starts_with("sk-ant-")) {
+                ANTHROPIC_DEFAULT_MODEL
+            } else {
+                DEFAULT_MODEL
+            }
+        })
+        .to_string()
 }
 
 pub fn credential_decision(
@@ -664,7 +681,7 @@ pub fn describe(planned: &Planned) -> Vec<String> {
         }
         CredentialDecision::PromptOnce => {
             lines.push(
-                "model credential: prompt once for an OpenRouter key (sk-or-) before cluster up"
+                "model credential: prompt once for an Anthropic API key (sk-ant-) or OpenRouter key (sk-or-) before cluster up"
                     .to_string(),
             );
         }
@@ -886,8 +903,10 @@ async fn deployed_release_snapshot(
 
 async fn release_matches_quickstart_target(
     opts: &QuickstartOpts,
+    model: &str,
+    preserve_recorded_model: bool,
     kind_target: bool,
-) -> Result<bool> {
+) -> Result<(bool, String)> {
     let common = CommonOpts {
         namespace: opts.namespace.clone(),
         release: opts.release.clone(),
@@ -895,15 +914,22 @@ async fn release_matches_quickstart_target(
     };
     let chart_version = crate::ops::chart_version(&opts.chart).await?;
     let Some((values, metadata)) = deployed_release_snapshot(&common).await? else {
-        return Ok(false);
+        return Ok((false, model.to_string()));
     };
-    Ok(quickstart_release_matches(
-        &chart_version,
-        &metadata,
-        &values,
-        &opts.model,
-        kind_target,
-    ))
+    // With no local credential the release keeps its recorded key. Keep its
+    // model too, so an Anthropic rerun cannot install an OpenRouter-only id.
+    let model = if preserve_recorded_model {
+        values
+            .pointer("/agentSandbox/runner/model")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(model)
+    } else {
+        model
+    };
+    let matches =
+        quickstart_release_matches(&chart_version, &metadata, &values, model, kind_target);
+    Ok((matches, model.to_string()))
 }
 
 pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
@@ -970,11 +996,23 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     } else {
         release_model_recorded(&opts).await?
     };
-    let release_at_target = match &targeted {
+    let effective_credential = credit_check_key(
+        crate::ops::explicit_model_credential_env(),
+        crate::ops::saved_model_credential(),
+        release_has_real_model,
+    );
+    let model = quickstart_model(opts.model.as_deref(), effective_credential.as_deref());
+    let (release_at_target, model) = match &targeted {
         Some(context) if !opts.dry_run => {
-            release_matches_quickstart_target(&opts, is_kind_context(context)).await?
+            release_matches_quickstart_target(
+                &opts,
+                &model,
+                opts.model.is_none() && effective_credential.is_none() && release_has_real_model,
+                is_kind_context(context),
+            )
+            .await?
         }
-        _ => false,
+        _ => (false, model),
     };
     let planned = quickstart_plan(&PlanInput {
         repo: opts.repo.clone(),
@@ -989,7 +1027,7 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
         existing_kind_clusters: existing,
         namespace: opts.namespace.clone(),
         release: opts.release.clone(),
-        model: opts.model.clone(),
+        model,
         org: opts.org.clone(),
         execution_deadline_seconds: opts.execution_deadline_seconds,
         budget_usd: opts.budget_usd,
@@ -1010,9 +1048,9 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     }
     if planned.credential == CredentialDecision::RefuseNonInteractive {
         return Err(
-            CliError::usage("OpenRouter key needed and stdin is not a terminal")
+            CliError::usage("model credential needed and stdin is not a terminal")
                 .with_fix(
-                    "set CURIE_CREDENTIALS to an OpenRouter key starting with sk-or- and rerun",
+                    "set CURIE_CREDENTIALS to an Anthropic API key starting with sk-ant- or an OpenRouter key starting with sk-or- and rerun",
                 )
                 .into(),
         );
@@ -1044,6 +1082,7 @@ async fn execute(
         crate::ui::ui().note("release already at the target chart and values; skipping cluster up");
     }
     let mut prompted = false;
+    let mut prompted_model = None;
     let mut intake_json = serde_json::Value::Null;
     let mut rendered_image: Option<String> = None;
     let mut credit_remaining_usd = None;
@@ -1063,6 +1102,13 @@ async fn execute(
                         || release_model_recorded(opts).await.unwrap_or(true);
             }
             ensure_credential(&planned.credential)?;
+            if planned.credential == CredentialDecision::PromptOnce {
+                let credential = crate::ops::model_credential_env()?;
+                prompted_model = Some(quickstart_model(
+                    opts.model.as_deref(),
+                    credential.as_deref(),
+                ));
+            }
         }
         match action {
             Action::External { program, args } => {
@@ -1074,7 +1120,17 @@ async fn execute(
                 run_program(program, args, step).await?;
             }
             Action::Cluster { args } => {
-                run_self(args, "Installing Curie").await?;
+                // Prompted credentials become available only immediately before
+                // this action. Resolve again so an omitted model follows that key.
+                let mut args = args.clone();
+                if let Some(model) = &prompted_model {
+                    let model_index = args
+                        .iter()
+                        .position(|arg| arg == "--model")
+                        .expect("quickstart cluster up always specifies its model");
+                    args[model_index + 1] = model.clone();
+                }
+                run_self(&args, "Installing Curie").await?;
             }
             Action::Register {
                 org,
@@ -1084,6 +1140,7 @@ async fn execute(
                 release,
                 model,
             } => {
+                let model = prompted_model.as_ref().unwrap_or(model);
                 let name = crate::factory_app::random_app_name();
                 let url = crate::factory_app::registration_url(org.as_deref(), &name);
                 let steps = registration_steps(&RerunTarget {
@@ -1364,6 +1421,9 @@ async fn check_credit(release_has_real_model: bool) -> Option<f64> {
             return None;
         }
     };
+    if key.starts_with("sk-ant-") {
+        return None;
+    }
     match crate::openrouter_credit::remaining_credit_usd(&key).await {
         Ok(Some(left)) => {
             if left < RUN_CREDIT_USD {
@@ -1421,36 +1481,36 @@ fn ensure_credential(decision: &CredentialDecision) -> Result<()> {
     match decision {
         CredentialDecision::UseEnv => {
             let key = crate::ops::model_credential_env()?.unwrap_or_default();
-            validate_openrouter_key(&key)?;
+            validate_model_credential(&key)?;
             Ok(())
         }
         CredentialDecision::PreserveRecorded => Ok(()),
         CredentialDecision::PromptOnce => {
             if !std::io::stdin().is_terminal() {
                 return Err(CliError::usage(
-                    "OpenRouter key needed and stdin is not a terminal",
+                    "model credential needed and stdin is not a terminal",
                 )
                 .with_fix(
-                    "set CURIE_CREDENTIALS to an OpenRouter key starting with sk-or- and rerun",
+                    "set CURIE_CREDENTIALS to an Anthropic API key starting with sk-ant- or an OpenRouter key starting with sk-or- and rerun",
                 )
                 .into());
             }
-            eprint!("OpenRouter API key: ");
+            eprint!("Anthropic or OpenRouter API key: ");
             let _ = std::io::stderr().flush();
             let key = rpassword::read_password().map_err(|err| {
-                CliError::usage(format!("could not read the OpenRouter key: {err}"))
-                    .with_fix("set CURIE_CREDENTIALS to an OpenRouter key starting with sk-or-")
+                CliError::usage(format!("could not read the model credential: {err}"))
+                    .with_fix("set CURIE_CREDENTIALS to an Anthropic API key starting with sk-ant- or an OpenRouter key starting with sk-or-")
             })?;
             let key = key.trim().to_string();
-            validate_openrouter_key(&key)?;
+            validate_model_credential(&key)?;
             // The child `cluster up` reads this env. The value stays out of argv.
             std::env::set_var("CURIE_CREDENTIALS", key);
             Ok(())
         }
         CredentialDecision::RefuseNonInteractive => Err(CliError::usage(
-            "OpenRouter key needed and stdin is not a terminal",
+            "model credential needed and stdin is not a terminal",
         )
-        .with_fix("set CURIE_CREDENTIALS to an OpenRouter key starting with sk-or- and rerun")
+        .with_fix("set CURIE_CREDENTIALS to an Anthropic API key starting with sk-ant- or an OpenRouter key starting with sk-or- and rerun")
         .into()),
     }
 }
@@ -2011,14 +2071,14 @@ mod tests {
             "sk-ant-api03-PLACEHOLDER",
             "sk-ant-oat01-PLACEHOLDER",
         ] {
-            assert!(validate_openrouter_key(key).is_ok());
+            assert!(validate_model_credential(key).is_ok());
         }
     }
 
     #[test]
     fn factory_quickstart_rejects_invalid_and_empty_credential_prefixes() {
         for key in ["", "sk-or-", "sk-ant-", "sk-ant", "invalid-credential"] {
-            assert!(validate_openrouter_key(key).is_err());
+            assert!(validate_model_credential(key).is_err());
         }
     }
 

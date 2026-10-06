@@ -139,6 +139,9 @@ class Agent(Base):
     # the platform/worker default model applies. The value is passed straight
     # through to the runner, which resolves it against its configured provider.
     model: Mapped[str | None] = mapped_column(default=None)
+    # Per-agent reviewer model (#4120). NULL lets the runner choose the
+    # credential's default; a value becomes the SDK's Opus alias target.
+    reviewer_model: Mapped[str | None] = mapped_column(default=None)
     # Per-agent thinking depth (#1182, ADR-0098). Forwarded as CURIE_THINKING at
     # sandbox boot; NULL means the worker's CURIE_THINKING default applies, and
     # unset at both layers means the runner sends no thinking configuration and

@@ -134,6 +134,7 @@ API_BACKEND_ENV = BootEnv.env_key("api_backend")
 # Which env var(s) carry the model credential (#514): a bare name or a JSON array.
 MODEL_ENV_KEY_ENV = BootEnv.env_key("model_env_key")
 MODEL_ENV = BootEnv.env_key("model")
+REVIEWER_MODEL_ENV = BootEnv.env_key("reviewer_model")
 # Thinking depth (#1182, ADR-0098): the model half's sibling, same producer and
 # same consumer, so it is named from BootEnv rather than typed as a literal.
 THINKING_ENV = BootEnv.env_key("thinking")
@@ -309,6 +310,7 @@ SELECT a.id AS agent_id,
        a.max_output_tokens_per_run AS max_output_tokens_per_run,
        a.behavior_packs AS behavior_packs,
        a.model AS model,
+       a.reviewer_model AS reviewer_model,
        a.thinking AS thinking,
        a.approval_required_tools AS approval_required_tools,
        a.approval_routes AS approval_routes,
@@ -343,6 +345,7 @@ SELECT a.id AS agent_id,
        a.max_output_tokens_per_run AS max_output_tokens_per_run,
        a.behavior_packs AS behavior_packs,
        a.model AS model,
+       a.reviewer_model AS reviewer_model,
        a.thinking AS thinking,
        a.approval_required_tools AS approval_required_tools,
        a.approval_routes AS approval_routes,
@@ -420,6 +423,9 @@ class ResolvedDeployment(BaseModel):
     # The agent's pinned model id (#254), forwarded as CURIE_MODEL at boot.
     # None falls back to the worker's configured default model.
     model: str | None = None
+    # The agent's reviewer override (#4120). None lets the runner choose its
+    # credential's provider default.
+    reviewer_model: str | None = None
     # The agent's thinking depth (#1182, ADR-0098), forwarded as CURIE_THINKING
     # at boot. None falls back to the worker's configured default; unset at both
     # layers sends nothing and leaves the model's own default standing.
@@ -972,25 +978,26 @@ class BindingResolver:
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None, dict[str, Any] | None]:
-        """The agent's model, thinking, and runner_resources for eval boots."""
+    ) -> tuple[str | None, str | None, str | None, dict[str, Any] | None]:
+        """Model, reviewer model, thinking, and resources for eval boots."""
         sql = text(
-            "SELECT model, thinking, runner_resources "
+            "SELECT model, reviewer_model, thinking, runner_resources "
             f"FROM {self._config.db_schema}.agents WHERE id = :id"
         )
         async with self._engine.connect() as conn:
             result = await conn.execute(sql, {"id": agent_id})
             row = result.first()
         if row is None:
-            return None, None, None
+            return None, None, None, None
         model: str | None = row[0]
-        thinking: str | None = row[1]
-        runner_resources = row[2]
+        reviewer_model: str | None = row[1]
+        thinking: str | None = row[2]
+        runner_resources = row[3]
         if isinstance(runner_resources, str):
             runner_resources = json.loads(runner_resources)
         if runner_resources is not None and not isinstance(runner_resources, dict):
             runner_resources = None
-        return model, thinking, runner_resources
+        return model, reviewer_model, thinking, runner_resources
 
     def packs_for(self, resolved: ResolvedDeployment) -> BehaviorPacks:
         """The agent's parsed behavior packs (all-off when none are configured).
@@ -1200,6 +1207,7 @@ class BindingResolver:
             # The agent's pinned model (#254) overrides the worker default; None
             # falls back to the platform default.
             model=resolved.model if resolved.model is not None else self._config.model,
+            reviewer_model=resolved.reviewer_model,
             # Same precedence as the model above (#1182): the agent's value wins,
             # then the platform default, then nothing at all -- and "nothing at
             # all" is what makes an unconfigured install behave as it always has.
@@ -1451,6 +1459,7 @@ def apply_model_env(
     env: dict[str, str],
     config: WorkerConfig,
     model_override: str | None = None,
+    reviewer_model_override: str | None = None,
     thinking_override: str | None = None,
 ) -> None:
     """Layer the runner model + credentials passthrough onto a boot env.
@@ -1470,7 +1479,10 @@ def apply_model_env(
     the runner sends no thinking configuration and the model's own default
     stands.
 
-    Those two are the only per-agent knobs here. The api_backend and env_key declarations
+    ``reviewer_model_override`` is the per-agent reviewer model (#4120).
+    Without an override the runner resolves the default from its credential.
+
+    The api_backend and env_key declarations
     (#514) come from WorkerConfig only and take no override: they select which
     wire protocol is dialed and which env var a credential is read from, so a
     lower-privileged agent author must not be able to set them.
@@ -1492,6 +1504,8 @@ def apply_model_env(
     model = model_override if model_override is not None else config.model
     if model:
         env[MODEL_ENV] = model
+    if reviewer_model_override:
+        env[REVIEWER_MODEL_ENV] = reviewer_model_override
     thinking = thinking_override if thinking_override is not None else config.thinking
     if thinking:
         env[THINKING_ENV] = thinking
