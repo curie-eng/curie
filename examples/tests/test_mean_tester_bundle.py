@@ -604,7 +604,8 @@ def test_the_validator_doc_allows_only_a_read_only_scope_go():
 def test_the_spec_can_come_from_the_threads_repository_workspace():
     spec = _section("Where the spec comes from")
     assert "/workspace" in spec
-    assert "https://github.com/" in spec
+    # A regex, not a substring test: the skill must show the URL's whole shape.
+    assert re.search(r"`https://github\.com/<owner>/<repo>`", spec)
     assert "git -C /workspace rev-parse HEAD" in spec
     # Request text stays first, and Git through the token stays a fallback.
     assert spec.index("The request itself") < spec.index("/workspace") < spec.index(
