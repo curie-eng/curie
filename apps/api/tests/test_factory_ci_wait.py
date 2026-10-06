@@ -1274,8 +1274,11 @@ def test_a_lapsed_heartbeat_does_not_lose_a_request_waiting_on_ci(admitted: Any)
     published = _published(client, github, sink, number)
     _execute(
         "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
-        "clock_timestamp() - interval '1 second' WHERE id = :id",
-        {"id": published["id"]},
+        "clock_timestamp() - CAST(:elapsed AS interval) WHERE id = :id",
+        {
+            "id": published["id"],
+            "elapsed": timedelta(seconds=get_settings().work_item_runtime_ttl_seconds + 5),
+        },
     )
 
     _reconcile()
