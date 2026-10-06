@@ -295,6 +295,16 @@ Drain task or launch a second copy to apply the guidance.
 
 ### Preflight checks
 
+The full and fast preflight requirements in this section apply only when the
+checkout being checked contains both the `curie dev preflight` command and
+`tools/preflight/preflight.py`. Check the selected release train and worktree,
+even when these instructions were loaded from a different launch checkout.
+If that train does not contain preflight, run its applicable required checks
+directly using its own instructions and CI workflow, and require current-head
+PR checks to pass. Do not run another checkout's preflight against it or port
+preflight into the train to satisfy this section. Missing prerequisites or a
+failing preflight in a checkout that supports it remain failures.
+
 Before opening or updating a pull request, run the full tier from the source
 checkout: `curie dev preflight --pr-body <file> --title <text>`. The full tier
 is the default. It fetches the base and refuses a head that does not contain
