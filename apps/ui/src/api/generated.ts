@@ -6770,6 +6770,7 @@ export interface components {
             /** Objective Truncated */
             objective_truncated: boolean;
             pr: components["schemas"]["WorkItemPrOut"] | null;
+            progress?: components["schemas"]["WorkItemProgressOut"] | null;
             publication: components["schemas"]["WorkItemPublicationOut"] | null;
             /** Repo Full Name */
             repo_full_name: string;
@@ -6782,6 +6783,8 @@ export interface components {
              * @enum {string}
              */
             state: "queued" | "waiting" | "running" | "cancellation_requested" | "cancelled" | "expired" | "failed" | "awaiting_approval" | "publishing" | "published" | "completed_unpublished";
+            /** Title */
+            title?: string | null;
             /**
              * Updated At
              * Format: date-time
@@ -6796,6 +6799,18 @@ export interface components {
             status: string;
             /** Url */
             url: string;
+        };
+        /**
+         * WorkItemProgressOut
+         * @description The latest execution's progress, derived by ``factory_progress.phase_view``.
+         */
+        WorkItemProgressOut: {
+            /** Current */
+            current: string | null;
+            /** Note */
+            note: string | null;
+            /** Stages */
+            stages: components["schemas"]["WorkItemStageOut"][];
         };
         /** WorkItemPublicationOut */
         WorkItemPublicationOut: {
@@ -6837,6 +6852,23 @@ export interface components {
             termination_observation: string | null;
             /** Wait Deadline */
             wait_deadline: string | null;
+        };
+        /**
+         * WorkItemStageOut
+         * @description One stage of the factory progress strip, as the status card shows it.
+         */
+        WorkItemStageOut: {
+            /** Id */
+            id: string;
+            /** Label */
+            label: string;
+            /** Round Label */
+            round_label: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "done" | "current" | "redo" | "blocked" | "pending";
         };
         /** WorkItemUsageModel */
         WorkItemUsageModel: {

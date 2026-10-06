@@ -7,6 +7,7 @@ const CRUMB: Record<Nav, string> = {
   overview: "Overview",
   agents: "Agents",
   "work-items": "Work items",
+  factory: "Factory",
   evals: "Evals",
   observability: "Observability",
   versions: "Versions",
