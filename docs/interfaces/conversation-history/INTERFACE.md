@@ -77,7 +77,9 @@ conversation, reconstructed through the selected harness adapter.
   therefore both show which message carried which files, so a file re-attached
   under an unchanged name is announced even when this boot's system prompt is
   the one the checkpoint recorded. The legacy `user` projection stays the
-  person's text.
+  person's text. One known gap: a text-only turn whose runner boots fresh is
+  handed the thread's retained files (#4079), and until #4081 lands its notice
+  names them as though that message carried them.
 - **Append side.** `append(record)` durably writes one turn. A serving runner
   holds a persistable `DONE` or `AWAITING_APPROVAL` final until append finishes
   within its 15 second budget. A dangling denied tool call gets an explicit
