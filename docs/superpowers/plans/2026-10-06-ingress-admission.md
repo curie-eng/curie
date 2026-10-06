@@ -46,9 +46,10 @@ consumer, thread locks, markers, ACI, plugin format, charts, cron fire and
 Tasks 1 through 8 land in one pull request to `next`, because #4075 requires
 the `supported` answer to land with the ingress wiring, and an active
 protected publication before ingress admission would hand out a scoped key
-that ingress refuses. That pull request depends on
+that ingress refuses. Tasks 3, 5 and 7 depend on
 [#4131](https://github.com/curie-eng/curie/pull/4131), which brings the torn
-read fix to next; its tests start only after #4131 merges.
+read fix to next; their tests start only after #4131 merges. Tasks 1, 2, 4
+and 6 need only the specification commit and their own dependencies.
 
 ## Tasks
 
@@ -57,11 +58,11 @@ read fix to next; its tests start only after #4131 merges.
 | 0. Torn read fix on next, #4131 | Protected hooks package owner | ADMISSION-4 | #4131 merged |
 | 1. Shared authority evaluation | Protected hooks package owner, then integration owner for the probe | SOURCE-9, ADMISSION-4 | Spec commit |
 | 2. Enqueue file, transport and measured ZRANGE recipe | API bootstrap owner, protected hooks package owner | SOURCE-6, LANE-3, ADMISSION-6 | Spec commit |
-| 3. Facade amendments | Protected hooks package owner | ADMISSION-1, ADMISSION-4, ADMISSION-5, ADMISSION-7 | Tasks 0, 1, 2 |
+| 3. Facade amendments | Protected hooks package owner | ADMISSION-1, ADMISSION-4, ADMISSION-5, ADMISSION-7 | Tasks 0 (#4131), 1, 2 |
 | 4. Protected publication, GET and secret | Protected hooks package owner, API source owner | SOURCE-3, SOURCE-6 | Tasks 1, 2 |
-| 5. Ingress wiring and receipts | Integration owner | SOURCE-2, SOURCE-8, LANE-4 | Tasks 2, 3 |
+| 5. Ingress wiring and receipts | Integration owner | SOURCE-2, SOURCE-8, LANE-4 | Tasks 0 (#4131), 2, 3 |
 | 6. Probe `supported` and parity | Integration owner | SOURCE-9 | Tasks 1, 5 |
-| 7. Reconciliation owner | Integration owner | LANE-4, ADMISSION-5 | Tasks 2, 3 |
+| 7. Reconciliation owner | Integration owner | LANE-4, ADMISSION-5 | Tasks 0 (#4131), 2, 3 |
 | 8. OpenAPI, operator note, gates and ladder | Integration owner | All of the above | Tasks 4 to 7 |
 
 Tasks 1 and 2 may run in parallel on independent files and broker resources.
@@ -74,11 +75,12 @@ because both edit the API composition.
 `a9b587075`) onto `next`; they apply cleanly to `00c421da5`. A wholesale
 forward merge of main is not used: main also carries the source feature
 reverts (`4028180c1`, `5ce293357`, `468ddef03`), which would undo the next
-only administration and probe work. This plan starts its tests only after
-#4131 merges, and records that
+only administration and probe work. Tasks 3, 5 and 7 start their tests only
+after #4131 merges, and record that
 `uv run --frozen pytest packages/protected-hooks/tests -q -p no:randomly`
-passes on the resulting base. Without it, task 5's concurrent retry tests
-would flake on the same `AdmissionUnavailable`.
+passes on the resulting base. Ingress retries of one delivery are serialized
+by the agent gate; the torn view arises when gate free reconcilers race those
+retries and each other, which tasks 5 and 7 exercise.
 
 **Task 1.** Add the pure `authority_evaluation` module with its closed
 outcome, its target and reads records, its admission and publication phases
@@ -101,8 +103,9 @@ the commit after that record. Failing first
 tests for the loader: extra, missing or duplicate members, other version,
 numbers, `default` username, the reader's username, a `credential_ref`
 differing from the manifest, oversize, FIFO and directory all refuse; a valid
-file parses and redacts; the administrative loader and the probe's three file
-loader never open it. Transport tests on the disposable TLS broker with an
+file parses and redacts; `load_bootstrap` and the administrative loader never
+open it, proven with a FIFO in its place; `load_ingress` opens it and the
+probe's step 12 calls `load_ingress` and discards the credential. Transport tests on the disposable TLS broker with an
 `admission_acl_rules("enqueue")` principal: connection verifies pin, CA,
 hostname and run_id before commands; a killed connection is never reopened;
 an expired budget refuses; the enqueue principal cannot write source or
@@ -115,8 +118,10 @@ and add `preparing`. Failing first tests on the real broker: control manifest
 bytes differing from the trusted manifest refuse with no write; a preparing
 retry with a different `received_at` recovers the original and returns its
 receipt once authority opens; a byte identical retry restores deleted
-recovery bytes; `preparing` lists exactly outstanding intents in score order,
-skips committed, failed and orphan members and writes nothing (key and stream
+recovery bytes; a reconciler `recover` racing an `admit` retry of the same
+delivery on another connection yields one entry and the original receipt; `preparing` lists exactly outstanding intents in score order
+even when committed members outnumber them, skips committed, failed and orphan
+members and writes nothing (key and stream
 snapshot before and after). Every existing test under
 `packages/protected-hooks/tests` passes.
 
@@ -128,7 +133,9 @@ active when evidence is current; each evaluation outcome refuses with the
 committed generation and no active record; an expired readiness between the
 reader check and the CAS still publishes, and a delivery then refuses
 atomically; exact replay publishes a committed unpublished operation; a lost
-reservation answers `source_reservation_lost`; a delayed publisher loses to a
+reservation answers `source_reservation_lost`; GET `active` and the secret
+are served for a published source whose readiness has since expired, while a
+delivery refuses; a delayed publisher loses to a
 later reservation; GET reports protected active and each closed reason; the
 secret is served only for an active protected record, with `no-store`, and is
 refused for every other state with no key in any response, error or captured
@@ -144,24 +151,33 @@ members and the result table. Failing first tests over real HTTP: one
 protected delivery yields one intent, binding, quota member and stream entry
 with the exact envelope and turn, no ordinary claim, backlog slot, workspace
 row or SQL write; explicit reply target 422; declared source bindings 503;
-oversize turn 413 with no broker I/O; exact, freshly signed and post closure
-retries return the original receipt; changed body, policy and generation
-conflict; a prior ordinary claim, pending or enqueued, conflicts with no
-broker write; each refusal row answers as tabled with an unchanged broker
+oversize turn 413 with no broker I/O; the turn's `received_at` is the signed
+timestamp; exact, freshly signed and post closure retries return the original
+receipt; resending one signed request after its recovery bytes were deleted
+by an owned fault restores them and commits; changed body, policy and generation
+conflict; an enqueued ordinary claim answers 409 and a pending one 503
+`ordinary_delivery_pending` with `Retry-After`, both with no broker write; an
+ordinary Valkey failure answers 503; each refusal row answers as tabled with an unchanged broker
 snapshot; 24 concurrent deliveries of one ID on eight threads produce one
-entry; a stale signature after rotation keeps 401; tombstone ingress admits
-only with its ordinary publication active, refuses a private intent and closes
-on broker failure; never configured hooks keep every existing answer and open
+entry and only the tabled 200, 202 and 503 answers; a reconciler tick racing a
+signed retry of one preparing delivery leaves one entry and the original
+receipt; a stale signature after rotation keeps 401; tombstone ingress admits
+only with its ordinary publication active, refuses a private intent, closes
+on broker failure and answers 503 `broker_unavailable` with a full ingress
+executor; the probe still answers `source_closed` for that published
+tombstone; never configured hooks keep every existing answer and open
 no broker connection; a third gate waiter on a protected row answers 503
 within the bound while an ordinary waiter keeps waiting without a bound;
 cancellation releases the gate only after the broker call. Update
 `apps/api/tests/test_hook_source_ingress.py::test_configured_or_history_source_is_closed_before_every_effect`
 so that only pending history and unpublished rows stay closed.
 
-**Task 6.** Add step 1a and step 12 to the probe and remove the final
+**Task 6.** Add step 0 and step 12 to the probe and remove the final
 `configuration_unsupported`. Failing first tests: a fully valid tuple answers
 200 `supported` with runtime members; source bindings, a missing or unbound
-enqueue file and closed admission each answer their reason; then the parity
+enqueue file and closed admission each answer their reason; source bindings
+with no runtime files answer `configuration_unsupported` on both the probe and
+ingress; then the parity
 test, which drives the same seeded broker states through the probe over HTTP
 and through a real signed delivery and asserts that the delivery is accepted
 exactly when the probe answered `supported`, outside the stated per delivery
@@ -171,17 +187,23 @@ exclusions. Update
 **Task 7.** Add the reconciler and its lifespan wiring. Failing first tests:
 with no caller retry, an interrupted intent commits once authority opens; a
 closed authority consumes one attempt per tick and fails with refund at the
-tenth; the 300 second deadline fails and refunds; an unset setting or invalid
+tenth; the 300 second deadline fails and refunds; a preparing intent newer
+than 63 committed members is found; one malformed intent is skipped and the
+tick continues; an injected exception in the loop is survived; an intent
+without a quota member is left to a caller retry, which recovers it; an unset setting or invalid
 file performs no broker I/O; two reconcilers on one broker never double append
-or double refund; shutdown joins within ten seconds with a paused broker; logs
-carry no payload or credential.
+or double refund; shutdown joins within ten seconds with a paused broker; the
+tick log carries quota occupancy and parked counts and no payload or
+credential.
 
 **Task 8.** Regenerate OpenAPI with `uv run python -m curie_api.export_openapi`
 and run `uv run pytest apps/api/tests/test_openapi_drift.py -q`. Extend the
 operator note in `docs/interfaces/triggers/INTERFACE.md`: protected
 publication and its refusal codes, the enqueue file, tombstone restoration,
-the new receipt members, the 429 backlog and its release only by the future
-worker. Then run the full affected suites, the isolated Python baseline,
+the new receipt members, the 429 backlog without `Retry-After` and its release
+only by the future worker, the tick log counts, and the procedure for a
+misprovisioned runtime: close admission in the selection, after which parked
+entries stay private until LANE-6. Then run the full affected suites, the isolated Python baseline,
 Ruff, mypy, import boundary and `scripts/check-docs.sh`, and the tier
 evidence below.
 
@@ -226,18 +248,32 @@ own diagnostics and publish only anonymous values.
 | Tier | Classification | Reason or command |
 | --- | --- | --- |
 | skill | not applicable | No runner loop, ACI event, bundle or skill packaging change; the turn shape is the existing QueuedTurn. |
-| local | required, tasks 5 to 8 | API wiring and a lifespan task change. `curie local up --build`, then `CURIE_E2E_TIERS=local curie dev e2e-ladder`, plus signed deliveries against that stack: a never configured hook enqueues and dedupes as before; an unpublished protected source and a probe answer 503 `runtime_unavailable` with no runtime directory; the reconciler idles. |
+| local | required, tasks 5 to 8 | API wiring and a lifespan task change. `curie local up --build`, then `CURIE_E2E_TIERS=local curie dev e2e-ladder`. Then the verification campaign below against that stack, with a never configured hook enqueuing and deduping as before and the reconciler idling while the runtime directory is unset. |
 | local-release | not applicable | No migration, version pin, release compose or image identity change. Promote if the path guard maps a changed file. |
 | cluster | not applicable | No chart template, RBAC, secret mount or NetworkPolicy; mounting the runtime directory is LANE-8 and #4076. |
 | live provider | not applicable | No protected turn reaches a model, runner, MCP catalog, PreToolUse or workspace path in this slice. |
-| external integration | required, tasks 5 and 6 | Signed hook ingress changes. Drive real signed deliveries and probes from an independent sender over the network to the candidate stack, in live mode, for the ordinary and closed protected cases. Positive protected admission is proven only by the real store suites with fixture seeded authority. |
+| external integration | required, tasks 5 and 6 | Signed hook ingress changes. In live mode, an independent sender drives real signed deliveries and probes over the network to the candidate stack through the verification campaign below. |
 | factory | not applicable | No factory runtime, CI, progress, publication or work item change. |
 
-Positive protected admission against a running stack needs an out of band
-provisioner for the runtime directory and a qualified runtime, and its
-delivery to a runner needs the protected worker. The PR records
-`Discovery waiver: no provisioner can supply a protected runtime to the local stack #4076`
-and
+**Verification campaign.** The campaign owns a disposable verification
+provisioner: it starts its own TLS broker with the default user disabled,
+installs distinct enqueue, control reader and source writer principals from
+the existing recipes, writes `manifest.json`, `ca.pem`, `bootstrap.json`,
+`source_writer.json` and `enqueue.json` into a private directory, seeds
+selection, qualification and readiness in its broker, and mounts that
+directory read only into the candidate API through a campaign owned override,
+never a chart or compose default. The campaign then creates the protected row
+through the real PUT route and observes 200 `active`, reads the scoped key
+through the real secret route, and drives: probe 200 `supported`; a signed
+delivery accepted with one private entry and nothing in the ordinary store;
+exact and freshly signed retries returning the original receipt; readiness
+expiry and closed admission refusing with the probe agreeing; DELETE then a
+tombstone delivery enqueued ordinarily; and pending history and never
+configured cases unchanged. It tears down its broker and directory by owned
+identity. That provisioner is verification tooling, not LANE-8, and its
+records are not qualification. The real accepted delivery that #4075 requires
+is this campaign's accepted delivery on the final candidate. Delivery to a
+runner needs the protected worker, so the PR records
 `Discovery waiver: no protected worker consumes or replies to an admitted delivery #3603`.
 
 ## Prior intent to preserve
@@ -284,9 +320,35 @@ and
   it fills and answers 429 until LANE-6 lands.
 * Declared source bindings on any hook of the agent exclude it from protected
   delivery.
-* Reconciler attempts count across replicas.
+* Reconciler attempts count across replicas, and the gate free reconcilers race
+  ingress retries; the torn read retry from #4131 decides that race.
+* `received_at` comes from the signed timestamp rather than API wall time for
+  protected turns only.
+* An intent interrupted before its quota member is left to a caller retry.
+* GET `active` and the secret attest publication, not current readiness.
 * The enqueue file shares the runtime directory; keeping it out of ordinary
   workers and runners is a LANE-8 guard concern.
+
+## Review dispositions
+
+| Finding | Disposition |
+| --- | --- |
+| F1 probe tombstone answer | The probe keeps `source_closed` for every tombstone, and the SOURCE-9 definition is amended to states admitting no protected delivery; GET `activation` answers ordinary restoration. Acceptance case added. |
+| F2 unreachable byte identical retry | Protected `received_at` is rendered from the signed timestamp, so resending one signed request is byte identical; a freshly signed retry cannot restore and that window ends in terminal failure, stated. HTTP test added in task 5. |
+| F3 reconciler discovery | `preparing` reads every quota member (at most the 64 limit), so committed members never starve it; per intent errors continue the tick; the loop is supervised; intents without a quota member are stated as left to a caller retry and LANE-4 ownership is narrowed to intents holding capacity. |
+| F4 race rationale and test | The race is reconciler against ingress and reconciler against reconciler; tasks 3, 5 and 7 test it; the HTTP concurrency case asserts one entry and only tabled answers. |
+| F5 live E2E | A campaign owned disposable verification provisioner supplies the runtime and creates the row through the real routes; #4075's real accepted delivery is that campaign's; the provisioner waiver is removed. |
+| F6 publication evidence | Stated as an amendment to the SOURCE-6 clause with the per delivery atomic argument; GET `active` and the secret attest publication only; task 4 tests it. |
+| F7 tombstone executor | Tombstone broker reads share the two thread ingress executor and five second budget, 503 `broker_unavailable` when full or expired. |
+| F8 loader | `load_ingress` is named; ingress, the reconciler and probe step 12 use it; the probe discards the credential; tested. |
+| F9 reason order | Source bindings are probe step 0, read under the gate in the same snapshot, before file checks, matching ingress. |
+| F10 exclusions | Missing delivery ID, explicit reply target, partition and ordinary Valkey failure (503 `authority_unavailable`) added; partition placed in the ingress order. |
+| F11 pending ordinary claim | 503 `ordinary_delivery_pending` with `Retry-After` of the ordinary lease; 409 only for an enqueued claim. |
+| F12 tombstone duplicate generation | Stated as an amendment to SOURCE-8: null means not recorded. |
+| F13 operator visibility | 429 carries no `Retry-After`; the tick log reports quota occupancy and parked counts; the close admission procedure is specified and goes in the operator note. |
+| F14 #4131 ordering | The #4131 dependency is scoped to tasks 3, 5 and 7. |
+| Connection count | Corrected to four connections. |
+| Enqueue against writer username | Not checked, because `load_ingress` never opens the writer file; a shared principal fails closed under the permission reset. Stated. |
 
 ## Completion
 

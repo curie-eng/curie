@@ -1052,9 +1052,14 @@ is invalid rather than silently used. The username must be nonempty, differ
 from `default` and differ from the control reader username. It parses into a
 new frozen, slotted `EnqueueCredential(username, password)` beside the reader
 and writer credentials, whose representation redacts both fields. The
-existing runtime file module gains one loader returning the bootstrap plus
-this credential; the writer file is never opened by it, and the administrative
-loader never opens `enqueue.json`. No route, CLI verb, chart default,
+existing runtime file module gains one loader, `load_ingress`, returning the
+bootstrap plus this credential; it never opens the writer file. Ingress, the
+reconciler and the probe's step 12 call it. `load_bootstrap` and the
+administrative loader never open `enqueue.json`. The probe discards the parsed
+credential unused and never connects with it. The enqueue username need not
+be checked against the writer file, which `load_ingress` never opens: the
+provisioner's permission reset makes a shared principal fail closed rather
+than widen. No route, CLI verb, chart default,
 environment variable or platform key creates, returns or derives it, and it is
 never mounted into an ordinary worker or runner. Extending `bootstrap.json`
 was rejected for the same reason as the writer file: its strict v1 grammar
@@ -1062,16 +1067,20 @@ refuses another member, and a probe or administration only deployment would
 then carry enqueue authority.
 
 <!-- @spec PROTECTED-HOOK-SOURCE-2 -->
-**Connections and gate.** Protected ingress uses three connections and no new
-pool. The request session and the existing four connection gate pool carry
-the gate-held reload, reauthentication and snapshot read; a protected delivery
-writes no SQL. The ordinary Valkey client carries only the ordinary claim
+**Connections and gate.** Protected ingress uses four connections and no new
+pool: one gate pool connection holding the agent lock, the request session's
+work connection for the gate-held reload, reauthentication and snapshot read,
+the ordinary Valkey client and one enqueue broker connection. A protected
+delivery writes no SQL. The ordinary Valkey client carries only the ordinary claim
 lookup below. One fresh `AuthenticatedEnqueueClient` connection per delivery
 carries every protected broker read and the admission script; it is opened
 after the gate-held reauthentication, under one five second budget covering
 connection and every call, and always closed. It never reconnects. Admission
-runs on its own executor of two threads that fails rather than queueing, so at
-most two gate connections wait on broker I/O for ingress at any time. A
+and the tombstone broker read below run on one ingress executor of two threads
+that fails rather than queueing, each under that five second budget, with 503
+`broker_unavailable` when the executor is full or the budget ends. At most two
+gate connections therefore wait on broker I/O for ingress at any time, even
+though tombstone ingress keeps the unbounded gate wait. A
 request cancelled during a broker call keeps the gate until that call returns
 or its budget ends, as the administrative slot does. When the ungated
 authentication found a protected row, signed delivery ingress acquires the
@@ -1101,8 +1110,10 @@ rule. An agent whose `source_bindings` is not empty refuses with 503
 body, so no protected delivery reaches a workspace selection and the probe can
 decide the same condition. The turn has source `WEBHOOK`, author
 `hook:{hook}`, the existing event ID, the existing delivery text with no
-mapping block, `tool_access` `read-only`, no attachments and a reply handle
-with a null placeholder. Its exact JSON bytes above the ADMISSION-2 limit of
+mapping block, `tool_access` `read-only`, no attachments, a reply handle
+with a null placeholder and a `received_at` rendered from the signed
+`X-Curie-Timestamp` (ADMISSION-4), so resending one signed request yields
+identical bytes. Its exact JSON bytes above the ADMISSION-2 limit of
 262144 refuse with 413 before any broker I/O. The ordinary per agent backlog
 slot is not taken and no ordinary claim is written. Cron and manual fire keep
 refusing configured hooks; their private routing is not part of this change.
@@ -1111,13 +1122,19 @@ refusing configured hooks; their private routing is not part of this change.
 **Receipts and duplicates across both stores.** The signed route's steps for
 a protected row are, in order: hook name 400, bounded body 413, ungated
 authentication 401, bounded gate and gate-held reauthentication 401, delivery
-ID 400, reply target and surface checks, source binding refusal, an unset
-setting or invalid runtime or enqueue file 503 `runtime_unavailable`, a full
-admission executor 503 `broker_unavailable`, the ordinary claim lookup, turn
-construction and payload bound, then admission. The ordinary claim lookup
-reads the ordinary key for the same agent, hook and delivery ID; any value,
-pending or a stream ID, answers 409 `delivery_conflict` without a broker
-write, because a prior ordinary claim prevents a private enqueue. The
+ID 400, explicit reply target 422, partition derivation 422, the existing
+reply surface checks, source binding refusal 503
+`configuration_unsupported`, an unset setting or invalid runtime or enqueue
+file 503 `runtime_unavailable`, a full ingress executor 503
+`broker_unavailable`, the ordinary claim lookup, turn construction and payload
+bound, then admission. The ordinary claim lookup reads the ordinary key for
+the same agent, hook and delivery ID without a broker write. A stream ID
+answers 409 `delivery_conflict`, because a prior enqueued ordinary turn
+prevents a private enqueue. A `pending:` value answers 503
+`ordinary_delivery_pending` with `Retry-After` of the ordinary delivery lease,
+because a crashed ordinary request leaves that claim only until its lease
+expires and a retryable answer must not lose the delivery. An ordinary Valkey
+failure answers 503 `authority_unavailable`. The
 admission request carries the decoded delivery ID header, the committed row's
 SOURCE-6 fields, the requested policy as signed, the SHA256 of the exact raw
 body and the exact turn bytes. The live gate is probed before the ordinary
@@ -1125,14 +1142,24 @@ lookup and before admission.
 
 A tombstone row authenticates with the current legacy key, then, before any
 ordinary claim, quota or workspace effect, requires valid runtime and enqueue
-files and one enqueue connection that reads the source record and the
-delivery's private intent key. The record must hold an active ordinary
+files and one enqueue connection, on the ingress executor under its budget,
+that reads the source record and the delivery's private intent key. The record must hold an active ordinary
 publication whose generation, operation and fingerprint equal the committed
 row; otherwise 503 `source_closed`. A present private intent answers 409
 `delivery_conflict`; a broker failure answers 503 `broker_unavailable`. The
 connection closes before the unchanged ordinary path runs under the same
 gate. Never configured hooks open no broker connection and keep every current
 answer. Pending history keeps 503 `pending_history`.
+
+The support probe's answer for a tombstone row does not change: 503
+`source_closed`, effective policy equal to the requested one, the row's
+generation, no runtime members and no broker read. This amends the SOURCE-9
+sentence on `source_closed`, which now marks every state whose delivery
+ingress admits no protected delivery. A published tombstone admits ordinary
+deliveries only, so the probe, which answers protected support alone, still
+reports it closed; its effective member already reports the ordinary
+resolution the row records. Whether ordinary delivery is restored is answered
+by GET's `activation`, not by the probe.
 
 `HookAccepted` gains `requested_tool_access`, `effective_tool_access`,
 `source_generation` (a canonical decimal string or null) and
@@ -1142,6 +1169,8 @@ policy as both policies, `pending` on the existing 202 and a null source
 generation, except that a fresh tombstone acceptance reports the committed
 row's generation. An ordinary duplicate reports a null generation, because
 the ordinary store never recorded one and a duplicate is never relabeled.
+This amends SOURCE-8, which reserves a null generation for never configured
+hooks: a tombstone duplicate's null means not recorded, not never configured.
 Protected admission results map as follows:
 
 | Admission result | HTTP | Answer |
@@ -1151,7 +1180,7 @@ Protected admission results map as follows:
 | preparing | 202 | Null stream ID and conversation, `preparing`, the request's matching tuple. |
 | failed | 409 | `protected_delivery_failed`; the delivery ID never admits again. |
 | conflict | 409 | `delivery_conflict`. |
-| refused, `quota_full` | 429 | `protected_backlog_full`, with `Retry-After` of the hook backlog window. |
+| refused, `quota_full` | 429 | `protected_backlog_full`, with no `Retry-After`, because capacity frees only when the future protected worker completes deliveries. |
 | refused, other reason | 503 | The admission reason as the detail. |
 | unavailable, budget, connection or identity failure | 503 | `broker_unavailable`. |
 
@@ -1175,15 +1204,29 @@ five seconds after the previous tick ends. A tick with the setting unset does
 nothing; otherwise it loads the runtime and enqueue files afresh, and an
 invalid file skips the tick without broker I/O. A valid tick opens one enqueue
 connection under a five second budget, lists preparing intents through the
-admission facade and calls its `recover` for each until the budget ends,
-leaving the rest to the next tick. It holds no SQL gate and fabricates no HTTP
+admission facade, which reads every quota member because the set never holds
+more than the 64 member limit, and calls its `recover` for each until the
+budget ends, leaving the rest to the next tick. Committed members therefore
+never hide a newer preparing intent. An `AdmissionUnavailable` for one intent
+is counted and the tick continues with the next; a connection or budget
+failure ends the tick. The task is supervised: an unexpected exception is
+logged safely and the loop resumes on the next tick, never ending the API
+process or the reconciler. An intent interrupted after its intent write and
+before its quota member write holds no capacity, binding or stream entry, so
+the reconciler does not find it; a caller retry recovers it, and a late caller
+after its 300 second deadline receives its failure. This narrows LANE-4's
+ownership to preparing intents that hold capacity. It holds no SQL gate and fabricates no HTTP
 authentication: recovery checks the original source authority in the broker,
 which every SQL removal or rotation has already revoked. Every API replica
-runs its own reconciler. Attempts count per intent across replicas, so with
-several replicas the ten attempt bound can be reached sooner than fifty
-seconds; the 300 second broker time deadline is unchanged. Each tick logs only
-counts and a safe outcome, never identities beyond the delivery digest, a
-payload or a credential. No Postgres bookkeeping is recorded after broker
+runs its own reconciler. Ingress retries of one delivery are serialized by the
+agent gate, but the gate free reconcilers of every replica race those retries
+and each other on the same intent; the facade's script and torn read retry
+decide that race. Attempts count per intent across replicas, so with several
+replicas the ten attempt bound can be reached sooner than fifty seconds; the
+300 second broker time deadline is unchanged. Each tick logs only counts and a
+safe outcome: quota occupancy, committed members parked without a worker,
+preparing, recovered, failed and skipped intents. It never logs identities
+beyond the delivery digest, a payload or a credential. No Postgres bookkeeping is recorded after broker
 acceptance in this release.
 
 <!-- @spec PROTECTED-HOOK-LANE-4 -->
@@ -1197,7 +1240,12 @@ still require a selection, a qualification record and current readiness,
 which LANE-2 lets only the separately credentialed verifier write after the
 full qualification campaign that needs the protected worker and LANE-8
 guards. Tests seed those records with a fixture administrator; that is test
-setup, never qualification.
+setup, never qualification. That argument rests on the out of band verifier,
+not on API code. If a misprovisioned runtime opens admission early, the
+recovery is to close admission in the provisioner's selection
+(`admission_open: false`), which stops new admission at once; parked entries
+and their quota stay private and wait for LANE-6, and the tick log's quota
+occupancy shows them.
 
 <!-- @spec PROTECTED-HOOK-SOURCE-9 -->
 **One authority evaluation.** A new pure module in the internal package,
@@ -1228,11 +1276,13 @@ probe does.
 **The `supported` answer.** The probe answers HTTP 200 with `supported` true,
 reason `supported` and all runtime members if and only if, in one request:
 the gate-held snapshot holds a committed protected row whose fingerprint
-computes; the agent's `source_bindings` is empty; the setting is set and the
-runtime files are valid; one control reader session yields `accept`; and
-`enqueue.json` is valid and bound to the manifest. The source binding check
-is step 1a, after step 1 and before broker I/O, reporting
-`configuration_unsupported` without runtime members. The enqueue file check is
+computes; the agent's `source_bindings`, read under the gate in that same
+snapshot, is empty; the setting is set and the runtime files are valid; one
+control reader session yields `accept`; and `enqueue.json` is valid and bound
+to the manifest. The source binding check is step 0, before the runtime files
+are read and before broker I/O, reporting `configuration_unsupported` without
+runtime members; ingress refuses on source bindings before its file checks
+too, so the two report the same first reason. The enqueue file check is
 step 12, after step 11 passes, reporting `runtime_unavailable` with runtime
 members; the probe parses that file and never connects with it. Every other
 outcome is the existing 503 DTO. The final `configuration_unsupported` of the
@@ -1240,8 +1290,10 @@ base contract is removed. The probe still reads with the control reader, so
 an enqueue principal that the broker refuses makes ingress answer
 `broker_unavailable` while the probe reported support; that is an availability
 fault, not a tuple difference. `supported` does not cover per delivery
-conditions: quota, an existing receipt or conflict, the ordinary claim, the
-reply surface, the body bound, executor slots and broker reachability. Under
+conditions: a missing delivery ID, an explicit reply target, partition
+derivation, the reply surface, the body bound, the ordinary claim and an
+ordinary Valkey failure, quota, an existing receipt or conflict, executor
+slots and broker reachability. Under
 those exclusions and with no record or time change between them, a delivery is
 accepted exactly when the probe reports `supported`; the parity test drives
 both paths over the same broker states.
@@ -1262,9 +1314,14 @@ the active protected record. A refusal answers 503 with the committed
 generation and the outcome as its code (`runtime_unavailable`,
 `broker_identity_mismatch`, `qualification_unavailable`, `evidence_missing`,
 `evidence_expired` or `configuration_unsupported`), or `source_reservation_lost`
-or `broker_unavailable`. This check is not atomic with the CAS and need not
-be: publication admits nothing, and every delivery repeats the evaluation
-atomically. Success answers 200 with `activation: active`. An exact replay of
+or `broker_unavailable`. This amends the base SOURCE-6 clause
+that publishes active only if required runtime evidence is current: the
+evidence must be current at the reader check, which is not atomic with the
+CAS. That suffices because publication admits nothing: every delivery repeats
+the full evaluation inside its admission script against live broker time and
+run_id, so evidence that expires before or after the CAS refuses each
+delivery. GET `active` and secret issuance therefore attest publication only,
+never current readiness; the probe answers readiness. Success answers 200 with `activation: active`. An exact replay of
 a committed protected operation now publishes when its reservation still
 matches. `source_publication_deferred` and GET's `publication_deferred` are
 retired.
@@ -1286,11 +1343,15 @@ which authenticates nothing. Every handler response keeps `no-store`.
 routing, the CLI and console siblings
 ([#4053](https://github.com/curie-eng/curie/issues/4053),
 [#4054](https://github.com/curie-eng/curie/issues/4054)) and #4091 stay out.
-End to end evidence therefore stops at the broker: real signed HTTP delivery
-to a private stream entry and receipt, with fixture seeded authority on a
-disposable broker. No protected turn reaches a worker, runner, model or reply,
-read only enforcement is not observed on a runner, and no provisioner supplies
-a runtime to a running stack. #3603 stays open and the installation gate stays
+End to end evidence therefore stops at the broker. On the candidate stack a
+disposable verification provisioner owned by the campaign supplies the
+runtime: it runs its own TLS broker with enqueue, reader and writer
+principals, writes the runtime files, seeds the control records, and the
+campaign then creates and publishes the protected row through the real
+administrative routes and sends real signed deliveries. That provisioner is
+verification tooling, not LANE-8 provisioning, and its records are not
+qualification. No protected turn reaches a worker, runner, model or reply,
+and read only enforcement is not observed on a runner. #3603 stays open and the installation gate stays
 closed.
 
 ## Acceptance cases and commands
@@ -1353,8 +1414,11 @@ Each test/implementation unit cites its corresponding ID above. Required cases:
   protected PUT, rotate and replay publish only with current evidence; the
   reconciler finishes, fails and refunds preparing intents with no caller
   retry; the enqueue file, its binding to the manifest and its absence behave
-  as specified; and no response, log or error contains a credential, payload
-  or source key.
+  as specified; a published tombstone admits ordinary delivery while the probe
+  reports `source_closed`; a pending ordinary claim answers 503 and an
+  enqueued one 409; a reconciler recovery racing a signed retry of the same
+  delivery leaves one entry and the original receipt; and no response, log or
+  error contains a credential, payload or source key.
 
 Run `uv run pytest apps/api/tests/test_hook_tool_access.py
 apps/api/tests/test_hooks.py -q` plus the

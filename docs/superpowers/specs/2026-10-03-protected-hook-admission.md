@@ -315,8 +315,10 @@ section of the source policy contract wires this foundation into the signed
 hook route and the API reconciler. It changes the facade as follows, keeping
 the IDs. The torn read retry that
 [#4094](https://github.com/curie-eng/curie/pull/4094) added to ADMISSION-4 on
-main is a prerequisite: concurrent signed retries of one delivery are exactly
-the torn view it retries. It reaches next through
+main is a prerequisite. Signed retries of one delivery are serialized by the
+agent gate, but the gate free API reconcilers of every replica call `recover`
+on the same intents concurrently with those retries and with each other, which
+is exactly the torn view it retries. It reaches next through
 [#4131](https://github.com/curie-eng/curie/pull/4131), a cherry pick of its
 three commits, before this wiring.
 
@@ -339,12 +341,19 @@ operation and fingerprint but different payload bytes is a recovery attempt
 without a supplied payload, not a conflict: the retried turn differs only in
 API receive time or in reply coordinates the original already fixed, and the
 original wins as it does on the ordinary path. Only byte identical payload may
-restore missing recovery bytes.
+restore missing recovery bytes. To make that path reachable over HTTP, a
+protected turn's `received_at` is the canonical UTC ISO rendering of the
+signed `X-Curie-Timestamp`, not API wall time, so an upstream resending the
+same signed request with the same reply selection yields identical bytes. A
+freshly signed retry yields different bytes and recovers without restoring
+them; if the recovery bytes are missing it cannot restore, and that intent
+ends in terminal failure at its deadline.
 
 <!-- @spec PROTECTED-HOOK-ADMISSION-5 -->
 The facade gains `preparing(limit: int) -> tuple[DeliveryIdentity, ...]` for
-the trusted reconciler. It reads at most `limit` quota members in score order
-with ZRANGE, reads each member's intent, state and commit, and returns the
+the trusted reconciler, called with `limit` equal to the backlog limit. It
+reads every quota member in score order with ZRANGE, the set never exceeding
+the backlog limit, reads each member's intent, state and commit, and returns the
 identities of intents with neither a commit nor a failed state. It writes
 nothing and authorizes nothing; `recover` decides each one. An orphan member
 without an intent is skipped and reported only as a count.
@@ -361,7 +370,9 @@ recipe stays unchanged and `preparing` is unavailable.
 <!-- @spec PROTECTED-HOOK-ADMISSION-7 -->
 Acceptance adds: a preparing retry with different payload bytes recovers the
 original and never conflicts; a byte identical retry restores missing recovery
-bytes; `preparing` returns exactly the outstanding intents and writes nothing;
+bytes, proven over HTTP by resending one signed request; a reconciler
+`recover` racing a signed retry of the same delivery returns one entry and the
+original receipt; `preparing` returns exactly the outstanding intents and writes nothing;
 a control manifest differing from the trusted manifest refuses; and a frozen
 vector of broker states yields the same decision from the probe evaluation
 and from `admit`, with reasons following the frozen mapping.
