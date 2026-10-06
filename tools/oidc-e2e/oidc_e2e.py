@@ -552,12 +552,20 @@ def phase_default(s: Settings, stack: Stack, ev: Evidence) -> str:
         "GET", f"{s.api}/console/principal", headers=cookie(LEGACY_SESSION_COOKIE, token)
     )
     ev.check("the retired cookie name is refused", legacy.status == 401, legacy.status)
+    # require_api_key (#1045) now falls through to a live console session on a
+    # safe GET; require_platform_key (minting a login code) never does.
     machine = request("GET", f"{s.api}/agents", headers=cookie(SESSION_COOKIE, token))
     control = request("GET", f"{s.api}/agents", headers={"X-API-Key": API_KEY})
+    mint = request(
+        "POST",
+        f"{s.api}/console/login-codes",
+        headers=cookie(SESSION_COOKIE, token),
+        json_body={"subject": "oidc-e2e-should-not-mint"},
+    )
     ev.check(
-        "a console session is not a platform credential",
-        machine.status == 401 and control.status == 200,
-        f"{machine.status}/{control.status}",
+        "a console session never opens the immutable platform boundary",
+        machine.status == 200 and control.status == 200 and mint.status == 401,
+        f"{machine.status}/{control.status}/{mint.status}",
     )
     return token
 

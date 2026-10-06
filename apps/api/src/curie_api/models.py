@@ -2986,6 +2986,9 @@ class ChannelIdentity(Base):
     provider_installation_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), default=None
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class OidcLoginAttempt(Base):
