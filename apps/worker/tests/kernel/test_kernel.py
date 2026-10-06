@@ -176,6 +176,11 @@ class _PressureAttachmentLane:
     def discard_prepared(self, **_kwargs: object) -> None:
         self.discard_calls += 1
 
+    def carry(self, thread_key: str, *, agent_id: str | None = None) -> dict[str, str]:
+        """No retained set: a text-only turn carries nothing (#4079)."""
+
+        return {}
+
 
 def _capture_pressure_outcomes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     real_record_metric = kernel_module.record_metric
@@ -2599,6 +2604,9 @@ def test_active_file_turn_with_a_real_delivery_lease_settles_once(
             def resolve(self, **_kwargs: object) -> object:
                 self.resolve_calls += 1
                 raise AssertionError("an active file turn downloaded its attachment")
+
+            def carry(self, thread_key: str, *, agent_id: str | None = None) -> dict[str, str]:
+                return {}
 
         async with make_harness() as h:
             lane = AttachmentLane()
