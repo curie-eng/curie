@@ -19,8 +19,11 @@ body names no scope.
 
 ``POST /v1/internal/thread-attachments/query``
     request  ``{"agent_id": "<uuid>", "thread_key": "<key>"}``
-    200      ``{"refs": [<ref>, ...]}`` in arrival order (``seq``), ``[]`` for a
-             thread with no live references.
+    200      ``{"refs": [<row>, ...]}`` in arrival order (``seq``), ``[]`` for a
+             thread with no live references. A ``<row>`` is exactly a
+             ``<ref>`` plus ``"event_id": str``, the event it was appended
+             under, so a redelivered turn's worker recognises its own rows
+             by (event_id, file_id).
 
 ``POST /v1/internal/thread-attachments/append``
     request  ``{"agent_id": "<uuid>", "thread_key": "<key>",
@@ -39,7 +42,8 @@ body names no scope.
     422      a ref carrying any field not listed below (``extra="forbid"``):
              the ledger never records an endpoint, a URL or bytes.
 
-``<ref>`` is exactly these fields, in both directions::
+``<ref>`` is exactly these fields (an append's refs; a query row adds only
+``event_id``)::
 
     {"file_id": str, "ordinal": int, "name": str, "disk_name": str,
      "mime_type": str | None, "size_bytes": int | None, "sha256": str,
@@ -103,6 +107,8 @@ REF_FIELDS = {
     "route_adapter",
     "route_identity",
 }
+# A query row: the appended ref plus the event it was recorded under, nothing else.
+ROW_FIELDS = REF_FIELDS | {"event_id"}
 
 CHANNEL = "C0EXAMPLE1"
 THREAD = scoped_conversation_id("slack", CHANNEL, "1700000000.000100")
@@ -255,10 +261,14 @@ def test_refs_come_back_in_arrival_order_with_exactly_the_recorded_fields(
 
     refs = _query(client, aid)
     assert _file_ids(refs) == ["F0A", "F0B", "F0C"]
-    # Exactly the recorded fields: no endpoint, URL, bytes, or row internals.
+    # Exactly the recorded fields and their event: no endpoint, URL, bytes,
+    # or row internals.
     for ref in refs:
-        assert set(ref) == REF_FIELDS, ref
-    assert refs == [*first, *second]
+        assert set(ref) == ROW_FIELDS, ref
+    assert refs == [
+        *({**ref, "event_id": "evt-1"} for ref in first),
+        *({**ref, "event_id": "evt-2"} for ref in second),
+    ]
 
 
 def test_a_redelivered_append_records_nothing_twice_and_keeps_the_order(
@@ -314,7 +324,12 @@ def test_the_same_file_on_a_later_event_is_a_new_reference(
     assert _appended(client, aid, "evt-1", [_ref("F0A")]) == 1
     assert _appended(client, aid, "evt-2", [_ref("F0A", disk_name="F0A (1).pdf")]) == 1
 
-    assert [ref["disk_name"] for ref in _query(client, aid)] == ["F0A.pdf", "F0A (1).pdf"]
+    refs = _query(client, aid)
+    assert [ref["disk_name"] for ref in refs] == ["F0A.pdf", "F0A (1).pdf"]
+    assert [(ref["event_id"], ref["file_id"]) for ref in refs] == [
+        ("evt-1", "F0A"),
+        ("evt-2", "F0A"),
+    ]
 
 
 def test_threads_and_agents_do_not_share_a_ledger(
