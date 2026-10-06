@@ -704,6 +704,12 @@ private metadata binds the existing `QueuedTurn.tool_access`.
 
 ## Administrative route exposure
 
+One service path serves every caller. The administrative service exposes only
+the operations these routes define; earlier internal methods whose answers this
+section changes (absent-row removal without history, unrestricted reads) are
+removed rather than kept beside the new ones, so a later CLI or console caller
+cannot inherit a retired answer.
+
 This section realizes the SOURCE-3 routes and the SOURCE-6/7/10 broker path
 for the API. The [route exposure plan](../plans/2026-10-06-source-admin-routes.md)
 orders the work. It extends the criteria above without changing their IDs and
@@ -921,15 +927,20 @@ secret and legacy secret requests for that agent each hold a gate connection
 waiting on the advisory lock, which no checkout timeout bounds. Two slow
 mutations plus two such waiters can exhaust the four connection pool and stall
 gated ingress for every agent for that long. This slice accepts that bound and
-proves it with a paused owned broker; a bounded lock wait for gate waiters
-belongs to the ingress owner.
+proves it with a paused owned broker; a bounded lock wait for ingress gate
+waiters belongs to the ingress owner. Administrative requests bound their own
+waits: a mutation, GET or secret request that has not acquired the agent gate
+within five seconds answers 503 `source_state_unavailable` without registering,
+reserving or writing, and a mutation releases its administrative slot when it
+gives up.
 
 <!-- @spec PROTECTED-HOOK-SOURCE-7 -->
 Recovery uses the existing coordinator unchanged in order. An exact replay of
 the current committed operation with the same intent, even with stale expected
 generation, allocates nothing: a tombstone resumes its idempotent publication,
 and a protected row answers 503 `source_publication_deferred` with its
-committed generation again. Different intent under that operation, any
+committed generation again, decided from SQL alone without opening a broker
+connection, so the answer does not depend on broker reachability. Different intent under that operation, any
 historical operation and any pending operation are 409
 `source_operation_conflict` with no broker call. A crash or failure before
 reservation leaves pending history only; the source closes, and recovery is a
