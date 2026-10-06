@@ -1231,11 +1231,18 @@ turn resolves only its own files and a text turn reads nothing.
   `CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS` (default 30) and the
   delivery's remaining budget. The prepare has the same deadline plus a short
   grace. A failed read boots with `ledger_unavailable` in the manifest. An
-  adopt, a steer and a sweep continuation read nothing.
+  adopt, a steer and a sweep continuation read nothing. A route that the
+  locked snapshot saw live is read once more just before the claim, with a
+  ledger wired: if its sandbox is gone, the claim cold-creates, so that boot
+  carries the set too.
+- **An API without the ledger routes** (query answered 404, a mixed rollout)
+  is treated as no ledger: a file turn resolves its own files and appends
+  nothing, and a text boot carries no attachment env.
 - **Names are fixed when recorded.** A current file's disk name is cleaned with
   the init container's rules (a leading `.` becomes `_`) and disambiguated
-  against every name the ledger holds, then stored on its ref and never
-  recomputed.
+  against every name the ledger holds, ignoring case, and cut to fit 255
+  bytes. It is then stored on its ref and never recomputed. A redelivery is
+  the same (event, file id), and it keeps its stored name.
 - **Bytes stay short lived.** An earlier file whose parked copy outlives the
   capability by a margin is re-minted, and a new owner record (still
   `"version": 1`, with optional `agent` and `shas` fields) keeps it from the

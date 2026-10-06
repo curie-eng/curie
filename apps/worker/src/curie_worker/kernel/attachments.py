@@ -38,7 +38,8 @@ from ..workspace import (
 if TYPE_CHECKING:
     from .core import Kernel
 
-from . import clock, constants, failures, routing, workspace
+from ..ledger_client import LedgerNotDeployed
+from . import clock, constants, failures, log, routing, workspace
 from .log import logger
 
 
@@ -466,7 +467,7 @@ async def _prepare_thread_attachments(
     boot_env: dict[str, str] | None,
     agent_id: uuid.UUID | None,
     remaining_s: float | None,
-) -> tuple[dict[str, str], PreparedThreadSet]:
+) -> tuple[dict[str, str], PreparedAttachments | PreparedThreadSet]:
     """A file turn's whole thread set (ADR 0205 decision 3), outside the lock.
 
     The ledger is read FIRST; any failure refuses the turn before the claim
@@ -489,6 +490,16 @@ async def _prepare_thread_attachments(
             ledger_refs = tuple(
                 await ledger.query(agent_id=str(agent_id), thread_key=thread_key)
             )
+    except LedgerNotDeployed:
+        # Mixed rollout: the API does not serve the ledger yet. Behave exactly
+        # as a worker with no ledger wired: this message's files only, and no
+        # append. Never a refusal of the person's file.
+        logger.warning(
+            "thread attachment ledger is not deployed on the API (HTTP 404) for "
+            "thread %s; resolving this message's files without the ledger",
+            thread_key,
+        )
+        return await self._resolve_attachments(qevent, boot_env, agent_id)
     except Exception as exc:  # noqa: BLE001 - every ledger failure refuses the same way
         reason = redact_text(failures._exception_reason(exc))[: constants._ESCALATION_DETAIL_MAX]
         raise AttachmentResolutionError(
@@ -511,6 +522,7 @@ async def _prepare_thread_attachments(
         agent_id=str(agent_id),
         ledger_refs=ledger_refs,
         current=current,
+        event_id=qevent.event_id,
         identity=identity,
         # ADR-0153: a channel-port turn's files come from its own adapter,
         # and the server-minted handle is what names that adapter.
@@ -556,6 +568,14 @@ async def _prepare_boot_thread_set(
             ledger_refs = tuple(
                 await ledger.query(agent_id=str(agent_id), thread_key=thread_key)
             )
+    except LedgerNotDeployed:
+        # Mixed rollout: no ledger yet, so the boot is exactly today's.
+        logger.warning(
+            "thread attachment ledger is not deployed on the API (HTTP 404) for "
+            "thread %s; booting without the thread's files",
+            thread_key,
+        )
+        return None
     except Exception as exc:  # noqa: BLE001 - a text boot proceeds without earlier files
         ledger_unavailable = True
         logger.warning(
@@ -629,6 +649,7 @@ async def _append_thread_attachments(
                 refs=refs,
             )
     except Exception as exc:  # noqa: BLE001 - the turn is already running
+        _record_ledger_append("failure")
         logger.warning(
             "thread attachment ledger append failed for thread %s event %s; these "
             "files will be missing from later boots: %s",
@@ -636,6 +657,15 @@ async def _append_thread_attachments(
             qevent.event_id,
             redact_text(failures._exception_reason(exc))[: constants._ESCALATION_DETAIL_MAX],
         )
+    else:
+        _record_ledger_append("success")
+
+
+def _record_ledger_append(outcome: str) -> None:
+    log.record_metric(
+        "curie.attachments.ledger.append",
+        attributes={"service.name": "curie-worker", "outcome": outcome},
+    )
 
 
 async def _discard_unclaimed_thread_set(

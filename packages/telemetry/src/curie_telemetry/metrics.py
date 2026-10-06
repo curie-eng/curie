@@ -175,6 +175,13 @@ _QUEUE_RETRY_ATTRIBUTES = {
         "sandbox-capacity",
     ],
 }
+# ADR 0205 (#4141): the worker's append of a turn's installed files to the
+# thread attachment ledger. Closed on purpose: no thread, agent or event label.
+_ATTACHMENT_LEDGER_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "outcome": ["success", "failure"],
+}
+
 _THREAD_ATTRIBUTES = {
     "service.name": ["curie-worker"],
     "source": ["worker"],
@@ -598,6 +605,13 @@ _METRICS: dict[str, dict[str, Any]] = {
     ),
     "curie.thread.lock.wait.duration": _definition(
         "histogram", "s", "Thread lock acquisition duration.", False, _THREAD_ATTRIBUTES
+    ),
+    "curie.attachments.ledger.append": _definition(
+        "counter",
+        "{append}",
+        "Thread attachment ledger appends after install.",
+        True,
+        _ATTACHMENT_LEDGER_ATTRIBUTES,
     ),
     "curie.thread.route": _definition(
         "counter", "{decision}", "Thread routing decisions.", True, _THREAD_ATTRIBUTES

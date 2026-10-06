@@ -57,7 +57,7 @@ from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Se
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
-from aci_protocol import Attachment, ReplyHandle
+from aci_protocol import Attachment, BootEnv, ReplyHandle
 from aci_protocol.turn import DEFAULT_IDENTITY, slack_speaking_identity
 
 from .ledger_client import ThreadAttachmentRef
@@ -86,12 +86,10 @@ ATTACHMENTS_REF_ENV = "CURIE_ATTACHMENTS_REF"
 
 #: The claim-env key carrying the attachment manifest to the runner (ADR 0205
 #: decision 8): each delivered file's on-disk name and whether it arrived on the
-#: current message, plus the earlier files that are unavailable or omitted. It
-#: is ``aci_protocol``'s ``BootEnv`` key of the same name; spelled here as a
-#: string so the worker does not depend on the protocol release that adds the
-#: field. Unlike ``CURIE_ATTACHMENTS_REF`` it is a runner input and carries no
-#: URL, no id and no credential.
-ATTACHMENTS_MANIFEST_ENV = "CURIE_ATTACHMENTS_MANIFEST"
+#: current message, plus the earlier files that are unavailable or omitted.
+#: Unlike ``CURIE_ATTACHMENTS_REF`` it is a runner input (``BootEnv``'s
+#: ``attachments_manifest``) and carries no URL, no id and no credential.
+ATTACHMENTS_MANIFEST_ENV = BootEnv.env_key("attachments_manifest")
 
 #: Where a resolved attachment lands inside the sandbox, on EVERY substrate.
 #: Kubernetes reaches it through an init container and a mounted emptyDir;
@@ -340,7 +338,40 @@ def clean_attachment_leaf(name: str) -> str:
         raise AttachmentResolutionError("name", f"attachment name {name!r} has no usable leaf")
     if leaf.startswith("."):
         leaf = "_" + leaf[1:]
-    return leaf
+    return _fit_leaf(leaf)
+
+
+# Filesystems cap a name at 255 BYTES. Cleaned names are cut to leave room for
+# the ``-N`` suffix disambiguation may add, so init never meets one too long.
+_MAX_LEAF_BYTES = 255
+_SUFFIX_ROOM_BYTES = 12
+
+
+def _fit_leaf(leaf: str, limit: int = _MAX_LEAF_BYTES - _SUFFIX_ROOM_BYTES) -> str:
+    """Shorten ``leaf`` to ``limit`` UTF-8 bytes, keeping a short extension."""
+
+    if len(leaf.encode("utf-8")) <= limit:
+        return leaf
+    stem, extension = os.path.splitext(leaf)
+    if len(extension.encode("utf-8")) > 16:
+        stem, extension = leaf, ""
+    room = limit - len(extension.encode("utf-8"))
+    cut = stem.encode("utf-8")[:room].decode("utf-8", errors="ignore")
+    return cut + extension
+
+
+class _FoldedNames:
+    """``in`` that ignores case: a docker host on macOS or Windows folds case,
+    so ``Report.pdf`` and ``report.pdf`` would land on one file there."""
+
+    def __init__(self, names: Iterable[str]) -> None:
+        self._folded = {name.casefold() for name in names}
+
+    def __contains__(self, name: object) -> bool:
+        return isinstance(name, str) and name.casefold() in self._folded
+
+    def add(self, name: str) -> None:
+        self._folded.add(name.casefold())
 
 
 def assign_disk_names(names: Sequence[str], *, taken: Iterable[str]) -> tuple[str, ...]:
@@ -352,7 +383,7 @@ def assign_disk_names(names: Sequence[str], *, taken: Iterable[str]) -> tuple[st
     same call are taken too.
     """
 
-    held = set(taken)
+    held = _FoldedNames(taken)
     assigned: list[str] = []
     for name in names:
         leaf = unique_attachment_leaf(clean_attachment_leaf(name), held)
@@ -1060,6 +1091,7 @@ class AttachmentCoordinator:
         agent_id: str | None,
         ledger_refs: Sequence[ThreadAttachmentRef],
         current: Sequence[Attachment] = (),
+        event_id: str | None = None,
         identity: str = DEFAULT_IDENTITY,
         handle: ReplyHandle | None = None,
         routes: Sequence[Any] = (),
@@ -1098,15 +1130,21 @@ class AttachmentCoordinator:
                 "wiring", "attachment resolution requires a bound agent"
             )
 
-        # A ledger ref for a file this message carries is this message's file
-        # (a redelivered turn finds its own refs already appended): it keeps
-        # the name already recorded and is delivered once, as current.
+        # A ledger row recorded by THIS event for a file this message carries
+        # is this message's file (a redelivered turn finds its own refs already
+        # appended): it keeps the name already recorded and is delivered once,
+        # as current. The same file id recorded by another event is an earlier
+        # file, and this message's copy gets a new name (#4141).
         current_ids = {attachment.id for attachment in attached}
         recorded: dict[str, ThreadAttachmentRef] = {}
         for ref in held:
-            if ref.file_id in current_ids:
+            if ref.event_id == event_id and ref.file_id in current_ids:
                 recorded.setdefault(ref.file_id, ref)
-        earlier = [ref for ref in held if ref.file_id not in current_ids]
+        earlier = [
+            ref
+            for ref in held
+            if not (ref.event_id == event_id and ref.file_id in current_ids)
+        ]
         current_names = self._current_disk_names(attached, recorded, held)
 
         mint = uuid.uuid4().hex
@@ -1139,6 +1177,11 @@ class AttachmentCoordinator:
         reused: list[str] = []
         cache = self._parked_cache(thread_key, agent_id) if kept else {}
         for position, ref in kept:
+            if ref.size_bytes is not None and ref.size_bytes > self.limits.max_file_bytes:
+                # Recorded under a larger per-file cap than this worker's: it
+                # would be refused mid-stream anyway, so it is not sent.
+                unavailable[position] = "fetch_failed"
+                continue
             hit = cache.get(ref.sha256)
             if hit is not None:
                 delivered[position] = ThreadSetEntry(
@@ -1258,7 +1301,7 @@ class AttachmentCoordinator:
                 reused_ids.add(attachment.id)
                 names.append(prior.disk_name)
                 continue
-            (leaf,) = assign_disk_names([attachment.name], taken=taken)
+            (leaf,) = assign_disk_names([attachment.name], taken=(*taken, *names))
             taken.add(leaf)
             names.append(leaf)
         return tuple(names)

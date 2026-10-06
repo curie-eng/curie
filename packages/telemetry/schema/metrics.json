@@ -103,6 +103,22 @@
       "type": "gauge",
       "unit": "s"
     },
+    "curie.attachments.ledger.append": {
+      "attributes": {
+        "outcome": [
+          "success",
+          "failure"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 2,
+      "description": "Thread attachment ledger appends after install.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{append}"
+    },
     "curie.background.last_success.age": {
       "attributes": {
         "operation": [

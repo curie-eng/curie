@@ -511,9 +511,23 @@ async def _route_and_start(
         # already holds the files, so it reads nothing. A file turn arrives
         # here with its whole set already prepared (attachment_fresh_only).
         thread_set = None
+        boots = existing_handle is None or replace_handle is not None
+        if (
+            not boots
+            and not attachment_fresh_only
+            and getattr(self, "_attachment_ledger", None) is not None
+        ):
+            # The snapshot above saw a live route, but its sandbox may be gone
+            # by now (a removed container, a pod no longer Running). The claim
+            # below would then evict the stale route and cold-create, and that
+            # fresh boot must carry the thread's files (#4141). Re-read the
+            # route with the claim's own liveness test (``lookup``'s
+            # get_sandbox Running check) just before claiming: one bounded
+            # control-plane read, and only where a ledger is wired.
+            boots = await asyncio.to_thread(self._substrate.lookup, thread_key) is None
         if (
             not attachment_fresh_only
-            and (existing_handle is None or replace_handle is not None)
+            and boots
             and not (
                 boot_env
                 and (ATTACHMENTS_REF_ENV in boot_env or ATTACHMENTS_MANIFEST_ENV in boot_env)

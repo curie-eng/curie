@@ -30,6 +30,15 @@ class LedgerUnavailable(RuntimeError):
     """The thread attachment ledger could not be read or written."""
 
 
+class LedgerNotDeployed(LedgerUnavailable):
+    """The API answered the query 404: it does not serve the ledger routes yet.
+
+    A mixed rollout (a worker ahead of its API) meets this. The kernel treats
+    it as "no ledger wired" rather than as an unreadable ledger, so a person's
+    file is never refused because the API has not rolled.
+    """
+
+
 @dataclass(frozen=True)
 class ThreadAttachmentRef:
     """One recorded file of a thread, exactly the API's wire fields."""
@@ -44,6 +53,10 @@ class ThreadAttachmentRef:
     route_kind: str
     route_adapter: str | None
     route_identity: str
+    #: The event that recorded this row, as the query answers it. Never sent
+    #: on append: the append names its event once, and the API refuses an
+    #: extra ref field.
+    event_id: str | None = None
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -68,6 +81,7 @@ class ThreadAttachmentRef:
             mime = raw["mime_type"]
             size = raw["size_bytes"]
             adapter = raw["route_adapter"]
+            event_id = raw.get("event_id")
             ordinal = raw["ordinal"]
             if isinstance(ordinal, bool) or not isinstance(ordinal, int):
                 raise TypeError("ordinal is not an integer")
@@ -84,10 +98,29 @@ class ThreadAttachmentRef:
                 route_kind=_text(raw["route_kind"]),
                 route_adapter=None if adapter is None else _text(adapter),
                 route_identity=_text(raw["route_identity"]),
+                event_id=None if event_id is None else _text(event_id),
             )
         except (KeyError, TypeError) as exc:
             raise LedgerUnavailable("thread attachment ref is malformed") from exc
         return ref
+
+
+def _error_code(response: httpx.Response) -> str | None:
+    """The API's refusal code (``{"detail": {"code": ...}}``), when it sent one.
+
+    Bounded and character-checked: it lands in a log line.
+    """
+
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        return None
+    code = detail.get("code") if isinstance(detail, Mapping) else None
+    if not isinstance(code, str) or not code or len(code) > 128:
+        return None
+    if not all(ch.isalnum() or ch in "._-" for ch in code):
+        return None
+    return code
 
 
 def _text(value: Any) -> str:
@@ -136,6 +169,11 @@ class ThreadAttachmentLedgerClient:
             )
         except httpx.HTTPError as exc:
             raise LedgerUnavailable("thread attachment ledger is unreachable") from exc
+        if response.status_code == 404:
+            raise LedgerNotDeployed(
+                "thread attachment ledger query returned HTTP 404; the API does not "
+                "serve the ledger yet"
+            )
         if response.status_code != 200:
             raise LedgerUnavailable(
                 f"thread attachment ledger query returned HTTP {response.status_code}"
@@ -192,8 +230,10 @@ class ThreadAttachmentLedgerClient:
                 last = f"HTTP {response.status_code}"
                 continue
             if response.status_code != 200:
+                code = _error_code(response)
                 raise LedgerUnavailable(
                     f"thread attachment ledger refused the append: HTTP {response.status_code}"
+                    + (f" {code}" if code else "")
                 )
             try:
                 appended = response.json()["appended"]
