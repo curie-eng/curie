@@ -599,3 +599,43 @@ def test_the_validator_doc_allows_only_a_read_only_scope_go():
     assert "GO (read-only scope)" in ship
     # Full GO for an action-bearing suite still needs slice 2.
     assert "slice 2" in ship and "full GO" in ship and "action" in ship
+
+
+def test_the_spec_can_come_from_the_threads_repository_workspace():
+    spec = _section("Where the spec comes from")
+    assert "/workspace" in spec
+    assert "https://github.com/" in spec
+    assert "git -C /workspace rev-parse HEAD" in spec
+    # Request text stays first, and Git through the token stays a fallback.
+    assert spec.index("The request itself") < spec.index("/workspace") < spec.index(
+        "A listed repository"
+    )
+
+
+def test_a_workspace_suite_is_copied_byte_for_byte_not_retyped():
+    fixed = _section("Fixed acceptance suite")
+    assert "cp /workspace/" in fixed
+    assert "/tmp/mean-test-suite.json" in fixed
+
+
+def test_the_readme_places_the_tester_beside_its_target():
+    readme = (BUNDLE / "README.md").read_text()
+    for phrase in (
+        "sibling identity",
+        "ADR 0168",
+        "its own Slack app",
+        "api.githubRepoAllowlist",
+        "model credential",
+    ):
+        assert phrase in readme, phrase
+
+
+def test_a_sibling_tester_paces_under_the_platforms_sibling_limits():
+    skill = (BUNDLE / "skills/mean-tester/SKILL.md").read_text()
+    worker = (REPO / "apps/worker/src/curie_worker/sibling_turns.py").read_text()
+    notice = "Stopped here: the bots in this installation have messaged each other too"
+    # The notice the skill grades by must be the one the worker posts.
+    assert notice in worker and notice in skill
+    assert "SIBLING_TURN_LIMIT: Final = 5" in worker
+    assert "SIBLING_OPEN_LIMIT: Final = 5" in worker
+    assert "5 or less" in skill and "4 or less" in skill
