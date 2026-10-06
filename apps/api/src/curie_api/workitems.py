@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from curie_telemetry.redact import redact_text
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -355,12 +355,26 @@ async def _opened_pull_request(
     return succeeded is not None
 
 
-async def _publication_owns_terminus(session: AsyncSession, work_item: WorkItem) -> bool:
+async def _publication_owns_terminus(
+    session: AsyncSession, work_item: WorkItem, request: ExecutionRequest
+) -> bool:
+    """Whether a publication can still settle this request (#4158).
+
+    This request's own publication, in any status, or one still in flight on
+    the work item's lineage or conversation, owns the terminus. An earlier
+    request's settled publication on the same lineage does not.
+    """
+    scope = Publication.workspace_conversation_id == work_item.conversation_id
     if work_item.publication_lineage_id is not None:
-        return True
+        scope = or_(scope, Publication.lineage_id == work_item.publication_lineage_id)
     found = await session.scalar(
         select(Publication.id)
-        .where(Publication.workspace_conversation_id == work_item.conversation_id)
+        .where(
+            or_(
+                Publication.execution_request_id == request.id,
+                and_(scope, Publication.status.in_(_IN_FLIGHT_PUBLICATION)),
+            )
+        )
         .limit(1)
     )
     return found is not None
@@ -1190,7 +1204,7 @@ async def _terminalize_execution(
                 session, "publication_pending", work_item=work_item, request=request
             )
     if status == "failed" and cause.strip() in _UNPUBLISHED_CAUSES:
-        if await _publication_owns_terminus(session, work_item):
+        if await _publication_owns_terminus(session, work_item, request):
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request
             )
