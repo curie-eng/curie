@@ -11,6 +11,7 @@ import json
 import uuid
 from base64 import urlsafe_b64decode
 
+from curie_internal.sandbox_token import verify
 from curie_worker.binding import (
     HISTORY_TOKEN_ENV,
     MEMORY_TOKEN_ENV,
@@ -18,7 +19,6 @@ from curie_worker.binding import (
     ResolvedDeployment,
 )
 from curie_worker.config import WorkerConfig
-from curie_internal.sandbox_token import verify
 
 _AGENT = uuid.UUID("11111111-1111-4111-8111-111111111111")
 _KEY = "test-api-key"
