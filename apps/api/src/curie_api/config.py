@@ -650,14 +650,6 @@ class Settings(BaseSettings):
     # same way as GITHUB_FACTORY_RECONCILE_INTERVAL_S (#3709): refused at boot
     # rather than surfacing mid-delivery (#3720).
     hook_backlog_window_s: int = Field(default=60, gt=0)
-    # Protected runtime bootstrap directory (PROTECTED-HOOK-SOURCE-9). Only the
-    # out of band provisioner writes it and mounts it read only into the API:
-    # manifest.json, ca.pem and bootstrap.json, read afresh by each support probe
-    # evaluation. Unset means no protected runtime is provisioned here, so a
-    # protected row reports runtime_unavailable. Nothing in this API creates it.
-    protected_runtime_dir: str | None = Field(
-        default=None, validation_alias="CURIE_PROTECTED_RUNTIME_DIR"
-    )
     channel_binding_backlog_limit: int = 64
     channel_binding_backlog_window_s: int = Field(default=60, gt=0)
     # Sandbox ResourceQuota hard limits (#3209). The chart sets all four when

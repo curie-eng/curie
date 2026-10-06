@@ -611,76 +611,10 @@ a committed row reports `read-only`, the most restrictive policy any pending
 operation could commit, rather than inferring an ordinary resolution from
 incomplete history. Runtime members stay null until an authenticated broker
 evaluation supplies them; the policy row's own runtime, qualification and bundle
-references are writable configuration and are never echoed. The status always
-follows `supported`.
-
-Broker evaluation of a protected row uses the API protected runtime bootstrap.
-The setting `CURIE_PROTECTED_RUNTIME_DIR` names a directory that only the out of
-band provisioner writes and mounts read only into the API. It holds exactly
-`manifest.json` (the trusted runtime manifest bytes), `ca.pem` (the broker CA
-certificates) and `bootstrap.json`, a strict object containing exactly
-`schema_version: 1`, `max_readiness_ms` (a positive canonical decimal string)
-and `control_reader: {username, password}` for the control reader principal.
-No route, CLI verb or chart default creates, returns or mounts this directory
-here, and it is never mounted into an ordinary worker or runner; provisioning
-and its preventive guards remain LANE-8 work. The probe reads the files afresh
-on each evaluation so a provisioner rotation needs no restart, and never logs
-their content. An unset setting, or a missing, unreadable or invalid file,
-evaluates to `runtime_unavailable`.
-
-The probe releases the source gate, and ends its request database transaction,
-before any broker I/O: the evaluation is observational, every delivery repeats
-it, and no database connection may wait on the broker. Each API process runs at
-most four broker evaluations at once; a probe beyond that limit reports
-`broker_unavailable` without connecting rather than queueing. One evaluation
-has a five second budget across connection and every read, and exceeding it
-reports `broker_unavailable`. The budget starts after address resolution of the
-manifest endpoint; name resolution is bounded by the host resolver, not by this
-budget. A nested budget can only shorten an enclosing one. Bootstrap files are read relative to one opened
-directory, must each be a regular file after symlink resolution, are opened
-without blocking on special files, and are bounded in size; anything else makes
-the bootstrap invalid. Validating `ca.pem` takes time linear in its size. It opens one
-`AuthenticatedMetadataReader` from the bootstrap off the event loop, performs
-the reads below on that connection, and closes it. The first failing step
-decides the reason:
-
-1. The bootstrap manifest's `runtime_id` differs from the policy row's:
-   `configuration_unsupported` (one runtime per deployment, SOURCE-1).
-2. The reader cannot connect, authenticate or confirm the manifest's live
-   `run_id`, or any later read fails: `broker_unavailable`. The reader's single
-   safe error does not distinguish these causes.
-3. `read_source` has no active record, or its generation, operation, mode or
-   `policy_fingerprint` differs from the committed row under SOURCE-6:
-   `source_closed`.
-4. `protected:control:selection:{runtime_id}` is absent or malformed, its
-   `manifest_digest` differs from the bootstrap manifest, or the manifest
-   control record differs from the bootstrap bytes: `runtime_unavailable`.
-5. The selection's `broker_run_id`, or the run_id that `observe()` returns,
-   differs from the manifest's: `broker_identity_mismatch`.
-6. The selected qualification record is absent: `qualification_unavailable`.
-7. The selected readiness record is absent: `evidence_missing`.
-8. Broker time from `observe()` is at or after the readiness `expires_at_ms`:
-   `evidence_expired`.
-9. `validate_authority` refuses the manifest, qualification and readiness with
-   the bootstrap `max_readiness_ms` and observed broker time, or the
-   selection's runtime identifier, runtime generation, qualification identifier
-   or qualification generation differs from them: `qualification_unavailable`.
-10. The selection's qualification or the manifest's bundle digest differs from
-    the policy row's references: `configuration_unsupported`.
-11. The selection has `admission_open: false`: `runtime_unavailable`.
-
-A control record that is present but malformed counts as absent at its own
-step: selection or manifest at step 4, qualification at step 6, readiness at
-step 7. Manifest comparisons use canonical bytes, so a parseable but
-non-canonical `manifest.json` matches its canonical control record. Extra files
-in the bootstrap directory are ignored. A `default` control reader username,
-like any credential the reader refuses before connecting, makes the bootstrap
-invalid. A committed row whose policy fingerprint cannot be computed returns
-the 503 `authority_unavailable` refusal without this DTO. Runtime members are
-reported only once steps 4 through 9 have validated the selected tuple. A row that passes every step still reports
-`configuration_unsupported`, HTTP 503, until delivery ingress admits protected
-deliveries under LANE-4; the probe must not claim support that ingress cannot
-honor. Unconfigured, tombstoned and pending-history rows never open a reader.
+references are writable configuration and are never echoed. While the API holds
+no protected broker metadata reader, broker evaluation of a protected row
+returns `broker_unavailable`. All four rows return HTTP 503 with
+`supported=false`; the status always follows `supported`.
 
 Local/cluster CLI `hook policy support` serializes this exact request and
 verifies this DTO rather than inspecting OpenAPI. It reads the scoped key from

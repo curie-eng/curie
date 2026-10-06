@@ -15181,7 +15181,7 @@
     },
     "/hooks/{agent_id}/{hook}/support": {
       "post": {
-        "description": "Report the current protected support resolution for one hook; write nothing.\n\nThe JSON body is ``HookSupportIn``, read raw because its exact bytes are\nsigned. Order follows the spec: hook name, bounded body, strict parse,\nungated support signature, delivery id, gate-held reauthentication, snapshot,\ngate release, then broker evaluation of a protected row only.\nThe delivery id is signed context only and reserves nothing.",
+        "description": "Report the current protected support resolution for one hook; write nothing.\n\nThe JSON body is ``HookSupportIn``, read raw because its exact bytes are\nsigned. Order follows the spec: hook name, bounded body, strict parse,\nungated support signature, delivery id, gate-held reauthentication, snapshot.\nThe delivery id is signed context only and reserves nothing.",
         "operationId": "probe_hook_support_hooks__agent_id___hook__support_post",
         "parameters": [
           {

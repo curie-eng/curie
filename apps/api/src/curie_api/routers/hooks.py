@@ -75,7 +75,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, ValidationError
-from sqlalchemy.exc import SQLAlchemyError
 
 from .. import crud
 from ..config import get_settings
@@ -103,11 +102,6 @@ from ..hook_source_auth import (
 from ..hook_source_policy_schemas import HookSupportIn, HookSupportOut, HookSupportReason
 from ..identities import refuse_undeclared
 from ..models import Agent, AgentChannel
-from ..protected_support import (
-    RuntimeMembers,
-    SupportAuthorityUnavailable,
-    evaluate_protected_support,
-)
 from ..source_binding import MappingOutcome, resolve_source_binding
 from ..wirebody import read_bounded_body
 
@@ -755,21 +749,16 @@ def _parse_support(raw: bytes) -> HookSupportIn:
         ) from exc
 
 
-async def _resolve_support(
-    snapshot: SourceSnapshot, requested: ToolAccess | None, runtime_dir: str | None
-) -> HookSupportOut:
-    """The spec's resolution table over a snapshot captured under the gate.
+def _resolve_support(snapshot: SourceSnapshot, requested: ToolAccess | None) -> HookSupportOut:
+    """The spec's resolution table over a gate-held snapshot.
 
-    Called after the source gate is released: only a committed protected row
-    runs the observational broker evaluation, and only it can carry runtime
-    members. Nothing from the bootstrap or the row's references is echoed.
+    Runtime members stay null: the API holds no protected broker reader yet.
     @spec PROTECTED-HOOK-SOURCE-9.
     """
     policy = snapshot.policy
     effective: ToolAccess | None = requested
     generation: str | None = None
     reason: HookSupportReason = "source_unconfigured"
-    runtime: RuntimeMembers | None = None
     if policy is None:
         if snapshot.attempt_history_present:
             effective, reason = ToolAccess.READ_ONLY, "source_closed"
@@ -777,22 +766,16 @@ async def _resolve_support(
         generation, reason = str(policy.generation), "source_closed"
     elif policy.mode == "protected":
         effective, generation = ToolAccess.READ_ONLY, str(policy.generation)
-        try:
-            evaluation = await evaluate_protected_support(policy, runtime_dir)
-        except SupportAuthorityUnavailable:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable"
-            ) from None
-        reason, runtime = evaluation.reason, evaluation.runtime
+        reason = "broker_unavailable"
     else:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable")
     return HookSupportOut(
         requested_tool_access=requested,
         effective_tool_access=effective,
         source_generation=generation,
-        runtime_id=runtime.runtime_id if runtime is not None else None,
-        runtime_generation=runtime.runtime_generation if runtime is not None else None,
-        qualification_id=runtime.qualification_id if runtime is not None else None,
+        runtime_id=None,
+        runtime_generation=None,
+        qualification_id=None,
         supported=False,
         reason=reason,
     )
@@ -842,8 +825,7 @@ async def probe_hook_support(
 
     The JSON body is ``HookSupportIn``, read raw because its exact bytes are
     signed. Order follows the spec: hook name, bounded body, strict parse,
-    ungated support signature, delivery id, gate-held reauthentication, snapshot,
-    gate release, then broker evaluation of a protected row only.
+    ungated support signature, delivery id, gate-held reauthentication, snapshot.
     The delivery id is signed context only and reserves nothing.
     \f
     @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-SOURCE-2/4.
@@ -863,16 +845,8 @@ async def probe_hook_support(
         timestamp=x_curie_timestamp,
         delivery_id=x_curie_delivery_id,
         signature=x_curie_signature_256,
-    ) as gated:
-        snapshot = gated
-    # The gate is released here, and the request transaction ends next: broker
-    # evaluation is observational, every delivery repeats it, and no database
-    # connection may wait on the broker.
-    try:
-        await session.rollback()
-    except SQLAlchemyError:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable") from None
-    resolution = await _resolve_support(snapshot, requested, settings.protected_runtime_dir)
+    ) as snapshot:
+        resolution = _resolve_support(snapshot, requested)
     return JSONResponse(
         status_code=(
             status.HTTP_200_OK if resolution.supported else status.HTTP_503_SERVICE_UNAVAILABLE

@@ -394,19 +394,6 @@ def broker(tls_broker):
     tls_broker.command("CLIENT", "KILL", "USER", "control_reader", "SKIPME", "yes")
 
 
-def wait_no_reader_sessions(broker, seconds=2):
-    """The server lists a closed session briefly after the client closes it.
-
-    Poll ``CLIENT LIST`` until no control reader session remains, @spec
-    PROTECTED-HOOK-LANE-3.
-    """
-    deadline = time.monotonic() + seconds
-    while broker.reader_sessions():
-        if time.monotonic() > deadline:
-            fail_safely("closed reader session still listed")
-        time.sleep(0.02)
-
-
 def assert_safe(error, broker):
     """Exact public safe error oracle, @spec PROTECTED-HOOK-LANE-3."""
     assert type(error) is BrokerMetadataUnavailable
@@ -709,7 +696,7 @@ def test_invalid_coordinates_precede_identity_and_close_is_terminal(broker):
         assert broker.command("ACL", "LOG") == []
         reader.close()
         reader.close()
-        wait_no_reader_sessions(broker)
+        assert broker.reader_sessions() == []
         for operation in (
             lambda: reader.read_control(CONTROL),
             lambda: reader.read_source(AGENT, HOOK),
@@ -745,32 +732,3 @@ def test_broker_type_and_source_corruption_refusals_are_safe(broker):
         assert_safe(caught.value, broker)
     finally:
         reader.close()
-
-
-@pytest.mark.parametrize("inner", [None, 60], ids=["outer-only", "nested-longer"])
-def test_nested_budget_cannot_extend_the_enclosing_deadline(broker, inner):
-    """An inner ``metadata_reader_budget(60)`` inside a short outer one keeps the outer deadline.
-
-    The manifest names an owned loopback listener that never accepts, so the
-    reader's TLS handshake stalls until a deadline ends it. Only an upper bound
-    is asserted; the per socket timeout (two seconds) lies above it.
-    @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-LANE-2/3.
-    """
-    module = transport()
-    assert hasattr(module, "metadata_reader_budget"), "metadata reader budget absent"
-    with socket.socket() as stalled:
-        stalled.bind(("127.0.0.1", 0))
-        stalled.listen(4)
-        manifest = broker.manifest(endpoint={"host": "127.0.0.1", "port": stalled.getsockname()[1]})
-        started = time.monotonic()
-        with module.metadata_reader_budget(0.3):
-            if inner is None:
-                with pytest.raises(BrokerMetadataUnavailable) as caught:
-                    broker.connect(module, manifest)
-            else:
-                with module.metadata_reader_budget(inner):
-                    with pytest.raises(BrokerMetadataUnavailable) as caught:
-                        broker.connect(module, manifest)
-        elapsed = time.monotonic() - started
-    assert_safe(caught.value, broker)
-    assert elapsed < 1.5, f"reader outlived the enclosing budget: {elapsed:.2f}s"
