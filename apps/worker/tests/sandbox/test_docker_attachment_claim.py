@@ -23,9 +23,13 @@ unusable name, over the cap. A refusal must leave nothing half-materialized.
 **What is mocked, and why only that.** The presigned object store's HTTP GET,
 and nothing else. It is an external service; the decode, the digest check, the
 cap, the materialization, the chmod and the argv are all exercised for real.
-The download is intercepted at ``urllib.request.urlopen``, which is the call
-``_prepare_workspace`` makes -- a driver that fetches some other way will fail
-here saying it never fetched at all, which is the correct thing for it to say.
+The download is intercepted at ``urllib.request.OpenerDirector.open``, which
+both ``urllib.request.urlopen`` (the call ``_prepare_workspace`` makes) and an
+opener built with a refusing redirect handler go through. A 302 is resolved the
+way urllib resolves it: by asking the opener's own redirect handler, so a driver
+that follows redirects is seen following one. A driver that fetches some other
+way will fail here saying it never fetched at all, which is the correct thing
+for it to say.
 
 **The mount path is a cross-substrate seam.** ``curie_runner.__main__.ATTACHMENTS_DIR``
 is compiled into the runner (the reference env is deliberately scoped away from
@@ -195,6 +199,11 @@ class _FakeObjectStore:
         # socket timeout, and the monotonic clock jumps past any fetch deadline,
         # which is what a real stall costs the boot.
         self.stalls: set[str] = set()
+        # urls that hand over one byte per read and advance the clock a step
+        # each time: no read trips a socket timeout, the body outlasts the deadline.
+        self.drips: set[str] = set()
+        # url -> location a 302 points at.
+        self.redirects: dict[str, str] = {}
         self.clock: _Clock | None = None
 
     def add(self, url: str, payload: bytes, *, chunk_size: int = 16) -> str:
@@ -202,11 +211,33 @@ class _FakeObjectStore:
         return url
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(urllib.request, "urlopen", self._urlopen)
+        store = self
 
-    def _urlopen(self, request: Any, *_args: Any, **_kwargs: Any) -> _FakeBody:
-        url = str(getattr(request, "full_url", request))
+        def _open(
+            opener: urllib.request.OpenerDirector, request: Any, *_a: Any, **_k: Any
+        ) -> _FakeBody:
+            return store._open(opener, request)
+
+        monkeypatch.setattr(urllib.request.OpenerDirector, "open", _open)
+
+    def _open(self, opener: urllib.request.OpenerDirector, request: Any) -> _FakeBody:
+        if isinstance(request, str):
+            request = urllib.request.Request(request)
+        url = str(request.full_url)
         self.requested.append(url)
+        if url in self.redirects:
+            target = self.redirects[url]
+            handlers = [
+                h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)
+            ]
+            follow = (
+                handlers[0].redirect_request(request, None, 302, "Found", {}, target)  # type: ignore[arg-type]
+                if handlers
+                else None
+            )
+            if follow is None:
+                raise urllib.error.HTTPError(url, 302, "Found", {}, None)  # type: ignore[arg-type]
+            return self._open(opener, follow)
         if url in self.errors:
             code = self.errors[url]
             raise urllib.error.HTTPError(url, code, "store refused", {}, None)  # type: ignore[arg-type]
@@ -215,6 +246,8 @@ class _FakeObjectStore:
         payload, chunk_size = self.objects[url]
         if url in self.stalls:
             return _StalledBody(self, url, payload, chunk_size)
+        if url in self.drips:
+            return _DrippingBody(self, url, payload, 1)
         return _FakeBody(self, url, payload, chunk_size)
 
 
@@ -225,8 +258,18 @@ class _StalledBody(_FakeBody):
         raise TimeoutError("timed out")
 
 
+class _DrippingBody(_FakeBody):
+    def read(self, amount: int | None = None) -> bytes:
+        if self._store.clock is not None:
+            self._store.clock.advance(_DRIP_STEP_SECONDS)
+        return super().read(1)
+
+
 # Longer than any fetch deadline either substrate could configure.
 _STALL_SECONDS = 10_000.0
+# One drip byte costs this much monotonic time: inside any socket timeout, and
+# the vector's drip bodies (>= 15 bytes) add up past the driver's deadline.
+_DRIP_STEP_SECONDS = 30.0
 
 
 class _Clock:
@@ -739,6 +782,8 @@ def _vector_payload(
     now = int(time.time())
     for index, item in enumerate(case["entries"]):
         body = item["body"].encode()
+        if item["serve"] == "oversize":
+            body = b"z" * (_VECTOR["cap_bytes"] + 1)
         url = f"https://objects.example.test/attachments/vector/{index:03d}.bin"
         served = body + b" tampered" if item["serve"] == "digest_mismatch" else body
         objects.add(url, served)
@@ -746,6 +791,11 @@ def _vector_payload(
             objects.errors[url] = int(item["serve"].removeprefix("http_"))
         if item["serve"] == "stall":
             objects.stalls.add(url)
+        if item["serve"] == "drip":
+            objects.drips.add(url)
+        if item["serve"] == "redirect":
+            objects.add(url + ".moved", body)
+            objects.redirects[url] = url + ".moved"
         entry: dict[str, Any] = {
             "n": item["n"],
             "u": url,
@@ -762,7 +812,10 @@ def _vector_payload(
 
 
 def _assert_common(
-    case: dict[str, Any], by_url: dict[str, dict[str, Any]], requested: list[str]
+    case: dict[str, Any],
+    by_url: dict[str, dict[str, Any]],
+    requested: list[str],
+    objects: _FakeObjectStore,
 ) -> None:
     """The invariants every vector case carries, as the chart script checks them."""
 
@@ -781,9 +834,34 @@ def _assert_common(
         f"an expired reference was fetched ({order}); it must be skipped unfetched"
     )
     late = {row["name"] for row in case.get("status") or [] if row["reason"] == "deadline"}
-    assert not [i["n"] for i in fetched if i["n"] in late], (
+    assert not [i["n"] for i in fetched if i["n"] in late and i["serve"] != "drip"], (
         f"an entry past the overall deadline was fetched ({order}); it must be skipped unfetched"
     )
+    if case.get("refused_before_fetch"):
+        assert requested == [], (
+            f"the payload was refused only after fetching {order}; an unusable name "
+            "must be refused before any byte is pulled"
+        )
+    followed = [url for url in requested if url.endswith(".moved")]
+    assert followed == [], f"a redirect was followed to {followed}; it must be refused"
+    for url, item in by_url.items():
+        if item["serve"] == "drip":
+            delivered = objects.delivered.get(url, 0)
+            assert delivered < len(item["body"].encode()), (
+                f"{item['n']!r} was read to the end ({delivered} bytes) although it "
+                "dripped past the fetch deadline; the deadline must cut a slow body off"
+            )
+
+
+def _assert_nothing_outside(root: Path, staged_dirs: list[Path]) -> None:
+    strays = [
+        path
+        for staged_dir in staged_dirs
+        if staged_dir.exists()
+        for path in staged_dir.rglob("*")
+        if path != root and path.parent != root
+    ]
+    assert strays == [], f"something was written outside the mount root: {strays}"
 
 
 @pytest.mark.parametrize("case", _VECTOR["cases"], ids=[c["name"] for c in _VECTOR["cases"]])
@@ -803,14 +881,15 @@ def test_the_docker_driver_matches_the_shared_init_outcome_vector(
 
     objects.clock = _Clock(monkeypatch)
     encoded, by_url = _vector_payload(case, objects)
-    client = _client()
+    # The vector's per-file cap, the same number the chart script renders.
+    client = _client(limits=_limits(max_file_bytes=_VECTOR["cap_bytes"]))
     env = {**_BASE_ENV, ATTACHMENTS_REF_ENV: encoded}
 
     if case["outcome"] == "fatal":
         _refused(client, env, because=f"vector case {case['name']}")
         assert client.calls == [], "no container may be started for a refused claim"
         _left_nothing(staged)
-        _assert_common(case, by_url, objects.requested)
+        _assert_common(case, by_url, objects.requested, objects)
         return
 
     client.create_claim("claim-attachments", pool="pool", env=env)
@@ -822,19 +901,27 @@ def test_the_docker_driver_matches_the_shared_init_outcome_vector(
     assert visible == {name: body.encode() for name, body in case["visible"].items()}
     hidden = sorted(entry.name for entry in root.iterdir() if entry.name.startswith("."))
     status_name = _VECTOR["status_file"]
-    assert hidden == [status_name], (
-        f"hidden entries {hidden} in the mount; expected only {status_name} "
+    # A legacy payload (no "c") may or may not write the status file.
+    allowed = [[status_name]] if case["status"] is not None else [[], [status_name]]
+    assert hidden in allowed, (
+        f"hidden entries {hidden} in the mount; expected one of {allowed} "
         "(written to a temp name and renamed into place)"
     )
-    status_path = root / status_name
-    assert status_path.stat().st_mode & 0o004, "the status file is not readable by the runner"
-    status = json.loads(status_path.read_text())
-    assert set(status) == {"v", "files"} and status["v"] == _VECTOR["status_version"], status
-    assert all(set(row) == {"name", "status", "reason"} for row in status["files"]), status
-    assert sorted(status["files"], key=lambda r: r["name"]) == sorted(
-        case["status"], key=lambda r: r["name"]
-    )
-    _assert_common(case, by_url, objects.requested)
+    _assert_nothing_outside(root, staged)
+    if case["status"] is not None:
+        status_path = root / status_name
+        assert status_path.stat().st_mode & 0o004, "the status file is not readable by the runner"
+        status = json.loads(status_path.read_text())
+        assert set(status) == {"v", "files"} and status["v"] == _VECTOR["status_version"], status
+        assert all(set(row) == {"name", "status", "reason"} for row in status["files"]), status
+        got = sorted(status["files"], key=lambda r: r["name"])
+        want = sorted(case["status"], key=lambda r: r["name"])
+        assert [r["name"] for r in got] == [r["name"] for r in want], (got, want)
+        for row, expected in zip(got, want, strict=True):
+            reasons = expected["reason"]
+            reasons = reasons if isinstance(reasons, list) else [reasons]
+            assert row["status"] == expected["status"] and row["reason"] in reasons, (row, expected)
+    _assert_common(case, by_url, objects.requested, objects)
 
 
 def test_the_attachment_manifest_is_forwarded_to_the_runner(

@@ -1,244 +1,932 @@
 {
-  "comment": "ADR 0205 decisions 4, 6 and 8: what a sandbox boot makes of one CURIE_ATTACHMENTS_REF payload. Two substrates redeem the same payload and must agree case by case: the rendered attachments-init program (executed by charts/curie/ci/attachment-init-behavior-assertions.sh against a fixture HTTP server) and the docker driver's _prepare_attachments (apps/worker/tests/sandbox/test_docker_attachment_claim.py, urlopen faked). Each entry is the wire entry (n/u/s/b/e/m) plus 'c': 1 for a file on the current message, 0 for an earlier one, and absent for a payload from a worker that predates the field, which is read as current. 'serve' says how the store answers: ok serves the body; expired mints the reference with a closed window (it must never be fetched); http_404/http_403/http_500 answer with that status; stall sends the headers and part of the body and then goes silent past the init container's fetch timeout; digest_mismatch serves bytes other than the ones the digest was minted from. outcome 'fatal' means the boot is refused and nothing is visible in the mount; 'ok' means 'visible' is exactly the set of non-hidden files in the mount (name -> bytes) and the status file holds exactly 'status' (order-insensitive by name). Every harness also checks, for every case: no current entry is fetched after an earlier one, an expired entry is never fetched, and an entry recorded unavailable for 'deadline' is never fetched.",
+  "comment": "ADR 0205 decisions 4, 6 and 8: what a sandbox boot makes of one CURIE_ATTACHMENTS_REF payload. Two substrates redeem the same payload and must agree case by case: the rendered attachments-init program (executed by charts/curie/ci/attachment-init-behavior-assertions.sh against a fixture HTTP server) and the docker driver's _prepare_attachments (apps/worker/tests/sandbox/test_docker_attachment_claim.py, OpenerDirector.open faked). Each entry is the wire entry (n/u/s/b/e/m) plus 'c': 1 for a file on the current message, 0 for an earlier one. A payload whose entries carry NO 'c' is an older worker's (mixed-version rollout) and keeps the pre-ADR behavior for the whole payload: every entry is current and all-or-nothing, the name is cleaned to its basename (blank, '.', '..' refused) and a duplicate is disambiguated with a numeric suffix before the extension (report.pdf, report-2.pdf, ...), skipping a name already taken. Exact-name strictness (unclean, reserved '.curie-' or duplicate name fatal; whitespace-only fatal) applies only to a payload that carries 'c'. 'serve' says how the store answers: ok serves the body; expired mints the reference with a closed window (never fetched); http_404/http_403/http_500 answer with that status; redirect answers 302 to a location that would serve the body (a redirect is refused, never followed); stall sends the headers and one byte and then goes silent past the fetch deadline; drip sends one byte at a time, each well inside a socket timeout, so the whole body takes longer than the fetch deadline; oversize serves cap_bytes + 1 bytes whose digest is the minted one (only the per-file cap can refuse it); digest_mismatch serves bytes other than the ones the digest was minted from. outcome 'fatal' means the boot is refused and nothing is visible in the mount; refused_before_fetch additionally means no entry of the payload was requested. 'ok' means 'visible' is exactly the set of non-hidden files in the mount (name -> bytes) and, when 'status' is not null, the status file holds exactly 'status' (order-insensitive by name; a reason given as a list accepts any of its members). With 'status' null (a legacy payload) the status file may or may not be written. Every harness also checks, for every case: no current entry is fetched after an earlier one, an expired entry is never fetched, an entry recorded 'deadline' that is not itself a drip is never fetched, nothing is written outside the mount, and a drip is abandoned at the deadline rather than read to the end.",
   "status_file": ".curie-attachments-status.json",
   "status_version": 1,
-  "unavailable_reasons": ["expired", "not_found", "forbidden", "fetch_failed", "timeout", "deadline"],
+  "unavailable_reasons": [
+    "no_route",
+    "no_credential",
+    "not_found",
+    "forbidden",
+    "rate_limited",
+    "timeout",
+    "digest_changed",
+    "expired",
+    "deadline",
+    "fetch_failed"
+  ],
   "cases": [
     {
       "name": "current_files_keep_their_exact_names",
       "entries": [
-        {"n": "report.csv", "c": 1, "body": "a,b\n1,2\n", "serve": "ok"},
-        {"n": "Q3 notes - final (v2).txt", "c": 1, "body": "hello attachment", "serve": "ok"}
+        {
+          "n": "report.csv",
+          "c": 1,
+          "body": "a,b\n1,2\n",
+          "serve": "ok"
+        },
+        {
+          "n": "Q3 notes - final (v2).txt",
+          "c": 1,
+          "body": "hello attachment",
+          "serve": "ok"
+        }
       ],
       "outcome": "ok",
-      "visible": {"report.csv": "a,b\n1,2\n", "Q3 notes - final (v2).txt": "hello attachment"},
+      "visible": {
+        "report.csv": "a,b\n1,2\n",
+        "Q3 notes - final (v2).txt": "hello attachment"
+      },
       "status": [
-        {"name": "report.csv", "status": "ok", "reason": null},
-        {"name": "Q3 notes - final (v2).txt", "status": "ok", "reason": null}
+        {
+          "name": "report.csv",
+          "status": "ok",
+          "reason": null
+        },
+        {
+          "name": "Q3 notes - final (v2).txt",
+          "status": "ok",
+          "reason": null
+        }
       ]
     },
     {
       "name": "a_payload_without_c_is_all_current",
       "entries": [
-        {"n": "a.txt", "body": "alpha", "serve": "ok"},
-        {"n": "b.txt", "body": "bravo", "serve": "ok"}
+        {
+          "n": "a.txt",
+          "body": "alpha",
+          "serve": "ok"
+        },
+        {
+          "n": "b.txt",
+          "body": "bravo",
+          "serve": "ok"
+        }
       ],
       "outcome": "ok",
-      "visible": {"a.txt": "alpha", "b.txt": "bravo"},
-      "status": [
-        {"name": "a.txt", "status": "ok", "reason": null},
-        {"name": "b.txt", "status": "ok", "reason": null}
-      ]
+      "visible": {
+        "a.txt": "alpha",
+        "b.txt": "bravo"
+      },
+      "status": null
     },
     {
       "name": "an_expired_entry_without_c_is_current_and_fatal",
       "entries": [
-        {"n": "a.txt", "body": "alpha", "serve": "ok"},
-        {"n": "b.txt", "body": "bravo", "serve": "expired"}
+        {
+          "n": "a.txt",
+          "body": "alpha",
+          "serve": "ok"
+        },
+        {
+          "n": "b.txt",
+          "body": "bravo",
+          "serve": "expired"
+        }
       ],
       "outcome": "fatal"
     },
     {
       "name": "earlier_and_current_names_are_written_as_recorded",
       "entries": [
-        {"n": "report.pdf", "c": 0, "body": "first report", "serve": "ok"},
-        {"n": "report-2.pdf", "c": 1, "body": "second report", "serve": "ok"}
+        {
+          "n": "report.pdf",
+          "c": 0,
+          "body": "first report",
+          "serve": "ok"
+        },
+        {
+          "n": "report-2.pdf",
+          "c": 1,
+          "body": "second report",
+          "serve": "ok"
+        }
       ],
       "outcome": "ok",
-      "visible": {"report.pdf": "first report", "report-2.pdf": "second report"},
+      "visible": {
+        "report.pdf": "first report",
+        "report-2.pdf": "second report"
+      },
       "status": [
-        {"name": "report.pdf", "status": "ok", "reason": null},
-        {"name": "report-2.pdf", "status": "ok", "reason": null}
+        {
+          "name": "report.pdf",
+          "status": "ok",
+          "reason": null
+        },
+        {
+          "name": "report-2.pdf",
+          "status": "ok",
+          "reason": null
+        }
       ]
     },
     {
       "name": "current_is_fetched_before_earlier_whatever_the_payload_order",
       "entries": [
-        {"n": "old-1.txt", "c": 0, "body": "one", "serve": "ok"},
-        {"n": "old-2.txt", "c": 0, "body": "two", "serve": "ok"},
-        {"n": "new.txt", "c": 1, "body": "three", "serve": "ok"}
+        {
+          "n": "old-1.txt",
+          "c": 0,
+          "body": "one",
+          "serve": "ok"
+        },
+        {
+          "n": "old-2.txt",
+          "c": 0,
+          "body": "two",
+          "serve": "ok"
+        },
+        {
+          "n": "new.txt",
+          "c": 1,
+          "body": "three",
+          "serve": "ok"
+        }
       ],
       "outcome": "ok",
-      "visible": {"old-1.txt": "one", "old-2.txt": "two", "new.txt": "three"},
+      "visible": {
+        "old-1.txt": "one",
+        "old-2.txt": "two",
+        "new.txt": "three"
+      },
       "status": [
-        {"name": "old-1.txt", "status": "ok", "reason": null},
-        {"name": "old-2.txt", "status": "ok", "reason": null},
-        {"name": "new.txt", "status": "ok", "reason": null}
+        {
+          "name": "old-1.txt",
+          "status": "ok",
+          "reason": null
+        },
+        {
+          "name": "old-2.txt",
+          "status": "ok",
+          "reason": null
+        },
+        {
+          "name": "new.txt",
+          "status": "ok",
+          "reason": null
+        }
       ]
     },
     {
       "name": "an_expired_earlier_reference_is_skipped_and_recorded",
       "entries": [
-        {"n": "old.csv", "c": 0, "body": "x,y\n", "serve": "expired"},
-        {"n": "new.csv", "c": 1, "body": "a,b\n", "serve": "ok"}
+        {
+          "n": "old.csv",
+          "c": 0,
+          "body": "x,y\n",
+          "serve": "expired"
+        },
+        {
+          "n": "new.csv",
+          "c": 1,
+          "body": "a,b\n",
+          "serve": "ok"
+        }
       ],
       "outcome": "ok",
-      "visible": {"new.csv": "a,b\n"},
+      "visible": {
+        "new.csv": "a,b\n"
+      },
       "status": [
-        {"name": "old.csv", "status": "unavailable", "reason": "expired"},
-        {"name": "new.csv", "status": "ok", "reason": null}
+        {
+          "name": "old.csv",
+          "status": "unavailable",
+          "reason": "expired"
+        },
+        {
+          "name": "new.csv",
+          "status": "ok",
+          "reason": null
+        }
       ]
     },
     {
       "name": "a_text_only_boot_whose_earlier_references_all_expired_still_boots",
       "entries": [
-        {"n": "old-1.csv", "c": 0, "body": "1", "serve": "expired"},
-        {"n": "old-2.csv", "c": 0, "body": "2", "serve": "expired"}
+        {
+          "n": "old-1.csv",
+          "c": 0,
+          "body": "1",
+          "serve": "expired"
+        },
+        {
+          "n": "old-2.csv",
+          "c": 0,
+          "body": "2",
+          "serve": "expired"
+        }
       ],
       "outcome": "ok",
       "visible": {},
       "status": [
-        {"name": "old-1.csv", "status": "unavailable", "reason": "expired"},
-        {"name": "old-2.csv", "status": "unavailable", "reason": "expired"}
+        {
+          "name": "old-1.csv",
+          "status": "unavailable",
+          "reason": "expired"
+        },
+        {
+          "name": "old-2.csv",
+          "status": "unavailable",
+          "reason": "expired"
+        }
       ]
     },
     {
       "name": "earlier_http_errors_are_skipped_with_their_reason",
       "entries": [
-        {"n": "gone.pdf", "c": 0, "body": "gone", "serve": "http_404"},
-        {"n": "revoked.pdf", "c": 0, "body": "revoked", "serve": "http_403"},
-        {"n": "broken.pdf", "c": 0, "body": "broken", "serve": "http_500"},
-        {"n": "fine.pdf", "c": 0, "body": "fine", "serve": "ok"},
-        {"n": "now.txt", "c": 1, "body": "now", "serve": "ok"}
+        {
+          "n": "gone.pdf",
+          "c": 0,
+          "body": "gone",
+          "serve": "http_404"
+        },
+        {
+          "n": "revoked.pdf",
+          "c": 0,
+          "body": "revoked",
+          "serve": "http_403"
+        },
+        {
+          "n": "broken.pdf",
+          "c": 0,
+          "body": "broken",
+          "serve": "http_500"
+        },
+        {
+          "n": "fine.pdf",
+          "c": 0,
+          "body": "fine",
+          "serve": "ok"
+        },
+        {
+          "n": "now.txt",
+          "c": 1,
+          "body": "now",
+          "serve": "ok"
+        }
       ],
       "outcome": "ok",
-      "visible": {"fine.pdf": "fine", "now.txt": "now"},
+      "visible": {
+        "fine.pdf": "fine",
+        "now.txt": "now"
+      },
       "status": [
-        {"name": "gone.pdf", "status": "unavailable", "reason": "not_found"},
-        {"name": "revoked.pdf", "status": "unavailable", "reason": "forbidden"},
-        {"name": "broken.pdf", "status": "unavailable", "reason": "fetch_failed"},
-        {"name": "fine.pdf", "status": "ok", "reason": null},
-        {"name": "now.txt", "status": "ok", "reason": null}
+        {
+          "name": "gone.pdf",
+          "status": "unavailable",
+          "reason": "not_found"
+        },
+        {
+          "name": "revoked.pdf",
+          "status": "unavailable",
+          "reason": "forbidden"
+        },
+        {
+          "name": "broken.pdf",
+          "status": "unavailable",
+          "reason": "fetch_failed"
+        },
+        {
+          "name": "fine.pdf",
+          "status": "ok",
+          "reason": null
+        },
+        {
+          "name": "now.txt",
+          "status": "ok",
+          "reason": null
+        }
       ]
     },
     {
       "name": "an_earlier_fetch_that_stalls_is_skipped_as_timeout",
       "entries": [
-        {"n": "now.txt", "c": 1, "body": "now", "serve": "ok"},
-        {"n": "slow.bin", "c": 0, "body": "slow bytes", "serve": "stall"}
+        {
+          "n": "now.txt",
+          "c": 1,
+          "body": "now",
+          "serve": "ok"
+        },
+        {
+          "n": "slow.bin",
+          "c": 0,
+          "body": "slow bytes",
+          "serve": "stall"
+        }
       ],
       "outcome": "ok",
-      "visible": {"now.txt": "now"},
+      "visible": {
+        "now.txt": "now"
+      },
       "status": [
-        {"name": "now.txt", "status": "ok", "reason": null},
-        {"name": "slow.bin", "status": "unavailable", "reason": "timeout"}
+        {
+          "name": "now.txt",
+          "status": "ok",
+          "reason": null
+        },
+        {
+          "name": "slow.bin",
+          "status": "unavailable",
+          "reason": "timeout"
+        }
       ]
     },
     {
       "name": "an_earlier_reference_reached_after_the_deadline_is_skipped_unfetched",
       "entries": [
-        {"n": "slow.bin", "c": 0, "body": "slow bytes", "serve": "stall"},
-        {"n": "late.txt", "c": 0, "body": "late", "serve": "ok"},
-        {"n": "now.txt", "c": 1, "body": "now", "serve": "ok"}
+        {
+          "n": "slow.bin",
+          "c": 0,
+          "body": "slow bytes",
+          "serve": "stall"
+        },
+        {
+          "n": "late.txt",
+          "c": 0,
+          "body": "late",
+          "serve": "ok"
+        },
+        {
+          "n": "now.txt",
+          "c": 1,
+          "body": "now",
+          "serve": "ok"
+        }
       ],
       "outcome": "ok",
-      "visible": {"now.txt": "now"},
+      "visible": {
+        "now.txt": "now"
+      },
       "status": [
-        {"name": "slow.bin", "status": "unavailable", "reason": "timeout"},
-        {"name": "late.txt", "status": "unavailable", "reason": "deadline"},
-        {"name": "now.txt", "status": "ok", "reason": null}
+        {
+          "name": "slow.bin",
+          "status": "unavailable",
+          "reason": "timeout"
+        },
+        {
+          "name": "late.txt",
+          "status": "unavailable",
+          "reason": "deadline"
+        },
+        {
+          "name": "now.txt",
+          "status": "ok",
+          "reason": null
+        }
       ]
     },
     {
       "name": "an_expired_current_reference_is_fatal",
       "entries": [
-        {"n": "old.txt", "c": 0, "body": "old", "serve": "ok"},
-        {"n": "now.txt", "c": 1, "body": "now", "serve": "expired"}
+        {
+          "n": "old.txt",
+          "c": 0,
+          "body": "old",
+          "serve": "ok"
+        },
+        {
+          "n": "now.txt",
+          "c": 1,
+          "body": "now",
+          "serve": "expired"
+        }
       ],
       "outcome": "fatal"
     },
     {
       "name": "a_current_http_error_is_fatal",
       "entries": [
-        {"n": "now.txt", "c": 1, "body": "now", "serve": "http_404"}
+        {
+          "n": "now.txt",
+          "c": 1,
+          "body": "now",
+          "serve": "http_404"
+        }
       ],
       "outcome": "fatal"
     },
     {
       "name": "a_current_fetch_that_stalls_is_fatal",
       "entries": [
-        {"n": "now.txt", "c": 1, "body": "now", "serve": "stall"}
+        {
+          "n": "now.txt",
+          "c": 1,
+          "body": "now",
+          "serve": "stall"
+        }
       ],
       "outcome": "fatal"
     },
     {
       "name": "a_current_digest_mismatch_is_fatal",
       "entries": [
-        {"n": "now.txt", "c": 1, "body": "now", "serve": "digest_mismatch"}
+        {
+          "n": "now.txt",
+          "c": 1,
+          "body": "now",
+          "serve": "digest_mismatch"
+        }
       ],
       "outcome": "fatal"
     },
     {
       "name": "an_earlier_digest_mismatch_is_fatal_not_skipped",
       "entries": [
-        {"n": "old.txt", "c": 0, "body": "old", "serve": "digest_mismatch"},
-        {"n": "now.txt", "c": 1, "body": "now", "serve": "ok"}
+        {
+          "n": "old.txt",
+          "c": 0,
+          "body": "old",
+          "serve": "digest_mismatch"
+        },
+        {
+          "n": "now.txt",
+          "c": 1,
+          "body": "now",
+          "serve": "ok"
+        }
       ],
       "outcome": "fatal"
     },
     {
       "name": "a_name_with_a_parent_traversal_is_fatal",
-      "entries": [{"n": "../escape.csv", "c": 1, "body": "x", "serve": "ok"}],
-      "outcome": "fatal"
+      "entries": [
+        {
+          "n": "../escape.csv",
+          "c": 1,
+          "body": "x",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "fatal",
+      "refused_before_fetch": true
     },
     {
       "name": "a_name_with_a_directory_is_fatal",
-      "entries": [{"n": "dir/report.csv", "c": 1, "body": "x", "serve": "ok"}],
-      "outcome": "fatal"
+      "entries": [
+        {
+          "n": "dir/report.csv",
+          "c": 1,
+          "body": "x",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "fatal",
+      "refused_before_fetch": true
     },
     {
       "name": "an_unclean_earlier_name_is_fatal_too",
       "entries": [
-        {"n": "../old.csv", "c": 0, "body": "x", "serve": "ok"},
-        {"n": "now.csv", "c": 1, "body": "y", "serve": "ok"}
+        {
+          "n": "../old.csv",
+          "c": 0,
+          "body": "x",
+          "serve": "ok"
+        },
+        {
+          "n": "now.csv",
+          "c": 1,
+          "body": "y",
+          "serve": "ok"
+        }
       ],
-      "outcome": "fatal"
+      "outcome": "fatal",
+      "refused_before_fetch": true
     },
     {
       "name": "an_empty_name_is_fatal",
-      "entries": [{"n": "", "c": 1, "body": "x", "serve": "ok"}],
-      "outcome": "fatal"
+      "entries": [
+        {
+          "n": "",
+          "c": 1,
+          "body": "x",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "fatal",
+      "refused_before_fetch": true
     },
     {
       "name": "a_dot_name_is_fatal",
-      "entries": [{"n": ".", "c": 1, "body": "x", "serve": "ok"}],
-      "outcome": "fatal"
+      "entries": [
+        {
+          "n": ".",
+          "c": 1,
+          "body": "x",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "fatal",
+      "refused_before_fetch": true
     },
     {
       "name": "a_dot_dot_name_is_fatal",
-      "entries": [{"n": "..", "c": 1, "body": "x", "serve": "ok"}],
-      "outcome": "fatal"
+      "entries": [
+        {
+          "n": "..",
+          "c": 1,
+          "body": "x",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "fatal",
+      "refused_before_fetch": true
     },
     {
       "name": "a_slash_name_is_fatal",
-      "entries": [{"n": "/", "c": 1, "body": "x", "serve": "ok"}],
-      "outcome": "fatal"
+      "entries": [
+        {
+          "n": "/",
+          "c": 1,
+          "body": "x",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "fatal",
+      "refused_before_fetch": true
     },
     {
       "name": "a_name_shadowing_the_status_file_is_fatal",
-      "entries": [{"n": ".curie-attachments-status.json", "c": 1, "body": "{}", "serve": "ok"}],
-      "outcome": "fatal"
+      "entries": [
+        {
+          "n": ".curie-attachments-status.json",
+          "c": 1,
+          "body": "{}",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "fatal",
+      "refused_before_fetch": true
     },
     {
       "name": "a_name_in_the_reserved_prefix_is_fatal",
-      "entries": [{"n": ".curie-anything", "c": 0, "body": "x", "serve": "ok"}],
-      "outcome": "fatal"
+      "entries": [
+        {
+          "n": ".curie-anything",
+          "c": 0,
+          "body": "x",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "fatal",
+      "refused_before_fetch": true
     },
     {
       "name": "a_duplicate_name_across_earlier_and_current_is_fatal",
       "entries": [
-        {"n": "report.pdf", "c": 0, "body": "one", "serve": "ok"},
-        {"n": "report.pdf", "c": 1, "body": "two", "serve": "ok"}
+        {
+          "n": "report.pdf",
+          "c": 0,
+          "body": "one",
+          "serve": "ok"
+        },
+        {
+          "n": "report.pdf",
+          "c": 1,
+          "body": "two",
+          "serve": "ok"
+        }
       ],
-      "outcome": "fatal"
+      "outcome": "fatal",
+      "refused_before_fetch": true
     },
     {
       "name": "a_duplicate_name_within_current_is_fatal",
       "entries": [
-        {"n": "report.pdf", "c": 1, "body": "one", "serve": "ok"},
-        {"n": "report.pdf", "c": 1, "body": "two", "serve": "ok"}
+        {
+          "n": "report.pdf",
+          "c": 1,
+          "body": "one",
+          "serve": "ok"
+        },
+        {
+          "n": "report.pdf",
+          "c": 1,
+          "body": "two",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "fatal",
+      "refused_before_fetch": true
+    },
+    {
+      "name": "a_whitespace_only_name_is_fatal",
+      "entries": [
+        {
+          "n": "   ",
+          "c": 1,
+          "body": "x",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "fatal",
+      "refused_before_fetch": true
+    },
+    {
+      "name": "legacy_duplicate_names_are_disambiguated",
+      "entries": [
+        {
+          "n": "report.pdf",
+          "body": "first report",
+          "serve": "ok"
+        },
+        {
+          "n": "report.pdf",
+          "body": "second report",
+          "serve": "ok"
+        },
+        {
+          "n": "report.pdf",
+          "body": "third report",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "ok",
+      "visible": {
+        "report.pdf": "first report",
+        "report-2.pdf": "second report",
+        "report-3.pdf": "third report"
+      },
+      "status": null
+    },
+    {
+      "name": "legacy_disambiguation_skips_a_literal_name",
+      "entries": [
+        {
+          "n": "report.pdf",
+          "body": "one",
+          "serve": "ok"
+        },
+        {
+          "n": "report-2.pdf",
+          "body": "literally report-2",
+          "serve": "ok"
+        },
+        {
+          "n": "report.pdf",
+          "body": "three",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "ok",
+      "visible": {
+        "report.pdf": "one",
+        "report-2.pdf": "literally report-2",
+        "report-3.pdf": "three"
+      },
+      "status": null
+    },
+    {
+      "name": "legacy_traversal_name_is_reduced_to_its_basename",
+      "entries": [
+        {
+          "n": "../escape.csv",
+          "body": "x,y\n",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "ok",
+      "visible": {
+        "escape.csv": "x,y\n"
+      },
+      "status": null
+    },
+    {
+      "name": "legacy_directory_name_is_reduced_to_its_basename",
+      "entries": [
+        {
+          "n": "dir/report.csv",
+          "body": "a,b\n",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "ok",
+      "visible": {
+        "report.csv": "a,b\n"
+      },
+      "status": null
+    },
+    {
+      "name": "legacy_blank_name_is_refused",
+      "entries": [
+        {
+          "n": "   ",
+          "body": "x",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "fatal",
+      "refused_before_fetch": true
+    },
+    {
+      "name": "legacy_dot_dot_name_is_refused",
+      "entries": [
+        {
+          "n": "..",
+          "body": "x",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "fatal",
+      "refused_before_fetch": true
+    },
+    {
+      "name": "legacy_http_error_is_fatal",
+      "entries": [
+        {
+          "n": "a.txt",
+          "body": "alpha",
+          "serve": "ok"
+        },
+        {
+          "n": "b.txt",
+          "body": "bravo",
+          "serve": "http_404"
+        }
+      ],
+      "outcome": "fatal"
+    },
+    {
+      "name": "a_current_redirect_is_fatal",
+      "entries": [
+        {
+          "n": "now.txt",
+          "c": 1,
+          "body": "now",
+          "serve": "redirect"
+        }
+      ],
+      "outcome": "fatal"
+    },
+    {
+      "name": "an_earlier_redirect_is_unavailable",
+      "entries": [
+        {
+          "n": "moved.txt",
+          "c": 0,
+          "body": "moved",
+          "serve": "redirect"
+        },
+        {
+          "n": "now.txt",
+          "c": 1,
+          "body": "now",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "ok",
+      "visible": {
+        "now.txt": "now"
+      },
+      "status": [
+        {
+          "name": "moved.txt",
+          "status": "unavailable",
+          "reason": "fetch_failed"
+        },
+        {
+          "name": "now.txt",
+          "status": "ok",
+          "reason": null
+        }
+      ]
+    },
+    {
+      "name": "a_current_name_over_255_bytes_is_fatal",
+      "entries": [
+        {
+          "n": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt",
+          "c": 1,
+          "body": "x",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "fatal"
+    },
+    {
+      "name": "an_earlier_name_over_255_bytes_is_unavailable",
+      "entries": [
+        {
+          "n": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt",
+          "c": 0,
+          "body": "x",
+          "serve": "ok"
+        },
+        {
+          "n": "now.txt",
+          "c": 1,
+          "body": "now",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "ok",
+      "visible": {
+        "now.txt": "now"
+      },
+      "status": [
+        {
+          "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt",
+          "status": "unavailable",
+          "reason": "fetch_failed"
+        },
+        {
+          "name": "now.txt",
+          "status": "ok",
+          "reason": null
+        }
+      ]
+    },
+    {
+      "name": "a_current_file_over_the_cap_is_fatal",
+      "entries": [
+        {
+          "n": "big.bin",
+          "c": 1,
+          "body": "",
+          "serve": "oversize"
+        }
+      ],
+      "outcome": "fatal"
+    },
+    {
+      "name": "an_earlier_file_over_the_cap_is_unavailable",
+      "entries": [
+        {
+          "n": "big.bin",
+          "c": 0,
+          "body": "",
+          "serve": "oversize"
+        },
+        {
+          "n": "now.txt",
+          "c": 1,
+          "body": "now",
+          "serve": "ok"
+        }
+      ],
+      "outcome": "ok",
+      "visible": {
+        "now.txt": "now"
+      },
+      "status": [
+        {
+          "name": "big.bin",
+          "status": "unavailable",
+          "reason": "fetch_failed"
+        },
+        {
+          "name": "now.txt",
+          "status": "ok",
+          "reason": null
+        }
+      ]
+    },
+    {
+      "name": "an_earlier_file_dripping_past_the_deadline_is_unavailable",
+      "entries": [
+        {
+          "n": "now.txt",
+          "c": 1,
+          "body": "now",
+          "serve": "ok"
+        },
+        {
+          "n": "drip.txt",
+          "c": 0,
+          "body": "dripping slowly",
+          "serve": "drip"
+        }
+      ],
+      "outcome": "ok",
+      "visible": {
+        "now.txt": "now"
+      },
+      "status": [
+        {
+          "name": "now.txt",
+          "status": "ok",
+          "reason": null
+        },
+        {
+          "name": "drip.txt",
+          "status": "unavailable",
+          "reason": [
+            "deadline",
+            "timeout"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a_current_file_dripping_past_the_deadline_is_fatal",
+      "entries": [
+        {
+          "n": "drip.txt",
+          "c": 1,
+          "body": "dripping slowly",
+          "serve": "drip"
+        }
       ],
       "outcome": "fatal"
     }
-  ]
+  ],
+  "cap_bytes": 64
 }

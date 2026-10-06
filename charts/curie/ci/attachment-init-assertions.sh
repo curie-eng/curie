@@ -40,8 +40,10 @@
 #     because claim env injection only overrides env the pod template already
 #     declares; the thread's file count and byte budget reach the worker as
 #     CURIE_ATTACHMENT_THREAD_MAX_FILES / _BYTES; a byte budget the attachments
-#     volume cannot hold refuses to render; and the init container's fetch
-#     deadline defaults to 120 seconds, room for a thread's earlier files.
+#     volume cannot hold refuses to render (the worker counts the CURRENT
+#     message's files inside threadMaxBytes too, so the budget is the whole
+#     boot's footprint on the volume, not just the earlier files'); and the init
+#     container's fetch deadline keeps its 45 second default.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly.
 set -euo pipefail
@@ -517,7 +519,10 @@ assert float(str(overridden[THREAD_BYTES_ENV]["value"])) == 1048576, (
 )
 print(f"ok: worker.attachments.threadMaxFiles/threadMaxBytes reach the worker as {THREAD_FILES_ENV}/{THREAD_BYTES_ENV}")
 
-# (c) A byte budget the volume cannot hold is refused at render time, against
+# (c) A byte budget the volume cannot hold is refused at render time. The
+# worker counts the current message's files inside threadMaxBytes (the budget
+# is everything one boot materializes), so a budget that fits the volume means
+# the whole boot fits it. This is checked against
 # the volume's ACTUAL sizeLimit rather than a constant: over the default 512Mi
 # fails, exactly 512Mi renders, and the same 1Gi budget renders once the volume
 # is raised to 2Gi.
@@ -545,18 +550,20 @@ assert raised.returncode == 0, (
 )
 print("ok: a threadMaxBytes over the attachments volume's sizeLimit refuses to render")
 
-# (d) The init container's fetch deadline defaults to 120 seconds and is the
+# (d) The init container's fetch deadline keeps its 45 second default (an
+# earlier file that does not fit in it is skipped, never fatal) and is the
 # operator's value, not a literal.
 with open(f"{CHART}/values.yaml") as handle:
     chart_values = yaml.safe_load(handle)
 default_timeout = chart_values["agentSandbox"]["runner"]["attachments"]["fetchTimeoutSeconds"]
-assert default_timeout == 120, (
+assert default_timeout == 45, (
     f"agentSandbox.runner.attachments.fetchTimeoutSeconds defaults to {default_timeout}, "
-    "expected 120: a boot now fetches the thread's earlier files too"
+    "expected 45: earlier files are best effort inside the existing deadline, "
+    "so a thread's history does not lengthen every boot"
 )
 init_script = script_of(named(pod_spec(default_docs)["initContainers"], INIT_NAME))
-assert 120.0 in numeric_literals(init_script), (
-    "the rendered attachments-init program does not carry the 120 second fetch deadline"
+assert 45.0 in numeric_literals(init_script), (
+    "the rendered attachments-init program does not carry the 45 second fetch deadline"
 )
 custom = script_of(
     named(
@@ -566,10 +573,10 @@ custom = script_of(
         INIT_NAME,
     )
 )
-assert 77.0 in numeric_literals(custom) and 120.0 not in numeric_literals(custom), (
+assert 77.0 in numeric_literals(custom) and 45.0 not in numeric_literals(custom), (
     "fetchTimeoutSeconds=77 did not replace the rendered fetch deadline"
 )
-print("ok: the init container's fetch deadline defaults to 120s and follows the value")
+print("ok: the init container's fetch deadline defaults to 45s and follows the value")
 
 print()
 print(
@@ -579,6 +586,6 @@ print(
     "disappears entirely -- on both halves, from one value -- when the lane is "
     "switched off; the runner declares the attachment manifest, the thread "
     "budget reaches the worker and must fit the volume, and the fetch deadline "
-    "defaults to 120 seconds."
+    "defaults to 45 seconds."
 )
 PY

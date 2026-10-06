@@ -96,6 +96,14 @@ import yaml
 RENDERED, MOUNT, CAP = sys.argv[1], Path(sys.argv[2]), int(sys.argv[3])
 VECTOR = json.loads(Path(sys.argv[4]).read_text())
 FETCH_TIMEOUT, STALL = int(sys.argv[5]), int(sys.argv[6])
+# A drip byte every DRIP seconds: far inside any socket timeout, while the
+# vector's drip bodies (>= 15 bytes) take several times the deadline in total.
+DRIP = 0.4
+# How long past the deadline a boot may still be running when it finishes:
+# writing the status file and tearing down, not waiting out a slow store.
+GRACE = 1.5
+if VECTOR["cap_bytes"] != CAP:
+    fail(f"the vector's cap_bytes {VECTOR['cap_bytes']} is not the rendered cap {CAP}")
 STATUS_FILE = VECTOR["status_file"]
 
 INIT_NAME = "attachments-init"
@@ -149,6 +157,11 @@ class _Store(BaseHTTPRequestHandler):
     errors: dict[str, int] = {}
     # paths that send the headers and one byte, then go silent for STALL seconds.
     stalls: set[str] = set()
+    # paths that send one byte every DRIP seconds: no single read ever waits long
+    # enough to trip a socket timeout, but the whole body outlasts the deadline.
+    drips: set[str] = set()
+    # path -> Location a 302 points at (a redirect is refused, never followed).
+    redirects: dict[str, str] = {}
     requested: list[str] = []
 
     def do_GET(self):  # noqa: N802 -- BaseHTTPRequestHandler's own name
@@ -167,6 +180,24 @@ class _Store(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 time.sleep(STALL)
                 self.wfile.write(payload[1:])
+            except OSError:
+                pass
+            return
+        if self.path in self.redirects:
+            self.send_response(302)
+            self.send_header("Location", self.redirects[self.path])
+            self.end_headers()
+            return
+        if self.path in self.drips:
+            payload = self.objects[self.path]
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            try:
+                for index in range(len(payload)):
+                    self.wfile.write(payload[index : index + 1])
+                    self.wfile.flush()
+                    time.sleep(DRIP)
             except OSError:
                 pass
             return
@@ -410,6 +441,8 @@ def vector_ref(case_index, case):
     wire, paths = [], {}
     for index, item in enumerate(case["entries"]):
         body = item["body"].encode()
+        if item["serve"] == "oversize":
+            body = b"z" * (VECTOR["cap_bytes"] + 1)
         path = f"/vector-{case_index}-{index}"
         served = body + b" tampered" if item["serve"] == "digest_mismatch" else body
         _Store.objects[path] = served
@@ -417,6 +450,11 @@ def vector_ref(case_index, case):
             _Store.errors[path] = int(item["serve"].removeprefix("http_"))
         if item["serve"] == "stall":
             _Store.stalls.add(path)
+        if item["serve"] == "drip":
+            _Store.drips.add(path)
+        if item["serve"] == "redirect":
+            _Store.objects[path + "-moved"] = body
+            _Store.redirects[path] = path + "-moved"
         entry_wire = {
             "n": item["n"],
             "u": f"{BASE}{path}",
@@ -454,8 +492,22 @@ def check_common(label, case, paths, requested):
     for item in fetched:
         if item["serve"] == "expired":
             fail(f"{label}: expired reference {item['n']!r} was fetched; it must be skipped unfetched")
+    if case.get("refused_before_fetch") and requested:
+        fail(
+            f"{label}: the payload was refused, but only after fetching "
+            f"{[i['n'] for i in fetched]}; an unusable name must be refused before "
+            "any byte is pulled"
+        )
+    moved = [path for path in requested if path.endswith("-moved")]
+    if moved:
+        fail(f"{label}: a redirect was followed to {moved}; it must be refused")
+    strays = sorted(child.name for child in MOUNT.parent.iterdir())
+    if strays != sorted(["attachments", "rendered.yaml"]):
+        fail(f"{label}: something was written outside the mount: {strays}")
     for row in case.get("status") or []:
-        if row["reason"] == "deadline" and any(i["n"] == row["name"] for i in fetched):
+        if row["reason"] == "deadline" and any(
+            i["n"] == row["name"] and i["serve"] != "drip" for i in fetched
+        ):
             fail(
                 f"{label}: {row['name']!r} was fetched although it was reached past "
                 "the overall deadline; it must be recorded and skipped without a fetch"
@@ -477,6 +529,19 @@ def by_name(rows):
     return sorted(rows, key=lambda row: row["name"])
 
 
+def status_matches(actual, expected):
+    """Rows equal by name; an expected reason given as a list accepts any member."""
+
+    actual, expected = by_name(actual), by_name(expected)
+    if [row["name"] for row in actual] != [row["name"] for row in expected]:
+        return False
+    for got, want in zip(actual, expected):
+        reasons = want["reason"] if isinstance(want["reason"], list) else [want["reason"]]
+        if got["status"] != want["status"] or got["reason"] not in reasons:
+            return False
+    return True
+
+
 def run_vector_case(case_index, case):
     label = f"vector {case['name']}"
     ref, paths = vector_ref(case_index, case)
@@ -494,6 +559,8 @@ def run_vector_case(case_index, case):
             )
         if visible():
             fail(f"{label}: refused but left {sorted(visible())} visible in the mount")
+        if any(i["serve"] == "drip" for i in case["entries"]) and elapsed > FETCH_TIMEOUT + GRACE:
+            fail(f"{label}: refused only after {elapsed:.1f}s; the {FETCH_TIMEOUT}s deadline did not cut the drip off")
         check_common(label, case, paths, requested)
         print(f"  ok: {label}: refused (exit {completed.returncode}), nothing visible")
         return
@@ -508,20 +575,25 @@ def run_vector_case(case_index, case):
     if visible() != expected_visible:
         fail(f"{label}: the mount holds {sorted(visible())}, expected {sorted(expected_visible)} (bytes included)")
     # Only the status file may remain hidden: a leftover stage dir or a status
-    # temp file means the write was not finished by a rename.
-    if hidden_entries() != [STATUS_FILE]:
+    # temp file means the write was not finished by a rename. A legacy payload
+    # (no "c") may or may not write it.
+    allowed = [[STATUS_FILE]] if case["status"] is not None else [[], [STATUS_FILE]]
+    if hidden_entries() not in allowed:
         fail(
-            f"{label}: hidden entries {hidden_entries()} in the mount; expected only "
-            f"{STATUS_FILE} (written to a temp name and renamed, stage dir removed)"
+            f"{label}: hidden entries {hidden_entries()} in the mount; expected one of "
+            f"{allowed} (status written to a temp name and renamed, stage dir removed)"
         )
-    status = read_status()
-    if not isinstance(status, dict) or set(status) != {"v", "files"} or status["v"] != VECTOR["status_version"]:
-        fail(f"{label}: {STATUS_FILE} is {status!r}, expected {{'v': {VECTOR['status_version']}, 'files': [...]}}")
-    for row in status["files"]:
-        if set(row) != {"name", "status", "reason"}:
-            fail(f"{label}: status row {row!r} must carry exactly name, status and reason")
-    if by_name(status["files"]) != by_name(case["status"]):
-        fail(f"{label}: status files {by_name(status['files'])} != expected {by_name(case['status'])}")
+    if case["status"] is not None:
+        status = read_status()
+        if not isinstance(status, dict) or set(status) != {"v", "files"} or status["v"] != VECTOR["status_version"]:
+            fail(f"{label}: {STATUS_FILE} is {status!r}, expected {{'v': {VECTOR['status_version']}, 'files': [...]}}")
+        for row in status["files"]:
+            if set(row) != {"name", "status", "reason"}:
+                fail(f"{label}: status row {row!r} must carry exactly name, status and reason")
+        if not status_matches(status["files"], case["status"]):
+            fail(f"{label}: status files {by_name(status['files'])} != expected {by_name(case['status'])}")
+    if any(i["serve"] == "drip" for i in case["entries"]) and elapsed > FETCH_TIMEOUT + GRACE:
+        fail(f"{label}: finished after {elapsed:.1f}s; the {FETCH_TIMEOUT}s deadline did not cut the drip off")
     if elapsed > FETCH_TIMEOUT + STALL:
         fail(f"{label}: took {elapsed:.1f}s; the {FETCH_TIMEOUT}s deadline did not bound the boot")
     check_common(label, case, paths, requested)
