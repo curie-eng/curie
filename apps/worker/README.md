@@ -1228,15 +1228,22 @@ turn resolves only its own files and a text turn reads nothing.
 - **A text turn that boots** (fresh claim, suspended resume, turn budget or
   workspace handoff) reads the ledger and prepares the earlier files under the
   route lock. The ledger read is bounded by
-  `CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS` (default 30) and the
+  `CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS` (default 15) and the
   delivery's remaining budget. The prepare has the same deadline plus a short
   grace. A failed read boots with `ledger_unavailable` in the manifest. An
   adopt, a steer and a sweep continuation read nothing. A route that the
   locked snapshot saw live is read once more just before the claim, with a
-  ledger wired: if its sandbox is gone, the claim cold-creates, so that boot
-  carries the set too.
-- **An API without the ledger routes** (query answered 404, a mixed rollout)
-  is treated as no ledger: a file turn resolves its own files and appends
+  ledger wired, using the readiness test the claim itself will use (a
+  workspace claim's `substrate.adopt`, which also needs the claim and sandbox
+  ready): if it fails, the claim cold-creates, so that boot carries the set
+  too.
+- **The rebuild is charged to the turn.** On the text-boot and the file paths,
+  the time spent preparing the thread's files comes off the delivery's
+  remaining budget before the claim and the turn start.
+- **An API without the ledger routes** (query answered a bare 404, a mixed
+  rollout) is treated as no ledger. A 404 carrying the ledger's own
+  `detail.code` (such as `thread_attachment.agent_not_found`) is an ordinary
+  ledger failure. No ledger means: a file turn resolves its own files and appends
   nothing, and a text boot carries no attachment env.
 - **Names are fixed when recorded.** A current file's disk name is cleaned with
   the init container's rules (a leading `.` becomes `_`) and disambiguated
@@ -1245,10 +1252,11 @@ turn resolves only its own files and a text turn reads nothing.
   the same (event, file id), and it keeps its stored name.
 - **Bytes stay short lived.** An earlier file whose parked copy outlives the
   capability by a margin is re-minted, and a new owner record (still
-  `"version": 1`, with optional `agent` and `shas` fields) keeps it from the
-  reaper. Otherwise it is fetched again through the agent's current bindings
+  `"version": 1`, with optional `agent` and `shas` fields), written before any
+  re-fetch starts, keeps it from the reaper. Otherwise it is fetched again through the agent's current bindings
   (`BindingResolver.routes_for_agent`), never a recorded endpoint, and its
-  digest must match. One that cannot be had is named unavailable (`no_route`,
+  digest must match. The prepare deadline is checked as each chunk arrives,
+  so a slow earlier file is cut and named `deadline`. One that cannot be had is named unavailable (`no_route`,
   `no_credential`, `not_found`, `forbidden`, `rate_limited`, `timeout`,
   `digest_changed`, `deadline`, `fetch_failed`) and never fails the boot.
 - **The per-thread budget** (`CURIE_ATTACHMENT_THREAD_MAX_FILES`, default 20,

@@ -498,8 +498,10 @@ class PreparedThreadSet:
     refs: tuple[AttachmentRef, ...] = field(default=(), repr=False)
     #: Whether this prepare wrote an owner record, under ``_owner_token``.
     owner_recorded: bool = field(default=False, repr=False)
+    #: Minted before any store write, so the owner record for re-minted parked
+    #: copies can be written ahead of the re-fetches and rewritten at the end.
     _owner_token: str = field(
-        init=False, compare=False, repr=False, default_factory=lambda: uuid.uuid4().hex
+        compare=False, repr=False, default_factory=lambda: uuid.uuid4().hex
     )
 
     def claim_env(self) -> dict[str, str]:
@@ -548,6 +550,10 @@ class PreparedThreadSet:
         return env
 
 
+class _FetchDeadline(Exception):
+    """Internal: an earlier file's bytes were still arriving at the deadline."""
+
+
 class _EarlierUnavailable(Exception):
     """Internal: one earlier file is unavailable for ``reason``."""
 
@@ -569,6 +575,8 @@ def _unavailable_reason(exc: BaseException) -> str:
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        if isinstance(current, _FetchDeadline):
+            return "deadline"
         if isinstance(current, TimeoutError):
             return "timeout"
         if isinstance(current, urllib.error.URLError) and isinstance(
@@ -1175,7 +1183,10 @@ class AttachmentCoordinator:
         delivered: dict[int, ThreadSetEntry] = {}
         unavailable: dict[int, str] = {}
         reused: list[str] = []
+        owner_token = uuid.uuid4().hex
+        early_owner = False
         cache = self._parked_cache(thread_key, agent_id) if kept else {}
+        refetch: list[tuple[int, ThreadAttachmentRef]] = []
         for position, ref in kept:
             if ref.size_bytes is not None and ref.size_bytes > self.limits.max_file_bytes:
                 # Recorded under a larger per-file cap than this worker's: it
@@ -1183,25 +1194,60 @@ class AttachmentCoordinator:
                 unavailable[position] = "fetch_failed"
                 continue
             hit = cache.get(ref.sha256)
-            if hit is not None:
-                delivered[position] = ThreadSetEntry(
-                    disk_name=ref.disk_name,
-                    object_key=hit,
-                    sha256=ref.sha256,
-                    size_bytes=ref.size_bytes if ref.size_bytes is not None else 0,
-                    mime_type=ref.mime_type,
-                    current=False,
-                )
-                reused.append(hit)
+            if hit is None:
+                refetch.append((position, ref))
                 continue
-            key = self._object_key(agent_id=agent_id, generation=mint, index=len(written))
+            delivered[position] = ThreadSetEntry(
+                disk_name=ref.disk_name,
+                object_key=hit,
+                sha256=ref.sha256,
+                size_bytes=ref.size_bytes if ref.size_bytes is not None else 0,
+                mime_type=ref.mime_type,
+                current=False,
+            )
+            reused.append(hit)
+        if reused:
+            # Own every re-minted key BEFORE the first re-fetch: a reap that
+            # runs during a slow fetch must already see this boot's owner, or
+            # it deletes bytes the boot is about to hand out. Rewritten in
+            # place at the end with everything this prepare holds.
             try:
-                entry = self._refetch_earlier(ref, key, routes, deadline_epoch)
-            except _EarlierUnavailable as gone:
-                unavailable[position] = gone.reason
-                continue
-            written.append(key)
-            delivered[position] = entry
+                self._write_owner(
+                    thread_key,
+                    owner_token,
+                    _AttachmentSet(
+                        thread_key=thread_key,
+                        refs=(),
+                        object_keys=tuple(dict.fromkeys(reused)),
+                        expires_at_epoch=int(self._clock())
+                        + self.limits.retention_ttl_seconds,
+                        agent_id=agent_id,
+                        shas={
+                            entry.object_key: entry.sha256 for entry in delivered.values()
+                        },
+                    ),
+                )
+                early_owner = True
+            except Exception:
+                self._discard(written)
+                raise
+        try:
+            for position, ref in refetch:
+                key = self._object_key(agent_id=agent_id, generation=mint, index=len(written))
+                try:
+                    entry = self._refetch_earlier(ref, key, routes, deadline_epoch)
+                except _EarlierUnavailable as gone:
+                    unavailable[position] = gone.reason
+                    continue
+                written.append(key)
+                delivered[position] = entry
+        except BaseException:
+            # Anything not named unavailable abandons the prepare: nothing it
+            # wrote, the early owner record included, outlives it.
+            self._discard(written)
+            if early_owner:
+                self._discard([self._owner_key(thread_key, owner_token)])
+            raise
 
         entries: list[ThreadSetEntry] = [
             delivered[position] for position in range(len(earlier)) if position in delivered
@@ -1245,6 +1291,7 @@ class AttachmentCoordinator:
             append_refs=tuple(append_refs),
             ledger_unavailable=ledger_unavailable,
             object_keys=tuple(written),
+            _owner_token=owner_token,
         )
         if not entries:
             return prepared
@@ -1266,22 +1313,28 @@ class AttachmentCoordinator:
             )
             prepared = replace(prepared, refs=refs, owner_recorded=True)
             owned = tuple(dict.fromkeys([*written, *reused]))
-            with self._lock:
-                record = _AttachmentSet(
+            self._write_owner(
+                thread_key,
+                owner_token,
+                _AttachmentSet(
                     thread_key=thread_key,
                     refs=refs,
                     object_keys=owned,
                     expires_at_epoch=int(self._clock()) + self.limits.retention_ttl_seconds,
                     agent_id=agent_id,
                     shas={entry.object_key: entry.sha256 for entry in entries},
-                )
-                self.objects.put_stream(
-                    self._owner_key(thread_key, prepared._owner_token), (record.encode(),)
-                )
+                ),
+            )
         except Exception:
             self._discard(written)
+            if early_owner:
+                self._discard([self._owner_key(thread_key, owner_token)])
             raise
         return prepared
+
+    def _write_owner(self, thread_key: str, owner_token: str, record: _AttachmentSet) -> None:
+        with self._lock:
+            self.objects.put_stream(self._owner_key(thread_key, owner_token), (record.encode(),))
 
     def _current_disk_names(
         self,
@@ -1365,7 +1418,7 @@ class AttachmentCoordinator:
         except Exception as exc:  # noqa: BLE001 -- an earlier file never fails the set
             raise _EarlierUnavailable("fetch_failed") from exc
         try:
-            digest, size = self._park(ref.file_id, ref.disk_name, key, files)
+            digest, size = self._park(ref.file_id, ref.disk_name, key, files, deadline_epoch)
         except Exception as exc:  # noqa: BLE001 -- named, never raised
             self._discard([key])
             raise _EarlierUnavailable(_unavailable_reason(exc)) from exc
@@ -1443,27 +1496,28 @@ class AttachmentCoordinator:
         agent_prefix = f"{ATTACHMENT_OBJECT_PREFIX}/{agent_id}/"
         best: dict[str, tuple[int, str]] = {}
         try:
-            with self._lock:
-                keys = tuple(self.objects.list_keys(f"{ATTACHMENT_LEDGER_PREFIX}/{digest}"))
-                for owner_key in keys:
-                    try:
-                        record = self._load_key(owner_key)
-                    except Exception:  # noqa: BLE001 -- a bad record is not a cache hit
-                        continue
-                    if (
-                        record.thread_key != thread_key
-                        or record.agent_id != agent_id
-                        or record.expires_at_epoch <= floor
+            # No process-wide lock across these store reads: they only read,
+            # and a reused key is owned by a record written before any fetch.
+            keys = tuple(self.objects.list_keys(f"{ATTACHMENT_LEDGER_PREFIX}/{digest}"))
+            for owner_key in keys:
+                try:
+                    record = self._load_key(owner_key)
+                except Exception:  # noqa: BLE001 -- a bad record is not a cache hit
+                    continue
+                if (
+                    record.thread_key != thread_key
+                    or record.agent_id != agent_id
+                    or record.expires_at_epoch <= floor
+                ):
+                    continue
+                for object_key, sha in record.shas.items():
+                    if object_key not in record.object_keys or not object_key.startswith(
+                        agent_prefix
                     ):
                         continue
-                    for object_key, sha in record.shas.items():
-                        if object_key not in record.object_keys or not object_key.startswith(
-                            agent_prefix
-                        ):
-                            continue
-                        held = best.get(sha)
-                        if held is None or record.expires_at_epoch > held[0]:
-                            best[sha] = (record.expires_at_epoch, object_key)
+                    held = best.get(sha)
+                    if held is None or record.expires_at_epoch > held[0]:
+                        best[sha] = (record.expires_at_epoch, object_key)
             present: dict[str, set[str]] = {}
             cache: dict[str, str] = {}
             for sha, (_expiry, object_key) in best.items():
@@ -1498,7 +1552,12 @@ class AttachmentCoordinator:
         return files
 
     def _park(
-        self, file_id: str, name: str, key: str, files: AttachmentFilePort
+        self,
+        file_id: str,
+        name: str,
+        key: str,
+        files: AttachmentFilePort,
+        deadline_epoch: float | None = None,
     ) -> tuple[str, int]:
         """Stream one file into the store under its cap, returning digest+size."""
 
@@ -1512,6 +1571,7 @@ class AttachmentCoordinator:
                     name=name,
                     digest=digest,
                     counted=counted,
+                    deadline_epoch=deadline_epoch,
                 ),
             )
         except AttachmentResolutionError:
@@ -1531,6 +1591,7 @@ class AttachmentCoordinator:
         name: str,
         digest: Any,
         counted: list[int],
+        deadline_epoch: float | None = None,
     ) -> Iterator[bytes]:
         """``_read_bounded_upload``'s shape: refuse at the crossing chunk.
 
@@ -1541,6 +1602,10 @@ class AttachmentCoordinator:
 
         total = 0
         for chunk in source:
+            if deadline_epoch is not None and self._clock() > deadline_epoch:
+                # Checked as the bytes arrive, so one dripping earlier file
+                # cannot hold the boot past its budget (ADR 0205 decision 6).
+                raise _FetchDeadline(name)
             total += len(chunk)
             if total > self.limits.max_file_bytes:
                 raise AttachmentTooLargeError(name, self.limits.max_file_bytes)

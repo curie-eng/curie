@@ -1136,7 +1136,7 @@ class WorkerConfig(BaseSettings):
         validation_alias="CURIE_ATTACHMENT_THREAD_MAX_BYTES",
     )
     attachment_thread_prepare_timeout_seconds: float = Field(
-        default=30.0, gt=0, validation_alias="CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS"
+        default=15.0, gt=0, validation_alias="CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS"
     )
     # Approval-gated publication runs only on the Kubernetes substrate. These
     # values shape the worker-owned Job; none are bundle inputs.

@@ -31,7 +31,7 @@ class LedgerUnavailable(RuntimeError):
 
 
 class LedgerNotDeployed(LedgerUnavailable):
-    """The API answered the query 404: it does not serve the ledger routes yet.
+    """The API answered the query a bare 404: it does not serve the ledger yet.
 
     A mixed rollout (a worker ahead of its API) meets this. The kernel treats
     it as "no ledger wired" rather than as an unreadable ledger, so a person's
@@ -169,14 +169,18 @@ class ThreadAttachmentLedgerClient:
             )
         except httpx.HTTPError as exc:
             raise LedgerUnavailable("thread attachment ledger is unreachable") from exc
-        if response.status_code == 404:
+        if response.status_code == 404 and _error_code(response) is None:
+            # The route itself is missing (FastAPI's bare "Not Found"). A 404
+            # the ledger answers with its own code is an ordinary failure.
             raise LedgerNotDeployed(
                 "thread attachment ledger query returned HTTP 404; the API does not "
                 "serve the ledger yet"
             )
         if response.status_code != 200:
+            code = _error_code(response)
             raise LedgerUnavailable(
                 f"thread attachment ledger query returned HTTP {response.status_code}"
+                + (f" ({code})" if code else "")
             )
         try:
             rows = response.json()["refs"]

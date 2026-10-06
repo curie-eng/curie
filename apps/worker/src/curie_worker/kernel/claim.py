@@ -511,6 +511,7 @@ async def _route_and_start(
         # already holds the files, so it reads nothing. A file turn arrives
         # here with its whole set already prepared (attachment_fresh_only).
         thread_set = None
+        rebuild_started = clock.time.monotonic()
         boots = existing_handle is None or replace_handle is not None
         if (
             not boots
@@ -523,8 +524,15 @@ async def _route_and_start(
             # fresh boot must carry the thread's files (#4141). Re-read the
             # route with the claim's own liveness test (``lookup``'s
             # get_sandbox Running check) just before claiming: one bounded
-            # control-plane read, and only where a ledger is wired.
-            boots = await asyncio.to_thread(self._substrate.lookup, thread_key) is None
+            # control-plane read, and only where a ledger is wired. The
+            # workspace claim adopts through ``substrate.adopt``, whose
+            # readiness test is stricter (claim and sandbox ready), so that
+            # path asks it; it evicts exactly what that claim would evict.
+            # Same condition ``_claim_or_resume`` uses to take that path.
+            if workspace_repo is not None and workspace_deployment_id is not None:
+                boots = await asyncio.to_thread(self._substrate.adopt, thread_key) is None
+            else:
+                boots = await asyncio.to_thread(self._substrate.lookup, thread_key) is None
         if (
             not attachment_fresh_only
             and boots
@@ -542,6 +550,10 @@ async def _route_and_start(
                     if boot_env is None:
                         boot_env = {}
                     boot_env.update(thread_env)
+        if remaining_s is not None:
+            # The rebuild ran on this delivery's clock: the claim and the turn
+            # get only what is left of it.
+            remaining_s = max(0.0, remaining_s - (clock.time.monotonic() - rebuild_started))
         try:
             handle = await self._claim_or_resume(
                 thread_key,

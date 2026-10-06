@@ -65,14 +65,17 @@ async def _route_attachment_and_start(
 
     lock_key = self._config.lock_key(thread_key)
     probe_budget_started = clock.time.monotonic()
+    # The probes measure elapsed time from here against the budget as it was
+    # here; ``remaining_s`` itself is charged for the rebuild further down.
+    probe_remaining_s = remaining_s
 
     def current_probe_budget() -> float:
-        if remaining_s is None:
+        if probe_remaining_s is None:
             return constants._ATTACHMENT_HANDOFF_PROBE_TIMEOUT_S
         elapsed = clock.time.monotonic() - probe_budget_started
         return max(
             0.0,
-            min(constants._ATTACHMENT_HANDOFF_PROBE_TIMEOUT_S, remaining_s - elapsed),
+            min(constants._ATTACHMENT_HANDOFF_PROBE_TIMEOUT_S, probe_remaining_s - elapsed),
         )
 
     async def settle_shielded(task: asyncio.Task[Any]) -> None:
@@ -169,6 +172,7 @@ async def _route_attachment_and_start(
     # a failed resolve does.
     resolved_env: dict[str, str]
     prepared: PreparedAttachments | PreparedThreadSet
+    prepare_started = clock.time.monotonic()
     if self._attachment_ledger is not None:
         resolved_env, prepared = await self._prepare_thread_attachments(
             qevent,
@@ -182,6 +186,10 @@ async def _route_attachment_and_start(
             boot_env,
             agent_id,
         )
+    if remaining_s is not None:
+        # The rebuild ran on this delivery's clock: the claim and the turn get
+        # only what is left of it.
+        remaining_s = max(0.0, remaining_s - (clock.time.monotonic() - prepare_started))
     prepared_installed = False
     routed: routing._RouteResult | None = None
     try:
