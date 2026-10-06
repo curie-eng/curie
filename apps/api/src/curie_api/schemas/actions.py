@@ -63,8 +63,9 @@ class ActionOut(BaseModel):
     completed_at: datetime | None
     undone_at: datetime | None
     undone_by: str | None
-    # Derived on the model, never stored, so a record cannot claim a
-    # reversibility nothing captured the state for (ADR-0117).
+    # Derived at read time, never stored, so a record cannot claim a
+    # reversibility nothing captured the state for (ADR-0117). Computed by
+    # ``curie_api.action_undoable`` (ACTION-EXECUTOR-11).
     undoable: bool
 
 

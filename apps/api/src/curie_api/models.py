@@ -39,6 +39,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 from .approval_wording import approval_display
 from .db import SCHEMA, Base
 from .repo_full_name import normalize_repo_full_name
+from .sealed_snapshot import is_sealed_envelope
 
 # Work-item execution deadline bounds (#3071). An agent's
 # `execution_deadline_seconds` NULL means the default; a set value is bounded
@@ -1677,28 +1678,46 @@ class AgentAction(Base):
     # written by later slices; they live here because they are lifecycle of this
     # row, and a two-column migration later buys nothing.
     completed_at: Mapped[datetime | None] = mapped_column(default=None)
+    # Written only when a restore execution is CONFIRMED (ACTION-EXECUTOR-11);
+    # rows from before the executor may carry the ruling-time claim instead.
     undone_at: Mapped[datetime | None] = mapped_column(default=None)
     undone_by: Mapped[str | None] = mapped_column(default=None)
+    # @spec ACTION-EXECUTOR-11: what a pinned, sealed restore needs beyond the
+    # envelope in ``prior_state``. ``post_version`` is the opaque version the
+    # call left, compared with ``observe_version`` before any restore;
+    # ``connector`` and ``connector_digest`` pin the image the restore must run
+    # under; ``authority_kind`` and ``authority_ref`` name what permitted a
+    # platform-executed forward call (shared with #4068). All NULL on rows
+    # written before the executor, which are therefore never undoable.
+    post_version: Mapped[str | None] = mapped_column(Text, default=None)
+    connector: Mapped[str | None] = mapped_column(Text, default=None)
+    connector_digest: Mapped[str | None] = mapped_column(Text, default=None)
+    authority_kind: Mapped[str | None] = mapped_column(Text, default=None)
+    authority_ref: Mapped[str | None] = mapped_column(Text, default=None)
 
     @property
-    def undoable(self) -> bool:
-        """Whether this record holds what a restore needs -- derived, never stored.
+    def holds_restore_record(self) -> bool:
+        """The record-level half of ``undoable`` (ACTION-EXECUTOR-11).
 
-        A stored flag can be set by a writer that captured nothing, and the
-        platform would then offer an undo it cannot honor. Deny-by-default falls
-        out of this: a third-party tool that reports neither a prior state nor a
-        target lands on ``False`` without anyone declaring anything.
+        Derived, never stored: succeeded, attributed to an agent, a valid sealed
+        envelope in ``prior_state`` (ACTION-EXECUTOR-9), a ``post_version``, a
+        ``target``, a ``connector`` and its ``connector_digest``. A cleartext
+        ``prior_state`` is history, not a snapshot, so a legacy row fails here.
+        ``post_state`` is no longer read for a sealed record.
 
-        ``post_state`` is required too: the undo route compares the live resource
-        against it and refuses without it, so a row lacking it is not one an undo
-        can be granted on.
+        The other half -- capability, key custody and no live restore -- needs
+        the database and the in-force bundle; ``curie_api.action_undoable``
+        combines both and is the only place ``undoable`` is answered.
         """
 
         return (
             self.status == ActionStatus.succeeded
-            and self.prior_state is not None
-            and self.post_state is not None
+            and self.agent_id is not None
+            and is_sealed_envelope(self.prior_state)
+            and bool(self.post_version)
             and self.target is not None
+            and bool(self.connector)
+            and bool(self.connector_digest)
             and self.undone_at is None
         )
 
@@ -1732,6 +1751,124 @@ class ActionAuditEntry(Base):
     # point: an operator has to see that their manual fix is what stopped it.
     evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ExecutionKind(enum.StrEnum):
+    """What an action execution runs (ACTION-EXECUTOR-2)."""
+
+    restore = "restore"
+    forward = "forward"
+    probe = "probe"
+
+
+class ExecutionState(enum.StrEnum):
+    """Lifecycle of one action execution (ACTION-EXECUTOR-17).
+
+    ``refused`` is a provable non-write and releases the action; ``confirmed``,
+    ``failed`` and ``indeterminate`` are terminal and may have written, so a
+    restore in any state but ``refused`` holds its action.
+    """
+
+    requested = "requested"
+    claimed = "claimed"
+    dispatched = "dispatched"
+    confirmed = "confirmed"
+    failed = "failed"
+    indeterminate = "indeterminate"
+    refused = "refused"
+
+
+def _sql_in(values: type[enum.StrEnum]) -> str:
+    return ", ".join(f"'{member.value}'" for member in values)
+
+
+class ActionExecution(Base):
+    """One call the platform runs without a model (ACTION-EXECUTOR-2).
+
+    @spec ACTION-EXECUTOR-2. A restore of a recorded action, a forward action
+    whose authority its owner verified, or a read-only capability probe, each
+    run under the target connector's own binding. Created only by the undo
+    ruling, the forward creation function and the probe route
+    (ACTION-EXECUTOR-1); ``idempotency_key`` is unique so a replayed creation
+    adopts the existing row. At most one restore that is not ``refused`` may
+    name one action, enforced by a partial unique index rather than a writer.
+    ``outcome`` carries version strings, a key identifier and codes only, never
+    an envelope, a state or a result.
+    """
+
+    __tablename__ = "action_executions"
+    __table_args__ = (
+        CheckConstraint(f"kind IN ({_sql_in(ExecutionKind)})", name="action_executions_kind_ck"),
+        CheckConstraint(
+            f"state IN ({_sql_in(ExecutionState)})", name="action_executions_state_ck"
+        ),
+        UniqueConstraint("idempotency_key", name="uq_action_executions_idempotency_key"),
+        Index(
+            "uq_action_executions_live_restore",
+            "subject_action_id",
+            unique=True,
+            postgresql_where=text("kind = 'restore' AND state <> 'refused'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    kind: Mapped[str] = mapped_column(Text)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
+    )
+    connector: Mapped[str] = mapped_column(Text)
+    # The upstream tool name; ``restore`` for a restore, NULL for a probe.
+    tool: Mapped[str | None] = mapped_column(Text, default=None)
+    # Restore: the action put back. Forward: the record created at dispatch.
+    subject_action_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agent_actions.id", ondelete="CASCADE"), default=None
+    )
+    arguments_sha256: Mapped[str | None] = mapped_column(Text, default=None)
+    forward_arguments: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    connector_digest: Mapped[str] = mapped_column(Text)
+    authority_kind: Mapped[str] = mapped_column(Text)
+    authority_ref: Mapped[str] = mapped_column(Text)
+    requested_by: Mapped[str | None] = mapped_column(Text, default=None)
+    idempotency_key: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(
+        Text, server_default=ExecutionState.requested, index=True
+    )
+    refusal_code: Mapped[str | None] = mapped_column(Text, default=None)
+    failure_code: Mapped[str | None] = mapped_column(Text, default=None)
+    attempt: Mapped[int] = mapped_column(Integer, server_default="0", default=0)
+    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    outcome: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+
+
+class ConnectorCapability(Base):
+    """Whether one connector image can restore, as its probe observed it.
+
+    @spec ACTION-EXECUTOR-13. Keyed on the agent, connector and image digest:
+    a digest's tool list is a property of the image, so one probe answers for
+    every action recorded under it, including actions recorded before the probe
+    completed. Key custody depends on the version's declarations, not the image,
+    and is deliberately not stored here (ACTION-EXECUTOR-16).
+    """
+
+    __tablename__ = "connector_capabilities"
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), primary_key=True
+    )
+    connector: Mapped[str] = mapped_column(Text, primary_key=True)
+    digest: Mapped[str] = mapped_column(Text, primary_key=True)
+    restore_capable: Mapped[bool]
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class ChannelCanvasEdit(Base):

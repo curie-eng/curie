@@ -22,6 +22,7 @@ the connector's address.
 
 import logging
 import uuid
+from collections.abc import Sequence
 from typing import NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
@@ -40,8 +41,9 @@ from curie_api.schemas.actions import (
     ActionUndoOut,
 )
 
+from ..action_undoable import undoable_action_ids
 from ..auth import require_api_key
-from ..deps import ApproverSetSelectorDep, SessionDep
+from ..deps import ApproverSetSelectorDep, SessionDep, StoreDep
 from ..models import ActionAuditEntry, ActionStatus, AgentAction, Approval
 
 logger = logging.getLogger(__name__)
@@ -49,9 +51,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/actions", tags=["actions"], dependencies=[Depends(require_api_key)])
 
 
+def _out(action: AgentAction, *, undoable: bool) -> ActionOut:
+    fields = {name: getattr(action, name) for name in ActionOut.model_fields if name != "undoable"}
+    return ActionOut.model_validate({**fields, "undoable": undoable})
+
+
+async def _outs(
+    session: SessionDep, store: StoreDep, actions: Sequence[AgentAction]
+) -> list[ActionOut]:
+    """Render actions with ``undoable`` derived at read time.
+
+    @spec ACTION-EXECUTOR-11: every read of an action, single or listed, takes
+    ``undoable`` from the one derivation, so the two can never disagree.
+    """
+
+    undoable = await undoable_action_ids(session, store, actions)
+    return [_out(action, undoable=action.id in undoable) for action in actions]
+
+
 @router.post("", response_model=ActionOut, status_code=status.HTTP_201_CREATED)
 async def record_action(
-    data: ActionRecord, session: SessionDep, response: Response
+    data: ActionRecord, session: SessionDep, store: StoreDep, response: Response
 ) -> ActionOut:
     """Record a side-effecting call; idempotent on ``dedupe_key``.
 
@@ -69,13 +89,14 @@ async def record_action(
                 status.HTTP_409_CONFLICT, "action violates a uniqueness constraint"
             ) from exc
         response.status_code = status.HTTP_200_OK
-        return ActionOut.model_validate(existing)
-    return ActionOut.model_validate(action)
+        return (await _outs(session, store, [existing]))[0]
+    return (await _outs(session, store, [action]))[0]
 
 
 @router.get("", response_model=list[ActionOut])
 async def list_actions(
     session: SessionDep,
+    store: StoreDep,
     conversation_id: str | None = None,
     agent_id: uuid.UUID | None = None,
     limit: int = 50,
@@ -88,20 +109,20 @@ async def list_actions(
         agent_id=agent_id,
         limit=min(max(limit, 1), 200),
     )
-    return [ActionOut.model_validate(a) for a in actions]
+    return await _outs(session, store, actions)
 
 
 @router.get("/{action_id}", response_model=ActionOut)
-async def get_action(action_id: uuid.UUID, session: SessionDep) -> ActionOut:
+async def get_action(action_id: uuid.UUID, session: SessionDep, store: StoreDep) -> ActionOut:
     action = await crud_actions.get_action(session, action_id)
     if action is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "action not found")
-    return ActionOut.model_validate(action)
+    return (await _outs(session, store, [action]))[0]
 
 
 @router.post("/{action_id}/complete", response_model=ActionOut)
 async def complete_action(
-    action_id: uuid.UUID, data: ActionComplete, session: SessionDep
+    action_id: uuid.UUID, data: ActionComplete, session: SessionDep, store: StoreDep
 ) -> ActionOut:
     """Record what the tool answered.
 
@@ -114,7 +135,7 @@ async def complete_action(
     if action is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "action not found")
     completed = await crud_actions.complete_action(session, action, data)
-    return ActionOut.model_validate(completed)
+    return (await _outs(session, store, [completed]))[0]
 
 
 @router.get("/{action_id}/audit", response_model=list[ActionAuditOut])
@@ -353,6 +374,9 @@ async def undo_action(
     await session.commit()
     await session.refresh(claimed)
     return ActionUndoOut(
-        action=ActionOut.model_validate(claimed),
+        # The claim just set ``undone_at``, which the record half of the
+        # derivation refuses before reading anything else, so the full
+        # derivation answers False here by construction (ACTION-EXECUTOR-11).
+        action=_out(claimed, undoable=False),
         restore=ActionRestore(target=action.target, prior_state=action.prior_state),
     )
