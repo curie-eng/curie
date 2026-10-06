@@ -41,6 +41,7 @@ from ..hook_source_policy_schemas import (
     HookSourcePolicyMutation,
     HookSourcePolicyOut,
     HookSourcePolicyWrite,
+    HookSourceRefusal,
     HookSourceSecretOut,
     SourceHook,
     SourceUuid,
@@ -57,32 +58,24 @@ _PROTECTED_TARGET = "protected"
 AgentPath = Annotated[SourceUuid, Path()]
 HookPath = Annotated[SourceHook, Path()]
 
-_REFUSAL_SCHEMA: dict[str, Any] = {
-    "description": "Source refusal",
+_REFUSAL: dict[str, Any] = {"model": HookSourceRefusal, "description": "Source refusal"}
+# A request shape 422 is FastAPI's validation list; a reference 422 is a source refusal.
+_SHAPE_OR_REFERENCE: dict[str, Any] = {
+    "description": "Validation error or unknown source reference",
     "content": {
         "application/json": {
             "schema": {
-                "type": "object",
-                "required": ["detail"],
-                "properties": {
-                    "detail": {
-                        "type": "object",
-                        "required": ["code", "committed_generation"],
-                        "properties": {
-                            "code": {"type": "string"},
-                            "committed_generation": {"type": ["string", "null"]},
-                        },
-                    }
-                },
+                "anyOf": [
+                    {"$ref": "#/components/schemas/HTTPValidationError"},
+                    {"$ref": "#/components/schemas/HookSourceRefusal"},
+                ]
             }
         }
     },
 }
-_REFUSALS: dict[int | str, dict[str, Any]] = {
-    404: _REFUSAL_SCHEMA,
-    409: _REFUSAL_SCHEMA,
-    503: _REFUSAL_SCHEMA,
-}
+_READ_REFUSALS: dict[int | str, dict[str, Any]] = {404: _REFUSAL, 503: _REFUSAL}
+_REFUSALS: dict[int | str, dict[str, Any]] = {**_READ_REFUSALS, 409: _REFUSAL}
+_REFERENCE_REFUSALS: dict[int | str, dict[str, Any]] = {**_REFUSALS, 422: _SHAPE_OR_REFERENCE}
 
 
 def _refusal(error: SourceAdminError) -> JSONResponse:
@@ -143,7 +136,7 @@ async def _mutate(
 @router.get(
     "/{agent_id}/hooks/{hook}/source-policy",
     response_model=HookSourcePolicyOut,
-    responses=_REFUSALS,
+    responses=_READ_REFUSALS,
 )
 async def get_source_policy(agent_id: AgentPath, hook: HookPath, request: Request) -> JSONResponse:
     """Committed source policy and its publication activation.
@@ -165,7 +158,7 @@ async def get_source_policy(agent_id: AgentPath, hook: HookPath, request: Reques
 @router.put(
     "/{agent_id}/hooks/{hook}/source-policy",
     response_model=HookSourcePolicyOut,
-    responses={**_REFUSALS, 422: _REFUSAL_SCHEMA},
+    responses=_REFERENCE_REFUSALS,
 )
 async def put_source_policy(
     agent_id: AgentPath, hook: HookPath, body: HookSourcePolicyWrite, request: Request
@@ -221,7 +214,7 @@ async def delete_source_policy(
         policy = await _mutate(
             request,
             lambda coordinator: coordinator.remove(
-                agent_id, hook, cas.expected_generation, cas.operation_id, refuse_unconfigured=True
+                agent_id, hook, cas.expected_generation, cas.operation_id
             ),
         )
         body = policy_out(
@@ -240,7 +233,7 @@ async def delete_source_policy(
 @router.post(
     "/{agent_id}/hooks/{hook}/source-policy/rotate",
     response_model=HookSourcePolicyOut,
-    responses={**_REFUSALS, 422: _REFUSAL_SCHEMA},
+    responses=_REFERENCE_REFUSALS,
 )
 async def rotate_source_policy(
     agent_id: AgentPath, hook: HookPath, body: HookSourcePolicyMutation, request: Request

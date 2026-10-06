@@ -4652,6 +4652,48 @@
         "title": "HookSourcePolicyWrite",
         "type": "object"
       },
+      "HookSourceRefusal": {
+        "additionalProperties": false,
+        "description": "@spec PROTECTED-HOOK-SOURCE-3.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/HookSourceRefusalDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "HookSourceRefusal",
+        "type": "object"
+      },
+      "HookSourceRefusalDetail": {
+        "additionalProperties": false,
+        "description": "A source service refusal: a stable code and, only after a confirmed commit, its generation.\n\n@spec PROTECTED-HOOK-SOURCE-3.",
+        "properties": {
+          "code": {
+            "pattern": "^[a-z][a-z0-9_]{0,62}$",
+            "title": "Code",
+            "type": "string"
+          },
+          "committed_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Committed Generation"
+          }
+        },
+        "required": [
+          "code",
+          "committed_generation"
+        ],
+        "title": "HookSourceRefusalDetail",
+        "type": "object"
+      },
       "HookSourceSecretOut": {
         "additionalProperties": false,
         "description": "@spec PROTECTED-HOOK-SOURCE-3.",
@@ -10845,30 +10887,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  "$ref": "#/components/schemas/HookSourceRefusal"
                 }
               }
             },
@@ -10878,30 +10897,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  "$ref": "#/components/schemas/HookSourceRefusal"
                 }
               }
             },
@@ -10921,30 +10917,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  "$ref": "#/components/schemas/HookSourceRefusal"
                 }
               }
             },
@@ -11010,63 +10983,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Source refusal"
-          },
-          "409": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  "$ref": "#/components/schemas/HookSourceRefusal"
                 }
               }
             },
@@ -11086,30 +11003,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  "$ref": "#/components/schemas/HookSourceRefusal"
                 }
               }
             },
@@ -11185,30 +11079,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  "$ref": "#/components/schemas/HookSourceRefusal"
                 }
               }
             },
@@ -11218,30 +11089,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  "$ref": "#/components/schemas/HookSourceRefusal"
                 }
               }
             },
@@ -11251,63 +11099,24 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/HookSourceRefusal"
                     }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  ]
                 }
               }
             },
-            "description": "Source refusal"
+            "description": "Validation error or unknown source reference"
           },
           "503": {
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  "$ref": "#/components/schemas/HookSourceRefusal"
                 }
               }
             },
@@ -11385,30 +11194,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  "$ref": "#/components/schemas/HookSourceRefusal"
                 }
               }
             },
@@ -11418,30 +11204,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  "$ref": "#/components/schemas/HookSourceRefusal"
                 }
               }
             },
@@ -11451,63 +11214,24 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/HookSourceRefusal"
                     }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  ]
                 }
               }
             },
-            "description": "Source refusal"
+            "description": "Validation error or unknown source reference"
           },
           "503": {
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  "$ref": "#/components/schemas/HookSourceRefusal"
                 }
               }
             },
@@ -11575,30 +11299,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  "$ref": "#/components/schemas/HookSourceRefusal"
                 }
               }
             },
@@ -11608,30 +11309,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  "$ref": "#/components/schemas/HookSourceRefusal"
                 }
               }
             },
@@ -11651,30 +11329,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "properties": {
-                    "detail": {
-                      "properties": {
-                        "code": {
-                          "type": "string"
-                        },
-                        "committed_generation": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "committed_generation"
-                      ],
-                      "type": "object"
-                    }
-                  },
-                  "required": [
-                    "detail"
-                  ],
-                  "type": "object"
+                  "$ref": "#/components/schemas/HookSourceRefusal"
                 }
               }
             },
