@@ -293,6 +293,43 @@ or older worktree does not automatically acquire newer instructions; read this
 section from the updated base when resuming. Do not edit a live claimed Bonus
 Drain task or launch a second copy to apply the guidance.
 
+### Preflight checks
+
+The full and fast preflight requirements in this section apply only when the
+checkout being checked contains both the `curie dev preflight` command and
+`tools/preflight/preflight.py`. Check the selected release train and worktree,
+even when these instructions were loaded from a different launch checkout.
+If that train does not contain preflight, run its applicable required checks
+directly using its own instructions and CI workflow, and require current-head
+PR checks to pass. Do not run another checkout's preflight against it or port
+preflight into the train to satisfy this section. Missing prerequisites or a
+failing preflight in a checkout that supports it remain failures.
+
+Before opening or updating a pull request, run the full tier from the source
+checkout: `curie dev preflight --pr-body <file> --title <text>`. The full tier
+is the default. It fetches the base and refuses a head that does not contain
+its current tip, printing `git merge origin/<base>` without merging for you.
+Failing required checks on the base produce a warning. It runs the PR body and
+Fix pin guards, then tests the changed Python workspace members and their
+transitive dependents in a private Compose project that it tears down on exit.
+Without `--pr-body`, the body and Fix pin checks are reported as skipped.
+Selected end to end tiers and kind jobs are listed as runs in CI only.
+
+After committing and before pushing, run `curie dev preflight --fast` from the
+source checkout. It selects the cheap PR gates for the committed change and
+runs their CI commands. The default base is `main`; use `--base <branch>`
+to compare against another fetched `origin/<branch>`. Use `--dry-run` to inspect
+the selected commands and `--json` for one structured report. A failing gate
+includes its output tail. This fast tier does not replace any required
+verification below.
+
+`curie install`, `curie update`, and `curie dev hooks install` configure the
+shared relative `core.hooksPath=.githooks`. Each linked worktree runs its own
+tracked hook. A differing existing path is preserved with a warning; use
+`git config --local core.hooksPath .githooks` to select the Curie hooks
+explicitly. The tracked pre-push hook runs fast preflight. The explicit escape
+hatch is `git push --no-verify`.
+
 **Rust CLI:**
 ```bash
 cd cli
@@ -824,15 +861,16 @@ required and proved, not carried on the original classification.
 | cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
 | live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow; also the MCP/workspace/coding-tool path set below | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
 | external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape; Slack is required on the MCP/workspace/coding-tool path set below | drive the real integration; a replayed fixture or a fake does not close this tier |
-| factory | API factory runtime, CI, progress, or publication behavior; runner verification preflight or factory progress; the dark factory example; worker work item execution | `curie dev factory-e2e run --scenario issue-to-pr` until the scenario in #3814 ships |
+| factory | API factory runtime, CI, progress, or publication behavior; runner verification preflight or factory progress; the dark factory example; worker work item execution | `curie dev factory-e2e scripted` on the kind rung when factory paths change |
 
 The factory path set includes `apps/api/src/curie_api/factory_runtime*`,
 `factory_ci*`, `factory_progress*`, and `routers/publications*`;
 runner verification preflight and progress; `examples/dark-factory/`; and
 worker work item execution. Factory evidence must run the production factory
 scenario through the changed components. A canned fixture or fake scenario
-does not close this tier. Until #3814 ships its scenario, use the command in
-the factory row.
+does not close this tier. The factory row names `curie dev factory-e2e scripted`,
+the kind-rung scenario that replays a recorded model transcript against the
+GitHub stub and a fixture whose layout is not this repository.
 
 The PR body guard derives minimum required tiers from changed files. A row
 required by those paths cannot be omitted or marked not applicable through
@@ -1087,6 +1125,15 @@ the work in a linked GitHub issue and pull request. Follow
   it is deletable and does not change the architecture, so it is a feature, not an
   architectural decision. The issue carries the what and the why; the *how* lives in
   the PR. An issue may cite an ADR.
+- **An example bundle or agent is never the subject of an ADR.** What a bundle
+  under `examples/` does (its skill text, prompts, tool policy, test or verdict
+  rules, safety rules, operator guidance) is that bundle's design, even when it
+  is safety relevant. Record it in the bundle's README or `docs/`, and track
+  changes in issues. When a bundle needs the platform itself to change shape,
+  the ADR covers only that platform contract, seam or invariant, stated so that
+  it holds for every bundle, not the bundle's own rules. The mean tester ADRs
+  (0169, 0172, 0181) are the counterexample: they record one example bundle's
+  behavior.
 - **When in doubt, write the issue.** Promote to an ADR only when the same decision
   gets re-explained across a third issue or PR.
 

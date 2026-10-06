@@ -17,8 +17,8 @@ installation it belongs to (#3039). ``credential_ref`` and
 CHECKed to be references (``env:NAME`` or ``k8s-secret:name/key``) that do not
 have the shape of a well-known credential, whoever writes them.
 
-Revision ID: 0078
-Revises: 0077
+Revision ID: 0083
+Revises: 0082
 Create Date: 2026-09-23
 """
 
@@ -28,8 +28,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0078"
-down_revision: str | None = "0077"
+revision: str = "0083"
+down_revision: str | None = "0082"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

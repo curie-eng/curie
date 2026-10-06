@@ -126,7 +126,7 @@ fn eval_cases(name: &str) -> String {
 /// current landmine list.
 fn agents_md(name: &str) -> String {
     format!(
-        "# Agent instructions: {name}\n\nThis is a Curie bundle (a Claude Code plugin shape). The full harness\nprimer is one command away and is the source of truth:\n\n    curie guide\n\n## The loop\n\n1. `curie skill up --fake-model` -- boot the runner offline, no credential.\n   The fake model is plumbing, not a subject under test: it answers every input\n   with the same canned reply, so nothing it says is evidence about behavior.\n2. Edit `skills/{name}/SKILL.md` (behavior) and `evals/cases.json` (the contract).\n3. `curie skill up --fake-model` -- the runner executes an immutable\n   snapshot of the bundle taken at `skill up`, so a `SKILL.md` edit reaches it\n   ONLY after a restart. A second `up` from this directory replaces the recorded\n   runner automatically when the source changed; `--replace` still forces a\n   restart of an unchanged snapshot. Skip this and step 4 grades the pre-edit bundle with\n   no sign anything is stale. (`evals/cases.json` is read live from source, so\n   the contract does not need the restart -- only the behavior does.) Confirm\n   what is loaded with `curie skill status --json` and its `bundle_digest`.\n4. `curie skill eval` under `--fake-model` reports `plumbing_ok` -- it proves\n   the turn completed, and grades nothing. Re-run it with a real credential to\n   grade the cases; that green is the promotion gate. Merging to main promotes.\n5. `curie skill down` when finished.\n\n## What this bundle declares\n\n- `skills/{name}/SKILL.md` -- behavior. The main thing to edit.\n- `evals/cases.json` -- the promotion gate. Make it FALSIFIABLE.\n- `connectors.yaml` -- what this agent needs RUNNING (an MCP server Curie\n  hosts for it). Scaffolded empty and commented; Curie derives the Deployment,\n  Service, hardening, host allowlist, NetworkPolicy, and the URL the agent\n  dials, so none of that belongs in this repo. Never hand-write that URL: it\n  embeds the release, the agent, and the namespace, so it differs per agent.\n- `deploy.yaml` -- WHERE this bundle goes. `curie cluster deploy --target prod`\n  reads it, so routing is a reviewable diff instead of flags in CI. The bundle\n  is identical across targets; only the binding differs.\n\n## Rules\n\n- Verify before running: `curie schema` lists every real command; never\n  invoke one you have not confirmed.\n- The eval file is the promotion gate and never changes across tiers\n  (skill/local/cluster). Grading, and therefore green and red, is a\n  real-credential concept; never deploy on red.\n- Landmines: run `curie guide` (or read\n  `.claude/skills/using-curie/SKILL.md`) for the full, current list.\n- If a step genuinely needs human sign-off, do NOT collect it in the skill. Call\n  the built-in `request_approval` tool only when it is available, then end the\n  turn: the platform posts the card, authorizes the resolver server-side, and\n  resumes you with a turn beginning `[approval resolved]`, which this skill must\n  handle. If the tool is absent, explain that the bundle cannot perform the\n  action; do not fabricate a remediation request. `curie guide` has the section;\n  `docs/approvals.md` in the Curie repo has the full walkthrough.\n- The scaffolded eval is a starter smoke test: it only checks the agent named\n  itself, so it fails on an empty/errored turn but proves nothing about the\n  real work. Replace it with a FALSIFIABLE grader -- one a plausibly-broken\n  agent would fail -- as the first authoring step (ADR-0022).\n- A bare greeting (\"hey\", \"hi\") is answered by the real model by default --\n  a full sandbox claim and model turn for something a canned reply could\n  handle for free. If this agent gets greeted often, consider a `greeting`\n  behavior pack: `GET`/`PUT /agents/{{id}}/behavior-packs` (no CLI verb yet)\n  short-circuits a bare greeting/help request before the model ever runs.\n  See `docs/behavior-packs.md`.\n"
+        "# Agent instructions: {name}\n\nThis is a Curie bundle (a Claude Code plugin shape). The full harness\nprimer is one command away and is the source of truth:\n\n    curie guide\n\n## The loop\n\n1. `curie skill up --fake-model` -- boot the runner offline, no credential.\n   The fake model is plumbing, not a subject under test: it answers every input\n   with the same canned reply, so nothing it says is evidence about behavior.\n2. Edit `skills/{name}/SKILL.md` (behavior) and `evals/cases.json` (the contract).\n3. `curie skill up --fake-model` -- the runner executes an immutable\n   snapshot of the bundle taken at `skill up`, so a `SKILL.md` edit reaches it\n   ONLY after a restart. A second `up` from this directory replaces the recorded\n   runner automatically when the source changed; `--replace` still forces a\n   restart of an unchanged snapshot. Skip this and step 4 grades the pre-edit bundle with\n   no sign anything is stale. (`evals/cases.json` is read live from source, so\n   the contract does not need the restart -- only the behavior does.) Confirm\n   what is loaded with `curie skill status --json` and its `bundle_digest`.\n4. `curie skill eval` under `--fake-model` reports `plumbing_ok` -- it proves\n   the turn completed, and grades nothing. Re-run it with a real credential to\n   grade the cases; that green is the promotion gate. Merging to main promotes.\n5. `curie skill down` when finished.\n\n## What this bundle declares\n\n- `skills/{name}/SKILL.md` -- behavior. The main thing to edit.\n- `evals/cases.json` -- the promotion gate. Make it FALSIFIABLE.\n- `connectors.yaml` -- what this agent needs RUNNING (an MCP server Curie\n  hosts for it). Scaffolded empty and commented; Curie derives the Deployment,\n  Service, hardening, host allowlist, NetworkPolicy, and the URL the agent\n  dials, so none of that belongs in this repo. Never hand-write that URL: it\n  embeds the release, the agent, and the namespace, so it differs per agent.\n- `deploy.yaml` -- WHERE this bundle goes. `curie cluster deploy --target prod`\n  reads it, so routing is a reviewable diff instead of flags in CI. The bundle\n  is identical across targets; only the binding differs.\n\n## Cron triggers\n\nA bundle can wake its agent on a schedule by declaring `triggers` in\n`.claude-plugin/plugin.json`. This scaffold declares none, so it schedules\nnothing until you add one:\n\n```json\n{{\n  \"triggers\": [\n    {{\n      \"type\": \"cron\",\n      \"name\": \"weekday-digest\",\n      \"schedule\": \"0 9 * * 1-5\",\n      \"timezone\": \"UTC\",\n      \"target\": \"C0EXAMPLE1\",\n      \"prompt\": \"Summarize what changed since yesterday.\"\n    }}\n  ]\n}}\n```\n\n`name` keys the run history, `schedule` is five-field cron, and `timezone`\n(default UTC) and `target` are optional. `target` must be a channel bound to\nthis agent; without it the turn runs silently and posts nothing, and a\ntargetless turn that hits an approval gate records `failed`. Read the record\nwith `curie local schedules` and run one now with\n`curie local hook fire <agent> <name>`. `curie guide` has the full section.\n\n## Rules\n\n- Verify before running: `curie schema` lists every real command; never\n  invoke one you have not confirmed.\n- The eval file is the promotion gate and never changes across tiers\n  (skill/local/cluster). Grading, and therefore green and red, is a\n  real-credential concept; never deploy on red.\n- Landmines: run `curie guide` (or read\n  `.claude/skills/using-curie/SKILL.md`) for the full, current list.\n- If a step genuinely needs human sign-off, do NOT collect it in the skill. Call\n  the built-in `request_approval` tool only when it is available, then end the\n  turn: the platform posts the card, authorizes the resolver server-side, and\n  resumes you with a turn beginning `[approval resolved]`, which this skill must\n  handle. If the tool is absent, explain that the bundle cannot perform the\n  action; do not fabricate a remediation request. `curie guide` has the section;\n  `docs/approvals.md` in the Curie repo has the full walkthrough.\n- The scaffolded eval is a starter smoke test: it only checks the agent named\n  itself, so it fails on an empty/errored turn but proves nothing about the\n  real work. Replace it with a FALSIFIABLE grader -- one a plausibly-broken\n  agent would fail -- as the first authoring step (ADR-0022).\n- A bare greeting (\"hey\", \"hi\") is answered by the real model by default --\n  a full sandbox claim and model turn for something a canned reply could\n  handle for free. If this agent gets greeted often, consider a `greeting`\n  behavior pack: `GET`/`PUT /agents/{{id}}/behavior-packs` (no CLI verb yet)\n  short-circuits a bare greeting/help request before the model ever runs.\n  See `docs/behavior-packs.md`.\n"
     )
 }
 
@@ -136,7 +136,7 @@ fn agents_md(name: &str) -> String {
 /// `crate::guide::primer_markdown()` -- one source of truth, drift-gated.
 fn using_curie_skill() -> String {
     format!(
-        "---\nname: using-curie\ndescription: How to drive the Curie harness -- the parity ladder, tier decision logic, landmines, and recovery steps. Invoke when running curie commands, authoring or evaluating a bundle, or debugging a divergence between skill, local, and cluster tiers.\n---\n\n{}",
+        "---\nname: using-curie\ndescription: How to drive the Curie harness -- the parity ladder, tier decision logic, landmines, cron triggers (see its Cron triggers section), and recovery steps. Invoke when running curie commands, authoring or evaluating a bundle, or debugging a divergence between skill, local, and cluster tiers.\n---\n\n{}",
         crate::guide::primer_markdown()
     )
 }
@@ -758,6 +758,59 @@ mod tests {
             .strip_prefix('\n')
             .expect("blank line after the closing frontmatter fence");
         assert_eq!(body, crate::guide::primer_markdown());
+    }
+
+    #[test]
+    fn scaffold_documents_cron_triggers_without_declaring_any() {
+        // AC (#4012): a fresh scaffold teaches cron triggers but schedules
+        // nothing. The AGENTS.md example must be copyable JSON, so parse it.
+        let dir = tempfile::tempdir().unwrap();
+        scaffold(dir.path(), "cronbot").unwrap();
+
+        let agents = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(
+            agents.contains("\"triggers\""),
+            "AGENTS.md must show the `\"triggers\"` key: {agents}"
+        );
+        let block = agents
+            .split("```json\n")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("AGENTS.md has a fenced json example");
+        let example: serde_json::Value =
+            serde_json::from_str(block).expect("the AGENTS.md cron example is valid JSON");
+        let first = &example["triggers"]
+            .as_array()
+            .expect("example has a triggers array")[0];
+        assert_eq!(first["type"], "cron");
+        for field in ["name", "schedule", "prompt"] {
+            assert!(
+                first[field].as_str().is_some_and(|v| !v.is_empty()),
+                "example trigger missing `{field}`: {first}"
+            );
+        }
+
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".claude-plugin/plugin.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            manifest.get("triggers").is_none(),
+            "a fresh scaffold must declare no triggers: {manifest}"
+        );
+
+        let harness_skill =
+            std::fs::read_to_string(dir.path().join(".claude/skills/using-curie/SKILL.md"))
+                .unwrap();
+        let description = harness_skill
+            .lines()
+            .find(|l| l.starts_with("description:"))
+            .expect("harness skill has a description line");
+        assert!(
+            description.contains("cron triggers"),
+            "using-curie description must point at cron triggers: {description}"
+        );
+        assert!(harness_skill.contains("## Cron triggers"));
     }
 
     #[test]

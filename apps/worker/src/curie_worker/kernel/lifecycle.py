@@ -40,7 +40,7 @@ from ..capacity_wait import (
     current_wait,
 )
 from ..delivery_lease import DeliveryLease
-from ..hook_runs import HookRunRecorderError, retry_expiry
+from ..hook_runs import HookRunOutcome, HookRunReason, HookRunRecorderError, retry_expiry
 from ..reply_sink import (
     TargetRoute,
 )
@@ -318,6 +318,7 @@ async def _process_event(
                     telemetry_outcome="interrupted",
                     lease=lease,
                     hook_outcome="skipped",
+                    hook_reason="deferred_expired",
                 )
                 return
 
@@ -410,6 +411,7 @@ async def _process_event(
                     telemetry_outcome="interrupted",
                     lease=lease,
                     hook_outcome="failed",
+                    hook_reason="reply_undeliverable",
                 )
                 return
 
@@ -474,6 +476,7 @@ async def _process_event(
                 telemetry_outcome="classified_failure",
                 lease=lease,
                 hook_outcome="failed",
+                hook_reason="prior_side_effect",
             )
             return
 
@@ -535,6 +538,7 @@ async def _process_event(
                     telemetry_outcome="interrupted",
                     lease=lease,
                     hook_outcome="failed",
+                    hook_reason="deployment_missing",
                 )
                 return
             constants._TURN_AGENT.set(resolved.agent_name)
@@ -546,6 +550,7 @@ async def _process_event(
                     telemetry_outcome="interrupted",
                     lease=lease,
                     hook_outcome="blocked",
+                    hook_reason="agent_killed",
                 )
                 return
             agent_id = resolved.agent_id
@@ -992,6 +997,7 @@ async def _process_event(
                             telemetry_outcome="deadline_halted",
                             lease=lease,
                             hook_outcome="failed",
+                            hook_reason="turn_error",
                         )
                         return
                     # DISTINCT from the model-spend ``budget-exceeded``
@@ -1013,6 +1019,9 @@ async def _process_event(
                         telemetry_outcome="deadline_halted",
                         lease=lease,
                         hook_outcome=hooks._hook_failure_outcome(),
+                        hook_reason=(
+                            "turn_error" if hooks._hook_failure_outcome() == "failed" else None
+                        ),
                     )
                     return
             try:
@@ -1046,6 +1055,7 @@ async def _process_event(
                     telemetry_outcome="interrupted",
                     lease=lease,
                     hook_outcome="failed",
+                    hook_reason="turn_error",
                 )
                 return
             except WorkItemStartRefused as exc:
@@ -1105,6 +1115,7 @@ async def _process_event(
                             telemetry_outcome="interrupted",
                             lease=lease,
                             hook_outcome="blocked",
+                            hook_reason="hook_paused",
                         )
                         return
                     if isinstance(busy, failures.LiveSessionBusy):
@@ -1125,6 +1136,7 @@ async def _process_event(
                                 telemetry_outcome="interrupted",
                                 lease=lease,
                                 hook_outcome="failed",
+                                hook_reason="turn_error",
                             )
                             return
                         logger.info(
@@ -1151,6 +1163,16 @@ async def _process_event(
                     expired = isinstance(busy, failures.CatchUpExpired) or (
                         expiry is not None and datetime.now(UTC) >= expiry
                     )
+                    busy_outcome: HookRunOutcome = "skipped" if expired else "deferred"
+                    busy_reason: HookRunReason = (
+                        "deferred_expired"
+                        if expiry is not None and datetime.now(UTC) >= expiry
+                        else "catch_up_expired"
+                        if expired
+                        else "hook_paused"
+                        if isinstance(busy, failures.HookPaused)
+                        else "live_session"
+                    )
                     logger.info(
                         "cron event %s met a live session or its bound; %s",
                         event_id,
@@ -1162,7 +1184,8 @@ async def _process_event(
                         "dropped",
                         telemetry_outcome="interrupted",
                         lease=lease,
-                        hook_outcome="skipped" if expired else "deferred",
+                        hook_outcome=busy_outcome,
+                        hook_reason=busy_reason,
                     )
                     return
                 raise
@@ -1178,6 +1201,7 @@ async def _process_event(
                     telemetry_outcome="classified_failure",
                     lease=lease,
                     hook_outcome="failed",
+                    hook_reason="approval_gate_targetless",
                 )
                 return
 
@@ -1198,6 +1222,9 @@ async def _process_event(
                     telemetry_outcome="classified_failure",
                     lease=lease,
                     hook_outcome=hooks._hook_failure_outcome(),
+                    hook_reason=(
+                        "turn_error" if hooks._hook_failure_outcome() == "failed" else None
+                    ),
                 )
                 return
 
@@ -1236,6 +1263,9 @@ async def _process_event(
                     ),
                     lease=lease,
                     hook_outcome=hooks._hook_success_outcome(),
+                    hook_reason=(
+                        "turn_error" if hooks._hook_success_outcome() == "failed" else None
+                    ),
                 )
                 return
 
@@ -1253,6 +1283,9 @@ async def _process_event(
                     ),
                     lease=lease,
                     hook_outcome=hooks._hook_success_outcome(),
+                    hook_reason=(
+                        "turn_error" if hooks._hook_success_outcome() == "failed" else None
+                    ),
                     turn=outcome,
                 )
                 return
@@ -1296,6 +1329,9 @@ async def _process_event(
                     telemetry_outcome="side_effect_halted",
                     lease=lease,
                     hook_outcome=hooks._hook_failure_outcome(),
+                    hook_reason=(
+                        "turn_error" if hooks._hook_failure_outcome() == "failed" else None
+                    ),
                     turn=outcome,
                 )
                 return
@@ -1324,6 +1360,9 @@ async def _process_event(
                     telemetry_outcome="deadline_halted",
                     lease=lease,
                     hook_outcome=hooks._hook_failure_outcome(),
+                    hook_reason=(
+                        "turn_error" if hooks._hook_failure_outcome() == "failed" else None
+                    ),
                 )
                 return
             retryable = retryable and qevent.source is not TurnSource.CRON
@@ -1364,6 +1403,11 @@ async def _process_event(
                     ),
                     lease=lease,
                     hook_outcome=hooks._hook_failure_outcome(),
+                    hook_reason=(
+                        "budget_exhausted"
+                        if outcome.classification == "budget-exceeded"
+                        else "turn_error"
+                    ),
                     turn=outcome,
                 )
                 return

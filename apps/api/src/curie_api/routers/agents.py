@@ -286,6 +286,8 @@ async def update_agent(
     sent = data.model_fields_set
     if "model" in sent:
         agent = await crud_agents.update_agent_model(session, agent, data.model)
+    if "reviewer_model" in sent:
+        agent = await crud_agents.update_agent_reviewer_model(session, agent, data.reviewer_model)
     if "thinking" in sent:
         agent = await crud_agents.update_agent_thinking(session, agent, data.thinking)
     if "execution_deadline_seconds" in sent:

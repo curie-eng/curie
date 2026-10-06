@@ -1407,6 +1407,11 @@ api:
   githubCloneBase: "https://github.com"
   # REST base used by credential minting, polling, and managed publication.
   githubApiUrl: "https://api.github.com"
+  # Optional ConfigMap name whose key ca.pem is a private CA for a GitHub
+  # stub. Empty leaves TLS trust on the image bundle. When set, the api,
+  # worker, and runner sandbox mount it and point SSL_CERT_FILE,
+  # GIT_SSL_CAINFO, and REQUESTS_CA_BUNDLE at that file.
+  githubStubCaConfigMap: ""
   # How often (seconds) the API scans for lapsed pending approvals and resumes
   # their stranded sessions (#412). Set to 0 (or any value <= 0) to disable the
   # expiry sweeper entirely. Default matches the app's built-in 30s cadence.
@@ -2476,15 +2481,17 @@ preflights:
   # runs a CLUSTER-scope NetworkPolicy informer; if its RBAC cannot satisfy that
   # cluster LIST the manager crash-loops and no SandboxClaim ever binds (issue
   # #350). This post-install/upgrade hook Job fails the Helm operation unless the
-  # controller reaches "Starting workers" (all informer caches synced), so an RBAC
-  # regression fails at install, not at first turn. Gated also on
-  # agentSandbox.controller.deploy.
+  # controller logs "Starting workers" or its current Running pod has positive
+  # successful-reconcile metrics (all informer caches synced). Failure logs and
+  # pod restarts take precedence over either signal. The metrics counter survives
+  # startup-log rotation. Gated also on agentSandbox.controller.deploy.
   controllerReady:
     enabled: true
     image: alpine/k8s:1.31.2
-    # Max seconds to wait for the controller to become Available and log
-    # "Starting workers". Sized for a fresh install; an upgrade over a
-    # crash-looping controller may need a manual pod delete + `helm test`.
+    # Max seconds to wait for "Starting workers" or positive successful-reconcile
+    # metrics after checking for controller failures. Sized for a fresh install;
+    # an upgrade over a crash-looping controller may need a manual pod delete
+    # + `helm test`.
     timeoutSeconds: 180
     resources:
       requests: { cpu: 50m, memory: 64Mi }

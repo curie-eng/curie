@@ -10,6 +10,13 @@ that establish or materially change durable system boundaries. CI configuration,
 build plumbing, and similar delivery mechanics are outside this requirement
 unless they also make such an architectural decision.
 
+An ADR records structure only. The behavior of a single example bundle or
+agent (its skill text, prompts, tool policy, test or verdict rules, safety
+rules, or operator guidance) is not architecture and never gets an ADR. It
+lives in that bundle's README or `docs/` and is tracked in issues. If a bundle
+needs a platform change, write the ADR about the platform contract alone, so
+that it holds for every bundle.
+
 ## Status vocabulary
 
 1. `Draft` is open for discussion and revision. It may merge, but it does not

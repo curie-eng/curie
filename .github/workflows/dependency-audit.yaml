@@ -5,6 +5,16 @@ on:
     branches: [main, next]
   pull_request:
     branches: [main, next, "task/**"]
+    paths:
+      - cli/Cargo.lock
+      - cli/Cargo.toml
+      - packages/aci-protocol/generated/rust/Cargo.lock
+      - packages/aci-protocol/generated/rust/Cargo.toml
+      - uv.lock
+      - "**/pyproject.toml"
+      - apps/ui/pnpm-lock.yaml
+      - apps/ui/package.json
+      - .github/workflows/dependency-audit.yaml
   schedule:
     # Advisory databases change independently of the code, so re-run weekly to
     # catch newly-published CVEs against dependencies that never changed.

@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from test_factory_progress import DECLARATION, STAGED_DECLARATION, report
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     _LABELS,
+    HEAD_A,
     REPO,
     _attach_publication,
     _attach_revision_publication,
@@ -44,8 +45,11 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     _request,
     _revision_objective,
     _rows,
+    _set_base_ref,
     _start_running,
     admitted,
+    check_run,
+    ci_entry,
     comments,
 )
 from test_github_factory_ingress import LABEL, _issue_event, _post
@@ -357,6 +361,40 @@ def test_completion_patches_the_pr_link_and_finalizes(admitted: Any) -> None:  #
     sink.requests.clear()
     _reconcile()
     assert _writes(sink) == []
+
+
+def test_a_preexisting_base_failure_is_named_in_the_final_comment(admitted: Any) -> None:  # noqa: F811
+    """#4105 AC5: a check also failing on the base branch completes with a note."""
+
+    client, github, sink = admitted
+    number = 9923
+    base_head = "d4" * 20
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+    comment_id = _notices(request_id)[0]["comment_id"]
+    _start_running(request_id)
+    assert report(client, request_id, "publish").status_code == 201
+    work_item_id = _request(number)["work_item_id"]
+    sink.ci_scripts = {
+        HEAD_A: [ci_entry(check_run("pip-audit", conclusion="failure"), check_run("lint"))],
+        base_head: [ci_entry(check_run("pip-audit", conclusion="failure"), check_run("lint"))],
+    }
+    sink.branches = {"main": base_head}
+    _attach_publication(work_item_id, status="succeeded", pr=77)
+    _set_base_ref(work_item_id, "main")
+    sink.requests.clear()
+    _reconcile()
+
+    assert _request(number)["status"] == "completed"
+    patches = _patches(sink)
+    assert patches and {path for path, _ in patches} == {
+        f"/repos/{REPO}/issues/comments/{comment_id}"
+    }
+    body = patches[-1][1] or ""
+    assert f"Completed: https://github.com/{REPO}/pull/77" in body
+    assert "Status: SUCCEEDED" in body
+    assert "Also failing on the base branch, not caused by this change: pip-audit" in body
+    assert _notices(request_id)[0]["finalized_at"] is not None
 
 
 def test_a_pending_publication_shows_publishing_and_stays_live(admitted: Any) -> None:  # noqa: F811

@@ -7,7 +7,8 @@ object key, a repo full name, a base sha, a checkout mode), and its TTL is the
 ROUTE lease -- refreshed by ``touch`` every time sandbox affinity is refreshed,
 because its whole job is to say "this thread's sandbox is still using this base".
 Attachment objects answer a different question ("may these bytes still be fetched
-by a retry of this turn?") on a different clock, and folding them in would put a
+by a retry of this turn, or by a later text-only turn in the thread that boots
+another sandbox (#4079)?") on a different clock, and folding them in would put a
 foreign object class under a thread-ownership authority. Hence a second ledger,
 with its own prefix and its own expiry field, swept from the SAME
 ``reap_orphans`` tick.
@@ -129,6 +130,7 @@ def _plant_owner(
     thread_key: str,
     object_keys: Sequence[str],
     expires_at_epoch: int,
+    ref_count: int = 1,
 ) -> None:
     """Write one owner record straight into the store at an exact key.
 
@@ -148,14 +150,15 @@ def _plant_owner(
                     "expires_at_epoch": expires_at_epoch,
                     "object_keys": list(object_keys),
                     "refs": module.encode_attachment_refs(
-                        (
+                        tuple(
                             module.AttachmentRef(
-                                name="planted.csv",
+                                name="planted.csv" if index == 0 else f"planted-{index}.csv",
                                 url="https://objects.example.com/planted?one-object=yes",
                                 sha256="c" * 64,
                                 size_bytes=9,
                                 expires_at_epoch=expires_at_epoch,
-                            ),
+                            )
+                            for index in range(ref_count)
                         )
                     ),
                 },
@@ -696,3 +699,447 @@ def test_the_workspace_reaper_still_sweeps_its_own_thread_beside_an_attachment_l
     # The attachment lane is still inside its own, longer window.
     assert attachment_lane.enumerate_expired() == []
     assert all(key in store.objects for key in attachment_set.object_keys)
+
+
+# --- Carry into a text-only follow-up (#4079) -----------------------------------
+
+OTHER_THREAD = "slack:C1:1700000000.000300"
+
+
+class _MintingStore(RetainingObjectStore):
+    """A conforming store whose every presign is distinguishable from the last.
+
+    The base fake signs the same key to the same URL, so "a FRESH capability for
+    the same object" and "the stale capability copied out of the ledger" would be
+    indistinguishable. A per-call counter in the URL tells them apart while every
+    other port behavior stays the shared one.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._mints = 0
+
+    def presign_get(self, key: str, *, expires_seconds: int) -> str:
+        super().presign_get(key, expires_seconds=expires_seconds)
+        self._mints += 1
+        return f"https://objects.example.com/{key}?one-object=yes&mint={self._mints}"
+
+
+def _carry_lane(
+    module: Any,
+    store: RetainingObjectStore,
+    clock: MovableClock,
+    *,
+    payloads: dict[str, list[bytes]] | None = None,
+    **bounds: Any,
+) -> Any:
+    return module.AttachmentCoordinator(
+        files=FakeSlackFiles(
+            payloads or {"F1": [b"csv-bytes"], "F2": [b"deck-bytes"], "F3": [b"other"]}
+        ),
+        objects=store,
+        limits=limits(module, **bounds),
+        clock=clock,
+    )
+
+
+def _store_snapshot(store: RetainingObjectStore) -> tuple[dict[str, bytes], list[str], int]:
+    return dict(store.objects), list(store.deleted), len(store.put_inputs)
+
+
+def _carried_refs(module: Any, env: dict[str, str]) -> tuple[Any, ...]:
+    assert set(env) == {module.ATTACHMENTS_REF_ENV}, env
+    return module.decode_attachment_refs(env[module.ATTACHMENTS_REF_ENV])
+
+
+def test_carry_re_mints_the_retained_set_for_the_same_objects(attachments: Any) -> None:
+    """A follow-up gets the files turn one saw, through NEW capabilities.
+
+    The ledger's own URLs were minted for turn one and lapse after
+    ``reference_ttl_seconds``; replaying them would hand a fresh runner a dead
+    link. What must survive is everything the init container verifies against
+    (name, digest, size, mime) and the object each capability opens.
+    """
+
+    store = _MintingStore()
+    clock = MovableClock()
+    lane = _carry_lane(attachments, store, clock, reference_ttl_seconds=120)
+    prepared = lane.resolve(
+        thread_key=ATTACHMENT_THREAD,
+        agent_id=AGENT_ID,
+        attachments=[Attachment(id="F1", name="report.csv", mime_type="text/csv")],
+    )
+    clock.advance(200)
+    signed_before = len(store.signed)
+
+    env = lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID)
+
+    (carried,) = _carried_refs(attachments, env)
+    (original,) = prepared.refs
+    assert carried.name == original.name == "report.csv"
+    assert carried.sha256 == original.sha256 == hashlib.sha256(b"csv-bytes").hexdigest()
+    assert carried.size_bytes == original.size_bytes == len(b"csv-bytes")
+    assert carried.mime_type == original.mime_type == "text/csv"
+    assert store.signed[signed_before:] == [(prepared.object_keys[0], 120)], (
+        "carry must presign the retained object itself, once, for the reference TTL"
+    )
+    assert carried.url != original.url, "a stale ledger URL was replayed"
+    assert carried.url.startswith(f"https://objects.example.com/{prepared.object_keys[0]}?")
+    assert carried.expires_at_epoch == int(clock.now) + 120
+    assert carried.expires_at_epoch != original.expires_at_epoch
+
+
+def test_carry_keeps_a_multi_file_set_in_wire_order(attachments: Any) -> None:
+    store = _MintingStore()
+    clock = MovableClock()
+    lane = _carry_lane(attachments, store, clock)
+    prepared = lane.resolve(
+        thread_key=ATTACHMENT_THREAD,
+        agent_id=AGENT_ID,
+        attachments=[
+            Attachment(id="F1", name="report.csv", mime_type="text/csv"),
+            Attachment(id="F2", name="deck.pptx"),
+        ],
+    )
+    signed_before = len(store.signed)
+
+    carried = _carried_refs(attachments, lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID))
+
+    assert [ref.name for ref in carried] == ["report.csv", "deck.pptx"]
+    assert [ref.sha256 for ref in carried] == [ref.sha256 for ref in prepared.refs]
+    assert [ref.size_bytes for ref in carried] == [len(b"csv-bytes"), len(b"deck-bytes")]
+    assert [ref.mime_type for ref in carried] == ["text/csv", None]
+    assert [key for key, _ttl in store.signed[signed_before:]] == list(prepared.object_keys)
+    for ref, key in zip(carried, prepared.object_keys, strict=True):
+        assert ref.url.startswith(f"https://objects.example.com/{key}?")
+
+
+def test_carry_is_empty_for_a_thread_with_no_retained_set(attachments: Any) -> None:
+    store = _MintingStore()
+    lane = _carry_lane(attachments, store, MovableClock())
+
+    assert lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID) == {}
+    assert store.signed == []
+    assert store.objects == {}
+
+
+def test_carry_is_empty_once_the_retained_set_has_expired(attachments: Any) -> None:
+    """AC3: retention policy is unchanged, so a lapsed set is simply gone."""
+
+    store = _MintingStore()
+    clock = MovableClock()
+    lane = _carry_lane(attachments, store, clock, retention_ttl_seconds=600)
+    lane.resolve(
+        thread_key=ATTACHMENT_THREAD,
+        agent_id=AGENT_ID,
+        attachments=[Attachment(id="F1", name="report.csv")],
+    )
+    clock.advance(601)
+    signed_before = len(store.signed)
+
+    assert lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID) == {}
+    assert len(store.signed) == signed_before
+
+
+def test_carry_is_empty_when_the_set_expires_inside_the_reference_ttl(
+    attachments: Any,
+) -> None:
+    """A capability must not outlive the bytes it opens.
+
+    With less than one reference TTL of retention left, the reaper may delete the
+    objects before the init container redeems the URL, which would fail the boot
+    instead of merely booting without the files.
+    """
+
+    store = _MintingStore()
+    clock = MovableClock()
+    lane = _carry_lane(
+        attachments, store, clock, reference_ttl_seconds=300, retention_ttl_seconds=600
+    )
+    lane.resolve(
+        thread_key=ATTACHMENT_THREAD,
+        agent_id=AGENT_ID,
+        attachments=[Attachment(id="F1", name="report.csv")],
+    )
+
+    clock.advance(299)
+    assert lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID) != {}, (
+        "301s of retention covers a 300s reference"
+    )
+
+    clock.advance(2)  # 299s of retention left, under the 300s reference TTL.
+    signed_before = len(store.signed)
+    assert lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID) == {}
+    assert len(store.signed) == signed_before
+
+
+def test_carry_takes_the_newest_of_two_sets_for_one_thread(attachments: Any) -> None:
+    """The same set ``current`` names: a later message's files replace the earlier."""
+
+    store = _MintingStore()
+    clock = MovableClock()
+    lane = _carry_lane(attachments, store, clock)
+    lane.resolve(
+        thread_key=ATTACHMENT_THREAD,
+        agent_id=AGENT_ID,
+        attachments=[Attachment(id="F1", name="first.csv")],
+    )
+    clock.advance(10)
+    newer = lane.resolve(
+        thread_key=ATTACHMENT_THREAD,
+        agent_id=AGENT_ID,
+        attachments=[Attachment(id="F2", name="second.pptx")],
+    )
+    signed_before = len(store.signed)
+
+    (carried,) = _carried_refs(attachments, lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID))
+
+    assert carried.name == "second.pptx"
+    assert carried.sha256 == newer.refs[0].sha256
+    assert store.signed[signed_before:] == [(newer.object_keys[0], 300)]
+
+
+def test_carry_never_reaches_another_threads_set(attachments: Any) -> None:
+    """The thread key is the boundary, even when the neighbour's set is newer."""
+
+    store = _MintingStore()
+    clock = MovableClock()
+    lane = _carry_lane(attachments, store, clock)
+    mine = lane.resolve(
+        thread_key=ATTACHMENT_THREAD,
+        agent_id=AGENT_ID,
+        attachments=[Attachment(id="F1", name="mine.csv")],
+    )
+    clock.advance(10)
+    lane.resolve(
+        thread_key=OTHER_THREAD,
+        agent_id=AGENT_ID,
+        attachments=[Attachment(id="F3", name="theirs.csv")],
+    )
+
+    assert lane.carry(WORKSPACE_THREAD, agent_id=AGENT_ID) == {}, (
+        "a thread with no set borrowed a neighbour's"
+    )
+    (carried,) = _carried_refs(attachments, lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID))
+    assert carried.name == "mine.csv"
+    assert carried.sha256 == mine.refs[0].sha256
+
+
+def test_carry_writes_and_deletes_nothing(attachments: Any) -> None:
+    """A read: no new owner record, no extended retention, no object touched.
+
+    Extending retention on every follow-up would be a data-retention decision
+    this change explicitly does not make.
+    """
+
+    store = _MintingStore()
+    clock = MovableClock()
+    lane = _carry_lane(attachments, store, clock)
+    lane.resolve(
+        thread_key=ATTACHMENT_THREAD,
+        agent_id=AGENT_ID,
+        attachments=[Attachment(id="F1", name="report.csv")],
+    )
+    current_before = lane.current(ATTACHMENT_THREAD)
+    before = _store_snapshot(store)
+
+    assert lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID) != {}
+    assert lane.carry(OTHER_THREAD, agent_id=AGENT_ID) == {}
+
+    assert _store_snapshot(store) == before
+    assert lane.current(ATTACHMENT_THREAD) == current_before
+
+
+OTHER_AGENT = "33333333-3333-4333-8333-333333333333"
+
+
+def _thread_owner_key(module: Any, thread_key: str, name: str) -> str:
+    """A key under this thread's own owner prefix, the listing ``carry`` reads."""
+
+    return f"{module.ATTACHMENT_LEDGER_PREFIX}/{_thread_digest(thread_key)}/{name}.json"
+
+
+def test_carry_refuses_a_set_parked_for_another_agent(attachments: Any) -> None:
+    """The thread key has no agent in it, but the bytes do.
+
+    An address rebound to another agent, or another agent's webhook turn
+    replying into the thread, shares the thread key. A cold boot of agent B must
+    not materialize the files agent A was sent: B has none of A's history, and
+    the runner would announce them as just attached.
+    """
+
+    store = _MintingStore()
+    clock = MovableClock()
+    lane = _carry_lane(attachments, store, clock)
+    lane.resolve(
+        thread_key=ATTACHMENT_THREAD,
+        agent_id=OTHER_AGENT,
+        attachments=[Attachment(id="F1", name="theirs.csv")],
+    )
+    signed_before = len(store.signed)
+
+    assert lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID) == {}
+    assert len(store.signed) == signed_before, "a refused set must not be presigned"
+
+    (carried,) = _carried_refs(attachments, lane.carry(ATTACHMENT_THREAD, agent_id=OTHER_AGENT))
+    assert carried.name == "theirs.csv", "the owning agent still gets its own set"
+
+
+def test_carry_refuses_a_set_naming_any_object_outside_the_agent_prefix(
+    attachments: Any,
+) -> None:
+    """EVERY object key must be the agent's, not just the first one."""
+
+    store = _MintingStore()
+    clock = MovableClock()
+    lane = _carry_lane(attachments, store, clock)
+    mine = f"{attachments.ATTACHMENT_OBJECT_PREFIX}/{AGENT_ID}/planted/000.bin"
+    theirs = f"{attachments.ATTACHMENT_OBJECT_PREFIX}/{OTHER_AGENT}/planted/001.bin"
+    store.put_stream(mine, (b"mine",))
+    store.put_stream(theirs, (b"theirs",))
+    _plant_owner(
+        attachments,
+        store,
+        _thread_owner_key(attachments, ATTACHMENT_THREAD, "mixed"),
+        thread_key=ATTACHMENT_THREAD,
+        object_keys=[mine, theirs],
+        expires_at_epoch=int(clock.now) + 3600,
+        ref_count=2,
+    )
+
+    assert lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID) == {}
+    assert store.signed == []
+
+
+def test_carry_skips_an_undecodable_record_beside_a_valid_set(attachments: Any) -> None:
+    """Best effort: one broken record must not suppress the thread's carry forever.
+
+    The reaper still raises on it; a read that only decides whether to hand a
+    follow-up its files skips it and carries the valid set instead.
+    """
+
+    store = _MintingStore()
+    clock = MovableClock()
+    lane = _carry_lane(attachments, store, clock)
+    valid = lane.resolve(
+        thread_key=ATTACHMENT_THREAD,
+        agent_id=AGENT_ID,
+        attachments=[Attachment(id="F1", name="report.csv")],
+    )
+    store.put_stream(_thread_owner_key(attachments, ATTACHMENT_THREAD, "garbage"), (b"{not json",))
+
+    (carried,) = _carried_refs(attachments, lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID))
+
+    assert carried.name == "report.csv"
+    assert carried.sha256 == valid.refs[0].sha256
+
+
+def test_carry_is_empty_when_the_only_record_is_undecodable(attachments: Any) -> None:
+    store = _MintingStore()
+    lane = _carry_lane(attachments, store, MovableClock())
+    store.put_stream(_thread_owner_key(attachments, ATTACHMENT_THREAD, "garbage"), (b"{not json",))
+
+    assert lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID) == {}
+    assert store.signed == []
+
+
+def test_carry_skips_a_record_whose_refs_and_object_keys_disagree(
+    attachments: Any,
+) -> None:
+    """A record naming two objects but one ref cannot be re-minted index by index.
+
+    It is newer than the valid set here, so a carry that merely sorted it out
+    of the way would still pick it; it must be skipped, not raised on.
+    """
+
+    store = _MintingStore()
+    clock = MovableClock()
+    lane = _carry_lane(attachments, store, clock)
+    valid = lane.resolve(
+        thread_key=ATTACHMENT_THREAD,
+        agent_id=AGENT_ID,
+        attachments=[Attachment(id="F1", name="report.csv")],
+    )
+    first = f"{attachments.ATTACHMENT_OBJECT_PREFIX}/{AGENT_ID}/planted/000.bin"
+    second = f"{attachments.ATTACHMENT_OBJECT_PREFIX}/{AGENT_ID}/planted/001.bin"
+    store.put_stream(first, (b"one",))
+    store.put_stream(second, (b"two",))
+    _plant_owner(
+        attachments,
+        store,
+        _thread_owner_key(attachments, ATTACHMENT_THREAD, "mismatched"),
+        thread_key=ATTACHMENT_THREAD,
+        object_keys=[first, second],
+        expires_at_epoch=valid.retention_expires_at_epoch + 600,
+        ref_count=1,
+    )
+
+    (carried,) = _carried_refs(attachments, lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID))
+
+    assert carried.name == "report.csv"
+    assert carried.sha256 == valid.refs[0].sha256
+
+
+def test_carry_is_empty_when_a_retained_object_is_gone(attachments: Any) -> None:
+    """A capability for a deleted object fails the boot, so none is minted.
+
+    A partial discard or a cross-worker race can leave a live record naming an
+    object that no longer exists. Carrying the rest would be a partial set,
+    which reads to an agent exactly like a complete one.
+    """
+
+    store = _MintingStore()
+    clock = MovableClock()
+    lane = _carry_lane(attachments, store, clock)
+    prepared = lane.resolve(
+        thread_key=ATTACHMENT_THREAD,
+        agent_id=AGENT_ID,
+        attachments=[
+            Attachment(id="F1", name="report.csv"),
+            Attachment(id="F2", name="deck.pptx"),
+        ],
+    )
+    store.delete(prepared.object_keys[1])
+    assert prepared.object_keys[1] not in set(
+        store.list_keys(attachments.ATTACHMENT_OBJECT_PREFIX)
+    ), "the fixture's listing must reflect the delete"
+    signed_before = len(store.signed)
+
+    assert lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID) == {}
+    assert len(store.signed) == signed_before
+
+
+def test_carry_does_not_wait_on_the_coordinators_lock(attachments: Any) -> None:
+    """Carry is a read on every text-only turn; it must not queue behind a reap.
+
+    The reap tick holds ``_lock`` across full-ledger scans and object deletes. A
+    carry that took the same lock would park every text-only turn, and a
+    default-executor thread per turn, behind it.
+    """
+
+    store = _MintingStore()
+    lane = _carry_lane(attachments, store, MovableClock())
+    lane.resolve(
+        thread_key=ATTACHMENT_THREAD,
+        agent_id=AGENT_ID,
+        attachments=[Attachment(id="F1", name="report.csv")],
+    )
+    result: dict[str, Any] = {}
+
+    def _carry() -> None:
+        result["env"] = lane.carry(ATTACHMENT_THREAD, agent_id=AGENT_ID)
+
+    assert lane._lock.acquire(timeout=1.0)  # noqa: SLF001
+    worker = threading.Thread(target=_carry, name="carry-under-held-lock", daemon=True)
+    try:
+        worker.start()
+        worker.join(timeout=2.0)
+        finished = not worker.is_alive()
+    finally:
+        lane._lock.release()  # noqa: SLF001
+        worker.join(timeout=5.0)
+
+    assert finished, "carry blocked on the coordinator lock another thread held"
+    assert "env" in result, "carry raised in its thread instead of returning the set"
+    (carried,) = _carried_refs(attachments, result["env"])
+    assert carried.name == "report.csv"

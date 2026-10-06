@@ -315,6 +315,6 @@ fn down_sweep_selector_is_scoped_by_release_and_namespace() {
     let sweep = cmds[1].display();
     assert_eq!(
         sweep,
-        "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found"
+        "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found --timeout=300s"
     );
 }

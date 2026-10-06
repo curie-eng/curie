@@ -59,8 +59,8 @@ own ``expires_at`` is still in the future. Removal follows
 their own expiry with no live transcript), the agent FK cascade, and the
 ADR-0168 pre-identity copy-forward and deletion.
 
-The migration is revision ``0082`` on ``next``'s head ``0081`` (``main``'s
-newest is ``0080``; no branch holds an ``0082``).
+The next-only migration is revision ``0086`` after action executions at ``0085``,
+following the immutable published stable chain through ``0081``.
 
 Real router, real Postgres. Nothing mocked.
 """
@@ -121,8 +121,8 @@ MAIL_ENDPOINT = "http://curie-mail-adapter:8080/"
 MAIL_OLD_KEY = scoped_conversation_id("email", MAIL_ADDRESS, "thread/9")
 MAIL_NEW_KEY = scoped_conversation_id("email", MAIL_ADDRESS, "thread/9", identity=MAIL_ADAPTER)
 
-REVISION = "0082"
-BELOW = "0081"
+REVISION = "0086"
+BELOW = "0085"
 
 _FAR_FUTURE = 4102444800  # 2100-01-01
 

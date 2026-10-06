@@ -1,7 +1,7 @@
 """@spec DEPLOY-NOTICE-RELEASE-1: opt-in notices and durable outbox
 
-Revision ID: 0077
-Revises: 0076
+Revision ID: 0082
+Revises: 0081
 Create Date: 2026-09-29
 """
 
@@ -10,8 +10,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0077"
-down_revision: str | None = "0076"
+revision: str = "0082"
+down_revision: str | None = "0081"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

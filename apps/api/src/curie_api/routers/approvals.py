@@ -573,7 +573,8 @@ async def resolve_approval(
                 )
                 # Enqueue-first-then-mark (#418): only a wake that reached the
                 # stream is written off, so a failure below leaves resumed_at
-                # NULL and the reconciler re-enqueues it past its grace horizon.
+                # NULL for the reconciler: a failed enqueue on its next pass
+                # (#4016), a failed mark past its grace horizon.
                 # This is the sole recovery path for an expiry wake -- a flipped
                 # record is no longer pending, so no later sweep re-selects it.
                 await crud_approvals.mark_approval_resumed(session, approval_id)

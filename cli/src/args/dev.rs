@@ -4,6 +4,24 @@ use super::*;
 
 #[derive(Subcommand)]
 pub(crate) enum DevAction {
+    /// Check the committed change before opening or updating a pull request.
+    Preflight {
+        /// Run only the fast tier; the full tier is the default.
+        #[arg(long)]
+        fast: bool,
+        /// Origin branch to compare against (for example, main or next).
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Print the selected checks without running them.
+        #[arg(long)]
+        dry_run: bool,
+        /// File containing the proposed pull request body.
+        #[arg(long, conflicts_with = "fast")]
+        pr_body: Option<PathBuf>,
+        /// Proposed pull request title used by the body guard.
+        #[arg(long, requires = "pr_body")]
+        title: Option<String>,
+    },
     /// Manage hooks for this source checkout.
     Hooks {
         #[command(subcommand)]
@@ -44,6 +62,16 @@ pub(crate) enum DevAction {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Serve or record a scripted Anthropic Messages endpoint (#3814).
+    /// `serve` replays a transcript and fails on an unexpected request.
+    /// `record` proxies to a provider and writes the transcript.
+    ModelScript {
+        /// `serve` or `record`, followed by endpoint flags.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Check the OpenRouter credit on CURIE_CREDENTIALS before a graded ladder spends a build.
+    ModelCredit,
     /// Serve a TLS GitHub fixture or capture public check lifecycle recordings.
     GithubStub {
         /// `serve` or `capture`, followed by fixture flags.

@@ -78,6 +78,51 @@ REDACTED_DISCORD_HEADERS = "{'Authorization': 'Bot [REDACTED:discord_bot_token]'
 TWO_SEGMENTS = "FAKEFAKEFAKEFAKEFAKE0000." + "FAKE00"
 FOUR_SEGMENTS = FAKE_DISCORD_BOT_TOKEN + "." + "FAKE_EXTRA-0000"
 _FIRST, _MIDDLE, _LAST = FAKE_SHAPED_DISCORD_BOT_TOKEN.split(".")
+# Presigned object URLs carry their credential in prefixed query parameters:
+# AWS SigV4 (``X-Amz-Credential``, ``X-Amz-Security-Token``, ``X-Amz-Signature``,
+# https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html)
+# and GCS V4 (``X-Goog-Credential``, ``X-Goog-Signature``,
+# https://cloud.google.com/storage/docs/access-control/signed-urls). The
+# algorithm, date, expiry and signed-header parameters are not secret and stay
+# visible for diagnosis.
+FAKE_AMZ_CREDENTIAL = "ASIA" + "FAKEFAKEFAKE0000%2F20261005%2Fus-east-1%2Fs3%2Faws4_request"
+FAKE_AMZ_SECURITY_TOKEN = "FAKE" + "SESSIONTOKEN0000%2B%2Ffake%3D%3D"
+FAKE_PRESIGN_SIGNATURE = "fake" + "0000000000000000000000000000000000000000000000000000000000"
+_AMZ_PUBLIC_PARAMS = (
+    "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20261005T000000Z"
+    "&X-Amz-Expires=300&X-Amz-SignedHeaders=host"
+)
+_GOOG_PUBLIC_PARAMS = (
+    "X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Date=20261005T000000Z"
+    "&X-Goog-Expires=300&X-Goog-SignedHeaders=host"
+)
+FAKE_S3_PRESIGNED_URL = (
+    "https://bucket.example.com/attachments/report.pdf?"
+    + _AMZ_PUBLIC_PARAMS
+    + "&X-Amz-Credential="
+    + FAKE_AMZ_CREDENTIAL
+    + "&X-Amz-Security-Token="
+    + FAKE_AMZ_SECURITY_TOKEN
+    + "&X-Amz-Signature="
+    + FAKE_PRESIGN_SIGNATURE
+)
+REDACTED_S3_PRESIGNED_URL = (
+    "https://bucket.example.com/attachments/report.pdf?"
+    + _AMZ_PUBLIC_PARAMS
+    + "[REDACTED:url_secret_param]" * 3
+)
+FAKE_GCS_PRESIGNED_URL = (
+    "https://storage.example.com/bucket/report.pdf?"
+    + _GOOG_PUBLIC_PARAMS
+    + "&X-Goog-Credential=signer%40example.com%2F20261005%2Fauto%2Fstorage%2Fgoog4_request"
+    + "&X-Goog-Signature="
+    + FAKE_PRESIGN_SIGNATURE
+)
+REDACTED_GCS_PRESIGNED_URL = (
+    "https://storage.example.com/bucket/report.pdf?"
+    + _GOOG_PUBLIC_PARAMS
+    + "[REDACTED:url_secret_param]" * 2
+)
 
 
 def _bot_token(first_len: int = 24, middle_len: int = 6, last_len: int = 27) -> str:
@@ -95,6 +140,30 @@ def _bot_token(first_len: int = 24, middle_len: int = 6, last_len: int = 27) -> 
 # Each case: input text, exact redacted output. Every output must also be a
 # fixed point of redaction (idempotence).
 REDACTED_CASES = [
+    pytest.param(
+        f"attachment fetch failed for {FAKE_S3_PRESIGNED_URL} (403 Forbidden)",
+        f"attachment fetch failed for {REDACTED_S3_PRESIGNED_URL} (403 Forbidden)",
+        id="s3_presigned_url_signature_credential_and_session_token_are_redacted",
+    ),
+    pytest.param(
+        FAKE_GCS_PRESIGNED_URL,
+        REDACTED_GCS_PRESIGNED_URL,
+        id="gcs_presigned_url_signature_and_credential_are_redacted",
+    ),
+    *(
+        pytest.param(
+            f"https://bucket.example.com/key?{name}={value}",
+            "https://bucket.example.com/key[REDACTED:url_secret_param]",
+            id=f"presigned_param_is_redacted_in_any_case-{name}",
+        )
+        for name, value in (
+            ("X-Amz-Signature", FAKE_PRESIGN_SIGNATURE),
+            ("x-amz-credential", FAKE_AMZ_CREDENTIAL),
+            ("X-AMZ-SECURITY-TOKEN", FAKE_AMZ_SECURITY_TOKEN),
+            ("x-goog-signature", FAKE_PRESIGN_SIGNATURE),
+            ("X-Goog-Credential", "signer%40example.com%2F20261005"),
+        )
+    ),
     *(
         pytest.param(
             f"before ({token}) after",
@@ -403,6 +472,14 @@ def test_redaction(text: str, expected: str) -> None:
 
 # Each case: text that carries no credential and must pass through unchanged.
 PRESERVED_CASES = [
+    pytest.param(
+        "https://bucket.example.com/attachments/report.pdf?" + _AMZ_PUBLIC_PARAMS,
+        id="presigned_url_public_amz_params_are_preserved",
+    ),
+    pytest.param(
+        "https://storage.example.com/bucket/report.pdf?" + _GOOG_PUBLIC_PARAMS,
+        id="presigned_url_public_goog_params_are_preserved",
+    ),
     *(
         pytest.param(text, id=f"curie_token_near_match_is_preserved_{index}")
         for index, text in enumerate(
@@ -548,6 +625,18 @@ def test_redaction_is_idempotent(secret: str) -> None:
 # RedactingLogFilter lets through. The argument is interpolated only at format
 # time, so this proves the filter redacts formatted args, not just msg.
 FILTER_CASES = [
+    pytest.param(
+        "discarding prepared attachment: %s",
+        f"GET {FAKE_S3_PRESIGNED_URL} returned 403",
+        f"discarding prepared attachment: GET {REDACTED_S3_PRESIGNED_URL} returned 403",
+        id="s3_presigned_url_in_exception_text_is_redacted_through_filter",
+    ),
+    pytest.param(
+        "discarding prepared attachment: %s",
+        f"GET {FAKE_GCS_PRESIGNED_URL} returned 403",
+        f"discarding prepared attachment: GET {REDACTED_GCS_PRESIGNED_URL} returned 403",
+        id="gcs_presigned_url_in_exception_text_is_redacted_through_filter",
+    ),
     pytest.param(
         "ingress X-API-Key: %s",
         FAKE_CHANNEL_TOKEN,

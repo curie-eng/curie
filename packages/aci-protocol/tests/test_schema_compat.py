@@ -1,8 +1,8 @@
-"""The artifact-sync gate: committed schema and generated Rust match the models.
+"""The artifact-sync gate: committed schema, Rust and .env.example match the models.
 
 These tests check *artifact sync* only: if a model changes without regenerating
-the committed schema or Rust, they fail. Regenerate with
-``scripts/check-contracts.sh`` (or the two module entry points) and commit the
+the committed schema, Rust or .env.example block, they fail. Regenerate with
+``scripts/check-contracts.sh`` (or the three module entry points) and commit the
 result. They do not, and cannot, judge backward compatibility -- a model change
 regenerates both sides and stays green. Compatibility is a policy defined by the
 semver change-class table (packages/CLAUDE.md); an *unbumped* wire change is
@@ -13,6 +13,7 @@ it is not regenerated here); its input is the same committed schema this gate
 pins, so a drifted schema is caught here before TypeScript can diverge.
 """
 
+from aci_protocol.env_example_export import env_example_path, render_env_example
 from aci_protocol.rust_export import crate_dir, render_rust
 from aci_protocol.schema_export import build_schema, render_schema, schema_path
 
@@ -28,6 +29,13 @@ def test_committed_rust_is_current() -> None:
     committed = (crate_dir() / "src" / "lib.rs").read_text(encoding="utf-8")
     assert render_rust() == committed, (
         "generated Rust is stale; run scripts/check-contracts.sh and commit"
+    )
+
+
+def test_committed_env_example_is_current() -> None:
+    committed = env_example_path().read_text(encoding="utf-8")
+    assert render_env_example(committed) == committed, (
+        ".env.example boot env block is stale; run scripts/check-contracts.sh and commit"
     )
 
 
@@ -59,7 +67,7 @@ def test_reply_placeholders_are_required_nullable_strings() -> None:
 
 def test_publication_context_is_an_optional_event_field_with_required_contents() -> None:
     schema = build_schema()
-    assert schema["protocolVersion"] == "0.5.17"
+    assert schema["protocolVersion"] == "0.5.18"
 
     definitions = schema["$defs"]
     event = definitions["Event"]

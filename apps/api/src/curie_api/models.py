@@ -170,6 +170,9 @@ class Agent(Base):
     # the platform/worker default model applies. The value is passed straight
     # through to the runner, which resolves it against its configured provider.
     model: Mapped[str | None] = mapped_column(default=None)
+    # Per-agent reviewer model (#4120). NULL lets the runner choose the
+    # credential's default; a value becomes the SDK's Opus alias target.
+    reviewer_model: Mapped[str | None] = mapped_column(default=None)
     # Per-agent thinking depth (#1182, ADR-0098). Forwarded as CURIE_THINKING at
     # sandbox boot; NULL means the worker's CURIE_THINKING default applies, and
     # unset at both layers means the runner sends no thinking configuration and
@@ -2235,6 +2238,10 @@ class HookRun(Base):
             "('ran', 'deferred', 'skipped', 'blocked', 'reclaimed', 'failed')",
             name="hook_runs_outcome_ck",
         ),
+        CheckConstraint(
+            "source IN ('schedule', 'manual')",
+            name="hook_runs_source_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -2248,7 +2255,11 @@ class HookRun(Base):
     version_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agent_versions.id", ondelete="CASCADE")
     )
+    source: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'schedule'")
+    )
     outcome: Mapped[str | None] = mapped_column(String, default=None)
+    reason: Mapped[str | None] = mapped_column(Text, default=None)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
