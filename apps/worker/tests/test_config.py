@@ -370,6 +370,40 @@ _ENV_TABLE: list[_Row] = [
         bare="ATTACHMENT_RETENTION_TTL_SECONDS",
         bare_raw="999999",
     ),
+    # --- the per-thread attachment budget (ADR 0205 decision 7, #4079) ---
+    # Every boot rebuilds the thread's files, so one boot's work is bounded per
+    # thread, separately from the per-message ``max_files``. The defaults are
+    # literals here on purpose: the ADR names them, and ``AttachmentLimits``
+    # carries the same two counts (pinned in test_attachment_thread_set.py).
+    # The prepare timeout bounds the worker's own rebuild (ledger read, cache
+    # re-mint, channel re-fetch) inside the turn's remaining budget.
+    _Row(
+        "attachment_thread_max_files",
+        "CURIE_ATTACHMENT_THREAD_MAX_FILES",
+        "15",
+        15,
+        20,
+        bare="ATTACHMENT_THREAD_MAX_FILES",
+        bare_raw="999",
+    ),
+    _Row(
+        "attachment_thread_max_bytes",
+        "CURIE_ATTACHMENT_THREAD_MAX_BYTES",
+        "134217728",
+        134217728,
+        256 * 1024 * 1024,
+        bare="ATTACHMENT_THREAD_MAX_BYTES",
+        bare_raw="999",
+    ),
+    _Row(
+        "attachment_thread_prepare_timeout_seconds",
+        "CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS",
+        "12.5",
+        12.5,
+        30.0,
+        bare="ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS",
+        bare_raw="999",
+    ),
 ]
 
 
@@ -1458,6 +1492,45 @@ def test_a_non_positive_attachment_bound_is_refused_not_read_as_unlimited(
     # bounded, and a zero TTL mints a capability that is already expired.
     with pytest.raises(ValidationError):
         WorkerConfig.model_validate(overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"attachment_thread_max_files": 0},
+        {"attachment_thread_max_bytes": 0},
+        {"attachment_thread_max_bytes": -1},
+        {"attachment_thread_prepare_timeout_seconds": 0},
+        {"attachment_thread_prepare_timeout_seconds": -1.0},
+    ],
+)
+def test_a_non_positive_thread_attachment_bound_is_refused(
+    overrides: dict[str, object],
+) -> None:
+    """ADR 0205 decision 7: the per-thread budget bounds every boot's rebuild."""
+
+    with pytest.raises(ValidationError):
+        WorkerConfig.model_validate(overrides)
+
+
+def test_the_thread_file_budget_cannot_be_smaller_than_one_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thread budget below the per-message cap would omit files the message
+    that carried them is entitled to keep (the current files are always kept),
+    so the worker refuses it at startup rather than at the first boot."""
+
+    _clear_all_config_env(monkeypatch)
+    per_message = AttachmentLimits().max_files
+
+    with pytest.raises(ValidationError):
+        WorkerConfig.model_validate({"attachment_thread_max_files": per_message - 1})
+    assert (
+        WorkerConfig.model_validate(
+            {"attachment_thread_max_files": per_message}
+        ).attachment_thread_max_files
+        == per_message
+    )
 
 
 @pytest.mark.parametrize("mode", ["all", "failures", "off"])
