@@ -106,7 +106,7 @@ def test_build_options_only_enables_sdk_title_with_configured_model(
     [
         ("sk-ant-api03-PLACEHOLDER", None, "claude-opus-5-5"),
         ("sk-ant-oat01-PLACEHOLDER", None, "claude-opus-5-5"),
-        ("sk-or-PLACEHOLDER", None, "anthropic/claude-opus-5.5"),
+        ("sk-or-PLACEHOLDER", None, "openai/gpt-6.1-sol"),
         ("sk-ant-api03-PLACEHOLDER", "acme-reviewer-model", "acme-reviewer-model"),
         ("sk-or-PLACEHOLDER", "acme-reviewer-model", "acme-reviewer-model"),
     ],

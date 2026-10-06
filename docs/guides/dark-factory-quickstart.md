@@ -28,7 +28,7 @@ token. The platform reads the issue for the sandbox.
 | [`kubectl`](https://kubernetes.io/docs/tasks/tools/) | Kubernetes operations, required for every context |
 | [`helm`](https://helm.sh/docs/intro/install/) | Curie installation, required for every context |
 | `curie` v0.12.1 or later | install it with the command below |
-| An [Anthropic](https://console.anthropic.com/) API key (`sk-ant-`) or an [OpenRouter](https://openrouter.ai/) API key (`sk-or-`) | Anthropic defaults to `claude-sonnet-5-5` for implementation and `claude-opus-5-5` for review. OpenRouter defaults to `z-ai/glm-5.3-flash` for implementation and `anthropic/claude-opus-5.5` for review. Plan on about 5 USD of available OpenRouter credit per run; actual spend varies. The command asks once, or reads `CURIE_CREDENTIALS`. |
+| An [Anthropic](https://console.anthropic.com/) API key (`sk-ant-`) or an [OpenRouter](https://openrouter.ai/) API key (`sk-or-`) | Anthropic defaults to `claude-sonnet-5-5` for implementation and `claude-opus-5-5` for review. OpenRouter defaults to `z-ai/glm-5.3-flash` for implementation and `openai/gpt-6.1-sol` for review. Plan on about 5 USD of available OpenRouter credit per run; actual spend varies. The command asks once, or reads `CURIE_CREDENTIALS`. |
 | A GitHub account | your own GitHub App and the trial repository |
 
 The command checks all required tools on `PATH` before running any command or
@@ -220,8 +220,8 @@ Dry-run describes the inference without reading GitHub.
 
 An explicit `--model <id>` selects the implementer model instead of the
 credential's default, even when it matches the OpenRouter default. Both
-reviewers use the `opus` alias; the runner resolves it to the provider's Opus
-model. To pin another reviewer model for this agent, use the same context,
+reviewers use the `opus` alias; the runner resolves it to the credential's
+default reviewer model. To pin another reviewer model for this agent, use the same context,
 namespace and release as the quickstart:
 
 ```bash
@@ -248,7 +248,7 @@ label to try again. Credit exhaustion continues to use the add-credit remedy.
 
 The recommended 5 USD of available provider credit is a planning allowance,
 not a guaranteed minimum charge per run. Actual spend depends on the task,
-including the Opus reviewers. Separately, quickstart configures the agent's
+including the reviewers. Separately, quickstart configures the agent's
 budget to 5 USD per day; several inexpensive runs can fit within that daily
 budget. Having provider credit does not raise the configured daily budget.
 
