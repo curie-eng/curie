@@ -713,7 +713,7 @@ one stage; only ruling and pre-dispatch codes are provable non-writes.
 
 | Stage | Codes |
 | --- | --- |
-| Ruling (HTTP 409, 412 or 503; audit row, no execution) | `executor_disabled`, `refused_restore_in_flight`, `refused_no_agent`, `refused_unsealed`, `refused_unversioned`, `refused_no_digest`, `refused_not_restore_capable`, `refused_key_custody`, `refused_authority_unresolved`, plus the existing ruling refusals |
+| Ruling (HTTP 409, 412 or 503; audit row, no execution) | `executor_disabled`, `refused_restore_in_flight`, `refused_no_agent`, `refused_unsealed`, `refused_unversioned`, `refused_no_digest`, `refused_not_restore_capable`, `refused_key_custody`, `refused_authority_unresolved`, `refused_actor_mismatch` (HTTP 403), `refused_duplicate_ruling` (HTTP 409), plus the existing ruling refusals |
 | Pre-dispatch (`refused`) | `agent_stopped`, `authority_unavailable`, `reserved_verb_via_forward`, `arguments_mismatch`, `tool_not_grant_bound`, `connector_not_hosted`, `connector_digest_unavailable`, `restore_not_advertised`, `restore_schema_mismatch`, `tool_not_advertised`, `version_conflict`, `sandbox_unavailable`, `runner_unavailable`, `connector_unreachable` |
 | Connector refusal during `call` (`failed`) | `version_conflict_at_write`, `sealing_key_unavailable`, `snapshot_unopenable` |
 | Post-dispatch (`failed` or `indeterminate`) | `connector_error`, `unstructured_reply`, `response_lost`, `deadline_exceeded` |
@@ -736,6 +736,10 @@ with `restore_capable` true only when the probe observed both `restore` and
 
 Review decisions for the routes, which the worker and later tasks rely on:
 
+* A chat principal may undo only an action whose gating approval its token
+  names, an adapter principal only an action whose gating approval it serves
+  (anything else reads as not found), and an ungated action accepts no chat
+  credential.
 * The undo ruling derives its actor and channel evidence from an authenticated
   chat, console, operator or adapter principal, exactly as the approval resolver
   does under ADR 0106; a self-asserted `actor` in the request body is not
