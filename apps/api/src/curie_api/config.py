@@ -589,6 +589,11 @@ class Settings(BaseSettings):
     # thread is deleted at its terminal.
     transcript_max_thread_bytes: int = 16 * 1024 * 1024  # 16 MiB per thread
     transcript_idle_ttl_seconds: int = 30 * 24 * 3600  # 30 days
+    # The thread attachment ledger (ADR 0205, #4079) lives as long as the
+    # transcript. This caps how many file references one thread may record;
+    # an append that would pass it is refused whole (413). The worker's own
+    # per-boot budget is separate and smaller.
+    thread_attachment_max_refs: int = 200
     # Cap on behavior-packs content per agent (#936, introduced by #883). Packs
     # are stored on the agent row and injected verbatim into the runner context
     # at each bind, so an uncapped pack bloats both the row and the prompt. Size

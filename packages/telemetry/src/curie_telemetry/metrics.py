@@ -395,6 +395,9 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/termination",
     "/v1/internal/work-items/issue-read/context",
     "/v1/internal/channel-read/context",
+    # The thread attachment ledger (ADR 0205).
+    "/v1/internal/thread-attachments/query",
+    "/v1/internal/thread-attachments/append",
     "/v1/work-item-progress/{request_id}",
     "/v1/work-item-progress/{request_id}/usage",
     "/v1/work-item-progress/{request_id}/verification",

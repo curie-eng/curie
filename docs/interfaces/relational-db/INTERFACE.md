@@ -45,12 +45,13 @@ PostgreSQL 16:
 - **Migrations**: the target DB must apply the **whole Alembic chain in `apps/api/alembic/versions/`**, in revision order, ending at `alembic heads`. The chain grows with the product, so it is deliberately not enumerated here: `ls apps/api/alembic/versions/` is the list, and `alembic heads` is the tip a conforming DB must reach. A single head is the invariant — a fork means two branches each added a migration (rebase and merge the heads before swapping anything). Two recent expand revisions make authenticated review feedback part of this schema contract: `0042_review_lineage_authority.py` adds immutable App-observed authority to publication lineages and the `publication_review_reservations` concurrency table; `0043_github_review_feedback.py` adds the `github_review_deliveries` audit table and the `github_review_feedback` durable feedback/outbox table. The latter stores normalized feedback and a credential-free queued turn, never a raw webhook body or GitHub credential.
 
 The application schema window keeps minimum `0077` and advances its head to
-`0081`, as recorded in `apps/api/src/curie_api/schema_compat.json`. The
+`0082`, as recorded in `apps/api/src/curie_api/schema_compat.json`. The
 v0.12.1 release raised the minimum to `0077` (`0077_agent_deploy_notifications.py`,
 following hook source policy/operation expansions `0075`/`0076`, which in turn
 follow polling cursor migration `0073`). Provider installations and channel
 identities migration `0078` follows it, channel canvas edits migration
-`0079` follows that, and action executions migration `0081` follows `0079`.
+`0079` follows that, action executions migration `0081` follows `0079`, and
+thread attachment ledger migration `0082` follows `0081`.
 
 The `channel_canvas_edits` table (`apps/api/src/curie_api/models.py::ChannelCanvasEdit`,
 migration `0079_channel_canvas_edits.py`, ADR 0200) holds one audit row per canvas cell
@@ -68,6 +69,17 @@ a unique `idempotency_key`, and a partial unique index allowing one restore that
 is not `refused` per recorded action. The `connector_capabilities` table
 (`apps/api/src/curie_api/models.py::ConnectorCapability`) records whether a
 connector image can restore, keyed on the agent, connector and digest.
+
+Migration `0082_thread_attachment_refs.py` (#4079) is additive. The
+`thread_attachment_refs` table (`apps/api/src/curie_api/models.py::ThreadAttachmentRef`)
+holds one row per file a thread's agent was given, keyed like `thread_transcripts`
+(agent, binding scope, thread key) and removed with the transcript. Each row
+records the turn's event id, the channel's file id, the name, the on-disk name,
+the best-effort mime type and size, the sha256, the arrival order (`seq`, an
+identity column) and the route kind, adapter and identity; never an endpoint,
+a URL or bytes. (agent, scope, thread, event, file) and (agent, scope, thread,
+disk name) are each unique with a NULL scope equal, and the agent foreign key
+cascades.
 
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
