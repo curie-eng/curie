@@ -213,6 +213,17 @@
       "refusal": "phase_out_of_order"
     },
     {
+      "name": "forward_tool_after_restore",
+      "phases": [
+        "list",
+        "observe",
+        "call",
+        "call"
+      ],
+      "tool": "scale",
+      "refusal": "phase_out_of_order"
+    },
+    {
       "name": "restore_without_observe",
       "phases": [
         "list",

@@ -391,8 +391,17 @@ def test_observe_returns_the_frozen_version(tmp_path: Path, reply: dict[str, Any
     _drive({_CONNECTOR: _connector(tmp_path, **env)}, drive)
 
 
-def _step(phase: str) -> dict[str, Any]:
-    return _forward_call() if phase == "call" else _request(phase)
+def _step(phase: str, before: list[str]) -> dict[str, Any]:
+    """The request for ``phase`` after ``before``: a ``call`` after ``observe`` is a restore.
+
+    @spec ACTION-EXECUTOR-6 (amended): ``observe`` is accepted only before a
+    restore, so a sequence's ``call`` takes the restore request once ``observe``
+    has run and the forward request otherwise.
+    """
+
+    if phase != "call":
+        return _request(phase)
+    return _request("call") if "observe" in before else _forward_call()
 
 
 @pytest.mark.parametrize(
@@ -407,11 +416,11 @@ def test_an_out_of_order_phase_is_refused_without_dialing(
     observe_reply = json.dumps({"version": "rv-1041"})
 
     async def drive(client: TestClient) -> None:
-        for phase in prefix:
-            status, body = await _post(client, _step(phase))
+        for index, phase in enumerate(prefix):
+            status, body = await _post(client, _step(phase, prefix[:index]))
             assert status == 200, (phase, body)
         before = len(_calls(tmp_path))
-        status, body = await _post(client, _step(last))
+        status, body = await _post(client, _step(last, prefix))
         _assert_refused(status, body, "phase_out_of_order")
         assert len(_calls(tmp_path)) == before
 
