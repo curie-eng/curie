@@ -131,7 +131,7 @@ connection, counted from the broker's client sessions; protected rows report
 `publication_deferred`; secret is 409 for absent, history only and tombstone
 and 503 `source_publication_deferred` for protected, with `no-store` on every
 handler response and no source key in any response, error or captured log.
-Update `apps/api/tests/test_hook_source_admin.py::test_get_reports_locked_sql_state_without_activation`
+Update `apps/api/tests/test_hook_source_admin.py::test_read_reports_the_route_dto_with_locked_counter`
 for the new protected reason; keep its unprovisioned cases.
 
 **Task 5.** Serve the routes in a new router module under the `/agents`
