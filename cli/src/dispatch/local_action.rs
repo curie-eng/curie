@@ -428,6 +428,21 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             )
             .await?,
         ),
+        // @spec ACTION-EXECUTOR-23
+        LocalAction::Actions { verb } => {
+            let (verb, conn) = verb.into_parts();
+            emit(
+                commands::actions(
+                    commands::ActionsOpts {
+                        api_url: conn.api_url,
+                        api_key: conn.api_key,
+                        tier: "local",
+                    },
+                    verb,
+                )
+                .await?,
+            )
+        }
         LocalAction::Observability { query, open } => match query {
             None => emit(commands::observability(open).await?),
             Some(_) if open => Err(curie::exit::usage(

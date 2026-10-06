@@ -1119,6 +1119,12 @@ pub(crate) enum ClusterAction {
         #[command(flatten)]
         guidance: MemoryGuidanceArgs,
     },
+    /// The action ledger and its undo: list and read an agent's recorded
+    /// actions, ask for an undo, and read an execution's receipt.
+    Actions {
+        #[command(subcommand)]
+        verb: ActionsCommand<ClusterConn>,
+    },
     /// The human-in-the-loop plane: list and resolve pending approval records,
     /// and view or set the tools whose calls require approval. Which channel an
     /// approval posts to, and who may resolve it, come from the agent's approval

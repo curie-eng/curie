@@ -2093,6 +2093,166 @@
           "name": "memory"
         },
         {
+          "about": "The action ledger and its undo: list and read an agent's recorded actions, ask for an undo, and read an execution's receipt",
+          "hidden": false,
+          "name": "actions",
+          "subcommands": [
+            {
+              "about": "List recorded actions (`GET /actions`), each with whether it can be undone",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Scope to one agent (name or id)",
+                  "id": "agent",
+                  "long": "agent",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "list"
+            },
+            {
+              "about": "Read one recorded action (`GET /actions/{id}`). Snapshot material is never shown",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Action id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "show"
+            },
+            {
+              "about": "Ask for an undo of one action (`POST /actions/{id}/undo`) and print the execution it created. Authentication comes from CURIE_APPROVAL_PRINCIPAL_TOKEN",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Action id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "undo"
+            },
+            {
+              "about": "Read an execution's receipt (`GET /action-executions/{id}`): its state and its refusal or failure code",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Execution id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "execution"
+            }
+          ]
+        },
+        {
           "about": "The human-in-the-loop plane: list and resolve pending approval records, and view or set the tools whose calls require approval. Which channel an approval posts to, and who may resolve it, come from the agent's approval route bindings; `curie guide` explains the whole plane",
           "args": [
             {
@@ -6875,6 +7035,234 @@
           ],
           "hidden": false,
           "name": "memory"
+        },
+        {
+          "about": "The action ledger and its undo: list and read an agent's recorded actions, ask for an undo, and read an execution's receipt",
+          "hidden": false,
+          "name": "actions",
+          "subcommands": [
+            {
+              "about": "List recorded actions (`GET /actions`), each with whether it can be undone",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Scope to one agent (name or id)",
+                  "id": "agent",
+                  "long": "agent",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "list"
+            },
+            {
+              "about": "Read one recorded action (`GET /actions/{id}`). Snapshot material is never shown",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Action id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "show"
+            },
+            {
+              "about": "Ask for an undo of one action (`POST /actions/{id}/undo`) and print the execution it created. Authentication comes from CURIE_APPROVAL_PRINCIPAL_TOKEN",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Action id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "undo"
+            },
+            {
+              "about": "Read an execution's receipt (`GET /action-executions/{id}`): its state and its refusal or failure code",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Execution id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "execution"
+            }
+          ]
         },
         {
           "about": "The human-in-the-loop plane: list and resolve pending approval records, and view or set the tools whose calls require approval. Which channel an approval posts to, and who may resolve it, come from the agent's approval route bindings; `curie guide` explains the whole plane",

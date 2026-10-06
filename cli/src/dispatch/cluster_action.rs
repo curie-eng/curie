@@ -1449,6 +1449,24 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 }
             }
         }
+        // @spec ACTION-EXECUTOR-23
+        ClusterAction::Actions { verb } => {
+            let (verb, conn) = verb.into_parts();
+            // `_cluster_api_pf` is the port-forward guard; it must live for
+            // the whole call.
+            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, false).await?;
+            emit(
+                commands::actions(
+                    commands::ActionsOpts {
+                        api_url,
+                        api_key,
+                        tier: "cluster",
+                    },
+                    verb,
+                )
+                .await?,
+            )
+        }
         ClusterAction::Approvals {
             target,
             gate,

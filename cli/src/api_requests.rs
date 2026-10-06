@@ -195,3 +195,11 @@ pub struct EvalTriggerRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suite: Option<String>,
 }
+
+// @spec ACTION-EXECUTOR-23 @spec ACTION-EXECUTOR-3
+/// `POST /actions/{action_id}/undo` (`ActionUndo`). Always sent empty: the
+/// actor is the authenticated principal, never a claim in the body, and the
+/// platform observes the live state itself. Braced, not a unit struct, so it
+/// serializes as `{}` rather than `null`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ActionUndo {}
