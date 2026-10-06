@@ -1214,6 +1214,10 @@ const ADOPTED_CONTENTS_ANNOTATION: &str = "curietech.ai/adopted-contents";
 const ADOPTION_RECORD_LIMIT: usize = 4096;
 const ADOPT_HINT: &str =
     "; pass --adopt to adopt it anyway, recording what was adopted on the namespace";
+/// Set only on the `cluster up` child that `factory quickstart` spawns.
+/// Quickstart has no `--adopt`, so that child names a working remedy instead.
+pub(crate) const QUICKSTART_NAMESPACE_HINT_ENV: &str = "CURIE_QUICKSTART_NAMESPACE_HINT";
+const METADATA_NAME_LABEL: &str = "kubernetes.io/metadata.name";
 
 /// Emitted alongside [`MODEL_CREDENTIAL_KEY`], and only when a credential is
 /// present -- see `up_commands`, which pushes both inside one `if let`.
@@ -9138,6 +9142,88 @@ mod tests {
             "the conflict guard matches the key trimmed on both ends"
         );
     }
+
+    #[test]
+    fn cluster_up_foreign_label_refusal_keeps_adopt_and_omits_metadata_name() {
+        let mut labels = BTreeMap::new();
+        labels.insert("foo".to_string(), "bar".to_string());
+        labels.insert(METADATA_NAME_LABEL.to_string(), "acme-dev".to_string());
+        let keys = reported_foreign_label_keys(&labels, "acme-dev");
+        let hint = adoption_hint(
+            NamespaceHintAudience::ClusterUp,
+            "acme-dev",
+            Some("acme-cluster"),
+            Some(&keys),
+        );
+        let message = foreign_labels_message("acme-dev", &keys, &hint);
+        assert_eq!(keys, vec!["foo".to_string()]);
+        assert!(message.contains("foreign labels (foo)"), "{message}");
+        assert!(message.contains("--adopt"), "{message}");
+        assert!(!message.contains(METADATA_NAME_LABEL), "{message}");
+        assert!(!message.contains("label namespace"), "{message}");
+    }
+
+    #[test]
+    fn quickstart_foreign_label_refusal_names_removal_and_another_namespace() {
+        let keys = vec!["foo".to_string()];
+        let hint = adoption_hint(
+            NamespaceHintAudience::Quickstart,
+            "acme-dev",
+            Some("acme-cluster"),
+            Some(&keys),
+        );
+        let message = foreign_labels_message("acme-dev", &keys, &hint);
+        assert!(
+            message.contains("kubectl --context acme-cluster label namespace acme-dev foo-"),
+            "{message}"
+        );
+        assert!(message.contains("--namespace"), "{message}");
+        assert!(!message.contains("--adopt"), "{message}");
+    }
+
+    #[test]
+    fn quickstart_ownership_and_contents_refusals_name_another_namespace_only() {
+        let ownership = adoption_hint(
+            NamespaceHintAudience::Quickstart,
+            "acme-dev",
+            Some("acme-cluster"),
+            None,
+        );
+        let contents = adoption_hint(
+            NamespaceHintAudience::Quickstart,
+            "acme-dev",
+            Some("acme-cluster"),
+            None,
+        );
+        assert_eq!(ownership, "; rerun with a different --namespace");
+        assert_eq!(contents, ownership);
+        assert!(!ownership.contains("--adopt"));
+        assert!(!ownership.contains("label namespace"));
+        assert_eq!(
+            adoption_hint(
+                NamespaceHintAudience::ClusterUp,
+                "acme-dev",
+                Some("acme-cluster"),
+                None,
+            ),
+            ADOPT_HINT
+        );
+    }
+
+    #[test]
+    fn a_namespace_whose_only_label_is_its_metadata_name_stays_adoptable() {
+        let mut labels = BTreeMap::new();
+        labels.insert(METADATA_NAME_LABEL.to_string(), "acme-dev".to_string());
+        assert!(labels_allow_empty_adoption(&labels, "acme-dev"));
+        assert!(reported_foreign_label_keys(&labels, "acme-dev").is_empty());
+        let mut mismatched = labels.clone();
+        mismatched.insert(METADATA_NAME_LABEL.to_string(), "other".to_string());
+        assert!(!labels_allow_empty_adoption(&mismatched, "acme-dev"));
+        assert_eq!(
+            reported_foreign_label_keys(&mismatched, "acme-dev"),
+            vec![METADATA_NAME_LABEL.to_string()]
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -9337,6 +9423,69 @@ fn adoption_timestamp() -> Result<String> {
         .context("formatting the adoption timestamp")
 }
 
+#[derive(Clone, Copy)]
+enum NamespaceHintAudience {
+    ClusterUp,
+    Quickstart,
+}
+
+fn namespace_hint_audience() -> NamespaceHintAudience {
+    match std::env::var(QUICKSTART_NAMESPACE_HINT_ENV) {
+        Ok(value) if value == "1" => NamespaceHintAudience::Quickstart,
+        _ => NamespaceHintAudience::ClusterUp,
+    }
+}
+
+fn reported_foreign_label_keys(labels: &BTreeMap<String, String>, namespace: &str) -> Vec<String> {
+    labels
+        .iter()
+        .filter(|(key, value)| {
+            !(key.as_str() == METADATA_NAME_LABEL && value.as_str() == namespace)
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+fn kubectl_unlabel(context: Option<&str>, namespace: &str, keys: &[String]) -> String {
+    let mut parts = vec!["kubectl".to_string()];
+    if let Some(context) = context.filter(|context| !context.is_empty()) {
+        parts.push("--context".to_string());
+        parts.push(shell_quote(context));
+    }
+    parts.push("label".to_string());
+    parts.push("namespace".to_string());
+    parts.push(shell_quote(namespace));
+    for key in keys {
+        parts.push(shell_quote(&format!("{key}-")));
+    }
+    parts.join(" ")
+}
+
+fn adoption_hint(
+    audience: NamespaceHintAudience,
+    namespace: &str,
+    context: Option<&str>,
+    keys: Option<&[String]>,
+) -> String {
+    match audience {
+        NamespaceHintAudience::ClusterUp => ADOPT_HINT.to_string(),
+        NamespaceHintAudience::Quickstart => match keys {
+            Some(keys) => format!(
+                "; remove it with `{}`, or rerun with a different --namespace",
+                kubectl_unlabel(context, namespace, keys)
+            ),
+            None => "; rerun with a different --namespace".to_string(),
+        },
+    }
+}
+
+fn foreign_labels_message(namespace: &str, keys: &[String], hint: &str) -> String {
+    format!(
+        "namespace `{namespace}` has foreign labels ({}) and cannot be adopted{hint}",
+        keys.join(", ")
+    )
+}
+
 fn announce_adoption_override(namespace: &str, taken: &AdoptionOverride) {
     let ui = crate::ui::ui();
     ui.warn(&format!(
@@ -9393,11 +9542,16 @@ async fn establish_primary_namespace_ownership(o: &CommonOpts, adopt: bool) -> R
             {
                 return Ok(());
             }
+            let audience = namespace_hint_audience();
+            let context = std::env::var("HELM_KUBECONTEXT")
+                .ok()
+                .filter(|value| !value.is_empty());
             if (created_by.is_some() || created_in.is_some()) && !adopt {
                 let by = created_by.map(String::as_str).unwrap_or("<missing>");
                 let install = created_in.map(String::as_str).unwrap_or("<missing>");
+                let hint = adoption_hint(audience, &o.namespace, context.as_deref(), None);
                 bail!(
-                    "namespace `{}` has incomplete or foreign ownership labels: {CREATED_BY_LABEL}={by}, {CREATED_IN_LABEL}={install}; refusing to mutate it{ADOPT_HINT}",
+                    "namespace `{}` has incomplete or foreign ownership labels: {CREATED_BY_LABEL}={by}, {CREATED_IN_LABEL}={install}; refusing to mutate it{hint}",
                     o.namespace
                 );
             }
@@ -9408,18 +9562,25 @@ async fn establish_primary_namespace_ownership(o: &CommonOpts, adopt: bool) -> R
                 );
             }
             let foreign_labels = !labels_allow_empty_adoption(&record.labels, &o.namespace);
+            let foreign_keys = reported_foreign_label_keys(&record.labels, &o.namespace);
             if foreign_labels && !adopt {
-                let keys = record.labels.keys().cloned().collect::<Vec<_>>().join(", ");
+                let hint = adoption_hint(
+                    audience,
+                    &o.namespace,
+                    context.as_deref(),
+                    Some(&foreign_keys),
+                );
                 bail!(
-                    "namespace `{}` has foreign labels ({keys}) and cannot be adopted{ADOPT_HINT}",
-                    o.namespace
+                    "{}",
+                    foreign_labels_message(&o.namespace, &foreign_keys, &hint)
                 );
             }
             let contents = namespace_foreign_contents(&o.namespace).await?;
             if let Some(detail) = &contents {
                 if !adopt {
+                    let hint = adoption_hint(audience, &o.namespace, context.as_deref(), None);
                     bail!(
-                        "namespace `{}` contains non-default objects and cannot be adopted: {detail}{ADOPT_HINT}",
+                        "namespace `{}` contains non-default objects and cannot be adopted: {detail}{hint}",
                         o.namespace
                     );
                 }
@@ -9730,10 +9891,7 @@ fn is_root_ca_config_map(item: &serde_json::Value, namespace: &str) -> bool {
 fn labels_allow_empty_adoption(labels: &BTreeMap<String, String>, namespace: &str) -> bool {
     labels.is_empty()
         || (labels.len() == 1
-            && labels
-                .get("kubernetes.io/metadata.name")
-                .map(String::as_str)
-                == Some(namespace))
+            && labels.get(METADATA_NAME_LABEL).map(String::as_str) == Some(namespace))
 }
 
 async fn namespace_foreign_contents(namespace: &str) -> Result<Option<String>> {

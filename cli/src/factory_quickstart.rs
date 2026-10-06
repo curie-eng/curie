@@ -1597,6 +1597,13 @@ async fn run_command(program: &Path, args: &[String], step: &str) -> Result<Outp
         // Poll quickstart has no webhook secret, just as its in-process plan.
         cmd.env_remove(crate::factory_intake::WEBHOOK_SECRET_ENV);
     }
+    if args.first().map(String::as_str) == Some("cluster")
+        && args.get(1).map(String::as_str) == Some("up")
+    {
+        // The child is still `cluster up`. Quickstart does not grow `--adopt`;
+        // this tells that child to name a remedy the quickstart command can use.
+        cmd.env(crate::ops::QUICKSTART_NAMESPACE_HINT_ENV, "1");
+    }
     let output = cmd.output().await.map_err(|error| {
         step_error(
             program,

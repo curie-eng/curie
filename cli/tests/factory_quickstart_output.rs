@@ -5,6 +5,9 @@
 //! responses follow the REST App endpoints cited in `factory_github_app.rs`.
 //! OpenRouter responses follow the `/key` and `/credits` shapes recorded from
 //! the real API on 2026-10-04 and cited in `openrouter_credit.rs` (#3935).
+//! Namespace labels follow the Namespace metadata object, including the
+//! `kubernetes.io/metadata.name` label Kubernetes writes on every namespace:
+//! https://kubernetes.io/docs/reference/labels-annotations-taints/#kubernetesiometadataname
 
 #![cfg(unix)]
 
@@ -142,10 +145,12 @@ if tool == 'kubectl':
     if 'scale' in args: print('deployment.apps/coredns scaled'); sys.exit(0)
     if 'apply' in args: sys.stdin.read(); print('secret configured'); sys.exit(0)
     if 'delete' in args and 'sandboxclaim' in args: print('No resources found'); sys.exit(0)
+    if args and args[0] == 'api-resources': print('configmaps\nserviceaccounts'); sys.exit(0)
     if 'rollout' in args or 'label' in args or 'patch' in args: print('fixture command completed'); sys.exit(0)
     if 'get' in args:
         ix = args.index('get'); kind = args[ix+1]; name = args[ix+2] if len(args) > ix+2 else ''
         if kind == 'runtimeclass': print('Error from server (Forbidden): runtimeclasses.node.k8s.io "'+name+'" is forbidden: User "fixture" cannot get resource "runtimeclasses" in API group "node.k8s.io" at the cluster scope', file=sys.stderr); sys.exit(1)
+        if kind == 'apiservices.apiregistration.k8s.io': emit({'apiVersion':'v1','kind':'List','items':[]})
         if kind == 'events' and '--watch' in args:
             deadline = time.monotonic() + 5
             while not (root / 'retried').exists():
@@ -157,7 +162,14 @@ if tool == 'kubectl':
             time.sleep(10); sys.exit(0)
         if kind == 'events' and any('jsonpath=' in arg for arg in args): sys.exit(0)
         if kind in ['namespace','namespaces'] and name not in ['-o','--output']:
-            emit({'apiVersion':'v1','kind':'Namespace','metadata':{'name':name,'uid':'fixture-'+name,'resourceVersion':'1','labels':{'curietech.ai/created-by':release,'curietech.ai/created-in':ns}}})
+            labels = {'curietech.ai/created-by':release,'curietech.ai/created-in':ns}
+            if name == ns and os.environ.get('QUICKSTART_NAMESPACE_LABELS'):
+                labels = json.loads(os.environ['QUICKSTART_NAMESPACE_LABELS'])
+            emit({'apiVersion':'v1','kind':'Namespace','metadata':{'name':name,'uid':'fixture-'+name,'resourceVersion':'1','labels':labels}})
+        if kind == 'configmaps':
+            items = [{'apiVersion':'v1','kind':'ConfigMap','metadata':{'name':'acme-settings','namespace':ns},'data':{'setting':'value'}}] if os.environ.get('QUICKSTART_NON_DEFAULT_OBJECTS') == '1' else []
+            emit({'apiVersion':'v1','kind':'List','items':items})
+        if kind == 'serviceaccounts': emit({'apiVersion':'v1','kind':'List','items':[]})
         if kind in ['secret','secrets']: absent(kind, name)
         if kind in ['priorityclass','priorityclasses'] and name not in ['-o','--output']: emit(owned('PriorityClass',name))
         if kind in ['deployment','deployments'] and name == 'agent-sandbox-controller': emit(owned('Deployment',name))
@@ -607,6 +619,23 @@ fn helm_upgrade_calls(fixture: &Fixture) -> Vec<Vec<String>> {
         .collect()
 }
 
+fn namespace_mutations(fixture: &Fixture) -> Vec<Vec<String>> {
+    let text = fs::read_to_string(fixture.dir.path().join("calls")).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let call: Vec<String> = serde_json::from_str(line).ok()?;
+            (call.first().map(String::as_str) == Some("kubectl")
+                && matches!(
+                    call.get(1).map(String::as_str),
+                    Some(
+                        "patch" | "label" | "annotate" | "create" | "delete" | "apply" | "replace"
+                    )
+                ))
+            .then_some(call)
+        })
+        .collect()
+}
+
 fn intake_documents(fixture: &Fixture) -> Vec<Value> {
     let text = fs::read_to_string(fixture.dir.path().join("helm-values")).unwrap_or_default();
     text.lines()
@@ -616,6 +645,123 @@ fn intake_documents(fixture: &Fixture) -> Vec<Value> {
             (values.pointer("/api/githubFactoryIntake") == Some(&json!("poll"))).then_some(values)
         })
         .collect()
+}
+
+#[test]
+fn quickstart_foreign_labels_refusal_names_only_foreign_keys_and_their_removal() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(
+            false,
+            &[
+                "--context",
+                "acme-cluster",
+                "--namespace",
+                "acme-dev",
+                "--color",
+                "never",
+            ],
+        )
+        .env("QUICKSTART_NAMESPACE", "acme-dev")
+        .env(
+            "QUICKSTART_NAMESPACE_LABELS",
+            json!({"foo":"bar","kubernetes.io/metadata.name":"acme-dev"}).to_string(),
+        )
+        .output()
+        .unwrap();
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{shown}");
+    assert!(shown.contains("foreign labels (foo)"), "{shown}");
+    assert!(
+        shown.contains("kubectl --context acme-cluster label namespace acme-dev foo-"),
+        "{shown}"
+    );
+    assert!(shown.contains("--namespace"), "{shown}");
+    assert!(!shown.contains("--adopt"), "{shown}");
+    assert!(!shown.contains("kubernetes.io/metadata.name"), "{shown}");
+    assert!(helm_upgrade_calls(&fixture).is_empty(), "{shown}");
+    assert!(
+        namespace_mutations(&fixture).is_empty(),
+        "foreign-label refusal mutated the namespace: {shown}"
+    );
+}
+
+#[test]
+fn quickstart_ownership_and_contents_refusals_suggest_another_namespace() {
+    for (labels, non_default_objects, expected) in [
+        (
+            json!({"curietech.ai/created-by":"acme-other","kubernetes.io/metadata.name":"curie"}),
+            false,
+            "incomplete or foreign ownership labels",
+        ),
+        (
+            json!({"kubernetes.io/metadata.name":"curie"}),
+            true,
+            "contains non-default objects",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture
+            .command(false, &["--context", "acme-cluster", "--color", "never"])
+            .env("QUICKSTART_NAMESPACE_LABELS", labels.to_string())
+            .env(
+                "QUICKSTART_NON_DEFAULT_OBJECTS",
+                if non_default_objects { "1" } else { "0" },
+            )
+            .output()
+            .unwrap();
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "{shown}");
+        assert!(shown.contains(expected), "{shown}");
+        assert!(shown.contains("--namespace"), "{shown}");
+        assert!(!shown.contains("--adopt"), "{shown}");
+        assert!(!shown.contains("label namespace"), "{shown}");
+        assert!(helm_upgrade_calls(&fixture).is_empty(), "{shown}");
+        assert!(
+            namespace_mutations(&fixture).is_empty(),
+            "{expected} refusal mutated the namespace: {shown}"
+        );
+    }
+}
+
+#[test]
+fn quickstart_adopts_an_empty_namespace_with_only_its_metadata_name_label() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(false, &["--context", "acme-cluster", "--color", "never"])
+        .env(
+            "QUICKSTART_NAMESPACE_LABELS",
+            json!({"kubernetes.io/metadata.name":"curie"}).to_string(),
+        )
+        .output()
+        .unwrap();
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{shown}");
+    assert!(shown.contains("Installing Curie"), "{shown}");
+    let calls = fs::read_to_string(fixture.dir.path().join("calls")).unwrap();
+    assert!(
+        calls.lines().any(|line| {
+            let call: Vec<String> = serde_json::from_str(line).unwrap();
+            call.first().map(String::as_str) == Some("kubectl")
+                && call.iter().any(|arg| arg == "patch")
+                && call.iter().any(|arg| arg == "namespace")
+                && call.iter().any(|arg| arg == "curie")
+        }),
+        "metadata-only namespace did not reach guarded adoption: {calls}"
+    );
+    assert_eq!(helm_upgrade_calls(&fixture).len(), 1, "{shown}");
 }
 
 #[test]

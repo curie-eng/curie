@@ -195,6 +195,17 @@ def test_request_id_matches_api_derivation() -> None:
     assert fe.request_id_for(123, 9, "d-1") == expected
 
 
+def test_last_label_event_id_keeps_the_newest_matching_event() -> None:
+    events = [
+        {"event": "labeled", "id": 10, "label": {"name": "factory"}},
+        {"event": "labeled", "id": 11, "label": {"name": "other"}},
+        {"event": "labeled", "id": "12", "label": {"name": "factory"}},
+        {"event": "labeled", "id": 13, "label": {"name": "factory"}},
+    ]
+    assert fe.last_label_event_id(events, "factory") == 13
+    assert fe.last_label_event_id(events, "missing") is None
+
+
 def _delivery(guid: str, number: int, repo: str, *, action: str = "labeled") -> dict[str, Any]:
     return {
         "guid": guid,
