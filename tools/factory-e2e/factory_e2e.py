@@ -747,14 +747,36 @@ def app_jwt(app_id: str, key_file: Path, *, now: int | None = None) -> str:
     return f"{header}.{payload}.{_b64url(signed.stdout)}"
 
 
-def request_id_for(repository_id: int, issue_number: int, delivery_id: str) -> uuid.UUID:
+def request_id_for(repository_id: int, issue_number: int, admission_id: str) -> uuid.UUID:
     """The execution request id the api derives for a label admission.
 
-    Each labeled delivery is its own request, so the delivery id is part of it.
+    The admission id is the issue timeline event id when GitHub returned one,
+    which is the identity `FactoryNotice.request_id` uses. A delivery id is
+    only the fallback when that event id is absent.
     """
 
-    identity = f"https://github.com/factory/label/{repository_id}/{issue_number}/{delivery_id}"
+    identity = f"https://github.com/factory/label/{repository_id}/{issue_number}/{admission_id}"
     return uuid.uuid5(uuid.NAMESPACE_URL, identity)
+
+
+def last_label_event_id(events: list[Any], label: str) -> int | None:
+    """The newest ``labeled`` event id for ``label``, or None.
+
+    Same selection as the api's label-event admission identity: the last
+    matching event in the list GitHub returns.
+    """
+
+    found: int | None = None
+    for event in events:
+        if (
+            isinstance(event, dict)
+            and event.get("event") == "labeled"
+            and isinstance(event.get("label"), dict)
+            and event["label"].get("name") == label
+            and type(event.get("id")) is int
+        ):
+            found = event["id"]
+    return found
 
 
 def revision_request_id(repository_id: int, comment_id: int) -> uuid.UUID:
@@ -2487,6 +2509,23 @@ class Preflight:
         elif status != 200:
             raise PreflightFailed(f"reading the factory label failed (HTTP {status})")
 
+    def label_admission_event_id(self, issue_number: int) -> int:
+        """The timeline event id the api used as the admission identity."""
+
+        def probe() -> int | None:
+            status, body = self.as_actor(
+                "GET",
+                f"/repos/{self.config.repo}/issues/{issue_number}/events?per_page=100",
+            )
+            if status != 200 or not isinstance(body, list):
+                return None
+            return last_label_event_id(body, self.config.label)
+
+        found = _wait("the labelled timeline event", 60, probe, 2)
+        if type(found) is not int:
+            raise PreflightFailed("the labelled issue has no labeled timeline event")
+        return found
+
     def open_labelled_issue(self) -> int:
         if self.issue_spec is not None:
             title, body_text = self.issue_spec
@@ -2561,7 +2600,8 @@ class Preflight:
                 f"{delivery.get('status_code')}, api status {api_status!r}"
             )
         self.step("delivery accepted", delivery_id=delivery.get("guid"))
-        request_id = request_id_for(self.repository_id, issue_number, str(delivery.get("guid")))
+        event_id = self.label_admission_event_id(issue_number)
+        request_id = request_id_for(self.repository_id, issue_number, str(event_id))
         status, body = self.api(
             "GET",
             f"/v1/internal/work-items/requests/{request_id}",
