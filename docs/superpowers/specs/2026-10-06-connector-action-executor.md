@@ -337,6 +337,15 @@ refusal with no call observed; `/v1/event` returns `409` in executor mode.
 
 ## Exact arguments and the paired verbs
 
+Each executor sandbox serves exactly one `call`. A `call` refused by a
+preflight check still consumes the sequence: any later `call` in the same
+sandbox is refused `phase_out_of_order` and dials nothing. A forward tool
+call follows `list` then `call`; the `observe` phase is accepted only before a
+restore. A `call` whose connector grant cannot be attached (for example a
+connector the executor cannot reach by URL) is refused before dispatch. `list`
+pagination and a `call` result are bounded (100 pages and 1 MiB), and exceeding
+either refuses or fails the execution without retrying.
+
 <!-- @spec ACTION-EXECUTOR-7 -->
 **ACTION-EXECUTOR-7. Exact canonical arguments, bound at the edge.** Canonical
 form is the proxy's: sorted keys, separators `,` and `:`, `ensure_ascii=False`.
@@ -355,6 +364,10 @@ canonicalizer and the proxy's production parser and asserts identical bytes,
 including non-ASCII strings and nested objects; at the real proxy, a replayed
 grant, a grant for other arguments and a call without a grant are refused; a
 forward request naming an ungated tool is refused before any sandbox claim.
+
+Canonicalization refuses values JSON cannot represent exactly, including
+NaN and infinities, on every side; the worker and the proxy share one
+canonicalizer implementation rather than copies.
 
 <!-- @spec ACTION-EXECUTOR-8 -->
 **ACTION-EXECUTOR-8. The paired verbs are the deploy-time capability rule.**
@@ -462,6 +475,12 @@ like a token, is withheld, the frame is `redacted` and the record is not
 undoable; a secret in `result.summary` is scrubbed, the valid envelope beside it
 crosses unaltered, the frame is `redacted` and the record is not undoable; the
 existing redaction suites still pass.
+
+The held-literal check applies to the decoded ciphertext bytes as well as to
+the envelope text, so a plaintext secret wrapped in base64 withholds the replay
+inputs exactly as an unwrapped one does. `post_version` is at most 512 bytes of
+printable ASCII without placeholders; the worker and the API both refuse a
+longer or malformed value rather than truncating it.
 
 <!-- @spec ACTION-EXECUTOR-11 -->
 **ACTION-EXECUTOR-11. The ledger records what a restore needs.** Additive
