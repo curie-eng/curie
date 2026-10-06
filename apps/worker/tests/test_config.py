@@ -400,7 +400,7 @@ _ENV_TABLE: list[_Row] = [
         "CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS",
         "12.5",
         12.5,
-        30.0,
+        15.0,
         bare="ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS",
         bare_raw="999",
     ),

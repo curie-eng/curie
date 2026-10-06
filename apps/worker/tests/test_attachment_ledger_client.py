@@ -392,3 +392,28 @@ def test_a_name_mismatch_append_names_the_code_and_is_not_retried(ledger: Any) -
         asyncio.run(go())
     assert "thread_attachment.name_mismatch" in str(raised.value)
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"detail": {"code": "thread_attachment.agent_not_found", "message": "no such agent"}}],
+)
+def test_a_ledger_404_is_a_ledger_failure_not_a_missing_ledger(
+    ledger: Any, body: dict[str, Any]
+) -> None:
+    """Round 4 (#4141): only a 404 that is not a ledger error (the route itself
+    is missing, FastAPI's default ``{"detail": "Not Found"}``) means the API has
+    no ledger. A 404 the ledger answers with its own code is an ordinary
+    failure with the ADR's semantics."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json=body)
+
+    async def go() -> None:
+        client, http = _client(ledger, handler)
+        async with http:
+            await client.query(agent_id=AGENT, thread_key=THREAD)
+
+    with pytest.raises(ledger.LedgerUnavailable) as raised:
+        asyncio.run(go())
+    assert not isinstance(raised.value, ledger.LedgerNotDeployed)

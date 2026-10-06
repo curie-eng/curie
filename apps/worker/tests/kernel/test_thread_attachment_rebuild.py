@@ -57,6 +57,14 @@ Round 2 (#4141):
   ledger": the file turn proceeds with its own files only and appends nothing,
   a text boot carries no attachment env, and a WARNING is logged. Any other
   query failure keeps the ADR behavior.
+* Round 4: the time the rebuild spends is charged to the turn: the claim and
+  the turn start see ``remaining_s`` reduced by it, on the text-boot and the
+  file paths. A slow earlier fetch on the file path is cut at the prepare
+  deadline (checked while the bytes arrive) and named ``deadline``. A
+  workspace thread whose route fails ``substrate.adopt``'s readiness test
+  (claim or sandbox not ready, not only ``operatingMode``) boots with the
+  set. A 404 carrying the ledger's own ``detail.code`` is an ordinary ledger
+  failure, not a missing ledger.
 * A failed append counts ``curie.attachments.ledger.append`` with
   ``outcome=failure`` (``service.name=curie-worker``), declared in
   ``packages/telemetry``.
@@ -66,6 +74,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import inspect
 import json
 import sys
@@ -929,10 +938,12 @@ class _Api:
         self,
         *,
         query_status: int = 200,
+        query_body: dict[str, Any] | None = None,
         append_status: int = 200,
         append_body: dict[str, Any] | None = None,
     ) -> None:
         self.query_status = query_status
+        self.query_body = query_body
         self.append_status = append_status
         self.append_body = append_body
         self.queries: list[dict[str, Any]] = []
@@ -943,7 +954,9 @@ class _Api:
         if request.url.path.endswith("/query"):
             self.queries.append(body)
             if self.query_status != 200:
-                return httpx.Response(self.query_status, json={"detail": "Not Found"})
+                return httpx.Response(
+                    self.query_status, json=self.query_body or {"detail": "Not Found"}
+                )
             return httpx.Response(200, json={"refs": []})
         self.appends.append(body)
         if self.append_status != 200:
@@ -1121,5 +1134,304 @@ def test_a_failed_append_is_counted(make_harness, monkeypatch) -> None:
                 attrs for name, attrs in points if name == "curie.attachments.ledger.append"
             ]
             assert appended == [{"service.name": "curie-worker", "outcome": "failure"}]
+
+    asyncio.run(go())
+
+
+# --- round 4 (#4141) -------------------------------------------------------------------
+
+
+class _SlowThreadLane(_FakeThreadLane):
+    def __init__(self, seconds: float) -> None:
+        super().__init__()
+        self._seconds = seconds
+
+    def prepare_thread_set(self, **kwargs: Any) -> _FakeThreadSet:
+        time.sleep(self._seconds)
+        return super().prepare_thread_set(**kwargs)
+
+
+_LEASED = {
+    "delivery_budget_s": 60.0,
+    "delivery_lease_ttl_s": 5.0,
+    "delivery_lease_heartbeat_s": 0.3,
+    "runner_total_timeout_s": 30.0,
+}
+
+
+async def _lease(h: Any, event: QueuedTurn) -> Any:
+    """A real ADR-0131 delivery lease over a real pending entry for ``event``."""
+
+    from curie_dispatcher.queue import to_stream_fields
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    try:
+        await h.async_redis.xgroup_create(
+            h.config.stream, h.config.consumer_group, id="0", mkstream=True
+        )
+    except Exception:  # noqa: BLE001 - the group may already exist
+        pass
+    entry = await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+    await h.async_redis.xreadgroup(
+        h.config.consumer_group, h.config.consumer_name, {h.config.stream: ">"}, count=1
+    )
+    return await DeliveryLeaseStore(h.async_redis, h.config).acquire(
+        h.config.stream, h.config.consumer_group, entry, consumer=h.config.consumer_name
+    )
+
+
+def _spy_budgets(h: Any, lease: Any) -> list[tuple[str, float | None, float]]:
+    """Record the ``remaining_s`` the claim and the turn start are handed,
+    beside what the lease itself says is left at that moment."""
+
+    seen: list[tuple[str, float | None, float]] = []
+    real_claim = h.kernel._claim_or_resume
+    real_start = h.kernel._start_turn_under_hook_control
+
+    async def claim(*args: Any, **kwargs: Any) -> Any:
+        seen.append(("claim", kwargs.get("remaining_s"), lease.remaining_s()))
+        return await real_claim(*args, **kwargs)
+
+    async def start(handle: Any, event: Any, remaining_s: Any, **kwargs: Any) -> Any:
+        seen.append(("start", remaining_s, lease.remaining_s()))
+        return await real_start(handle, event, remaining_s, **kwargs)
+
+    h.kernel._claim_or_resume = claim  # type: ignore[method-assign]
+    h.kernel._start_turn_under_hook_control = start  # type: ignore[method-assign]
+    return seen
+
+
+def _assert_charged(seen: list[tuple[str, float | None, float]], *stages: str) -> None:
+    for stage in stages:
+        points = [(given, left) for name, given, left in seen if name == stage]
+        assert points, f"no {stage} was observed"
+        given, left = points[-1]
+        assert given is not None
+        # One second of rebuild happened before this point. A budget that was
+        # not charged for it is about a second larger than what is left.
+        assert given <= left + 0.3, (
+            f"{stage} was handed {given:.2f}s while the delivery had {left:.2f}s left"
+        )
+
+
+def test_a_text_boots_rebuild_time_is_charged_to_the_turn(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(binding=_Binding(), **_LEASED) as h:
+            lane, ledger = _wire(h, lane=_SlowThreadLane(1.0))
+            _answer_everywhere(h)
+            thread_key = _thread_key("tChargedText")
+            ledger.seed(thread_key, [_Ref("F1", "a.txt")])
+            event = _event("hello", thread="tChargedText")
+            lease = await _lease(h, event)
+            seen = _spy_budgets(h, lease)
+
+            await h.kernel.process_event(event, lease=lease)
+
+            assert len(lane.prepare_calls) == 1
+            _assert_charged(seen, "claim", "start")
+
+    asyncio.run(go())
+
+
+def test_a_file_turns_rebuild_time_is_charged_to_the_turn(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(binding=_Binding(), **_LEASED) as h:
+            lane, _ledger = _wire(h, lane=_SlowThreadLane(1.0))
+            _answer_everywhere(h)
+            event = _event(
+                "read", thread="tChargedFile", attachments=[Attachment(id="F1", name="a.txt")]
+            )
+            lease = await _lease(h, event)
+            seen = _spy_budgets(h, lease)
+
+            await h.kernel.process_event(event, lease=lease)
+
+            assert len(lane.prepare_calls) == 1
+            _assert_charged(seen, "start")
+
+    asyncio.run(go())
+
+
+class _DrippingFiles(FakeSlackFiles):
+    """A file whose bytes arrive one slow chunk at a time, in real time."""
+
+    def __init__(self, payloads: dict[str, list[bytes]], *, slow: str, seconds: float) -> None:
+        super().__init__(payloads)
+        self._slow = slow
+        self._seconds = seconds
+
+    def fetch(self, file_id: str) -> Any:
+        for chunk in super().fetch(file_id):
+            if file_id == self._slow:
+                time.sleep(self._seconds)
+            yield chunk
+
+
+def test_a_slow_earlier_fetch_cannot_hold_a_file_turn_past_its_prepare_deadline(
+    make_harness,
+) -> None:
+    """Real coordinator: the dripping earlier file is cut at the deadline and
+    named, and the person's own file still boots."""
+
+    from curie_worker.ledger_client import ThreadAttachmentRef
+
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(), attachment_thread_prepare_timeout_seconds=1.0
+        ) as h:
+            slow = [b"s"] * 20
+            files = _DrippingFiles({"F1": [b"new"], "OLD": slow}, slow="OLD", seconds=0.25)
+            lane = AttachmentCoordinator(
+                files=files,
+                objects=RetainingObjectStore(),
+                limits=AttachmentLimits(max_file_bytes=1024, read_chunk_bytes=16),
+            )
+            _lane, ledger = _wire(h, lane=lane)
+            _answer_everywhere(h)
+            thread_key = _thread_key("tDripping")
+            ledger.seed(
+                thread_key,
+                [
+                    ThreadAttachmentRef(
+                        file_id="OLD",
+                        ordinal=0,
+                        name="old.txt",
+                        disk_name="old.txt",
+                        mime_type=None,
+                        size_bytes=20,
+                        sha256=hashlib.sha256(b"s" * 20).hexdigest(),
+                        route_kind="slack",
+                        route_adapter=None,
+                        route_identity="default",
+                    )
+                ],
+                event_id="old-event",
+            )
+            started = time.monotonic()
+
+            await h.kernel.process_event(
+                _event("read", thread="tDripping", attachments=[Attachment(id="F1", name="n.txt")])
+            )
+
+            elapsed = time.monotonic() - started
+            assert elapsed < 1.0 + 2.0, f"the turn waited {elapsed:.1f}s on one earlier file"
+            env = _claim_envs(h)[-1]
+            assert [entry["n"] for entry in _ref_entries(env)] == ["n.txt"]
+            assert json.loads(env[MANIFEST_ENV])["unavailable"] == [
+                {"name": "old.txt", "reason": "deadline"}
+            ]
+
+    asyncio.run(go())
+
+
+class _WorkspaceProbe:
+    """The workspace coordinator double from ``test_attachment_claim.py``."""
+
+    def __init__(self, substrate: Any, *, selected_repo: str | None = "acme/example") -> None:
+        self.substrate = substrate
+        self.selected_repo = selected_repo
+        self.claim_calls: list[dict[str, Any]] = []
+
+    def select_repository(self, **_kwargs: Any) -> str | None:
+        return self.selected_repo
+
+    def claim_or_resume_with_handle(self, **kwargs: Any) -> object:
+        from curie_worker.sandbox import SuspendedThreadError
+
+        self.claim_calls.append(dict(kwargs))
+        env = dict(kwargs.get("env") or {})
+        thread_key = str(kwargs["thread_key"])
+        fence = {"fresh_only": kwargs["fresh_only"]} if "fresh_only" in kwargs else {}
+        try:
+            handle = self.substrate.claim(
+                thread_key,
+                env=env,
+                agent_name=kwargs.get("agent_name"),
+                workspace_repo=kwargs.get("repo_full_name"),
+                **fence,
+            )
+        except SuspendedThreadError:
+            handle = self.substrate.resume(
+                thread_key,
+                env=env,
+                agent_name=kwargs.get("agent_name"),
+                workspace_repo=kwargs.get("repo_full_name"),
+            )
+        return SimpleNamespace(handle=handle, prepared=SimpleNamespace(claim_env=lambda: env))
+
+    def touch(self, _thread_key: str, *, ttl_seconds: int) -> bool:
+        return True
+
+    def enumerate_expired(self) -> list[str]:
+        return []
+
+    def begin_expired_reap(self, _thread_key: str) -> None:
+        return None
+
+    def finish_expired_reap(self, _candidate: object) -> bool:
+        return True
+
+
+def test_a_workspace_route_that_fails_adopts_readiness_boots_with_the_thread_set(
+    make_harness,
+) -> None:
+    """``lookup`` reads only the sandbox's operating mode; the workspace claim
+    path adopts through ``substrate.adopt``, which also needs the claim (and
+    sandbox) ready. A route that passes the first and fails the second is
+    evicted and cold-created, and that boot must carry the thread's files."""
+
+    async def go() -> None:
+        binding = _Binding()
+        binding.resolved.deployment_id = uuid.uuid4()
+        async with make_harness(binding=binding, per_sandbox_runners=2) as h:
+            lane, ledger = _wire(h)
+            workspace = _WorkspaceProbe(h.substrate)
+            h.kernel._workspace = workspace  # type: ignore[assignment]
+            _answer_everywhere(h)
+            thread = "tWorkspaceUnready"
+            thread_key = _thread_key(thread)
+            ledger.seed(thread_key, [_Ref("F1", "a.txt")])
+
+            await h.kernel.process_event(_event("first", thread=thread))
+            old = h.substrate.lookup(thread_key)
+            assert old is not None and old.workspace_repo == "acme/example"
+            h.fake_k8s.claims[old.claim_name].ready = False
+            assert h.substrate.lookup(thread_key) == old, "lookup still calls it live"
+
+            await h.kernel.process_event(_event("second", thread=thread))
+
+            assert len(workspace.claim_calls) == 2, "the unready route was not replaced"
+            new = h.substrate.lookup(thread_key)
+            assert new is not None and new.claim_name != old.claim_name
+            assert workspace.claim_calls[-1]["env"].get(REF_ENV) == "thread-set:a.txt", (
+                "the replacement workspace sandbox booted without the thread's files"
+            )
+
+    asyncio.run(go())
+
+
+def test_a_404_with_the_ledgers_own_code_still_refuses_a_file_turn(
+    make_harness, caplog
+) -> None:
+    async def go() -> None:
+        api = _Api(
+            query_status=404,
+            query_body={"detail": {"code": "thread_attachment.agent_not_found"}},
+        )
+        client, http = api.client()
+        async with http, make_harness(binding=_Binding()) as h:
+            lane, _store = _real_lane({"F1": [b"bytes"]})
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.kernel._attachment_ledger = client  # type: ignore[attr-defined]
+            _answer_everywhere(h)
+            event = _event(
+                "read", thread="tAgentNotFound", attachments=[Attachment(id="F1", name="a.txt")]
+            )
+
+            with caplog.at_level("WARNING", logger="curie_worker.kernel"):
+                await h.kernel.process_event(event)
+
+            assert h.fake_k8s.claim_envs == []
+            assert "stage=ledger" in caplog.text
 
     asyncio.run(go())

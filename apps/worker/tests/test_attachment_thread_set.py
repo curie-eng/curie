@@ -1298,3 +1298,114 @@ def test_current_files_count_against_the_thread_byte_budget(
     assert [entry.disk_name for entry in prepared.entries] == ["e3.bin", "c.bin"]
     assert sum(entry.size_bytes for entry in prepared.entries) <= 100
     assert prepared.omitted == ("e1.bin", "e2.bin")
+
+
+# --- round 4 (#4141): the deadline bounds a fetch, and reuse is owned first -----------
+
+
+class _DrippingSlackFiles(FakeSlackFiles):
+    """Each chunk of ``slow`` costs ``seconds`` of the coordinator's clock."""
+
+    def __init__(
+        self,
+        clock: MovableClock,
+        payloads: dict[str, list[bytes]],
+        *,
+        slow: str,
+        seconds: float,
+        events: list[tuple[str, str]] | None = None,
+    ) -> None:
+        super().__init__(payloads)
+        self._clock = clock
+        self._slow = slow
+        self._seconds = seconds
+        self._events = events
+
+    def fetch(self, file_id: str) -> Iterator[bytes]:
+        if self._events is not None:
+            self._events.append(("fetch", file_id))
+        for chunk in super().fetch(file_id):
+            if file_id == self._slow:
+                self._clock.advance(self._seconds)
+            yield chunk
+
+
+def test_a_slow_earlier_fetch_is_cut_at_the_deadline_not_after_it(
+    attachments: Any, ledger: Any
+) -> None:
+    """The deadline is checked while the bytes arrive, not only before a fetch
+    starts: one dripping file cannot hold the boot past its budget."""
+
+    clock = MovableClock()
+    payload = [b"x"] * 20
+    files = _DrippingSlackFiles(clock, {"SLOW": payload}, slow="SLOW", seconds=10)
+    coordinator, store, _clock = _coordinator(attachments, files=files, clock=clock)
+    deadline = clock() + 30
+
+    prepared = _prepare(
+        coordinator,
+        ledger_refs=[_earlier(ledger, "SLOW", b"x" * 20, disk_name="slow.bin")],
+        routes=[_slack_route(attachments)],
+        deadline_epoch=deadline,
+    )
+
+    assert _unavailable(prepared) == {"slow.bin": "deadline"}
+    assert clock() <= deadline + 10, "the fetch ran on past its deadline"
+    assert len(files.delivered["SLOW"]) < len(payload), "the slow file was drained whole"
+    assert _attachment_objects(store) == set(), "the cut fetch leaves no bytes behind"
+
+
+class _LoggingStore(RetainingObjectStore):
+    def __init__(self, events: list[tuple[str, str]]) -> None:
+        super().__init__()
+        self.events = events
+
+    def put_stream(self, key: str, chunks: Any) -> None:
+        super().put_stream(key, chunks)
+        self.events.append(("put", key))
+
+
+def test_reused_parked_files_are_owned_before_any_refetch_starts(
+    attachments: Any, ledger: Any
+) -> None:
+    """A reap that runs during a slow re-fetch must already see the new owner
+    of every key this boot reuses, or it deletes bytes the boot will hand out."""
+
+    events: list[tuple[str, str]] = []
+    clock = MovableClock()
+    files = _DrippingSlackFiles(
+        clock, {"A": [b"parked"], "B": [b"lapsed"]}, slow="B", seconds=1, events=events
+    )
+    store = _LoggingStore(events)
+    coordinator, _store, _clock = _coordinator(
+        attachments, files=files, store=store, clock=clock
+    )
+    first = _prepare(coordinator, event_id="ev-1", current=[Attachment(id="A", name="a.txt")])
+    reused_key = first.entries[0].object_key
+    owners_before = set(_owners(store))
+    events.clear()
+
+    later = _prepare(
+        coordinator,
+        event_id="ev-3",
+        ledger_refs=[
+            *_as_rows(first.append_refs, "ev-1"),
+            _earlier(ledger, "B", b"lapsed", disk_name="b.txt"),  # newest, not parked
+        ],
+        routes=[_slack_route(attachments)],
+    )
+
+    assert [entry.disk_name for entry in later.entries] == ["a.txt", "b.txt"]
+    refetch = events.index(("fetch", "B"))
+    owner_writes = [
+        index
+        for index, (kind, key) in enumerate(events)
+        if kind == "put" and key.startswith("_attachments/") and key not in owners_before
+    ]
+    naming_reused = [
+        index
+        for index in owner_writes
+        if reused_key in json.loads(store.objects[events[index][1]])["object_keys"]
+    ]
+    assert naming_reused, "no new owner record names the reused key"
+    assert min(naming_reused) < refetch, events
