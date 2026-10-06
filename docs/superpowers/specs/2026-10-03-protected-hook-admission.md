@@ -308,6 +308,64 @@ do not qualify the role inventory, TLS or runtime. The anonymous local probe
 used the pinned image already recorded in ADR 0191 evidence and removed its
 exact container only after verifying its owned label and CID.
 
+## Ingress wiring
+
+The [ingress admission wiring](2026-10-02-protected-hook-source-policy.md#ingress-admission-wiring)
+section of the source policy contract wires this foundation into the signed
+hook route and the API reconciler. It changes the facade as follows, keeping
+the IDs. The torn read retry that
+[#4094](https://github.com/curie-eng/curie/pull/4094) added to ADMISSION-4 on
+main is a prerequisite: concurrent signed retries of one delivery are exactly
+the torn view it retries. It reaches next through
+[#4131](https://github.com/curie-eng/curie/pull/4131), a cherry pick of its
+three commits, before this wiring.
+
+<!-- @spec PROTECTED-HOOK-ADMISSION-1 -->
+The facade receives `trusted_manifest: Manifest` from the provisioner runtime
+files in place of a bare broker identity, and derives the broker identity from
+it. Its client comes from the LANE-3 enqueue transport, which owns and closes
+the connection; the facade still constructs none and closes none.
+
+<!-- @spec PROTECTED-HOOK-ADMISSION-4 -->
+The preflight reads one broker observation through INFO server and TIME on the
+same connection and decides authority through the shared `authority_evaluation`
+module, so the probe and admission take the same decision and their reasons
+follow its frozen mapping. The script still compares the exact snapshots it is
+given and rechecks run_id and readiness expiry against live broker time; a
+change between preflight and script refuses or retries as today and never
+accepts on the preflight alone. A preparing original whose authenticated
+retry carries the same requested policy, body digest, source generation,
+operation and fingerprint but different payload bytes is a recovery attempt
+without a supplied payload, not a conflict: the retried turn differs only in
+API receive time or in reply coordinates the original already fixed, and the
+original wins as it does on the ordinary path. Only byte identical payload may
+restore missing recovery bytes.
+
+<!-- @spec PROTECTED-HOOK-ADMISSION-5 -->
+The facade gains `preparing(limit: int) -> tuple[DeliveryIdentity, ...]` for
+the trusted reconciler. It reads at most `limit` quota members in score order
+with ZRANGE, reads each member's intent, state and commit, and returns the
+identities of intents with neither a commit nor a failed state. It writes
+nothing and authorizes nothing; `recover` decides each one. An orphan member
+without an intent is skipped and reported only as a count.
+
+<!-- @spec PROTECTED-HOOK-ADMISSION-6 -->
+The enqueue rules add ZRANGE on exactly `protected:admission:quota`, within
+the existing quota selector, only once a measured observation against the
+pinned Valkey is recorded in the
+[ADR 0191 evidence record](../../adr/evidence/0191-protected-hooks/README.md):
+the exact recipe, command and observed outcome, including that ZRANGE on the
+quota key succeeds and on any other key refuses. Until that record exists the
+recipe stays unchanged and `preparing` is unavailable.
+
+<!-- @spec PROTECTED-HOOK-ADMISSION-7 -->
+Acceptance adds: a preparing retry with different payload bytes recovers the
+original and never conflicts; a byte identical retry restores missing recovery
+bytes; `preparing` returns exactly the outstanding intents and writes nothing;
+a control manifest differing from the trusted manifest refuses; and a frozen
+vector of broker states yields the same decision from the probe evaluation
+and from `admit`, with reasons following the frozen mapping.
+
 ## Acceptance
 
 <!-- @spec PROTECTED-HOOK-ADMISSION-7 -->
