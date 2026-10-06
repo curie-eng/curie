@@ -2075,6 +2075,8 @@ class ThreadAttachmentRef(Base):
             "seq",
         ),
         Index("ix_thread_attachment_refs_expires_at", "expires_at"),
+        # The orphan sweep runs on every transcript write, scoped to one agent.
+        Index("ix_thread_attachment_refs_agent_expires_at", "agent_id", "expires_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

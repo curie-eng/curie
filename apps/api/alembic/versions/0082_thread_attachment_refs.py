@@ -81,9 +81,17 @@ def upgrade() -> None:
         schema=SCHEMA,
     )
     op.create_index("ix_thread_attachment_refs_expires_at", TABLE, ["expires_at"], schema=SCHEMA)
+    # The orphan sweep runs on every transcript write, scoped to one agent.
+    op.create_index(
+        "ix_thread_attachment_refs_agent_expires_at",
+        TABLE,
+        ["agent_id", "expires_at"],
+        schema=SCHEMA,
+    )
 
 
 def downgrade() -> None:
+    op.drop_index("ix_thread_attachment_refs_agent_expires_at", table_name=TABLE, schema=SCHEMA)
     op.drop_index("ix_thread_attachment_refs_expires_at", table_name=TABLE, schema=SCHEMA)
     op.drop_index("ix_thread_attachment_refs_thread_seq", table_name=TABLE, schema=SCHEMA)
     op.drop_table(TABLE, schema=SCHEMA)

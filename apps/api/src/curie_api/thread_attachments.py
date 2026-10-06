@@ -58,6 +58,25 @@ _LOCK_SQL = text(
 )
 
 
+async def _lock(session: AsyncSession, agent_id: uuid.UUID, scope: str | None, key: str) -> None:
+    """Serialize ledger writes to one thread for the rest of the transaction."""
+
+    await session.execute(_LOCK_SQL, {"agent_id": str(agent_id), "scope": scope, "key": key})
+
+
+class NameMismatch(Exception):
+    """A redelivered (event, file) names a different ``disk_name`` than recorded.
+
+    A disk name is fixed when it is recorded (ADR 0205 decision 4), so the
+    redelivery is refused rather than swallowed: the worker would otherwise
+    tell the agent a path the ledger never holds.
+    """
+
+    def __init__(self, file_id: str) -> None:
+        super().__init__(file_id)
+        self.file_id = file_id
+
+
 class NameConflict(Exception):
     """A ref's ``disk_name`` is held in the thread by a different (event, file)."""
 
@@ -164,8 +183,13 @@ async def _adopt_pre_identity(
 async def list_refs(
     session: AsyncSession, agent_id: uuid.UUID, scope: str | None, key: str
 ) -> list[ThreadAttachmentRef]:
-    """The thread's live references in arrival order. Commits."""
+    """The thread's live references in arrival order. Commits.
 
+    Takes the per-thread lock before copying pre-identity rows forward, so the
+    copy cannot land between a concurrent append's checks and its insert.
+    """
+
+    await _lock(session, agent_id, scope, key)
     await _adopt_pre_identity(session, agent_id, scope, key)
     state, transcript_expires_at = await _transcript_state(session, agent_id, scope, key)
     if state == "expired":
@@ -224,13 +248,15 @@ async def append_refs(
     """Record one turn's files in one transaction. Commits.
 
     Idempotent per (event_id, file_id): a ref already recorded is not inserted
-    again and keeps its place. Raises ``NameConflict`` when a ref's
+    again and keeps its place. Raises ``NameMismatch`` when a recorded (or
+    repeated) (event, file) arrives with a different ``disk_name``,
+    ``NameConflict`` when a ref's
     ``disk_name`` is held by a different (event, file) in the thread or in the
-    request, and ``ThreadFull`` when the new rows would pass the cap; in both
-    cases nothing is stored. Returns the number of rows inserted.
+    request, and ``ThreadFull`` when the new rows would pass the cap; in every
+    case nothing is stored. Returns the number of rows inserted.
     """
 
-    await session.execute(_LOCK_SQL, {"agent_id": str(agent_id), "scope": scope, "key": key})
+    await _lock(session, agent_id, scope, key)
     await _adopt_pre_identity(session, agent_id, scope, key)
     await _settle(session, agent_id, scope, key)
 
@@ -243,7 +269,9 @@ async def append_refs(
             ).where(*_thread(agent_id, scope, key))
         )
     ).all()
-    recorded = {(row.event_id, row.file_id) for row in existing}
+    recorded: dict[tuple[str, str], str] = {
+        (row.event_id, row.file_id): row.disk_name for row in existing
+    }
     holders: dict[str, tuple[str, str]] = {
         row.disk_name: (row.event_id, row.file_id) for row in existing
     }
@@ -251,6 +279,10 @@ async def append_refs(
     for ref in refs:
         owner = (event_id, str(ref["file_id"]))
         disk_name = str(ref["disk_name"])
+        stored_name = recorded.get(owner)
+        if stored_name is not None and stored_name != disk_name:
+            await session.rollback()
+            raise NameMismatch(owner[1])
         held = holders.get(disk_name)
         if held is not None and held != owner:
             await session.rollback()
@@ -258,7 +290,7 @@ async def append_refs(
         if owner in recorded:
             continue
         holders[disk_name] = owner
-        recorded.add(owner)
+        recorded[owner] = disk_name
         fresh.append(ref)
 
     cap = get_settings().thread_attachment_max_refs

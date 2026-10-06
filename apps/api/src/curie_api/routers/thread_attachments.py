@@ -59,6 +59,12 @@ async def append_thread_attachments(
             payload.event_id,
             [ref.model_dump() for ref in payload.refs],
         )
+    except thread_attachments.NameMismatch as exc:
+        raise HTTPException(
+            409,
+            {"code": "thread_attachment.name_mismatch", "file_id": exc.file_id},
+            headers=_NO_STORE,
+        ) from None
     except thread_attachments.NameConflict as exc:
         raise HTTPException(
             409,
