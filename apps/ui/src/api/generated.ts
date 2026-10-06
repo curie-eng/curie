@@ -7039,10 +7039,39 @@ export interface components {
             /** Size Bytes */
             size_bytes?: number | null;
         };
+        /**
+         * ThreadAttachmentRefRow
+         * @description A query row: the appended ref plus the event it was recorded under, so a
+         *     redelivered turn's worker recognises its own rows by (event_id, file_id).
+         */
+        ThreadAttachmentRefRow: {
+            /** Disk Name */
+            disk_name: string;
+            /** Event Id */
+            event_id: string;
+            /** File Id */
+            file_id: string;
+            /** Mime Type */
+            mime_type?: string | null;
+            /** Name */
+            name: string;
+            /** Ordinal */
+            ordinal: number;
+            /** Route Adapter */
+            route_adapter?: string | null;
+            /** Route Identity */
+            route_identity: string;
+            /** Route Kind */
+            route_kind: string;
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes?: number | null;
+        };
         /** ThreadAttachmentRefsOut */
         ThreadAttachmentRefsOut: {
             /** Refs */
-            refs: components["schemas"]["ThreadAttachmentRefBody"][];
+            refs: components["schemas"]["ThreadAttachmentRefRow"][];
         };
         /**
          * ThreadResetState

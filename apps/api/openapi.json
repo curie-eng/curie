@@ -9531,11 +9531,109 @@
         "title": "ThreadAttachmentRefBody",
         "type": "object"
       },
+      "ThreadAttachmentRefRow": {
+        "additionalProperties": false,
+        "description": "A query row: the appended ref plus the event it was recorded under, so a\nredelivered turn's worker recognises its own rows by (event_id, file_id).",
+        "properties": {
+          "disk_name": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Disk Name",
+            "type": "string"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "file_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "File Id",
+            "type": "string"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
+          },
+          "name": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "ordinal": {
+            "minimum": 0.0,
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "route_adapter": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Adapter"
+          },
+          "route_identity": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Route Identity",
+            "type": "string"
+          },
+          "route_kind": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Route Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9A-Fa-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          }
+        },
+        "required": [
+          "file_id",
+          "ordinal",
+          "name",
+          "disk_name",
+          "sha256",
+          "route_kind",
+          "route_identity",
+          "event_id"
+        ],
+        "title": "ThreadAttachmentRefRow",
+        "type": "object"
+      },
       "ThreadAttachmentRefsOut": {
         "properties": {
           "refs": {
             "items": {
-              "$ref": "#/components/schemas/ThreadAttachmentRefBody"
+              "$ref": "#/components/schemas/ThreadAttachmentRefRow"
             },
             "title": "Refs",
             "type": "array"

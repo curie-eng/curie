@@ -19,7 +19,7 @@ from ..schemas.thread_attachments import (
     ThreadAttachmentAppend,
     ThreadAttachmentAppendOut,
     ThreadAttachmentQuery,
-    ThreadAttachmentRefBody,
+    ThreadAttachmentRefRow,
     ThreadAttachmentRefsOut,
 )
 
@@ -39,7 +39,7 @@ async def query_thread_attachments(
     response.headers.update(_NO_STORE)
     rows = await thread_attachments.list_refs(session, payload.agent_id, None, payload.thread_key)
     return ThreadAttachmentRefsOut(
-        refs=[ThreadAttachmentRefBody.model_validate(row) for row in rows]
+        refs=[ThreadAttachmentRefRow.model_validate(row) for row in rows]
     )
 
 

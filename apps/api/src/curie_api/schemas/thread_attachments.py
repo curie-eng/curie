@@ -43,8 +43,15 @@ class ThreadAttachmentAppend(ThreadAttachmentQuery):
     refs: list[ThreadAttachmentRefBody] = Field(max_length=1000)
 
 
+class ThreadAttachmentRefRow(ThreadAttachmentRefBody):
+    """A query row: the appended ref plus the event it was recorded under, so a
+    redelivered turn's worker recognises its own rows by (event_id, file_id)."""
+
+    event_id: str
+
+
 class ThreadAttachmentRefsOut(BaseModel):
-    refs: list[ThreadAttachmentRefBody]
+    refs: list[ThreadAttachmentRefRow]
 
 
 class ThreadAttachmentAppendOut(BaseModel):
