@@ -315,13 +315,17 @@ def parse_selection(raw: bytes) -> dict[str, Any]:
     The one Selection grammar admission and the support probe both read.
     @spec PROTECTED-HOOK-ADMISSION-2/4 @spec PROTECTED-HOOK-SOURCE-9.
     """
-    selection = _decode(raw, _MAX_METADATA)
-    _require(type(selection) is dict and selection.keys() == _SELECTION.keys())
-    opened = selection.pop("admission_open")
-    _require(type(opened) is bool)
-    _canonical(_encode(selection), {k: v for k, v in _SELECTION.items() if k != "admission_open"})
-    selection["admission_open"] = opened
-    return dict(selection)
+    try:
+        selection = _decode(raw, _MAX_METADATA)
+        _require(type(selection) is dict and selection.keys() == _SELECTION.keys())
+        opened = selection.pop("admission_open")
+        _require(type(opened) is bool)
+        fields = {k: v for k, v in _SELECTION.items() if k != "admission_open"}
+        _canonical(_encode(selection), fields)
+        selection["admission_open"] = opened
+        return dict(selection)
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        raise ValueError("invalid protected admission record") from None
 
 
 @dataclass(frozen=True, slots=True, repr=False, kw_only=True)

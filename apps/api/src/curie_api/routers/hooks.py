@@ -75,6 +75,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 
 from .. import crud
 from ..config import get_settings
@@ -94,7 +95,6 @@ from ..hook_partition import (
     PartitionError,
     derive_partition,
 )
-from ..hook_source_admin import SourceAdminError
 from ..hook_source_auth import (
     MISSING_DELIVERY_DETAIL,
     authenticated_source,
@@ -103,7 +103,11 @@ from ..hook_source_auth import (
 from ..hook_source_policy_schemas import HookSupportIn, HookSupportOut, HookSupportReason
 from ..identities import refuse_undeclared
 from ..models import Agent, AgentChannel
-from ..protected_support import RuntimeMembers, evaluate_protected_support
+from ..protected_support import (
+    RuntimeMembers,
+    SupportAuthorityUnavailable,
+    evaluate_protected_support,
+)
 from ..source_binding import MappingOutcome, resolve_source_binding
 from ..wirebody import read_bounded_body
 
@@ -775,7 +779,7 @@ async def _resolve_support(
         effective, generation = ToolAccess.READ_ONLY, str(policy.generation)
         try:
             evaluation = await evaluate_protected_support(policy, runtime_dir)
-        except SourceAdminError:
+        except SupportAuthorityUnavailable:
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable"
             ) from None
@@ -861,8 +865,13 @@ async def probe_hook_support(
         signature=x_curie_signature_256,
     ) as gated:
         snapshot = gated
-    # The gate is released here: broker evaluation is observational and every
-    # delivery repeats it, so no broker I/O ever holds the source gate.
+    # The gate is released here, and the request transaction ends next: broker
+    # evaluation is observational, every delivery repeats it, and no database
+    # connection may wait on the broker.
+    try:
+        await session.rollback()
+    except SQLAlchemyError:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable") from None
     resolution = await _resolve_support(snapshot, requested, settings.protected_runtime_dir)
     return JSONResponse(
         status_code=(
