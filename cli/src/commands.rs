@@ -919,15 +919,24 @@ fn configure_source_hooks(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// One cheap workflow step selected by the preflight planner.
+/// One selected preflight gate, including its mirrored CI command when present.
 #[derive(Deserialize, Serialize)]
 pub struct PreflightCheck {
-    pub workflow: String,
-    pub job: String,
-    pub step: String,
-    pub command: String,
-    pub cwd: String,
-    pub group: String,
+    pub name: String,
+    pub status: String,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -937,14 +946,24 @@ pub struct PreflightFailure {
     pub exit_code: i32,
 }
 
-/// The planner's report is shared by dry runs and executed fast checks.
+#[derive(Deserialize, Serialize)]
+pub struct PreflightBase {
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub contains_tip: bool,
+    pub failing_required_checks: Vec<String>,
+}
+
+/// The source-owned report is shared by both tiers and their dry runs.
 #[derive(Deserialize, Serialize)]
 pub struct PreflightOutput {
     pub checks: Vec<PreflightCheck>,
     pub failures: Vec<PreflightFailure>,
     pub passed: bool,
     pub dry_run: bool,
-    pub base: String,
+    pub tier: String,
+    pub base: PreflightBase,
+    pub ci_only: Vec<String>,
     pub head: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -966,50 +985,53 @@ impl crate::ui::CliOutput for PreflightOutput {
     fn render(&self, ui: &crate::ui::Ui) {
         for check in &self.checks {
             ui.payload_plain(&format!(
-                "{} / {} / {} ({}): {}",
-                check.workflow, check.job, check.step, check.cwd, check.command
+                "{}: {}\n{}",
+                check.name, check.status, check.detail
             ));
         }
-        for failure in &self.failures {
-            ui.payload_plain(&format!(
-                "{} failed (exit {}):\n{}",
-                failure.check, failure.exit_code, failure.output_tail
-            ));
+        for entry in &self.ci_only {
+            ui.payload_plain(&format!("{entry}: runs in CI only"));
         }
         if self.dry_run {
             ui.note(&format!(
-                "Fast preflight plan: {} checks.",
+                "{} preflight plan: {} checks.",
+                self.tier,
                 self.checks.len()
             ));
         } else if self.passed {
             ui.success(&format!(
-                "Fast preflight passed: {} checks.",
+                "{} preflight passed: {} checks.",
+                self.tier,
                 self.checks.len()
             ));
         }
     }
 }
 
-/// Run the source-owned fast planner and preserve its single structured result.
-pub async fn dev_preflight(fast: bool, base: &str, dry_run: bool) -> Result<PreflightOutput> {
-    if !fast {
-        return Err(
-            crate::exit::CliError::usage("The preflight command requires --fast.")
-                .with_fix("Run `curie dev preflight --fast`.")
-                .into(),
-        );
-    }
+/// Run the source-owned planner and preserve its single structured result.
+pub async fn dev_preflight(
+    fast: bool,
+    base: &str,
+    dry_run: bool,
+    pr_body: Option<&Path>,
+    title: Option<&str>,
+) -> Result<PreflightOutput> {
     let root = find_repo_root().ok_or_else(|| {
-        crate::exit::CliError::usage("Fast preflight requires a Curie source checkout.")
-            .with_fix("Run `curie dev preflight --fast` from a Curie source checkout.")
+        crate::exit::CliError::usage("Preflight requires a Curie source checkout.")
+            .with_fix("Run `curie dev preflight` from a Curie source checkout.")
     })?;
     if !root.join("tools/preflight/preflight.py").is_file() {
         return Err(crate::exit::CliError::usage(
-            "The source checkout has no fast preflight tool.",
+            "The source checkout has no preflight tool.",
         )
         .with_fix("Update this Curie source checkout to a revision containing the preflight tool.")
         .into());
     }
+    // Resolve the caller's file before changing the subprocess working directory.
+    let body_file = pr_body
+        .map(|path| std::env::current_dir().map(|cwd| cwd.join(path)))
+        .transpose()
+        .context("Could not resolve the proposed pull request body file")?;
     let mut command = tokio::process::Command::new("uv");
     command
         .args([
@@ -1019,31 +1041,39 @@ pub async fn dev_preflight(fast: bool, base: &str, dry_run: bool) -> Result<Pref
             "pyyaml==6.0.3",
             "python3",
             "tools/preflight/preflight.py",
-            "--fast",
             "--base",
             base,
             "--json",
         ])
         .current_dir(&root)
         .stderr(std::process::Stdio::inherit());
+    if fast {
+        command.arg("--fast");
+    }
     if dry_run {
         command.arg("--dry-run");
     }
+    if let Some(path) = body_file {
+        command.arg("--pr-body").arg(path);
+    }
+    if let Some(title) = title {
+        command.arg("--title").arg(title);
+    }
     let output = command.output().await.map_err(|error| {
-        crate::exit::CliError::usage(format!("Could not run the fast preflight tool: {error}"))
+        crate::exit::CliError::transient(format!("Could not run the preflight tool: {error}"))
             .with_fix("Install uv, then run `curie install` from this source checkout and retry.")
     })?;
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .context("The fast preflight tool did not return one JSON object")?;
+        .context("The preflight tool did not return one JSON object")?;
     if output.status.code() == Some(2) {
         let error: PreflightSetupError = serde_json::from_value(payload)
-            .context("The fast preflight tool returned an invalid setup error")?;
+            .context("The preflight tool returned an invalid setup error")?;
         return Err(crate::exit::CliError::usage(error.error)
             .with_fix(error.fix)
             .into());
     }
-    let report: PreflightOutput = serde_json::from_value(payload)
-        .context("The fast preflight tool returned an invalid report")?;
+    let report: PreflightOutput =
+        serde_json::from_value(payload).context("The preflight tool returned an invalid report")?;
     if !output.status.success() {
         let message = report
             .error
@@ -1053,7 +1083,12 @@ pub async fn dev_preflight(fast: bool, base: &str, dry_run: bool) -> Result<Pref
             .fix
             .as_deref()
             .context("The failed preflight report omitted its fix")?;
-        let error = crate::exit::CliError::failure(message).with_fix(fix);
+        let error = if output.status.code() == Some(3) {
+            crate::exit::CliError::transient(message)
+        } else {
+            crate::exit::CliError::failure(message)
+        }
+        .with_fix(fix);
         return Err(crate::ui::ui().failed_report(&report, error.into()));
     }
     Ok(report)
