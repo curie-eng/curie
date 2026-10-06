@@ -1,5 +1,5 @@
 {
-  "comment": "@spec ACTION-EXECUTOR-7. The one canonical form of a connector call's arguments, frozen across the images that compute or check it: the API ruling stores `arguments_sha256` of the restore call (`restore` cases), the worker recomputes it and mints the `ccg` grant over the canonical text, the caller proxy's production parser re-canonicalizes the arguments it forwards and compares them with the grant, and the runner's `call` preflight refuses a text that is not already canonical. `form` states the rule; every `vectors` entry gives the arguments object, the exact canonical text and the SHA-256 hex of its UTF-8 bytes. `non_canonical_texts` parse to an object whose canonical text differs from the text itself; `not_an_object_texts` do not parse to an object; the runner refuses both with `refusal`. Read by apps/api/tests/test_action_canonical_arguments_vector.py, apps/worker/tests/test_action_canonical_arguments_vector.py and runner/tests/test_runner_execute_vector.py, each of which rejects an unknown key.",
+  "comment": "@spec ACTION-EXECUTOR-7. The one canonical form of a connector call's arguments, frozen across the images that compute or check it: the API ruling stores `arguments_sha256` of the restore call (`restore` cases), the worker recomputes it and mints the `ccg` grant over the canonical text, the caller proxy's production parser re-canonicalizes the arguments it forwards and compares them with the grant, and the runner's `call` preflight refuses a text that is not already canonical. `form` states the rule; every `vectors` entry gives the arguments object, the exact canonical text and the SHA-256 hex of its UTF-8 bytes. `non_canonical_texts` parse to an object whose canonical text differs from the text itself; `not_an_object_texts` do not parse to an object; the runner refuses both with `refusal`. `non_finite_texts` carry NaN or an infinity, which JSON cannot represent exactly: parsed with Python's permissive reader, the worker's and the proxy's canonicalizer refuse the object (one shared implementation), and the runner refuses the text with `refusal`. Read by apps/api/tests/test_action_canonical_arguments_vector.py, apps/worker/tests/test_action_canonical_arguments_vector.py and runner/tests/test_runner_execute_vector.py, each of which rejects an unknown key.",
   "form": {
     "sort_keys": true,
     "item_separator": ",",
@@ -257,6 +257,24 @@
     {
       "name": "empty",
       "text": ""
+    }
+  ],
+  "non_finite_texts": [
+    {
+      "name": "nan",
+      "text": "{\"value\":NaN}"
+    },
+    {
+      "name": "infinity",
+      "text": "{\"value\":Infinity}"
+    },
+    {
+      "name": "negative_infinity",
+      "text": "{\"value\":-Infinity}"
+    },
+    {
+      "name": "nested_nan",
+      "text": "{\"outer\":{\"value\":NaN}}"
     }
   ],
   "refusal": "arguments_mismatch"

@@ -27,6 +27,7 @@ _CANONICAL_KEYS = {
     "restore",
     "non_canonical_texts",
     "not_an_object_texts",
+    "non_finite_texts",
     "refusal",
 }
 

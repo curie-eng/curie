@@ -21,13 +21,18 @@ replies from ``tests/vectors/executor-restore-calls.json``.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
+import socket
 import sys
-from collections.abc import Awaitable, Callable
+import threading
+import time
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+import uvicorn
 from aiohttp.test_utils import TestClient, TestServer
 
 _VECTORS = Path(__file__).resolve().parents[2] / "tests" / "vectors"
@@ -36,6 +41,7 @@ _CANONICAL = json.loads((_VECTORS / "action-canonical-arguments.json").read_text
 _CALLS = json.loads((_VECTORS / "executor-restore-calls.json").read_text("utf-8"))
 _FIXTURE = Path(__file__).parent / "fixtures" / "mcp_executor_connector.py"
 _TOKEN = "example-runner-token"
+_GRANT_HEADER = "X-Curie-Connector-Grant"
 _CONNECTOR = _ROUTE["phases"]["list"]["request"]["connector"]
 _ATTESTATION = {
     "session_id": "example-session",
@@ -52,6 +58,9 @@ _ROUTE_KEYS = {
     "phases",
     "sequences",
     "refused_sequences",
+    "refused_tool_sequences",
+    "refused_call_consumes",
+    "bounds",
     "refusal_body_key",
     "refusals",
     "call_transport_failure",
@@ -90,7 +99,92 @@ def test_the_runner_reads_the_frozen_mode_variable() -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _load_fixture() -> Any:
+    spec = importlib.util.spec_from_file_location("_mcp_executor_connector", _FIXTURE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_CONNECTOR_FIXTURE = _load_fixture()
+_ENV_SETTINGS = {
+    "CURIE_TEST_EXECUTOR_TOOLS": ("tools", str),
+    "CURIE_TEST_OBSERVE_REPLY": ("observe_reply", json.loads),
+    "CURIE_TEST_CALL_REPLY": ("call_reply", json.loads),
+    "CURIE_TEST_LIST_PAGES": ("list_pages", int),
+    "CURIE_TEST_CALL_RESULT_BYTES": ("call_result_bytes", int),
+}
+
+
+class _Hosted:
+    """The fixture connector over streamable HTTP on a loopback port."""
+
+    def __init__(self, settings: dict[str, Any]) -> None:
+        self.requests: list[dict[str, Any]] = []
+        app = _CONNECTOR_FIXTURE.http_app(settings, self.requests)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(32)
+        self._socket = listener
+        host, port = listener.getsockname()[:2]
+        self._server = uvicorn.Server(
+            uvicorn.Config(app, host=host, port=port, access_log=False, log_level="critical")
+        )
+        self._thread = threading.Thread(
+            target=self._server.run, kwargs={"sockets": [listener]}, daemon=True
+        )
+        self._thread.start()
+        for _ in range(250):
+            if self._server.started:
+                break
+            time.sleep(0.02)
+        else:
+            raise RuntimeError("fixture connector did not start")
+        self.url = f"http://{host}:{port}/mcp"
+
+    def calls(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": request["params"]["name"],
+                "arguments": request["params"].get("arguments") or {},
+                "headers": request["headers"],
+            }
+            for request in self.requests
+            if request["method"] == "tools/call"
+        ]
+
+    def stop(self) -> None:
+        self._server.should_exit = True
+        self._thread.join(timeout=5)
+        self._socket.close()
+
+
+_HOSTED: dict[Path, _Hosted] = {}
+
+
+@pytest.fixture(autouse=True)
+def _stop_hosted_connectors() -> Iterator[None]:
+    yield
+    while _HOSTED:
+        _HOSTED.popitem()[1].stop()
+
+
 def _connector(tmp_path: Path, **env: str) -> dict[str, Any]:
+    """A hosted (URL) connector, the only kind a ``call`` grant can ride to."""
+
+    settings = {
+        key: parse(env[name]) for name, (key, parse) in _ENV_SETTINGS.items() if name in env
+    }
+    hosted = _Hosted(settings)
+    _HOSTED[tmp_path] = hosted
+    return {"type": "http", "url": hosted.url}
+
+
+def _stdio_connector(tmp_path: Path, **env: str) -> dict[str, Any]:
+    """A stdio connector: reachable for ``list`` and ``observe``, but not by URL."""
+
     return {
         "command": sys.executable,
         "args": [str(_FIXTURE)],
@@ -99,10 +193,16 @@ def _connector(tmp_path: Path, **env: str) -> dict[str, Any]:
 
 
 def _calls(tmp_path: Path) -> list[dict[str, Any]]:
+    if tmp_path in _HOSTED:
+        return _HOSTED[tmp_path].calls()
     log = tmp_path / "calls.jsonl"
     if not log.exists():
         return []
     return [json.loads(line) for line in log.read_text("utf-8").splitlines() if line]
+
+
+def _list_requests(tmp_path: Path) -> int:
+    return sum(1 for request in _HOSTED[tmp_path].requests if request["method"] == "tools/list")
 
 
 Drive = Callable[[TestClient], Awaitable[None]]
@@ -255,6 +355,10 @@ def test_a_restore_runs_list_observe_call_with_the_frozen_shapes(tmp_path: Path)
     assert calls[0]["arguments"] == {"target": phases["observe"]["request"]["target"]}
     assert calls[0]["arguments"] == _CALLS["observe_arguments"]
     assert calls[1]["arguments"] == json.loads(phases["call"]["request"]["arguments"])
+    # The grant rides only the write call, to the hosted connector.
+    grant = _GRANT_HEADER.lower()
+    assert calls[1]["headers"][grant] == phases["call"]["request"]["grant"]
+    assert grant not in calls[0]["headers"]
 
 
 def test_a_forward_action_runs_list_then_call(tmp_path: Path) -> None:
@@ -404,3 +508,118 @@ def test_an_unreachable_connector_is_refused_on_list(tmp_path: Path) -> None:
         _assert_refused(status, body, "connector_unreachable")
 
     _drive({_CONNECTOR: broken}, drive)
+
+
+# --------------------------------------------------------------------------- #
+# Review round: one call per sandbox, forward order, grant, bounds
+# --------------------------------------------------------------------------- #
+
+
+def test_a_call_refused_by_preflight_still_spends_the_sandbox_call(tmp_path: Path) -> None:
+    """@spec ACTION-EXECUTOR-6: a refused ``call`` consumes the sequence; nothing dials."""
+
+    spec = _ROUTE["refused_call_consumes"]
+
+    async def drive(client: TestClient) -> None:
+        assert (await _post(client, _request("list")))[0] == 200
+        status, body = await _post(client, _forward_call(tool=spec["first_tool"]))
+        _assert_refused(status, body, spec["first_refusal"])
+        status, body = await _post(client, _forward_call(tool=spec["second_tool"]))
+        _assert_refused(status, body, spec["second_refusal"])
+
+    _drive({_CONNECTOR: _connector(tmp_path)}, drive)
+    assert _calls(tmp_path) == []
+
+
+@pytest.mark.parametrize("case", _ROUTE["refused_tool_sequences"], ids=lambda case: case["name"])
+def test_the_call_tool_decides_whether_observe_belongs(
+    tmp_path: Path, case: dict[str, Any]
+) -> None:
+    """@spec ACTION-EXECUTOR-6: forward is ``list`` then ``call``; restore needs ``observe``."""
+
+    *prefix, last = case["phases"]
+    assert last == "call"
+
+    async def drive(client: TestClient) -> None:
+        for phase in prefix:
+            assert (await _post(client, _request(phase)))[0] == 200, phase
+        before = [call["name"] for call in _calls(tmp_path)]
+        request = _request("call") if case["tool"] == _CALLS["restore_tool"] else _forward_call()
+        status, body = await _post(client, {**request, "tool": case["tool"]})
+        _assert_refused(status, body, case["refusal"])
+        assert [call["name"] for call in _calls(tmp_path)] == before
+
+    connector = _connector(tmp_path, CURIE_TEST_OBSERVE_REPLY=json.dumps({"version": "rv-1041"}))
+    _drive({_CONNECTOR: connector}, drive)
+    assert case["tool"] not in [call["name"] for call in _calls(tmp_path)]
+
+
+def test_a_call_the_grant_cannot_ride_to_is_refused_before_dispatch(tmp_path: Path) -> None:
+    """@spec ACTION-EXECUTOR-6: a connector with no URL never gets an ungranted write."""
+
+    async def drive(client: TestClient) -> None:
+        assert (await _post(client, _request("list")))[0] == 200
+        status, body = await _post(client, _forward_call())
+        _assert_refused(status, body, "connector_not_hosted")
+
+    _drive({_CONNECTOR: _stdio_connector(tmp_path)}, drive)
+    assert _calls(tmp_path) == []
+
+
+def test_list_pagination_past_the_bound_is_refused_without_retrying(tmp_path: Path) -> None:
+    """@spec ACTION-EXECUTOR-6: at most ``list_pages`` pages, then a refusal, no retry."""
+
+    bounds = _ROUTE["bounds"]
+    pages = bounds["list_pages"]
+
+    async def drive(client: TestClient) -> None:
+        status, body = await _post(client, _request("list"))
+        _assert_refused(status, body, bounds["list_over_bound"]["refusal"])
+
+    _drive({_CONNECTOR: _connector(tmp_path, CURIE_TEST_LIST_PAGES=str(pages * 3))}, drive)
+    assert pages <= _list_requests(tmp_path) <= pages + 1
+
+
+def test_list_pagination_at_the_bound_is_served(tmp_path: Path) -> None:
+    """@spec ACTION-EXECUTOR-6: the bound is inclusive."""
+
+    pages = _ROUTE["bounds"]["list_pages"]
+
+    async def drive(client: TestClient) -> None:
+        status, body = await _post(client, _request("list"))
+        assert status == 200, body
+        assert body == _ROUTE["phases"]["list"]["response"]
+
+    _drive({_CONNECTOR: _connector(tmp_path, CURIE_TEST_LIST_PAGES=str(pages))}, drive)
+    assert _list_requests(tmp_path) == pages
+
+
+def test_a_call_result_past_the_bound_fails_without_retrying(tmp_path: Path) -> None:
+    """@spec ACTION-EXECUTOR-6: the write landed once; the oversized result is an error."""
+
+    bounds = _ROUTE["bounds"]
+
+    async def drive(client: TestClient) -> None:
+        assert (await _post(client, _request("list")))[0] == 200
+        status, body = await _post(client, _forward_call())
+        assert status == 200, body
+        assert body == bounds["call_over_bound"]["response"]
+
+    connector = _connector(tmp_path, CURIE_TEST_CALL_RESULT_BYTES=str(bounds["call_result_bytes"]))
+    _drive({_CONNECTOR: connector}, drive)
+    assert [call["name"] for call in _calls(tmp_path)] == ["scale"]
+
+
+@pytest.mark.parametrize("case", _CANONICAL["non_finite_texts"], ids=lambda case: case["name"])
+def test_a_non_finite_argument_text_is_refused_before_the_call(
+    tmp_path: Path, case: dict[str, Any]
+) -> None:
+    """@spec ACTION-EXECUTOR-7: NaN and infinities are never canonical."""
+
+    async def drive(client: TestClient) -> None:
+        assert (await _post(client, _request("list")))[0] == 200
+        status, body = await _post(client, _forward_call(arguments=case["text"]))
+        _assert_refused(status, body, _CANONICAL["refusal"])
+
+    _drive({_CONNECTOR: _connector(tmp_path)}, drive)
+    assert _calls(tmp_path) == []

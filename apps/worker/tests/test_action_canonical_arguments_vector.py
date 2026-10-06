@@ -41,6 +41,7 @@ def test_the_vector_has_only_known_keys() -> None:
         "restore",
         "non_canonical_texts",
         "not_an_object_texts",
+        "non_finite_texts",
         "refusal",
     }
     unknown = set(_VECTOR) - expected
@@ -94,3 +95,32 @@ def test_a_non_canonical_text_never_digests_as_its_canonical_form(case: dict[str
     assert connector_grant.arguments_sha256(case["text"]) != connector_grant.arguments_sha256(
         canonical
     )
+
+
+@pytest.mark.parametrize("case", _VECTOR["non_finite_texts"], ids=lambda case: case["name"])
+def test_the_worker_and_the_proxy_refuse_non_finite_numbers(case: dict[str, Any]) -> None:
+    """@spec ACTION-EXECUTOR-7: NaN and infinities have no exact JSON form, on any side."""
+
+    arguments = json.loads(case["text"])  # Python's permissive reader accepts them
+    assert proxy_server._canonical_arguments(arguments) is None
+    with pytest.raises(ValueError):
+        connector_grant.canonical_arguments(arguments)
+
+
+@pytest.mark.parametrize(
+    "case",
+    _VECTOR["vectors"] + _VECTOR["non_finite_texts"],
+    ids=lambda case: case["name"],
+)
+def test_the_worker_and_the_proxy_canonicalize_as_one_implementation(
+    case: dict[str, Any],
+) -> None:
+    """@spec ACTION-EXECUTOR-7: one canonicalizer, so the two never disagree on any input."""
+
+    arguments = case["arguments"] if "arguments" in case else json.loads(case["text"])
+    proxied = proxy_server._canonical_arguments(arguments)
+    try:
+        worker: str | None = connector_grant.canonical_arguments(arguments)
+    except ValueError:
+        worker = None
+    assert worker == proxied

@@ -10,7 +10,9 @@
     "kid_pattern": "^[A-Za-z0-9._-]{1,64}$",
     "ciphertext": "standard base64 alphabet with padding, no line breaks, 1 to 65536 decoded bytes",
     "version_max_length": 256,
-    "redaction_placeholder_prefix": "[REDACTED:"
+    "redaction_placeholder_prefix": "[REDACTED:",
+    "version_alphabet": "printable ASCII (0x20 to 0x7e)",
+    "held_check": "held literals are searched in the envelope text and in the decoded ciphertext bytes"
   },
   "vectors": [
     {
@@ -894,6 +896,194 @@
       "runner": {
         "replay_inputs": "withheld",
         "redacted": true
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "held_literal_base64_wrapped_offset_0",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "eyJ0b2tlbiI6ICJFeGFtcGxlSGVsZFNlY3JldFZhbHVlLTAwMDAwMDAwMDAwMDAwMDMifQ=="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [
+        "ExampleHeldSecretValue-0000000000000003"
+      ],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "withheld",
+        "redacted": true
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "held_literal_base64_wrapped_offset_1",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "AHsidG9rZW4iOiAiRXhhbXBsZUhlbGRTZWNyZXRWYWx1ZS0wMDAwMDAwMDAwMDAwMDAzIn0="
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [
+        "ExampleHeldSecretValue-0000000000000003"
+      ],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "withheld",
+        "redacted": true
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "held_literal_base64_wrapped_offset_2",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "AAB7InRva2VuIjogIkV4YW1wbGVIZWxkU2VjcmV0VmFsdWUtMDAwMDAwMDAwMDAwMDAwMyJ9"
+        },
+        "version": "rv-1041",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [
+        "ExampleHeldSecretValue-0000000000000003"
+      ],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "withheld",
+        "redacted": true
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "version_non_printable",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041\u0007",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "version_with_newline",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041\nrv-1042",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "version_non_ascii",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "rv-1041-é",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
+      },
+      "worker": {
+        "records_snapshot": false
+      }
+    },
+    {
+      "name": "version_513_bytes",
+      "reply": {
+        "ok": true,
+        "prior": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "version": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "held_secrets": [],
+      "envelope_valid": true,
+      "runner": {
+        "replay_inputs": "verbatim",
+        "redacted": false
       },
       "worker": {
         "records_snapshot": false

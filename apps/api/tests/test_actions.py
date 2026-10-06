@@ -332,3 +332,65 @@ def test_a_completion_stores_the_post_version_it_reports(client: Any, auth_heade
         ActionComplete.model_validate({"post_version": "rv-1041"}).model_dump().get("post_version")
         == "rv-1041"
     )
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        pytest.param("v" * 257, id="over_256_chars"),
+        pytest.param("rv-1041\u0007", id="non_printable"),
+        pytest.param("rv-1041\nrv-1042", id="line_break"),
+        pytest.param("rv-1041-é", id="non_ascii"),
+        pytest.param("[REDACTED:jwt]", id="placeholder"),
+        pytest.param("rv-[REDACTED:held_secret]", id="embedded_placeholder"),
+        pytest.param("", id="empty"),
+    ],
+)
+def test_a_malformed_post_version_is_refused_not_truncated(
+    client: Any, auth_headers: Any, version: str
+) -> None:
+    """@spec ACTION-EXECUTOR-9: at most 256 characters of printable ASCII, no placeholder.
+
+    The API refuses rather than truncating or storing it, so a worker-credential
+    holder cannot plant a version the observation comparison would trust.
+    """
+
+    action_id = client.post("/actions", json=_open_body(), headers=auth_headers).json()["id"]
+    response = client.post(
+        f"/actions/{action_id}/complete",
+        json=_complete_body(post_version=version),
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 422
+    row = client.get(f"/actions/{action_id}", headers=auth_headers)
+    if row.status_code == 200:
+        assert row.json()["status"] == "pending"
+
+
+def test_a_256_char_printable_post_version_is_stored(client: Any, auth_headers: Any) -> None:
+    """@spec ACTION-EXECUTOR-9: the bound is inclusive."""
+
+    action_id = client.post("/actions", json=_open_body(), headers=auth_headers).json()["id"]
+    version = "~" * 256
+    response = client.post(
+        f"/actions/{action_id}/complete",
+        json=_complete_body(post_version=version),
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+
+    async def stored() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                return (
+                    await conn.execute(
+                        text("SELECT post_version FROM curie.agent_actions WHERE id = :id"),
+                        {"id": uuid.UUID(action_id)},
+                    )
+                ).scalar_one()
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(stored()) == version

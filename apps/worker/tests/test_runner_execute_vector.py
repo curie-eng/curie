@@ -46,6 +46,9 @@ _KEYS = {
     "phases",
     "sequences",
     "refused_sequences",
+    "refused_tool_sequences",
+    "refused_call_consumes",
+    "bounds",
     "refusal_body_key",
     "refusals",
     "call_transport_failure",
@@ -170,3 +173,20 @@ def test_a_lost_call_outcome_is_response_lost() -> None:
     with pytest.raises(runner_client.ExecuteRefused) as refused:
         _run(answer, _VECTOR["phases"]["call"]["request"])
     assert refused.value.code == failure["worker_code"]
+
+
+def test_an_oversized_call_result_fails_the_execution() -> None:
+    """@spec ACTION-EXECUTOR-6: past the result bound the call failed; it is never retried."""
+
+    from curie_worker.action_executor import call_outcome
+
+    over = _VECTOR["bounds"]["call_over_bound"]
+
+    async def answer(_request: web.Request) -> web.StreamResponse:
+        return web.json_response(over["response"])
+
+    response, seen = _run(answer, _VECTOR["phases"]["call"]["request"])
+    assert len(seen) == 1
+    assert response == over["response"]
+    state, code = call_outcome(is_error=response["is_error"], structured=response["structured"])
+    assert (state, code) == (over["worker_state"], over["worker_code"])
