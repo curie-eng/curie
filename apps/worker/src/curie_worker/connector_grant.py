@@ -17,28 +17,18 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-from collections.abc import Mapping
-from typing import Any
 
+from curie_connector_proxy.canonical import canonical_arguments
 from nacl.signing import SigningKey
 
 from .caller_token import signing_key
 
+# @spec ACTION-EXECUTOR-7. Re-exported: the worker canonicalizes with the
+# proxy's own implementation, so grant ``args`` and the proxy's comparison are
+# one function, NaN and infinity refusals included.
+__all__ = ["PREFIX", "arguments_sha256", "canonical_arguments", "mint"]
+
 PREFIX = "ccg"
-
-
-def canonical_arguments(arguments: Mapping[str, Any]) -> str:
-    """The canonical text of one call's arguments. @spec ACTION-EXECUTOR-7.
-
-    Byte-identical to the caller proxy's parser
-    (``curie_connector_proxy.server._canonical_arguments``), which compares the
-    forwarded arguments with the grant's ``args``; any drift between the two
-    refuses every grant-bound call.
-    """
-
-    if not isinstance(arguments, Mapping):
-        raise TypeError("connector call arguments must be a JSON object")
-    return json.dumps(dict(arguments), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def arguments_sha256(text: str) -> str:

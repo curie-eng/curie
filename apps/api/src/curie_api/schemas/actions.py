@@ -2,7 +2,9 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from ..sealed_snapshot import MAX_VERSION_LENGTH, is_post_version
 
 
 class ActionRecord(BaseModel):
@@ -40,10 +42,22 @@ class ActionComplete(BaseModel):
     post_state: dict[str, Any] | None = None
     # The opaque version the call left, from the connector's sealed reply
     # (ACTION-EXECUTOR-9); one ingredient of ``undoable`` (ACTION-EXECUTOR-11).
-    # The worker sends it only beside a valid envelope.
-    post_version: str | None = None
+    # The worker sends it only beside a valid envelope. A malformed one is a
+    # 422, never truncated or stored.
+    post_version: str | None = Field(
+        default=None, min_length=1, max_length=MAX_VERSION_LENGTH, pattern=r"^[\x20-\x7e]+$"
+    )
     target: dict[str, Any] | None = None
     detail: str | None = None
+
+    @field_validator("post_version")
+    @classmethod
+    def _post_version_is_well_formed(cls, value: str | None) -> str | None:
+        """@spec ACTION-EXECUTOR-9: printable ASCII, at most 256, no placeholder."""
+
+        if value is not None and not is_post_version(value):
+            raise ValueError("post_version must be 1 to 256 printable ASCII characters")
+        return value
 
 
 class ActionOut(BaseModel):

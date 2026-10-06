@@ -4,8 +4,8 @@
 ``prior``, ``version`` and ``target``. ``prior`` is an envelope of exactly the
 keys ``sealed`` (the constant ``curie.snapshot.v1``), ``kid`` (1 to 64
 characters of ``[A-Za-z0-9._-]``) and ``ciphertext`` (standard base64, no line
-breaks, 1 to 65536 decoded bytes); ``version`` is a non-empty string of at most
-256 characters. The worker never seals, opens or inspects the ciphertext.
+breaks, 1 to 65536 decoded bytes); ``version`` is 1 to 256 printable ASCII
+characters. The worker never seals, opens or inspects the ciphertext.
 
 The API (``curie_api.sealed_snapshot``) and the runner's redactor validate the
 same grammar in other images; all three read
@@ -28,6 +28,7 @@ MAX_VERSION_LENGTH: Final = 256
 REDACTION_PLACEHOLDER_PREFIX: Final = "[REDACTED:"
 
 _ENVELOPE_KEYS: Final = frozenset({"sealed", "kid", "ciphertext"})
+_PRINTABLE_ASCII = re.compile(r"[\x20-\x7e]*")
 _KID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 # Standard alphabet with padding only: ``b64decode`` would otherwise skip line
 # breaks and, without ``validate``, the URL-safe ``-`` and ``_``.
@@ -63,11 +64,17 @@ def is_sealed_envelope(value: Any) -> bool:
 
 
 def is_post_version(value: Any) -> bool:
-    """A non-empty version string of at most 256 characters, with no placeholder."""
+    """1 to 256 printable ASCII characters (0x20 to 0x7e), with no placeholder.
+
+    @spec ACTION-EXECUTOR-9. Refused, never truncated: a cut version would be
+    compared with ``observe_version`` as if the connector had written it. The
+    API's ``ActionComplete`` applies the same rule (HTTP 422).
+    """
 
     return (
         isinstance(value, str)
         and 0 < len(value) <= MAX_VERSION_LENGTH
+        and _PRINTABLE_ASCII.fullmatch(value) is not None
         and REDACTION_PLACEHOLDER_PREFIX not in value
     )
 

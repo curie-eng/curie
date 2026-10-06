@@ -83,6 +83,9 @@ _EXECUTE_REFUSALS = {
     "restore_not_advertised": "restore_not_advertised",
     "restore_schema_mismatch": "restore_schema_mismatch",
     "arguments_mismatch": "arguments_mismatch",
+    # A ``call`` whose connector has no URL the grant header could ride to; the
+    # route refuses before dialing, so it is pre-dispatch, never response_lost.
+    "connector_not_hosted": "connector_not_hosted",
 }
 _READ_PHASE_REFUSALS = {**_EXECUTE_REFUSALS, "connector_unreachable": "connector_unreachable"}
 _EXECUTE_REFUSAL_BODY_KEY = "refused"
