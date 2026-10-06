@@ -8,7 +8,11 @@ is read afresh on every evaluation so a provisioner rotation needs no restart,
 and an unset, missing, unreadable or invalid bootstrap is ``runtime_unavailable``.
 
 The evaluation is observational and runs after the caller has released the
-source gate. It opens one ``AuthenticatedMetadataReader`` off the event loop,
+source gate and ended its request transaction. At most four run at once per
+process, on their own small executor; a probe beyond that reports
+``broker_unavailable`` without connecting. Bootstrap files are read relative to
+one opened directory, as bounded regular files opened without blocking. One
+evaluation opens one ``AuthenticatedMetadataReader`` under a five second budget,
 reads the source record, the selected control records and one broker
 observation on that connection, always closes it, and then decides the spec's
 ordered steps over what it read. A fully valid tuple still reports
@@ -20,9 +24,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import stat
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from curie_protected_hooks.admission_records import parse_selection
@@ -40,6 +47,7 @@ from curie_protected_hooks.broker_metadata import BrokerMetadataUnavailable, Bro
 from curie_protected_hooks.broker_transport import (
     AuthenticatedMetadataReader,
     MetadataReaderCredential,
+    metadata_reader_budget,
     trusted_ca_pem,
 )
 from curie_protected_hooks.source_fence import SourceState
@@ -57,6 +65,18 @@ _MAX_MILLISECOND = 9007199254740991
 _POSITIVE_DECIMAL = re.compile(r"[1-9][0-9]{0,15}", re.ASCII)
 _BOOTSTRAP_FIELDS = frozenset({"schema_version", "max_readiness_ms", "control_reader"})
 _READER_FIELDS = frozenset({"username", "password"})
+_FILE_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NONBLOCK | os.O_CLOEXEC
+_CONCURRENCY = 4
+_BUDGET_SECONDS = 5.0
+_SLOTS = threading.BoundedSemaphore(_CONCURRENCY)
+_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_CONCURRENCY, thread_name_prefix="curie-protected-support"
+)
+
+
+class SupportAuthorityUnavailable(Exception):
+    """The committed row's fingerprint cannot be computed, @spec PROTECTED-HOOK-SOURCE-9."""
 
 
 class _BootstrapInvalid(Exception):
@@ -114,12 +134,26 @@ def _require(condition: bool) -> None:
         raise _BootstrapInvalid()
 
 
-def _read_file(directory: Path, name: str) -> bytes:
-    """One bounded bootstrap file, @spec PROTECTED-HOOK-SOURCE-9."""
-    with (directory / name).open("rb") as handle:
-        raw = handle.read(_MAX_FILE_BYTES + 1)
-    _require(len(raw) <= _MAX_FILE_BYTES)
-    return raw
+def _read_file(directory_fd: int, name: str) -> bytes:
+    """One bounded regular bootstrap file relative to the opened directory.
+
+    Symlinks are followed (a secret volume links through ``..data``); the
+    opened file must be regular, so a FIFO, device or directory is refused
+    without blocking. @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    descriptor = os.open(name, _FILE_FLAGS, dir_fd=directory_fd)
+    try:
+        status = os.fstat(descriptor)
+        _require(stat.S_ISREG(status.st_mode) and status.st_size <= _MAX_FILE_BYTES)
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, _MAX_FILE_BYTES + 1 - total):
+            chunks.append(chunk)
+            total += len(chunk)
+            _require(total <= _MAX_FILE_BYTES)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
 
 def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -136,17 +170,24 @@ def _reject_number(_value: str) -> Any:
     raise _BootstrapInvalid()
 
 
-def _load_bootstrap(directory: Path) -> _Bootstrap:
+def _load_bootstrap(directory: str) -> _Bootstrap:
     """Strict bootstrap files, read afresh; any defect is one refusal.
 
     A credential the reader would refuse before connecting (``default`` among
     them) makes the bootstrap invalid. @spec PROTECTED-HOOK-SOURCE-9.
     """
     try:
-        manifest = parse_manifest(_read_file(directory, _MANIFEST_FILE))
-        ca_pem = trusted_ca_pem(_read_file(directory, _CA_FILE).decode("ascii"))
+        directory_fd = os.open(directory, _DIRECTORY_FLAGS)
+        try:
+            manifest_raw = _read_file(directory_fd, _MANIFEST_FILE)
+            ca_raw = _read_file(directory_fd, _CA_FILE)
+            bootstrap_raw = _read_file(directory_fd, _BOOTSTRAP_FILE)
+        finally:
+            os.close(directory_fd)
+        manifest = parse_manifest(manifest_raw)
+        ca_pem = trusted_ca_pem(ca_raw.decode("ascii"))
         config = json.loads(
-            _read_file(directory, _BOOTSTRAP_FILE).decode("utf-8"),
+            bootstrap_raw.decode("utf-8"),
             object_pairs_hook=_unique_pairs,
             parse_float=_reject_number,
             parse_constant=_reject_number,
@@ -183,6 +224,12 @@ def _read_broker(bootstrap: _Bootstrap, agent_id: str, hook: str) -> _BrokerRead
     @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-LANE-2/3.
     """
     runtime = bootstrap.manifest.as_dict()["runtime_id"]
+    with metadata_reader_budget(_BUDGET_SECONDS):
+        return _read_session(bootstrap, runtime, agent_id, hook)
+
+
+def _read_session(bootstrap: _Bootstrap, runtime: str, agent_id: str, hook: str) -> _BrokerReads:
+    """Connect and read inside the caller's budget, @spec PROTECTED-HOOK-SOURCE-9."""
     reader = AuthenticatedMetadataReader.connect(
         bootstrap.manifest, bootstrap.credential, bootstrap.ca_pem
     )
@@ -295,7 +342,7 @@ def _evaluate(policy: SourcePolicySnapshot, fingerprint: str, directory: str) ->
     Blocking; the caller runs it off the event loop. @spec PROTECTED-HOOK-SOURCE-9.
     """
     try:
-        bootstrap = _load_bootstrap(Path(directory))
+        bootstrap = _load_bootstrap(directory)
     except _BootstrapInvalid:
         return ProtectedSupport("runtime_unavailable")
     # 1. One runtime per deployment (SOURCE-1), decided before any broker I/O.
@@ -314,9 +361,27 @@ async def evaluate_protected_support(
 ) -> ProtectedSupport:
     """Broker evaluation of one committed protected row; the gate is already released.
 
+    Raises ``SupportAuthorityUnavailable`` when the row's fingerprint cannot be
+    computed. Beyond four evaluations in flight it reports ``broker_unavailable``
+    at once. A slot is held until its thread finishes, not until the awaiting
+    request ends, so a cancelled request still counts until the budget ends it.
     @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-LANE-2/3.
     """
-    fingerprint = committed_policy_fingerprint(policy)
+    try:
+        fingerprint = committed_policy_fingerprint(policy)
+    except Exception:
+        raise SupportAuthorityUnavailable() from None
     if not directory:
         return ProtectedSupport("runtime_unavailable")
-    return await asyncio.to_thread(_evaluate, policy, fingerprint, directory)
+    if not _SLOTS.acquire(blocking=False):
+        return ProtectedSupport("broker_unavailable")
+    try:
+        submitted: Future[ProtectedSupport] = _EXECUTOR.submit(
+            _evaluate, policy, fingerprint, directory
+        )
+    except BaseException:
+        _SLOTS.release()
+        raise
+    # Released once the work finishes or is cancelled before it starts.
+    submitted.add_done_callback(lambda _done: _SLOTS.release())
+    return await asyncio.wrap_future(submitted)
