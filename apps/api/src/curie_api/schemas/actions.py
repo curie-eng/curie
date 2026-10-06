@@ -38,6 +38,10 @@ class ActionComplete(BaseModel):
     result: dict[str, Any] | None = None
     prior_state: dict[str, Any] | None = None
     post_state: dict[str, Any] | None = None
+    # The opaque version the call left, from the connector's sealed reply
+    # (ACTION-EXECUTOR-9); one ingredient of ``undoable`` (ACTION-EXECUTOR-11).
+    # The worker sends it only beside a valid envelope.
+    post_version: str | None = None
     target: dict[str, Any] | None = None
     detail: str | None = None
 

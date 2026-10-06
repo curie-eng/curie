@@ -2867,6 +2867,8 @@ export interface components {
             post_state?: {
                 [key: string]: unknown;
             } | null;
+            /** Post Version */
+            post_version?: string | null;
             /** Prior State */
             prior_state?: {
                 [key: string]: unknown;

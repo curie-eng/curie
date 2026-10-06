@@ -136,6 +136,17 @@
             ],
             "title": "Post State"
           },
+          "post_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Post Version"
+          },
           "prior_state": {
             "anyOf": [
               {

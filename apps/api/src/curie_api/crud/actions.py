@@ -83,6 +83,8 @@ async def complete_action(
         "result": null() if data.result is None else data.result,
         "prior_state": null() if data.prior_state is None else data.prior_state,
         "post_state": null() if data.post_state is None else data.post_state,
+        # Text, not JSONB: Python None binds as SQL NULL. @spec ACTION-EXECUTOR-11.
+        "post_version": data.post_version,
         "target": null() if data.target is None else data.target,
         "completed_at": datetime.now(UTC).replace(tzinfo=None),
     }

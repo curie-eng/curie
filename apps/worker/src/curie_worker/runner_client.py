@@ -59,6 +59,35 @@ TimeoutResult = Literal["accepted", "conflict", "unconfirmed"]
 
 logger = logging.getLogger(__name__)
 
+# @spec ACTION-EXECUTOR-5 @spec ACTION-EXECUTOR-24. The runner-private boot
+# variable (outside ``BootEnv``) an executor claim sets, and its value. Frozen
+# with the runner's reader by ``tests/vectors/runner-execute.json``.
+RUNNER_MODE_ENV = "CURIE_RUNNER_MODE"
+EXECUTOR_MODE = "execute"
+
+# @spec ACTION-EXECUTOR-6. The executor route's one request shape: every key is
+# present on every phase, and a key the phase does not use is null.
+EXECUTE_PATH = "/v1/execute"
+EXECUTE_REQUEST_KEYS = frozenset(
+    {"execution_id", "phase", "connector", "tool", "arguments", "grant", "target"}
+)
+EXECUTE_PHASES = frozenset({"list", "observe", "call"})
+# @spec ACTION-EXECUTOR-20. A route refusal that provably dialed nothing (or, for
+# ``connector_unreachable`` on ``list``/``observe``, only a read) maps to one
+# pre-dispatch code. Ordering and shape refusals are the worker's own fault
+# against a healthy runner, reported as ``runner_unavailable``.
+_EXECUTE_REFUSALS = {
+    "phase_out_of_order": "runner_unavailable",
+    "invalid_request": "runner_unavailable",
+    "tool_not_advertised": "tool_not_advertised",
+    "restore_not_advertised": "restore_not_advertised",
+    "restore_schema_mismatch": "restore_schema_mismatch",
+    "arguments_mismatch": "arguments_mismatch",
+}
+_READ_PHASE_REFUSALS = {**_EXECUTE_REFUSALS, "connector_unreachable": "connector_unreachable"}
+_EXECUTE_REFUSAL_BODY_KEY = "refused"
+_EXECUTE_BODY_MAX_BYTES = 1_048_576
+
 
 def _auth_headers(token: str | None) -> dict[str, str] | None:
     """Per-call Authorization header for the per-sandbox runner token (issue #63).
@@ -94,6 +123,42 @@ def _valid_turn_epoch(value: str | None) -> bool:
 
 class RunnerError(Exception):
     """The runner returned an unexpected HTTP status or an unreadable stream."""
+
+
+class ExecuteRefused(RunnerError):
+    """An executor route call ended without a usable phase response.
+
+    ``code`` is the closed ACTION-EXECUTOR-20 code the worker reports: a
+    pre-dispatch code (``runner_unavailable`` for a runner without the route, an
+    unreachable runner or an ordering refusal) or, for a ``call`` whose outcome
+    may have reached the connector, ``response_lost``, which is never a refusal
+    (ACTION-EXECUTOR-17).
+    """
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"/v1/execute: {code} ({detail})")
+        self.code = code
+
+
+def _execute_failure_code(phase: str, status: int | None, refused: object) -> str:
+    """The ACTION-EXECUTOR-20 code for a failed executor route call.
+
+    ``status`` is None for a transport failure. Only a refusal the route makes
+    before dialing is a provable non-write; anything else on a ``call``, an
+    unknown code above all, may have reached the connector and is
+    ``response_lost``.
+    """
+
+    if status == 404:
+        # A runner image without the route (ACTION-EXECUTOR-24); it dials nothing.
+        return "runner_unavailable"
+    if phase == "call":
+        if isinstance(refused, str) and refused in _EXECUTE_REFUSALS:
+            return _EXECUTE_REFUSALS[refused]
+        return "response_lost"
+    if isinstance(refused, str) and refused in _READ_PHASE_REFUSALS:
+        return _READ_PHASE_REFUSALS[refused]
+    return "runner_unavailable"
 
 
 class RunnerStreamTimeout(TimeoutError):
@@ -768,6 +833,66 @@ class RunnerClient:
                 return None, "success"
 
         await self._rpc("turn-admit", token, request)
+
+    async def execute(
+        self,
+        base_url: str,
+        request: Mapping[str, Any],
+        *,
+        token: str,
+        remaining_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Run one executor phase on an executor-mode runner. @spec ACTION-EXECUTOR-24.
+
+        Posts ``request`` (exactly the ACTION-EXECUTOR-6 keys) to
+        ``/v1/execute`` with the per-sandbox bearer and returns the phase's
+        response body. Every other ending raises ``ExecuteRefused`` with the
+        code the worker reports; nothing about the arguments, grant or reply is
+        logged or carried in the error.
+        """
+
+        if not token:
+            raise RunnerError("/v1/execute requires a runner token")
+        if set(request) != EXECUTE_REQUEST_KEYS:
+            raise RunnerError("/v1/execute request does not carry exactly the frozen keys")
+        phase = request["phase"]
+        if phase not in EXECUTE_PHASES:
+            raise RunnerError("/v1/execute request names an unknown phase")
+        body = dict(request)
+
+        async def send(headers: dict[str, str] | None) -> tuple[dict[str, Any], str]:
+            try:
+                async with self._session.post(
+                    f"{base_url}{EXECUTE_PATH}",
+                    json=body,
+                    headers=headers,
+                    timeout=self._request_timeout(remaining_s),
+                ) as resp:
+                    raw = await resp.content.read(_EXECUTE_BODY_MAX_BYTES + 1)
+                    status = resp.status
+            except (aiohttp.ClientError, TimeoutError) as exc:
+                code = _execute_failure_code(phase, None, None)
+                raise ExecuteRefused(code, f"transport {type(exc).__name__}") from exc
+            parsed: object = None
+            if len(raw) <= _EXECUTE_BODY_MAX_BYTES:
+                try:
+                    parsed = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    parsed = None
+            if status != 200:
+                refused = (
+                    parsed.get(_EXECUTE_REFUSAL_BODY_KEY) if isinstance(parsed, dict) else None
+                )
+                code = _execute_failure_code(phase, status, refused)
+                raise ExecuteRefused(code, f"HTTP {status}")
+            if not isinstance(parsed, dict) or parsed.get("phase") != phase:
+                # A 200 the worker cannot read: on ``call`` the write may have
+                # happened, so it is lost, never refused.
+                code = "response_lost" if phase == "call" else "runner_unavailable"
+                raise ExecuteRefused(code, "unreadable phase response")
+            return parsed, "success"
+
+        return await self._rpc("execute", token, send)
 
     async def close(self) -> None:
         if self._own_session:
