@@ -22,6 +22,7 @@ ENV CARGO_HOME=${HOME}/.cargo
 ENV UV_CACHE_DIR=${HOME}/.cache/uv
 ENV PNPM_HOME=${HOME}/.local/share/pnpm
 ENV PATH="/usr/local/cargo/bin:${PATH}"
+RUN rustup component add rustfmt clippy
 # Claude Code asks for up to 64000 output tokens per Opus request by default,
 # and OpenRouter reserves credit for the whole ceiling, so a low balance refused
 # every reviewer call (#3935). A verdict needs a few thousand tokens. The CLI
