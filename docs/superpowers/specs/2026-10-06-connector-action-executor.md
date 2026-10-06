@@ -744,8 +744,12 @@ Review decisions for the routes, which the worker and later tasks rely on:
   chat, console, operator or adapter principal, exactly as the approval resolver
   does under ADR 0106; a self-asserted `actor` in the request body is not
   authority, and a body actor that differs from the principal is refused. A
-  ruling now causes a real restore, so a platform key alone cannot impersonate
-  an approver.
+  ruling now causes a real restore, so a bare platform key with a body actor no
+  longer rules. Operator and adapter principals are signed with that key, so
+  its holder can still mint an operator principal naming any approver; that is
+  the same trust ADR 0106 places in approving, not a stronger guarantee. The
+  undo route authenticates the principal before it looks up the action, so an
+  unauthenticated caller cannot learn which action identifiers exist.
 * The internal probe, claim, observation, report and dispatch routes require
   the internal worker token, not the platform or operator key, so a key holder
   cannot forge a confirmed restore or a `restore_capable` capability row. With
