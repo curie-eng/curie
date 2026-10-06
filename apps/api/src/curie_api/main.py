@@ -76,6 +76,7 @@ from .routers import (
     runs,
     schedules,
     state,
+    thread_attachments,
     turn_progress,
     work_item_issue,
     work_item_outcomes,
@@ -476,6 +477,7 @@ def create_app() -> FastAPI:
     app.include_router(state.router)
     app.include_router(state.internal_router)
     app.include_router(state.released_router)
+    app.include_router(thread_attachments.internal_router)
     app.include_router(memory.router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise
     # be matched by GET /approvals/{approval_id} and fail as a bad uuid.

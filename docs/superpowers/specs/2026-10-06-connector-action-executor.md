@@ -529,6 +529,12 @@ call that straddles a rollout, a tag-referenced `image:` connector, a plugin
 MCP server, an unreadable Deployment and an API server delayed past the bound
 each record null; the turn completes in every case, within the bound.
 
+The worker's `get` on Deployments is granted only when the executor is enabled
+and the connector reconciler that already manages those Deployments is
+enabled; with the executor off, the worker Role is unchanged and actions record
+no digest, so they are not undoable. Least privilege outweighs recording digests
+for an executor that is not running.
+
 <!-- @spec ACTION-EXECUTOR-13 -->
 **ACTION-EXECUTOR-13. Restore capability from the advertised list.** When the
 connector reconcile observes a hosted connector rolled out at a digest with no

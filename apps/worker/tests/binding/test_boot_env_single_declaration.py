@@ -285,6 +285,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # _serve before harness resolution. Runner-private by design, so it is
         # deliberately not a BootEnv key (BootEnv is a frozen contract).
         "CURIE_RUNNER_MODE",
+        # The connector action executor switch (ACTION-EXECUTOR, #4067): read by
+        # the API settings and by WorkerConfig at worker startup to decide
+        # whether executions are claimed and dispatched. Never a sandbox boot key.
+        "CURIE_ACTION_EXECUTOR_ENABLED",
         # End to end namespace reaper (#3245), read by the worker process only.
         # The test cluster kubeconfig is not among them: the reaper reads it
         # from the connector Secret at sweep time.

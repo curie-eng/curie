@@ -462,6 +462,8 @@
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
           "/v1/internal/channel-read/context",
+          "/v1/internal/thread-attachments/query",
+          "/v1/internal/thread-attachments/append",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
@@ -493,7 +495,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1080,
+      "cardinality_bound": 1096,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -624,6 +626,8 @@
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
           "/v1/internal/channel-read/context",
+          "/v1/internal/thread-attachments/query",
+          "/v1/internal/thread-attachments/append",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
@@ -662,7 +666,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 5400,
+      "cardinality_bound": 5480,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -793,6 +797,8 @@
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
           "/v1/internal/channel-read/context",
+          "/v1/internal/thread-attachments/query",
+          "/v1/internal/thread-attachments/append",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
@@ -831,7 +837,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 5400,
+      "cardinality_bound": 5480,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",
