@@ -3166,20 +3166,21 @@ for policy in (
 retained = pathlib.Path(sys.argv[2]).read_text()
 assert metadata_ci(yaml.safe_load_all(retained)) == "{}", "retained values lost the empty metadata CI default"
 
-for policy in (
-    [],
-    {"repo": {"checks": ["pr-body"]}},
-    {"acme/repo/extra": {"checks": ["pr-body"]}},
-    {"acme/repo": []},
-    {"acme/repo": {"unknown": ["pr-body"]}},
-    {"acme/repo": {"checks": "pr-body"}},
-    {"acme/repo": {"statuses": [1]}},
-    {"acme/repo": {"checks": [""]}},
-    {"acme/repo": {"statuses": [""]}},
+for policy, diagnostics in (
+    ([], ("githubFactoryMetadataCi",)),
+    ({"repo": {"checks": ["pr-body"]}}, ("repo", "^[^/]+/[^/]+$")),
+    ({"acme/repo/extra": {"checks": ["pr-body"]}}, ("acme/repo/extra", "^[^/]+/[^/]+$")),
+    ({"acme/repo": []}, ("githubFactoryMetadataCi",)),
+    ({"acme/repo": {"unknown": ["pr-body"]}}, ("githubFactoryMetadataCi", "unknown")),
+    ({"acme/repo": {"checks": "pr-body"}}, ("githubFactoryMetadataCi", "checks")),
+    ({"acme/repo": {"statuses": [1]}}, ("githubFactoryMetadataCi", "statuses")),
+    ({"acme/repo": {"checks": [""]}}, ("githubFactoryMetadataCi", "checks")),
+    ({"acme/repo": {"statuses": [""]}}, ("githubFactoryMetadataCi", "statuses")),
 ):
     result = render("--set-json", f"{value_key}={json.dumps(policy)}")
     assert result.returncode != 0, f"accepted malformed {value_key}: {policy!r}"
-    assert "githubFactoryMetadataCi" in result.stderr, result.stderr
+    assert "schema(s)" in result.stderr, result.stderr
+    assert all(diagnostic in result.stderr for diagnostic in diagnostics), result.stderr
 
 result = render(
     "--set", f"api.extraEnv[0].name={env_name}",
