@@ -1193,3 +1193,108 @@ def test_a_thread_budget_below_one_message_is_refused(
 ) -> None:
     with pytest.raises(ValueError):
         attachments.AttachmentLimits(**overrides)
+
+
+# --- round 3 (#4141): name and size edges ----------------------------------------------
+
+
+def test_disk_names_are_unique_regardless_of_case(attachments: Any, ledger: Any) -> None:
+    """A case-folding host (docker on macOS or Windows) would land ``Report.pdf``
+    on top of ``report.pdf``, so the two are one name for uniqueness."""
+
+    assert attachments.assign_disk_names(["Report.pdf"], taken={"report.pdf"}) == (
+        "Report-2.pdf",
+    )
+    assert attachments.assign_disk_names(["a.TXT", "A.txt"], taken=()) == ("a.TXT", "A-2.txt")
+
+    files = FakeSlackFiles({"C1": [b"new"], "E1": [b"old"]})
+    coordinator, _store, _clock = _coordinator(attachments, files=files)
+    prepared = _prepare(
+        coordinator,
+        ledger_refs=[_earlier(ledger, "E1", b"old", disk_name="report.pdf")],
+        routes=[_slack_route(attachments)],
+        current=[Attachment(id="C1", name="Report.pdf")],
+    )
+
+    names = [entry.disk_name for entry in prepared.entries]
+    assert names == ["report.pdf", "Report-2.pdf"]
+    assert len({name.casefold() for name in names}) == len(names)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["x" * 300 + ".pdf", "é" * 200 + ".csv"],
+    ids=["ascii", "multibyte"],
+)
+def test_a_name_over_255_bytes_is_shortened_at_assignment_keeping_its_extension(
+    attachments: Any, raw: str
+) -> None:
+    extension = raw[-4:]
+    assert len(raw.encode("utf-8")) > 255
+
+    first, second = attachments.assign_disk_names([raw, raw], taken=())
+
+    for name in (first, second):
+        assert len(name.encode("utf-8")) <= 255, "a filesystem refuses a longer leaf"
+        assert name.endswith(extension)
+    assert first != second, "shortening must not collapse two files onto one name"
+
+    files = FakeSlackFiles({"C1": [b"one"], "C2": [b"two"]})
+    coordinator, _store, _clock = _coordinator(attachments, files=files)
+    prepared = _prepare(
+        coordinator,
+        current=[Attachment(id="C1", name=raw), Attachment(id="C2", name=raw)],
+    )
+    carried = [entry["n"] for entry in _ref_entries(prepared.claim_env())]
+    assert len(carried) == 2
+    assert all(len(name.encode("utf-8")) <= 255 for name in carried)
+    assert [ref.disk_name for ref in prepared.append_refs] == carried
+
+
+def test_an_earlier_file_recorded_over_the_per_file_cap_is_unavailable_and_never_fetched(
+    attachments: Any, ledger: Any
+) -> None:
+    """Recorded under a larger cap than this worker's: it would be refused
+    mid-stream, so it is named unavailable without spending a fetch."""
+
+    files = FakeSlackFiles({"BIG": [b"b" * 10], "OK": [b"ok"]})
+    coordinator, _store, _clock = _coordinator(attachments, files=files, max_file_bytes=64)
+
+    prepared = _prepare(
+        coordinator,
+        ledger_refs=[
+            _earlier(ledger, "BIG", b"b" * 10, disk_name="big.bin", size_bytes=65),
+            _earlier(ledger, "OK", b"ok", disk_name="ok.bin", ordinal=1),
+        ],
+        routes=[_slack_route(attachments)],
+    )
+
+    assert _unavailable(prepared) == {"big.bin": "fetch_failed"}
+    assert "BIG" not in files.requested
+    assert [entry.disk_name for entry in prepared.entries] == ["ok.bin"]
+
+
+def test_current_files_count_against_the_thread_byte_budget(
+    attachments: Any, ledger: Any
+) -> None:
+    """The budget bounds the whole boot: earlier files fill only what the
+    current message left, newest first."""
+
+    files = FakeSlackFiles(
+        {"C1": [b"c" * 60], "E1": [b"1" * 30], "E2": [b"2" * 30], "E3": [b"3" * 30]}
+    )
+    coordinator, _store, _clock = _coordinator(attachments, files=files, thread_max_bytes=100)
+
+    prepared = _prepare(
+        coordinator,
+        ledger_refs=[
+            _earlier(ledger, f"E{index}", str(index).encode() * 30, disk_name=f"e{index}.bin")
+            for index in (1, 2, 3)
+        ],
+        routes=[_slack_route(attachments)],
+        current=[Attachment(id="C1", name="c.bin")],
+    )
+
+    assert [entry.disk_name for entry in prepared.entries] == ["e3.bin", "c.bin"]
+    assert sum(entry.size_bytes for entry in prepared.entries) <= 100
+    assert prepared.omitted == ("e1.bin", "e2.bin")
