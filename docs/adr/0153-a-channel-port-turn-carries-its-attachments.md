@@ -4,6 +4,14 @@ Date: 2026-09-16
 
 Status: Accepted
 
+**Partially amended by [ADR 0205](0205-an-attachment-belongs-to-its-thread.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+a file reaches every sandbox that boots for its thread, not only the one for
+the message that carried it, and an earlier message's file the channel no
+longer serves is reported unavailable instead of failing the boot. The
+transport, the adapter fetch route, and the all-or-nothing rule for the
+carrying message stand.
+
 > Offered upstream from a downstream fork, where it was implemented and is
 > running. Nothing in it is tenant-specific: the transport it decides is the one
 > this repository's own AgentMail adapter needs, and it names no installation.
