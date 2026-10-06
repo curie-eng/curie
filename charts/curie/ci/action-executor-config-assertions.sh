@@ -39,6 +39,9 @@ fail() {
   exit 1
 }
 
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
 # $@ = extra --set flags.
 render() {
   helm template curie "$CHART" -n "$NS" \
@@ -50,11 +53,12 @@ render() {
 
 # Print "<api>|<worker>" where each side is the literal env value, or <absent>.
 flag_pair() {
-  python3 - "$1" <<'PY'
+  local manifest; manifest=$(mktemp "$WORK/manifest.XXXXXX"); printf '%s' "$1" >"$manifest"
+  python3 - "$manifest" <<'PY'
 import sys, yaml
 
 FLAG = "CURIE_ACTION_EXECUTOR_ENABLED"
-docs = [d for d in yaml.safe_load_all(sys.argv[1]) if d]
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1]).read()) if d]
 
 
 def deployment(component):
@@ -89,9 +93,10 @@ PY
 }
 
 worker_role_rules() {
-  python3 - "$1" <<'PY'
+  local manifest; manifest=$(mktemp "$WORK/manifest.XXXXXX"); printf '%s' "$1" >"$manifest"
+  python3 - "$manifest" <<'PY'
 import sys, yaml
-docs = [d for d in yaml.safe_load_all(sys.argv[1]) if d]
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1]).read()) if d]
 roles = [
     d for d in docs
     if d.get("kind") == "Role" and d["metadata"]["name"].endswith("-worker")
