@@ -64,6 +64,31 @@ def released_upgrade_environment(
     }
 
 
+def private_service_environment(
+    environment: dict[str, str], *, postgres: int, valkey: int, s3: int, otel: int
+) -> dict[str, str]:
+    # Every endpoint the Python gates read, pointed at the private project's
+    # published ports. Ambient values for the same variables are replaced.
+    database = f"postgresql+asyncpg://postgres:postgres@127.0.0.1:{postgres}/postgres"
+    return {
+        **environment,
+        **released_upgrade_environment(
+            environment["COMPOSE_PROJECT_NAME"], environment["COMPOSE_FILE"], postgres
+        ),
+        "DATABASE_URL": database,
+        "TEST_DATABASE_URL": database,
+        "TEST_VALKEY_HOST": "127.0.0.1",
+        "TEST_VALKEY_PORT": str(valkey),
+        "VALKEY_HOST": "127.0.0.1",
+        "VALKEY_PORT": str(valkey),
+        "S3_ENDPOINT_URL": f"http://127.0.0.1:{s3}",
+        "TEST_S3_ENDPOINT_URL": f"http://127.0.0.1:{s3}",
+        "TEST_OTEL_COLLECTOR_ENDPOINT": f"http://127.0.0.1:{otel}/v1/traces",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{otel}",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+    }
+
+
 def exact(job: str, step: str, command: str, cwd: str, group: str) -> Check:
     return Check("ci.yaml", job, step, command, cwd, group, command)
 
@@ -1030,25 +1055,8 @@ def private_services(root: Path, worktree: Path) -> Iterator[dict[str, str]]:
                 valkey = port("valkey", 6379)
                 s3 = port("rustfs", 9000)
                 otel = port("otel-collector", 4318)
-                environment.update(
-                    released_upgrade_environment(
-                        environment["COMPOSE_PROJECT_NAME"], environment["COMPOSE_FILE"], postgres
-                    )
-                )
-                environment.update(
-                    {
-                        "DATABASE_URL": f"postgresql+asyncpg://postgres:postgres@127.0.0.1:{postgres}/postgres",
-                        "TEST_DATABASE_URL": f"postgresql+asyncpg://postgres:postgres@127.0.0.1:{postgres}/postgres",
-                        "TEST_VALKEY_HOST": "127.0.0.1",
-                        "TEST_VALKEY_PORT": str(valkey),
-                        "VALKEY_HOST": "127.0.0.1",
-                        "VALKEY_PORT": str(valkey),
-                        "S3_ENDPOINT_URL": f"http://127.0.0.1:{s3}",
-                        "TEST_S3_ENDPOINT_URL": f"http://127.0.0.1:{s3}",
-                        "TEST_OTEL_COLLECTOR_ENDPOINT": f"http://127.0.0.1:{otel}/v1/traces",
-                        "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{otel}",
-                        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-                    }
+                environment = private_service_environment(
+                    environment, postgres=postgres, valkey=valkey, s3=s3, otel=otel
                 )
                 migration = run_check(
                     root / "apps/api",
