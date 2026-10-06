@@ -139,6 +139,7 @@ api:
   GITHUB_FACTORY_CI_WAIT_S: api.githubFactoryCiWaitSeconds
   GITHUB_FACTORY_PYTHON_CI: api.githubFactoryPythonCi
   GITHUB_FACTORY_BASES: api.githubFactoryBases
+  GITHUB_FACTORY_METADATA_CI: api.githubFactoryMetadataCi
   GITHUB_FACTORY_INGRESS_ENABLED: api.githubFactoryIngressEnabled
   GITHUB_FACTORY_INTAKE: api.githubFactoryIntake
   GITHUB_FACTORY_LABEL: api.githubFactoryLabel

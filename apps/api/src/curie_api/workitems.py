@@ -1921,7 +1921,7 @@ async def request_owner_lost_cancellation(
     ttl = timedelta(seconds=get_settings().work_item_runtime_ttl_seconds)
     heartbeat_lapsed = (
         request.runtime_heartbeat_expires_at is not None
-        and request.runtime_heartbeat_expires_at <= now
+        and request.runtime_heartbeat_expires_at + ttl <= now
     )
     owner_absent = (
         request.runtime_owner is None
@@ -1957,7 +1957,7 @@ async def request_owner_lost_cancellation(
                     ExecutionRequest.runtime_heartbeat_expires_at.is_not(None)
                     & (
                         ExecutionRequest.runtime_heartbeat_expires_at
-                        <= func.clock_timestamp()
+                        <= func.clock_timestamp() - ttl
                     )
                 )
                 | (

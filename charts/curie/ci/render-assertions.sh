@@ -77,6 +77,10 @@
 # preflight to post-install, so that hook uses the platform class too. Negative
 # controls prove both pod spec shapes and both phase exceptions.
 #
+# Issue #4162, Assertion 20. Metadata CI policy has a first-class chart value,
+# defaults to an empty JSON object, and rejects malformed values and extraEnv
+# overrides. Retained values from before the key existed keep the empty default.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
 
@@ -3172,6 +3176,87 @@ PYEOF
   fi
   echo "  ok: $case_name worker pods/log rule is rejected"
 done
+
+echo "=== Assertion 21: API metadata CI policy renders from its chart value (#4162) ==="
+python3 - "$CHART" "$TMP/reuse-render/curie/templates/api.yaml" <<'PYEOF'
+import json
+import pathlib
+import subprocess
+import sys
+
+import yaml
+
+chart = sys.argv[1]
+env_name = "GITHUB_FACTORY_METADATA_CI"
+value_key = "api.githubFactoryMetadataCi"
+
+
+def metadata_ci(documents):
+    apis = [
+        doc for doc in documents
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Deployment"
+        and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "api"
+    ]
+    assert len(apis) == 1, f"expected one API Deployment, found {len(apis)}"
+    containers = apis[0]["spec"]["template"]["spec"]["containers"]
+    api = [container for container in containers if container["name"] == "api"]
+    assert len(api) == 1, f"expected one API container, found {len(api)}"
+    entries = [entry for entry in api[0]["env"] if entry["name"] == env_name]
+    assert len(entries) == 1, f"expected exactly one {env_name}, found {entries!r}"
+    assert set(entries[0]) == {"name", "value"}, entries[0]
+    assert isinstance(entries[0]["value"], str), entries[0]
+    return entries[0]["value"]
+
+
+def render(*args):
+    return subprocess.run(
+        ["helm", "template", "acme", chart, *args],
+        text=True, capture_output=True,
+    )
+
+
+for policy in (
+    None,
+    {"acme/repo": {"checks": ["pr-body"], "statuses": []}},
+    {"acme/repo": {"checks": ["pr-body"]}, "acme/other": {"statuses": ["lint"]}},
+):
+    args = [] if policy is None else ["--set-json", f"{value_key}={json.dumps(policy)}"]
+    result = render(*args)
+    assert result.returncode == 0, result.stderr
+    value = metadata_ci(yaml.safe_load_all(result.stdout))
+    expected = {} if policy is None else policy
+    assert json.loads(value) == expected, f"{env_name} rendered {value!r}, expected {expected!r}"
+    if policy is None:
+        assert value == "{}", f"default {env_name} must render {{}}"
+
+retained = pathlib.Path(sys.argv[2]).read_text()
+assert metadata_ci(yaml.safe_load_all(retained)) == "{}", "retained values lost the empty metadata CI default"
+
+for policy, diagnostics in (
+    ([], ("githubFactoryMetadataCi",)),
+    ({"repo": {"checks": ["pr-body"]}}, ("repo", "^[^/]+/[^/]+$")),
+    ({"acme/repo/extra": {"checks": ["pr-body"]}}, ("acme/repo/extra", "^[^/]+/[^/]+$")),
+    ({"acme/repo": []}, ("githubFactoryMetadataCi",)),
+    ({"acme/repo": {"unknown": ["pr-body"]}}, ("githubFactoryMetadataCi", "unknown")),
+    ({"acme/repo": {"checks": "pr-body"}}, ("githubFactoryMetadataCi", "checks")),
+    ({"acme/repo": {"statuses": [1]}}, ("githubFactoryMetadataCi", "statuses")),
+    ({"acme/repo": {"checks": [""]}}, ("githubFactoryMetadataCi", "checks")),
+    ({"acme/repo": {"statuses": [""]}}, ("githubFactoryMetadataCi", "statuses")),
+):
+    result = render("--set-json", f"{value_key}={json.dumps(policy)}")
+    assert result.returncode != 0, f"accepted malformed {value_key}: {policy!r}"
+    assert "schema(s)" in result.stderr, result.stderr
+    assert all(diagnostic in result.stderr for diagnostic in diagnostics), result.stderr
+
+result = render(
+    "--set", f"api.extraEnv[0].name={env_name}",
+    "--set-string", "api.extraEnv[0].value={}",
+)
+assert result.returncode != 0, f"accepted reserved api.extraEnv {env_name}"
+assert "api.extraEnv" in result.stderr and value_key in result.stderr, result.stderr
+print("  ok: default, configured and retained metadata CI render; schema and extraEnv refuse invalid inputs")
+PYEOF
 
 echo
 echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate while every other workload keeps its strategy; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays; every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from the chart-owned runner token Secret and none renders the tokenless dev flag, proven by three failing negative controls."

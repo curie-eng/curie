@@ -1293,6 +1293,10 @@ api:
   # an entry may only use its default branch. Rendered as JSON into
   # GITHUB_FACTORY_BASES.
   githubFactoryBases: {}
+  # Checks and commit statuses that rerun after a pull request metadata edit,
+  # keyed by owner/name: {checks: [name, ...], statuses: [name, ...]}.
+  # Rendered as JSON into GITHUB_FACTORY_METADATA_CI.
+  githubFactoryMetadataCi: {}
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed

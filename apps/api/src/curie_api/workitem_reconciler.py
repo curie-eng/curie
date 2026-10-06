@@ -277,7 +277,7 @@ class WorkItemReconciler:
                                 )
                                 & (
                                     ExecutionRequest.runtime_heartbeat_expires_at
-                                    <= now
+                                    <= now - ttl
                                 )
                             )
                             | (
