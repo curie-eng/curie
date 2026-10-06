@@ -162,6 +162,151 @@ def _client(api: _FakeApi) -> KubernetesSandboxClient:
     return client
 
 
+class _LogApi(_FakeApi):
+    """The CoreV1Api boundary, with one response per attempted log read."""
+
+    def __init__(self, responses: list[object], *, elapsed: list[float] | None = None) -> None:
+        super().__init__()
+        self.responses = responses
+        self.elapsed = elapsed or [0.0] * len(responses)
+        self.now = 100.0
+        self.log_reads: list[dict[str, object]] = []
+
+    def read_namespaced_pod_log(
+        self,
+        name: str,
+        namespace: str,
+        *,
+        container: str,
+        previous: bool,
+        tail_lines: int,
+        limit_bytes: int,
+        _preload_content: bool,
+        _request_timeout: float,
+    ) -> object:
+        # Kubernetes documents previous as the previous terminated container's
+        # log and bounds by both lines and bytes. The generated Python API
+        # exposes the urllib3 response when _preload_content is false:
+        # https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#read-log
+        # https://github.com/kubernetes-client/python/blob/master/kubernetes/docs/CoreV1Api.md#read_namespaced_pod_log
+        self.log_reads.append(
+            {
+                "name": name,
+                "namespace": namespace,
+                "container": container,
+                "previous": previous,
+                "tail_lines": tail_lines,
+                "limit_bytes": limit_bytes,
+                "preload_content": _preload_content,
+                "request_timeout": _request_timeout,
+            }
+        )
+        self.now += self.elapsed.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (
+            SimpleNamespace(data=b"runner boot\ntraceback: \xff\n"),
+            "runner boot\ntraceback: \ufffd\n",
+        ),
+        (b"plain bytes\n", "plain bytes\n"),
+        ("plain text\n", "plain text\n"),
+    ],
+    ids=["http-response-invalid-utf8", "raw-bytes", "text"],
+)
+def test_pod_log_tail_reads_previous_runner_output_with_bounds(
+    response: object, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = _LogApi([response])
+    monkeypatch.setattr(k8s_module.time, "monotonic", lambda: api.now)
+
+    assert _client(api).pod_log_tail("runner-pod", request_timeout_seconds=5.0) == expected
+    assert api.log_reads == [
+        {
+            "name": "runner-pod",
+            "namespace": "test-ns",
+            "container": "runner",
+            "previous": True,
+            "tail_lines": 200,
+            "limit_bytes": 8192,
+            "preload_content": False,
+            "request_timeout": 5.0,
+        }
+    ]
+
+
+def test_pod_log_tail_falls_back_to_current_only_when_previous_returns_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _LogApi(
+        [k8s_module.k8s_client.ApiException(status=400), SimpleNamespace(data=b"current\n")],
+        elapsed=[2.0, 0.0],
+    )
+    monkeypatch.setattr(k8s_module.time, "monotonic", lambda: api.now)
+
+    assert _client(api).pod_log_tail("runner-pod", request_timeout_seconds=5.0) == "current\n"
+    assert [read["previous"] for read in api.log_reads] == [True, False]
+    assert [read["request_timeout"] for read in api.log_reads] == [5.0, 3.0]
+    assert all(
+        read["name"] == "runner-pod"
+        and read["namespace"] == "test-ns"
+        and read["container"] == "runner"
+        and read["tail_lines"] == 200
+        and read["limit_bytes"] == 8192
+        and read["preload_content"] is False
+        for read in api.log_reads
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        k8s_module.k8s_client.ApiException(status=403),
+        k8s_module.k8s_client.ApiException(status=404),
+        k8s_module.k8s_client.ApiException(status=500),
+        TimeoutError("log read timed out"),
+        OSError("log transport failed"),
+    ],
+    ids=["forbidden", "missing", "server-error", "timeout", "transport"],
+)
+def test_pod_log_tail_errors_return_none_without_retry(error: BaseException) -> None:
+    api = _LogApi([error])
+
+    assert _client(api).pod_log_tail("runner-pod", request_timeout_seconds=5.0) is None
+    assert len(api.log_reads) == 1
+    assert api.log_reads[0]["previous"] is True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [k8s_module.k8s_client.ApiException(status=400), TimeoutError("current log timed out")],
+    ids=["current-400", "current-timeout"],
+)
+def test_pod_log_tail_current_failure_returns_none_and_never_retries_again(
+    error: BaseException,
+) -> None:
+    api = _LogApi([k8s_module.k8s_client.ApiException(status=400), error])
+
+    assert _client(api).pod_log_tail("runner-pod", request_timeout_seconds=5.0) is None
+    assert [read["previous"] for read in api.log_reads] == [True, False]
+
+
+def test_pod_log_tail_exhausted_previous_read_does_not_start_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _LogApi([k8s_module.k8s_client.ApiException(status=400)], elapsed=[5.1])
+    monkeypatch.setattr(k8s_module.time, "monotonic", lambda: api.now)
+
+    assert _client(api).pod_log_tail("runner-pod", request_timeout_seconds=5.0) is None
+    assert len(api.log_reads) == 1
+
+
 def _resource_quota(
     *,
     name: str = "curie-sandbox-quota",

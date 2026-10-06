@@ -33,6 +33,7 @@ from typing import Any
 
 from aci_protocol import BootEnv
 from curie_telemetry import operation_span, record_metric
+from curie_telemetry.redact import redact_text
 from opentelemetry.trace import SpanKind, StatusCode
 
 from ..binding import (
@@ -46,6 +47,7 @@ from ..binding import (
 from ..workitem_dispatch import TerminationObservation
 from .affinity import AffinityStore
 from .docker import DockerSandboxClient
+from .k8s import KubernetesSandboxClient
 from .types import (
     AGENT_LABEL,
     MANAGED_BY_LABEL,
@@ -1401,6 +1403,7 @@ class SandboxSubstrate:
         last_ready_condition: tuple[str | None, str | None] | None = None
         consecutive_quota = 0
         last_unschedulable: str | None = None
+        last_pod_name = claim_name
         sleeps = _poll_sleeps(self._config)
         while time.monotonic() < deadline:
             claim = self._k8s.get_claim(
@@ -1411,6 +1414,7 @@ class SandboxSubstrate:
                 ),
             )
             if claim is not None:
+                last_pod_name = claim.sandbox_name or claim_name
                 last_quota_rejection = claim.quota_rejection
                 if claim.quota_rejection is not None:
                     consecutive_quota += 1
@@ -1453,6 +1457,15 @@ class SandboxSubstrate:
                 f"claim {claim_name} not bound within {self._config.claim_timeout_seconds}s; "
                 f"its pod is Unschedulable: {last_unschedulable}"
             )
+        if isinstance(self._k8s, KubernetesSandboxClient):
+            tail = self._k8s.pod_log_tail(last_pod_name, request_timeout_seconds=5.0)
+            if tail:
+                logger.warning(
+                    "runner log tail for claim %s pod %s:\n%s",
+                    claim_name,
+                    last_pod_name,
+                    redact_text(tail),
+                )
         raise ClaimTimeoutError(
             f"claim {claim_name} not bound within {self._config.claim_timeout_seconds}s; "
             f"{condition_detail}."

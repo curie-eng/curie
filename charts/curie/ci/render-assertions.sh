@@ -32,6 +32,9 @@
 # negative controls. Every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from
 # the chart-owned runner token Secret and nothing renders the tokenless dev flag.
 #
+# Issue #4171 (runner boot failure log capture), Assertion 20 and its negative
+# controls. The worker gets exactly one read-only pods/log rule for diagnosis.
+#
 # Issue #1109/#1124 (the API's outbound GitHub credential), Assertion 12 and its
 # negative control. api.githubToken is the one OPTIONAL credential in the
 # Secret, so it is a deliberate plain pass-through rather than a
@@ -3105,6 +3108,70 @@ if check_runner_token "$MUTANT_19C" present "19c: tokenless dev flag injected" 2
   fail "negative control 19c did not fire: a runner carrying CURIE_RUNNER_ALLOW_TOKENLESS passed Assertion 19."
 fi
 echo "  ok: 19c a runner template carrying the tokenless dev flag is rejected"
+
+echo "=== Assertion 20: worker runner log capture grants only namespaced pods/log get (#4171) ==="
+assert_worker_log_rule() {
+  python3 - "$1" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as source:
+    roles = [
+        doc for doc in yaml.safe_load_all(source)
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Role"
+        and (doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")) == "worker"
+    ]
+if len(roles) != 1:
+    sys.exit(f"worker pods/log rule requires one worker Role, got {len(roles)}")
+log_rules = [
+    rule for rule in roles[0].get("rules") or []
+    if set(rule.get("apiGroups") or []) & {"", "*"}
+    and set(rule.get("resources") or []) & {"pods/log", "*/log", "*"}
+]
+expected = {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]}
+if log_rules != [expected]:
+    sys.exit(f"worker pods/log rule must grant only namespaced get: {log_rules}")
+print("  ok: worker grants exactly namespaced get on pods/log")
+PYEOF
+}
+WORKER_LOG_RENDER="$TMP/worker-log-tail.yaml"
+helm template acme "$CHART" --namespace acme \
+  --show-only templates/worker.yaml > "$WORKER_LOG_RENDER"
+assert_worker_log_rule "$WORKER_LOG_RENDER" \
+  || fail "worker runner log capture requires only namespaced get on pods/log."
+
+echo "=== Assertion 20 negative controls: absent and broader pods/log rules FAIL ==="
+for case_name in absent broader; do
+  mutant_chart="$TMP/worker-log-tail-$case_name"
+  cp -a "$CHART" "$mutant_chart"
+  python3 - "$mutant_chart/templates/worker.yaml" "$case_name" <<'PYEOF'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text()
+rule = '  - apiGroups: [""]\n    resources: ["pods/log"]\n    verbs: ["get"]\n'
+if source.count(rule) != 1:
+    sys.exit("worker log negative control requires exactly one pods/log get rule")
+replacement = "" if sys.argv[2] == "absent" else rule.replace(
+    'verbs: ["get"]', 'verbs: ["get", "list"]'
+)
+path.write_text(source.replace(rule, replacement))
+PYEOF
+  mutant_render="$TMP/worker-log-tail-$case_name.yaml"
+  helm template acme "$mutant_chart" --namespace acme \
+    --show-only templates/worker.yaml > "$mutant_render"
+  negative_output=""
+  if negative_output="$(assert_worker_log_rule "$mutant_render" 2>&1)"; then
+    fail "worker log negative control $case_name passed the pods/log rule assertion."
+  fi
+  if [[ "$negative_output" != *"worker pods/log rule must grant only namespaced get"* ]]; then
+    fail "worker log negative control $case_name failed unexpectedly: $negative_output"
+  fi
+  echo "  ok: $case_name worker pods/log rule is rejected"
+done
 
 echo
 echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate while every other workload keeps its strategy; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays; every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from the chart-owned runner token Secret and none renders the tokenless dev flag, proven by three failing negative controls."

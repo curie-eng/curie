@@ -642,6 +642,46 @@ class KubernetesSandboxClient:
                 return message if isinstance(message, str) and message else "Unschedulable"
         return None
 
+    def pod_log_tail(self, name: str, *, request_timeout_seconds: float) -> str | None:
+        """Read the runner's last 8 KB, preferring its terminated instance."""
+
+        deadline = time.monotonic() + request_timeout_seconds
+        for previous in (True, False):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            response: Any = None
+            try:
+                response = self._core_api.read_namespaced_pod_log(
+                    name,
+                    self._namespace,
+                    container="runner",
+                    previous=previous,
+                    tail_lines=200,
+                    limit_bytes=8192,
+                    _preload_content=False,
+                    _request_timeout=remaining,
+                )
+                data = getattr(response, "data", response)
+                if isinstance(data, bytes):
+                    return data.decode("utf-8", errors="replace")
+                return str(data)
+            except k8s_client.ApiException as exc:
+                if previous and exc.status == 400:
+                    continue
+                return None
+            except Exception:  # noqa: BLE001 - diagnosis is best effort
+                return None
+            finally:
+                for method_name in ("close", "release_conn"):
+                    try:
+                        method = getattr(response, method_name, None)
+                        if callable(method):
+                            method()
+                    except Exception:  # noqa: BLE001 - response cleanup is best effort
+                        pass
+        return None
+
     def pod_termination(
         self, name: str, *, since: datetime, request_timeout_seconds: float
     ) -> SandboxTermination | None:

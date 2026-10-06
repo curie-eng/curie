@@ -75,6 +75,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get"]
+  # A claim that never became Ready logs the runner's last 8 KB before cleanup.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list"]
