@@ -235,3 +235,14 @@ def test_it_will_not_start_without_both_secrets(monkeypatch, missing):
     monkeypatch.setattr(srv, attr, "")
     with pytest.raises(SystemExit):
         srv.build_app()
+
+
+def test_metrics_for_one_agent_filter_on_its_trace_token_not_its_name(platform):
+    # The API's `agent` filter is a trace-name contains match on
+    # `agent-<id>` (curie_api.metrics.agent_trace_filter). The name matches no
+    # trace, so passing it read as zero runs for an agent that had run.
+    srv, fake = platform
+    srv.metrics_summary("acme-bot")
+    method, path, params, _ = fake.calls[-1]
+    assert (method, path) == ("GET", "/observability/metrics/summary")
+    assert params == {"agent": f"agent-{OTHER_ID}"}

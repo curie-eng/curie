@@ -249,7 +249,10 @@ def list_approvals(status: str = "", agent: str = "", limit: int = 20) -> dict[s
 def metrics_summary(agent: str = "", start: str = "", end: str = "") -> dict[str, Any]:
     """Runs, error rate, p95 latency, tokens and cost over a window (ISO 8601
     `start`/`end`; the platform's default window when both are empty)."""
-    params = {k: v for k, v in {"agent": agent.strip(), "start": start, "end": end}.items() if v}
+    # The API filters on the trace-name token `agent-<id>`, not the agent's name
+    # (curie_api.metrics.agent_trace_filter); a name matches no trace at all.
+    token = f"agent-{_agent(agent)['id']}" if agent.strip() else ""
+    params = {k: v for k, v in {"agent": token, "start": start, "end": end}.items() if v}
     return _call("GET", "/observability/metrics/summary", params=params)
 
 
