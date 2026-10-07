@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from aci_protocol import (
     ErrorEvent,
@@ -25,17 +26,26 @@ from aci_protocol import (
     ReplyHandle,
     SessionStatus,
     TextDelta,
+    ToolNote,
     TurnSource,
 )
 from channel_protocol.reply import ReplyAck, ReplyEvent
-from curie_worker.approvals import ApprovalRequest, CreatedApproval, PublicationLineage
+from curie_worker.approvals import (
+    ApprovalClient,
+    ApprovalRequest,
+    CreatedApproval,
+    PublicationCreateRequest,
+    PublicationLineage,
+)
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.config import WorkerConfig
 from curie_worker.kernel import ThreadBusyError
 from curie_worker.reply_sink import ReplySink, TargetRoute, build_reply_sink
+from curie_worker.runner_client import RunnerWorkspaceSnapshot
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemConflict,
+    WorkItemRequestView,
     WorkItemStartGrant,
     WorkItemStartRefused,
 )
@@ -145,6 +155,15 @@ class _WorkItems:
         self.finishes.append(kwargs)
         if self.after_finish is not None:
             await self.after_finish()
+
+    async def get_request(self, _request_id: uuid.UUID) -> WorkItemRequestView:
+        self.calls.append("get_request")
+        return WorkItemRequestView(
+            status="running",
+            runtime_epoch=1,
+            runtime_claim_name=None,
+            runtime_sandbox_name=None,
+        )
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
         async def record(*_args: object, **_kwargs: object) -> None:
@@ -272,9 +291,7 @@ def test_factory_turn_receives_only_authoritative_publication_context(
             def __init__(self) -> None:
                 self.mint_calls: list[dict[str, object]] = []
 
-            async def get_publication_lineage(
-                self, *_args: object
-            ) -> PublicationLineage | None:
+            async def get_publication_lineage(self, *_args: object) -> PublicationLineage | None:
                 if mint_mode == "absent":
                     return None
                 return PublicationLineage(
@@ -358,8 +375,8 @@ def test_work_item_approval_resume_emits_no_requesting_turn_reply(
             binding=_Binding(),
             workspace_factory=_Workspace,
             approvals=_Approvals(),
-
-        publication_creator=_NoExistingPublication(),) as h:
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             work_items = _WorkItems()
             h.kernel._work_items = work_items
             request_id = uuid.uuid4()
@@ -416,8 +433,8 @@ def test_github_work_item_reaches_the_model_without_chat_replies(make_harness) -
                 binding=_Binding(),
                 workspace_factory=_Workspace,
                 sink=sink,
-
-            publication_creator=_NoExistingPublication(),) as h:
+                publication_creator=_NoExistingPublication(),
+            ) as h:
                 work_items = _WorkItems()
                 h.kernel._work_items = work_items
                 h.runner.default_script = [
@@ -703,13 +720,226 @@ def test_finish_refused_as_cancelled_releases_the_sandbox_claim(make_harness) ->
     asyncio.run(exercise())
 
 
+# --- #4191: a publication refused because the run was cancelled settles ---------
+
+PUBLISH_TOOL = "mcp__curie__publish_changes"
+_CANCELLED_PUBLICATION_BODY = {
+    "detail": {
+        "code": "publication.work_item_cancelled",
+        "message": "the work item request was cancelled",
+    }
+}
+# A FastAPI request-validation 422: the detail is a list, not a coded dict.
+_UNPROCESSABLE_PUBLICATION_BODY = {
+    "detail": [{"loc": ["body", "base_sha"], "msg": "field required", "type": "missing"}]
+}
+
+
+class _HttpPublicationApi(_NoExistingPublication):
+    """Publication creator whose create goes through the real ``ApprovalClient``.
+
+    The API answer is served by an ``httpx.MockTransport``, so the
+    ``ApprovalBackendError`` and its ``refusal`` are built by
+    ``ApprovalClient.create_publication`` in curie_worker/approvals.py exactly as
+    a live 409 or 422 builds them.
+    """
+
+    def __init__(self, status: int, body: dict[str, object]) -> None:
+        self.creates = 0
+        self._http = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _req: httpx.Response(status, json=body))
+        )
+        self._client = ApprovalClient(
+            api_base_url="http://api.example.test",
+            api_key="",
+            client=self._http,
+            read_timeout_s=5.0,
+            worker_token="example-worker-token",
+        )
+
+    async def create_publication(self, request: PublicationCreateRequest) -> object:
+        self.creates += 1
+        return await self._client.create_publication(request)
+
+    async def aclose(self) -> None:
+        await self._http.aclose()
+
+
+class _CodedFinishRefusal(_WorkItems):
+    """``finish`` is refused with ``code``; the claims live at that moment are kept."""
+
+    def __init__(self, code: str, fake_k8s: object) -> None:
+        super().__init__()
+        self.code = code
+        self.fake_k8s = fake_k8s
+        self.claims_at_finish: list[str] = []
+
+    async def finish(self, _request_id: uuid.UUID, **kwargs: object) -> None:
+        self.calls.append("finish")
+        self.finishes.append(kwargs)
+        self.claims_at_finish = list(self.fake_k8s.claims)  # type: ignore[attr-defined]
+        raise WorkItemConflict(self.code)
+
+
+def _patch_publication_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+        return RunnerWorkspaceSnapshot(
+            repo_full_name=WORK_ITEM_REPO,
+            base_sha="a1" * 20,
+            patch=b"diff --git a/src/widget.py b/src/widget.py\n",
+            changed_paths=("src/widget.py",),
+            contains_workflow_files=False,
+            publication_title="Fix the widget parser",
+            publication_body="Fixes the parser.",
+        )
+
+    monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        "curie_worker.kernel.validate_snapshot_against_base",
+        lambda *_args, **_kwargs: None,
+    )
+
+
+_PUBLISH_TURN = [
+    ToolNote(text=f"running tool {PUBLISH_TOOL}", tool=PUBLISH_TOOL),
+    Final(
+        text="Ready to publish",
+        status=SessionStatus.AWAITING_APPROVAL,
+        approval_summary="Publish the change",
+        approval_gate_kind="permission",
+        approval_granted_tool=PUBLISH_TOOL,
+    ),
+]
+
+
+def _escalations(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "escalating event" in r.getMessage()]
+
+
+def test_publication_refused_as_cancelled_settles_and_releases_the_claim(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#4191 AC1: the API refuses the publication 409 work_item_cancelled and then
+    refuses the approval_create_failed finish the same way. The delivery settles
+    on this pass, releases the run's claim, and flags nobody."""
+
+    caplog.set_level("INFO", logger="curie_worker.kernel")
+
+    async def exercise() -> None:
+        publications = _HttpPublicationApi(409, _CANCELLED_PUBLICATION_BODY)
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                publication_creator=publications,
+            ) as h:
+                work_items = _CodedFinishRefusal("work_item_cancelled", h.fake_k8s)
+                h.kernel._work_items = work_items
+                _patch_publication_snapshot(h, monkeypatch)
+                h.runner.turn_scripts = [list(_PUBLISH_TURN)]
+                h.runner.default_script = [Final(text="must not run", status=SessionStatus.DONE)]
+                request_id = uuid.uuid4()
+
+                await h.kernel.process_event(
+                    _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+                )
+
+                assert publications.creates == 1
+                assert work_items.calls.count("finish") == 1
+                assert work_items.finishes[0]["cause"] == "approval_create_failed"
+                assert len(work_items.claims_at_finish) == 1
+                assert work_items.claims_at_finish[0] in h.fake_k8s.deleted_claims
+                assert h.fake_k8s.claims == {}
+                assert _escalations(caplog) == []
+                assert any(
+                    "approval create refused for cancelled work item" in r.getMessage()
+                    for r in caplog.records
+                )
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_publication_refused_as_cancelled_still_raises_on_a_stale_owner_finish(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4191 AC2: only work_item_cancelled and publication_pending settle the
+    approval_create_failed finish; any other refusal still leaves the entry."""
+
+    async def exercise() -> None:
+        publications = _HttpPublicationApi(409, _CANCELLED_PUBLICATION_BODY)
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                publication_creator=publications,
+            ) as h:
+                work_items = _CodedFinishRefusal("stale_owner", h.fake_k8s)
+                h.kernel._work_items = work_items
+                _patch_publication_snapshot(h, monkeypatch)
+                h.runner.turn_scripts = [list(_PUBLISH_TURN)]
+                h.runner.default_script = [Final(text="must not run", status=SessionStatus.DONE)]
+
+                with pytest.raises(WorkItemConflict) as raised:
+                    await h.kernel.process_event(
+                        _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+                    )
+
+                assert raised.value.code == "stale_owner"
+                assert work_items.calls.count("finish") == 1
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_publication_unprocessable_still_escalates_approval_create_failed(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#4191 AC2: a 422 publication create is a real failure, still flagged."""
+
+    caplog.set_level("INFO", logger="curie_worker.kernel")
+
+    async def exercise() -> None:
+        publications = _HttpPublicationApi(422, _UNPROCESSABLE_PUBLICATION_BODY)
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                publication_creator=publications,
+            ) as h:
+                work_items = _WorkItems()
+                h.kernel._work_items = work_items
+                _patch_publication_snapshot(h, monkeypatch)
+                h.runner.turn_scripts = [list(_PUBLISH_TURN)]
+                h.runner.default_script = [Final(text="must not run", status=SessionStatus.DONE)]
+
+                await h.kernel.process_event(
+                    _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+                )
+
+                assert publications.creates == 1
+                assert [f["cause"] for f in work_items.finishes] == ["approval_create_failed"]
+                escalations = _escalations(caplog)
+                assert escalations, "a 422 publication create must still be flagged"
+                assert any("approval-create-failed" in text for text in escalations)
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
 def test_approval_hold_keeps_its_sandbox_claim(make_harness) -> None:
     """Awaiting approval is not a terminus: the resume turn still needs the route."""
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, approvals=_Approvals()
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            approvals=_Approvals(),
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [
                 Final(
@@ -738,8 +968,11 @@ def test_cancelled_work_item_deletes_its_suspended_sandbox_claim(make_harness, p
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, approvals=_Approvals()
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            approvals=_Approvals(),
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             work_items = _WorkItems()
             h.kernel._work_items = work_items
             h.runner.default_script = [
@@ -788,8 +1021,11 @@ def test_work_item_boot_env_carries_the_configured_turn_budget(make_harness) -> 
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
             request_id = uuid.uuid4()
@@ -811,8 +1047,11 @@ def test_ordinary_chat_boot_env_carries_no_turn_budget(make_harness) -> None:
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.runner.default_script = [Final(text="Noted.", status=SessionStatus.DONE)]
 
             await h.kernel.process_event(
@@ -843,8 +1082,11 @@ def test_work_item_max_turns_escalation_names_the_work_item_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = _max_turns_script()
             request_id = uuid.uuid4()
@@ -871,8 +1113,11 @@ def test_chat_max_turns_escalation_names_the_runner_budget(make_harness) -> None
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.runner.default_script = _max_turns_script()
 
             await h.kernel.process_event(
@@ -897,8 +1142,11 @@ def test_work_item_replaces_a_chat_sandbox_booted_without_its_turn_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
 
@@ -923,8 +1171,11 @@ def test_chat_replaces_a_work_item_sandbox_booted_with_the_factory_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
 
@@ -965,8 +1216,11 @@ def test_consecutive_work_items_replace_the_sandbox_even_with_the_same_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
             _fail_settled_release(h)
@@ -995,8 +1249,11 @@ def test_chat_steers_a_live_work_item_turn_instead_of_replacing_it(make_harness)
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
             _fail_settled_release(h)
@@ -1023,8 +1280,11 @@ def test_chat_never_opens_a_turn_on_a_runner_with_the_factory_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
             _fail_settled_release(h)
@@ -1127,8 +1387,11 @@ def test_terminate_wake_for_an_orphan_tears_down_its_stored_claim(make_harness) 
 def test_owns_work_item_tracks_live_and_held_runs(make_harness) -> None:
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, approvals=_Approvals()
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            approvals=_Approvals(),
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             work_items = _WorkItems()
             h.kernel._work_items = work_items
             running = uuid.uuid4()
@@ -1375,13 +1638,13 @@ def test_a_runner_whose_caller_token_still_fits_is_adopted(
     asyncio.run(exercise())
 
 
-
 def test_usage_limited_factory_run_finishes_with_its_cause_without_retry(
     make_harness,
 ) -> None:
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace,
+            binding=_Binding(),
+            workspace_factory=_Workspace,
             publication_creator=_NoExistingPublication(),
         ) as h:
             work_items = _WorkItems()

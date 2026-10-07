@@ -820,6 +820,10 @@ def _escalation_text(
 # the deadline that the escalation and the terminal settle still need.
 _MIN_ATTEMPT_BUDGET_S = 5.0
 
+# Cap on the request status read before a continuation. A status read must not
+# stall the continuation; an unreadable status keeps today's continuation (#4191).
+_REQUEST_STATUS_READ_TIMEOUT_S = 5.0
+
 # Start-refusal codes that mean the work item settled terminally, so the
 # execution is over and the delivering worker is the only one that can release
 # the sandbox claim it just made (#3208). ``not_dispatchable`` is excluded on
@@ -3782,7 +3786,10 @@ class Kernel:
                                     detail=pause.failure_detail,
                                 )
                             except WorkItemConflict as exc:
-                                if exc.code != "publication_pending":
+                                # work_item_cancelled means what it does in
+                                # _complete (#3208): the request is settled as
+                                # cancelled and accepts no finish (#4191).
+                                if exc.code not in {"publication_pending", "work_item_cancelled"}:
                                     raise
                                 run.finished = True
                     await self._complete(
@@ -8552,6 +8559,11 @@ class Kernel:
             # not constrain. The API rejected these with a 422 before the model
             # was shared, which surfaced here as ApprovalBackendError; both still
             # escalate to a human rather than stranding the turn.
+            refusal = exc.refusal if isinstance(exc, ApprovalBackendError) else None
+            if refusal is not None and refusal.startswith("publication.work_item_cancelled:"):
+                # #4191: a cancelled run is not a failure for a person.
+                logger.info("approval create refused for cancelled work item %s", qevent.event_id)
+                return _ApprovalPause.refused(refusal)
             logger.warning("approval create failed for %s: %s", qevent.event_id, exc)
             await self._escalate(
                 qevent,
@@ -8560,7 +8572,6 @@ class Kernel:
                 "not be created; flagging for a human instead of pausing.",
                 failure_class="approval-create-failed",
             )
-            refusal = exc.refusal if isinstance(exc, ApprovalBackendError) else None
             return _ApprovalPause.refused(refusal)
 
         progress_plan = _TURN_PROGRESS.get()
@@ -8945,6 +8956,18 @@ class Kernel:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
+    async def _request_not_running(self, run: WorkItemRun) -> str | None:
+        """The request's status when it is readable and not running, else None."""
+
+        if self._work_items is None:
+            return None
+        try:
+            async with asyncio.timeout(_REQUEST_STATUS_READ_TIMEOUT_S):
+                view = await self._work_items.get_request(run.request_id)
+        except (WorkItemConflict, WorkItemTransportError, TimeoutError):
+            return None
+        return None if view.status == "running" else view.status
+
     async def _continue_unpublished(
         self,
         qevent: QueuedTurn,
@@ -8982,6 +9005,14 @@ class Kernel:
             return outcome
         left = run.bound_remaining_s(remaining_s)
         if left is not None and left <= _MIN_ATTEMPT_BUDGET_S:
+            return outcome
+        # #4191: the request status is the authority for a requested cancel; a
+        # cancelled request is not re-prompted.
+        status = await self._request_not_running(run)
+        if status is not None:
+            logger.info(
+                "work-item continuation skipped for %s: request %s", qevent.event_id, status
+            )
             return outcome
         early = _unpublished_cause(outcome.tools_called) == "early_stop"
         prompt = _EARLY_STOP_PROMPT if early else _UNPUBLISHED_PROMPT
@@ -9026,7 +9057,14 @@ class Kernel:
         except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
             # The agent never saw the prompt, so the ending is the runner's: the
             # normal failure policy (retry, or escalate after a side effect)
-            # decides, not early_stop.
+            # decides, not early_stop. A cancel that landed after the status
+            # read above stops the continuation instead (#4191).
+            status = await self._request_not_running(run)
+            if status is not None:
+                logger.info(
+                    "work-item continuation stopped for %s: request %s", qevent.event_id, status
+                )
+                return outcome
             logger.warning(
                 "work-item continuation failed to start for %s",
                 qevent.event_id,
