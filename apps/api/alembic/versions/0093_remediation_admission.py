@@ -25,15 +25,18 @@ a well-formed nomination to approval (AUTOMATED-REMEDIATION-8), one of the
 frozen ``approval_reasons`` of ``tests/vectors/remediation-codes.json``.
 Existing rows read NULL.
 
-``remediation_nomination_submissions`` gains the protected delivery's
-conversation (the envelope's ``logical_conversation_key``) and reply surface
-(the envelope's ``reply_handle``: ``reply_kind``, ``reply_channel``,
-``reply_endpoint``, ``reply_adapter``), which an approval raised after the
-binding is gone is raised on (AUTOMATED-REMEDIATION-15). Existing rows read
+``remediation_delivery_surfaces`` records, per protected delivery (event id),
+the reply surface the hook route chose for its turn (kind, channel, endpoint,
+adapter); the broker's admission records keep their released key sets. It
+cascades with the agent. ``remediation_nomination_submissions`` gains the
+delivery's conversation (the envelope's ``logical_conversation_key``) and the
+reply surface copied from that row at nomination time (``reply_kind``,
+``reply_channel``, ``reply_endpoint``, ``reply_adapter``), which an approval
+is raised on (AUTOMATED-REMEDIATION-15). Existing rows read
 NULL. ``remediation_nominations_refusal_ck`` gains ``reply_surface_unavailable``:
 a nomination whose delivery recorded no reply surface has nowhere to ask.
 
-The downgrade drops both tables and the added columns, deletes the nominations
+The downgrade drops the three tables and the added columns, deletes the nominations
 refused ``reply_surface_unavailable`` (they never executed or asked) and
 restores the refusal check.
 
@@ -52,6 +55,7 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 SCHEMA = "curie"
+SURFACES = "remediation_delivery_surfaces"
 BREAKERS = "remediation_breakers"
 RESERVATIONS = "remediation_reservations"
 NOMINATIONS = "remediation_nominations"
@@ -170,6 +174,24 @@ def upgrade() -> None:
         f"approval_reason IS NULL OR approval_reason IN ({reasons})",
         schema=SCHEMA,
     )
+    op.create_table(
+        SURFACES,
+        sa.Column("event_id", sa.String(256), primary_key=True),
+        sa.Column("agent_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("hook", sa.String(63), nullable=False),
+        sa.Column("reply_kind", sa.Text(), nullable=False),
+        sa.Column("reply_channel", sa.Text(), nullable=False),
+        sa.Column("reply_endpoint", sa.Text(), nullable=True),
+        sa.Column("reply_adapter", sa.Text(), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("now()"),
+        ),
+        sa.ForeignKeyConstraint(["agent_id"], [f"{SCHEMA}.agents.id"], ondelete="CASCADE"),
+        schema=SCHEMA,
+    )
     for column in SUBMISSION_COLUMNS:
         op.add_column(SUBMISSIONS, sa.Column(column, sa.Text(), nullable=True), schema=SCHEMA)
     op.drop_constraint(REFUSAL_CHECK, NOMINATIONS, type_="check", schema=SCHEMA)
@@ -186,6 +208,7 @@ def downgrade() -> None:
     op.create_check_constraint(REFUSAL_CHECK, NOMINATIONS, REFUSALS_BEFORE, schema=SCHEMA)
     for column in reversed(SUBMISSION_COLUMNS):
         op.drop_column(SUBMISSIONS, column, schema=SCHEMA)
+    op.drop_table(SURFACES, schema=SCHEMA)
     op.drop_constraint(REASON_CHECK, NOMINATIONS, type_="check", schema=SCHEMA)
     op.drop_column(NOMINATIONS, "approval_reason", schema=SCHEMA)
     op.drop_index("ix_remediation_reservations_agent", table_name=RESERVATIONS, schema=SCHEMA)

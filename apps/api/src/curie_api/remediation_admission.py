@@ -91,7 +91,7 @@ from typing import Any, Final
 
 from aci_protocol import QueuedTurn, ReplyHandle, ToolAccess, TurnSource
 from channel_protocol import hook_conversation_id
-from sqlalchemy import Integer, and_, cast, func, or_, select, text, update
+from sqlalchemy import Integer, and_, cast, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -105,6 +105,7 @@ from .models import (
     ConnectorCapability,
     ExecutionKind,
     ExecutionState,
+    RemediationDeliverySurface,
     RemediationNomination,
     RemediationNominationSubmission,
     RemediationPolicy,
@@ -173,6 +174,9 @@ _HOUR_SECONDS: Final = 3600
 # A ``received`` nomination this old was left by a submission that did not
 # finish admitting it; ``reconcile_admissions`` admits it.
 _STRANDED_SECONDS: Final = 60
+# A delivery's recorded reply surface is copied onto its submission row when its
+# block is submitted; one never submitted against is pruned after this long.
+_SURFACE_RETENTION_SECONDS: Final = 7 * 24 * 3600
 
 _ADMISSION_LOCK = text(
     "SELECT pg_advisory_xact_lock(hashtextextended('curie.remediation.admission:' || :agent, 0))"
@@ -639,11 +643,13 @@ async def _delivery_turn(
 
     @spec AUTOMATED-REMEDIATION-15: ``reply_kind`` and ``reply_channel`` (and
     the nullable reply columns) are copied from the protected delivery's
-    ``QueuedTurn``, never its text. Both were recorded on the submission row at
-    nomination time from the delivery's binding (its ``logical_conversation_key``
-    and ``reply_handle``), so the surface is the one the delivery selected even
-    after the agent's channels change. None when the submission recorded no
-    reply surface: there is nowhere to ask, and nothing is guessed.
+    ``QueuedTurn``, never its text. The submission row holds them: the
+    conversation from the binding's ``logical_conversation_key`` and the reply
+    surface the hook route recorded for the delivery
+    (``remediation_delivery_surfaces``), copied at nomination time, so the
+    surface is the one the delivery selected even after the agent's channels
+    change. None when no reply surface was recorded: there is nowhere to ask,
+    and nothing is guessed.
     """
 
     submission = await session.scalar(
@@ -1127,10 +1133,17 @@ async def reconcile_admissions(
     for every such row, so it is never selected again and cannot starve a
     raisable one: no reply surface recorded is ``reply_surface_unavailable``,
     and an action the generation the approval would bind no longer declares is
-    ``unknown_action`` (AUTOMATED-REMEDIATION-7, -15).
+    ``unknown_action`` (AUTOMATED-REMEDIATION-7, -15). Recorded delivery reply
+    surfaces older than a week (never submitted against) are pruned.
     """
 
     await _end_unraisable(session)
+    await session.execute(
+        delete(RemediationDeliverySurface).where(
+            RemediationDeliverySurface.created_at
+            < func.now() - func.make_interval(0, 0, 0, 0, 0, 0, _SURFACE_RETENTION_SECONDS)
+        )
+    )
     await session.commit()
     stranded = (
         await session.scalars(

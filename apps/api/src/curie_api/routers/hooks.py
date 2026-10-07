@@ -133,6 +133,7 @@ from ..protected_support import (
     SupportAuthorityUnavailable,
     evaluate_protected_support,
 )
+from ..remediation_nomination_store import record_delivery_surface
 from ..source_binding import MappingOutcome, resolve_source_binding
 from ..wirebody import read_bounded_body
 
@@ -619,8 +620,12 @@ async def _ingest_protected(
     ``configuration_unsupported``, the runtime and enqueue files 503
     ``runtime_unavailable``, a full ingress executor 503 ``broker_unavailable``,
     the ordinary claim lookup, turn construction and its bound (413), then one
-    atomic admission. No ordinary claim, backlog slot, workspace row or SQL
-    write is made. @spec PROTECTED-HOOK-SOURCE-2/8 @spec PROTECTED-HOOK-LANE-4.
+    atomic admission. No ordinary claim, backlog slot or workspace row is made.
+    The one SQL write: with remediation on, an admitted delivery's chosen reply
+    surface is recorded by event id (``remediation_delivery_surfaces``), which a
+    remediation approval for its nominations is raised on; it never decides
+    admission. @spec PROTECTED-HOOK-SOURCE-2/8 @spec PROTECTED-HOOK-LANE-4
+    @spec AUTOMATED-REMEDIATION-15.
     """
     agent = source.agent
     if explicit_target:
@@ -692,13 +697,6 @@ async def _ingest_protected(
                     request_body_sha256=hashlib.sha256(raw).hexdigest(),
                     queued_payload=payload,
                     remediation_generation=remediation_generation,
-                    # AUTOMATED-REMEDIATION-6, -15: the binding names the turn's
-                    # reply surface, which a remediation approval is raised on.
-                    # Only for a hook with a bound policy, like the generation:
-                    # an unbound hook keeps the released key sets (rollback).
-                    record_reply_handle=(
-                        settings.remediation_enabled and remediation_generation is not None
-                    ),
                 )
             except ValueError:
                 raise HTTPException(
@@ -709,6 +707,8 @@ async def _ingest_protected(
             result = await admit(slot, runtime, admission)
     except IngressBrokerUnavailable:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "broker_unavailable") from None
+    if settings.remediation_enabled and result.status in ("accepted", "duplicate", "preparing"):
+        await record_delivery_surface(session, agent.id, hook, event_id, binding)
     answer = _admission_answer(
         result, response, event_id=event_id, requested=requested, generation=policy.generation
     )

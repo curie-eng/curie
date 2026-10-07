@@ -2387,9 +2387,9 @@ class RemediationNominationSubmission(Base):
     # ``logical_conversation_key``), which an approval raised later names
     # (AUTOMATED-REMEDIATION-15). NULL for a submission recorded before 0093.
     conversation_id: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # The reply surface the delivery's turn named (its binding's ``reply_handle``),
-    # which an approval is raised on (AUTOMATED-REMEDIATION-15). NULL when the
-    # binding recorded none.
+    # The reply surface the delivery's turn named, copied from its
+    # ``remediation_delivery_surfaces`` row at nomination time; an approval is
+    # raised on it (AUTOMATED-REMEDIATION-15). NULL when none was recorded.
     reply_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
     reply_channel: Mapped[str | None] = mapped_column(Text, nullable=True)
     reply_endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -2952,6 +2952,31 @@ class ChannelIdentity(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class RemediationDeliverySurface(Base):
+    """The reply surface the hook route chose for one protected delivery.
+
+    @spec AUTOMATED-REMEDIATION-15. Written by the protected ingress (remediation
+    on) for an admitted delivery, keyed by its event id, so an approval for its
+    nominations is raised on the surface its ``QueuedTurn`` names. The broker's
+    admission records keep their released key sets.
+    """
+
+    __tablename__ = "remediation_delivery_surfaces"
+
+    event_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    hook: Mapped[str] = mapped_column(String(63), nullable=False)
+    reply_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    reply_channel: Mapped[str] = mapped_column(Text, nullable=False)
+    reply_endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_adapter: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
 

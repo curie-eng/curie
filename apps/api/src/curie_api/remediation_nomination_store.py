@@ -22,16 +22,20 @@ is written ``received`` with its kind and target key, for admission (tasks 9 and
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import (
     Agent,
+    AgentChannel,
+    RemediationDeliverySurface,
     RemediationNomination,
     RemediationNominationSubmission,
     RemediationPolicy,
@@ -46,6 +50,8 @@ from .remediation_nominations import (
     target_key,
     validate_entry,
 )
+
+logger = logging.getLogger(__name__)
 
 RECEIVED = "received"
 REFUSED = "refused"
@@ -150,10 +156,7 @@ async def record_submission(
             hook=event.hook,
             block_sha256=digest,
             conversation_id=event.conversation_id,
-            reply_kind=event.reply_kind,
-            reply_channel=event.reply_channel,
-            reply_endpoint=event.reply_endpoint,
-            reply_adapter=event.reply_adapter,
+            **(await _delivery_surface(session, event)),
         )
         .on_conflict_do_nothing(index_elements=["event_id"])
         .returning(RemediationNominationSubmission.event_id)
@@ -175,3 +178,58 @@ async def record_submission(
         session.add(RemediationNomination(id=row_id, **row))
         await session.flush()
     return ids
+
+
+async def record_delivery_surface(
+    session: AsyncSession,
+    agent_id: uuid.UUID,
+    hook: str,
+    event_id: str,
+    channel: AgentChannel,
+) -> None:
+    """Record the reply surface the hook route chose for one protected delivery.
+
+    @spec AUTOMATED-REMEDIATION-15: an approval for the delivery's nominations
+    is raised on the surface its ``QueuedTurn`` names (``kind``, ``address``,
+    ``endpoint``, ``adapter`` of the selected binding), never one guessed later.
+    Keyed by event id; the first record wins. Commits. A failure is logged and
+    leaves no row (a later approval is then ``reply_surface_unavailable``); it
+    never fails the delivery, which is already admitted.
+    """
+
+    try:
+        await session.execute(
+            insert(RemediationDeliverySurface)
+            .values(
+                event_id=event_id,
+                agent_id=agent_id,
+                hook=hook,
+                reply_kind=channel.kind,
+                reply_channel=channel.address,
+                reply_endpoint=channel.endpoint,
+                reply_adapter=channel.adapter,
+            )
+            .on_conflict_do_nothing(index_elements=["event_id"])
+        )
+        await session.commit()
+    except SQLAlchemyError as error:
+        await session.rollback()
+        logger.warning(
+            "remediation delivery surface not recorded event=%s error=%s",
+            event_id,
+            type(error).__name__,
+        )
+
+
+async def _delivery_surface(session: AsyncSession, event: ProtectedEvent) -> dict[str, Any]:
+    """The submission's reply columns from the delivery's recorded surface, or nulls."""
+
+    surface = await session.get(RemediationDeliverySurface, event.event_id)
+    if surface is None or surface.agent_id != event.agent_id or surface.hook != event.hook:
+        return {}
+    return {
+        "reply_kind": surface.reply_kind,
+        "reply_channel": surface.reply_channel,
+        "reply_endpoint": surface.reply_endpoint,
+        "reply_adapter": surface.reply_adapter,
+    }
