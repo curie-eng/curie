@@ -56,7 +56,10 @@ Surface these tests fix (see ``.projects/plans/task-remediation-verifier.tests.m
   action, *, store=None)`` -> ``None`` or ``"verifier_not_independent"`` for
   admission (task 9) to call.
 
-No migration: 0089 carries the outcome columns and 0090 the read executions.
+Migration 0091 (review round 1) adds ``remediation_nominations.execution_code``,
+the code of a forward execution that ended ``failed``, ``indeterminate`` or
+``refused`` after admission; 0089 carries the outcome columns and 0090 the read
+executions.
 
 Every identifier is a placeholder.
 """
@@ -708,13 +711,16 @@ def test_a_verification_is_at_most_sixty_samples(
     assert samples[-1]["not_before"] - dispatched_at == timedelta(seconds=600)
 
 
-@pytest.mark.parametrize("ending", ["failed", "indeterminate"])
+@pytest.mark.parametrize(
+    ("ending", "code"), [("failed", "connector_error"), ("indeterminate", "response_lost")]
+)
 def test_a_forward_that_does_not_confirm_gets_no_verifier_and_finishes_not_recovered(
-    client: Any, auth_headers: dict[str, str], tmp_path: Path, ending: str
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, ending: str, code: str
 ) -> None:
     """@spec AUTOMATED-REMEDIATION-18: "An execution that ends ``failed``,
     ``indeterminate`` or ``refused`` after admission gets no verifier and finishes
-    ``not-recovered`` for reporting".
+    ``not-recovered`` for reporting, with the execution code": the code is
+    recorded on the nomination (``execution_code``, migration 0091).
     """
 
     agent_id = _agent(client, auth_headers, tmp_path)
@@ -728,7 +734,94 @@ def test_a_forward_that_does_not_confirm_gets_no_verifier_and_finishes_not_recov
     assert _samples(nomination_id) == []
     assert _outcome(execution_id, nomination_id) == "not-recovered"
     assert _nomination(nomination_id)["state"] == "finished"
+    assert _nomination(nomination_id)["execution_code"] == code
     assert _restores() == []
+
+
+@pytest.mark.parametrize(
+    ("code", "authority"),
+    [
+        ("agent_stopped", "policy"),
+        ("agent_stopped", "approval"),
+        ("tool_not_advertised", "policy"),
+        ("sandbox_unavailable", "policy"),
+        ("arguments_mismatch", "approval"),
+    ],
+)
+def test_a_forward_refused_after_admission_finishes_not_recovered_with_its_code(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, code: str, authority: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-18 @spec AUTOMATED-REMEDIATION-11: a forward
+    execution refused before dispatch (a kill between admission and dispatch
+    refuses ``agent_stopped``) gets no verifier; its nomination finishes
+    ``not-recovered`` with the execution's code. No ledger row exists, so the
+    outcome lives on the nomination alone.
+    """
+
+    agent_id = _agent(client, auth_headers, tmp_path)
+    _bind_policy(agent_id, _document())
+    approval_id = uuid.uuid4() if authority == "approval" else None
+    nomination_id = _nominate(
+        agent_id,
+        state="admitted" if approval_id is None else "approved",
+        approval_id=approval_id,
+    )
+    created = _create_forward(nomination_id, approval_id)
+    claimed = _claim(client)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["id"] == str(created.execution_id)
+
+    refused = client.post(
+        f"/action-executions/{created.execution_id}/outcome",
+        json={**_fence(claimed.json()), "state": "refused", "code": code},
+        headers=worker_headers(),
+    )
+
+    assert refused.status_code == 200, refused.text
+    assert _execution(created.execution_id)["refusal_code"] == code
+    nomination = _nomination(nomination_id)
+    assert nomination["state"] == "finished"
+    assert nomination["verification_outcome"] == "not-recovered"
+    assert nomination["execution_code"] == code
+    assert _samples(nomination_id) == []
+    assert sql_dicts("SELECT id FROM curie.agent_actions") == []
+    assert _restores() == []
+
+
+def test_a_not_reversible_now_refusal_goes_back_to_approval_not_to_an_outcome(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-13 @spec AUTOMATED-REMEDIATION-18: the refusal
+    AUTOMATED-REMEDIATION-13 routes back to approval (``not_reversible_now``) is
+    not finished ``not-recovered``: the nomination is ``approval_requested`` with
+    no outcome and no execution code, and no verifier runs. (``policy_changed``,
+    the other such refusal, is the claim-time hook of executor amendment E8,
+    task 9.)
+    """
+
+    agent_id = _agent(client, auth_headers, tmp_path)  # no capability row
+    document = _document()
+    document["actions"][0]["reversibility"] = "reversible"
+    _bind_policy(agent_id, document)
+    nomination_id = _nominate(agent_id)
+    created = _create_forward(nomination_id)
+    claimed = _claim(client)
+    assert claimed.status_code == 200, claimed.text
+
+    dispatched = client.post(
+        f"/action-executions/{created.execution_id}/dispatch",
+        json=_fence(claimed.json()),
+        headers=worker_headers(),
+    )
+
+    assert dispatched.status_code == 200, dispatched.text
+    assert dispatched.json()["state"] == "refused"
+    assert dispatched.json()["refusal_code"] == "not_reversible_now"
+    nomination = _nomination(nomination_id)
+    assert nomination["state"] == "approval_requested"
+    assert nomination["verification_outcome"] is None
+    assert nomination["execution_code"] is None
+    assert _samples(nomination_id) == []
 
 
 def test_a_forward_execution_of_another_producer_gets_no_verifier(client: Any) -> None:
@@ -1070,6 +1163,106 @@ def test_another_ledger_record_on_the_target_supersedes_before_verified(
     assert _outcome(forward_id, nomination_id) == "superseded"
     assert _nomination(nomination_id)["state"] == "finished"
     assert _ledger(other_forward)["verification_outcome"] is None
+
+
+def _model_turn_record(client: Any, headers: dict[str, str], agent_id: str, **fields: Any) -> None:
+    """A ledger record a model turn writes through ``POST /actions``."""
+
+    body: dict[str, Any] = {
+        "agent_id": agent_id,
+        "conversation_id": "C0EXAMPLE9",
+        "call_id": f"toolu_{uuid.uuid4().hex[:8]}",
+        "tool": f"mcp__{ACT_CONNECTOR}__{ACT_TOOL}",
+        "arguments": {**NOMINATED, "replicas": 6},
+        "dedupe_key": f"event-{uuid.uuid4()}:toolu_01",
+    }
+    body.update(fields)
+    opened = client.post("/actions", json=body, headers=headers)
+    assert opened.status_code == 201, opened.text
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param({}, id="same-tool"),
+        pytest.param(
+            {
+                "tool": f"mcp__{ACT_CONNECTOR}__restart_deployment",
+                "arguments": {"namespace": "example-ns", "deployment": "example-api"},
+            },
+            id="other-tool-same-target",
+        ),
+    ],
+)
+def test_a_model_turn_record_on_the_target_supersedes_before_verified(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, fields: dict[str, Any]
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-18: "another ledger record on the same target
+    key" is any ledger record, not only a remediation's: a model turn's call on
+    the acting connector naming the same target (the value of the action's
+    target argument) supersedes, even when the next sample would have verified.
+    """
+
+    agent_id, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
+    _take(client, nomination_id)
+    _take(client, nomination_id)
+    _model_turn_record(client, auth_headers, agent_id, **fields)
+
+    _take(client, nomination_id)
+
+    assert _outcome(forward_id, nomination_id) == "superseded"
+
+
+def test_an_approval_gated_record_on_the_target_supersedes_before_verified(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-18: a record under an ``approval`` authority (no
+    nomination) on the same target key supersedes too.
+    """
+
+    agent_id, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
+    _take(client, nomination_id)
+    _take(client, nomination_id)
+    approval_id = uuid.uuid4()
+    sql_rows(
+        "INSERT INTO curie.agent_actions (id, agent_id, conversation_id, call_id, tool, "
+        "arguments, dedupe_key, connector, connector_digest, authority_kind, authority_ref, "
+        "actor_kind, gate_approval_id) VALUES (:id, :agent_id, 'C0EXAMPLE9', 'toolu_02', "
+        ":tool, CAST(:arguments AS jsonb), :key, :connector, :digest, 'approval', :ref, "
+        "'approval', :approval)",
+        {
+            "id": uuid.uuid4(),
+            "agent_id": uuid.UUID(agent_id),
+            "tool": f"mcp__{ACT_CONNECTOR}__{ACT_TOOL}",
+            "arguments": json.dumps({**NOMINATED, "replicas": 2}),
+            "key": f"approval-check-{uuid.uuid4()}",
+            "connector": ACT_CONNECTOR,
+            "digest": ACT_DIGEST,
+            "ref": str(approval_id),
+            "approval": approval_id,
+        },
+    )
+
+    _take(client, nomination_id)
+
+    assert _outcome(forward_id, nomination_id) == "superseded"
+
+
+def test_a_model_turn_record_on_another_target_does_not_supersede(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-18: only the same target key supersedes."""
+
+    agent_id, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
+    _take(client, nomination_id)
+    _take(client, nomination_id)
+    _model_turn_record(
+        client, auth_headers, agent_id, arguments={**NOMINATED, "deployment": "example-worker"}
+    )
+
+    _take(client, nomination_id)
+
+    assert _outcome(forward_id, nomination_id) == "verified"
 
 
 def test_a_record_on_another_target_does_not_supersede(

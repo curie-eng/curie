@@ -35,7 +35,7 @@ from sqlalchemy.exc import DBAPIError
 BELOW = "0086"
 # The single head now: the nomination revision (task 6), the ledger fields
 # revision (task 8) and the read executions revision (task 7) follow the policy one.
-HEAD = "0090"
+HEAD = "0091"
 
 POLICY_COLUMNS = {"agent_id", "hook", "generation", "operation_id", "armed", "active", "updated_at"}
 GENERATION_COLUMNS = {
