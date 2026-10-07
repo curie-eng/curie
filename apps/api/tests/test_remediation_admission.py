@@ -83,6 +83,7 @@ from _protected_ingress_harness import (
     _broker,
     deliver,
     ingress_broker_fixture,  # noqa: F401  (fixture)
+    private_entries,
     record,
     signed,
 )
@@ -2408,3 +2409,132 @@ def test_unraisable_owed_approvals_do_not_starve_a_raisable_one(
             ), approval
 
     run(scenario, timeout=240)
+
+
+# =========================================================================== #
+# Review round 2: the reply surface is recorded before the broker admits
+# (AUTOMATED-REMEDIATION-15, -6), through the real signed hook route
+# =========================================================================== #
+
+SURFACE_INSERT = "INSERT INTO curie.remediation_delivery_surfaces"
+
+
+async def surface_rows(event: str) -> list[dict[str, Any]]:
+    return await q(
+        "SELECT * FROM curie.remediation_delivery_surfaces WHERE event_id = :e", {"e": event}
+    )
+
+
+def _admitted(stage: Stage, event: str) -> bool:
+    return bool(stage.broker.command("EXISTS", "protected:admission:binding:" + event))
+
+
+async def _signed_delivery(stage: Stage, delivery: str) -> httpx.Response:
+    headers = signed(scoped_secret(stage.agent), delivery=delivery, body=BODY)
+    return await deliver(stage.client, stage.agent, headers, body=BODY)
+
+
+def test_a_delivery_whose_reply_surface_cannot_be_recorded_is_503_and_never_admitted(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-15 @spec AUTOMATED-REMEDIATION-6: the reply
+    surface a remediation approval is raised on is recorded before the broker
+    admits the delivery. When that write fails, the signed hook route answers
+    ``503`` and the broker holds no binding and no queued turn for it, so no
+    turn runs and nothing can be nominated against a delivery with no surface.
+    """
+
+    async def scenario() -> None:
+        async with world(ingress_broker, tmp_path, monkeypatch) as w:
+            await w.bind()
+            delivery = f"surface-fault-{uuid.uuid4().hex[:8]}"
+            event = event_id_of(w.stage.agent, delivery)
+            entries = len(private_entries(w.stage.broker))
+
+            with failing_statements(SURFACE_INSERT) as hits:
+                response = await _signed_delivery(w.stage, delivery)
+
+            assert hits, "the route never recorded the delivery's reply surface"
+            assert response.status_code == 503, response.text
+            assert not _admitted(w.stage, event), "a delivery with no surface was admitted"
+            assert len(private_entries(w.stage.broker)) == entries
+            assert await surface_rows(event) == []
+
+    run(scenario)
+
+
+def test_a_redelivery_after_a_failed_surface_write_records_it_and_admits_once(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-15: the sender's retry of the same signed
+    delivery records the surface and is admitted exactly once; a further
+    retry is the broker's duplicate and queues nothing more.
+    """
+
+    async def scenario() -> None:
+        async with world(ingress_broker, tmp_path, monkeypatch) as w:
+            await w.bind()
+            delivery = f"surface-retry-{uuid.uuid4().hex[:8]}"
+            event = event_id_of(w.stage.agent, delivery)
+            entries = len(private_entries(w.stage.broker))
+            with failing_statements(SURFACE_INSERT):
+                failed = await _signed_delivery(w.stage, delivery)
+            assert failed.status_code == 503, failed.text
+
+            retried = await _signed_delivery(w.stage, delivery)
+
+            assert retried.status_code == 200, retried.text
+            assert retried.json()["acceptance_status"] == "accepted", retried.text
+            assert _admitted(w.stage, event)
+            (surface,) = await surface_rows(event)
+            assert (surface["reply_kind"], surface["reply_channel"]) == (
+                EMAIL_REPLY["kind"],
+                EMAIL_REPLY["address"],
+            ), surface
+            assert len(private_entries(w.stage.broker)) == entries + 1
+
+            again = await _signed_delivery(w.stage, delivery)
+            assert again.status_code == 200, again.text
+            assert len(private_entries(w.stage.broker)) == entries + 1
+            assert len(await surface_rows(event)) == 1
+
+    run(scenario)
+
+
+def test_the_surface_is_committed_before_the_broker_admits_so_a_fast_turn_finds_it(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-15 @spec AUTOMATED-REMEDIATION-6: once the
+    broker admits, a protected worker may run the turn and submit its block
+    before the hook route answers. At the moment of admission the surface row
+    is already committed (observed from another connection), so a nomination
+    submitted right after the fastest turn raises its approval on it.
+    """
+
+    hooks_router = importlib.import_module("curie_api.routers.hooks")
+    original = hooks_router.admit
+    seen: list[list[dict[str, Any]]] = []
+
+    async def observing_admit(slot: Any, runtime: Any, admission: Any) -> Any:
+        event = admission.turn.event_id if hasattr(admission, "turn") else None
+        if event is None:
+            event = json.loads(admission.queued_payload)["event_id"]
+        seen.append(await surface_rows(event))
+        return await original(slot, runtime, admission)
+
+    async def scenario() -> None:
+        async with world(ingress_broker, tmp_path, monkeypatch) as w:
+            await w.bind(policy(automatic=False))
+            monkeypatch.setattr(hooks_router, "admit", observing_admit)
+            delivery = f"surface-fast-{uuid.uuid4().hex[:8]}"
+            response = await _signed_delivery(w.stage, delivery)
+            assert response.status_code == 200, response.text
+            assert seen and len(seen[0]) == 1, f"no committed surface at admission: {seen}"
+
+            event = str(response.json()["event_id"])
+            (row,) = await submit(w.stage, event, entry())
+            assert_approval(row, "not_automatic")
+            approval = await approval_of(row)
+            assert approval["reply_kind"] == EMAIL_REPLY["kind"], approval
+
+    run(scenario)
