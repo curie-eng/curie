@@ -2089,6 +2089,49 @@ A chart upgrade is a **full** upgrade: anything the new chart does not render is
 deleted. For a Deployment that means a restart. For a StatefulSet it means the
 data too.
 
+### Connector action executor (0.13.0, unreleased)
+
+0.13.0 adds the connector action executor
+([ARCHITECTURE.md](../ARCHITECTURE.md#the-action-ledger-and-the-connector-action-executor)):
+the platform can restore a recorded action by calling the connector's own
+`restore` verb under the same pinned connector image, with no model in the
+path. It is off by default. `actionExecutor.enabled: true` (compose:
+`CURIE_ACTION_EXECUTOR_ENABLED=true`) turns it on for both the API and the
+worker; with the connector reconciler also on, the worker Role gains a
+single-object `get` on Deployments, and nothing else. Restores run on the
+cluster tier only.
+
+**A connector tool named `restore` is unchanged unless the connector also
+serves `observe_version`.** A lone `restore` stays an ordinary tool: in the
+model's catalogue, gated only if your bundle's approval patterns gate it, and
+never called by the executor. Only a connector that advertises the pair, with
+the schemas in
+[Writing a connector the platform can undo](writing-a-reversible-connector.md#the-paired-verbs),
+has its `restore` hidden from the model. A runner boot whose probe of a
+connector fails hides that connector's `restore` too, lone or not, until the
+next boot probes it.
+
+What changes for existing installs:
+
+* `POST /actions/{id}/undo` ignores a caller's `observed_state` (the executor
+  observes the live version itself through the connector), no longer returns `target` or `prior_state`, and no longer marks the action
+  undone. It answers `202` with an execution id and state; the action is marked
+  undone only when that restore is confirmed. With the executor off, an undo
+  that would be granted is refused `executor_disabled` (HTTP 503). The undo
+  actor is the authenticated principal, and a body `actor` that differs is
+  refused.
+* Actions recorded before the upgrade, and any action whose connector replied
+  with a cleartext `prior`, are not undoable and are not migrated. Only a sealed
+  reply from a hosted connector at a pinned digest, with `SNAPSHOT_SEALING_KEY`
+  declared as a `SecretRef`, produces an undoable action.
+* `SNAPSHOT_SEALING_KEY` and `SNAPSHOT_SEALING_KEYS_RETAINED` are reserved. A
+  bundle declaring either in any form other than a `SecretRef` on a connector is
+  refused at intake, and a chart render with either under
+  `agentSandbox.connectorSecrets` or `agentSandbox.runner.extraEnv` fails.
+  Rename any existing secret that uses these names before upgrading.
+* `curie local actions` and `curie cluster actions` (`list`, `show`, `undo`,
+  `execution`) are new; `execution <id>` is the receipt of a restore.
+
 ### Agent memory (0.12.0)
 
 0.12.0 adds agent and channel memory, with writes off by default (see
