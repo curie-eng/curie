@@ -1521,6 +1521,42 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 .await?,
             )
         }
+        // @spec AUTOMATED-REMEDIATION-20
+        ClusterAction::Remediation { verb } => {
+            let (verb, conn) = verb.into_parts();
+            let verb = verb.validate()?;
+            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, false).await?;
+            emit(
+                commands::remediation(
+                    commands::RemediationPolicyOpts {
+                        api_url,
+                        api_key,
+                        tier: "cluster",
+                    },
+                    verb,
+                )
+                .await?,
+            )
+        }
+        // @spec AUTOMATED-REMEDIATION-22
+        ClusterAction::RemediationQualification { verb } => {
+            let (verb, conn) = verb.into_parts();
+            // Validated before the connection is resolved, so a missing
+            // principal or a bad input never reaches discovery or the API.
+            let verb = verb.validate()?;
+            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, false).await?;
+            emit(
+                commands::remediation_qualification(
+                    commands::RemediationPolicyOpts {
+                        api_url,
+                        api_key,
+                        tier: "cluster",
+                    },
+                    verb,
+                )
+                .await?,
+            )
+        }
         ClusterAction::Approvals {
             target,
             gate,

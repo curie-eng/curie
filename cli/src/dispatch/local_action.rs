@@ -482,6 +482,38 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                 .await?,
             )
         }
+        // @spec AUTOMATED-REMEDIATION-20
+        LocalAction::Remediation { verb } => {
+            let (verb, conn) = verb.into_parts();
+            let verb = verb.validate()?;
+            emit(
+                commands::remediation(
+                    commands::RemediationPolicyOpts {
+                        api_url: conn.api_url,
+                        api_key: conn.api_key,
+                        tier: "local",
+                    },
+                    verb,
+                )
+                .await?,
+            )
+        }
+        // @spec AUTOMATED-REMEDIATION-22
+        LocalAction::RemediationQualification { verb } => {
+            let (verb, conn) = verb.into_parts();
+            let verb = verb.validate()?;
+            emit(
+                commands::remediation_qualification(
+                    commands::RemediationPolicyOpts {
+                        api_url: conn.api_url,
+                        api_key: conn.api_key,
+                        tier: "local",
+                    },
+                    verb,
+                )
+                .await?,
+            )
+        }
         LocalAction::Observability { query, open } => match query {
             None => emit(commands::observability(open).await?),
             Some(_) if open => Err(curie::exit::usage(
