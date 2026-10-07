@@ -281,13 +281,14 @@ def test_secret_claim_uses_current_worker_marker_and_pool_policy() -> None:
 
 @pytest.mark.parametrize(
     "pools, templates, fragment",
-    [({}, {}, "acme-runner-pool"), ({"acme-runner-pool": "acme-runner"}, {}, "acme-runner")],
+    [({}, {}, "SandboxWarmPool is absent"), ({"acme-runner-pool": "acme-runner"}, {}, "SandboxTemplate is absent")],
 )
 def test_missing_pool_or_template_fails(pools: dict, templates: dict, fragment: str) -> None:
     """@spec STARTABILITY-2."""
     observer = load_observer()
     rows, _ = split(judge(observer, [binding()], pools=pools, templates=templates))
     assert rows[0]["ready"] == 0 and fragment in rows[0]["reason"]
+    assert "acme-runner" not in rows[0]["reason"]
 
 
 def test_missing_connector_reference_fails() -> None:
@@ -305,7 +306,43 @@ def test_missing_connector_reference_fails() -> None:
             templates={"acme-agent-runner": set()},
         )
     )
-    assert rows[0]["ready"] == 0 and "CONNECTOR_ROOT" in rows[0]["reason"]
+    assert rows[0]["ready"] == 0 and "runner secretKeyRef" in rows[0]["reason"]
+    assert "CONNECTOR_ROOT" not in rows[0]["reason"]
+
+
+def test_secret_backed_worker_pool_name_never_reaches_output(tmp_path: Path) -> None:
+    """@spec STARTABILITY-2 STARTABILITY-5 STARTABILITY-6 STARTABILITY-7."""
+    data = snapshot()
+    data["bindings"] = [binding(kind="email")]
+    data["worker_env"] = [
+        {"name": "CURIE_WARM_POOL", "secret": {"name": "acme-pool", "key": "name"}}
+    ]
+    data["worker_secrets"] = {"acme-pool": {"name": "example-sensitive-pool"}}
+    result, trace = run_cli(tmp_path, data)
+    assert result.returncode == 0
+    rows, total = split([json.loads(line) for line in result.stdout.splitlines()])
+    assert rows[0]["ready"] == 0 and total["not_ready"] == 1
+    assert "SandboxWarmPool is absent" in rows[0]["reason"]
+    assert "example-sensitive-pool" not in result.stdout + result.stderr
+    assert ("acme-pool", "acme-workers") in {
+        tuple(event["args"]) for event in trace if event["operation"] == "secret"
+    }
+
+
+def test_secret_backed_identity_lane_name_never_reaches_reason() -> None:
+    """@spec STARTABILITY-3 STARTABILITY-6."""
+    observer = load_observer()
+    rows, _ = split(
+        judge(
+            observer,
+            [binding(identity="support")],
+            lanes={},
+            identity_lanes={"support": ("EXAMPLE_SENSITIVE_APP_ENV", "EXAMPLE_SENSITIVE_BOT_ENV")},
+        )
+    )
+    assert rows[0]["ready"] == 0
+    assert "app credential" in rows[0]["reason"]
+    assert "EXAMPLE_SENSITIVE_APP_ENV" not in rows[0]["reason"]
 
 
 def snapshot() -> dict[str, Any]:
@@ -605,7 +642,8 @@ def test_cli_sidecar_reference_cannot_cover_missing_runner_reference(tmp_path: P
     assert result.returncode == 0
     rows, total = split([json.loads(line) for line in result.stdout.splitlines()])
     assert [row["ready"] for row in rows] == [0, 1, 1] and total["not_ready"] == 1
-    assert "CONNECTOR_ROOT" in rows[0]["reason"]
+    assert "runner secretKeyRef" in rows[0]["reason"]
+    assert "CONNECTOR_ROOT" not in rows[0]["reason"]
 
 
 @pytest.mark.parametrize("runner_count", [0, 2])
@@ -622,7 +660,8 @@ def test_cli_selected_template_requires_one_runner_without_connector_secrets(
     assert result.returncode == 0
     rows, total = split([json.loads(line) for line in result.stdout.splitlines()])
     assert rows[0]["ready"] == 0 and total["not_ready"] == 1
-    assert "acme-agent-runner" in rows[0]["reason"]
+    assert "SandboxTemplate has no unique runner container" in rows[0]["reason"]
+    assert "acme-agent-runner" not in rows[0]["reason"]
     assert "runner" in rows[0]["reason"]
 
 
@@ -742,7 +781,8 @@ def test_cli_unlisted_existing_agent_pool_is_selected(
     expected = 0 if generic_present else 1
     assert rows[0]["ready"] == expected and total["not_ready"] == 1 - expected
     if generic_present:
-        assert "acme-agent-runner" in rows[0]["reason"]
+        assert "SandboxTemplate is absent" in rows[0]["reason"]
+        assert "acme-agent-runner" not in rows[0]["reason"]
 
 
 def test_cli_discovered_pool_does_not_bypass_connector_secret_refusal(tmp_path: Path) -> None:
