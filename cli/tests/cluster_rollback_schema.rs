@@ -637,7 +637,10 @@ async fn v085_revision_0039_to_v084_is_refused_before_helm_mutates() {
     }
 
     // Negative control: an ambiguous target still performs no retained
-    // manifest read when the whole schema gate is disabled.
+    // manifest read when the whole schema gate is disabled. The refused run
+    // above may read the manifest after its catalog refusal (#4230), so the
+    // log starts empty here.
+    fs::write(&rollback_log, "").expect("reset helm log");
     fs::write(&history_json, two_revision_history("0.8.9", "0.9.0"))
         .expect("write ambiguous history");
     let mut opts = rollback_opts();
@@ -1037,7 +1040,10 @@ fn v0121_manifest_read_failure_keeps_the_catalog_refusal() {
     );
     let payload = json_payload(&output);
     assert!(
-        !payload["error"].as_str().unwrap_or_default().contains("boom"),
+        !payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("boom"),
         "the manifest read error must not replace the catalog refusal: {payload}"
     );
 }

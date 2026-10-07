@@ -465,8 +465,10 @@ jobs:
       run:
         working-directory: cli
     steps:
+      # Full history so the schema window gate can read release tags.
       - uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Toolchain
         run: rustup component add rustfmt clippy
