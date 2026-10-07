@@ -162,21 +162,62 @@ def test_test_actor_close_error_still_disposes_actual_backend_and_preserves_prim
 
 @pytest.mark.parametrize("actor", ["producer", "closer"])
 def test_owned_process_fatal_deadline_for_test_actor_with_actual_backend(
-    worker_db: Any, actor: str
+    worker_db: Any, actor: str, tmp_path: Path
+) -> None:
+    """Fatal machinery, not real cron qualification, @spec PROTECTED-HOOK-SOURCE-2."""
+    assert_fatal_deadline(worker_db, actor, tmp_path)
+
+
+def test_fatal_deadline_excludes_bounded_interpreter_startup(
+    worker_db: Any, tmp_path: Path
+) -> None:
+    """Slow startup must not consume SOURCE-2's owned close budget."""
+    assert_fatal_deadline(worker_db, "closer", tmp_path, startup_delay=3)
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [("late_exit", "owned cleanup exceeded"), ("wrong_exit", "must fatal-exit")],
+)
+def test_fatal_deadline_still_rejects_broken_cleanup(
+    worker_db: Any, tmp_path: Path, fault: str, message: str
+) -> None:
+    """Negative controls catch late or incorrect SOURCE-2 process exits."""
+    with pytest.raises(AssertionError, match=message):
+        assert_fatal_deadline(worker_db, "closer", tmp_path, fault=fault)
+
+
+def assert_fatal_deadline(
+    worker_db: Any,
+    actor: str,
+    tmp_path: Path,
+    *,
+    startup_delay: float = 0,
+    fault: str = "",
 ) -> None:
     """Fatal machinery, not real cron qualification, @spec PROTECTED-HOOK-SOURCE-2."""
     support, _, url = worker_db
     owner_class()
     program = '''
-import asyncio,json,os,uuid
+import time,os
+# Controlled startup delay, before worker imports and owned cleanup.
+time.sleep(float(os.environ['SOURCE_TEST_STARTUP_DELAY']))
+import asyncio,json,uuid
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_worker.worker_lifecycle import WorkerResources
+from pathlib import Path
+class TestOwner(WorkerResources):
+    def _fatal(self, code):
+        # Explicit negative controls; the actual owner is unchanged.
+        if os.environ['SOURCE_TEST_FAULT']=='late_exit': time.sleep(3)
+        if os.environ['SOURCE_TEST_FAULT']=='wrong_exit': os._exit(0)
+        super()._fatal(code)
 async def exercise():
     """@spec PROTECTED-HOOK-SOURCE-2."""
     engine=create_async_engine(os.environ['DATABASE_URL'],pool_size=1,max_overflow=0)
-    owner=WorkerResources()
+    owner=TestOwner()
     ready=asyncio.Event()
     async def stubborn():
         """Explicit TEST actor, @spec PROTECTED-HOOK-SOURCE-2."""
@@ -194,27 +235,47 @@ async def exercise():
         await ready.wait()
     else:
         owner.register_close('TEST-stubborn-closer',stubborn,order=1)
+    # SOURCE-2 budgets owned cleanup, independently of interpreter startup.
+    marker=Path(os.environ['SOURCE_TEST_CLEANUP_MARKER'])
+    pending=marker.with_suffix('.pending')
+    pending.write_text(str(time.monotonic()))
+    pending.replace(marker)
     await owner.aclose()
     print('unexpected-cleanup-success',flush=True)
 asyncio.run(exercise())
 '''
-    started = time.monotonic()
+    marker = tmp_path / "cleanup-started"
+    startup_deadline = time.monotonic() + 20
     process = subprocess.Popen(
         [sys.executable, "-c", program],
-        env=dict(os.environ, DATABASE_URL=url, SOURCE_TEST_ACTOR=actor),
+        env=dict(
+            os.environ,
+            DATABASE_URL=url,
+            SOURCE_TEST_ACTOR=actor,
+            SOURCE_TEST_STARTUP_DELAY=str(startup_delay),
+            SOURCE_TEST_FAULT=fault,
+            SOURCE_TEST_CLEANUP_MARKER=str(marker),
+        ),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
     try:
+        # Startup and owned cleanup each have an independent finite watchdog.
+        while not marker.exists():
+            assert process.poll() is None, "child exited before owned cleanup began"
+            assert time.monotonic() < startup_deadline, "child startup watchdog expired"
+            time.sleep(0.01)
+        started = float(marker.read_text())
+        assert started < startup_deadline, "child startup watchdog expired"
         stdout, _ = process.communicate(timeout=14 if actor == "producer" else 9)
-        assert process.returncode == 1, "unjoined TEST actor must fatal-exit owned process"
         elapsed = time.monotonic() - started
-        assert elapsed <= (12 if actor == "producer" else 7)
         pid = json.loads(stdout)["pid"]
         assert support.sql_dicts(
             "SELECT count(*) AS peers FROM pg_stat_activity WHERE pid=:pid", {"pid": pid}
         ) == [{"peers": 0}]
+        assert process.returncode == 1, "unjoined TEST actor must fatal-exit owned process"
+        assert elapsed <= (12 if actor == "producer" else 7), "owned cleanup exceeded its budget"
     finally:
         if process.poll() is None:
             process.kill()

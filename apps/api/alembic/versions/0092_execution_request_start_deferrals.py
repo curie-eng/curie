@@ -1,7 +1,7 @@
 """Count start deferrals and allow an unstarted request to fail (#4170).
 
-Revision ID: 0089
-Revises: 0081
+Revision ID: 0092
+Revises: 0091
 Create Date: 2026-10-07
 """
 
@@ -10,8 +10,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0089"
-down_revision: str | None = "0081"
+revision: str = "0092"
+down_revision: str | None = "0091"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

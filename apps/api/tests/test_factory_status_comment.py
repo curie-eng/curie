@@ -536,11 +536,18 @@ def test_every_terminal_failure_cause_shows_needs_human_status(
     assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
 
 
-def test_owner_lost_shows_needs_human_status(admitted: Any) -> None:  # noqa: F811
-    client, github, sink = admitted
-    number = 9932
-    request_id = _admit(client, github, sink, number)
-    _reconcile()
+def _issue_requests(number: int) -> list[dict[str, Any]]:
+    return _rows(
+        "SELECT r.id, r.sequence, r.status, r.terminal_cause "
+        "FROM curie.execution_requests r JOIN curie.work_items w ON w.id = r.work_item_id "
+        "WHERE w.github_issue_number = :n ORDER BY r.sequence",
+        {"n": number},
+    )
+
+
+def _lose_owner(client: Any, request_id: uuid.UUID) -> None:
+    """Start the request, lapse its heartbeat, and observe the owner_lost teardown."""
+
     _start_running(request_id)
     _execute(
         "UPDATE curie.execution_requests "
@@ -552,20 +559,93 @@ def test_owner_lost_shows_needs_human_status(admitted: Any) -> None:  # noqa: F8
         },
     )
     _reconcile()
-    assert (_request(number)["status"], _request(number)["terminal_cause"]) == (
-        "cancellation_requested",
-        "owner_lost",
+    (row,) = _rows(
+        "SELECT status, terminal_cause FROM curie.execution_requests WHERE id = :id",
+        {"id": request_id},
     )
+    assert (row["status"], row["terminal_cause"]) == ("cancellation_requested", "owner_lost")
     _observe_termination(client, request_id)
     _reconcile()
 
-    (comment,) = _marked(sink, request_id)
+
+RETRIED = (
+    "the worker running this request stopped responding. Curie started the work "
+    "again as a new run (attempt {attempt} of 3)."
+)
+EXHAUSTED = "the worker running this request stopped responding 3 times."
+
+
+def test_a_retried_owner_lost_hands_the_label_to_the_successor(
+    admitted: Any,  # noqa: F811
+) -> None:
+    """ADR 0206: the first loss names the retry; the successor speaks for the issue."""
+
+    client, github, sink = admitted
+    number = 9936
+    lost_id = _admit(client, github, sink, number)
+    _reconcile()
+    _lose_owner(client, lost_id)
+
+    requests = _issue_requests(number)
+    assert [(r["id"], r["status"], r["terminal_cause"]) for r in requests[:1]] == [
+        (lost_id, "failed", "owner_lost")
+    ]
+    assert len(requests) == 2, requests
+    successor_id = requests[1]["id"]
+    assert requests[1]["status"] == "waiting"
+
+    (lost,) = _marked(sink, lost_id)
+    body = lost["body"]
+    assert RETRIED.format(attempt=2) in body
+    assert EXHAUSTED not in body
+    assert "Cause: owner_lost" in body
+    assert FINAL_MARKER in body
+    (successor,) = _marked(sink, successor_id)
+    assert "Status: QUEUED" in successor["body"]
+    assert FINAL_MARKER not in successor["body"]
+    assert sink.posts == 2
+    assert _curie_labels(sink, number) == {"curie-factory:queued"}
+
+
+def test_owner_lost_shows_needs_human_status(admitted: Any) -> None:  # noqa: F811
+    """ADR 0206: two losses are retried; the third needs a human."""
+
+    client, github, sink = admitted
+    number = 9932
+    current = _admit(client, github, sink, number)
+    _reconcile()
+    lost: list[uuid.UUID] = []
+    for attempt in (2, 3):
+        _lose_owner(client, current)
+        lost.append(current)
+        requests = _issue_requests(number)
+        assert len(requests) == attempt, requests
+        (comment,) = _marked(sink, current)
+        body = comment["body"]
+        assert RETRIED.format(attempt=attempt) in body
+        assert "Cause: owner_lost" in body
+        assert FINAL_MARKER in body
+        assert _curie_labels(sink, number) == {"curie-factory:queued"}
+        current = requests[-1]["id"]
+
+    _lose_owner(client, current)
+    requests = _issue_requests(number)
+    assert [(r["status"], r["terminal_cause"]) for r in requests] == [
+        ("failed", "owner_lost")
+    ] * 3
+    (comment,) = _marked(sink, current)
     body = comment["body"]
+    assert EXHAUSTED in body
+    assert "Curie started the work again" not in body
     assert "Cause: owner_lost" in body
     assert "Status: NEEDS HUMAN" in body
     assert "Status: FAILED" not in body
     assert FINAL_MARKER in body
     assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
+    # The earlier comments keep their retry text once the third loss lands.
+    for attempt, request_id in zip((2, 3), lost, strict=True):
+        (earlier,) = _marked(sink, request_id)
+        assert RETRIED.format(attempt=attempt) in earlier["body"]
 
 
 def test_an_expired_run_shows_needs_human_status(admitted: Any) -> None:  # noqa: F811
