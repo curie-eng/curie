@@ -128,6 +128,17 @@ remediation's forward record carries its authority, actor, delivery and
 nomination from the dispatch commit
 (`apps/api/src/curie_api/remediation_forward.py`).
 
+Migration `0090_remediation_read_executions.py` (automated remediation,
+AUTOMATED-REMEDIATION-12, executor amendments E2 and E9) is additive.
+`action_executions` (`apps/api/src/curie_api/models.py::ActionExecution`) gains
+`not_before` (the claim route hands out an execution once due; NULL is due),
+`pointer` (a read's RFC 6901 pointer) and `sample` (a read's reported
+`{sample, value}`, or the API's `skipped`), all nullable with no backfill, and a
+partial index on (`not_before`, `created_at`) over requested rows. The kind
+check is replaced so `kind` gains `read`. Read executions are created only by
+`apps/api/src/curie_api/remediation_reads.py::create_read_execution`; the
+downgrade deletes them before restoring the check.
+
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
 validated against the actual API migration graph and CLI candidate catalog.

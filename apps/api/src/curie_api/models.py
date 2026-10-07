@@ -1842,6 +1842,9 @@ class ExecutionKind(enum.StrEnum):
     restore = "restore"
     forward = "forward"
     probe = "probe"
+    # @spec AUTOMATED-REMEDIATION-12 (executor amendment E2): one remediation
+    # sample, which never enters ``dispatched``.
+    read = "read"
 
 
 class ExecutionState(enum.StrEnum):
@@ -1911,6 +1914,13 @@ class ActionExecution(Base):
             unique=True,
             postgresql_where=text("kind = 'restore' AND state <> 'refused'"),
         ),
+        # @spec AUTOMATED-REMEDIATION-12 (executor amendment E9): due first.
+        Index(
+            "ix_action_executions_requested_not_before",
+            "not_before",
+            "created_at",
+            postgresql_where=text("state = 'requested'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -1948,6 +1958,13 @@ class ActionExecution(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     outcome: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # @spec AUTOMATED-REMEDIATION-12 (executor amendment E9): handed out only
+    # once due; NULL is due.
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # A read's RFC 6901 pointer, bound by its producer with tool and arguments.
+    pointer: Mapped[str | None] = mapped_column(Text, default=None)
+    # A read's ``{"sample", "value"}`` as reported, or the API's ``skipped``.
+    sample: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
 
 
 class ConnectorCapability(Base):
