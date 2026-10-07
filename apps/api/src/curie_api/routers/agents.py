@@ -3,10 +3,10 @@
 import functools
 import tempfile
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from aci_protocol.turn import route_identity
 from curie_protected_hooks.source_policy_sql import (
@@ -16,7 +16,10 @@ from curie_protected_hooks.source_policy_sql import (
     ensure_source_gate_live,
 )
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from plugin_format import connector_lock
 from plugin_format.connector_render import AmbiguousObjectName
 from plugin_format.deploy_targets import connectors_for_agent, restrict_connectors
@@ -48,7 +51,63 @@ from ..models import Agent, AgentChannel
 from ..publication_policy import PublicationPolicyConflict
 from ..runner_resources import RunnerResourcesError, quota_refusal
 
-router = APIRouter(prefix="/agents", tags=["agents"], dependencies=[Depends(require_api_key)])
+def _carries_secret_input(error: dict[str, Any]) -> bool:
+    """Whether a validation error's ``input`` can hold connector secret values.
+
+    The ``secrets`` field's own errors carry the whole submitted map; an error
+    on the body itself (a missing field, a non-object body) carries the whole
+    body, which may include that map.
+    """
+
+    loc = tuple(error.get("loc", ()))
+    if loc[:2] == ("body", "secrets"):
+        return True
+    value = error.get("input")
+    return isinstance(value, dict) and "secrets" in value
+
+
+class _SecretRedactingRoute(APIRoute):
+    """Answer a body validation failure without echoing secret values.
+
+    FastAPI's default 422 echoes pydantic's ``input``. For the agent
+    ``secrets`` map that is every submitted value, so a refused create or
+    update (a reserved name, an empty value, or a reserved snapshot sealing
+    key, @spec ACTION-EXECUTOR-16) would print them into any client or proxy
+    log of the error body. The same redaction the provider-installation and
+    channel-identity routers apply, narrowed to the errors that can hold those
+    values: every other error keeps FastAPI's default shape.
+    """
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+
+        async def redacting_handler(request: Request) -> Response:
+            try:
+                return await handler(request)
+            except RequestValidationError as exc:
+                errors = list(exc.errors())
+                if not any(_carries_secret_input(error) for error in errors):
+                    raise
+                detail = [
+                    {key: value for key, value in error.items() if key != "input"}
+                    if _carries_secret_input(error)
+                    else error
+                    for error in errors
+                ]
+                return JSONResponse(
+                    {"detail": jsonable_encoder(detail)},
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
+
+        return redacting_handler
+
+
+router = APIRouter(
+    prefix="/agents",
+    tags=["agents"],
+    dependencies=[Depends(require_api_key)],
+    route_class=_SecretRedactingRoute,
+)
 
 
 class HookSecretOut(BaseModel):
