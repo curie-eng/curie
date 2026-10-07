@@ -14,8 +14,10 @@ maintainer rulings of 2026-10-07 (M2, M3) and executor amendments E3, E5 and E9:
   key, or an observe-only execution against the acting connector reporting a
   version other than the action's ``post_version``), ``not-recovered`` (the
   deadline passes with at least one successful sample and no ``verified``) or
-  ``verifier-unavailable`` (no successful sample). A refused read is an
-  unsuccessful sample (AUTOMATED-REMEDIATION-12). A forward execution that ends
+  ``verifier-unavailable`` (no successful sample after settle by the deadline,
+  or a read execution refused, which ends the verification at once). Samples
+  before ``settle_seconds`` are taken and recorded but never count. A
+  ``skipped`` sample is unsuccessful, not refused. A forward execution that ends
   ``failed`` or ``indeterminate`` gets no verifier and finishes
   ``not-recovered``. The outcome is written on the nomination and the ledger
   record once.
@@ -27,11 +29,12 @@ maintainer rulings of 2026-10-07 (M2, M3) and executor amendments E3, E5 and E9:
   the undo ruling for a policy record without an approving principal.
 * AUTOMATED-REMEDIATION-20, -21: no receipt or log carries a sampled value.
 
-Schedule (plan task 11, as the task brief fixes it): the first sample is due
-``settle_seconds`` after the forward execution's ``dispatched_at``, then one
-every ``interval_seconds`` up to and including ``deadline_seconds`` after
-dispatch, so every scheduled sample counts and a verification is at most 60
-samples (``deadline_seconds`` <= 60 x ``interval_seconds``). Samples are all
+Schedule (AUTOMATED-REMEDIATION-18): one sample due every ``interval_seconds``
+after the forward execution's ``dispatched_at`` (``dispatched_at + k x
+interval`` for k = 1, 2, ...) up to and including ``deadline_seconds`` after
+dispatch, so a verification is at most 60 samples (``deadline_seconds`` <= 60 x
+``interval_seconds``); a sample counts when it is due at or after
+``dispatched_at + settle_seconds``. Samples are all
 created when the forward execution is confirmed (the skip rule of task 7 needs
 the successor rows), under the idempotency key namespace
 ``remediation:<nomination id>:`` and the forward execution's
@@ -101,6 +104,11 @@ READ_DIGEST = "sha256:" + "ef" * 32
 READ_IMAGE = f"ghcr.io/example/metrics-mcp@{READ_DIGEST}"
 OBSERVE_TOOL = "observe_version"
 POST_VERSION = "rv-2001"
+OBSERVED_TARGET: dict[str, Any] = {
+    "kind": "Deployment",
+    "namespace": "example-ns",
+    "name": "example-api",
+}
 
 USERS_ROUTE = "sre-oncall"
 CHANNEL = "C0EXAMPLE9"
@@ -113,11 +121,12 @@ SAMPLED = 0.0137
 SAMPLED_TEXT = "0.0137"
 UNHEALTHY = 0.9
 
-SETTLE = 30
+SETTLE = 60
 INTERVAL = 30
-DEADLINE = 120
-# Samples at settle, settle + interval, ... up to the deadline: 30, 60, 90, 120.
-OFFSETS = [30, 60, 90, 120]
+DEADLINE = 150
+# Samples every interval from dispatch up to the deadline: 30 (before settle,
+# recorded but never counted), 60 (at settle), 90, 120, 150.
+OFFSETS = [30, 60, 90, 120, 150]
 
 VERIFIER: dict[str, Any] = {
     "connector": READ_CONNECTOR,
@@ -597,13 +606,13 @@ def _restores() -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 
 
-def test_a_confirmed_forward_schedules_one_read_per_sample_from_settle_to_deadline(
+def test_a_confirmed_forward_schedules_one_read_per_interval_until_the_deadline(
     client: Any, auth_headers: dict[str, str], tmp_path: Path
 ) -> None:
     """@spec AUTOMATED-REMEDIATION-18 @spec AUTOMATED-REMEDIATION-12: one ``read``
     execution per sample of the declared verifier read (connector, in-force
-    digest, tool, canonical arguments, pointer), due at settle and then every
-    interval up to the deadline after dispatch, under the forward execution's
+    digest, tool, canonical arguments, pointer), due every interval from
+    dispatch up to the deadline (before settle too), under the forward execution's
     authority. The nomination is ``verifying`` and no outcome is written yet.
     """
 
@@ -686,7 +695,7 @@ def test_a_verification_is_at_most_sixty_samples(
     client: Any, auth_headers: dict[str, str], tmp_path: Path
 ) -> None:
     """@spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-17: a deadline of
-    60 intervals with settle one interval is exactly 60 samples, the cap.
+    60 intervals is exactly 60 samples, the cap.
     """
 
     document = _document(settle_seconds=10, interval_seconds=10, deadline_seconds=600)
@@ -765,22 +774,25 @@ def test_a_forward_execution_of_another_producer_gets_no_verifier(client: Any) -
 
 
 # --------------------------------------------------------------------------- #
-# AUTOMATED-REMEDIATION-18: verified
+# AUTOMATED-REMEDIATION-18: verified, and settle
 # --------------------------------------------------------------------------- #
 
 
-def test_consecutive_satisfied_samples_verify_and_end_the_verification(
+def test_a_recovered_target_is_verified_only_after_settle(
     client: Any, auth_headers: dict[str, str], tmp_path: Path
 ) -> None:
-    """@spec AUTOMATED-REMEDIATION-18 @spec AUTOMATED-REMEDIATION-14: ``verified``
-    once ``consecutive`` (2) samples satisfy the predicate before the deadline;
-    written once on the ledger record (with ``verified_at``) and the nomination,
-    which finishes; the rest of the series is never claimed.
+    """@spec AUTOMATED-REMEDIATION-18: "Samples before ``settle_seconds`` are taken
+    and recorded but never count"; ``verified`` once ``consecutive`` (2) samples
+    at or after settle satisfy the predicate, written once on the ledger record
+    (with ``verified_at``) and the nomination, which finishes; the rest of the
+    series is never claimed.
     """
 
     _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
 
-    _take(client, nomination_id)
+    _take(client, nomination_id)  # before settle: recorded, never counted
+    assert _samples(nomination_id)[0]["sample"] == {"sample": "value", "value": SAMPLED}
+    _take(client, nomination_id)  # the first sample at settle
     assert _outcome(forward_id, nomination_id) is None
     assert _nomination(nomination_id)["state"] == "verifying"
     _take(client, nomination_id)
@@ -803,25 +815,9 @@ def test_a_prometheus_numeric_string_satisfies_an_ordering_comparator(
 
     _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
 
+    _take(client, nomination_id, UNHEALTHY)
     _take(client, nomination_id, "0.01")
     _take(client, nomination_id, "0.02")
-
-    assert _outcome(forward_id, nomination_id) == "verified"
-
-
-def test_a_refused_read_is_an_unsuccessful_sample_not_the_end(
-    client: Any, auth_headers: dict[str, str], tmp_path: Path
-) -> None:
-    """@spec AUTOMATED-REMEDIATION-12: a refused read is one unsuccessful sample;
-    later samples can still verify.
-    """
-
-    _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
-
-    _refuse_next(client, nomination_id)
-    assert _outcome(forward_id, nomination_id) is None
-    _take(client, nomination_id)
-    _take(client, nomination_id)
 
     assert _outcome(forward_id, nomination_id) == "verified"
 
@@ -829,13 +825,13 @@ def test_a_refused_read_is_an_unsuccessful_sample_not_the_end(
 def test_satisfied_samples_that_are_not_consecutive_do_not_verify(
     client: Any, auth_headers: dict[str, str], tmp_path: Path
 ) -> None:
-    """@spec AUTOMATED-REMEDIATION-18: satisfied, unsatisfied, satisfied,
-    unsatisfied with ``consecutive`` 2 is ``not-recovered`` at the deadline.
+    """@spec AUTOMATED-REMEDIATION-18: after settle, satisfied, unsatisfied,
+    satisfied, unsatisfied with ``consecutive`` 2 is ``not-recovered``.
     """
 
     _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
 
-    for value in (SAMPLED, UNHEALTHY, SAMPLED):
+    for value in (UNHEALTHY, SAMPLED, UNHEALTHY, SAMPLED):
         _take(client, nomination_id, value)
         assert _outcome(forward_id, nomination_id) is None
     _take(client, nomination_id, UNHEALTHY)
@@ -866,18 +862,53 @@ def test_the_deadline_with_successful_unsatisfied_samples_is_not_recovered(
     assert _nomination(nomination_id)["state"] == "finished"
 
 
-def test_a_healthy_sample_then_unhealthy_ones_is_not_recovered(
+def test_a_target_healthy_before_settle_and_unhealthy_after_is_not_recovered(
     client: Any, auth_headers: dict[str, str], tmp_path: Path
 ) -> None:
-    """@spec AUTOMATED-REMEDIATION-18: one satisfied sample is not ``consecutive``."""
+    """@spec AUTOMATED-REMEDIATION-18 (acceptance): "a target healthy before settle
+    and unhealthy after is ``not-recovered``".
+    """
 
     _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
 
-    _take(client, nomination_id, SAMPLED)
+    _take(client, nomination_id, SAMPLED)  # before settle
     for _ in OFFSETS[1:]:
         _take(client, nomination_id, UNHEALTHY)
 
     assert _outcome(forward_id, nomination_id) == "not-recovered"
+
+
+def test_satisfied_samples_before_settle_never_verify(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-18: with settle three intervals, two satisfied
+    samples before settle do not verify; unhealthy after is ``not-recovered``.
+    """
+
+    document = _document(settle_seconds=3 * INTERVAL)
+    _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path, document=document)
+
+    _take(client, nomination_id, SAMPLED)
+    _take(client, nomination_id, SAMPLED)
+    assert _outcome(forward_id, nomination_id) is None
+    for _ in OFFSETS[2:]:
+        _take(client, nomination_id, UNHEALTHY)
+
+    assert _outcome(forward_id, nomination_id) == "not-recovered"
+
+
+def test_a_successful_sample_only_before_settle_is_verifier_unavailable(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-18: "no successful sample after settle"."""
+
+    _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
+
+    _take(client, nomination_id, UNHEALTHY)
+    for _ in OFFSETS[1:]:
+        _take(client, nomination_id, sample="result_unstructured")
+
+    assert _outcome(forward_id, nomination_id) == "verifier-unavailable"
 
 
 def test_pointer_absent_is_a_successful_unsatisfied_sample(
@@ -909,26 +940,49 @@ def test_no_successful_sample_by_the_deadline_is_verifier_unavailable(
 
     _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
 
-    for _ in OFFSETS:
+    for _ in OFFSETS[:-1]:
         _take(client, nomination_id, sample=sample)
+        assert _outcome(forward_id, nomination_id) is None
+    _take(client, nomination_id, sample=sample)
 
     assert _outcome(forward_id, nomination_id) == "verifier-unavailable"
     assert _nomination(nomination_id)["state"] == "finished"
 
 
-def test_every_read_refused_is_verifier_unavailable(
-    client: Any, auth_headers: dict[str, str], tmp_path: Path
+@pytest.mark.parametrize(
+    "code",
+    ["connector_unreachable", "sandbox_unavailable", "runner_unavailable", "tool_not_read_only"],
+)
+def test_a_refused_read_ends_the_verification_verifier_unavailable(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, code: str
 ) -> None:
-    """@spec AUTOMATED-REMEDIATION-18: "or the read execution is refused" (a read
-    connector made unreachable, a sandbox incident).
+    """@spec AUTOMATED-REMEDIATION-18: ``verifier-unavailable`` when "the read
+    execution is refused" (a read connector made unreachable, a sandbox
+    incident): at once, even after a satisfied sample, and the rest of the series
+    is never claimed.
     """
 
     _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
+    _take(client, nomination_id)
+    _take(client, nomination_id)
 
-    for code in ("connector_unreachable", "sandbox_unavailable", "runner_unavailable"):
-        _refuse_next(client, nomination_id, code)
-        assert _outcome(forward_id, nomination_id) is None
-    _refuse_next(client, nomination_id, "tool_not_read_only")
+    _refuse_next(client, nomination_id, code)
+
+    assert _outcome(forward_id, nomination_id) == "verifier-unavailable"
+    assert _nomination(nomination_id)["state"] == "finished"
+    assert [row["state"] for row in _samples(nomination_id)].count("requested") == 0
+    _shift(timedelta(seconds=DEADLINE * 2))
+    assert _claim(client).status_code == 204
+
+
+def test_a_refused_read_before_settle_ends_the_verification_too(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-18: the refusal rule has no settle condition."""
+
+    _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
+
+    _refuse_next(client, nomination_id)
 
     assert _outcome(forward_id, nomination_id) == "verifier-unavailable"
 
@@ -940,7 +994,7 @@ def test_every_read_refused_is_verifier_unavailable(
         (("result_unstructured", None), "verifier-unavailable"),
     ],
 )
-def test_samples_skipped_at_the_claim_count_as_unsuccessful(
+def test_samples_skipped_at_the_claim_are_unsuccessful_not_refused(
     client: Any,
     auth_headers: dict[str, str],
     tmp_path: Path,
@@ -948,8 +1002,8 @@ def test_samples_skipped_at_the_claim_count_as_unsuccessful(
     expected: str,
 ) -> None:
     """@spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-18: when every
-    sample is due at once the claim records all but the last ``skipped``; the
-    outcome follows the last one.
+    sample is due at once the claim records all but the last ``skipped`` (an
+    unsuccessful sample, never a refusal); the outcome follows the last one.
     """
 
     _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
@@ -966,17 +1020,18 @@ def test_samples_skipped_at_the_claim_count_as_unsuccessful(
     assert _outcome(forward_id, nomination_id) == expected
 
 
-def test_a_last_sample_whose_lease_expires_ends_the_verification_at_the_claim(
+def test_a_sample_whose_lease_expires_is_refused_and_ends_the_verification(
     client: Any, auth_headers: dict[str, str], tmp_path: Path
 ) -> None:
     """@spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-18: the claim
-    route's lease expiry (``runner_unavailable``) ends the last sample, and the
-    verification is decided then, not left ``verifying``.
+    route's lease expiry refuses the read ``runner_unavailable``, and the
+    verification is decided then (``verifier-unavailable``), not left
+    ``verifying``.
     """
 
     _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
-    for _ in OFFSETS[:-1]:
-        _take(client, nomination_id, UNHEALTHY)
+    _take(client, nomination_id, UNHEALTHY)
+    _take(client, nomination_id, UNHEALTHY)
     _make_next_due(nomination_id)
     claimed = _claim_read(client)
     sql_rows(
@@ -988,7 +1043,7 @@ def test_a_last_sample_whose_lease_expires_ends_the_verification_at_the_claim(
     assert _claim(client).status_code == 204
 
     assert _execution(claimed["id"])["state"] == "refused"
-    assert _outcome(forward_id, nomination_id) == "not-recovered"
+    assert _outcome(forward_id, nomination_id) == "verifier-unavailable"
 
 
 # --------------------------------------------------------------------------- #
@@ -1006,6 +1061,7 @@ def test_another_ledger_record_on_the_target_supersedes_before_verified(
 
     agent_id, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
     _take(client, nomination_id)
+    _take(client, nomination_id)
     other = _nominate(agent_id, event_id="event-0000000012", arguments={**NOMINATED, "replicas": 5})
     other_forward, _ = _dispatched(client, other)
 
@@ -1022,6 +1078,7 @@ def test_a_record_on_another_target_does_not_supersede(
     """@spec AUTOMATED-REMEDIATION-18: only the same target key supersedes."""
 
     agent_id, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
+    _take(client, nomination_id)
     _take(client, nomination_id)
     other = _nominate(
         agent_id,
@@ -1044,13 +1101,25 @@ def _observe_document() -> dict[str, Any]:
 def _observe_scenario(
     client: Any, headers: dict[str, str], tmp_path: Path
 ) -> tuple[uuid.UUID, uuid.UUID]:
-    _, nomination_id, forward_id = _scenario(
-        client, headers, tmp_path, document=_observe_document(), observe=True
-    )
+    """A reversible remediation whose ledger row records its target and version
+    (as the worker's completion does) before the forward execution is confirmed.
+    """
+
+    agent_id = _agent(client, headers, tmp_path, observe=True)
+    _bind_policy(agent_id, _observe_document())
+    nomination_id = _nominate(agent_id)
+    forward_id, fence = _dispatched(client, nomination_id)
     sql_rows(
-        "UPDATE curie.agent_actions SET post_version = :v WHERE id = :id",
-        {"v": POST_VERSION, "id": _execution(forward_id)["subject_action_id"]},
+        "UPDATE curie.agent_actions SET post_version = :v, target = CAST(:t AS jsonb) "
+        "WHERE id = :id",
+        {
+            "v": POST_VERSION,
+            "t": json.dumps(OBSERVED_TARGET),
+            "id": _execution(forward_id)["subject_action_id"],
+        },
     )
+    ended = _end(client, forward_id, fence)
+    assert ended.status_code == 200, ended.text
     return nomination_id, forward_id
 
 
@@ -1080,8 +1149,8 @@ def test_an_observe_only_execution_is_scheduled_beside_each_sample(
 ) -> None:
     """@spec AUTOMATED-REMEDIATION-18 (executor amendment E3): for an action whose
     connector advertises ``observe_version``, a ``read``-kind execution of the
-    acting connector's ``observe_version`` (no pointer) is due with each sample,
-    under the same authority.
+    acting connector's ``observe_version`` (no pointer), bound to the recorded
+    target, is due with each sample under the same authority.
     """
 
     nomination_id, _ = _observe_scenario(client, auth_headers, tmp_path)
@@ -1097,6 +1166,39 @@ def test_an_observe_only_execution_is_scheduled_beside_each_sample(
         assert row["connector_digest"] == ACT_DIGEST
         assert row["pointer"] is None
         assert row["authority_kind"] == "policy"
+        assert row["forward_arguments"] == {"target": OBSERVED_TARGET}
+        assert row["arguments_sha256"] == _sha({"target": OBSERVED_TARGET})
+
+
+def test_a_claimed_observe_only_execution_hands_its_holder_the_target(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-18 (E3): ``/arguments`` answers the holder
+    ``observe_version`` with the recorded target and no pointer.
+    """
+
+    nomination_id, _ = _observe_scenario(client, auth_headers, tmp_path)
+    _make_next_due(nomination_id)
+    for _ in range(2):
+        claimed = _claim(client)
+        assert claimed.status_code == 200, claimed.text
+        if _execution(claimed.json()["id"])["tool"] == OBSERVE_TOOL:
+            break
+        reported = _report(client, claimed.json(), "value", SAMPLED)
+        assert reported.status_code == 200, reported.text
+    body = claimed.json()
+    assert _execution(body["id"])["tool"] == OBSERVE_TOOL
+
+    answered = client.post(
+        f"/action-executions/{body['id']}/arguments", json=_fence(body), headers=worker_headers()
+    )
+
+    assert answered.status_code == 200, answered.text
+    assert answered.json() == {
+        "tool": OBSERVE_TOOL,
+        "arguments": {"target": OBSERVED_TARGET},
+        "pointer": None,
+    }
 
 
 def test_an_observed_version_other_than_the_actions_supersedes(
@@ -1108,6 +1210,7 @@ def test_an_observed_version_other_than_the_actions_supersedes(
 
     nomination_id, forward_id = _observe_scenario(client, auth_headers, tmp_path)
 
+    _step(client, nomination_id, SAMPLED, POST_VERSION)
     _step(client, nomination_id, SAMPLED, POST_VERSION)
     assert _outcome(forward_id, nomination_id) is None
     _step(client, nomination_id, SAMPLED, "rv-2002")
@@ -1147,6 +1250,7 @@ def test_the_outcome_is_written_once(
 
     _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
     _take(client, nomination_id)
+    _take(client, nomination_id)
     _make_next_due(nomination_id)
     claimed = _claim_read(client)
     assert _report(client, claimed, "value", SAMPLED).status_code == 200
@@ -1170,11 +1274,11 @@ def test_no_outcome_triggers_an_undo(
     """
 
     _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
-    for _ in OFFSETS:
-        if ending == "not-recovered":
+    if ending == "not-recovered":
+        for _ in OFFSETS:
             _take(client, nomination_id, UNHEALTHY)
-        else:
-            _take(client, nomination_id, sample="result_unstructured")
+    else:
+        _refuse_next(client, nomination_id)
 
     assert _outcome(forward_id, nomination_id) == ending
     assert _restores() == []
@@ -1201,7 +1305,7 @@ def test_no_receipt_or_log_carries_a_sampled_value(
 
     caplog.set_level(logging.DEBUG)
     _, nomination_id, forward_id = _scenario(client, auth_headers, tmp_path)
-    bodies = [_take(client, nomination_id).text, _take(client, nomination_id).text]
+    bodies = [_take(client, nomination_id).text for _ in range(3)]
     assert _outcome(forward_id, nomination_id) == "verified"
     action_id = _execution(forward_id)["subject_action_id"]
     for row in _samples(nomination_id):
