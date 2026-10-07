@@ -143,7 +143,11 @@ fn version_key(version: &str) -> Option<VersionKey> {
 
 /// Catalog head of the first catalogued version released after `app_version`.
 /// A build carrying `app_version` was cut before that release, so it cannot
-/// declare a later schema head. `None` when no later version is catalogued.
+/// declare a later schema head. `None` when no later version is catalogued;
+/// callers pass a catalogued version, so an unparseable one never reaches the
+/// open bound. Version order stands in for release order on one schema chain:
+/// a patch cut after a later line was catalogued is refused, which fails
+/// closed with a fail forward hint.
 pub fn next_release_head(app_version: &str) -> Option<String> {
     let key = version_key(app_version)?;
     catalog()
@@ -290,6 +294,20 @@ mod tests {
         assert_eq!(next_release_head("0.10.3").as_deref(), Some("0070"));
         assert_eq!(next_release_head("0.12.1").as_deref(), Some("0081"));
         assert_eq!(next_release_head("not-a-version"), None);
+    }
+
+    #[test]
+    fn newest_catalogued_version_has_no_next_release_head() {
+        let newest = catalog()
+            .windows
+            .keys()
+            .max_by_key(|version| version_key(version))
+            .expect("the catalog has released windows");
+        assert_eq!(
+            next_release_head(newest),
+            None,
+            "a main build carrying the newest release must keep an open upper bound"
+        );
     }
 
     #[test]
