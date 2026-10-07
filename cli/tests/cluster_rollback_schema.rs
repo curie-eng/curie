@@ -1061,3 +1061,55 @@ fn v0121_declared_window_that_still_excludes_live_keeps_the_catalog_refusal() {
         "fail forward to application 0.12.2, which can start against revision 0081",
     );
 }
+
+/// A chart packaged from this tree under the released 0.10.0 version declares
+/// the candidate head, which no build cut before 0.10.1 could carry. The
+/// declared window is past the next release's head, so the catalog refusal
+/// stands. This is the shape the cluster upgrade matrix's guarded rollback
+/// drives on kind.
+#[test]
+fn chart_packaged_from_a_newer_tree_under_v0100_keeps_the_catalog_refusal() {
+    let history = two_revision_history("0.10.0", "0.10.1");
+    let manifest = compatibility_manifest("prod-release-schema-compat", "0.10.0", "0076", "0081");
+    let fixture = RollbackFixture::new(&history, "0081", Ok(&manifest));
+    let output = fixture.run(&[]);
+    assert_original_catalog_refusal(
+        &fixture,
+        &output,
+        "0.10.0",
+        "0081",
+        "0058",
+        "no catalogued application version in this release history can start against revision 0081; stay on the current revision",
+    );
+    let log = fixture.helm_log();
+    assert!(
+        log.lines()
+            .any(|line| line == "get manifest prod-release -n agent-ns --revision 1"),
+        "the refusal must come from the declared window bound, not a skipped manifest read: {log}"
+    );
+}
+
+/// A build cut between 0.10.1 and 0.10.2 declares a head up to 0.10.2's
+/// catalog head 0062, so an older release line is admitted the same way as
+/// the newest one.
+#[test]
+fn main_built_v0101_before_the_next_release_rolls_back_by_declared_window() {
+    let history = two_revision_history("0.10.1", "0.10.2");
+    let manifest = compatibility_manifest("prod-release-schema-compat", "0.10.1", "0045", "0060");
+    let fixture = RollbackFixture::new(&history, "0060", Ok(&manifest));
+    let output = fixture.run(&[]);
+    assert!(
+        output.status.success(),
+        "declared 0045..0060 window admits live 0060: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fixture
+            .helm_log()
+            .lines()
+            .any(|line| line == "rollback prod-release 1 -n agent-ns"),
+        "the admitted target must be rolled back: {}",
+        fixture.helm_log()
+    );
+}
