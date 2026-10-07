@@ -2,7 +2,11 @@
 
 Date: 2026-10-05
 
-Status: Draft
+Status: Accepted
+
+Accepted 2026-10-07 with maintainer approval from TheConnMan, recorded as an
+approving review on the publishing pull request
+([#4048](https://github.com/curie-eng/curie/pull/4048)).
 
 This ADR amends
 [ADR 0198](0198-identity-links-live-in-provider-identity-namespaces.md).

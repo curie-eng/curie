@@ -4,6 +4,16 @@ Date: 2026-10-03
 
 Status: Accepted
 
+**Superseded in part by [ADR 0201](0201-provider-field-mappings-live-with-their-realization.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+in decision 6, the Slack list's field list ("the event's `user_team`, or an
+interaction payload's `user.team_id`") and, in property 1, the phrase "fields
+the provider documents as describing the sending user" plus, within a context
+ADR 0201 decision 2 establishes, its prohibition on deriving the namespace from
+installation fields. Consequence 2's list of what the dispatcher sends is
+amended to include each mapping's context fields. Everything else in this ADR
+stands.
+
 Accepted 2026-10-04 with maintainer approval from TheConnMan, recorded as an
 approving review on the publishing pull request
 ([#3928](https://github.com/curie-eng/curie/pull/3928)).
