@@ -7,6 +7,7 @@ from typing import Any
 from aci_protocol import ApprovalRequest
 from aci_protocol.turn import route_identity
 from sqlalchemy import (
+    case,
     func,
     literal,
     or_,
@@ -31,6 +32,20 @@ from ..resumequeue import parse_resume_event_id
 from .agents import get_agent
 from .errors import PublicationSettlementConflict
 from .publication_queries import get_publication_by_approval
+
+# Purposes whose outcome no resumed model turn reports, so no wake is ever owed:
+# ``publication`` (the worker reports it) and ``remediation`` (the platform
+# executes the bound call, AUTOMATED-REMEDIATION-16). The resolution and expiry
+# compare and sets mark them resumed, and resume reconciliation skips them.
+NO_WAKE_PURPOSES = ("publication", "remediation")
+
+
+def _no_wake_resumed_at() -> Any:
+    """``resumed_at`` for a settling CAS: now for a no-wake purpose, else unchanged."""
+
+    return case(
+        (Approval.purpose.in_(NO_WAKE_PURPOSES), func.now()), else_=Approval.resumed_at
+    )
 
 
 async def create_approval(
@@ -455,8 +470,7 @@ async def claim_approval_resolution(
             decision = ApprovalStatus.rejected
             values["status"] = decision
             values["resolution_note"] = "the factory run already ended"
-    if publication is not None:
-        values["resumed_at"] = func.now()
+    values["resumed_at"] = func.now() if publication is not None else _no_wake_resumed_at()
 
     result = await session.execute(
         update(Approval)
@@ -531,8 +545,9 @@ async def expire_approval(session: AsyncSession, approval_id: uuid.UUID) -> Appr
         "status": ApprovalStatus.expired,
         "resolved_at": func.now(),
     }
-    if publication is not None:
-        approval_values["resumed_at"] = func.now()
+    approval_values["resumed_at"] = (
+        func.now() if publication is not None else _no_wake_resumed_at()
+    )
     result = await session.execute(
         update(Approval)
         .where(Approval.id == approval_id, Approval.status == ApprovalStatus.pending)
@@ -607,7 +622,7 @@ async def reopen_dead_lettered_resume(
         update(Approval)
         .where(
             Approval.id == approval_id,
-            Approval.purpose != "publication",
+            Approval.purpose.not_in(NO_WAKE_PURPOSES),
             Approval.status.in_(_RESUMABLE_STATUSES),
             Approval.resumed_at.is_not(None),
             Approval.resumed_at < dead_lettered_after,
@@ -677,7 +692,7 @@ async def list_resolved_unresumed(
     result = await session.scalars(
         select(Approval.id)
         .where(
-            Approval.purpose != "publication",
+            Approval.purpose.not_in(NO_WAKE_PURPOSES),
             Approval.status.in_(_RESUMABLE_STATUSES),
             Approval.resolved_at.is_not(None),
             Approval.resumed_at.is_(None),
@@ -854,6 +869,8 @@ async def recover_approval_atomic(
             # resolve path does, so the reconciler never picks the row up for a
             # resume the router deliberately does not enqueue.
             values["resumed_at"] = func.now()
+        else:
+            values["resumed_at"] = _no_wake_resumed_at()
         result = await session.execute(
             update(Approval)
             .where(
@@ -933,7 +950,7 @@ def _owes_resume(approval_id: uuid.UUID) -> tuple[ColumnElement[bool], ...]:
 
     return (
         Approval.id == approval_id,
-        Approval.purpose != "publication",
+        Approval.purpose.not_in(NO_WAKE_PURPOSES),
         Approval.resumed_at.is_(None),
         Approval.status.in_(_RESUMABLE_STATUSES),
     )

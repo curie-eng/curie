@@ -79,6 +79,7 @@ from .publication_loop import (
     PublicationReconciler,
 )
 from .publication_store import PostgresPublicationStore
+from .remediation_cards import PostgresRemediationCardStore, RemediationCardLoop
 from .reply_sink import ObservedReplySink, ReplySinkRouter, build_reply_sink
 from .runner_client import RunnerClient
 from .sandbox import (
@@ -142,6 +143,10 @@ class Runtime:
     # Runtime constructed elsewhere need not name it.
     cron_loop: CronSchedulerLoop | None = None
     publication_loop: PublicationReconcileLoop | None = None
+    # None unless automated remediation is on (AUTOMATED-REMEDIATION-15): posts
+    # remediation approval cards beside the publication loop, outside the
+    # consumer and the stream path.
+    remediation_cards: RemediationCardLoop | None = None
     # None unless the action executor is enabled (ACTION-EXECUTOR-1). Launched
     # beside the connector reconcile loop, never inside the consumer.
     action_executor: ActionExecutorLoop | None = None
@@ -802,6 +807,7 @@ def build(
             default_max_output_tokens_per_run=config.default_max_output_tokens_per_run,
         ),
         publication_loop=publication_loop,
+        remediation_cards=_build_remediation_cards(config, engine, sink, card_store),
         stream_retention=build_stream_retention(config, async_redis),
     )
 
@@ -1291,6 +1297,29 @@ def _build_e2e_reaper(
     )
 
 
+def _build_remediation_cards(
+    config: WorkerConfig,
+    engine: AsyncEngine,
+    sink: ReplySinkRouter,
+    card_store: ApprovalCardStore,
+) -> RemediationCardLoop | None:
+    """The remediation approval card loop, behind the remediation switch.
+
+    @spec AUTOMATED-REMEDIATION-15. Its own observed reply sink and the shared
+    ``ApprovalCardStore``, as the publication loop delivers its cards.
+    """
+
+    if not config.remediation_enabled:
+        return None
+    return RemediationCardLoop(
+        store=PostgresRemediationCardStore(
+            engine, schema=config.db_schema, lease_owner=config.consumer_name
+        ),
+        replies=ObservedReplySink(sink),
+        card_store=card_store,
+    )
+
+
 def _build_publication_loop(
     config: WorkerConfig,
     env: Mapping[str, str],
@@ -1502,6 +1531,10 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
         tasks.append(launch("cron", lambda: rt.cron_loop.run_forever(shutdown)))  # type: ignore[union-attr]
     if getattr(rt, "publication_loop", None) is not None:
         tasks.append(launch("publications", lambda: rt.publication_loop.run_forever(shutdown)))  # type: ignore[union-attr]
+    if getattr(rt, "remediation_cards", None) is not None:
+        tasks.append(
+            launch("remediation-cards", lambda: rt.remediation_cards.run_forever(shutdown))  # type: ignore[union-attr]
+        )
     if sweeper is not None:
         tasks.append(launch("work-item-orphans", lambda: sweeper.run_forever(shutdown)))
     if retention is not None:

@@ -57,6 +57,7 @@ from ..auth import require_platform_key
 from ..config import get_settings
 from ..deps import ResumeQueueDep, SessionDep
 from ..models import AgentChannel, Approval, ApprovalAuditEntry, ApprovalStatus
+from ..remediation_approvals import REMEDIATION_PURPOSE, settle_remediation_approval
 from ..resumequeue import approval_trace_context, build_resume_turn
 
 logger = logging.getLogger(__name__)
@@ -326,7 +327,11 @@ async def recover_approval(
         data.recovery_key,
         data.reason,
     )
-    if recovered.purpose != "publication":
+    if recovered.purpose == REMEDIATION_PURPOSE:
+        # AUTOMATED-REMEDIATION-16: a rejected remediation creates nothing and
+        # ends its nominations; no model wake is owed.
+        await settle_remediation_approval(session, approval_id, ApprovalStatus.rejected)
+    elif recovered.purpose not in crud_approvals.NO_WAKE_PURPOSES:
         # Publication outcomes are reported by the worker through the stored
         # reply route; no model wake is owed and none is enqueued.
         await resume_queue.enqueue(build_resume_turn(recovered), parent=stored_parent)

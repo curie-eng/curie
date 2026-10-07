@@ -570,8 +570,9 @@ class Approval(Base):
     granted_arguments: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB(none_as_null=True), default=None
     )
-    # Server-owned purpose. ``publication`` suppresses the ordinary model wake;
-    # requester equality follows the same approver-set rule for every purpose.
+    # Server-owned purpose. ``publication`` and ``remediation`` (an argument-bound
+    # remediation call, AUTOMATED-REMEDIATION-15) suppress the ordinary model
+    # wake; requester equality follows the same approver-set rule for every purpose.
     purpose: Mapped[str] = mapped_column(server_default="session", default="session")
     # Set only when the platform resolved this row under ADR 0147. Human
     # resolutions leave both NULL so they stay distinguishable in the audit.
@@ -2469,6 +2470,69 @@ class RemediationNomination(Base):
         DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
     )
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RemediationApprovalRequest(Base):
+    """One remediation approval: who raised it, what attached, and its card outbox.
+
+    @spec AUTOMATED-REMEDIATION-15. Keyed by the approval; the deduplication
+    fields are the raising nomination's agent, hook, action and argument digest.
+    """
+
+    __tablename__ = "remediation_approval_requests"
+    __table_args__ = (
+        UniqueConstraint("nomination_id", name="remediation_approval_requests_nomination_key"),
+        CheckConstraint(
+            "arguments_sha256 ~ '^[0-9a-f]{64}$'",
+            name="remediation_approval_requests_digest_ck",
+        ),
+        CheckConstraint(
+            "attached_count >= 0 AND card_attempts >= 0",
+            name="remediation_approval_requests_counts_ck",
+        ),
+        Index(
+            "ix_remediation_approval_requests_identity",
+            "agent_id",
+            "hook",
+            "action",
+            "arguments_sha256",
+        ),
+    )
+
+    approval_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.approvals.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    nomination_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.remediation_nominations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    hook: Mapped[str] = mapped_column(String(63), nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    arguments_sha256: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    failed_check: Mapped[str] = mapped_column(Text, nullable=False)
+    observed: Mapped[Any | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    attached_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    newest_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    card_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    card_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    card_lease_owner: Mapped[str | None] = mapped_column(Text, nullable=True)
+    card_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    card_posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    card_dead_lettered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    card_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class HookRun(Base):

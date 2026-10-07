@@ -108,6 +108,8 @@ def test_one_hand_written_revision_on_the_ledger_fields_head() -> None:
     assert revision == HEAD
     # The nomination execution code revision (task 11, 0091) now follows this
     # one; the head pin lives in test_migration_remediation_execution_code.py.
+    # The remediation approvals revision (task 10, 0092) follows that; its head
+    # pin lives in test_migration_remediation_approvals.py.
     script = ScriptDirectory.from_config(alembic_config())
     assert HEAD in {rev.revision for rev in script.iterate_revisions(script.get_heads()[0], BELOW)}
 
