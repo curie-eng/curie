@@ -1,6 +1,6 @@
 {
   "candidate": {
-    "schema_head": "0088",
+    "schema_head": "0089",
     "schema_min": "0082"
   },
   "revisions": [
@@ -88,7 +88,8 @@
     "0085",
     "0086",
     "0087",
-    "0088"
+    "0088",
+    "0089"
   ],
   "windows": {
     "0.10.0": {
@@ -142,6 +143,10 @@
     "0.12.2": {
       "schema_head": "0081",
       "schema_min": "0076"
+    },
+    "0.13.0": {
+      "schema_head": "0089",
+      "schema_min": "0082"
     },
     "0.8.0": {
       "schema_head": "0036",
@@ -200,10 +205,6 @@
     "0.9.3": {
       "schema_head": "0045",
       "schema_min": "0045"
-    },
-    "0.13.0": {
-      "schema_head": "0088",
-      "schema_min": "0082"
     }
   }
 }
