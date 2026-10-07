@@ -1,10 +1,11 @@
 """Executor mode: the runner-private ``/v1/execute`` phases (ACTION-EXECUTOR-6).
 
 @spec ACTION-EXECUTOR-4 @spec ACTION-EXECUTOR-6 @spec ACTION-EXECUTOR-7
-@spec ACTION-EXECUTOR-13 @spec ACTION-EXECUTOR-15 @spec ACTION-EXECUTOR-24.
+@spec ACTION-EXECUTOR-13 @spec ACTION-EXECUTOR-15 @spec ACTION-EXECUTOR-24
+@spec AUTOMATED-REMEDIATION-12.
 A runner booted with ``CURIE_RUNNER_MODE=execute`` loads no harness, no model
 session and no history. It serves one connector action for the worker's
-executor loop in three phases, each over its own standalone MCP session:
+executor loop in four phases, each over its own standalone MCP session:
 
 * ``list``: ``tools/list`` only.
 * ``observe``: one call of the read verb ``observe_version`` with
@@ -15,9 +16,17 @@ executor loop in three phases, each over its own standalone MCP session:
   grant cannot ride to, is refused ``connector_not_hosted``. ``list`` stops past
   ``LIST_PAGE_LIMIT`` pages and a result past ``CALL_RESULT_MAX_BYTES`` is an
   error, neither retried.
+* ``read`` (executor amendments E3, E4): exactly one ``tools/call`` of a
+  declared read tool, no grant. A tool this sandbox's own ``list`` did not
+  advertise with ``readOnlyHint: true`` is refused ``tool_not_read_only``
+  without dialing. The answer is only the sample at the request's RFC 6901
+  ``pointer``: applied to the structured content, else to the strict JSON of
+  a result's one and only text block within ``CALL_RESULT_MAX_BYTES``
+  (maintainer ruling M3), else ``result_unstructured``; never the result.
 
 Within one sandbox the only accepted orders are ``list``, ``list`` then
-``observe`` then a restore ``call``, and ``list`` then a forward ``call``.
+``observe`` then a restore ``call``, ``list`` then a forward ``call``, and
+``list`` then one ``read`` (one sample per sandbox, maintainer ruling M2).
 Every refusal is decided before any write is dialed.
 The worker's client and every shape here are frozen in
 ``tests/vectors/runner-execute.json``. Nothing here emits an ACI frame or logs
@@ -36,7 +45,7 @@ from typing import Any
 
 import anyio
 from mcp import ClientSession
-from mcp.types import CallToolResult, PaginatedRequestParams
+from mcp.types import CallToolResult, PaginatedRequestParams, TextContent
 
 from .connectors import GRANT_HEADER
 from .mcp_tool_capability import server_streams
@@ -50,6 +59,8 @@ EXECUTOR_MODE = "execute"
 REQUEST_KEYS = frozenset(
     ("execution_id", "phase", "connector", "tool", "arguments", "grant", "target")
 )
+# @spec AUTOMATED-REMEDIATION-12: a ``read`` alone adds the predicate's pointer.
+READ_REQUEST_KEYS = REQUEST_KEYS | {"pointer"}
 RESTORE_TOOL = "restore"
 OBSERVE_TOOL = "observe_version"
 _SCHEMA_TOOLS = (RESTORE_TOOL, OBSERVE_TOOL)
@@ -59,6 +70,8 @@ _CALL_TIMEOUT_SECONDS = 60.0
 # Bounds (runner-execute.json ``bounds``): past either, no retry.
 LIST_PAGE_LIMIT = 100
 CALL_RESULT_MAX_BYTES = 1048576
+# remediation-predicate.json ``value_max_chars``: the compact JSON text of a sample.
+SAMPLE_VALUE_MAX_CHARS = 256
 
 # Route refusals and their HTTP status (runner-execute.json ``refusals``).
 _STATUS = {
@@ -69,6 +82,7 @@ _STATUS = {
     "restore_schema_mismatch": 409,
     "arguments_mismatch": 409,
     "connector_not_hosted": 409,
+    "tool_not_read_only": 409,
     "connector_unreachable": 502,
     "call_outcome_unknown": 502,
 }
@@ -99,6 +113,7 @@ class _Request:
     arguments: str | None
     grant: str | None
     target: dict[str, Any] | None
+    pointer: str | None = None
 
 
 @dataclass(frozen=True)
@@ -126,12 +141,37 @@ def _nonempty(value: object) -> bool:
     return isinstance(value, str) and bool(value)
 
 
-def parse_request(body: object) -> _Request:
-    """Exactly the frozen keys; a key the phase does not use is null."""
+def valid_pointer(pointer: object) -> bool:
+    """An RFC 6901 JSON pointer: empty, or ``/`` tokens whose ``~`` escapes are ``~0``/``~1``."""
 
-    if not isinstance(body, dict) or set(body) != REQUEST_KEYS:
+    if not isinstance(pointer, str):
+        return False
+    if pointer == "":
+        return True
+    if not pointer.startswith("/"):
+        return False
+    for token in pointer[1:].split("/"):
+        index = token.find("~")
+        while index != -1:
+            if token[index + 1 : index + 2] not in ("0", "1"):
+                return False
+            index = token.find("~", index + 2)
+    return True
+
+
+def parse_request(body: object) -> _Request:
+    """Exactly the frozen keys; a key the phase does not use is null.
+
+    @spec AUTOMATED-REMEDIATION-12: a ``read`` carries ``pointer`` as well, and
+    no other phase does.
+    """
+
+    if not isinstance(body, dict):
         raise ExecuteRefusal("invalid_request")
-    phase = body["phase"]
+    phase = body.get("phase")
+    expected = READ_REQUEST_KEYS if phase == "read" else REQUEST_KEYS
+    if set(body) != expected:
+        raise ExecuteRefusal("invalid_request")
     if not (_nonempty(body["execution_id"]) and _nonempty(body["connector"])):
         raise ExecuteRefusal("invalid_request")
     tool, arguments, grant, target = (
@@ -140,6 +180,7 @@ def parse_request(body: object) -> _Request:
         body["grant"],
         body["target"],
     )
+    pointer = body.get("pointer")
     if phase == "list":
         valid = tool is None and arguments is None and grant is None and target is None
     elif phase == "observe":
@@ -148,19 +189,109 @@ def parse_request(body: object) -> _Request:
         valid = (
             _nonempty(tool) and isinstance(arguments, str) and _nonempty(grant) and target is None
         )
+    elif phase == "read":
+        valid = (
+            _nonempty(tool)
+            and isinstance(arguments, str)
+            and canonical_arguments(arguments) is not None
+            and grant is None
+            and target is None
+            and valid_pointer(pointer)
+        )
     else:
         valid = False
     if not valid:
         raise ExecuteRefusal("invalid_request")
     return _Request(
         execution_id=body["execution_id"],
-        phase=phase,
+        phase=str(phase),
         connector=body["connector"],
         tool=tool,
         arguments=arguments,
         grant=grant,
         target=target,
+        pointer=pointer if phase == "read" else None,
     )
+
+
+_ABSENT = object()
+
+
+def _resolve(document: object, pointer: str) -> object:
+    """The value at ``pointer`` in ``document``, or ``_ABSENT`` (RFC 6901, no ``-``)."""
+
+    if pointer == "":
+        return document
+    current = document
+    for raw in pointer[1:].split("/"):
+        token = raw.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict):
+            if token not in current:
+                return _ABSENT
+            current = current[token]
+        elif isinstance(current, list):
+            if not token.isdigit() or not token.isascii() or (len(token) > 1 and token[0] == "0"):
+                return _ABSENT
+            index = int(token)
+            if index >= len(current):
+                return _ABSENT
+            current = current[index]
+        else:
+            return _ABSENT
+    return current
+
+
+def _strict_json(text: str) -> object:
+    """Strict JSON (no NaN or Infinity, nothing trailing), or ``_ABSENT``."""
+
+    def reject(constant: str) -> object:
+        raise ValueError(constant)
+
+    try:
+        return json.loads(text, parse_constant=reject)
+    except (ValueError, RecursionError):
+        return _ABSENT
+
+
+def read_document(result: CallToolResult) -> object:
+    """The document a pointer applies to, or ``_ABSENT`` (maintainer ruling M3).
+
+    The structured content when present; otherwise the strict JSON of the one
+    and only content block when it is text within ``CALL_RESULT_MAX_BYTES``.
+    """
+
+    structured = result.structured_content
+    if structured is not None:
+        return structured
+    content = result.content
+    if len(content) != 1 or not isinstance(content[0], TextContent):
+        return _ABSENT
+    text = content[0].text
+    if len(text.encode("utf-8")) > CALL_RESULT_MAX_BYTES:
+        return _ABSENT
+    return _strict_json(text)
+
+
+def sample_of(result: CallToolResult, pointer: str) -> dict[str, Any]:
+    """``{"sample", "value"}`` for one read result (remediation-predicate.json)."""
+
+    if result.is_error:
+        return {"sample": "tool_error", "value": None}
+    document = read_document(result)
+    if document is _ABSENT:
+        return {"sample": "result_unstructured", "value": None}
+    value = _resolve(document, pointer)
+    if value is _ABSENT:
+        return {"sample": "pointer_absent", "value": None}
+    if isinstance(value, (dict, list)):
+        return {"sample": "not_scalar", "value": None}
+    try:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except ValueError:
+        return {"sample": "result_unstructured", "value": None}
+    if len(text) > SAMPLE_VALUE_MAX_CHARS:
+        return {"sample": "value_too_long", "value": None}
+    return {"sample": "value", "value": value}
 
 
 def canonical_arguments(text: str) -> dict[str, Any] | None:
@@ -233,13 +364,16 @@ class Executor:
                 return await self._list(request)
             if request.phase == "observe":
                 return await self._observe(request)
+            if request.phase == "read":
+                return await self._read(request)
             return await self._call(request)
 
     def _check_order(self, request: _Request) -> None:
         done = self._done
         if request.phase == "list":
             accepted = not done
-        elif request.phase == "observe":
+        elif request.phase in ("observe", "read"):
+            # A read is one sample per sandbox and never mixes with a write.
             accepted = done == ["list"]
         elif request.tool == RESTORE_TOOL:
             # A restore always follows the version observation.
@@ -385,6 +519,35 @@ class Executor:
             "structured": structured if isinstance(structured, dict) else None,
         }
 
+    async def _read(self, request: _Request) -> dict[str, Any]:
+        """@spec AUTOMATED-REMEDIATION-12: one read, answering only the sample."""
+
+        assert request.tool is not None and request.arguments is not None
+        assert request.pointer is not None
+        # The sandbox's one read is spent by any read that passed ordering.
+        self._done.append("read")
+        tool = self._tools.get(request.tool)
+        if tool is None or not tool.read_only:
+            # Executor amendment E4: a fail-closed refusal on top of the
+            # generation's authority, decided before any dial.
+            raise ExecuteRefusal("tool_not_read_only")
+        # parse_request admitted only canonical argument text.
+        arguments = canonical_arguments(request.arguments) or {}
+        config = self._config(request.connector)
+        try:
+            with anyio.fail_after(_CALL_TIMEOUT_SECONDS):
+                result = await self._dial_call(config, request.tool, arguments)
+        except Exception as exc:  # noqa: BLE001 - a read that fails is unreachable
+            logger.warning(
+                "execute read failed connector=%s error_class=%s",
+                request.connector,
+                type(exc).__name__,
+            )
+            raise ExecuteRefusal("connector_unreachable") from exc
+        if not isinstance(result, CallToolResult):
+            raise ExecuteRefusal("connector_unreachable")
+        return {"phase": "read", **sample_of(result, request.pointer)}
+
     async def _dial_call(
         self, config: Mapping[str, Any], tool: str, arguments: dict[str, Any]
     ) -> object:
@@ -399,6 +562,7 @@ class Executor:
 
 __all__ = [
     "EXECUTOR_MODE",
+    "READ_REQUEST_KEYS",
     "REQUEST_KEYS",
     "RUNNER_MODE_ENV",
     "ExecuteRefusal",
@@ -406,4 +570,6 @@ __all__ = [
     "canonical_arguments",
     "parse_request",
     "restore_refusal",
+    "sample_of",
+    "valid_pointer",
 ]
