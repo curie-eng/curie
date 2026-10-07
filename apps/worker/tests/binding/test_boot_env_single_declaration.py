@@ -289,6 +289,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # the API settings and by WorkerConfig at worker startup to decide
         # whether executions are claimed and dispatched. Never a sandbox boot key.
         "CURIE_ACTION_EXECUTOR_ENABLED",
+        # The automated remediation switch (AUTOMATED-REMEDIATION-1): read by the
+        # API settings and by WorkerConfig at startup. Never a sandbox boot key.
+        "CURIE_REMEDIATION_ENABLED",
         # End to end namespace reaper (#3245), read by the worker process only.
         # The test cluster kubeconfig is not among them: the reaper reads it
         # from the connector Secret at sweep time.

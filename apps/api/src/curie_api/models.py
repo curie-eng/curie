@@ -2222,6 +2222,70 @@ class HookSourceOperation(Base):
     )
 
 
+class RemediationPolicy(Base):
+    """The current remediation policy generation of one bound hook.
+
+    @spec AUTOMATED-REMEDIATION-2.
+    """
+
+    __tablename__ = "remediation_policies"
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="remediation_policies_generation_ck"),
+        CheckConstraint("active OR NOT armed", name="remediation_policies_armed_ck"),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    hook: Mapped[str] = mapped_column(String(63), primary_key=True)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    operation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    armed: Mapped[bool] = mapped_column(nullable=False)
+    active: Mapped[bool] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RemediationPolicyGeneration(Base):
+    """One immutable remediation policy generation, kept while the agent exists.
+
+    @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3.
+    """
+
+    __tablename__ = "remediation_policy_generations"
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="remediation_policy_generations_generation_ck"),
+        CheckConstraint(
+            "intent_sha256 ~ '^[0-9a-f]{64}$'", name="remediation_policy_generations_intent_ck"
+        ),
+        CheckConstraint("active OR NOT armed", name="remediation_policy_generations_armed_ck"),
+        CheckConstraint(
+            "length(btrim(bound_by)) > 0", name="remediation_policy_generations_bound_by_ck"
+        ),
+        UniqueConstraint(
+            "agent_id", "hook", "operation_id", name="uq_remediation_policy_generation_operation"
+        ),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    hook: Mapped[str] = mapped_column(String(63), primary_key=True)
+    generation: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    operation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    intent_sha256: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    document: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    armed: Mapped[bool] = mapped_column(nullable=False)
+    active: Mapped[bool] = mapped_column(nullable=False)
+    bound_by: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class HookRun(Base):
     """One claimed trigger slot for an agent version."""
 

@@ -794,6 +794,14 @@ connectorCaller:
 actionExecutor:
   enabled: false
 
+# Automated remediation (AUTOMATED-REMEDIATION-1). One switch, rendered as
+# CURIE_REMEDIATION_ENABLED into both the API and the worker. Closed by default.
+# Enabling it requires actionExecutor.enabled: a render with remediation on and
+# the executor off fails. Off, the remediation policy routes stay readable and
+# writable so a policy can be staged before activation.
+remediation:
+  enabled: false
+
 rustfs:
   deploy: true
   image: rustfs/rustfs:1.0.0-beta.12

@@ -105,6 +105,15 @@ class Settings(BaseSettings):
             "CURIE_ACTION_EXECUTOR_ENABLED", "action_executor_enabled"
         ),
     )
+    # @spec AUTOMATED-REMEDIATION-1: automated remediation is closed by default.
+    # The chart value ``remediation.enabled`` and the matching compose value
+    # render this one setting into both the API and the worker. Enabling it
+    # requires the action executor; the policy routes stay readable and
+    # writable with it off, so a policy can be staged before activation.
+    remediation_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("CURIE_REMEDIATION_ENABLED", "remediation_enabled"),
+    )
 
     # Separate trust boundary for credential redemption. The operator/CLI API
     # key can administer deployments but cannot redeem the GitHub identity.
@@ -1003,6 +1012,20 @@ class Settings(BaseSettings):
                 )
             entries[repo] = {"bases": list(bases), "default_base": default_base}
         return entries
+
+    @model_validator(mode="after")
+    def _remediation_requires_the_executor(self) -> "Settings":
+        """@spec AUTOMATED-REMEDIATION-1: fail closed with the executor off.
+
+        The chart refuses this combination at render; compose cannot refuse a
+        render, so the API refuses to boot with it instead.
+        """
+        if self.remediation_enabled and not self.action_executor_enabled:
+            raise ValueError(
+                "CURIE_REMEDIATION_ENABLED=true requires CURIE_ACTION_EXECUTOR_ENABLED=true "
+                "(remediation.enabled requires actionExecutor.enabled)"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_connector_proxy(self) -> "Settings":

@@ -81,6 +81,19 @@ a URL or bytes. (agent, scope, thread, event, file) and (agent, scope, thread,
 disk name) are each unique with a NULL scope equal, and the agent foreign key
 cascades.
 
+Migration `0087_remediation_policies.py` (automated remediation,
+AUTOMATED-REMEDIATION-2) is additive. The `remediation_policies` table
+(`apps/api/src/curie_api/models.py::RemediationPolicy`) holds one row per bound
+hook, keyed on (agent, hook), with its current positive generation, the
+operation that wrote it and the `armed` and `active` flags. The
+`remediation_policy_generations` table
+(`apps/api/src/curie_api/models.py::RemediationPolicyGeneration`) holds one
+immutable row per generation, keyed on (agent, hook, generation), with the
+operation id (unique per agent and hook), the canonical intent digest, the whole
+policy document as JSONB, the flags and the operator principal that wrote it
+(`bound_by`). A trigger refuses any update of a generation row and its deletion
+while the agent exists; both tables cascade with the agent.
+
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
 validated against the actual API migration graph and CLI candidate catalog.

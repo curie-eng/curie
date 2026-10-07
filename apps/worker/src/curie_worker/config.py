@@ -489,6 +489,20 @@ class WorkerConfig(BaseSettings):
     )
 
     @model_validator(mode="after")
+    def _remediation_requires_the_executor(self) -> WorkerConfig:
+        """Refuse remediation with the action executor off.
+
+        @spec AUTOMATED-REMEDIATION-1: compose cannot refuse the combination at
+        render, so the worker fails closed at boot, as the API does.
+        """
+        if self.remediation_enabled and not self.action_executor_enabled:
+            raise ValueError(
+                "CURIE_REMEDIATION_ENABLED=true requires CURIE_ACTION_EXECUTOR_ENABLED=true "
+                "(remediation.enabled requires actionExecutor.enabled)"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _progress_render_needs_a_deliverer(self) -> WorkerConfig:
         """Refuse to start with progress rendering on (ADR 0130).
 
@@ -1275,6 +1289,11 @@ class WorkerConfig(BaseSettings):
     # withholds the Role's `get` on Deployments the digest reads need.
     action_executor_enabled: bool = Field(
         default=False, validation_alias="CURIE_ACTION_EXECUTOR_ENABLED"
+    )
+    # The automated remediation switch (AUTOMATED-REMEDIATION-1), rendered from
+    # the same chart or compose value as the API's. It requires the executor.
+    remediation_enabled: bool = Field(
+        default=False, validation_alias="CURIE_REMEDIATION_ENABLED"
     )
     # The cron scheduler (ADR-0099, #268) is always on; this is only its tick.
     # A slot fires on the first tick at or after it, so the tick bounds lateness.
