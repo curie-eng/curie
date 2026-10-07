@@ -5,6 +5,21 @@ use super::*;
 /// Run one parsed `dev` subcommand.
 pub(super) async fn run(action: DevAction) -> Result<()> {
     match action {
+        DevAction::Preflight {
+            fast,
+            base,
+            dry_run,
+            pr_body,
+            title,
+        } => emit(
+            commands::dev_preflight(fast, &base, dry_run, pr_body.as_deref(), title.as_deref())
+                .await?,
+        ),
+        DevAction::ModelScript { args } => {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            commands::dev_script("cli/scripts/model-script.sh", &args).await
+        }
+        DevAction::ModelCredit => curie::openrouter_credit::model_credit().await,
         DevAction::Hooks { action } => match action {
             HooksAction::Install => commands::dev_hooks_install(),
         },

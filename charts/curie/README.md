@@ -1078,21 +1078,28 @@ egress is actually blocked, and `enforcement=false` (fails loudly) otherwise.
 post-upgrade hook Job, also re-runnable via `helm test`. Default `enabled:
 true`, gated also on `agentSandbox.controller.deploy` (also default true).
 
-- The vendored agent-sandbox controller runs a cluster-scope NetworkPolicy
-  informer. If its RBAC cannot satisfy that cluster LIST, the manager
-  crash-loops and no SandboxClaim ever binds. The Deployment has no
-  readiness probe, so `rollout status` can pass while the manager still
-  blocks on cache sync. The load-bearing signal is the "Starting workers"
-  log line.
-- The Job fails the Helm operation unless the controller becomes Available
-  and logs "Starting workers" within
-  `preflights.controllerReady.timeoutSeconds` (default 180).
-- An upgrade over a crash-looping controller may need a manual pod delete
-  plus `helm test`, because the hook waits for a healthy controller that
-  never arrives.
-- Skipped when `agentSandbox.controller.deploy: false` (BYO controller) or
-  `preflights.controllerReady.enabled: false`.
-- Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-controller`.
+1. The vendored agent-sandbox controller runs a cluster-scope NetworkPolicy
+   informer. If its RBAC cannot satisfy that cluster LIST, the manager
+   crash-loops and no SandboxClaim ever binds. The Deployment has no
+   readiness probe, so `rollout status` can pass while the manager still
+   blocks on cache sync.
+2. Each poll checks current logs, pod restarts, and previous logs when available
+   before accepting a success signal. A forbidden-NetworkPolicy log, lost
+   leader-election lease, or pod restart fails the gate with its existing
+   cause-specific diagnostic.
+3. The Job passes when it observes "Starting workers" or a positive sum of
+   `controller_runtime_reconcile_total` samples with `result="success"` from
+   the current Running controller pod. It reads metrics on port 8080 through
+   the Kubernetes pod proxy. Successful reconciles require synced informer
+   caches, and their counter persists when the startup log rotates away.
+   Failed metrics requests and zero successful reconciles keep polling within
+   `preflights.controllerReady.timeoutSeconds` (default 180).
+4. An upgrade over a crash-looping controller may need a manual pod delete
+   plus `helm test`, because the hook waits for a healthy controller that
+   never arrives.
+5. Skipped when `agentSandbox.controller.deploy: false` (BYO controller) or
+   `preflights.controllerReady.enabled: false`.
+6. Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-controller`.
 
 ## Single-node footprint (measured on a disposable single-node k3s cluster, 4 GB / 4 core)
 

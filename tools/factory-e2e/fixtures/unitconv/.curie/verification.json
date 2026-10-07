@@ -1,0 +1,20 @@
+{
+  "checks": [
+    {
+      "id": "units",
+      "paths": [
+        "unitconv/**/*.py"
+      ],
+      "command": [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "unitconv/tests",
+        "-v"
+      ],
+      "delegated_to": "unittest"
+    }
+  ]
+}

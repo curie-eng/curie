@@ -830,6 +830,10 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/dark-factory/.gitignore"),
     ),
     (
+        ".dockerignore",
+        include_bytes!("../../examples/dark-factory/.dockerignore"),
+    ),
+    (
         "connectors.yaml",
         include_bytes!("../../examples/dark-factory/connectors.yaml"),
     ),

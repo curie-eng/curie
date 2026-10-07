@@ -3,7 +3,7 @@
 Consolidates the three per-field override suites: `model` (#254, forwarded as
 CURIE_MODEL at sandbox boot), `thinking` (ADR-0098's per-agent half of the
 two-layer operator control, #1182), and `execution_deadline_seconds` (#3071).
-All three share the same three-way PATCH contract: omitted leaves the field
+All nullable overrides share the same three-way PATCH contract: omitted leaves the field
 unchanged, an explicit JSON null clears it back to the platform default, and a
 value sets it. `model` and `thinking` additionally share a blank-string refusal
 contract (#1355, #1392): an empty or whitespace-only string is refused with a
@@ -22,6 +22,12 @@ durability of a write across a subsequent GET.
 from typing import Any
 
 import pytest
+
+_CHANNEL_PREFIX = {
+    "model": "C0EXAMPLEMODEL",
+    "reviewer_model": "C0EXAMPLEREVIEWER",
+    "thinking": "C0EXAMPLETHINKING",
+}
 
 
 def _create_agent(
@@ -49,11 +55,13 @@ def _read(client: Any, auth_headers: dict[str, str], agent_id: str) -> dict[str,
 # --- shared shapes: model and thinking are the same nullable-string override ---
 
 
-@pytest.mark.parametrize("field", ["model", "thinking"])
+@pytest.mark.parametrize("field", ["model", "reviewer_model", "thinking"])
 def test_agent_defaults_to_null(
     client: Any, auth_headers: dict[str, str], clean_db: None, field: str
 ) -> None:
-    agent = _create_agent(client, auth_headers, name=f"{field}-bot", address=f"C{field.upper()}DEF")
+    agent = _create_agent(
+        client, auth_headers, name=f"{field}-bot", address=f"{_CHANNEL_PREFIX[field]}DEF"
+    )
     assert agent[field] is None
     assert _read(client, auth_headers, agent["id"])[field] is None
 
@@ -62,6 +70,7 @@ def test_agent_defaults_to_null(
     ("field", "value"),
     [
         pytest.param("model", "glm-5.2", id="model"),
+        pytest.param("reviewer_model", "claude-opus-5-5", id="reviewer_model"),
         pytest.param("thinking", "disabled", id="thinking"),
     ],
 )
@@ -69,7 +78,11 @@ def test_create_with_value_persists(
     client: Any, auth_headers: dict[str, str], clean_db: None, field: str, value: str
 ) -> None:
     agent = _create_agent(
-        client, auth_headers, name=f"{field}-bot", address=f"C{field.upper()}PER", **{field: value}
+        client,
+        auth_headers,
+        name=f"{field}-bot",
+        address=f"{_CHANNEL_PREFIX[field]}PER",
+        **{field: value},
     )
     assert agent[field] == value
     assert _read(client, auth_headers, agent["id"])[field] == value
@@ -79,13 +92,16 @@ def test_create_with_value_persists(
     ("field", "value"),
     [
         pytest.param("model", "kimi-k2.1", id="model"),
+        pytest.param("reviewer_model", "claude-opus-5-5", id="reviewer_model"),
         pytest.param("thinking", "enabled:2000", id="thinking"),
     ],
 )
 def test_patch_sets_value(
     client: Any, auth_headers: dict[str, str], clean_db: None, field: str, value: str
 ) -> None:
-    agent = _create_agent(client, auth_headers, name=f"{field}-bot", address=f"C{field.upper()}SET")
+    agent = _create_agent(
+        client, auth_headers, name=f"{field}-bot", address=f"{_CHANNEL_PREFIX[field]}SET"
+    )
     resp = _patch(client, auth_headers, agent["id"], {field: value})
     assert resp.status_code == 200, resp.text
     assert resp.json()[field] == value
@@ -95,6 +111,7 @@ def test_patch_sets_value(
     ("field", "seed"),
     [
         pytest.param("model", "deepseek-v4", id="model"),
+        pytest.param("reviewer_model", "claude-opus-5-5", id="reviewer_model"),
         pytest.param("thinking", "adaptive", id="thinking"),
     ],
 )
@@ -106,8 +123,8 @@ def test_patch_without_field_leaves_it_unchanged(
     # could be co-cleared by a partial-update bug -- but the response still carries
     # the whole agent, and a handler that rebuilt it from the binding write alone
     # would drop the override just as silently.
-    address = f"C{field.upper()}CHN1"
-    moved = f"C{field.upper()}CHN2"
+    address = f"{_CHANNEL_PREFIX[field]}CHN1"
+    moved = f"{_CHANNEL_PREFIX[field]}CHN2"
     agent = _create_agent(
         client, auth_headers, name=f"{field}-bot", address=address, **{field: seed}
     )
@@ -134,6 +151,7 @@ def test_patch_without_field_leaves_it_unchanged(
     ("field", "seed"),
     [
         pytest.param("model", "kimi-k2", id="model"),
+        pytest.param("reviewer_model", "claude-opus-5-5", id="reviewer_model"),
         pytest.param("thinking", "adaptive", id="thinking"),
     ],
 )
@@ -146,7 +164,11 @@ def test_an_empty_value_is_refused_and_the_error_points_at_null(
     # is silently skipped rather than applied or cleared. Refuse it, and say what
     # to send instead.
     agent = _create_agent(
-        client, auth_headers, name=f"{field}-bot", address=f"C{field.upper()}EMP1", **{field: seed}
+        client,
+        auth_headers,
+        name=f"{field}-bot",
+        address=f"{_CHANNEL_PREFIX[field]}EMP1",
+        **{field: seed},
     )
     resp = _patch(client, auth_headers, agent["id"], {field: ""})
     assert resp.status_code == 422, resp.text
@@ -160,7 +182,7 @@ def test_an_empty_value_is_refused_and_the_error_points_at_null(
         "/agents",
         json={
             "name": f"empty-{field}",
-            "channel": {"kind": "slack", "address": f"C{field.upper()}EMP2"},
+            "channel": {"kind": "slack", "address": f"{_CHANNEL_PREFIX[field]}EMP2"},
             field: "",
         },
         headers=auth_headers,
@@ -168,7 +190,7 @@ def test_an_empty_value_is_refused_and_the_error_points_at_null(
     assert resp.status_code == 422, resp.text
 
 
-@pytest.mark.parametrize("field", ["model", "thinking"])
+@pytest.mark.parametrize("field", ["model", "reviewer_model", "thinking"])
 def test_a_whitespace_only_value_is_refused_on_both_paths(
     client: Any, auth_headers: dict[str, str], clean_db: None, field: str
 ) -> None:
@@ -179,7 +201,7 @@ def test_a_whitespace_only_value_is_refused_on_both_paths(
         "/agents",
         json={
             "name": f"ws-{field}",
-            "channel": {"kind": "slack", "address": f"C{field.upper()}WS1"},
+            "channel": {"kind": "slack", "address": f"{_CHANNEL_PREFIX[field]}WS1"},
             field: "   ",
         },
         headers=auth_headers,
@@ -190,7 +212,7 @@ def test_a_whitespace_only_value_is_refused_on_both_paths(
         client,
         auth_headers,
         name=f"{field}-bot",
-        address=f"C{field.upper()}WS2",
+        address=f"{_CHANNEL_PREFIX[field]}WS2",
         **{field: "kimi-k2"},
     )
     resp = _patch(client, auth_headers, agent["id"], {field: "  "})
@@ -201,6 +223,7 @@ def test_a_whitespace_only_value_is_refused_on_both_paths(
     ("field", "seed"),
     [
         pytest.param("model", "kimi-k2", id="model"),
+        pytest.param("reviewer_model", "claude-opus-5-5", id="reviewer_model"),
         pytest.param("thinking", "disabled", id="thinking"),
     ],
 )
@@ -211,7 +234,11 @@ def test_patch_with_explicit_null_clears_the_override(
     # "succeeded" and changed nothing, so an operator who pinned an agent had no
     # way, through the API, to put it back on the platform default.
     agent = _create_agent(
-        client, auth_headers, name=f"{field}-bot", address=f"C{field.upper()}CLR", **{field: seed}
+        client,
+        auth_headers,
+        name=f"{field}-bot",
+        address=f"{_CHANNEL_PREFIX[field]}CLR",
+        **{field: seed},
     )
     assert agent[field] == seed
 
@@ -399,3 +426,26 @@ def test_patch_rejects_out_of_range_and_keeps_the_stored_value(
     resp = _patch(client, auth_headers, agent["id"], {"execution_deadline_seconds": value})
     assert resp.status_code == 422, resp.text
     assert _read(client, auth_headers, agent["id"])["execution_deadline_seconds"] == 90
+
+
+def test_reviewer_model_omission_and_clear_preserve_the_implementer_override(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    agent = _create_agent(
+        client,
+        auth_headers,
+        name="acme-reviewer-override",
+        address="C0EXAMPLE1",
+        model="acme-implementer-model",
+        reviewer_model="acme-reviewer-model",
+    )
+    renamed = _patch(client, auth_headers, agent["id"], {"name": "acme-renamed"})
+    assert renamed.status_code == 200, renamed.text
+    assert _read(client, auth_headers, agent["id"])["reviewer_model"] == "acme-reviewer-model"
+    cleared = _patch(client, auth_headers, agent["id"], {"reviewer_model": None})
+    assert cleared.status_code == 200, cleared.text
+    stored = _read(client, auth_headers, agent["id"])
+    assert stored["reviewer_model"] is None
+    assert stored["model"] == "acme-implementer-model"

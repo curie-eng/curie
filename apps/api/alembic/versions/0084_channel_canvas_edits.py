@@ -1,7 +1,7 @@
 """Channel canvas edit audit (ADR 0200, #3819)
 
-Revision ID: 0079
-Revises: 0078
+Revision ID: 0084
+Revises: 0083
 Create Date: 2026-10-05
 """
 
@@ -11,8 +11,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0079"
-down_revision: str | None = "0078"
+revision: str = "0084"
+down_revision: str | None = "0083"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

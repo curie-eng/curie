@@ -12,7 +12,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast, get_args
 
 from aci_protocol import HookRunRef, QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from curie_api.routers.schedules import read_triggers, resolve_agent
-from curie_api.schemas.schedules import HookFireOut, ScheduleOutcome
+from curie_api.schemas.schedules import HookFireOut, HookRunReason, ScheduleOutcome
 
 from ..auth import require_api_key
 from ..db import SCHEMA
@@ -88,21 +88,23 @@ LIMIT 1
 
 _INSERT_SQL = """
 INSERT INTO {schema}.hook_runs
-       (id, agent_id, name, slot_utc, version_id, outcome, started_at, ended_at)
-VALUES (:id, :agent_id, :name, :slot, :version_id, CAST(:outcome AS text), now(),
+       (id, agent_id, name, slot_utc, version_id, source, outcome, reason, started_at, ended_at)
+VALUES (:id, :agent_id, :name, :slot, :version_id, 'manual', CAST(:outcome AS text),
+        CASE WHEN :terminal THEN :reason ELSE NULL END, now(),
         CASE WHEN :terminal THEN now() END)
-RETURNING id, slot_utc, outcome, started_at, ended_at
+RETURNING id, source, slot_utc, outcome, reason, started_at, ended_at
 """
 
 _FAIL_SQL = """
 UPDATE {schema}.hook_runs
-SET outcome = 'failed', ended_at = now()
+SET outcome = 'failed', reason = 'enqueue_failed', ended_at = now()
 WHERE id = :id AND outcome IS NULL
-RETURNING id, slot_utc, outcome, started_at, ended_at
+RETURNING id, source, slot_utc, outcome, reason, started_at, ended_at
 """
 
 _GET_SQL = """
-SELECT r.id, r.slot_utc, r.outcome, r.started_at, r.ended_at, a.name AS agent_name
+SELECT r.id, r.source, r.slot_utc, r.outcome, r.reason, r.started_at, r.ended_at,
+       a.name AS agent_name
 FROM {schema}.hook_runs r
 JOIN {schema}.agents a ON a.id = r.agent_id
 WHERE r.id = :id AND r.agent_id = :agent_id AND r.name = :name
@@ -121,6 +123,14 @@ def _cron(raw: list[Any], name: str) -> dict[str, Any] | None:
         if isinstance(declared, str) and declared.strip() == name:
             return item
     return None
+
+
+def _reason(value: Any) -> HookRunReason | None:
+    if value is None:
+        return None
+    if value not in get_args(HookRunReason):
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "hook run reason is unknown")
+    return cast(HookRunReason, value)
 
 
 def _budget_spent(usd: Any, tokens: Any) -> bool:
@@ -143,8 +153,10 @@ def _record(
         agent=agent,
         name=name,
         trigger="cron",
+        source=row["source"],
         slot_utc=row["slot_utc"],
         outcome=None if outcome is None else _OUTCOMES[str(outcome)],
+        reason=_reason(row["reason"]),
         started_at=row["started_at"],
         ended_at=row["ended_at"],
     )
@@ -205,6 +217,7 @@ async def _insert(
     version_id: uuid.UUID,
     name: str,
     outcome: str | None,
+    reason: str | None = None,
 ) -> Any:
     """@spec PROTECTED-HOOK-SOURCE-2."""
     slot = datetime.now(UTC)
@@ -215,6 +228,9 @@ async def _insert(
         ).first()
         if busy is not None:
             outcome = "skipped"
+            reason = "run_in_flight"
+    if outcome is None:
+        reason = None
     await ensure_source_gate_live(held)
     row = (
         (
@@ -227,6 +243,7 @@ async def _insert(
                     "slot": slot,
                     "version_id": version_id,
                     "outcome": outcome,
+                    "reason": reason,
                     "terminal": outcome is not None,
                 },
             )
@@ -278,11 +295,14 @@ async def fire_hook(
 
         killed = await request.app.state.kill_switch.is_killed(selected.id)
         terminal: str | None = None
+        reason: str | None = None
         handle: ReplyHandle | None = None
-        if killed or _budget_spent(
-            deployment["max_usd_per_day"], deployment["max_output_tokens_per_run"]
-        ):
+        if killed:
             terminal = "blocked"
+            reason = "agent_killed"
+        elif _budget_spent(deployment["max_usd_per_day"], deployment["max_output_tokens_per_run"]):
+            terminal = "blocked"
+            reason = "budget_exhausted"
         else:
             address = trigger.get("target")
             if isinstance(address, str) and address.strip():
@@ -312,6 +332,7 @@ async def fire_hook(
                     ]
                 if len(candidates) != 1:
                     terminal = "failed"
+                    reason = "target_unbound"
                 else:
                     binding = candidates[0]
                     handle = ReplyHandle(
@@ -331,6 +352,7 @@ async def fire_hook(
                 version_id=deployment["version_id"],
                 name=name,
                 outcome=terminal,
+                reason=reason,
             )
         record = _record(agent_id=selected.id, agent=selected.name, name=name, row=row)
         if outcome is not None:

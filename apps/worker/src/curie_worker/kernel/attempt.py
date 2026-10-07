@@ -311,7 +311,15 @@ async def _attempt_turn(
                     workspace_inference=workspace_inference,
                 )
             else:
-                claim_env = dict(boot_env or {}) if self._attachments is not None else boot_env
+                claim_env = boot_env
+                if self._attachments is not None:
+                    claim_env = dict(boot_env or {})
+                    if agent_id is not None:
+                        # #4079: a runner booted for this turn gets the files
+                        # an earlier message in the thread carried, at the
+                        # paths its history names. An adopted runner ignores
+                        # claim env.
+                        claim_env.update(await self._carried_attachment_env(thread_key, agent_id))
                 async with self._lock.hold(self._config.lock_key(thread_key)):
                     routed = await self._route_and_start(
                         thread_key,
