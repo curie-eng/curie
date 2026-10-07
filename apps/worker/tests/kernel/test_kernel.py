@@ -1463,6 +1463,9 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
         (False, False, "idle-awaiting-input", True),
         (False, True, "awaiting-approval", True),
         (False, True, "idle-awaiting-input", False),
+        (True, True, "classified-failure", True),
+        (False, False, "classified-failure", True),
+        (False, True, "classified-failure", False),
     ],
 )
 def test_late_workspace_selection_defers_without_steering_until_boundary_is_safe(
@@ -1518,6 +1521,8 @@ def test_late_workspace_selection_defers_without_steering_until_boundary_is_safe
     [
         pytest.param(SessionStatus.DONE, id="done"),
         pytest.param(SessionStatus.IDLE_AWAITING_INPUT, id="idle-awaiting-input"),
+        # #4188: a failed turn is never recorded, so durable replay is whole.
+        pytest.param(SessionStatus.CLASSIFIED_FAILURE, id="classified-failure"),
     ],
 )
 def test_workspace_handoff_boundary_accepts_completed_durable_status(
