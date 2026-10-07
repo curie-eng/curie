@@ -48,14 +48,32 @@ def reader():
     return module
 
 
-def page(names=(), *, token=None, disabled=(), composite=(), description="Example alarm"):
+def page(
+    names=(),
+    *,
+    token=None,
+    disabled=(),
+    composite=(),
+    description="Example alarm",
+    state="ALARM",
+    alarm_actions=(TOPIC,),
+    ok_actions=(),
+    insufficient_actions=(),
+):
     """AWS Query XML fixture; nested members deliberately contain no alarms."""
+
+    def action_members(tag, actions):
+        return f"<{tag}>" + "".join(f"<member>{escape(a)}</member>" for a in actions) + f"</{tag}>"
 
     def members(selected):
         return "".join(
             f"<member><AlarmName>{escape(name)}</AlarmName>"
             f"<ActionsEnabled>{str(name not in disabled).lower()}</ActionsEnabled>"
-            f"<AlarmDescription>{escape(description)}</AlarmDescription>"
+            f"<StateValue>{escape(state)}</StateValue>"
+            + action_members("AlarmActions", alarm_actions)
+            + action_members("OKActions", ok_actions)
+            + action_members("InsufficientDataActions", insufficient_actions)
+            + f"<AlarmDescription>{escape(description)}</AlarmDescription>"
             f"<StateTransitionedTimestamp>{TRANSITION}</StateTransitionedTimestamp>"
             "<Dimensions><member><Name>nested-not-an-alarm</Name></member></Dimensions>"
             "<StateReason>Changing reason</StateReason>"
@@ -198,7 +216,30 @@ def test_complete_pages_filter_disabled_alarms_and_preserve_episode(reader, tmp_
     assert [fields.get("NextToken") for _, _, _, fields in aws.requests[1:]] == [None, NEXT]
     first = page(["example-alarm"])
     refreshed = first.replace(b"Changing reason", b"New reason").replace(b"12:00:00Z", b"12:01:00Z")
-    assert reader.parse_alarms(first) == reader.parse_alarms(refreshed)
+    assert reader.parse_alarms(first, TOPIC) == reader.parse_alarms(refreshed, TOPIC)
+
+
+@pytest.mark.parametrize("composite", [False, True])
+@pytest.mark.parametrize(
+    "fields, expected",
+    [
+        ({"alarm_actions": (TOPIC, "arn:aws:sns:us-east-1:000000000000:other")}, True),
+        ({"alarm_actions": (), "ok_actions": (TOPIC,)}, False),
+        ({"alarm_actions": (), "insufficient_actions": (TOPIC,)}, False),
+        ({"alarm_actions": (TOPIC + "-other",)}, False),
+        ({"state": "OK"}, False),
+    ],
+)
+def test_provider_candidates_require_exact_alarm_action_and_current_alarm(
+    reader, tmp_path, composite, fields, expected
+):
+    # @spec SRE-CW-2 SRE-CW-3. Exercise the signed poll consumer, not just parser output.
+    source, aws, _ = poller(reader, tmp_path)
+    names = {"composite": ["candidate"]} if composite else {"names": ["candidate"]}
+    aws.pages = {None: (200, page(**names, **fields))}
+    source.poll_once()
+    assert ('alarm="candidate"' in source.metrics()) == expected
+    assert "alarm_poll_ok 1\n" in source.metrics()
 
 
 def test_missing_description_and_disabled_composite_are_handled(reader):
@@ -206,7 +247,7 @@ def test_missing_description_and_disabled_composite_are_handled(reader):
     response = page(
         ["example-metric"], composite=["example-composite", "disabled"], disabled=["disabled"]
     ).replace(b"<AlarmDescription>Example alarm</AlarmDescription>", b"")
-    alarms, token = reader.parse_alarms(response)
+    alarms, token = reader.parse_alarms(response, TOPIC)
     assert sorted(alarms) == [
         ("example-composite", "", TRANSITION),
         ("example-metric", "", TRANSITION),
@@ -404,6 +445,31 @@ def test_startup_refuses_invalid_configuration_without_credentials_or_listener(r
     assert result.returncode == 2
     assert "Traceback" not in result.stderr
     assert TOPIC not in result.stderr and ROLE not in result.stderr
+
+
+def test_occupied_listener_exits_with_safe_configuration_error(reader):
+    # @spec SRE-CW-1 SRE-CW-5. A real occupied socket crosses main's bind boundary.
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen()
+        env = {
+            "TOPIC_ARN": TOPIC,
+            "AWS_REGION": REGION,
+            "AWS_ROLE_ARN": ROLE,
+            "AWS_WEB_IDENTITY_TOKEN_FILE": "/does-not-exist",
+            "LISTEN_ADDR": f"127.0.0.1:{occupied.getsockname()[1]}",
+        }
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", str(PROGRAM)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "cloudwatch-alarms: invalid configuration\n"
+    assert "Traceback" not in result.stderr and ROLE not in result.stderr
 
 
 def test_program_imports_with_stdlib_and_sigterm_exits_zero(reader):
