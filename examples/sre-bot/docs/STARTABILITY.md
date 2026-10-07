@@ -29,23 +29,33 @@ Zero bindings produces a valid zero total, not a claim about unbound agents.
 
 The pure `judge` entry point accepts binding rows, worker environment values,
 credential states, pool-to-template names, and template secret-reference names.
-Production passes the candidate worker's actual `claim_warm_pool`, the actual
-`is_reserved_boot_env_name`, and `BootEnv.env_key('connector_secret_keys')`;
-never copy their routing or reserved-name policy into the observer. Strip
-whitespace from comma-separated worker pool lists, discard reserved names from
-the marker, and preserve the worker's ordinary generic-pool behavior. A worker
-refusal, missing selected pool, missing selected template, or missing connector
-secret reference fails only affected bindings. Check reference presence only;
+Production uses the candidate worker's actual `claim_warm_pool`,
+`inject_connector_secrets`, `is_reserved_boot_env_name`, and
+`BootEnv.env_key('connector_secret_keys')`. Build the marker from secret key names
+with empty placeholders through the actual injection helper, including its
+connector-only and sealing-key withholding; never read agent secret values.
+Strip whitespace from comma-separated worker pool lists. Preserve an explicitly
+blank `CURIE_WARM_POOL` instead of replacing it with the absent-variable default.
+After the claim helper chooses the generic pool, match the consumer's discovery
+of an existing per-agent pool in the snapshot, using the actual
+`agent_warm_pool_name` helper. An absent derived pool preserves the generic
+choice; a connector-secret refusal remains a refusal. Never copy the helpers'
+routing, derivation, or secret-name policy into the observer. A worker refusal,
+missing selected pool, missing selected template, or missing connector secret
+reference fails only affected bindings. Check reference presence only;
 do not claim that referenced sandbox Secrets exist or are usable.
 
 ### STARTABILITY-3: Dispatcher identity declarations
 
 `identity_lanes` maps the literal or resolved `CURIE_SLACK_IDENTITIES` JSON
-declaration's `name`, `app_token_env`, and `bot_token_env` fields. Absent or
-blank declarations use the platform's default `SLACK_APP_TOKEN` and
-`SLACK_BOT_TOKEN`. A Slack binding requires both declared lanes. An undeclared
+declaration's `name`, `app_token_env`, and `bot_token_env` fields. Parse with the
+actual protocol `SlackIdentities` parser used by the dispatcher. Absent, blank, and empty-list
+declarations use the platform's default `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN`.
+A Slack binding requires both declared lanes. An undeclared
 named identity fails rather than deriving an indexed credential name from its
-identity. Reject malformed declarations and duplicate identity names.
+identity. Reject every declaration the actual dispatcher rejects, including
+invalid or unbounded identity names, invalid credential variable names, missing default
+identity, shared credential variables, extra fields, and duplicate identities.
 Non-Slack bindings do not depend on Slack credentials. Retain the optional
 legacy identity-name lane derivation for callers that explicitly omit the
 `identity_lanes` argument to the pure judge; the live collector always passes
@@ -116,7 +126,10 @@ command in subprocesses against fixture-backed Kubernetes and database clients.
 Cover positive and negative collection, declaration values held in external
 references, credential absence/blankness/read failure, scoped resource reads,
 image incompatibility, deployment absence, missing pool/template/reference,
-reserved names, multiple bindings, and zero bindings. Test error redaction
+reserved and connector-only withheld names, empty-list and dispatcher-invalid
+declarations, blank worker pool configuration, discovery of an existing
+unlisted per-agent pool and its selected template, multiple bindings, and zero
+bindings. Test error redaction
 with a recognizable dummy value in exception text and the DSN. These boundary
 replays prove command wiring, not real Kubernetes/Postgres integration.
 
