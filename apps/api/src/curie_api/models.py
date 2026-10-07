@@ -2417,7 +2417,7 @@ class RemediationNomination(Base):
         CheckConstraint(
             "refusal_code IS NULL OR refusal_code IN ('nomination_malformed', 'unknown_action', "
             "'nomination_duplicate', 'arguments_schema_mismatch', 'agent_stopped', "
-            "'reply_surface_unavailable')",
+            "'reply_surface_unavailable', 'tune_execution_not_automated')",
             name="remediation_nominations_refusal_ck",
         ),
         CheckConstraint(
