@@ -95,6 +95,8 @@ spec:
               value: {{ include "curie.testInstallation.enabled" . | quote }}
             - name: CURIE_TEST_INSTALLATION_DRIVERS
               value: {{ include "curie.testInstallation.drivers" . | quote }}
+            - name: CURIE_TEST_INSTALLATION_THREAD_TURN_LIMIT
+              value: {{ include "curie.testInstallation.threadTurnLimit" . | quote }}
             {{- $threadedReserved := dict -}}
             {{- if .Values.dispatcher.threadedBotAllowlist }}
             # First-class allowlist (#2437). Rendered ONLY when the typed value is

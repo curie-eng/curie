@@ -92,6 +92,7 @@ from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text
 from .queue import claim_event, enqueue, release_event
 from .relevance import DropReason, Lane, classify, drop, missing_envelope_fields
+from .test_actions import MARK, REFUSAL, declared_driver, reserve_turn
 from .thread_context import SlackThreadContext
 
 if TYPE_CHECKING:
@@ -444,11 +445,17 @@ def process_event(
         return None
 
     bots = identity_bots or {}
+    # Derive the full Block Kit/attachment body before reading the mark; a
+    # non-empty top-level text remains byte-identical (#2006).
+    text = _strip_self_mention(derive_text(event), bot_user_id)
+    marked = lane == "mention" and bool(event.get("bot_id")) and text.startswith(MARK)
+    driver = declared_driver(config, event) if marked else None
     reason = classify(
         event,
         lane=lane,
         threaded_bot_allowlist=config.slack_threaded_bot_allowlist,
         identity_bot_ids=bots.keys(),
+        marked_test_action=marked,
     )
     if reason is not None:
         drop(log, reason, event_id=slack_event_id, lane=lane)
@@ -461,8 +468,11 @@ def process_event(
     ):
         sender_bot = event.get("bot_id")
         author = (
-            bots.get(sender_bot, "") if isinstance(sender_bot, str) else ""
-        ) or str(event.get("user") or "")
+            driver.bot_user_id
+            if driver is not None
+            else (bots.get(sender_bot, "") if isinstance(sender_bot, str) else "")
+            or str(event.get("user") or "")
+        )
         delivery_id = delivery_key(slack_event_id, slack_identity)
         if _refused_caller(
             admission=admission,
@@ -473,7 +483,13 @@ def process_event(
             # The turn's author as well: for a sibling identity's bot that is
             # its bot user id (ADR-0168 decision 6), which an operator may
             # have listed instead of the bot id.
-            callers=list(dict.fromkeys([author, *_event_callers(event)])),
+            callers=list(
+                dict.fromkeys(
+                    [author, str(sender_bot)]
+                    if driver is not None
+                    else [author, *_event_callers(event)]
+                )
+            ),
             lane=lane,
         ):
             return None
@@ -481,12 +497,33 @@ def process_event(
             drop(log, DropReason.DUPLICATE_DELIVERY, event_id=delivery_id)
             return None
 
-        # NOT `event.get("text", "")`: a Block Kit or attachment-shaped post
-        # carries an empty or fallback-only top-level `text` and its real body in
-        # `blocks`/`attachments`, so that read emptied the turn while still
-        # burning a placeholder (#2006). `derive_text` returns a non-empty
-        # top-level text byte-identically, so existing enqueues are unchanged.
-        text = _strip_self_mention(derive_text(event), bot_user_id)
+        if marked:
+            admitted = (
+                config.test_installation_enabled
+                and driver is not None
+                and driver.channel_id == channel
+            )
+            is_ping = text == f"{MARK} ping"
+            ping = is_ping and not event.get("thread_ts")
+            if admitted and ping:
+                assert driver is not None
+                web_client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=f"This installation accepts test actions from <@{driver.bot_user_id}>.",
+                )
+                return None
+            if (
+                not admitted
+                or (is_ping and not ping)
+                or not reserve_turn(
+                    redis_client, config, identity=slack_identity, channel=channel, thread=thread_ts
+                )
+            ):
+                drop(log, DropReason.TEST_ACTION_REFUSED, event_id=delivery_id, lane=lane)
+                web_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=REFUSAL)
+                return None
+
         # @spec slack-alert-followup-context: Decision. After the claim, so a
         # duplicate asks Slack nothing; before the placeholder, and it never
         # raises, so the claim -> placeholder -> XADD order holds. A reply in a

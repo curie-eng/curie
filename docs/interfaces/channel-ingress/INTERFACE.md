@@ -238,6 +238,7 @@ tests assert the two sets equal in both directions.
 |---|---|
 | `MALFORMED_ENVELOPE` | The delivery omits a field the turn is minted from -- the event id on an event, the channel, the thread key, or the interaction identity on a click -- and refusing it before the idempotency claim beats raising after it, because Bolt has already acked and would swallow the exception while the claim survived for work that never happened. |
 | `UNSUBSCRIBED_LANE` | The delivered envelope is outside the adapter's declared subscription surface — `apps/dispatcher/slack-app-manifest.yaml` subscribes to `app_mention` and `message.im` only, so a message event on any other channel type cannot legitimately arrive, and refusing it is envelope validation rather than a relevance judgement. |
+| `TEST_ACTION_REFUSED` | A bot-authored mention begins with `[test action]` after the target mention is stripped, but the installation is not enabled, the driver/channel is not listed, or the per-thread budget is exhausted. Refused after the caller check, with a fixed thread reply and no routing (ADR 0202). |
 | `BOT_AUTHORED_THREAD_REPLY` | Loop guard across installations: Curie's own replies and placeholders are always threaded, so admitting a bot-authored mention that carries a thread timestamp would let two Curie installations in one workspace mention-loop each other indefinitely, which Bolt's self filter cannot stop because the two bot identities differ. An exact operator-trusted sender/channel pair may bypass this refusal; self-event suppression remains mandatory. |
 | `NON_CONTENT_SUBTYPE` | The subtype marks something other than new user content: an edit, a delete, a tombstone, a body redacted by Enterprise Key Management, or an assistant thread-start marker. |
 | `DUPLICATE_DELIVERY` | Slack redelivered a delivery whose idempotency key was already claimed, so processing it again would post a second placeholder and mint a second turn for one message. |
@@ -300,6 +301,21 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
   and `message.im` subscribed, channel-lane noise (joins, leaves, topic and purpose
   changes, pins) cannot reach these lanes in production, so the denylist stays small rather
   than becoming a speculative catalogue of every subtype Slack documents.
+- **Marked test actions have a separate installation boundary (ADR 0202 decisions 2–3).**
+  A bot-authored mention beginning with `[test action]` after stripping the target's
+  mention bypasses the ordinary threaded-bot filter so the caller list can be checked
+  first. A refused caller receives no reply. Otherwise only an enabled declaration's
+  exact driver/channel pair can start a turn, with its configured bot user as author;
+  all other marked mentions receive `This installation does not accept test actions.`
+  after dedupe, before routing. People typing the mark and direct messages retain their
+  ordinary behavior. A listed driver's root `[test action] ping` receives a fixed
+  admission reply in its own thread without a turn; a ping in an existing thread is
+  refused. `testInstallation.threadTurnLimit` defaults to 10 (1–100) per addressed
+  identity/channel/thread in any ten minutes, shared across drivers. Atomic Valkey
+  reservations expire after ten minutes; pings and duplicate deliveries spend no budget.
+  The production ingress and Bolt regressions use real Valkey in
+  `apps/dispatcher/tests/test_test_actions.py`; they do not establish a live Slack
+  exchange or enable approval replies.
 - **Bot authorship is a mention-lane rule, and its cost is accepted.** A foreign bot's
   *root* `@`-mention is admitted — the alert-app case this work exists for, whose body
   typically arrives as Block Kit and is normalized by
