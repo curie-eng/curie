@@ -94,6 +94,10 @@ export interface paths {
          *     probe never does (ACTION-EXECUTOR-1). @spec ACTION-EXECUTOR-19: a
          *     ``claimed`` forward execution dispatches without observing, and the commit
          *     creates its one ledger row; a replay answers the row it already names.
+         *     @spec AUTOMATED-REMEDIATION-13: a policy remediation of a ``reversible``
+         *     action whose capability or custody no longer holds ends ``refused``
+         *     ``not_reversible_now`` instead, with no ledger row, and its nomination goes
+         *     back to approval.
          */
         post: operations["dispatch_execution_action_executions__execution_id__dispatch_post"];
         delete?: never;

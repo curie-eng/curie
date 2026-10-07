@@ -45,10 +45,11 @@ from starlette.concurrency import run_in_threadpool
 from . import bundles
 from .action_forward import ForwardAuthority, ForwardCreated, ForwardRefused
 from .action_forward import create_forward_execution as _create_forward_execution
-from .action_undoable import in_force_bundle_refs
+from .action_undoable import in_force_bundle_refs, sealing_custody
 from .config import get_settings
 from .models import (
     ActionExecution,
+    ConnectorCapability,
     ExecutionKind,
     RemediationNomination,
     RemediationPolicy,
@@ -343,3 +344,47 @@ async def policy_generation(
     return await session.get(
         RemediationPolicyGeneration, (nomination.agent_id, nomination.hook, number)
     )
+
+
+# @spec AUTOMATED-REMEDIATION-13: the nomination state a ``not_reversible_now``
+# refusal returns a policy remediation to.
+APPROVAL_REQUESTED: Final = "approval_requested"
+
+
+async def not_reversible_now(
+    session: AsyncSession,
+    store: ObjectStore,
+    execution: ActionExecution,
+    nomination: RemediationNomination,
+) -> bool:
+    """Whether a policy remediation's reversible action can no longer be undone.
+
+    @spec AUTOMATED-REMEDIATION-13: "A forward execution of a ``reversible``
+    action whose capability or custody no longer holds at dispatch is refused
+    ``not_reversible_now``". Only a ``policy`` authority is judged: an approver
+    accepted the action as it stands. The action's reversibility is read from
+    the generation that authorized it; capability is the probe's
+    ``restore_capable`` row for the execution's connector and digest
+    (ACTION-EXECUTOR-13) and custody the in-force version's sealing key
+    declaration (ACTION-EXECUTOR-16), each read now.
+    """
+
+    if execution.authority_kind != POLICY_AUTHORITY or nomination.action is None:
+        return False
+    generation = await policy_generation(session, nomination, POLICY_AUTHORITY)
+    declared = (
+        _declared_action(generation.document, nomination.action) if generation is not None else None
+    )
+    if declared is None or declared.get("reversibility") != "reversible":
+        return False
+    capable = await session.scalar(
+        select(ConnectorCapability.restore_capable).where(
+            ConnectorCapability.agent_id == execution.agent_id,
+            ConnectorCapability.connector == execution.connector,
+            ConnectorCapability.digest == execution.connector_digest,
+        )
+    )
+    if not capable:
+        return True
+    custody = await sealing_custody(session, store, [execution.agent_id])
+    return execution.connector not in custody.get(execution.agent_id, frozenset())

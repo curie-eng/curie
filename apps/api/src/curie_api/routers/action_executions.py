@@ -41,12 +41,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..action_execution_codes import (
     EXHAUSTED_CLAIM_CODE,
     EXPIRED_DISPATCH_CODE,
+    NOT_REVERSIBLE_NOW_CODE,
     CodeRejected,
     outcome_code,
 )
 from ..auth import require_internal_worker_token, require_platform_key
 from ..config import get_settings
-from ..deps import SessionDep
+from ..deps import SessionDep, StoreDep
 from ..models import (
     ActionAuditEntry,
     ActionExecution,
@@ -60,8 +61,10 @@ from ..models import (
 )
 from ..remediation_forward import (
     APPROVAL_AUTHORITY,
+    APPROVAL_REQUESTED,
     POLICY_AUTHORITY,
     nomination_for_execution,
+    not_reversible_now,
     policy_generation,
 )
 from ..schemas.action_executions import (
@@ -493,7 +496,7 @@ async def record_observation(
 
 @router.post("/{execution_id}/dispatch", response_model=ExecutionOut)
 async def dispatch_execution(
-    execution_id: uuid.UUID, data: ExecutionFence, session: SessionDep
+    execution_id: uuid.UUID, data: ExecutionFence, session: SessionDep, store: StoreDep
 ) -> ExecutionOut:
     """Commit ``dispatched``, the last step before a write call.
 
@@ -502,6 +505,10 @@ async def dispatch_execution(
     probe never does (ACTION-EXECUTOR-1). @spec ACTION-EXECUTOR-19: a
     ``claimed`` forward execution dispatches without observing, and the commit
     creates its one ledger row; a replay answers the row it already names.
+    @spec AUTOMATED-REMEDIATION-13: a policy remediation of a ``reversible``
+    action whose capability or custody no longer holds ends ``refused``
+    ``not_reversible_now`` instead, with no ledger row, and its nomination goes
+    back to approval.
     """
 
     execution = await _locked(session, execution_id)
@@ -518,6 +525,15 @@ async def dispatch_execution(
     if execution.state != ExecutionState.claimed:
         raise _conflict(f"an execution in state {execution.state} cannot dispatch")
     if execution.kind == ExecutionKind.forward:
+        nomination = await nomination_for_execution(session, execution)
+        if nomination is not None and await not_reversible_now(
+            session, store, execution, nomination
+        ):
+            _finish(session, execution, ExecutionState.refused, NOT_REVERSIBLE_NOW_CODE, now)
+            nomination.state = APPROVAL_REQUESTED
+            await session.commit()
+            await session.refresh(execution)
+            return _out(execution)
         await _record_forward_action(session, execution)
     elif execution.kind != ExecutionKind.restore:
         raise _conflict(f"a {execution.kind} execution cannot dispatch")

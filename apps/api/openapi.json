@@ -11929,7 +11929,7 @@
     },
     "/action-executions/{execution_id}/dispatch": {
       "post": {
-        "description": "Commit ``dispatched``, the last step before a write call.\n\n@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-15: only a ``claimed``\nrestore whose observed version equalled the recorded one dispatches. A\nprobe never does (ACTION-EXECUTOR-1). @spec ACTION-EXECUTOR-19: a\n``claimed`` forward execution dispatches without observing, and the commit\ncreates its one ledger row; a replay answers the row it already names.",
+        "description": "Commit ``dispatched``, the last step before a write call.\n\n@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-15: only a ``claimed``\nrestore whose observed version equalled the recorded one dispatches. A\nprobe never does (ACTION-EXECUTOR-1). @spec ACTION-EXECUTOR-19: a\n``claimed`` forward execution dispatches without observing, and the commit\ncreates its one ledger row; a replay answers the row it already names.\n@spec AUTOMATED-REMEDIATION-13: a policy remediation of a ``reversible``\naction whose capability or custody no longer holds ends ``refused``\n``not_reversible_now`` instead, with no ledger row, and its nomination goes\nback to approval.",
         "operationId": "dispatch_execution_action_executions__execution_id__dispatch_post",
         "parameters": [
           {
