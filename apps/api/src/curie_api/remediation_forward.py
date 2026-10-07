@@ -157,7 +157,9 @@ async def in_force_connector_digest(
         return None
 
 
-def _declared_action(document: Mapping[str, Any], name: str) -> Mapping[str, Any] | None:
+def declared_action(document: Mapping[str, Any], name: str) -> Mapping[str, Any] | None:
+    """The action named ``name`` in a policy generation's document, or None."""
+
     actions = document.get("actions")
     if not isinstance(actions, list):
         return None
@@ -280,7 +282,7 @@ async def create_remediation_forward(
         RemediationPolicyGeneration, (nomination.agent_id, nomination.hook, generation_number)
     )
     declared = (
-        _declared_action(generation.document, nomination.action) if generation is not None else None
+        declared_action(generation.document, nomination.action) if generation is not None else None
     )
     connector = declared.get("connector") if declared is not None else None
     tool = declared.get("tool") if declared is not None else None
@@ -418,7 +420,7 @@ async def not_reversible_now(
         return False
     generation = await policy_generation(session, nomination, POLICY_AUTHORITY)
     declared = (
-        _declared_action(generation.document, nomination.action) if generation is not None else None
+        declared_action(generation.document, nomination.action) if generation is not None else None
     )
     if declared is None or declared.get("reversibility") != "reversible":
         return False

@@ -8613,7 +8613,7 @@
         "type": "object"
       },
       "ReadArguments": {
-        "description": "A claimed read execution's bound call and pointer, read by its holder only.\n\n@spec AUTOMATED-REMEDIATION-12: the read is the declaration's, never a\ncaller's. Answered only by ``POST /action-executions/{id}/arguments``.",
+        "description": "A claimed read execution's bound call and pointer, read by its holder only.\n\n@spec AUTOMATED-REMEDIATION-12: the read is the declaration's, never a\ncaller's. Answered only by ``POST /action-executions/{id}/arguments``.\n@spec AUTOMATED-REMEDIATION-18 (executor amendment E3): ``pointer`` is null\nonly for an observe-only execution (``observe_version`` of the target).",
         "properties": {
           "arguments": {
             "additionalProperties": true,
@@ -8621,8 +8621,15 @@
             "type": "object"
           },
           "pointer": {
-            "title": "Pointer",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pointer"
           },
           "tool": {
             "title": "Tool",
@@ -11917,7 +11924,7 @@
     },
     "/action-executions/{execution_id}/arguments": {
       "post": {
-        "description": "The bound tool and arguments of the claimed forward execution this fence holds.\n\n@spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-19. The worker recomputes\n``arguments_sha256`` over the text it will send and refuses\n``arguments_mismatch`` on any difference, so it needs the bound arguments\nbefore dispatch; ``ExecutionOut`` never carries them. The body is exactly\nthe fence (a body naming a tool or arguments is a 422), a stale fence is a\n``409``, and only a ``claimed`` forward execution answers. Nothing moves.\n\n@spec AUTOMATED-REMEDIATION-12: a ``claimed`` read execution answers its\nbound tool, arguments and pointer the same way.",
+        "description": "The bound tool and arguments of the claimed forward execution this fence holds.\n\n@spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-19. The worker recomputes\n``arguments_sha256`` over the text it will send and refuses\n``arguments_mismatch`` on any difference, so it needs the bound arguments\nbefore dispatch; ``ExecutionOut`` never carries them. The body is exactly\nthe fence (a body naming a tool or arguments is a 422), a stale fence is a\n``409``, and only a ``claimed`` forward execution answers. Nothing moves.\n\n@spec AUTOMATED-REMEDIATION-12: a ``claimed`` read execution answers its\nbound tool, arguments and pointer the same way; an observe-only execution\n(AUTOMATED-REMEDIATION-18) answers ``observe_version``, the recorded target\nand a null pointer.",
         "operationId": "read_arguments_action_executions__execution_id__arguments_post",
         "parameters": [
           {
@@ -12135,7 +12142,7 @@
     },
     "/action-executions/{execution_id}/outcome": {
       "post": {
-        "description": "Record how an execution ended.\n\n@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-18 @spec ACTION-EXECUTOR-20.\n``refused`` lands only on a ``claimed`` row, with a pre-dispatch code:\npast ``dispatched`` the call may have reached the connector. ``confirmed``,\n``failed`` and ``indeterminate`` land only on a ``dispatched`` row, except\na probe, which never dispatches and is ``confirmed`` from ``claimed`` with\nthe verbs it observed. An unknown post-dispatch code is normalized by stage.\nA replay of the stored outcome returns the row unchanged; a different one\nis refused and the first stands.",
+        "description": "Record how an execution ended.\n\n@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-18 @spec ACTION-EXECUTOR-20.\n``refused`` lands only on a ``claimed`` row, with a pre-dispatch code:\npast ``dispatched`` the call may have reached the connector. ``confirmed``,\n``failed`` and ``indeterminate`` land only on a ``dispatched`` row, except\na probe, which never dispatches and is ``confirmed`` from ``claimed`` with\nthe verbs it observed. An unknown post-dispatch code is normalized by stage.\nA replay of the stored outcome returns the row unchanged; a different one\nis refused and the first stands.\n\n@spec AUTOMATED-REMEDIATION-18: a remediation's forward execution ending\nschedules its verifier (``confirmed``) or finishes it ``not-recovered``\n(``failed``, ``indeterminate``) in the same transaction; a refused read\nis evaluated by its verification.",
         "operationId": "report_outcome_action_executions__execution_id__outcome_post",
         "parameters": [
           {
@@ -12205,7 +12212,7 @@
     },
     "/action-executions/{execution_id}/samples": {
       "post": {
-        "description": "Record the one sample a claimed read execution took, ending it ``confirmed``.\n\n@spec AUTOMATED-REMEDIATION-12: the fence plus exactly ``sample`` and\n``value`` (remediation-predicate.json ``sample_report``); the API evaluates\nthe predicate from the stored sample (plan task 11). Only a ``claimed`` read\nreports one; a replay of the stored sample answers the row unchanged and a\ndifferent one is refused (``409``). The answer is the receipt, which never\ncarries the value or the pointer.",
+        "description": "Record the one sample a claimed read execution took, ending it ``confirmed``.\n\n@spec AUTOMATED-REMEDIATION-12: the fence plus exactly ``sample`` and\n``value`` (remediation-predicate.json ``sample_report``); the API evaluates\nthe predicate from the stored sample (AUTOMATED-REMEDIATION-18). Only a ``claimed`` read\nreports one; a replay of the stored sample answers the row unchanged and a\ndifferent one is refused (``409``). The answer is the receipt, which never\ncarries the value or the pointer.",
         "operationId": "report_sample_action_executions__execution_id__samples_post",
         "parameters": [
           {
