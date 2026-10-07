@@ -802,6 +802,41 @@ actionExecutor:
 remediation:
   enabled: false
 
+# The test installation declaration (ADR 0202 decision 1). Off by default, and
+# set only here: it is never derived from a channel name, a deployment's env,
+# a bundle, or anything an agent or a message says. Rendered as
+# CURIE_TEST_INSTALLATION_ENABLED and CURIE_TEST_INSTALLATION_DRIVERS into the
+# API and the dispatcher, and neither may be set through extraEnv.
+#
+# Turning it on is the operator's statement that every credential this
+# installation's agents hold reaches only test accounts, and that a driver's
+# Slack token is reachable by no agent other than the driver itself. A test
+# installation owns its Slack app exclusively (#2248).
+#
+# The chart refuses to render it on when api.environment is prod (a tripwire,
+# not evidence), when the API key, the worker token or the approval attester
+# secret is still the published default, or when a driver has no channel. The
+# API and the dispatcher refuse to boot on a published default secret too, and
+# the dispatcher's preflight refuses a driver that is this installation's
+# authorized identity (default), a sibling driver that names no agent, and a
+# sibling driver whose identity is bound to any other agent.
+#
+# Each driver is a channel id, a Slack bot id and that bot's user id, validated
+# like a dispatcher.threadedBotAllowlist pair. A sibling driver, another Slack
+# identity of this installation (dispatcher.slack.identities), also names the
+# one agent it serves:
+#   drivers:
+#     - channel_id: C0EXAMPLE1     # ^[CG][A-Z0-9]+$
+#       bot_id: B0EXAMPLE1         # ^B[A-Z0-9]+$
+#       bot_user_id: U0EXAMPLE1    # ^U[A-Z0-9]+$
+#     - channel_id: C0EXAMPLE1
+#       bot_id: B0EXAMPLE2
+#       bot_user_id: U0EXAMPLE2
+#       agent: acme-tester         # sibling driver only
+testInstallation:
+  enabled: false
+  drivers: []
+
 rustfs:
   deploy: true
   image: rustfs/rustfs:1.0.0-beta.12

@@ -188,6 +188,13 @@ spec:
             # the render when it is on and the executor is off.
             - name: CURIE_REMEDIATION_ENABLED
               value: {{ include "curie.remediationEnabled" . | quote }}
+            # The test installation declaration (ADR 0202 decision 1). The
+            # dispatcher renders the same two values from the same helpers;
+            # secrets.yaml refuses the render when it is on and unsafe.
+            - name: CURIE_TEST_INSTALLATION_ENABLED
+              value: {{ include "curie.testInstallation.enabled" . | quote }}
+            - name: CURIE_TEST_INSTALLATION_DRIVERS
+              value: {{ include "curie.testInstallation.drivers" . | quote }}
             # The connector caller public keys and the proxy image (ADR-0168
             # decision 7). The API renders a caller proxy into every hosted
             # connector it renders when the current key is set; the worker

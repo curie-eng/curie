@@ -12,7 +12,7 @@ production deployments.
 
 import json
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from aci_protocol import (
@@ -24,20 +24,30 @@ from aci_protocol import (
     derive_dead_letter_stream_name,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_internal.driver_declaration import (
+    PUBLISHED_DEFAULT_API_KEY,
+    PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET,
+    PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN,
+    TEST_INSTALLATION_DRIVERS_ENV,
+    TEST_INSTALLATION_ENABLED_ENV,
+    DeclaredDriver,
+    parse_drivers,
+    refuse_published_defaults,
+)
 from curie_internal.keyspace import WORKER_KEY_PREFIX_DEFAULT
 from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .e2e_connector import E2EInstall
 from .workspace_policy import valid_allowlist_entry, valid_repository_name
 
 # Dev-only default secrets. The production boot gate refuses to start when any of
 # these is still in place under ENVIRONMENT=prod.
-_DEV_DEFAULT_API_KEY = "curie-dev-key"
+_DEV_DEFAULT_API_KEY = PUBLISHED_DEFAULT_API_KEY
 _DEV_DEFAULT_WEBHOOK_SECRET = "dev-webhook-secret"
-_DEV_DEFAULT_INTERNAL_WORKER_TOKEN = "curie-dev-worker-token"
-_DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = "curie-dev-approval-chat-attester"
+_DEV_DEFAULT_INTERNAL_WORKER_TOKEN = PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN
+_DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET
 
 
 def valid_base_branch(name: Any) -> bool:
@@ -113,6 +123,20 @@ class Settings(BaseSettings):
     remediation_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("CURIE_REMEDIATION_ENABLED", "remediation_enabled"),
+    )
+
+    # The test installation declaration (ADR 0202 decision 1). Rendered only
+    # by the chart from testInstallation.enabled and testInstallation.drivers,
+    # never derived from a channel name, a deployment's env or anything an
+    # agent says. Off by default. On, the boot refuses a published default
+    # secret (``_refuse_published_defaults_on_a_test_installation``).
+    test_installation_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(TEST_INSTALLATION_ENABLED_ENV, "test_installation_enabled"),
+    )
+    test_installation_drivers: Annotated[tuple[DeclaredDriver, ...], NoDecode] = Field(
+        default=(),
+        validation_alias=AliasChoices(TEST_INSTALLATION_DRIVERS_ENV, "test_installation_drivers"),
     )
 
     # Separate trust boundary for credential redemption. The operator/CLI API
@@ -1155,6 +1179,30 @@ class Settings(BaseSettings):
                     "with no query or fragment"
                 )
         self.github_factory_card_base_url = value
+        return self
+
+    @field_validator("test_installation_drivers", mode="before")
+    @classmethod
+    def _parse_test_installation_drivers(cls, value: object) -> object:
+        # Parse here so JSON null is refused instead of being discarded by the
+        # settings env source and silently replaced by the empty default.
+        return parse_drivers(value)
+
+    @model_validator(mode="after")
+    def _refuse_published_defaults_on_a_test_installation(self) -> "Settings":
+        """Refuse boot on a published default secret while declared a test installation.
+
+        The chart refuses the same render, but it cannot see a secret supplied
+        another way, and a compose stack never renders the chart (ADR 0202).
+        """
+        refuse_published_defaults(
+            self.test_installation_enabled,
+            {
+                "API_KEY": self.api_key,
+                "CURIE_INTERNAL_WORKER_TOKEN": self.internal_worker_token,
+                "CURIE_APPROVAL_CHAT_ATTESTER_SECRET": self.approval_chat_attester_secret,
+            },
+        )
         return self
 
     @model_validator(mode="after")

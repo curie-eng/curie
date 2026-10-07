@@ -933,6 +933,17 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/threaded-bot-allowlist-assertions.sh
 
+      # The test installation declaration (ADR 0202 decision 1, #4133): off by
+      # default, one value rendered identically into the API and the
+      # dispatcher, render refusals on a prod environment, a published default
+      # secret and a driver with no channel (also with the schema removed), and
+      # the exact rendered value parsed by both services' real settings. Needs
+      # the uv workspace above.
+      - name: helm render assertions (test installation)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/test-installation-assertions.sh
+
       # dispatcher.slack.identities (ADR-0168 decision 1): a stock install
       # renders today's objects, a list renders by Secret reference only, and the
       # EXACT rendered declaration parses through the real Settings of the
