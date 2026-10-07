@@ -98,9 +98,20 @@ def _explicit_route(agent: Agent, route: str) -> None:
 async def _protected(session: AsyncSession, agent_id: uuid.UUID, hook: str) -> None:
     """A policy applies only to a hook with a protected source policy.
 
+    Read ``FOR SHARE`` inside the write transaction: a concurrent source policy
+    write holding the row is waited for, and its committed mode decides, so a
+    switch to ordinary cannot race a bind or arm onto an ordinary hook. The
+    share lock is held until this write commits.
     @spec AUTOMATED-REMEDIATION-1.
     """
-    source = await session.get(HookSourcePolicy, (agent_id, hook))
+    source = (
+        await session.execute(
+            select(HookSourcePolicy)
+            .where(HookSourcePolicy.agent_id == agent_id, HookSourcePolicy.hook == hook)
+            .with_for_update(read=True)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if source is None or source.mode != "protected":
         raise PolicyRefused(
             "hook_not_protected",
