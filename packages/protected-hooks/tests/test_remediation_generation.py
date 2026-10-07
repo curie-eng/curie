@@ -6,12 +6,15 @@ AUTOMATED-REMEDIATION-4 adds the remediation generation active at admission
 (or its absence) to the protected admission intent and to the envelope beside
 ``source_revision``, as ``remediation_generation``: internal transport metadata
 versioned with the envelope schema. Its value is a canonical generation string
-or ``null`` when no remediation policy is bound. An envelope written before
-the field existed still parses (it refuses automatic execution, never the turn),
-so the field is accepted absent on read. The caller supplies it on the
-``AdmissionRequest`` (``remediation_generation``), read by the ingress under the
-agent gate; the facade writes it into the intent and the immutable binding,
-which a retried delivery never relabels.
+when a remediation policy is bound; when none is bound the field is omitted, so
+the intent, the binding and the receipt are byte-compatible with the released
+validator (``RELEASED_KEYS``, the exact key sets of the records before this
+field) and a rollback can still read them. Only a record written while a policy
+was bound carries the key, a one-way change. An envelope written before the
+field existed still parses (it refuses automatic execution, never the turn).
+The caller supplies it on the ``AdmissionRequest`` (``remediation_generation``),
+read by the ingress under the agent gate; the facade writes it into the intent
+and the immutable binding, which a retried delivery never relabels.
 
 Records are exercised through their real parsers; the facade through the real
 atomic admission on the owned disposable TLS broker of ``admission_broker.py``.
@@ -42,6 +45,61 @@ admission_broker = broker_helpers.admission_broker
 admission_service = broker_helpers.admission_service
 
 FIELD = "remediation_generation"
+
+# The released contract: the exact key sets the previous release's validator
+# requires (``value.keys() == schema.keys()`` in ``admission_records._validate``
+# before AUTOMATED-REMEDIATION-4), copied here so the product cannot move it.
+_RELEASED_INTENT = {
+    "schema_version",
+    "identity",
+    "requested_tool_access",
+    "effective_tool_access",
+    "request_body_sha256",
+    "source_generation",
+    "source_operation_id",
+    "policy_fingerprint",
+    "manifest_digest",
+    "runtime_id",
+    "runtime_generation",
+    "qualification_id",
+    "event_id",
+    "conversation_id",
+    "payload_sha256",
+    "envelope_sha256",
+    "reserved_stream_id",
+    "created_at_ms",
+    "deadline_ms",
+}
+RELEASED_KEYS = {
+    "envelope": {
+        "schema_version",
+        "event_id",
+        "source_revision",
+        "runtime_id",
+        "runtime_generation",
+        "manifest_digest",
+        "qualification_id",
+        "runner_image_digest",
+        "bundle_digest",
+        "execution_config_digest",
+        "logical_conversation_key",
+        "execution_session_key",
+        "payload_sha256",
+    },
+    "intent": _RELEASED_INTENT,
+    "receipt": (
+        _RELEASED_INTENT - {"created_at_ms", "deadline_ms", "reserved_stream_id", "envelope_sha256"}
+    )
+    | {"stream_id", "acceptance_status", "tool_access"},
+}
+
+
+def released(kind, raw):
+    """Whether the released validator's exact-keys check accepts these bytes."""
+    value = json.loads(raw)
+    return type(value) is dict and set(value) == RELEASED_KEYS[kind]
+
+
 BINDING = "protected:admission:binding:event/example"
 
 
@@ -61,7 +119,7 @@ def _request(records, *, generation, delivery="delivery/example"):
 
 
 @pytest.mark.parametrize("kind", ["envelope", "intent", "receipt"])
-@pytest.mark.parametrize("value", ["7", "9223372036854775807", None])
+@pytest.mark.parametrize("value", ["7", "9223372036854775807"])
 def test_the_records_carry_the_remediation_generation(kind, value):
     """Envelope, intent and the receipt derived from it round-trip the field exactly.
 
@@ -132,8 +190,10 @@ def _setup(broker):
 def test_an_admission_writes_the_generation_into_the_intent_and_the_binding(
     admission_broker, value
 ):
-    """The binding and the stream copy carry the request's generation, null included.
+    """The binding and the stream copy carry a bound generation and omit an unbound one.
 
+    With no policy bound the written intent, binding and receipt have exactly
+    the released key sets, so the previous release's validator accepts them.
     @spec AUTOMATED-REMEDIATION-4.
     """
     b = admission_broker
@@ -144,11 +204,23 @@ def test_an_admission_writes_the_generation_into_the_intent_and_the_binding(
 
     assert out["status"] == "accepted", out
     d = r.delivery_digest(req.identity)
-    intent = r.parse_intent(b.command("GET", "protected:admission:intent:" + d)).as_dict()
-    assert intent[FIELD] == value
+    intent_raw = b.command("GET", "protected:admission:intent:" + d)
+    intent = r.parse_intent(intent_raw).as_dict()
     binding = b.command("GET", BINDING)
     envelope = r.parse_envelope(binding).as_dict()
-    assert FIELD in envelope and envelope[FIELD] == value
+    commit = json.loads(b.command("GET", "protected:admission:commit:" + d))
+    receipt_raw = json.dumps(commit["receipt"]).encode()
+    if value is None:
+        for record in (intent, envelope, commit["receipt"], out["receipt"]):
+            assert FIELD not in record, record
+        assert released("intent", intent_raw)
+        assert released("envelope", binding)
+        assert released("receipt", receipt_raw)
+    else:
+        assert intent[FIELD] == value
+        assert envelope[FIELD] == value
+        assert commit["receipt"][FIELD] == value
+        assert not released("envelope", binding), "a bound generation must be carried"
     assert envelope["source_revision"] == source_policy()["generation"]
     ((_, fields),) = b.raw_command("XRANGE", "curie:runs", "-", "+")
     assert fields[3] == binding

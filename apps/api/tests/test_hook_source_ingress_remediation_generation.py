@@ -8,7 +8,8 @@ current remediation policy generation (or its absence) under the agent gate and
 the admission writes it, as ``remediation_generation`` beside
 ``source_revision``, into the intent and the immutable binding envelope. A
 canonical generation string when a policy row exists (a removal keeps its
-positive generation), ``null`` when the hook has none. A later policy write
+positive generation); omitted when the hook has none, so those records keep the
+released key sets and a rollback still reads them. A later policy write
 never relabels an earlier binding, and a write racing a delivery yields the old
 generation or the new one, never anything else. The binding has no expiry, so it
 outlives the turn's submission window (AUTOMATED-REMEDIATION-6).
@@ -45,6 +46,52 @@ from test_remediation_nomination_routes import (
 )
 
 pytestmark = pytest.mark.usefixtures("support_db")
+
+_RELEASED_INTENT = {
+    "schema_version",
+    "identity",
+    "requested_tool_access",
+    "effective_tool_access",
+    "request_body_sha256",
+    "source_generation",
+    "source_operation_id",
+    "policy_fingerprint",
+    "manifest_digest",
+    "runtime_id",
+    "runtime_generation",
+    "qualification_id",
+    "event_id",
+    "conversation_id",
+    "payload_sha256",
+    "envelope_sha256",
+    "reserved_stream_id",
+    "created_at_ms",
+    "deadline_ms",
+}
+# The released contract: the exact key sets the previous release's admission
+# record validator requires, copied so the product cannot move it.
+RELEASED_KEYS = {
+    "envelope": {
+        "schema_version",
+        "event_id",
+        "source_revision",
+        "runtime_id",
+        "runtime_generation",
+        "manifest_digest",
+        "qualification_id",
+        "runner_image_digest",
+        "bundle_digest",
+        "execution_config_digest",
+        "logical_conversation_key",
+        "execution_session_key",
+        "payload_sha256",
+    },
+    "intent": _RELEASED_INTENT,
+    "receipt": (
+        _RELEASED_INTENT - {"created_at_ms", "deadline_ms", "reserved_stream_id", "envelope_sha256"}
+    )
+    | {"stream_id", "acceptance_status", "tool_access"},
+}
 admission_service = _broker.admission_service
 
 FIELD = "remediation_generation"
@@ -79,19 +126,32 @@ async def verb(stage: Stage, name: str) -> int:
     return stage.generation
 
 
-def test_a_hook_with_no_remediation_policy_records_null(
+def test_a_hook_with_no_remediation_policy_omits_the_field(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """@spec AUTOMATED-REMEDIATION-4: the absence is recorded, not omitted."""
+    """@spec AUTOMATED-REMEDIATION-4: an unbound hook writes released-compatible records.
+
+    The envelope, intent and committed receipt omit ``remediation_generation``
+    and have exactly the key sets the previous release's validator requires, so
+    a rollback still reads deliveries admitted while remediation was unbound.
+    """
 
     remediation(monkeypatch, enabled=True)
 
     async def scenario() -> None:
         async with staged(ingress_broker, tmp_path, monkeypatch) as stage:
-            _, envelope, intent = await delivered(stage)
+            event, envelope, intent = await delivered(stage)
+            commit = record(
+                stage.broker, admission_key("commit", stage.agent, stage.delivery_of[event])
+            )
+            assert commit is not None
 
-            assert FIELD in envelope and envelope[FIELD] is None, envelope
-            assert FIELD in intent and intent[FIELD] is None, intent
+            assert FIELD not in envelope, envelope
+            assert FIELD not in intent, intent
+            assert FIELD not in commit["receipt"], commit
+            assert set(envelope) == RELEASED_KEYS["envelope"]
+            assert set(intent) == RELEASED_KEYS["intent"]
+            assert set(commit["receipt"]) == RELEASED_KEYS["receipt"]
 
     run(scenario)
 
