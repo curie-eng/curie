@@ -15,15 +15,7 @@ phases against a real MCP session, not a stub of the route. It runs two ways:
 Settings (env name in parentheses for stdio):
 
 * ``tools`` (``CURIE_TEST_EXECUTOR_TOOLS``): ``paired`` (default),
-  ``lone_restore``, ``no_restore`` or ``readonly_restore``; ``read`` advertises
-  the read connector's catalogue of ``runner-execute.json``'s ``read.list_response``
-  (``query_value`` read-only, ``query_unhinted`` without the hint, a write
-  ``scale``), and ``paired_and_read`` both catalogues on one connector
-  (@spec AUTOMATED-REMEDIATION-12).
-* ``read_reply`` (``CURIE_TEST_READ_REPLY``, JSON): the ``structuredContent``
-  every ``query_*`` tool answers with; null answers text only.
-* ``read_error`` (``CURIE_TEST_READ_ERROR``, ``1``): every ``query_*`` tool
-  answers ``isError`` with ``read_reply`` as its structured content.
+  ``lone_restore``, ``no_restore`` or ``readonly_restore``.
 * ``observe_reply`` (``CURIE_TEST_OBSERVE_REPLY``, JSON): the
   ``structuredContent`` ``observe_version`` answers with; null answers text only.
 * ``call_reply`` (``CURIE_TEST_CALL_REPLY``, JSON): the ``structuredContent``
@@ -68,37 +60,7 @@ _RESTORE_SCHEMA = {
 }
 
 
-def _read_tools() -> list[Tool]:
-    """The read connector's catalogue. @spec AUTOMATED-REMEDIATION-12."""
-
-    return [
-        Tool(
-            name="query_value",
-            description="Query an example metric.",
-            inputSchema={"type": "object"},
-            annotations=ToolAnnotations(readOnlyHint=True),
-        ),
-        Tool(
-            name="query_unhinted",
-            description="Query an example metric without a read-only hint.",
-            inputSchema={"type": "object"},
-        ),
-    ]
-
-
 def _tools(mode: str) -> list[Tool]:
-    if mode == "read":
-        return [
-            *_read_tools(),
-            Tool(
-                name="scale",
-                description="Scale an example deployment.",
-                inputSchema={"type": "object"},
-                annotations=ToolAnnotations(readOnlyHint=False),
-            ),
-        ]
-    if mode == "paired_and_read":
-        return [*_tools("paired"), *_read_tools()]
     tools = [
         Tool(
             name="scale",
@@ -150,15 +112,7 @@ def build_server(
     ) -> CallToolResult:
         if record is not None:
             record(params.name, params.arguments)
-        if params.name.startswith("query_"):
-            structured = settings.get("read_reply")
-            if settings.get("read_error"):
-                return CallToolResult(
-                    content=[TextContent(type="text", text="query failed")],
-                    structuredContent=structured if isinstance(structured, dict) else None,
-                    isError=True,
-                )
-        elif params.name == "observe_version":
+        if params.name == "observe_version":
             structured = settings.get("observe_reply")
         else:
             structured = settings.get("call_reply")
@@ -240,8 +194,6 @@ def _env_settings() -> dict[str, Any]:
         "call_reply": loaded("CURIE_TEST_CALL_REPLY"),
         "list_pages": os.environ.get("CURIE_TEST_LIST_PAGES"),
         "call_result_bytes": os.environ.get("CURIE_TEST_CALL_RESULT_BYTES"),
-        "read_reply": loaded("CURIE_TEST_READ_REPLY"),
-        "read_error": os.environ.get("CURIE_TEST_READ_ERROR") == "1",
     }
 
 
