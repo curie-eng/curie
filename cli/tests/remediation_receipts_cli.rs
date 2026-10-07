@@ -94,13 +94,62 @@ fn row(id: &str, state: &str, stage: &str, authority: &str, code: Value, outcome
 /// A terminal row of each kind the receipt can end in.
 fn terminal_rows() -> Vec<Value> {
     vec![
-        row(NOMINATION, "refused", "refused", "none", json!("unknown_action"), Value::Null),
-        row("a0000000-0000-4000-8000-000000000001", "finished", "verified", "policy", Value::Null, json!("verified")),
-        row("a0000000-0000-4000-8000-000000000002", "finished", "not-recovered", "approval", Value::Null, json!("not-recovered")),
-        row("a0000000-0000-4000-8000-000000000003", "finished", "verifier-unavailable", "policy", Value::Null, json!("verifier-unavailable")),
-        row("a0000000-0000-4000-8000-000000000004", "finished", "superseded", "policy", Value::Null, json!("superseded")),
-        row("a0000000-0000-4000-8000-000000000005", "rejected", "approval_requested", "none", json!("out_of_bounds"), Value::Null),
-        row("a0000000-0000-4000-8000-000000000006", "expired", "approval_requested", "none", json!("breaker_open"), Value::Null),
+        row(
+            NOMINATION,
+            "refused",
+            "refused",
+            "none",
+            json!("unknown_action"),
+            Value::Null,
+        ),
+        row(
+            "a0000000-0000-4000-8000-000000000001",
+            "finished",
+            "verified",
+            "policy",
+            Value::Null,
+            json!("verified"),
+        ),
+        row(
+            "a0000000-0000-4000-8000-000000000002",
+            "finished",
+            "not-recovered",
+            "approval",
+            Value::Null,
+            json!("not-recovered"),
+        ),
+        row(
+            "a0000000-0000-4000-8000-000000000003",
+            "finished",
+            "verifier-unavailable",
+            "policy",
+            Value::Null,
+            json!("verifier-unavailable"),
+        ),
+        row(
+            "a0000000-0000-4000-8000-000000000004",
+            "finished",
+            "superseded",
+            "policy",
+            Value::Null,
+            json!("superseded"),
+        ),
+        row(
+            "a0000000-0000-4000-8000-000000000005",
+            "rejected",
+            "approval_requested",
+            "none",
+            json!("out_of_bounds"),
+            Value::Null,
+        ),
+        row(
+            "a0000000-0000-4000-8000-000000000006",
+            "expired",
+            "approval_requested",
+            "none",
+            json!("breaker_open"),
+            Value::Null,
+        ),
     ]
 }
 
@@ -242,7 +291,13 @@ fn run_at(
         .unwrap_or_else(|err| panic!("run curie {tier} {group} {}: {err}", args.join(" ")))
 }
 
-fn run(tier: &str, group: &str, args: &[&str], server: &MockServer, principal: Option<&str>) -> Output {
+fn run(
+    tier: &str,
+    group: &str,
+    args: &[&str],
+    server: &MockServer,
+    principal: Option<&str>,
+) -> Output {
     run_at(tier, group, args, &server.base_url, principal)
 }
 
@@ -251,9 +306,15 @@ fn one_object(output: &Output, what: &str) -> Value {
     let mut values = serde_json::Deserializer::from_str(&stdout).into_iter::<Value>();
     let first = match values.next() {
         Some(Ok(value)) => value,
-        other => panic!("{what}: --json stdout must be one JSON object, got {other:?}\n{}", text(output)),
+        other => panic!(
+            "{what}: --json stdout must be one JSON object, got {other:?}\n{}",
+            text(output)
+        ),
     };
-    assert!(values.next().is_none(), "{what}: exactly one JSON value\n{stdout}");
+    assert!(
+        values.next().is_none(),
+        "{what}: exactly one JSON value\n{stdout}"
+    );
     assert!(first.is_object(), "{what}: must be an object, not {first}");
     first
 }
@@ -263,7 +324,10 @@ fn assert_error_object(value: &Value, what: &str) {
         value["error"].as_str().is_some_and(|e| !e.is_empty()),
         "{what}: an error carries a non-empty `error`: {value}"
     );
-    assert!(value.get("fix").is_some(), "{what}: an error carries `fix`: {value}");
+    assert!(
+        value.get("fix").is_some(),
+        "{what}: an error carries `fix`: {value}"
+    );
 }
 
 fn assert_valid(schema_file: &str, value: &Value, what: &str) {
@@ -276,7 +340,10 @@ fn assert_valid(schema_file: &str, value: &Value, what: &str) {
     assert!(
         validator.is_valid(value),
         "{what}: does not validate against {schema_file}: {value}\nerrors: {:?}",
-        validator.iter_errors(value).map(|e| e.to_string()).collect::<Vec<_>>()
+        validator
+            .iter_errors(value)
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -301,7 +368,11 @@ fn query_pairs(path: &str) -> Vec<(String, String)> {
 }
 
 fn child(node: &Value, name: &str) -> Option<Value> {
-    node["subcommands"].as_array()?.iter().find(|c| c["name"] == name).cloned()
+    node["subcommands"]
+        .as_array()?
+        .iter()
+        .find(|c| c["name"] == name)
+        .cloned()
 }
 
 // --------------------------------------------------------------------------
@@ -315,17 +386,25 @@ fn both_tiers_expose_the_groups_and_verbs() {
         for (group, verbs) in [
             ("remediation", vec!["list", "show"]),
             ("remediation-policy", vec!["breakers"]),
-            ("remediation-qualification", vec!["record", "start-run", "show-run"]),
+            (
+                "remediation-qualification",
+                vec!["record", "start-run", "show-run"],
+            ),
         ] {
             let output = Command::new(bin())
                 .args([tier, group, "--help"])
                 .output()
                 .unwrap_or_else(|err| panic!("run {tier} {group} --help: {err}"));
             let help = text(&output);
-            assert!(output.status.success(), "{tier} {group} --help must render:\n{help}");
+            assert!(
+                output.status.success(),
+                "{tier} {group} --help must render:\n{help}"
+            );
             for verb in verbs {
                 assert!(
-                    help.lines().any(|l| l.trim_start().starts_with(&format!("{verb} ")) || l.trim() == verb),
+                    help.lines().any(
+                        |l| l.trim_start().starts_with(&format!("{verb} ")) || l.trim() == verb
+                    ),
                     "{tier} {group} must expose `{verb}`; help:\n{help}"
                 );
             }
@@ -343,12 +422,18 @@ fn committed_manifest_records_the_groups_under_both_tiers() {
         for (group, verbs) in [
             ("remediation", vec!["list", "show"]),
             ("remediation-policy", vec!["breakers"]),
-            ("remediation-qualification", vec!["record", "start-run", "show-run"]),
+            (
+                "remediation-qualification",
+                vec!["record", "start-run", "show-run"],
+            ),
         ] {
             let node = child(&tier_node, group)
                 .unwrap_or_else(|| panic!("manifest must record `{tier} {group}`"));
             for verb in verbs {
-                assert!(child(&node, verb).is_some(), "manifest must record `{tier} {group} {verb}`");
+                assert!(
+                    child(&node, verb).is_some(),
+                    "manifest must record `{tier} {group} {verb}`"
+                );
             }
         }
     }
@@ -391,7 +476,11 @@ fn list_with_no_agent_reads_every_nomination_without_an_agent_lookup() {
         let what = format!("{tier} remediation list");
         assert_eq!(output.status.code(), Some(0), "{what}:\n{}", text(&output));
         let value = one_object(&output, &what);
-        assert_eq!(value["nominations"], Value::Array(terminal_rows()), "{what}");
+        assert_eq!(
+            value["nominations"],
+            Value::Array(terminal_rows()),
+            "{what}"
+        );
         assert_valid("remediation-nominations.schema.json", &value, &what);
         let requests = server.recorded();
         assert_eq!(requests.len(), 1, "{what}: no agent lookup");
@@ -461,12 +550,21 @@ fn a_malformed_receipt_input_is_a_usage_error_before_any_request() {
 fn an_unknown_nomination_and_an_unreachable_api_are_one_error_object_each() {
     for tier in ["local", "cluster"] {
         let server = api();
-        let output = run(tier, "remediation", &["show", UNKNOWN_NOMINATION], &server, None);
+        let output = run(
+            tier,
+            "remediation",
+            &["show", UNKNOWN_NOMINATION],
+            &server,
+            None,
+        );
         let what = format!("{tier} remediation show (unknown)");
         assert_eq!(output.status.code(), Some(1), "{what}:\n{}", text(&output));
         let value = one_object(&output, &what);
         assert_error_object(&value, &what);
-        assert!(value["error"].as_str().unwrap().contains("not found"), "{what}: {value}");
+        assert!(
+            value["error"].as_str().unwrap().contains("not found"),
+            "{what}: {value}"
+        );
 
         let output = run_at(tier, "remediation", &["list"], &dead_url(), None);
         let what = format!("{tier} remediation list (no listener)");
@@ -485,7 +583,10 @@ fn breakers_lists_the_ids_close_breaker_needs_with_no_principal() {
     for tier in ["local", "cluster"] {
         for (args, state) in [
             (vec!["breakers", AGENT_NAME, HOOK], None),
-            (vec!["breakers", AGENT_ID, HOOK, "--state", "closed"], Some("closed")),
+            (
+                vec!["breakers", AGENT_ID, HOOK, "--state", "closed"],
+                Some("closed"),
+            ),
         ] {
             let server = api();
             let output = run(tier, "remediation-policy", &args, &server, None);
@@ -508,7 +609,9 @@ fn breakers_lists_the_ids_close_breaker_needs_with_no_principal() {
             assert!(read.header("X-Curie-Approval-Principal").is_none());
             assert_eq!(
                 query_pairs(&read.path),
-                state.map(|s| vec![("state".to_owned(), s.to_owned())]).unwrap_or_default(),
+                state
+                    .map(|s| vec![("state".to_owned(), s.to_owned())])
+                    .unwrap_or_default(),
                 "{what}"
             );
         }
@@ -537,18 +640,35 @@ fn breakers_refuses_an_unknown_state_before_any_request() {
 // Qualification
 // --------------------------------------------------------------------------
 
-fn record_args<'a>(evidence_file: &'a str) -> Vec<&'a str> {
+fn record_args(evidence_file: &str) -> Vec<&str> {
     vec![
-        "record", AGENT_NAME, QUALIFICATION, "--hook", HOOK, "--action", "scale-out-api",
-        "--generation", "4", "--evidence-file", evidence_file, "--worst-case",
+        "record",
+        AGENT_NAME,
+        QUALIFICATION,
+        "--hook",
+        HOOK,
+        "--action",
+        "scale-out-api",
+        "--generation",
+        "4",
+        "--evidence-file",
+        evidence_file,
+        "--worst-case",
         "scales one deployment to six replicas",
     ]
 }
 
-fn start_args<'a>(target: &'a str) -> Vec<&'a str> {
+fn start_args(target: &str) -> Vec<&str> {
     vec![
-        "start-run", AGENT_NAME, QUALIFICATION, "--hook", HOOK, "--action", "scale-out-api",
-        "--target", target,
+        "start-run",
+        AGENT_NAME,
+        QUALIFICATION,
+        "--hook",
+        HOOK,
+        "--action",
+        "scale-out-api",
+        "--target",
+        target,
     ]
 }
 
@@ -581,12 +701,18 @@ fn record_puts_the_qualification_unchanged_under_the_principal() {
         let value = one_object(&output, &what);
         assert_eq!(value, qualification_out(), "{what}");
         assert_valid("remediation-qualification.schema.json", &value, &what);
-        let writes: Vec<Request> =
-            server.recorded().into_iter().filter(|r| r.method != "GET").collect();
+        let writes: Vec<Request> = server
+            .recorded()
+            .into_iter()
+            .filter(|r| r.method != "GET")
+            .collect();
         assert_eq!(writes.len(), 1, "{what}");
         assert_eq!(writes[0].method, "PUT");
         assert_eq!(writes[0].path, qualification_base());
-        assert_eq!(writes[0].header("X-Curie-Approval-Principal"), Some(OPERATOR_PRINCIPAL));
+        assert_eq!(
+            writes[0].header("X-Curie-Approval-Principal"),
+            Some(OPERATOR_PRINCIPAL)
+        );
         assert_eq!(writes[0].header("X-Api-Key"), Some(TEST_API_KEY));
         let body: Value = serde_json::from_slice(&writes[0].body).expect("body is JSON");
         assert_eq!(
@@ -600,7 +726,10 @@ fn record_puts_the_qualification_unchanged_under_the_principal() {
             }),
             "{what}"
         );
-        assert!(!text(&output).contains(OPERATOR_PRINCIPAL), "{what}: token never printed");
+        assert!(
+            !text(&output).contains(OPERATOR_PRINCIPAL),
+            "{what}: token never printed"
+        );
     }
 }
 
@@ -608,7 +737,11 @@ fn record_puts_the_qualification_unchanged_under_the_principal() {
 #[test]
 fn start_run_posts_exactly_hook_action_and_target_under_the_principal() {
     for tier in ["local", "cluster"] {
-        for (literal, sent) in [("example-api", json!("example-api")), ("7", json!(7)), ("true", json!(true))] {
+        for (literal, sent) in [
+            ("example-api", json!("example-api")),
+            ("7", json!(7)),
+            ("true", json!(true)),
+        ] {
             let server = api();
             let output = run(
                 tier,
@@ -628,7 +761,10 @@ fn start_run_posts_exactly_hook_action_and_target_under_the_principal() {
                 .find(|r| r.method == "POST")
                 .expect("a POST");
             assert_eq!(post.path, format!("{}/verifier-runs", qualification_base()));
-            assert_eq!(post.header("X-Curie-Approval-Principal"), Some(OPERATOR_PRINCIPAL));
+            assert_eq!(
+                post.header("X-Curie-Approval-Principal"),
+                Some(OPERATOR_PRINCIPAL)
+            );
             let body: Value = serde_json::from_slice(&post.body).expect("body is JSON");
             assert_eq!(
                 body,
@@ -657,7 +793,10 @@ fn show_run_reads_the_run_and_needs_no_principal() {
         let value = one_object(&output, &what);
         assert_eq!(value["outcome"], "verified", "{what}");
         assert_valid("remediation-verifier-run.schema.json", &value, &what);
-        assert!(server.recorded().iter().all(|r| r.method == "GET"), "{what}");
+        assert!(
+            server.recorded().iter().all(|r| r.method == "GET"),
+            "{what}"
+        );
     }
 }
 
@@ -677,7 +816,8 @@ fn the_writes_without_a_principal_are_refused_before_any_request() {
             ] {
                 let server = api();
                 let output = run(tier, "remediation-qualification", &args, &server, principal);
-                let what = format!("{tier} remediation-qualification {name} (principal {principal:?})");
+                let what =
+                    format!("{tier} remediation-qualification {name} (principal {principal:?})");
                 assert_eq!(output.status.code(), Some(2), "{what}:\n{}", text(&output));
                 let value = one_object(&output, &what);
                 assert_error_object(&value, &what);
@@ -712,7 +852,13 @@ fn a_malformed_qualification_input_is_a_usage_error_before_any_request() {
         ];
         for (name, args) in cases {
             let server = api();
-            let output = run(tier, "remediation-qualification", &args, &server, Some(OPERATOR_PRINCIPAL));
+            let output = run(
+                tier,
+                "remediation-qualification",
+                &args,
+                &server,
+                Some(OPERATOR_PRINCIPAL),
+            );
             let what = format!("{tier} remediation-qualification {name} {args:?}");
             assert_eq!(output.status.code(), Some(2), "{what}:\n{}", text(&output));
             assert_error_object(&one_object(&output, &what), &what);
@@ -742,10 +888,18 @@ fn qualification_refusals_are_one_error_object_with_the_api_code() {
                 Some(OPERATOR_PRINCIPAL),
             );
             let what = format!("{tier} remediation-qualification record ({code})");
-            assert_eq!(output.status.code(), Some(exit), "{what}:\n{}", text(&output));
+            assert_eq!(
+                output.status.code(),
+                Some(exit),
+                "{what}:\n{}",
+                text(&output)
+            );
             let value = one_object(&output, &what);
             assert_error_object(&value, &what);
-            assert!(value["error"].as_str().unwrap().contains(code), "{what}: {value}");
+            assert!(
+                value["error"].as_str().unwrap().contains(code),
+                "{what}: {value}"
+            );
             assert!(!text(&output).contains(OPERATOR_PRINCIPAL), "{what}");
         }
     }

@@ -193,19 +193,40 @@ fn the_document_codes_are_policy_refusals() {
 #[test]
 fn the_cli_closes_the_frozen_code_sets() {
     let codes = codes_vector();
-    assert_eq!(set_of(remediation::NOMINATION_STATES), set(&codes.nomination_states));
-    assert_eq!(set_of(remediation::NOMINATION_REFUSALS), set(&codes.nomination_refusals));
-    assert_eq!(set_of(remediation::SUBMISSION_REFUSALS), set(&codes.submission_refusals));
-    assert_eq!(set_of(remediation::APPROVAL_REASONS), set(&codes.approval_reasons));
+    assert_eq!(
+        set_of(remediation::NOMINATION_STATES),
+        set(&codes.nomination_states)
+    );
+    assert_eq!(
+        set_of(remediation::NOMINATION_REFUSALS),
+        set(&codes.nomination_refusals)
+    );
+    assert_eq!(
+        set_of(remediation::SUBMISSION_REFUSALS),
+        set(&codes.submission_refusals)
+    );
+    assert_eq!(
+        set_of(remediation::APPROVAL_REASONS),
+        set(&codes.approval_reasons)
+    );
     assert_eq!(
         set_of(remediation::APPROVAL_RESOLUTION_REFUSALS),
         set(&codes.approval_resolution_refusals)
     );
-    assert_eq!(set_of(remediation::VERIFICATION_OUTCOMES), set(&codes.verification_outcomes));
-    assert_eq!(set_of(remediation::RECEIPT_STAGES), set(&codes.receipt_stages));
+    assert_eq!(
+        set_of(remediation::VERIFICATION_OUTCOMES),
+        set(&codes.verification_outcomes)
+    );
+    assert_eq!(
+        set_of(remediation::RECEIPT_STAGES),
+        set(&codes.receipt_stages)
+    );
     assert_eq!(set_of(remediation::KINDS), set(&codes.kinds));
     assert_eq!(set_of(remediation::AUTHORITIES), set(&codes.authorities));
-    assert_eq!(set_of(remediation::AUTHORITY_KINDS), set(&codes.authority_kinds));
+    assert_eq!(
+        set_of(remediation::AUTHORITY_KINDS),
+        set(&codes.authority_kinds)
+    );
     assert_eq!(set_of(remediation::ACTOR_KINDS), set(&codes.actor_kinds));
     assert!(!codes.admission_checks.is_empty());
 }
