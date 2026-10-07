@@ -56,6 +56,13 @@ from ..models import (
     ConnectorCapability,
     ExecutionKind,
     ExecutionState,
+    RemediationNomination,
+)
+from ..remediation_forward import (
+    APPROVAL_AUTHORITY,
+    POLICY_AUTHORITY,
+    nomination_for_execution,
+    policy_generation,
 )
 from ..schemas.action_executions import (
     ExecutionArguments,
@@ -173,6 +180,8 @@ def _audit(
         action=kind,
         actor=execution.requested_by or _EXECUTOR,
         actor_channel=None,
+        # @spec AUTOMATED-REMEDIATION-14: a restore's rows belong to its ruling.
+        actor_kind="undo_ruling",
         authorizer=_EXECUTOR,
         authorized=authorized,
         reason=reason,
@@ -543,6 +552,11 @@ async def _record_forward_action(session: AsyncSession, execution: ActionExecuti
     if not execution.tool or execution.forward_arguments is None:
         raise _conflict("this forward execution has no bound call")
     key = f"{_FORWARD_CALL_PREFIX}{execution.id}"
+    # @spec AUTOMATED-REMEDIATION-13 @spec AUTOMATED-REMEDIATION-14: a
+    # remediation's record carries its delivery, nomination and actor, and an
+    # approval authority's gating approval. Other forward calls keep them NULL.
+    nomination = await nomination_for_execution(session, execution)
+    provenance = _remediation_provenance(execution, nomination)
     action_id = await session.scalar(
         insert(AgentAction)
         .values(
@@ -552,17 +566,19 @@ async def _record_forward_action(session: AsyncSession, execution: ActionExecuti
             call_id=key,
             tool=f"mcp__{execution.connector}__{execution.tool}",
             arguments=execution.forward_arguments,
-            gate_approval_id=None,
             status=ActionStatus.pending.value,
             dedupe_key=key,
             connector=execution.connector,
             connector_digest=execution.connector_digest,
             authority_kind=execution.authority_kind,
             authority_ref=execution.authority_ref,
+            **provenance,
         )
         .on_conflict_do_nothing(index_elements=["dedupe_key"])
         .returning(AgentAction.id)
     )
+    if action_id is not None and nomination is not None:
+        session.add(await _remediation_audit(session, execution, nomination, action_id))
     if action_id is None:
         action_id = await session.scalar(
             select(AgentAction.id).where(
@@ -572,6 +588,66 @@ async def _record_forward_action(session: AsyncSession, execution: ActionExecuti
     if action_id is None:
         raise _conflict("the ledger row of this forward call could not be recorded")
     execution.subject_action_id = action_id
+
+
+def _remediation_provenance(
+    execution: ActionExecution, nomination: RemediationNomination | None
+) -> dict[str, Any]:
+    """The ledger columns a remediation adds (AUTOMATED-REMEDIATION-13, -14)."""
+
+    if nomination is None or execution.authority_kind not in (
+        POLICY_AUTHORITY,
+        APPROVAL_AUTHORITY,
+    ):
+        return {"gate_approval_id": None}
+    approval = execution.authority_kind == APPROVAL_AUTHORITY
+    return {
+        "gate_approval_id": nomination.approval_id if approval else None,
+        "actor_kind": execution.authority_kind,
+        "delivery_event_id": nomination.event_id,
+        "nomination_id": nomination.id,
+    }
+
+
+async def _remediation_audit(
+    session: AsyncSession,
+    execution: ActionExecution,
+    nomination: RemediationNomination,
+    action_id: uuid.UUID,
+) -> ActionAuditEntry:
+    """@spec AUTOMATED-REMEDIATION-14: the audit row naming a remediation's actor.
+
+    A policy actor is ``actor_kind`` ``policy`` with the policy reference as
+    ``actor``; the evidence names the policy, its generation and the operator
+    principal that bound it, the delivery and the nomination. An approval actor
+    is ``approval`` with the approval as ``actor``. Never an empty human field.
+    """
+
+    generation = await policy_generation(session, nomination)
+    approval = execution.authority_kind == APPROVAL_AUTHORITY
+    return ActionAuditEntry(
+        action_id=action_id,
+        action="authorized",
+        actor=f"approval:{execution.authority_ref}" if approval else execution.authority_ref,
+        actor_channel=None,
+        actor_kind=execution.authority_kind,
+        authorizer="remediation-approval" if approval else "remediation-policy",
+        authorized=True,
+        reason=(
+            "an approved remediation approval authorized this call"
+            if approval
+            else "an admitted nomination under a bound policy authorized this call"
+        ),
+        evidence={
+            "execution_id": str(execution.id),
+            "nomination_id": str(nomination.id),
+            "delivery_event_id": nomination.event_id,
+            "policy": f"{nomination.agent_id}:{nomination.hook}",
+            "generation": nomination.admitted_generation,
+            "bound_by": generation.bound_by if generation is not None else None,
+        },
+        created_at=func.clock_timestamp(),
+    )
 
 
 @router.post("/{execution_id}/arguments", response_model=ExecutionArguments)

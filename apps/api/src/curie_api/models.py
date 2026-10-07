@@ -1611,6 +1611,30 @@ class ApprovalAuditEntry(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+# @spec AUTOMATED-REMEDIATION-14 (executor amendment E1): the closed sets the
+# ledger checks enforce. ``authority_kind`` names what permitted a
+# platform-executed call; ``actor_kind`` who acted; the outcome is written by
+# verification. Revision 0089 carries the same literals.
+AUTHORITY_KINDS: tuple[str, ...] = (
+    "undo_ruling",
+    "capability_probe",
+    "policy",
+    "approval",
+    "qualification",
+)
+ACTOR_KINDS: tuple[str, ...] = ("model_turn", "policy", "approval", "undo_ruling")
+VERIFICATION_OUTCOMES: tuple[str, ...] = (
+    "verified",
+    "not-recovered",
+    "verifier-unavailable",
+    "superseded",
+)
+
+
+def _sql_values(values: tuple[str, ...]) -> str:
+    return ", ".join(f"'{value}'" for value in values)
+
+
 class AgentAction(Base):
     """One thing an agent did to the world, and what it takes to put it back.
 
@@ -1636,6 +1660,20 @@ class AgentAction(Base):
         # execution to its subject action's agent. ``id`` alone is already
         # unique, so this adds no restriction on the ledger itself.
         UniqueConstraint("id", "agent_id", name="uq_agent_actions_id_agent_id"),
+        # @spec AUTOMATED-REMEDIATION-14: closed domains, as database checks.
+        CheckConstraint(
+            f"authority_kind IS NULL OR authority_kind IN ({_sql_values(AUTHORITY_KINDS)})",
+            name="agent_actions_authority_kind_ck",
+        ),
+        CheckConstraint(
+            f"actor_kind IS NULL OR actor_kind IN ({_sql_values(ACTOR_KINDS)})",
+            name="agent_actions_actor_kind_ck",
+        ),
+        CheckConstraint(
+            "verification_outcome IS NULL OR verification_outcome IN "
+            f"({_sql_values(VERIFICATION_OUTCOMES)})",
+            name="agent_actions_verification_outcome_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -1703,6 +1741,18 @@ class AgentAction(Base):
     connector_digest: Mapped[str | None] = mapped_column(Text, default=None)
     authority_kind: Mapped[str | None] = mapped_column(Text, default=None)
     authority_ref: Mapped[str | None] = mapped_column(Text, default=None)
+    # @spec AUTOMATED-REMEDIATION-14: a remediation's provenance and outcome.
+    # ``delivery_event_id`` is the protected delivery the action was nominated
+    # from and ``nomination_id`` the nomination (not a foreign key, like
+    # ``gate_approval_id``: the record outlives the nomination row).
+    # ``actor_kind`` says who acted: ``model_turn`` for a call a turn recorded,
+    # ``policy`` or ``approval`` for a platform-executed remediation. All NULL
+    # on rows written before revision 0089.
+    delivery_event_id: Mapped[str | None] = mapped_column(String(256), default=None)
+    nomination_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    verification_outcome: Mapped[str | None] = mapped_column(Text, default=None)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    actor_kind: Mapped[str | None] = mapped_column(Text, default=None)
 
     def restore_record_refusal(self) -> str | None:
         """The ruling code for the first record ingredient missing, or None.
@@ -1756,6 +1806,12 @@ class ActionAuditEntry(Base):
     """
 
     __tablename__ = "action_audit_entries"
+    __table_args__ = (
+        CheckConstraint(
+            f"actor_kind IS NULL OR actor_kind IN ({_sql_values(ACTOR_KINDS)})",
+            name="action_audit_entries_actor_kind_ck",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     action_id: Mapped[uuid.UUID] = mapped_column(
@@ -1774,6 +1830,10 @@ class ActionAuditEntry(Base):
     # point: an operator has to see that their manual fix is what stopped it.
     evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    # @spec AUTOMATED-REMEDIATION-14: who acted, from ``ACTOR_KINDS``. A policy
+    # actor is ``policy`` with the policy reference as ``actor``, never an
+    # empty human field. NULL on rows written before revision 0089.
+    actor_kind: Mapped[str | None] = mapped_column(Text, default=None)
 
 
 class ExecutionKind(enum.StrEnum):
@@ -1826,6 +1886,11 @@ class ActionExecution(Base):
         CheckConstraint(f"kind IN ({_sql_in(ExecutionKind)})", name="action_executions_kind_ck"),
         CheckConstraint(
             f"state IN ({_sql_in(ExecutionState)})", name="action_executions_state_ck"
+        ),
+        # @spec AUTOMATED-REMEDIATION-14 (executor amendment E1).
+        CheckConstraint(
+            f"authority_kind IN ({_sql_values(AUTHORITY_KINDS)})",
+            name="action_executions_authority_kind_ck",
         ),
         # A replayed creation adopts the existing row on (agent_id, key), so one
         # agent's key can never adopt another agent's execution.

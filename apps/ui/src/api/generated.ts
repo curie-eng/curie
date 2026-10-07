@@ -2999,6 +2999,8 @@ export interface components {
             actor: string;
             /** Actor Channel */
             actor_channel: string | null;
+            /** Actor Kind */
+            actor_kind: string | null;
             /** Authorized */
             authorized: boolean;
             /** Authorizer */
@@ -3062,12 +3064,18 @@ export interface components {
         };
         /** ActionOut */
         ActionOut: {
+            /** Actor Kind */
+            actor_kind: string | null;
             /** Agent Id */
             agent_id: string | null;
             /** Arguments */
             arguments: {
                 [key: string]: unknown;
             } | null;
+            /** Authority Kind */
+            authority_kind: string | null;
+            /** Authority Ref */
+            authority_ref: string | null;
             /** Call Id */
             call_id: string;
             /** Completed At */
@@ -3081,6 +3089,8 @@ export interface components {
             created_at: string;
             /** Dedupe Key */
             dedupe_key: string;
+            /** Delivery Event Id */
+            delivery_event_id: string | null;
             /** Detail */
             detail: string | null;
             /** Gate Approval Id */
@@ -3090,6 +3100,8 @@ export interface components {
              * Format: uuid
              */
             id: string;
+            /** Nomination Id */
+            nomination_id: string | null;
             /** Post State */
             post_state: {
                 [key: string]: unknown;
@@ -3116,6 +3128,10 @@ export interface components {
             undone_at: string | null;
             /** Undone By */
             undone_by: string | null;
+            /** Verification Outcome */
+            verification_outcome: string | null;
+            /** Verified At */
+            verified_at: string | null;
         };
         /**
          * ActionRecord
