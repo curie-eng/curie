@@ -61,18 +61,18 @@ route body gates in the same change, so no route-adding PR fails those gates.
 | 7. Read executions | AR-12 | `apps/api` (migration, sample route), `runner` (`read` phase in `runner/src/curie_runner/executor.py`), `apps/worker` (executor loop) | 1 (M2, M3), 2; executor task 11; #4204 | Pointed scalar only crosses; `tool_not_read_only` without dialing; lease renewed per sample and expiry ends `refused`; sandbox released after the last sample and after a crash; no acting connector credential in a read sandbox (cluster exec); vector fails one-sided. |
 | 8. Forward execution with authority, ledger fields and actor | AR-13, AR-14 | `apps/api` with `apps/worker` | 3; executor tasks 11 and 12 | One ledger row per execution with closed `authority_kind`, generation in `authority_ref`, `actor_kind`, delivery and nomination ids; replay creates nothing; legacy rows unchanged; an unknown authority kind violates the check. |
 | **Wave 3** | | | | |
-| 10. Remediation approvals | AR-15, AR-16 | `apps/api` (purpose, resolution), `apps/worker` (card loop beside the publication loop) | 1 (M4), 6, 8 | Explicit expiry set; dedupe on nomination rows attaches while pending and raises a new approval after resolution; attached nominations finish with the approval; card rendered from the nomination row with inert `reason`; approve builds from the nomination row and yields one execution and no resume turn; a database-edited `granted_arguments` refused `arguments_mismatch`; withdrawn action refused `policy_changed`; reject and expiry yield none. |
+| 10. Remediation approvals (driven by inserted not-admitted nomination rows, since admission is task 9; verification of approved calls is proved in task 11) | AR-15, AR-16 | `apps/api` (purpose, resolution), `apps/worker` (card loop beside the publication loop) | 1 (M4), 6, 8 | Explicit expiry set; dedupe on nomination rows attaches while pending and raises a new approval after resolution; attached nominations finish with the approval; card rendered from the nomination row with inert `reason`; approve builds from the nomination row and yields one execution and no resume turn; a database-edited `granted_arguments` refused `arguments_mismatch`; withdrawn action refused `policy_changed`; reject and expiry yield none. |
 | 11. Verifier | AR-17, AR-18 | `apps/api` (evaluator, scheduling), `apps/worker` (sampling loop) | 7, 8 | Four outcomes on a real cluster; settle at least one interval; at most 60 samples; observe-only `superseded` check; independence refused at write and at admission; grammar refusals; one outcome per record. |
 | 14. Nomination capture in the protected worker | AR-6 | `apps/worker` (runner client wrapper in the protected lane's composition, reviewed by the #3603 owner) | 1 (M1), 2, 6; protected hooks plan task 4 | `done` turn submits once; no streamed edit or final reply contains the fence, including a fence split across deltas; other statuses submit nothing; retries cannot add nominations; off-limits files untouched. |
 | **Wave 4** | | | | |
-| 9. Admission, limits, breaker, disarm | AR-8, AR-9, AR-10, AR-11 | `apps/api` | 1 (M5), 5, 6, 7, 8, 11 | Table-driven order through real producers, including independence; re-check at the `precondition_pending` transition; racing last slot from two hooks yields one execution under the per-agent lock; target key literal membership; incident window per agent and target, opened by automatic and approved actions, one hour after verification, lengthen-only, never read from the alert body; breaker opens on outcomes and closes only through the administrative route with an operator principal; disarm after creation refused `policy_changed` at claim; kill switch between admission and dispatch refuses with no write; injected read failures never execute. |
+| 9. Admission, limits, breaker, disarm | AR-8, AR-9, AR-10, AR-11 | `apps/api` | 1 (M5), 5, 6, 7, 8, 11 | Table-driven order through real producers, including independence; re-check at the `precondition_pending` transition; racing last slot from two hooks yields one execution under the per-agent lock; target key literal membership; incident window per agent and target, opened by automatic and approved actions, one hour after verification, lengthen-only, never read from the alert body; breaker opens on outcomes and closes only through the administrative route with an operator principal; disarm after creation refused `policy_changed` at claim through the remediation authority hook (executor amendment E8); kill switch between admission and dispatch refuses with no write; injected read failures never execute. |
 | 15. Qualification records | AR-22, AR-23 | `apps/api`, `cli` | 8, 10, 11 | Evidence references checked by state and digest; record write and verifier run require an operator principal; verifier-run route refuses tool or argument fields and a target outside the list; no administrative forward route exists; digest upgrade makes the record stale; `automatic` refused without a record (adds the check to task 3's validator) and accepted with one. |
 | **Wave 5** | | | | |
 | 12. Escalation and authority-aware undo | AR-19 | `apps/api` | 8, 9, 10, 11 | Report, breaker and undo approval on any non-`verified`; approval drives one restore under the approving principal; policy and approval records refuse outsiders; no automatic undo path exists (no caller of the ruling without a principal). |
 | 16. Tuning and prevention kinds | AR-24, AR-25 | `apps/api`, `apps/worker` (card rendering) | 9, 10 | `prevent` always asks and is verified when approved; `kind_not_automatic` for `prevent` and `tune`; one tuning request per recorded series with platform-rendered diff and declared-read evidence; approval ends `tune_execution_not_automated` with no write. |
 | **Wave 6** | | | | |
 | 13. Receipts and telemetry | AR-20, AR-21 | `apps/worker`, `packages/telemetry`, `cli` | 9, 10, 11, 12 | One thread message per stage; metric manifest includes the counter with bounded domains; capture of messages, logs and spans contains no non-target argument, sample, reason or alert text. |
-| 17. Documentation | AR-12, AR-26, AR-27 | docs, `ARCHITECTURE.md`, ACI producer interface (seam owner review), executor spec amendments E1 to E7, example bundle docs | 7, 13, 14 | The `read` phase listed beside `/v1/execute`; the executor spec text amended as the remediation spec lists; the remediation data path; the nomination block author guide; the qualification drill order; the SRE example's intake guide states the policy boundary honestly. |
+| 17. Documentation | AR-12, AR-26, AR-27 | docs, `ARCHITECTURE.md`, ACI producer interface (seam owner review), executor spec amendments E1 to E8, example bundle docs | 7, 13, 14 | The `read` phase listed beside `/v1/execute`; the executor spec text amended as the remediation spec lists; the remediation data path; the nomination block author guide; the qualification drill order, including that a drill relies on a model nominating and is repeated with a fresh delivery, never replaced by a direct write, when the model does not; the SRE example's intake guide states the policy boundary honestly. |
 | **Wave 7** | | | | |
 | 18. Complete campaign | all | integration owner | 1 to 17 | On the final artifacts: protected delivery to automatic remediation verified; out-of-bounds to approval to execution verified; `not-recovered` to report, breaker and approved undo; disarm, kill and limits refusals; a recorded duplicate-rule series to one tuning request. |
 
@@ -86,11 +86,15 @@ identifiers.
   a branch: whether a runner client wrapper passed as the kernel's `runner` sees
   every `TextDelta` before the kernel streams it and the same `Final` the kernel
   renders on a retried attempt; how many `Final` frames a retried protected turn
-  produces; and how a model's fence lines split across deltas in practice.
+  produces; how a model's fence lines split across deltas in practice; that a
+  context variable set by the guarded consumer adapter before delegating is
+  visible in `start_turn` for every attempt of that turn; and that the wrapped
+  stream keeps `turn_epoch` and the async context manager protocol.
 * **M2.** Executor sandbox hold time and pool impact of a verifier read
   execution held for a 600 second deadline at 10 second intervals, claimed with
-  the per-claim stripped template from the agent's pool source (#4204), against
-  an ordinary turn's claim latency.
+  the per-claim stripped template from the agent's pool source (#4204), together
+  with its observe-only `superseded` execution against the acting connector (two
+  sandboxes per verification), against an ordinary turn's claim latency.
 * **M3.** Structured content shapes returned by representative read connectors
   (a metrics query and an alert state read) at a pinned digest, and whether a
   JSON pointer reaches the needed scalar without transformation.
@@ -235,7 +239,7 @@ No task modifies `packages/aci-protocol` or `packages/plugin-format` (AR-27).
 * **#4204 (per-claim stripped sandbox template).** Read executions and the
   verifier wait for it, because the pool template would carry the acting
   connector's credential into the verifier's sandbox.
-* **Executor spec amendments E1 to E7.** Each lands with the task that needs it
+* **Executor spec amendments E1 to E8.** Each lands with the task that needs it
   and updates the executor spec text (task 17 checks it); the remediation spec
   judges none of them to need an ADR and lists what would.
 * **The protected worker (#3603, protected hooks plan task 4).** No protected

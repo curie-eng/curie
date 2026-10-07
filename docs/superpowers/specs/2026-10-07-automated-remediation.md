@@ -31,7 +31,7 @@ on any outcome other than `verified`, whatever authorized the action
 (AUTOMATED-REMEDIATION-11); recurrence prevention and alert rule tuning are never
 automatic in the first release (AUTOMATED-REMEDIATION-24); and qualification
 evidence must be observed in the installation that binds the action
-(AUTOMATED-REMEDIATION-23); and a nomination with no bounded action for a person
+(AUTOMATED-REMEDIATION-23). Likewise, a nomination with no bounded action for a person
 to approve (malformed, an unknown action, a duplicate, or arguments outside the
 action's schema) or one from a stopped agent ends refused instead of becoming an
 approval request (AUTOMATED-REMEDIATION-7, -8), because ADR 0203 lets an injected
@@ -50,8 +50,9 @@ as decided text:
 * **Administrative principal.** Policy writes and breaker closes require an
   ADR 0106 operator principal in addition to the administrative credential, and
   that principal is recorded as the actor (AUTOMATED-REMEDIATION-3, -11, -14).
-  Qualification writes and verifier runs follow the same rule, because a
-  qualification record enables automatic execution (AUTOMATED-REMEDIATION-22).
+  This contract applies the ruling to qualification writes and verifier runs as
+  well, because a qualification record enables automatic execution
+  (AUTOMATED-REMEDIATION-22).
 * **Alert rule tuning (#4144).** Tuning stops at the nomination and the approval
   card; an approved tuning request ends refused with no write. Automated
   rule-owner change requests need a separate Draft ADR later
@@ -59,7 +60,7 @@ as decided text:
 * **Predicate grammar.** One JSON pointer and a closed comparator set is not an
   expression language under ADR 0007 or ADR 0117 (AUTOMATED-REMEDIATION-17).
 
-This contract also amends the executor contract in seven places, listed under
+This contract also amends the executor contract in eight places, listed under
 "Amendments to the executor contract", and records under "Needs an ADR" what it
 does not decide. Where realizing a decision meets an existing invariant, the
 conflict is stated, not designed around.
@@ -406,7 +407,21 @@ lane's composition passes to `apps/worker/src/curie_worker/kernel/core.py::Kerne
 as its `runner`, exactly as `apps/worker/src/curie_worker/run.py::build` passes
 `RunnerClient` today. PROTECTED-HOOK-LANE-7 plans a kernel facade and binding and
 substrate wrappers, not this wrapper; this work adds it to the protected lane's
-composition, reviewed by the #3603 owner. The wrapper:
+composition, reviewed by the #3603 owner.
+
+The kernel holds one runner for every turn, and `start_turn` receives an ACI
+`Event`, which carries no event id, so the wrapper learns the turn's `event_id`
+from a context variable owned by a new protected lane module (not the kernel's
+own context variables). The protected lane's guarded consumer adapter, which
+already resolves each entry's protected binding before delegating to the base
+consumer (protected hooks plan, phase 3), sets it to the binding's `event_id`
+before delegating, so every task the kernel creates for that turn inherits it.
+The wrapper reads it in `start_turn`; when it is absent or names an event with no
+binding, the wrapper still filters the block but submits nothing and logs
+`nomination_unattributed` (fail closed). `start_turn` returns a `TurnStream`
+subclass that wraps the parent stream, keeps its `turn_epoch` attribute and its
+async context manager protocol (`async with turn: async for frame in turn`),
+and filters frames in `__aiter__`. The wrapper:
 
 * passes `TextDelta` text through a line filter that withholds everything from a
   line that is exactly the opening fence to the closing fence line, holding back
@@ -415,7 +430,8 @@ composition, reviewed by the #3603 owner. The wrapper:
 * when the stream ends with a `Final` whose `status` is `done`, extracts the block
   from `Final.text`, submits it with the turn's `event_id` to
   `POST /v1/internal/remediation/nominations`, and yields a `Final` whose `text`
-  has the block removed;
+  has the block removed; an unclosed block is removed from the yielded `Final`
+  from its opening fence line to the end, in every status;
 * submits nothing for any other status or when no block is present, and submits
   the raw text of a block it cannot extract so the API records it as malformed.
 
@@ -594,11 +610,13 @@ verifier or approval closes it. Disarm writes a new generation with `armed`
 false and takes effect for every nomination evaluated after it, including those
 from deliveries admitted earlier (AUTOMATED-REMEDIATION-4).
 
-Between admission and dispatch, the API's executor claim route re-validates a
-policy-authorized forward execution: the nomination's generation is still current
-and armed and no breaker is open for its target key; otherwise it refuses the
-execution `policy_changed` before any sandbox claim and sends the nomination to
-approval. The kill switch is read at admission (check 2) and again by the
+Between admission and dispatch, a policy-authorized forward execution is
+re-validated when it is claimed: the nomination's generation is still current and
+armed and no breaker is open for its target key; otherwise the execution ends
+`refused` with `policy_changed` before any sandbox claim and the nomination goes
+to approval. The check is a remediation authority hook that the claim route calls
+for `authority_kind` `policy` only, owned by the remediation layer; this is
+executor amendment E8. The kill switch is read at admission (check 2) and again by the
 executor at claim and before dispatch (AE-21), so a kill between admission and
 dispatch refuses `agent_stopped` with no write call.
 
@@ -627,10 +645,12 @@ contract"). Concretely:
 * the runner's `/v1/execute` (phases in `runner/src/curie_runner/executor.py`)
   gains a `read` phase: after `list`, one or more `read` requests of the same tool
   with the same canonical arguments, each calling `tools/call` once. Executor mode
-  loads no harness, so the runner's read-only set does not exist there; the tool
-  must instead be advertised with `readOnlyHint: true` in that sandbox's own
-  `list`, and be the read the policy declares, or the phase refuses
-  `tool_not_read_only` without dialing. No grant is sent. Residual trust, named
+  loads no harness, so the runner's read-only set does not exist there. The read
+  is authorized by the policy generation that declares it (and the
+  qualification record), never by its annotation; as an additional fail-closed
+  refusal, a tool not advertised with `readOnlyHint: true` in that sandbox's own
+  `list` is refused `tool_not_read_only` without dialing (executor amendment
+  E4). No grant is sent. Residual trust, named
   as ADR 0191 names it: `readOnlyHint` is not proof of no effects, so the
   qualification's worst case statement covers the read tools
   (AUTOMATED-REMEDIATION-22);
@@ -777,8 +797,7 @@ a generation that removed the action is refused `policy_changed`.
 precondition) declares: `connector`, `tool`, `arguments` (canonical, may
 reference the target), `pointer` (an RFC 6901 JSON pointer), `comparator` (one
 of `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `in`, `absent`), `value` (a JSON scalar or,
-for `in`, a list of at most 16 scalars), and for a verifier `settle_seconds`,
-`settle_seconds` (at least `interval_seconds`, ADR 0203's minimum settle
+for `in`, a list of at most 16 scalars), and for a verifier `settle_seconds` (at least `interval_seconds`, ADR 0203's minimum settle
 interval), `deadline_seconds` (greater than settle, at most 3600, and at most 60
 times the interval, matching the sample cap of AUTOMATED-REMEDIATION-12),
 `interval_seconds` (at least 10) and `consecutive` (at least 1, default 1). Numeric comparison applies
@@ -816,13 +835,20 @@ outcome is:
 * `superseded`: before `verified`, another ledger record on the same target key
   is created, or, for an action whose connector advertises `observe_version`, a
   separate `observe` execution against the acting connector at each sample
-  reports a version different from the action's recorded `post_version`. This is
+  reports a version different from the action's recorded `post_version`. That
+  execution is a `read`-kind execution whose phase is `observe` (sequence `list`
+  then repeated `observe`), with the same `authority_kind`, lease and 60-sample
+  rules as the verifier read it accompanies. This is
   attribution, not a recovery verdict, so the acting connector may report it; it
   is never read as success;
 * `not-recovered`: the deadline passes with at least one successful sample after
   settle and no `verified`;
 * `verifier-unavailable`: the deadline passes with no successful sample after
   settle, or the read execution is refused.
+
+Reads never dispatch, so the kill switch's dispatch check does not stop them: a
+verifier keeps sampling after the agent is killed, up to its deadline, and the
+receipt for a killed agent never says that verification stopped.
 
 An execution that ends `failed`, `indeterminate` or `refused` after admission
 gets no verifier and finishes `not-recovered` for reporting, with the execution
@@ -1047,7 +1073,7 @@ plugin-format schema export are unchanged by every realizing PR.
 ## Amendments to the executor contract
 
 This contract amends the [executor contract](2026-10-06-connector-action-executor.md)
-as follows; each amendment lands with the task that needs it and updates the
+as follows (E1 to E8); each amendment lands with the task that needs it and updates the
 executor spec text in the same change.
 
 * **E1, AE-1 and AE-2 (producers and authority).** The closed producer set gains
@@ -1065,9 +1091,14 @@ executor spec text in the same change.
   forward action's target for the `superseded` check (AUTOMATED-REMEDIATION-18);
   AE-6's "observe only before a restore" otherwise stands, and the one-`call` rule
   is unchanged.
-* **E4, AE-4 and AE-6 (read-only evidence).** In executor mode the read-only set is
-  absent, so a `read` requires `readOnlyHint` in the sandbox's own `list`, with
-  the residual trust stated in AUTOMATED-REMEDIATION-12.
+* **E4, AE-4 and AE-6 (what authorizes a read).** The authority for a
+  platform-originated read is the policy generation that declares it (and, for
+  automatic execution, the action's qualification record). `readOnlyHint` is
+  never an authorization: ADR 0121 decision 5 calls it a runtime hint. In
+  executor mode the read-only set is absent, so the runner adds one fail-closed
+  refusal on top of that authority: a declared read whose tool is not advertised
+  with `readOnlyHint: true` in the sandbox's own `list` is refused
+  `tool_not_read_only`.
 * **E5, AE-17 (lifecycle).** Read executions never enter `dispatched`, renew their
   lease per sample, and end `confirmed` or `refused` without re-queueing.
 * **E6, AE-20 and AE-24 (codes).** Pre-dispatch codes gain `tool_not_read_only`,
@@ -1076,10 +1107,16 @@ executor spec text in the same change.
 * **E7, AE-5 (sandbox credentials).** Read executions require the per-claim
   stripped template proposed by #4204 (unmerged); this contract does not ship
   verification on the pool template.
+* **E8, AE-17 and AE-21 (claim-time authority re-check).** AE-21 leaves limits,
+  the breaker and disarm to admission. For a `policy`-authorized forward
+  execution, the claim route additionally calls the remediation authority hook
+  (AUTOMATED-REMEDIATION-11) and ends the execution `refused` with
+  `policy_changed` when it fails, before any sandbox claim. Executions of any
+  other authority are claimed exactly as AE-17 says.
 
 ## Needs an ADR
 
-Judged against ADR 0121, ADR 0124 and ADR 0203, none of E1 to E7 is a new
+Judged against ADR 0121, ADR 0124 and ADR 0203, none of E1 to E8 is a new
 architectural decision. Routing reads through executor sandboxes applies ADR 0121
 decision 2's reachability argument to reads and adds no reach: a sandbox under the
 read connector's binding reaches only what a model turn of the same agent already
