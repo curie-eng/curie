@@ -100,6 +100,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_ATTACHMENT_MAX_FILE_BYTES",
         "CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS",
         "CURIE_ATTACHMENT_RETENTION_TTL_SECONDS",
+        # ADR 0205 decision 7 (#4079): the per-thread budget every boot's
+        # rebuild is bounded by, and the worker's own prepare timeout.
+        "CURIE_ATTACHMENT_THREAD_MAX_FILES",
+        "CURIE_ATTACHMENT_THREAD_MAX_BYTES",
+        "CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS",
         "CURIE_BOOTING_TEXT",
         # Read by the worker capacity wait store, which bounds how long a
         # queued chat turn may wait. It is never sent to a sandbox.
@@ -289,6 +294,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # the API settings and by WorkerConfig at worker startup to decide
         # whether executions are claimed and dispatched. Never a sandbox boot key.
         "CURIE_ACTION_EXECUTOR_ENABLED",
+        # The automated remediation switch (AUTOMATED-REMEDIATION-1): read by the
+        # API settings and by WorkerConfig at startup. Never a sandbox boot key.
+        "CURIE_REMEDIATION_ENABLED",
         # End to end namespace reaper (#3245), read by the worker process only.
         # The test cluster kubeconfig is not among them: the reaper reads it
         # from the connector Secret at sweep time.

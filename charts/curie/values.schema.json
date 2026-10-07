@@ -375,6 +375,13 @@
         "enabled": {"type": "boolean"}
       }
     },
+    "remediation": {
+      "type": "object",
+      "description": "The automated remediation switch (AUTOMATED-REMEDIATION-1), rendered into both the API and the worker. Requires actionExecutor.enabled. A boolean, so a quoted \"true\" cannot turn it on.",
+      "properties": {
+        "enabled": {"type": "boolean"}
+      }
+    },
     "e2eConnectorIdentity": {
       "type": "object",
       "description": "End to end connector identity on a test cluster (ADR 0176 decision 4, issue #3243).",

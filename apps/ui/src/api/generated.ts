@@ -456,6 +456,77 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Remediation Policy
+         * @description The current remediation policy generation of a hook.
+         */
+        get: operations["get_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_get"];
+        /**
+         * Put Remediation Policy
+         * @description Bind, tighten or widen a protected hook's remediation policy.
+         *
+         *     A new binding starts disarmed; a later write keeps the armed flag. Each
+         *     write creates a generation recorded with the operator principal.
+         */
+        put: operations["put_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_put"];
+        post?: never;
+        /**
+         * Delete Remediation Policy
+         * @description Remove the policy: a new generation, inactive, disarmed and with no actions.
+         */
+        delete: operations["delete_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Arm Remediation Policy
+         * @description Arm the current policy as a new generation.
+         */
+        post: operations["arm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_arm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Disarm Remediation Policy
+         * @description Disarm the current policy as a new generation.
+         */
+        post: operations["disarm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_disarm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/hooks/{hook}/source-policy": {
         parameters: {
             query?: never;
@@ -6481,6 +6552,90 @@ export interface components {
             tool_access?: components["schemas"]["ToolAccess"] | null;
         };
         /**
+         * RemediationPolicyMutation
+         * @description Compare and swap plus idempotency for arm, disarm and removal.
+         *
+         *     @spec AUTOMATED-REMEDIATION-2.
+         */
+        RemediationPolicyMutation: {
+            /** Expected Generation */
+            expected_generation: string;
+            /** Operation Id */
+            operation_id: string;
+        };
+        /**
+         * RemediationPolicyOut
+         * @description One committed remediation policy generation.
+         *
+         *     @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3.
+         */
+        RemediationPolicyOut: {
+            /** Active */
+            active: boolean;
+            /** Agent Id */
+            agent_id: string;
+            /** Armed */
+            armed: boolean;
+            /**
+             * Bound By
+             * @description The operator principal that wrote this generation.
+             */
+            bound_by: string;
+            /** Generation */
+            generation: string;
+            /** Hook */
+            hook: string;
+            /** Policy */
+            policy: {
+                [key: string]: unknown;
+            };
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /**
+         * RemediationPolicyRefusal
+         * @description @spec AUTOMATED-REMEDIATION-2.
+         */
+        RemediationPolicyRefusal: {
+            detail: components["schemas"]["RemediationPolicyRefusalDetail"];
+        };
+        /**
+         * RemediationPolicyRefusalDetail
+         * @description A stable refusal code and, where one applies, the offending path.
+         *
+         *     @spec AUTOMATED-REMEDIATION-2.
+         */
+        RemediationPolicyRefusalDetail: {
+            /** Code */
+            code: string;
+            /** Message */
+            message?: string | null;
+            /** Path */
+            path?: string | null;
+        };
+        /**
+         * RemediationPolicyWrite
+         * @description Bind or replace the policy document of a protected hook.
+         *
+         *     @spec AUTOMATED-REMEDIATION-2.
+         */
+        RemediationPolicyWrite: {
+            /** Expected Generation */
+            expected_generation: string;
+            /** Operation Id */
+            operation_id: string;
+            /**
+             * Policy
+             * @description The closed policy document: route, limits and actions (AUTOMATED-REMEDIATION-2). Unknown keys are refused.
+             */
+            policy: {
+                [key: string]: unknown;
+            };
+        };
+        /**
          * ReplyHandle
          * @description Channel-neutral coordinates for where a turn's reply is delivered.
          *
@@ -8671,6 +8826,312 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyOut"];
+                };
+            };
+            /** @description Policy refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemediationPolicyWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyOut"];
+                };
+            };
+            /** @description Policy refusal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation error or named policy refusal */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+        };
+    };
+    delete_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_delete: {
+        parameters: {
+            query: {
+                expected_generation: string;
+                operation_id: string;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyOut"];
+                };
+            };
+            /** @description Policy refusal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation error or named policy refusal */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+        };
+    };
+    arm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_arm_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemediationPolicyMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyOut"];
+                };
+            };
+            /** @description Policy refusal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation error or named policy refusal */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+        };
+    };
+    disarm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_disarm_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemediationPolicyMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyOut"];
+                };
+            };
+            /** @description Policy refusal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation error or named policy refusal */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["RemediationPolicyRefusal"];
                 };
             };
         };

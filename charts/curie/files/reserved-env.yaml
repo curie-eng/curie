@@ -61,6 +61,7 @@ worker:
   CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS: worker.publication.resultMaxAttempts
   CURIE_PUBLICATION_SERVICE_ACCOUNT_NAME: worker.publication.serviceAccountName
   CURIE_RELEASE: the Helm release name
+  CURIE_REMEDIATION_ENABLED: remediation.enabled
   CURIE_ROUTE_TTL_SECONDS: worker.routeTtlSeconds
   CURIE_RUNNER_IMAGE: agentSandbox.runner.image
   CURIE_RUNNER_PORT: agentSandbox.runner.port
@@ -144,6 +145,7 @@ api:
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes
   CURIE_PUBLICATION_RETENTION_SECONDS: worker.publication.retentionSeconds
+  CURIE_REMEDIATION_ENABLED: remediation.enabled
   CURIE_SANDBOX_QUOTA_LIMITS_CPU: resourceQuota.hard.limitsCpu
   CURIE_SANDBOX_QUOTA_LIMITS_MEMORY: resourceQuota.hard.limitsMemory
   CURIE_SANDBOX_QUOTA_REQUESTS_CPU: resourceQuota.hard.requestsCpu

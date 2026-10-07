@@ -489,6 +489,20 @@ class WorkerConfig(BaseSettings):
     )
 
     @model_validator(mode="after")
+    def _remediation_requires_the_executor(self) -> WorkerConfig:
+        """Refuse remediation with the action executor off.
+
+        @spec AUTOMATED-REMEDIATION-1: compose cannot refuse the combination at
+        render, so the worker fails closed at boot, as the API does.
+        """
+        if self.remediation_enabled and not self.action_executor_enabled:
+            raise ValueError(
+                "CURIE_REMEDIATION_ENABLED=true requires CURIE_ACTION_EXECUTOR_ENABLED=true "
+                "(remediation.enabled requires actionExecutor.enabled)"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _progress_render_needs_a_deliverer(self) -> WorkerConfig:
         """Refuse to start with progress rendering on (ADR 0130).
 
@@ -1120,6 +1134,24 @@ class WorkerConfig(BaseSettings):
     attachment_retention_ttl_seconds: int = Field(
         default=3600, gt=0, validation_alias="CURIE_ATTACHMENT_RETENTION_TTL_SECONDS"
     )
+    # The per-thread budget (ADR 0205 decision 7): every boot rebuilds the
+    # thread's files, so one boot's work is bounded per thread, separately from
+    # the per-message cap. The file count may never be below one message's cap,
+    # because the current message's files are always kept whole. The byte
+    # budget must fit the sandbox's attachments volume; the chart checks that.
+    # The prepare timeout bounds the worker's own rebuild (ledger read, cache
+    # re-mint, channel re-fetch) inside the turn's remaining budget.
+    attachment_thread_max_files: int = Field(
+        default=20, gt=0, validation_alias="CURIE_ATTACHMENT_THREAD_MAX_FILES"
+    )
+    attachment_thread_max_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        gt=0,
+        validation_alias="CURIE_ATTACHMENT_THREAD_MAX_BYTES",
+    )
+    attachment_thread_prepare_timeout_seconds: float = Field(
+        default=15.0, gt=0, validation_alias="CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS"
+    )
     # Approval-gated publication runs only on the Kubernetes substrate. These
     # values shape the worker-owned Job; none are bundle inputs.
     publication_enabled: bool = Field(default=True, validation_alias="CURIE_PUBLICATION_ENABLED")
@@ -1157,6 +1189,19 @@ class WorkerConfig(BaseSettings):
         default=(),
         validation_alias="CURIE_PUBLICATION_PROTECTED_PATHS",
     )
+
+    @field_validator("attachment_thread_max_files")
+    @classmethod
+    def _thread_budget_holds_one_message(cls, value: int) -> int:
+        from .attachments import AttachmentLimits
+
+        per_message = AttachmentLimits().max_files
+        if value < per_message:
+            raise ValueError(
+                f"CURIE_ATTACHMENT_THREAD_MAX_FILES must be at least the per-message "
+                f"cap of {per_message}"
+            )
+        return value
 
     @field_validator("publication_protected_paths")
     @classmethod
@@ -1275,6 +1320,11 @@ class WorkerConfig(BaseSettings):
     # withholds the Role's `get` on Deployments the digest reads need.
     action_executor_enabled: bool = Field(
         default=False, validation_alias="CURIE_ACTION_EXECUTOR_ENABLED"
+    )
+    # The automated remediation switch (AUTOMATED-REMEDIATION-1), rendered from
+    # the same chart or compose value as the API's. It requires the executor.
+    remediation_enabled: bool = Field(
+        default=False, validation_alias="CURIE_REMEDIATION_ENABLED"
     )
     # The cron scheduler (ADR-0099, #268) is always on; this is only its tick.
     # A slot fires on the first tick at or after it, so the tick bounds lateness.
