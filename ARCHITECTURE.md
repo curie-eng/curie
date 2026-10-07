@@ -40,6 +40,7 @@ detail, and documentation drift on one version-selectable system diagram.
   - [The four kernel invariants](#the-four-kernel-invariants)
   - [Handling approvals (human in the loop)](#handling-approvals-human-in-the-loop)
   - [Deliberate progress (ADR 0130)](#deliberate-progress-adr-0130)
+- [The action ledger and the connector action executor](#the-action-ledger-and-the-connector-action-executor)
 - [Pushing agent versions with git (deploy flow)](#pushing-agent-versions-with-git-deploy-flow)
 - [Factory work items and publication](#factory-work-items-and-publication)
   - [Factory component map](#factory-component-map)
@@ -439,6 +440,148 @@ which owns the ordering, idempotency, terminal and milestone-budget rules.
 Rendering is off: nothing reaches an adapter yet. The worker README's
 [Deliberate progress](apps/worker/README.md#deliberate-progress-adr-0130)
 section holds the rules.
+
+## The action ledger and the connector action executor
+
+A tool call that changes the world is recorded in the action ledger, and the
+platform can later run one connector call for it without a model: a restore of
+a recorded action, a forward action whose authority its owner verified, or a
+read-only capability probe
+([ADR-0117](docs/adr/0117-a-tool-that-changes-the-world-reports-what-it-changed.md),
+[ADR-0121](docs/adr/0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md),
+[ADR-0124](docs/adr/0124-a-snapshot-is-sealed-to-the-connector-that-wrote-it.md),
+[ADR-0203](docs/adr/0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md)).
+The contract is the
+[connector action executor specification](docs/superpowers/specs/2026-10-06-connector-action-executor.md);
+the connector author's half is
+[`docs/writing-a-reversible-connector.md`](docs/writing-a-reversible-connector.md).
+The executor is closed by default: one chart value, `actionExecutor.enabled`,
+renders `CURIE_ACTION_EXECUTOR_ENABLED` into both the API and the worker
+(`charts/curie/values.yaml`, compose likewise).
+
+**Recording (every turn).** The runner emits a `side_effect_flag` carrying the
+connector's reply in `result`. The outbound redactor
+([`runner/src/curie_runner/redact.py::OutboundRedactor`](runner/src/curie_runner/redact.py))
+lets a valid sealed envelope cross verbatim or withholds the replay inputs,
+never alters them. The kernel opens and completes one ledger row per call
+([`apps/worker/src/curie_worker/kernel/attempt.py::_record_action`](apps/worker/src/curie_worker/kernel/attempt.py)
+through
+[`apps/worker/src/curie_worker/actions.py::ActionClient`](apps/worker/src/curie_worker/actions.py)),
+and
+[`apps/worker/src/curie_worker/actions.py::_snapshot`](apps/worker/src/curie_worker/actions.py)
+records `prior_state` and `post_version` only from an unredacted frame whose
+`prior` is a sealed envelope. On the cluster tier, with the executor and the
+connector reconciler both on, a wrapper around the same recorder reads the
+connector's Deployment by name on the opening and closing frames and attributes
+`connector` and `connector_digest` only when both reads show one completed
+rollout at an `@sha256:` image
+([`apps/worker/src/curie_worker/action_digest.py::DigestAttributingRecorder`](apps/worker/src/curie_worker/action_digest.py));
+the chart grants the worker that single-object `get` on Deployments only in
+that configuration (`charts/curie/templates/worker.yaml`). The row lives in
+[`apps/api/src/curie_api/models.py::AgentAction`](apps/api/src/curie_api/models.py).
+
+**Capability.** When the connector reconcile sees a hosted connector rolled out
+at a digest with no capability row,
+[`apps/worker/src/curie_worker/connector_probe.py::ProbeTrigger`](apps/worker/src/curie_worker/connector_probe.py)
+asks `POST /connector-capabilities/probes` for a probe
+([`apps/api/src/curie_api/routers/action_executions.py::create_probe`](apps/api/src/curie_api/routers/action_executions.py)).
+The executor runs it as a `list` phase and the API stores one
+[`apps/api/src/curie_api/models.py::ConnectorCapability`](apps/api/src/curie_api/models.py)
+row per agent, connector and digest, `restore_capable` only when `restore` and
+`observe_version` are both advertised with the required schemas and
+annotations. At boot the runner hides a paired `restore` from the model
+catalogue
+([`runner/src/curie_runner/adapter.py::hidden_restore_tools`](runner/src/curie_runner/adapter.py));
+a lone `restore` stays an ordinary tool. Once a digest is capable, the
+connectors route adds `<connector>/restore` to that connector's caller proxy
+gated set for the version that pins it
+([`apps/api/src/curie_api/routers/agents.py::_with_probed_restore`](apps/api/src/curie_api/routers/agents.py)),
+so the proxy refuses a `restore` without a grant.
+
+**Undoable, derived.** `undoable` is never stored. Every read and the undo
+ruling go through one derivation
+([`apps/api/src/curie_api/action_undoable.py::undo_refusal`](apps/api/src/curie_api/action_undoable.py)):
+a succeeded row with an agent, a sealed `prior_state`, a `post_version`, a
+`target`, a connector digest, a `restore_capable` row for that digest, sealing
+key custody (the agent's in-force version declares `SNAPSHOT_SEALING_KEY` as a
+`SecretRef` on that hosted connector), and no live restore.
+
+**Who creates an execution.** Exactly three producers write
+[`apps/api/src/curie_api/models.py::ActionExecution`](apps/api/src/curie_api/models.py):
+the undo ruling
+([`apps/api/src/curie_api/routers/actions.py::undo_action`](apps/api/src/curie_api/routers/actions.py),
+`202` with the execution id and state, never a snapshot), the forward creation
+function
+([`apps/api/src/curie_api/action_forward.py::create_forward_execution`](apps/api/src/curie_api/action_forward.py),
+an API function, not a route) and the probe route. No route accepts a tool
+name or arguments for execution. The operator asks for an undo with
+`curie <local|cluster> actions undo <id>` and reads the receipt with
+`actions execution <id>`
+([`cli/src/commands/actions.rs`](cli/src/commands/actions.rs)).
+
+**Running one.** The worker's
+[`apps/worker/src/curie_worker/action_executor_loop.py::ActionExecutorLoop`](apps/worker/src/curie_worker/action_executor_loop.py)
+runs beside the connector reconcile loop, not in the turn consumer, and reads
+no conversation, alert or model output:
+
+```
+API (ledger + executions)              worker executor loop                 executor sandbox            hosted connector
+-------------------------              --------------------                 ----------------            ----------------
+POST /action-executions/claim  <------ claim (lease + fence)
+                                       kill switch, pinned digest,
+                                       restore in the proxy's gated set
+                                       claim sandbox action-exec:<id> ----> runner, CURIE_RUNNER_MODE=execute
+                                       POST /v1/execute phase=list -------> tools/list ----------------> (caller proxy) connector
+                                       pinned digest again
+                                       POST /v1/execute phase=observe ----> observe_version {target} -> connector
+POST .../{id}/observation  <---------- version observed now
+  (API compares with post_version;
+   a difference ends it refused,
+   version_conflict, no write)
+POST .../{id}/dispatch  <------------- kill switch again, then commit
+                                       mint one ccg grant
+                                       POST /v1/execute phase=call -------> restore {target, prior_state,
+                                                                            expected_version?} + grant -> proxy spends grant -> connector
+POST .../{id}/outcome  <-------------- confirmed / failed / indeterminate
+                                       release the sandbox (every path)
+```
+
+The sandbox is claimed through the ordinary substrate under the agent's own
+pool and labels, from a per-claim template stripped of every model credential
+and of every connector secret outside the target connector's header set
+([`apps/worker/src/curie_worker/sandbox/claim_tokens.py::claim_template_spec`](apps/worker/src/curie_worker/sandbox/claim_tokens.py)).
+In executor mode the runner loads no harness or model session and serves only
+`/healthz`, `/status`, `/v1/status` and `POST /v1/execute`
+([`runner/src/curie_runner/server.py::create_executor_app`](runner/src/curie_runner/server.py),
+[`runner/src/curie_runner/executor.py::Executor`](runner/src/curie_runner/executor.py)).
+The worker's half of that route is
+[`apps/worker/src/curie_worker/runner_client.py::RunnerClient.execute`](apps/worker/src/curie_worker/runner_client.py);
+the two ship in different images and are frozen together by
+`tests/vectors/runner-execute.json` (the AGENTS.md parity seam registry). The
+grant is minted over the exact canonical argument text
+([`apps/worker/src/curie_worker/connector_grant.py::mint`](apps/worker/src/curie_worker/connector_grant.py))
+and spent once at the caller proxy
+([`apps/worker/src/curie_connector_proxy/server.py::_grant_refused`](apps/worker/src/curie_connector_proxy/server.py)),
+so a tool outside the proxy's rendered gated set refuses `tool_not_grant_bound`
+before dispatch. The local tier runs no caller proxy and no connector
+Deployment, so every restore there refuses. A forward execution runs `list`
+then one `call`, never observes, and never calls `restore` or `observe_version`
+(`reserved_verb_via_forward`); its `dispatched` commit creates the one
+ledger row the call completes.
+
+**At most once.** Everything before the `dispatched` commit is a provable
+non-write and ends `refused` with a closed code. After it, a lost answer, a
+crash or a deadline ends `indeterminate`, which is terminal: a call that may
+have reached the connector is never repeated. Expired claims are reclaimed at
+most three times; the claim route is the sweeper. A confirmed restore sets the
+ledger row's `undone_at`. Spans, metrics and logs carry kind, state, stage,
+code and connector only, never arguments, envelopes, results or versions.
+
+**Nothing frozen changed.** The envelope and version ride inside the existing
+free-form `result` of `SideEffectFlag`; `/v1/execute` and the mode variable are
+runner-private, outside `BootEnv` and the ACI frames (see the
+[ACI producer interface](docs/interfaces/aci-producer/INTERFACE.md)); the
+sealing key uses the existing `SecretRef` seam.
 
 ## Pushing agent versions with git (deploy flow)
 
