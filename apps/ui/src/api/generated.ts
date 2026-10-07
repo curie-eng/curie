@@ -29,6 +29,13 @@ export interface paths {
          *     dispatched) across the installation, and while two or more slots exist at
          *     most all but one are reads. An expired read is refused ``runner_unavailable``
          *     and never reclaimed; a due read whose series successor is due is skipped.
+         *
+         *     @spec AUTOMATED-REMEDIATION-11 (executor amendment E8): a ``policy`` forward
+         *     execution is handed out only while its remediation authority holds
+         *     (``remediation_admission.authority_refusal``); otherwise it ends ``refused``
+         *     ``policy_changed`` before any sandbox claim, its nomination goes back to
+         *     approval, and the next due execution is considered. An expired precondition
+         *     read decides its nomination's check 12 (AUTOMATED-REMEDIATION-9).
          */
         post: operations["claim_execution_action_executions_claim_post"];
         delete?: never;
@@ -171,6 +178,9 @@ export interface paths {
          *     with the execution's code (``failed``, ``indeterminate``, ``refused``) in
          *     the same transaction; a refused read
          *     is evaluated by its verification.
+         *
+         *     @spec AUTOMATED-REMEDIATION-9: a refused precondition read sends its
+         *     nomination to approval ``precondition_unavailable`` once this commits.
          */
         post: operations["report_outcome_action_executions__execution_id__outcome_post"];
         delete?: never;
@@ -198,6 +208,9 @@ export interface paths {
          *     reports one; a replay of the stored sample answers the row unchanged and a
          *     different one is refused (``409``). The answer is the receipt, which never
          *     carries the value or the pointer.
+         *
+         *     @spec AUTOMATED-REMEDIATION-9: a precondition read's sample decides its
+         *     nomination's check 12 once this commits (``remediation_admission``).
          */
         post: operations["report_sample_action_executions__execution_id__samples_post"];
         delete?: never;
@@ -580,6 +593,31 @@ export interface paths {
          * @description Arm the current policy as a new generation.
          */
         post: operations["arm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_arm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Close Remediation Breaker
+         * @description Close an open breaker, recording the operator principal and the reason.
+         *
+         *     Only this route closes a breaker: no nomination, delivery, verifier or
+         *     approval does. The breaker must hold an action this hook's policy
+         *     declares; any other id is ``404``. Closing an already closed breaker
+         *     answers it unchanged.
+         */
+        post: operations["close_remediation_breaker_agents__agent_id__hooks__hook__remediation_policy_breakers__breaker_id__close_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -6724,6 +6762,54 @@ export interface components {
             tool: string;
         };
         /**
+         * RemediationBreakerClose
+         * @description Why an operator closes a breaker; exactly ``{"reason"}``.
+         *
+         *     @spec AUTOMATED-REMEDIATION-11.
+         */
+        RemediationBreakerClose: {
+            /**
+             * Reason
+             * @description Why the breaker is closed, recorded with the operator principal.
+             */
+            reason: string;
+        };
+        /**
+         * RemediationBreakerOut
+         * @description One breaker on an agent's connector, tool and target key.
+         *
+         *     @spec AUTOMATED-REMEDIATION-11.
+         */
+        RemediationBreakerOut: {
+            /** Agent Id */
+            agent_id: string;
+            /** Close Reason */
+            close_reason: string | null;
+            /** Closed At */
+            closed_at: string | null;
+            /**
+             * Closed By
+             * @description The operator principal that closed it.
+             */
+            closed_by: string | null;
+            /** Connector */
+            connector: string;
+            /** Id */
+            id: string;
+            /**
+             * Opened At
+             * Format: date-time
+             */
+            opened_at: string;
+            /**
+             * Target
+             * @description The target key: the connector and the canonical target.
+             */
+            target: string;
+            /** Tool */
+            tool: string;
+        };
+        /**
          * RemediationNominationAccepted
          * @description The event's accepted submission: its nominations in block order.
          *
@@ -9355,6 +9441,62 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+        };
+    };
+    close_remediation_breaker_agents__agent_id__hooks__hook__remediation_policy_breakers__breaker_id__close_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+                breaker_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemediationBreakerClose"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationBreakerOut"];
+                };
+            };
+            /** @description Policy refusal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description No such breaker under this policy */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

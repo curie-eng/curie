@@ -328,6 +328,7 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/hooks/{hook}/remediation-policy",
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
     "/agents/{agent_id}/hooks/{name}/fire",
     "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
     "/agents/{agent_id}/versions",
