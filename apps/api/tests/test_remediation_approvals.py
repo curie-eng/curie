@@ -46,10 +46,13 @@ write; admission itself is task 9. Every identifier is a placeholder.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import importlib
 import json
 import re
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -238,8 +241,13 @@ def _nominate(
     n: int = 1,
     arguments: dict[str, Any] | None = None,
     state: str = "received",
+    generation: int | None = GENERATION,
 ) -> uuid.UUID:
-    """One well-formed, not admitted nomination of ``ACTION_NAME`` from delivery ``n``."""
+    """One well-formed, not admitted nomination of ``ACTION_NAME`` from delivery ``n``.
+
+    ``generation`` is its admitted and current generation; None is a delivery
+    admitted before any policy existed.
+    """
 
     agent = uuid.UUID(agent_id)
     bound = NOMINATED if arguments is None else arguments
@@ -255,14 +263,15 @@ def _nominate(
         "INSERT INTO curie.remediation_nominations "
         "(id, agent_id, hook, event_id, admitted_generation, current_generation, action, "
         "kind, arguments, arguments_sha256, target, reason, state) "
-        "VALUES (:id, :agent_id, :hook, :e, :generation, :generation, :action, 'remediate', "
+        "VALUES (:id, :agent_id, :hook, :e, CAST(:generation AS bigint), "
+        "CAST(:generation AS bigint), :action, 'remediate', "
         ":arguments, :sha, :target, :reason, :state)",
         {
             "id": nomination_id,
             "agent_id": agent,
             "hook": HOOK,
             "e": event_id,
-            "generation": GENERATION,
+            "generation": generation,
             "action": ACTION_NAME,
             "arguments": _canonical(bound),
             "sha": _sha(bound),
@@ -975,3 +984,390 @@ def test_the_card_never_carries_the_alert_body_and_renders_the_reason_inert(
         assert live not in joined, live
     # Markup is inert when escaped or quoted as code, where Slack applies none.
     assert "*urgent*" not in re.sub(r"```.*?```|`[^`]*`", "", joined, flags=re.DOTALL)
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1: attach racing resolution, recovery after the claim, L1, L2.
+# --------------------------------------------------------------------------- #
+
+
+def _sweep(runs_stream: str, now: Any = None) -> int:
+    """One pass of the API's periodic approval sweeper, as the API runs it."""
+
+    from curie_api.resumequeue import ResumeQueue
+    from curie_api.sweeper import sweep_expired_approvals
+    from redis import asyncio as aioredis
+
+    async def sweep() -> int:
+        settings = get_settings()
+        engine = create_async_engine(settings.database_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        valkey = aioredis.from_url(settings.valkey_dsn())
+        try:
+            async with sessions() as session:
+                return await sweep_expired_approvals(
+                    session, ResumeQueue(valkey, stream=runs_stream), now=now
+                )
+        finally:
+            await valkey.aclose()
+            await engine.dispose()
+
+    return asyncio.run(sweep())
+
+
+def _assert_ended_with(
+    nomination_id: uuid.UUID, approval_id: Any, outcome: tuple[str, ...]
+) -> None:
+    """A nomination never stays ``approval_requested`` under a resolved approval.
+
+    Either it is attached to ``approval_id`` and ended with its outcome, or (an
+    attach that re-checked the approval under its lock) it raised or joined
+    another approval that is still pending.
+    """
+
+    row = _nomination(nomination_id)
+    if row["approval_id"] == approval_id:
+        assert row["state"] in outcome, row["state"]
+        assert row["decided_at"] is not None
+    else:
+        assert row["approval_id"] is not None
+        assert row["state"] == "approval_requested"
+        assert _approval(row["approval_id"])["status"] == "pending"
+
+
+_OUTCOMES: dict[str, tuple[str, ...]] = {
+    "approved": ("finished",),
+    "rejected": ("rejected", "finished"),
+    "expired": ("expired", "finished"),
+}
+
+
+def _settle(client: Any, approval_id: Any, decision: str, runs_stream: str) -> None:
+    """Resolve by a person (approve or reject), or let the sweeper expire it."""
+
+    if decision == "expired":
+        sql_rows(
+            "UPDATE curie.approvals SET expires_at = now() - interval '1 second' WHERE id = :id",
+            {"id": approval_id},
+        )
+        _sweep(runs_stream)
+        return
+    assert _resolve(client, approval_id, decision).status_code == 200
+
+
+@pytest.mark.parametrize("decision", ["approved", "rejected", "expired"])
+def test_a_nomination_attaching_while_its_approval_is_resolved_ends_with_the_outcome(
+    client: Any,
+    auth_headers: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runs_stream: str,
+    decision: str,
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-15 @spec AUTOMATED-REMEDIATION-16 (review M1):
+    an attach that read the approval pending, interleaved with its resolution on
+    real Postgres, never leaves the nomination ``approval_requested`` under the
+    resolved approval: attached nominations "finish with that approval's outcome".
+
+    The attach is held right after it found the pending approval (the injection
+    point is the module's ``_pending_identical`` read); the resolution then runs
+    in another thread for up to two seconds (a fix that serializes it behind the
+    attach blocks there) before the attach is released.
+    """
+
+    agent_id = _setup(client, auth_headers, tmp_path)
+    first = _request(agent_id, _nominate(agent_id, n=1), n=1)
+    late_id = _nominate(agent_id, n=2)
+
+    module = _approvals_module()
+    original = module._pending_identical
+    holding, proceed = threading.Event(), threading.Event()
+
+    async def held(session: Any, nomination: Any) -> Any:
+        found = await original(session, nomination)
+        holding.set()
+        await asyncio.to_thread(proceed.wait, 10)
+        return found
+
+    monkeypatch.setattr(module, "_pending_identical", held)
+    outcome: dict[str, Any] = {}
+
+    def attach() -> None:
+        try:
+            outcome["attach"] = _request(agent_id, late_id, n=2)
+        except Exception as exc:  # noqa: BLE001 - reported by the assertions below
+            outcome["attach_error"] = exc
+
+    def settle() -> None:
+        try:
+            _settle(client, first.approval_id, decision, runs_stream)
+        except Exception as exc:  # noqa: BLE001 - reported by the assertions below
+            outcome["settle_error"] = exc
+
+    attacher = threading.Thread(target=attach)
+    attacher.start()
+    assert holding.wait(10), "the attach never reached the pending approval"
+    settler = threading.Thread(target=settle)
+    settler.start()
+    settler.join(2)
+    proceed.set()
+    attacher.join(20)
+    settler.join(20)
+    monkeypatch.setattr(module, "_pending_identical", original)
+
+    assert "attach_error" not in outcome, outcome
+    assert "settle_error" not in outcome, outcome
+    _assert_ended_with(late_id, first.approval_id, _OUTCOMES[decision])
+    executions = [row for row in _executions() if row["authority_ref"] == str(first.approval_id)]
+    assert len(executions) == (1 if decision == "approved" else 0)
+
+
+@pytest.mark.parametrize("decision", ["approved", "rejected"])
+def test_concurrent_attaches_racing_a_resolution_all_end_with_the_outcome(
+    client: Any,
+    auth_headers: dict[str, str],
+    tmp_path: Path,
+    runs_stream: str,
+    decision: str,
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-15 @spec AUTOMATED-REMEDIATION-16 (review M1),
+    unpaced: identical nominations attach from several threads while the approval
+    is resolved; none is left ``approval_requested`` under it, and the approval
+    yields at most one execution.
+    """
+
+    agent_id = _setup(client, auth_headers, tmp_path)
+    first = _request(agent_id, _nominate(agent_id, n=1), n=1)
+    late_ids = [_nominate(agent_id, n=n) for n in range(2, 10)]
+    start = threading.Barrier(len(late_ids) + 1)
+    errors: list[BaseException] = []
+
+    def attach(nomination_id: uuid.UUID, n: int) -> None:
+        start.wait(10)
+        try:
+            _request(agent_id, nomination_id, n=n)
+        except Exception as exc:  # noqa: BLE001 - reported below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=attach, args=(nomination_id, n))
+        for n, nomination_id in zip(range(2, 10), late_ids, strict=True)
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait(10)
+    _settle(client, first.approval_id, decision, runs_stream)
+    for thread in threads:
+        thread.join(30)
+
+    assert errors == []
+    for nomination_id in late_ids:
+        _assert_ended_with(nomination_id, first.approval_id, _OUTCOMES[decision])
+    executions = [row for row in _executions() if row["authority_ref"] == str(first.approval_id)]
+    assert len(executions) == (1 if decision == "approved" else 0)
+
+
+@contextlib.contextmanager
+def _fault(where: str) -> Any:
+    """A real Postgres error injected by trigger at one step after the claim.
+
+    ``execution``: inserting the forward execution. ``cleanup``: moving any
+    nomination off ``approval_requested``. Removed on exit.
+    """
+
+    statements = {
+        "execution": (
+            "CREATE TRIGGER remapr_test_fault BEFORE INSERT ON curie.action_executions "
+            "FOR EACH ROW EXECUTE FUNCTION curie.remapr_test_fault()"
+        ),
+        "cleanup": (
+            "CREATE TRIGGER remapr_test_fault BEFORE UPDATE ON curie.remediation_nominations "
+            "FOR EACH ROW WHEN (OLD.state = 'approval_requested' "
+            "AND NEW.state <> 'approval_requested') "
+            "EXECUTE FUNCTION curie.remapr_test_fault()"
+        ),
+    }
+    table = "action_executions" if where == "execution" else "remediation_nominations"
+    sql_rows(
+        "CREATE OR REPLACE FUNCTION curie.remapr_test_fault() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected fault'; END $$"
+    )
+    sql_rows(statements[where])
+    try:
+        yield
+    finally:
+        sql_rows(f"DROP TRIGGER IF EXISTS remapr_test_fault ON curie.{table}")
+        sql_rows("DROP FUNCTION IF EXISTS curie.remapr_test_fault()")
+
+
+def _settle_under_fault(client: Any, approval_id: Any, decision: str, runs_stream: str) -> None:
+    """The settling step, whose post-claim work fails: an error answer or a raise."""
+
+    with contextlib.suppress(Exception):
+        _settle(client, approval_id, decision, runs_stream)
+
+
+def _recover(client: Any, approval_id: Any, decision: str, runs_stream: str) -> None:
+    """What the platform retries: sweeper passes; a still pending approval (a fix
+    that rolls the claim back with the failed step) is resolved again by its person.
+    """
+
+    _sweep(runs_stream)
+    if _approval(approval_id)["status"] == "pending":
+        _settle(client, approval_id, decision, runs_stream)
+    _sweep(runs_stream)
+    _sweep(runs_stream)
+
+
+@pytest.mark.parametrize(
+    ("decision", "where"),
+    [
+        pytest.param("approved", "execution", id="approve-execution"),
+        pytest.param("approved", "cleanup", id="approve-cleanup"),
+        pytest.param("rejected", "cleanup", id="reject-cleanup"),
+        pytest.param("expired", "cleanup", id="expire-cleanup"),
+    ],
+)
+def test_a_failure_after_the_claim_is_recovered_once(
+    client: Any,
+    auth_headers: dict[str, str],
+    tmp_path: Path,
+    runs_stream: str,
+    stream: Any,
+    decision: str,
+    where: str,
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-16 (review M2): a database error after the
+    approve, reject or expire claim commits (at the execution's creation or at
+    the nominations' transition) is retried by the API's sweeper until an
+    approval has exactly one execution and every nomination ended with the
+    outcome; no model wake is enqueued.
+    """
+
+    agent_id = _setup(client, auth_headers, tmp_path)
+    raising_id = _nominate(agent_id, n=1)
+    requested = _request(agent_id, raising_id, n=1)
+    attached_id = _nominate(agent_id, n=2)
+    _request(agent_id, attached_id, n=2)
+
+    with _fault(where):
+        _settle_under_fault(client, requested.approval_id, decision, runs_stream)
+    assert [row for row in _executions()] == []
+
+    _recover(client, requested.approval_id, decision, runs_stream)
+
+    assert _approval(requested.approval_id)["status"] == decision
+    executions = _executions()
+    raising = _nomination(raising_id)
+    if decision == "approved":
+        assert len(executions) == 1
+        assert executions[0]["authority_kind"] == "approval"
+        assert executions[0]["authority_ref"] == str(requested.approval_id)
+        assert raising["state"] == "approved"
+        assert raising["execution_id"] == executions[0]["id"]
+    else:
+        assert executions == []
+        assert raising["state"] == decision
+    assert raising["decided_at"] is not None
+    _assert_ended_with(attached_id, requested.approval_id, _OUTCOMES[decision])
+    assert stream() == []
+
+
+def test_a_changed_tool_with_no_recorded_generation_is_refused_policy_changed(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, stream: Any
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-16 (review L1): a nomination from a delivery
+    admitted before any policy existed (no current generation) is raised under the
+    live generation; a later generation changing the action's tool is
+    ``policy_changed``, not ``arguments_mismatch``.
+    """
+
+    agent_id = _setup(client, auth_headers, tmp_path)
+    nomination_id = _nominate(agent_id, generation=None)
+    requested = _request(agent_id, nomination_id)
+    _advance_policy(agent_id, {**DOCUMENT, "actions": [{**ACTION, "tool": "patch_deployment"}]})
+
+    response = _resolve(client, requested.approval_id, "approved")
+
+    assert response.status_code == 409, response.text
+    assert "policy_changed" in response.text
+    assert _executions() == []
+    assert stream() == []
+
+
+class _Crash(BaseException):
+    """The worker process dying mid-delivery: nothing in the loop catches it."""
+
+
+class _FailingMemory(_CardMemory):
+    def __init__(self, failure: BaseException) -> None:
+        super().__init__()
+        self._failure = failure
+
+    async def remember(self, approval_id: str, **fields: Any) -> None:
+        raise self._failure
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(_Crash("worker died after the post"), id="crash"),
+        pytest.param(RuntimeError("card store unavailable"), id="error"),
+    ],
+)
+def test_a_card_post_retried_after_a_failure_posts_one_card(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, failure: BaseException
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-15 (review L2): the post succeeded, then the
+    worker died (lease left to expire) or recording the card failed; the retry,
+    by another worker, reaches Slack under the same idempotency key, so the
+    channel holds one card and the retry adopts its ts.
+
+    The fake Slack client honors ``client_msg_id`` as Slack does (a repeat key
+    answers the first message's ts and posts nothing).
+    """
+
+    cards = importlib.import_module("curie_worker.remediation_cards")
+    from curie_worker.slack_sink import SlackReplyAdapter
+
+    agent_id = _setup(client, auth_headers, tmp_path)
+    approval_id = str(_request(agent_id, _nominate(agent_id)).approval_id)
+    posts: list[dict[str, Any]] = []
+    messages: dict[str, str] = {}
+
+    async def chat_post_message(**kwargs: Any) -> dict[str, Any]:
+        posts.append(kwargs)
+        key = kwargs.get("client_msg_id") or f"unkeyed-{len(posts)}"
+        if key not in messages:
+            messages[key] = f"1700000000.{len(messages) + 1:06d}"
+        return {"ok": True, "channel": kwargs["channel"], "ts": messages[key]}
+
+    async def deliver(owner: str, memory: Any) -> bool:
+        sink = SlackReplyAdapter("xoxb-test")
+        sink._client_for(None).chat_postMessage = chat_post_message  # type: ignore[method-assign]
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            loop = cards.RemediationCardLoop(
+                store=cards.PostgresRemediationCardStore(
+                    engine, schema="curie", lease_owner=owner, lease_seconds=1
+                ),
+                replies=sink,
+                card_store=memory,
+            )
+            return bool(await loop.deliver_pending_card())
+        finally:
+            await engine.dispose()
+
+    with pytest.raises(type(failure)):
+        asyncio.run(deliver("worker-a", _FailingMemory(failure)))
+    time.sleep(1.5)
+    memory = _CardMemory()
+    assert asyncio.run(deliver("worker-b", memory)) is True
+    assert asyncio.run(deliver("worker-b", _CardMemory())) is False
+
+    assert len(posts) == 2
+    assert len(messages) == 1
+    keys = {post.get("client_msg_id") for post in posts}
+    assert len(keys) == 1 and None not in keys
+    assert [entry[0] for entry in memory.remembered] == [approval_id]
+    assert memory.remembered[0][1]["ts"] == next(iter(messages.values()))
