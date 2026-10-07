@@ -214,22 +214,19 @@ fn validated_id(kind: &str, raw: &str) -> Result<String> {
 /// The ADR-0106 operator principal that rules an undo, read from the same
 /// environment variable `approvals --resolve` reads. Never echoed.
 fn undo_principal_token() -> Result<String> {
-    std::env::var("CURIE_APPROVAL_PRINCIPAL_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::Error::from(
-                crate::exit::CliError::usage(
-                    "undo requires CURIE_APPROVAL_PRINCIPAL_TOKEN, which names WHO ruled the \
+    super::approvals::approval_principal_token(|| {
+        anyhow::Error::from(
+            crate::exit::CliError::usage(
+                "undo requires CURIE_APPROVAL_PRINCIPAL_TOKEN, which names WHO ruled the \
                      undo (the platform key authorizes reads but identifies nobody)",
-                )
-                .with_fix(
-                    "mint a reusable operator credential with `curie <local|cluster> approvals \
+            )
+            .with_fix(
+                "mint a reusable operator credential with `curie <local|cluster> approvals \
                      <AGENT> --mint-operator-principal <SUBJECT>`, export the one-time result \
                      as CURIE_APPROVAL_PRINCIPAL_TOKEN, and retry",
-                ),
-            )
-        })
+            ),
+        )
+    })
 }
 
 // @spec ACTION-EXECUTOR-23

@@ -975,6 +975,17 @@ pub async fn console_login(
     })
 }
 
+/// The ADR-0106 principal credential from CURIE_APPROVAL_PRINCIPAL_TOKEN, the
+/// one place every principal-authenticated verb (`approvals --resolve`,
+/// `approvals --recover`, `actions undo`) reads it. A blank value counts as
+/// unset; `missing` builds the caller's own refusal naming its verb.
+pub(super) fn approval_principal_token(missing: impl FnOnce() -> anyhow::Error) -> Result<String> {
+    std::env::var("CURIE_APPROVAL_PRINCIPAL_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(missing)
+}
+
 /// `<tier> approvals <agent> [--gate TOOL]... [--clear]`: view or set the tool
 /// names whose calls pause for human approval. No flags => show current gates.
 pub async fn approvals(
@@ -1118,18 +1129,15 @@ pub async fn approvals(
             }));
         }
 
-        let principal_token = std::env::var("CURIE_APPROVAL_PRINCIPAL_TOKEN")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                crate::exit::usage(format!(
-                    "{verb} requires CURIE_APPROVAL_PRINCIPAL_TOKEN, which names WHO acted \
+        let principal_token = approval_principal_token(|| {
+            crate::exit::usage(format!(
+                "{verb} requires CURIE_APPROVAL_PRINCIPAL_TOKEN, which names WHO acted \
                      in the audit row (the platform key authorizes the act but identifies \
                      nobody). Mint a reusable operator credential with `curie \
                      <local|cluster> approvals <AGENT> --mint-operator-principal <SUBJECT>`, \
                      export the one-time result, and retry"
-                ))
-            })?;
+            ))
+        })?;
         let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
         return Ok(ApprovalsOutput::Recovered {
             outcome: client
@@ -1316,16 +1324,13 @@ pub async fn approvals(
                 )],
             }));
         }
-        let principal_token = std::env::var("CURIE_APPROVAL_PRINCIPAL_TOKEN")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                crate::exit::usage(
-                    "--resolve requires CURIE_APPROVAL_PRINCIPAL_TOKEN. Mint a reusable \
+        let principal_token = approval_principal_token(|| {
+            crate::exit::usage(
+                "--resolve requires CURIE_APPROVAL_PRINCIPAL_TOKEN. Mint a reusable \
                      operator credential with `curie <local|cluster> approvals <AGENT> \
                      --mint-operator-principal <SUBJECT>`, export the one-time result, and retry",
-                )
-            })?;
+            )
+        })?;
         let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
         let record = client
             .resolve_approval(
