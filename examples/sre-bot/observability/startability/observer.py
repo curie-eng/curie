@@ -41,25 +41,18 @@ def exception_type(exc: Exception) -> str:
 
 def identity_lanes(env: list[dict[str, Any]]) -> dict[str, tuple[str, str]]:
     """@spec STARTABILITY-3."""
+    from aci_protocol.slack_identities import (
+        LEGACY_APP_TOKEN_ENV,
+        LEGACY_BOT_TOKEN_ENV,
+        SlackIdentities,
+    )
+    from pydantic import TypeAdapter
+
     raw = next((e.get("value") for e in env if e["name"] == "CURIE_SLACK_IDENTITIES"), None)
-    if raw is None or (isinstance(raw, str) and not raw.strip()):
-        return {"default": ("SLACK_APP_TOKEN", "SLACK_BOT_TOKEN")}
-    declared = json.loads(raw)
-    if not isinstance(declared, list):
-        raise ValueError("invalid identity declaration")
-    lanes: dict[str, tuple[str, str]] = {}
-    for item in declared:
-        if not isinstance(item, dict):
-            raise ValueError("invalid identity declaration")
-        name, app, bot = (item.get(key) for key in ("name", "app_token_env", "bot_token_env"))
-        if not isinstance(name, str) or not isinstance(app, str) or not isinstance(bot, str):
-            raise ValueError("invalid identity declaration")
-        if not all(value.strip() for value in (name, app, bot)):
-            raise ValueError("invalid identity declaration")
-        if name in lanes:
-            raise ValueError("duplicate identity declaration")
-        lanes[name] = (app, bot)
-    return lanes
+    declared = TypeAdapter(SlackIdentities).validate_python("" if raw is None else raw)
+    if not declared:
+        return {"default": (LEGACY_APP_TOKEN_ENV, LEGACY_BOT_TOKEN_ENV)}
+    return {item.name: (item.app_token_env, item.bot_token_env) for item in declared}
 
 
 def credential_states(
@@ -131,7 +124,11 @@ def judge(
     marker: str,
 ) -> list[dict[str, Any]]:
     """@spec STARTABILITY-1 STARTABILITY-2 STARTABILITY-3 STARTABILITY-6."""
-    base_pool = worker_env.get("CURIE_WARM_POOL") or "curie-runner-pool"
+    from curie_worker.binding import inject_connector_secrets
+    from curie_worker.sandbox.types import agent_warm_pool_name
+
+    configured_pool = worker_env.get("CURIE_WARM_POOL", "curie-runner-pool")
+    base_pool = "" if configured_pool is None else configured_pool
 
     def listed(key: str) -> frozenset[str]:
         """@spec STARTABILITY-2."""
@@ -159,7 +156,13 @@ def judge(
                     return f"Slack identity {identity}: {lane}: {state[1]}"
         if not binding["deployed"]:
             return "the agent has no active deployment"
-        names = sorted(name for name in binding["secret_names"] or [] if not reserved(name))
+        secret_env: dict[str, str] = {}
+        inject_connector_secrets(
+            secret_env,
+            {name: "" for name in binding["secret_names"] or [] if not reserved(name)},
+            agent_label=binding["agent"],
+        )
+        names = sorted(name for name in secret_env if name != marker)
         try:
             pool = claim(
                 base_pool,
@@ -170,6 +173,10 @@ def judge(
             )
         except Exception as exc:  # noqa: BLE001 - do not echo arbitrary refusal text
             return f"worker refuses connectorSecrets pool selection ({exception_type(exc)})"
+        if pool == base_pool:
+            derived = agent_warm_pool_name(base_pool, binding["agent"])
+            if derived != base_pool and derived in pools:
+                pool = derived
         if pool not in pools:
             return f"selected SandboxWarmPool {pool} is absent"
         template = pools[pool]
