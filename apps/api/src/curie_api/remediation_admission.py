@@ -174,9 +174,6 @@ _HOUR_SECONDS: Final = 3600
 # A ``received`` nomination this old was left by a submission that did not
 # finish admitting it; ``reconcile_admissions`` admits it.
 _STRANDED_SECONDS: Final = 60
-# A delivery's recorded reply surface is copied onto its submission row when its
-# block is submitted; one never submitted against is pruned after this long.
-_SURFACE_RETENTION_SECONDS: Final = 7 * 24 * 3600
 
 _ADMISSION_LOCK = text(
     "SELECT pg_advisory_xact_lock(hashtextextended('curie.remediation.admission:' || :agent, 0))"
@@ -1133,15 +1130,18 @@ async def reconcile_admissions(
     for every such row, so it is never selected again and cannot starve a
     raisable one: no reply surface recorded is ``reply_surface_unavailable``,
     and an action the generation the approval would bind no longer declares is
-    ``unknown_action`` (AUTOMATED-REMEDIATION-7, -15). Recorded delivery reply
-    surfaces older than a week (never submitted against) are pruned.
+    ``unknown_action`` (AUTOMATED-REMEDIATION-7, -15). A recorded delivery reply
+    surface is pruned once its submission copied it.
     """
 
     await _end_unraisable(session)
+    # A delivery's surface is needed until its submission copies it; the
+    # binding it shadows keeps no expiry, so an unsubmitted one stays too.
     await session.execute(
         delete(RemediationDeliverySurface).where(
-            RemediationDeliverySurface.created_at
-            < func.now() - func.make_interval(0, 0, 0, 0, 0, 0, _SURFACE_RETENTION_SECONDS)
+            select(RemediationNominationSubmission.event_id)
+            .where(RemediationNominationSubmission.event_id == RemediationDeliverySurface.event_id)
+            .exists()
         )
     )
     await session.commit()

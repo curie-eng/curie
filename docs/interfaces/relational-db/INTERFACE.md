@@ -175,7 +175,8 @@ check that sent a nomination to approval, one of the frozen `approval_reasons`
 of `tests/vectors/remediation-codes.json`, and
 `remediation_delivery_surfaces` (`RemediationDeliverySurface`) records, per
 protected delivery event id, the reply surface the hook route chose (written by
-`apps/api/src/curie_api/routers/hooks.py` with remediation on; pruned after a week); it cascades with
+`apps/api/src/curie_api/routers/hooks.py` with remediation on, committed before
+the broker admits the delivery; pruned once a submission copied it); it cascades with
 the agent. `remediation_nomination_submissions` gains `conversation_id` and the
 reply surface (`reply_kind`, `reply_channel`, `reply_endpoint`, `reply_adapter`)
 copied from that row at nomination time, which the approval request is raised on;

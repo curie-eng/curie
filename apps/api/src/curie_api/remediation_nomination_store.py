@@ -192,9 +192,12 @@ async def record_delivery_surface(
     @spec AUTOMATED-REMEDIATION-15: an approval for the delivery's nominations
     is raised on the surface its ``QueuedTurn`` names (``kind``, ``address``,
     ``endpoint``, ``adapter`` of the selected binding), never one guessed later.
-    Keyed by event id; the first record wins. Commits. A failure is logged and
-    leaves no row (a later approval is then ``reply_surface_unavailable``); it
-    never fails the delivery, which is already admitted.
+    Keyed by event id; the first record wins, so a redelivery changes nothing.
+    Written and committed before the broker admits the delivery. Raises
+    ``SQLAlchemyError`` having rolled back, for the route to refuse the
+    delivery. The row lives until a submission copies it (pruned then, by
+    ``remediation_admission.reconcile_admissions``), like the binding, which
+    keeps no expiry.
     """
 
     try:
@@ -219,6 +222,7 @@ async def record_delivery_surface(
             event_id,
             type(error).__name__,
         )
+        raise
 
 
 async def _delivery_surface(session: AsyncSession, event: ProtectedEvent) -> dict[str, Any]:
