@@ -53,6 +53,15 @@ CLAIM_TOKEN_ENVS: tuple[str, ...] = tuple(
 )
 
 _RUNNER_CONTAINER = "runner"
+# The chart's per-agent connector Secret is ``<fullname>-agent-<agent>-connector-secrets``
+# (charts/curie/templates/agent-connector-secrets.yaml); the runner reads each of
+# its keys by ``secretKeyRef``. Matched by suffix so a release name never matters.
+CONNECTOR_SECRET_NAME_SUFFIX = "-connector-secrets"
+# Runner env an executor claim's template never carries (ACTION-EXECUTOR-5): the
+# model credential and the model env-key declaration. Named from ``BootEnv``.
+EXECUTOR_WITHHELD_ENVS: frozenset[str] = frozenset(
+    BootEnv.env_key(field) for field in ("credentials_ref", "model_env_key")
+)
 _SECRET_SUFFIX = "-tokens"
 # Kubernetes object names and label values are capped at 63 characters; the
 # pool carries the longest suffix.
@@ -106,6 +115,7 @@ def claim_template_spec(
     secret_name: str,
     token_names: Iterable[str],
     runner_resources: dict[str, Any] | None,
+    executor_secret_names: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Copy ``source_spec`` with each token read from ``secret_name`` on the runner.
 
@@ -114,6 +124,12 @@ def claim_template_spec(
     placeholder) is replaced, not duplicated. ``runner_resources``, when set, is
     validated and applied to every container first. ``source_spec`` is not
     changed.
+
+    ``executor_secret_names`` set marks an executor claim (@spec
+    ACTION-EXECUTOR-5): the runner additionally loses ``CURIE_CREDENTIALS``, the
+    model env-key declaration, and every connector secret ``secretKeyRef`` whose
+    name is not in the set. Kept entries stay verbatim and in order; init
+    containers and the rest of the pod spec are untouched.
     """
 
     spec = (
@@ -127,6 +143,8 @@ def claim_template_spec(
         raise ValueError("source template has no runner container")
     names = list(token_names)
     env = [entry for entry in runner.get("env") or [] if entry.get("name") not in names]
+    if executor_secret_names is not None:
+        env = [entry for entry in env if _executor_keeps(entry, executor_secret_names)]
     for key in names:
         env.append(
             {
@@ -138,3 +156,19 @@ def claim_template_spec(
         )
     runner["env"] = env
     return spec
+
+
+def _is_connector_secret_ref(entry: Mapping[str, Any]) -> bool:
+    ref = (entry.get("valueFrom") or {}).get("secretKeyRef") or {}
+    return str(ref.get("name", "")).endswith(CONNECTOR_SECRET_NAME_SUFFIX)
+
+
+def _executor_keeps(entry: Mapping[str, Any], secret_names: frozenset[str]) -> bool:
+    """Whether an executor claim's runner keeps this source env entry."""
+
+    name = entry.get("name")
+    if name in EXECUTOR_WITHHELD_ENVS:
+        return False
+    if _is_connector_secret_ref(entry):
+        return name in secret_names
+    return True
