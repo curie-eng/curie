@@ -63,6 +63,7 @@ pub mod schema_window;
 pub mod schemas;
 pub mod seal;
 pub mod sealing;
+pub mod sealing_key;
 pub mod secrets;
 pub mod slack;
 pub mod spec;

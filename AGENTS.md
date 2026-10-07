@@ -693,6 +693,14 @@ as a whole; remembered only):
   [vector: `tests/vectors/workspace-selection-refusal.json`]
   [gate: `apps/api/tests/test_workspace_control_plane.py::test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe`]
   [gate: `apps/worker/tests/test_workspace.py::test_internal_workspace_selection_409_maps_machine_code_not_detail_prose`]
+- API vs CLI snapshot sealing key custody -- the reserved names, refusal
+  reason and reference grammar (`packages/curie-internal/src/curie_internal/sealing_key.py`)
+  with the API's bundle check (`apps/api/src/curie_api/bundles.py::sealing_key_custody_issues`)
+  and the CLI deploy preflight's mirror (`cli/src/sealing_key.rs`) can't share
+  code across Python/Rust, so the names, the reason verbatim and every bundle's
+  refusals with their locations are frozen together in
+  `tests/vectors/sealing-key-custody.json` (ACTION-EXECUTOR-23).
+  [vector: `tests/vectors/sealing-key-custody.json`]
 - real SDK vs fake model session in the runner (`FakeModelSession`,
   `runner/src/curie_runner/fake.py`).
   [by construction: `runner/src/curie_runner/adapter.py::ModelSession`]

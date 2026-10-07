@@ -3079,3 +3079,69 @@ fn identity_names_follow_the_deploy_yaml_rule() {
         assert!(err.to_string().contains("--identity"), "{err}");
     }
 }
+
+/// @spec ACTION-EXECUTOR-23: the deploy preflight both tiers share refuses a
+/// plain `SNAPSHOT_SEALING_KEY` with the API's reason, as a usage error, before
+/// it reaches the API (port 1 would be a transient error). The reason is read
+/// from `tests/vectors/sealing-key-custody.json`, which the API's half reads too.
+#[tokio::test]
+async fn prepare_deploy_refuses_a_plain_sealing_key_on_both_tiers() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/vectors/sealing-key-custody.json"
+    ))
+    .expect("parse tests/vectors/sealing-key-custody.json");
+    let reason = vector["reasons"]["SNAPSHOT_SEALING_KEY"]
+        .as_str()
+        .expect("reasons.SNAPSHOT_SEALING_KEY");
+    for tier in [super::DeployTier::Local, super::DeployTier::Cluster] {
+        let dir = tempfile::tempdir().unwrap();
+        crate::scaffold::scaffold(dir.path(), "sealer").unwrap();
+        std::fs::write(
+            dir.path().join("connectors.yaml"),
+            "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:\
+             abababababababababababababababababababababababababababababababab\n    \
+             env:\n      SNAPSHOT_SEALING_KEY: SEALVALUE-placeholder-7f3c9e1b\n",
+        )
+        .unwrap();
+        let opts = super::DeployOpts {
+            delivery: None,
+            agent: None,
+            target: None,
+            identity: None,
+            plugin_dir: dir.path().to_path_buf(),
+            api_url: "http://127.0.0.1:1".to_string(),
+            api_key: "k".to_string(),
+            slack_channel: None,
+            repo: None,
+            workspace: super::WorkspaceIntent::Preserve,
+            tier,
+            env: Some(super::DeployEnv::Dev),
+            label: Some("v0".to_string()),
+            secret: vec![],
+            secret_binding_supported: true,
+            connect_hint: String::new(),
+        };
+        let err = match super::prepare_deploy(opts).await {
+            Ok(_) => panic!("{tier:?}: a plain SNAPSHOT_SEALING_KEY must be refused"),
+            Err(err) => err,
+        };
+        let rendered = format!("{err:#}");
+        assert_eq!(
+            crate::exit::classify(&err).0,
+            crate::exit::ExitClass::Usage,
+            "{tier:?}: a custody refusal is a usage error: {rendered}"
+        );
+        assert!(
+            rendered.contains(reason),
+            "{tier:?}: the refusal must carry the API's reason verbatim: {rendered}"
+        );
+        assert!(
+            rendered.contains("connectors.yaml (connectors.k8s.env)"),
+            "{tier:?}: the refusal names where the key is declared: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SEALVALUE-placeholder"),
+            "{tier:?}: the refusal must not echo the key's value: {rendered}"
+        );
+    }
+}
