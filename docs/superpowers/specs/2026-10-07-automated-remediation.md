@@ -60,7 +60,29 @@ as decided text:
 * **Predicate grammar.** One JSON pointer and a closed comparator set is not an
   expression language under ADR 0007 or ADR 0117 (AUTOMATED-REMEDIATION-17).
 
-This contract also amends the executor contract in eight places, listed under
+**Maintainer rulings, 2026-10-07 (measurements M2, M3).** After plan task 1
+measured read connector shapes (M3) and executor sandbox cost (M2), the
+maintainer ruled:
+
+* **Text-only read results.** A read whose MCP result has no structured content
+  and exactly one text block whose content parses as JSON is evaluated against
+  that parsed JSON; any other shape is an unsuccessful sample, so a verifier that
+  never gets a successful sample ends `verifier-unavailable` as before. The
+  predicate grammar (one JSON pointer, closed comparators) is unchanged
+  (AUTOMATED-REMEDIATION-12, -17).
+* **No last-element pointer.** RFC 6901 pointers are not extended. Range-query
+  sampling stays unsupported (its samples are unsuccessful, ending
+  `verifier-unavailable`); instant queries and `scalar()` are the supported
+  metric shapes (AUTOMATED-REMEDIATION-17).
+* **One sandbox per sample, and a cap.** Each verifier sample claims an executor
+  sandbox and releases it right after the read; no sandbox is held across the
+  interval. The executor holds at most N sandboxes at once (default 2,
+  chart-configurable) so ordinary turns always keep sandbox quota, and a
+  verifier's deadline never blocks other executions, because each sample is its
+  own scheduled execution interleaved with the others (AUTOMATED-REMEDIATION-12,
+  -18; executor amendment E9).
+
+This contract also amends the executor contract in nine places, listed under
 "Amendments to the executor contract", and records under "Needs an ADR" what it
 does not decide. Where realizing a decision meets an existing invariant, the
 conflict is stated, not designed around.
@@ -643,8 +665,8 @@ contract"). Concretely:
   `qualification` and `authority_ref` naming the nomination or qualification
   verifier run;
 * the runner's `/v1/execute` (phases in `runner/src/curie_runner/executor.py`)
-  gains a `read` phase: after `list`, one or more `read` requests of the same tool
-  with the same canonical arguments, each calling `tools/call` once. Executor mode
+  gains a `read` phase: after `list`, exactly one `read` request, calling
+  `tools/call` once. One read execution is one sample. Executor mode
   loads no harness, so the runner's read-only set does not exist there. The read
   is authorized by the policy generation that declares it (and the
   qualification record), never by its annotation; as an additional fail-closed
@@ -655,19 +677,37 @@ contract"). Concretely:
   qualification's worst case statement covers the read tools
   (AUTOMATED-REMEDIATION-22);
 * the request carries the predicate's JSON pointer; the runner returns only the
-  value at that pointer in the result's structured content (a JSON scalar of at
-  most 256 characters) or `pointer_absent`, never the whole result;
-* the worker reports each sample's scalar to
+  value at that pointer (a JSON scalar of at most 256 characters) or
+  `pointer_absent`, never the whole result. The document the pointer is applied
+  to is the result's structured content when present; otherwise, when the result
+  has exactly one content block, of type text, whose text (within the existing
+  `CALL_RESULT_MAX_BYTES` bound) parses as JSON, the parsed JSON (maintainer
+  ruling, M3); any other shape returns `result_unstructured`, an unsuccessful
+  sample;
+* the worker reports the sample's scalar to
   `POST /action-executions/{id}/samples` (worker token, fenced like the other
   transitions); the API evaluates the predicate;
-* lifecycle: a read execution never enters `dispatched`, because no sample can
-  write. It runs in `claimed`, renewing its lease at each sample; it ends
-  `confirmed` when sampling ends, or `refused` with `runner_unavailable` on lease
-  expiry or any refusal, which the verifier treats as unsuccessful samples. It is
-  never re-queued;
-* a read execution holds its sandbox for at most its deadline and at most 60
-  samples (AUTOMATED-REMEDIATION-17 refuses a declaration whose deadline divided
-  by its interval exceeds 60), then releases it on every path;
+* lifecycle: a read execution never enters `dispatched`, because a read cannot
+  write. It runs `list` and its one `read` in `claimed` and ends `confirmed`, or
+  `refused` with `runner_unavailable` on lease expiry or any refusal, which the
+  verifier treats as an unsuccessful sample. It is never re-queued;
+* one sandbox per sample: a read execution claims its sandbox, reads once and
+  releases it on every path before it ends; no sandbox is held across a
+  verifier's interval (maintainer ruling, M2). A verification is a series of at
+  most 60 read executions (AUTOMATED-REMEDIATION-17 refuses a declaration whose
+  deadline divided by its interval exceeds 60);
+* scheduling and the cap (executor amendment E9): the API creates each sample as
+  its own execution with a `not_before` time; the claim route hands out due
+  executions oldest `not_before` first, interleaving samples with forward,
+  restore and probe executions, and never hands out more than
+  `actionExecutor.maxConcurrentSandboxes` live (claimed or dispatched)
+  executions across the installation (default 2, at least 1); while two or more
+  slots exist, at most all but one are read executions, so a write-kind
+  execution never waits behind samples. A sample that cannot be claimed before
+  its next sample is due is recorded skipped, an unsuccessful sample. Because the
+  measured cold claim takes about 5 seconds to ready and about 8 seconds to free
+  its quota after release (plan M2), intervals of 60 seconds or more are the
+  documented guidance;
 * the sandbox carries only the read connector's credentials, which requires the
   executor's per-claim stripped template ([#4204](https://github.com/curie-eng/curie/issues/4204),
   unmerged); without it the pool template would put the acting connector's
@@ -676,8 +716,13 @@ contract"). Concretely:
 Acceptance: against a read fixture, one `read` returns the pointed scalar and the
 API records it; a tool without `readOnlyHint`, an unadvertised tool and a write
 tool are refused `tool_not_read_only` with no call observed; the API never
-receives more than the scalar (log and payload capture); the sandbox is released
-after the last sample and after a worker crash (sweeper); a cluster exec check
+receives more than the scalar (log and payload capture); a text-only result
+whose one text block is JSON yields the pointed value, and a result with two text
+blocks, a non-JSON text block or an image block yields `result_unstructured`; the
+sandbox is released after each sample and after a worker crash (sweeper), and
+between two samples of one verification no executor sandbox exists for it; with
+the cap at 2, a third due execution waits for a slot and a forward execution is
+claimed while a verification is in progress; a cluster exec check
 finds no acting connector credential in a verifier read sandbox; the vector fails
 on a one-sided field change.
 
@@ -826,7 +871,13 @@ any other value by its type and exact value. There are no functions, arithmetic,
 variables or nesting; the maintainer ruled on 2026-10-07 that this closed form is
 not an expression language under ADR 0007 or ADR 0117, and anything richer needs
 a new decision. The numeric string rule was confirmed by the maintainer on
-2026-10-07. Independence
+2026-10-07. Pointers are not extended: RFC 6901's `-` names the element after
+the last, so a range query's latest sample is not addressable, and range-query
+reads are unsupported (maintainer ruling, M3). The supported metric shapes are
+instant queries, single series at `/data/0/value/1` or `scalar(...)` at
+`/data/1` (order-independent, recommended); an alert state is read by rule id
+(`/state` of a by-id get), never by list index. An instant query with no series
+yields `pointer_absent`, which only the `absent` comparator treats as satisfied. Independence
 (REMEDIATION-15) is checked at policy write and again at admission against the
 in-force version: the verifier's connector differs from the acting connector,
 and the set of secret names the verifier connector's MCP headers expand is
@@ -846,8 +897,10 @@ value, an `in` list of 17 entries, a settle below the interval and a deadline ov
 
 <!-- @spec AUTOMATED-REMEDIATION-18 -->
 **AUTOMATED-REMEDIATION-18. Running the verifier.** When a forward execution of a
-remediation ends `confirmed`, the API creates one verifier `read` execution. The
-worker samples at `interval_seconds` until `deadline_seconds` after dispatch.
+remediation ends `confirmed`, the API schedules the verifier's samples: one
+`read` execution per sample, due every `interval_seconds` until
+`deadline_seconds` after dispatch (AUTOMATED-REMEDIATION-12), each claiming and
+releasing its own sandbox.
 Samples before `settle_seconds` are taken and recorded but never count. The
 outcome is:
 
@@ -858,8 +911,8 @@ outcome is:
   separate `observe` execution against the acting connector at each sample
   reports a version different from the action's recorded `post_version`. That
   execution is a `read`-kind execution whose phase is `observe` (sequence `list`
-  then repeated `observe`), with the same `authority_kind`, lease and 60-sample
-  rules as the verifier read it accompanies. This is
+  then one `observe`), scheduled beside each verifier sample with the same
+  `authority_kind`, one-sandbox-per-sample, cap and 60-sample rules. This is
   attribution, not a recovery verdict, so the acting connector may report it; it
   is never read as success;
 * `not-recovered`: the deadline passes with at least one successful sample after
@@ -1094,7 +1147,7 @@ plugin-format schema export are unchanged by every realizing PR.
 ## Amendments to the executor contract
 
 This contract amends the [executor contract](2026-10-06-connector-action-executor.md)
-as follows (E1 to E8); each amendment lands with the task that needs it and updates the
+as follows (E1 to E9); each amendment lands with the task that needs it and updates the
 executor spec text in the same change.
 
 * **E1, AE-1 and AE-2 (producers and authority).** The closed producer set gains
@@ -1107,8 +1160,8 @@ executor spec text in the same change.
   policy generation or a nomination row.
 * **E2, AE-2 (kind).** `kind` gains `read` (AUTOMATED-REMEDIATION-12).
 * **E3, AE-6 (phases and sequences).** A `read` phase is added, with the sequence
-  `list` then one or more `read`s of one tool and arguments. `observe` is also
-  accepted, repeatedly and with no `call`, in an execution that only observes a
+  `list` then one `read`. `observe` is also accepted, once and with no `call`,
+  in an execution that only observes a
   forward action's target for the `superseded` check (AUTOMATED-REMEDIATION-18);
   AE-6's "observe only before a restore" otherwise stands, and the one-`call` rule
   is unchanged.
@@ -1120,11 +1173,11 @@ executor spec text in the same change.
   refusal on top of that authority: a declared read whose tool is not advertised
   with `readOnlyHint: true` in the sandbox's own `list` is refused
   `tool_not_read_only`.
-* **E5, AE-17 (lifecycle).** Read executions never enter `dispatched`, renew their
-  lease per sample, and end `confirmed` or `refused` without re-queueing.
+* **E5, AE-17 (lifecycle).** Read executions never enter `dispatched`, take one
+  sample in one sandbox, and end `confirmed` or `refused` without re-queueing.
 * **E6, AE-20 and AE-24 (codes).** Pre-dispatch codes gain `tool_not_read_only`,
-  `not_reversible_now` and `policy_changed`; `pointer_absent` is a sample result,
-  not a refusal. The `runner-execute` vector carries all of them.
+  `not_reversible_now` and `policy_changed`; `pointer_absent`, `result_unstructured`
+  and a skipped sample are sample results, not refusals. The `runner-execute` vector carries all of them.
 * **E7, AE-5 (sandbox credentials).** Read executions require the per-claim
   stripped template proposed by #4204 (unmerged); this contract does not ship
   verification on the pool template.
@@ -1134,10 +1187,23 @@ executor spec text in the same change.
   (AUTOMATED-REMEDIATION-11) and ends the execution `refused` with
   `policy_changed` when it fails, before any sandbox claim. Executions of any
   other authority are claimed exactly as AE-17 says.
+* **E9, AE-1, AE-5 and AE-17 (scheduling and concurrency).** Executions gain a
+  nullable `not_before`; the claim route hands out only due executions, oldest
+  `not_before` first, and never more than `actionExecutor.maxConcurrentSandboxes`
+  live executions across the installation (default 2, rendered into the API and
+  the worker, with the matching compose value), keeping one slot for write-kind
+  executions while two or more exist. The worker's executor loop, which today
+  runs one execution at a time
+  (`apps/worker/src/curie_worker/action_executor_loop.py::ActionExecutorLoop`),
+  may run up to that many at once; the API's count, not the loop, is the
+  authority, so worker replicas cannot exceed it. Executor routes stay out of
+  the pressure path (AE-5), and the cap is what leaves sandbox quota to ordinary
+  turns. This is a scheduling rule inside the executor ADR 0121 already decided,
+  not a new boundary.
 
 ## Needs an ADR
 
-Judged against ADR 0121, ADR 0124 and ADR 0203, none of E1 to E8 is a new
+Judged against ADR 0121, ADR 0124 and ADR 0203, none of E1 to E9 is a new
 architectural decision. Routing reads through executor sandboxes applies ADR 0121
 decision 2's reachability argument to reads and adds no reach: a sandbox under the
 read connector's binding reaches only what a model turn of the same agent already
