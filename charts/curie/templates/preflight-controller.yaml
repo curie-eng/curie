@@ -6,18 +6,37 @@ The vendored agent-sandbox controller runs a CLUSTER-scope NetworkPolicy
 informer; if its RBAC cannot satisfy that cluster LIST, the manager crash-loops
 and no SandboxClaim ever binds. The vendored Deployment has NO readiness probe,
 so `rollout status` passes while the manager still blocks on cache sync -- the
-gate first rejects observed RBAC/lease failures and pod restarts, then requires
-the "Starting workers" log line or positive successful-reconcile metrics from
-the current Running controller pod. Both signals require synced informer
-caches, and the reconcile counter survives startup-log rotation. This
-post-install/post-upgrade hook Job fails the Helm operation unless the
-controller reaches that state, so an RBAC regression fails at install.
+gate first rejects a forbidden-NetworkPolicy line in the current log, then
+accepts a stable serving leader (below), then rejects observed RBAC/lease
+failures and pod restarts, and finally requires the "Starting workers" log line
+or positive successful-reconcile metrics from the current Running controller
+pod. This post-install/post-upgrade hook Job fails the Helm operation unless the
+controller reaches one of those states, so an RBAC regression fails at install.
 
-The gate is read-only: its Role can only get/list/watch deployments + pods and
-get pod logs + pod proxy metrics in agent-sandbox-system. Gated on
-agentSandbox.controller.deploy so it never runs against a BYO controller this
-release does not own.
+Stable serving leader (issue #4197): the controller Deployment has completed
+its rollout for its current generation, the leader-election Lease names a
+current Running, Ready, non-terminating controller pod, its renewTime advances
+while the hook watches, and that same holder has led continuously for at least
+preflights.controllerReady.stableLeaderSeconds. A controller-runtime manager
+whose caches cannot sync exits after CacheSyncTimeout (2 minutes by default,
+not overridden by agent-sandbox v0.5.0), which ends its leadership; the next
+process takes a new holder identity and a new acquireTime. So a holder that has
+led longer than that bound has synced, without needing a startup log line that
+only a restart produces. Both lease timestamps are written by the controller,
+so the hold duration does not depend on the hook node's clock.
+
+The gate is read-only: its Role can only get/list/watch deployments + pods, get
+pod logs + pod proxy metrics, and get the controller's one leader-election
+Lease in agent-sandbox-system. Gated on agentSandbox.controller.deploy so it
+never runs against a BYO controller this release does not own.
 */}}
+{{- /* Defaulted here, not only in values.yaml: `helm upgrade --reuse-values`
+renders these templates against the PREVIOUS chart's values, which predate
+this key (#3813). */}}
+{{- $stableLeaderSeconds := int (default 180 .Values.preflights.controllerReady.stableLeaderSeconds) }}
+{{- if lt $stableLeaderSeconds 150 }}
+{{- fail (printf "preflights.controllerReady.stableLeaderSeconds must be at least 150 (the controller's 120s cache-sync timeout plus lease and scheduling margin); got %d" $stableLeaderSeconds) }}
+{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -53,6 +72,10 @@ rules:
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["pods/proxy"]
+    verbs: ["get"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["a3317529.agent-sandbox.x-k8s.io"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -118,8 +141,16 @@ spec:
               value: "agent-sandbox-system"
             - name: DEPLOY
               value: "agent-sandbox-controller"
+            # The vendored controller's fixed LeaderElectionID; leader
+            # election auto-detects the pod's own namespace. Upstream:
+            # kubernetes-sigs/agent-sandbox v0.5.0
+            # cmd/agent-sandbox-controller/main.go.
+            - name: LEASE
+              value: "a3317529.agent-sandbox.x-k8s.io"
             - name: TIMEOUT
               value: {{ .Values.preflights.controllerReady.timeoutSeconds | quote }}
+            - name: STABLE_LEADER_SECONDS
+              value: {{ $stableLeaderSeconds | quote }}
           command:
             - /bin/sh
             - -c
@@ -146,6 +177,97 @@ spec:
               rc=$?
               echo "rollout status rc=${rc} (informative only)"
 
+              # Seconds between two RFC 3339 UTC timestamps as Kubernetes
+              # serializes them (MicroTime is always UTC with a "Z" suffix).
+              # Pure awk arithmetic, so it behaves the same under busybox,
+              # mawk and gawk; prints -1 for anything it cannot parse.
+              seconds_between() {
+                printf '%s %s\n' "$1" "$2" | awk '
+                  function epoch(ts,   y, m, d, era, yoe, mp, doy, doe) {
+                    if (ts !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9](\.[0-9]+)?Z$/) return -1
+                    y = substr(ts, 1, 4) + 0; m = substr(ts, 6, 2) + 0; d = substr(ts, 9, 2) + 0
+                    if (m <= 2) y -= 1
+                    era = int(y / 400); yoe = y - era * 400
+                    mp = (m + 9) % 12
+                    doy = int((153 * mp + 2) / 5) + d - 1
+                    doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+                    return ((era * 146097 + doe - 719468) * 86400) + substr(ts, 12, 2) * 3600 + substr(ts, 15, 2) * 60 + substr(ts, 18, 2)
+                  }
+                  { a = epoch($1); b = epoch($2); if (a < 0 || b < 0) print -1; else print b - a }
+                '
+              }
+
+              # Stable serving leader (issue #4197). An upgrade that does not
+              # restart the controller produces no fresh startup log line, so
+              # judge the controller as it is now: its rollout is complete, the
+              # leader Lease names a current Running, Ready, non-terminating
+              # pod, the same holder has led for at least STABLE_LEADER_SECONDS
+              # -- longer than the 120s CacheSyncTimeout after which a manager
+              # whose informers cannot sync exits, ending its leadership (the
+              # next process gets a new holder identity and acquireTime) --
+              # and it renews the Lease while we watch, so a stale record left
+              # by a dead process cannot pass. Every missing or unparsable
+              # field fails closed to "not proven".
+              read_lease() {
+                kubectl get lease "${LEASE}" -n "${CONTROLLER_NS}" \
+                  -o jsonpath='{.spec.holderIdentity} {.spec.acquireTime} {.spec.renewTime}' \
+                  2>/dev/null
+              }
+              leader_detail=""
+              stable_leader() {
+                deploy_fields=$(kubectl get deployment "${DEPLOY}" -n "${CONTROLLER_NS}" \
+                  -o jsonpath='{.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.replicas} {.status.updatedReplicas} {.status.readyReplicas} {.status.availableReplicas}' \
+                  2>/dev/null) || return 1
+                # shellcheck disable=SC2086
+                set -- ${deploy_fields}
+                [ "$#" -eq 7 ] || return 1
+                [ "$1" = "$2" ] && [ "$3" -ge 1 ] 2>/dev/null \
+                  && [ "$4" = "$3" ] && [ "$5" = "$3" ] && [ "$6" = "$3" ] && [ "$7" = "$3" ] \
+                  || return 1
+
+                lease_fields=$(read_lease) || return 1
+                # shellcheck disable=SC2086
+                set -- ${lease_fields}
+                [ "$#" -eq 3 ] || return 1
+                holder=$1
+                acquired=$2
+                renewed=$3
+                # controller-runtime names the holder <hostname>_<uuid>; a pod
+                # name cannot contain "_", so the prefix is the pod name.
+                case "${holder}" in
+                  *_*) holder_pod=${holder%%_*} ;;
+                  *) return 1 ;;
+                esac
+
+                pod_fields=$(kubectl get pods -n "${CONTROLLER_NS}" -l app=agent-sandbox-controller \
+                  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{" "}{.status.conditions[?(@.type=="Ready")].status}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' \
+                  2>/dev/null) || return 1
+                printf '%s\n' "${pod_fields}" | awk -v pod="${holder_pod}" '
+                  $1 == pod && $2 == "Running" && $3 == "True" && NF == 3 { found = 1 }
+                  END { exit !found }
+                ' || return 1
+
+                held=$(seconds_between "${acquired}" "${renewed}")
+                [ "${held}" -ge "${STABLE_LEADER_SECONDS}" ] 2>/dev/null || return 1
+
+                # controller-runtime renews every 2s (RetryPeriod); one wait
+                # longer than that must show the same holder renewing. The
+                # wait counts against TIMEOUT so the Job stays inside Helm's
+                # hook timeout.
+                sleep 5
+                elapsed=$(( elapsed + 5 ))
+                lease_fields=$(read_lease) || return 1
+                # shellcheck disable=SC2086
+                set -- ${lease_fields}
+                [ "$#" -eq 3 ] && [ "$1" = "${holder}" ] && [ "$2" = "${acquired}" ] \
+                  && [ "$3" != "${renewed}" ] || return 1
+                held=$(seconds_between "${acquired}" "$3")
+                [ "${held}" -ge "${STABLE_LEADER_SECONDS}" ] 2>/dev/null || return 1
+
+                leader_detail="pod ${holder_pod} has held lease ${LEASE} for ${held}s (>= ${STABLE_LEADER_SECONDS}s) and is renewing it"
+                return 0
+              }
+
               # Poll failure signals before accepting "Starting workers" or
               # positive successful-reconcile metrics, which both require
               # synced informer caches. The counter survives startup-log
@@ -157,6 +279,24 @@ spec:
               elapsed=0
               while [ "${elapsed}" -lt "${TIMEOUT}" ]; do
                 logs=$(kubectl logs "deployment/${DEPLOY}" -n "${CONTROLLER_NS}" --tail=-1 2>/dev/null || true)
+
+                # The current container's own forbidden-networkpolicies line is
+                # the #350 RBAC signature and outranks every success signal.
+                if printf '%s\n' "${logs}" | grep -Eq "networkpolicies.*[Ff]orbidden"; then
+                  cause=rbac
+                  echo "detected controller failure (forbidden networkpolicies log)."
+                  break
+                fi
+
+                # A leader that has served past the cache-sync bound has synced
+                # since any earlier restart, so this is checked before restart
+                # history (an old restart or its previous log is not current
+                # state). A controller restarted by this upgrade holds a fresh
+                # lease and falls through to the checks below.
+                if stable_leader; then
+                  echo "RESULT: PASS -- agent-sandbox-controller rollout complete and serving: ${leader_detail}."
+                  exit 0
+                fi
 
                 restarts=$(kubectl get pods -n "${CONTROLLER_NS}" -l app=agent-sandbox-controller \
                   -o jsonpath='{.items[*].status.containerStatuses[*].restartCount}' 2>/dev/null || true)
@@ -235,6 +375,10 @@ spec:
               echo "controller pod status:"
               kubectl get pods -n "${CONTROLLER_NS}" -l app=agent-sandbox-controller 2>/dev/null || true
               echo "---"
+              echo "controller leader Lease (holder acquireTime renewTime):"
+              read_lease || true
+              echo
+              echo "---"
               case "${cause}" in
                 rbac)
                   echo "RESULT: FAIL -- controller did not reach 'Starting workers' -- its NetworkPolicy"
@@ -253,9 +397,10 @@ spec:
                   echo "        leader-election lease/renew deadlines."
                   ;;
                 *)
-                  echo "RESULT: FAIL -- controller did not reach 'Starting workers' within ${TIMEOUT}s and no"
-                  echo "        recognized failure signature (forbidden-networkpolicies or lease loss) was"
-                  echo "        logged. Inspect the controller log lines above for the cause."
+                  echo "RESULT: FAIL -- controller showed no 'Starting workers', no successful reconcile and no"
+                  echo "        stable serving leader within ${TIMEOUT}s, and no recognized failure signature"
+                  echo "        (forbidden-networkpolicies or lease loss) was logged. Inspect the controller"
+                  echo "        log lines, pod status and leader Lease above for the cause."
                   echo "        If this is an upgrade over a previously crash-looping controller, the"
                   echo "        pod may still be in CrashLoopBackOff backoff -- delete the controller"
                   echo "        pod and re-run 'helm test <release>'."
