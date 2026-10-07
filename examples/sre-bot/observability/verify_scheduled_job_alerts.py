@@ -135,6 +135,11 @@ def run() -> None:
                 except (OSError, KeyError, IndexError):
                     pass
                 time.sleep(1)
+            if not suspension_fired:
+                logs = subprocess.run(
+                    ["docker", "logs", container_id], capture_output=True, text=True
+                )
+                print(logs.stdout + logs.stderr, flush=True)
             assert suspension_fired, (
                 "Prometheus did not fire the generated suspension rule within 90 seconds"
             )
