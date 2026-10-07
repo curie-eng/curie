@@ -7,8 +7,8 @@ a not-admitted nomination creates one ``Approval`` with ``purpose``
 ``remediation`` ("the ``approvals_purpose_ck`` constraint gains the value").
 
 Revision assumed (see ``.projects/plans/task-remediation-approvals.tests.md``):
-``0091``, revising the read executions head ``0090`` (plan task 11 needed no
-migration). If another revision lands first, renumber and move ``BELOW`` and
+``0092``, revising plan task 11's execution code revision ``0091``. If
+another revision lands first, renumber and move ``BELOW`` and
 ``HEAD`` here and the head pins. The revision is otherwise
 found by its source (``approvals_purpose_ck`` and ``remediation``), so a
 renumbering only moves the two constants below. Any further columns the
@@ -28,8 +28,8 @@ from alembic import command
 from alembic.script import ScriptDirectory
 from sqlalchemy.exc import IntegrityError
 
-BELOW = "0090"
-HEAD = "0091"
+BELOW = "0091"
+HEAD = "0092"
 
 
 def _revision() -> tuple[str, str]:

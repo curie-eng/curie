@@ -86,7 +86,9 @@ def test_one_hand_written_revision_on_the_read_executions_head() -> None:
     assert down == BELOW, f"revision {revision} revises {down}, expected {BELOW}"
     assert revision == HEAD
     script = ScriptDirectory.from_config(alembic_config())
-    assert script.get_heads() == [HEAD]
+    # The remediation approvals revision (task 10, 0092) follows this one; the
+    # head pin lives in test_migration_remediation_approvals.py.
+    assert HEAD in {rev.revision for rev in script.iterate_revisions(script.get_heads()[0], BELOW)}
 
 
 def test_the_upgrade_adds_a_nullable_text_execution_code(
