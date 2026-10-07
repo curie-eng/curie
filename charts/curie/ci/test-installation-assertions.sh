@@ -190,6 +190,7 @@ for label, entry, field in (
     ("user as bot", {**DRIVER, "bot_id": "U0EXAMPLE1"}, "bot_id"),
     ("bot as user", {**DRIVER, "bot_user_id": "B0EXAMPLE1"}, "bot_user_id"),
     ("blank agent", {**DRIVER, "agent": ""}, "agent"),
+    ("null agent", {**DRIVER, "agent": None}, "agent"),
     ("unknown key", {**DRIVER, "note": "x"}, "note"),
 ):
     refuse(f"(f) {label}", REAL_SECRETS, on((entry,)), expected=[field])

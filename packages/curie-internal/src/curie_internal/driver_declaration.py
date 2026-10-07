@@ -93,7 +93,7 @@ def parse_drivers(value: object) -> tuple[DeclaredDriver, ...]:
             if not pattern.fullmatch(field):
                 raise ValueError(f"{where}.{key} does not match {pattern.pattern}")
         agent = entry.get("agent")
-        if agent is not None and (not isinstance(agent, str) or not agent.strip()):
+        if "agent" in entry and (not isinstance(agent, str) or not agent.strip()):
             raise ValueError(f"{where}.agent must be a nonblank string when present")
         drivers.append(
             DeclaredDriver(

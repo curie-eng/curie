@@ -103,6 +103,7 @@ def test_off_keeps_the_published_defaults_bootable() -> None:
         ([{**DRIVER, "bot_id": "U0EXAMPLE1"}], "bot_id"),
         ([{**DRIVER, "bot_user_id": "B0EXAMPLE1"}], "bot_user_id"),
         ([{**DRIVER, "agent": ""}], "agent"),
+        ([{**DRIVER, "agent": None}], "agent"),
         ([{**DRIVER, "note": "x"}], "note"),
         ({"channel_id": "C0EXAMPLE1"}, "list"),
         (None, "list"),

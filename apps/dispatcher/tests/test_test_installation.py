@@ -118,10 +118,14 @@ def test_off_keeps_the_published_api_key_bootable() -> None:
         ([{**EXTERNAL_DRIVER, "channel_id": ""}], "channel_id"),
         ([{**EXTERNAL_DRIVER, "channel_id": EXTERNAL_DRIVER["channel_id"] + "\n"}], "channel_id"),
         ([{**EXTERNAL_DRIVER, "bot_id": EXTERNAL_DRIVER["bot_id"] + "\n"}], "bot_id"),
-        ([{**EXTERNAL_DRIVER, "bot_user_id": EXTERNAL_DRIVER["bot_user_id"] + "\n"}], "bot_user_id"),
+        (
+            [{**EXTERNAL_DRIVER, "bot_user_id": EXTERNAL_DRIVER["bot_user_id"] + "\n"}],
+            "bot_user_id",
+        ),
         ([{**EXTERNAL_DRIVER, "bot_id": "U0EXAMPLE1"}], "bot_id"),
         ([{**EXTERNAL_DRIVER, "bot_user_id": "B0EXAMPLE1"}], "bot_user_id"),
         ([{**EXTERNAL_DRIVER, "extra": "x"}], "extra"),
+        ([{**EXTERNAL_DRIVER, "agent": None}], "agent"),
         (None, "list"),
     ],
 )
