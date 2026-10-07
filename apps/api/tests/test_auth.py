@@ -35,9 +35,9 @@ def test_ready_sanitizes_an_unavailable_database_and_health_stays_open(
     )
     engine = create_async_engine(failed_url)
     failed_sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-    original_sessionmaker = client.app.state.sessionmaker
+    original_liveness_sessionmaker = client.app.state.liveness_sessionmaker
     try:
-        client.app.state.sessionmaker = failed_sessionmaker
+        client.app.state.liveness_sessionmaker = failed_sessionmaker
 
         ready = client.get("/ready")
         assert ready.status_code == 503
@@ -50,7 +50,7 @@ def test_ready_sanitizes_an_unavailable_database_and_health_stays_open(
         assert health.status_code == 200
         assert health.json() == {"status": "ok"}
     finally:
-        client.app.state.sessionmaker = original_sessionmaker
+        client.app.state.liveness_sessionmaker = original_liveness_sessionmaker
         client.portal.call(engine.dispose)
 
 
@@ -64,11 +64,11 @@ def test_ready_times_out_before_the_probe_when_the_real_pool_is_exhausted(
         pool_timeout=4,
     )
     constrained_sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-    original_sessionmaker = client.app.state.sessionmaker
+    original_liveness_sessionmaker = client.app.state.liveness_sessionmaker
     held_connection: Any | None = None
     try:
         held_connection = client.portal.call(engine.connect)
-        client.app.state.sessionmaker = constrained_sessionmaker
+        client.app.state.liveness_sessionmaker = constrained_sessionmaker
 
         started = time.monotonic()
         ready = client.get("/ready")
@@ -88,7 +88,7 @@ def test_ready_times_out_before_the_probe_when_the_real_pool_is_exhausted(
         assert recovered.status_code == 200
         assert recovered.json() == {"status": "ok"}
     finally:
-        client.app.state.sessionmaker = original_sessionmaker
+        client.app.state.liveness_sessionmaker = original_liveness_sessionmaker
         if held_connection is not None:
             client.portal.call(held_connection.close)
         client.portal.call(engine.dispose)
@@ -116,6 +116,7 @@ def test_ready_is_unavailable_when_select_on_agents_is_denied(
     restricted_url = db_url.set(username=role, password=password)
     restricted_engine: Any | None = None
     original_sessionmaker = client.app.state.sessionmaker
+    original_liveness_sessionmaker = client.app.state.liveness_sessionmaker
 
     async def _create_role() -> None:
         async with admin_engine.begin() as conn:
@@ -171,9 +172,14 @@ def test_ready_is_unavailable_when_select_on_agents_is_denied(
         finally:
             client.portal.call(restricted_connection.close)
 
-        client.app.state.sessionmaker = async_sessionmaker(
+        # Both pools connect with the same database credentials in a
+        # deployment, so a role denied SELECT breaks the probe and the real
+        # route together.
+        restricted_sessionmaker = async_sessionmaker(
             restricted_engine, expire_on_commit=False
         )
+        client.app.state.sessionmaker = restricted_sessionmaker
+        client.app.state.liveness_sessionmaker = restricted_sessionmaker
 
         ready = client.get("/ready")
         assert ready.status_code == 503
@@ -200,6 +206,7 @@ def test_ready_is_unavailable_when_select_on_agents_is_denied(
             transport.raise_server_exceptions = raise_exceptions
     finally:
         client.app.state.sessionmaker = original_sessionmaker
+        client.app.state.liveness_sessionmaker = original_liveness_sessionmaker
         if restricted_engine is not None:
             client.portal.call(restricted_engine.dispose)
         try:

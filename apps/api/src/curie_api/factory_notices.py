@@ -21,6 +21,7 @@ https://docs.github.com/en/rest/pulls/comments#list-review-comments-on-a-pull-re
 https://docs.github.com/en/rest/pulls/comments#update-a-review-comment-for-a-pull-request
 Labels:
 https://docs.github.com/en/rest/issues/labels#add-labels-to-an-issue
+https://docs.github.com/en/rest/issues/labels#list-labels-for-an-issue
 https://docs.github.com/en/rest/issues/labels#remove-a-label-from-an-issue
 """
 
@@ -30,15 +31,18 @@ import hashlib
 import logging
 import math
 import re
+import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import quote, urlsplit
 
 import httpx
 from curie_telemetry.redact import redact_text
 from sqlalchemy import and_, case, exists, func, literal, or_, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 from starlette.concurrency import run_in_threadpool
 
@@ -341,10 +345,11 @@ def render_base_line(work_item: WorkItem) -> str | None:
 
 
 async def mark_status_comment_stale(session: AsyncSession, work_item_id: uuid.UUID) -> None:
-    """Let the reconciler edit the latest finalized status comment once more.
+    """Let the reconciler edit the latest status comment once more.
 
     Its body carries the ignored-label note, so a change to that note must reach
-    a comment that was already finalized. The comment re-finalizes after the edit.
+    a comment that was already finalized. A sync holding the lease is flagged so
+    its writeback leaves the row due. The comment re-finalizes after the edit.
     """
 
     latest = (
@@ -359,10 +364,16 @@ async def mark_status_comment_stale(session: AsyncSession, work_item_id: uuid.UU
         .where(
             FactoryStatusComment.work_item_id == work_item_id,
             FactoryStatusComment.execution_request_id == latest,
-            FactoryStatusComment.finalized_at.is_not(None),
+            or_(
+                FactoryStatusComment.finalized_at.is_not(None),
+                FactoryStatusComment.sync_owner.is_not(None),
+            ),
             FactoryStatusComment.refused_at.is_(None),
         )
-        .values(finalized_at=None)
+        .values(
+            finalized_at=None,
+            sync_invalidated=FactoryStatusComment.sync_owner.is_not(None),
+        )
     )
 
 
@@ -587,20 +598,78 @@ def _desired_label_sql() -> Any:
 
 
 async def sync_status_comments(
-    session: AsyncSession,
+    sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
     *,
+    owner: str,
     limit: int = 20,
     paused_for_upgrade: bool = False,
 ) -> int:
-    """Create, edit, finalize and label every due status comment this pass can lock.
+    """Claim, render, release the session, call GitHub, then persist under the lease.
 
-    Returns the number of GitHub writes. The row lock is held across the GitHub
-    calls so a second reconciler skips it. A crash before commit leaves the row
-    as it was; the next pass finds a created comment by its marker instead of
-    posting another.
+    Returns the number of GitHub writes. A crashed claimer's lease expires;
+    marker recovery finds a comment whose create response was lost.
     """
 
+    writes = 0
+    attempted_ids: set[uuid.UUID] = set()
+    async with httpx.AsyncClient(timeout=settings.github_app_timeout_seconds) as client:
+        for _ in range(limit):
+            async with sessionmaker() as session:
+                claim = await _claim_next(
+                    session,
+                    settings,
+                    owner=owner,
+                    attempted_ids=attempted_ids,
+                    paused_for_upgrade=paused_for_upgrade,
+                )
+                await session.commit()
+            if claim is None:
+                break
+            attempted_ids.add(claim.row.execution_request_id)
+            calls = _GitHubCalls()
+            token = _github_calls.set(calls)
+            started = time.monotonic()
+            try:
+                writes += await _sync_one(client, settings, claim)
+                claim.row.attempts += 1
+                async with sessionmaker() as session:
+                    await _write_back(session, claim, owner=owner)
+                    await session.commit()
+            finally:
+                _github_calls.reset(token)
+                elapsed_ms = (time.monotonic() - started) * 1000
+                logger.info(
+                    "factory status sync calls=%d elapsed_ms=%.1f",
+                    calls.count,
+                    elapsed_ms,
+                    extra={"call_count": calls.count, "elapsed_ms": elapsed_ms},
+                )
+    return writes
+
+
+@dataclass(frozen=True)
+class _StatusClaim:
+    row: FactoryStatusComment
+    repo_full_name: str
+    github_installation_id: int
+    github_issue_number: int
+    work_item_id: uuid.UUID
+    status: str
+    target: ReplyTarget
+    body: str
+    latest: bool
+    now: datetime
+
+
+async def _claim_next(
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    owner: str,
+    attempted_ids: set[uuid.UUID],
+    paused_for_upgrade: bool,
+) -> _StatusClaim | None:
     later = aliased(ExecutionRequest)
     is_latest = and_(
         ExecutionRequest.status != "queued",
@@ -620,7 +689,7 @@ async def sync_status_comments(
         FactoryStatusComment.applied_label.is_distinct_from(""),
         FactoryStatusComment.applied_label.is_distinct_from(_desired_label_sql()),
     )
-    rows = (
+    selected = (
         await session.execute(
             select(
                 FactoryStatusComment,
@@ -642,35 +711,144 @@ async def sync_status_comments(
                 FactoryStatusComment.refused_at.is_(None),
                 ExecutionRequest.objective.is_not(None),
                 or_(FactoryStatusComment.finalized_at.is_(None), label_due),
+                or_(
+                    FactoryStatusComment.sync_owner.is_(None),
+                    FactoryStatusComment.sync_lease_expires_at <= func.clock_timestamp(),
+                ),
+                FactoryStatusComment.execution_request_id.not_in(attempted_ids),
             )
             .order_by(
                 FactoryStatusComment.attempts,
                 FactoryStatusComment.created_at,
             )
-            .limit(limit)
+            .limit(1)
             .with_for_update(skip_locked=True, of=FactoryStatusComment)
         )
-    ).all()
-    if not rows:
-        await session.commit()
-        return 0
-    writes = 0
-    async with httpx.AsyncClient(timeout=settings.github_app_timeout_seconds) as client:
-        for row, work_item, request, pr_url, latest in rows:
-            writes += await _sync_one(
-                session,
-                client,
-                settings,
-                row,
-                work_item,
-                request,
-                pr_url=pr_url,
-                latest=bool(latest),
-                paused_for_upgrade=paused_for_upgrade,
+    ).one_or_none()
+    if selected is None:
+        return None
+    row, work_item, request, pr_url, latest = selected
+    assert request.objective is not None
+    now = await _clock(session)
+    await session.execute(
+        update(FactoryStatusComment)
+        .where(FactoryStatusComment.execution_request_id == row.execution_request_id)
+        .values(
+            sync_owner=owner,
+            sync_lease_expires_at=func.clock_timestamp() + timedelta(seconds=300),
+            sync_invalidated=False,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    target = parse_reply_target(
+        request.objective,
+        repo_full_name=work_item.repo_full_name,
+        clone_base=settings.github_clone_base,
+    )
+    body = await _render(
+        session,
+        settings,
+        row,
+        work_item,
+        request,
+        target,
+        pr_url=pr_url,
+        paused_for_upgrade=paused_for_upgrade,
+    )
+    claim = _StatusClaim(
+        row=row,
+        repo_full_name=work_item.repo_full_name,
+        github_installation_id=work_item.github_installation_id,
+        github_issue_number=work_item.github_issue_number,
+        work_item_id=work_item.id,
+        status=request.status,
+        target=target,
+        body=body,
+        latest=bool(latest),
+        now=now,
+    )
+    session.expunge(row)
+    return claim
+
+
+async def _write_back(session: AsyncSession, claim: _StatusClaim, *, owner: str) -> bool:
+    row = claim.row
+    written = await session.scalar(
+        update(FactoryStatusComment)
+        .where(
+            FactoryStatusComment.execution_request_id == row.execution_request_id,
+            FactoryStatusComment.sync_owner == owner,
+        )
+        .values(
+            comment_id=row.comment_id,
+            comment_list=row.comment_list,
+            posted_at=row.posted_at,
+            rendered_digest=row.rendered_digest,
+            scan_page=row.scan_page,
+            subject_title=row.subject_title,
+            refusal=row.refusal,
+            refused_at=row.refused_at,
+            # An invalidation that landed during the claim keeps the row due.
+            finalized_at=case(
+                (FactoryStatusComment.sync_invalidated, None),
+                else_=literal(row.finalized_at, FactoryStatusComment.finalized_at.type),
+            ),
+            applied_label=row.applied_label,
+            attempts=row.attempts,
+            sync_owner=None,
+            sync_lease_expires_at=None,
+            sync_invalidated=False,
+        )
+        .returning(FactoryStatusComment.execution_request_id)
+    )
+    if written is None:
+        logger.info("factory status sync dropped stale owner writeback")
+        return False
+    return True
+
+
+@dataclass
+class _GitHubCalls:
+    count: int = 0
+
+
+_github_calls: ContextVar[_GitHubCalls | None] = ContextVar("factory_github_calls", default=None)
+
+
+async def _github_request(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    path_template: str,
+    **kwargs: Any,
+) -> httpx.Response:
+    calls = _github_calls.get()
+    if calls is not None:
+        calls.count += 1
+    started = time.monotonic()
+    status: int | str = "http_error"
+    try:
+        response = await client.request(method, url, **kwargs)
+        status = response.status_code
+        return response
+    finally:
+        elapsed_ms = (time.monotonic() - started) * 1000
+        failed = not isinstance(status, int) or (status != 404 and not 200 <= status < 300)
+        if elapsed_ms > 2000 or failed:
+            logger.warning(
+                "factory GitHub call method=%s path=%s status=%s elapsed_ms=%.1f",
+                method,
+                path_template,
+                status,
+                elapsed_ms,
+                extra={
+                    "method": method,
+                    "path_template": path_template,
+                    "status": status,
+                    "elapsed_ms": elapsed_ms,
+                },
             )
-            row.attempts += 1
-    await session.commit()
-    return writes
 
 
 @dataclass(frozen=True)
@@ -682,35 +860,23 @@ class _GitHub:
 
 
 async def _sync_one(
-    session: AsyncSession,
     client: httpx.AsyncClient,
     settings: Settings,
-    row: FactoryStatusComment,
-    work_item: WorkItem,
-    request: ExecutionRequest,
-    *,
-    pr_url: str | None,
-    latest: bool,
-    paused_for_upgrade: bool = False,
+    claim: _StatusClaim,
 ) -> int:
-    assert request.objective is not None
-    target = parse_reply_target(
-        request.objective,
-        repo_full_name=work_item.repo_full_name,
-        clone_base=settings.github_clone_base,
-    )
+    row = claim.row
     try:
         token = await run_in_threadpool(
             credentials_for(settings).token_for_verified_installation,
-            work_item.repo_full_name,
-            work_item.github_installation_id,
+            claim.repo_full_name,
+            claim.github_installation_id,
         )
     except (GitHubInstallationRefused, GitHubAppError, ValueError):
         return 0
     github = _GitHub(
         client=client,
         api=settings.github_api_url.rstrip("/"),
-        repo_path=f"/repos/{repo_url_path(work_item.repo_full_name)}",
+        repo_path=f"/repos/{repo_url_path(claim.repo_full_name)}",
         headers={
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
@@ -719,53 +885,25 @@ async def _sync_one(
     )
     writes = 0
     if row.finalized_at is None:
-        writes += await _sync_comment(
-            session,
-            github,
-            settings,
-            row,
-            work_item,
-            request,
-            target,
-            pr_url=pr_url,
-            paused_for_upgrade=paused_for_upgrade,
-        )
-    if latest and row.refused_at is None:
-        writes += await _sync_labels(github, row, work_item, request.status)
+        writes += await _sync_comment(github, claim)
+    if claim.latest and row.refused_at is None:
+        writes += await _sync_labels(github, claim)
     return writes
 
 
 async def _sync_comment(
-    session: AsyncSession,
     github: _GitHub,
-    settings: Settings,
-    row: FactoryStatusComment,
-    work_item: WorkItem,
-    request: ExecutionRequest,
-    target: ReplyTarget,
-    *,
-    pr_url: str | None,
-    paused_for_upgrade: bool = False,
+    claim: _StatusClaim,
 ) -> int:
+    row, target, body, now = claim.row, claim.target, claim.body, claim.now
     if row.subject_title is None:
-        row.subject_title = await _subject_title(github, work_item, target)
-    body = await _render(
-        session,
-        settings,
-        row,
-        work_item,
-        request,
-        target,
-        pr_url=pr_url,
-        paused_for_upgrade=paused_for_upgrade,
-    )
+        row.subject_title = await _subject_title(github, claim.github_issue_number, target)
     terminal = FINAL_MARKER in body
     writes = 0
     if row.comment_id is None:
-        outcome = await _deliver(github, work_item, row, target, body)
+        outcome = await _deliver(github, claim.github_issue_number, row, target, body)
         if outcome is None:
             return 0
-        now = await _clock(session)
         if outcome[0] == "refused":
             row.refusal = outcome[1]
             row.refused_at = now
@@ -797,12 +935,12 @@ async def _sync_comment(
             row.posted_at = None
             row.rendered_digest = None
             row.refusal = edited
-            row.refused_at = await _clock(session)
+            row.refused_at = now
             return writes
         else:
             return writes
     if terminal:
-        row.finalized_at = await _clock(session)
+        row.finalized_at = now
     return writes
 
 
@@ -906,16 +1044,23 @@ async def _superseded(
     return later is not None
 
 
-async def _subject_title(github: _GitHub, work_item: WorkItem, target: ReplyTarget) -> str | None:
+async def _subject_title(github: _GitHub, issue_number: int, target: ReplyTarget) -> str | None:
     """The issue or PR title for the card, read once. A failed read stays NULL."""
 
     if target.pr_number is None:
-        path = f"{github.repo_path}/issues/{work_item.github_issue_number}"
+        path = f"{github.repo_path}/issues/{issue_number}"
+        template = "/repos/{owner}/{repo}/issues/{issue_number}"
     else:
         path = f"{github.repo_path}/pulls/{target.pr_number}"
+        template = "/repos/{owner}/{repo}/pulls/{pull_number}"
     try:
-        found = await github.client.get(
-            f"{github.api}{path}", headers=github.headers, follow_redirects=False
+        found = await _github_request(
+            github.client,
+            "GET",
+            f"{github.api}{path}",
+            path_template=template,
+            headers=github.headers,
+            follow_redirects=False,
         )
         payload = found.json() if found.status_code == 200 else None
     except (httpx.HTTPError, ValueError):
@@ -925,27 +1070,79 @@ async def _subject_title(github: _GitHub, work_item: WorkItem, target: ReplyTarg
     return None
 
 
-async def _sync_labels(
-    github: _GitHub, row: FactoryStatusComment, work_item: WorkItem, status: str
-) -> int:
+async def _sync_labels(github: _GitHub, claim: _StatusClaim) -> int:
     """Add the desired state label and remove the others, on the issue.
 
     Only the four state labels are ever written. A refused write is logged and
     given up; any other failure is retried next pass.
     """
 
+    row = claim.row
     if row.applied_label == "":
         return 0
-    desired = desired_label(status)
+    desired = desired_label(claim.status)
     if row.applied_label == desired:
         return 0
-    labels_path = f"{github.api}{github.repo_path}/issues/{work_item.github_issue_number}/labels"
+    labels_path = f"{github.api}{github.repo_path}/issues/{claim.github_issue_number}/labels"
+    template = "/repos/{owner}/{repo}/issues/{issue_number}/labels"
+    resource = httpx.URL(labels_path)
+    url = labels_path
+    params: dict[str, int] | None = {"per_page": 100}
+    present: set[str] = set()
+    seen: set[str] = set()
+    # GitHub labels are paginated. Read every page before changing anything:
+    # https://docs.github.com/en/rest/issues/labels#list-labels-for-an-issue
+    while True:
+        try:
+            listed = await _github_request(
+                github.client,
+                "GET",
+                url,
+                path_template=template,
+                headers=github.headers,
+                params=params,
+                follow_redirects=False,
+            )
+            if listed.status_code != 200:
+                return 0
+            payload = listed.json()
+        except (httpx.HTTPError, ValueError):
+            return 0
+        if not isinstance(payload, list) or any(
+            not isinstance(label, dict) or not isinstance(label.get("name"), str)
+            for label in payload
+        ):
+            return 0
+        present.update(label["name"] for label in payload)
+        seen.add(str(listed.request.url))
+        next_link = listed.links.get("next")
+        if next_link is None:
+            break
+        next_url = next_link.get("url")
+        if not isinstance(next_url, str):
+            return 0
+        try:
+            next_resource = httpx.URL(next_url)
+        except httpx.InvalidURL:
+            return 0
+        if (next_resource.scheme, next_resource.host, next_resource.port, next_resource.path) != (
+            resource.scheme,
+            resource.host,
+            resource.port,
+            resource.path,
+        ) or str(next_resource) in seen:
+            return 0
+        url = str(next_resource)
+        params = None
     writes = 0
     complete = True
-    if desired:
+    if desired and desired not in present:
         try:
-            added = await github.client.post(
+            added = await _github_request(
+                github.client,
+                "POST",
                 labels_path,
+                path_template=template,
                 headers=github.headers,
                 json={"labels": [desired]},
                 follow_redirects=False,
@@ -954,20 +1151,21 @@ async def _sync_labels(
             return writes
         writes += 1
         if added.status_code in _REFUSED_STATUSES:
-            logger.warning(
+            logger.info(
                 "factory state label refused",
-                extra={"work_item_id": str(work_item.id), "status": added.status_code},
+                extra={"work_item_id": str(claim.work_item_id), "status": added.status_code},
             )
         elif added.status_code not in {200, 201}:
             return writes
-    # Legacy deletes stay unconditional. A new request starts with
-    # applied_label NULL, and the issue may still carry a legacy name.
     for name in (*STATE_LABELS, *LEGACY_STATE_LABELS):
-        if name == desired:
+        if name == desired or name not in present:
             continue
         try:
-            removed = await github.client.delete(
+            removed = await _github_request(
+                github.client,
+                "DELETE",
                 f"{labels_path}/{quote(name, safe=':')}",
+                path_template=template + "/{label}",
                 headers=github.headers,
                 follow_redirects=False,
             )
@@ -977,9 +1175,9 @@ async def _sync_labels(
         writes += 1
         # 404: the label was not on the issue, which is the goal.
         if removed.status_code in {401, 403}:
-            logger.warning(
+            logger.info(
                 "factory state label removal refused",
-                extra={"work_item_id": str(work_item.id), "status": removed.status_code},
+                extra={"work_item_id": str(claim.work_item_id), "status": removed.status_code},
             )
         elif removed.status_code not in {200, 204, 404}:
             complete = False
@@ -997,7 +1195,7 @@ CommentList = Literal["issue", "review"]
 
 async def _deliver(
     github: _GitHub,
-    work_item: WorkItem,
+    issue_number: int,
     row: FactoryStatusComment,
     target: ReplyTarget,
     body: str,
@@ -1009,7 +1207,7 @@ async def _deliver(
     """
 
     api, repo_path, headers, client = github.api, github.repo_path, github.headers, github.client
-    number = work_item.github_issue_number if target.pr_number is None else target.pr_number
+    number = issue_number if target.pr_number is None else target.pr_number
     comments_path = f"{repo_path}/issues/{number}/comments"
     marker = marker_for(row.execution_request_id)
     stored = max(1, row.scan_page)
@@ -1027,7 +1225,14 @@ async def _deliver(
                 (comments_path, 1, _SECOND_LIST_OFFSET, "issue"),
             ]
     for path, start, offset, listed in scans:
-        existing = await _find_marker(client, api, path, headers, marker, start_page=start)
+        existing = await _find_marker(
+            client,
+            api,
+            path,
+            headers,
+            marker,
+            start_page=start,
+        )
         if existing.refusal is not None:
             return ("refused", existing.refusal)
         if existing.unavailable:
@@ -1045,10 +1250,17 @@ async def _deliver(
             f"{api}{repo_path}/pulls/{number}/comments/{root}/replies",
             headers,
             body,
+            path_template="/repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies",
         )
         if replied != _UNPROCESSABLE:
             return _created(row, replied, "review")
-    posted = await _post(client, f"{api}{comments_path}", headers, body)
+    posted = await _post(
+        client,
+        f"{api}{comments_path}",
+        headers,
+        body,
+        path_template="/repos/{owner}/{repo}/issues/{issue_number}/comments",
+    )
     # A comment GitHub cannot process stays pending, as before #2798.
     if posted == _UNPROCESSABLE:
         return None
@@ -1075,8 +1287,11 @@ async def _patch(
     kind = "pulls" if row.comment_list == "review" else "issues"
     url = f"{github.api}{github.repo_path}/{kind}/comments/{row.comment_id}"
     try:
-        edited = await github.client.patch(
+        edited = await _github_request(
+            github.client,
+            "PATCH",
             url,
+            path_template=f"/repos/{{owner}}/{{repo}}/{kind}/comments/{{comment_id}}",
             headers=github.headers,
             json={"body": _redact_factory_comment(body)},
             follow_redirects=False,
@@ -1102,8 +1317,11 @@ async def _thread_root(
     """Reply to the thread's first comment; replies to replies are refused."""
 
     try:
-        found = await client.get(
+        found = await _github_request(
+            client,
+            "GET",
             f"{api}{repo_path}/pulls/comments/{comment_id}",
+            path_template="/repos/{owner}/{repo}/pulls/comments/{comment_id}",
             headers=headers,
             follow_redirects=False,
         )
@@ -1118,11 +1336,19 @@ async def _thread_root(
 
 
 async def _post(
-    client: httpx.AsyncClient, url: str, headers: dict[str, str], body: str
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    body: str,
+    *,
+    path_template: str,
 ) -> tuple[str, str] | None:
     try:
-        created = await client.post(
+        created = await _github_request(
+            client,
+            "POST",
             url,
+            path_template=path_template,
             headers=headers,
             json={"body": _redact_factory_comment(body)},
             follow_redirects=False,
@@ -1164,8 +1390,11 @@ async def _find_marker(
     page = start_page
     for _ in range(_PAGES_PER_PASS):
         try:
-            listed = await client.get(
+            listed = await _github_request(
+                client,
+                "GET",
                 f"{api}{path}",
+                path_template="/repos/{owner}/{repo}/{comment_resource}/{subject_number}/comments",
                 headers=headers,
                 params={"per_page": 100, "page": page},
                 follow_redirects=False,
@@ -1248,8 +1477,11 @@ async def upsert_issue_notice(
         if found.body == body:
             return "unchanged"
         try:
-            edited = await client.patch(
+            edited = await _github_request(
+                client,
+                "PATCH",
                 f"{api}{repo_path}/issues/comments/{found.comment_id}",
+                path_template="/repos/{owner}/{repo}/issues/comments/{comment_id}",
                 headers=headers,
                 json={"body": body},
                 follow_redirects=False,
@@ -1257,7 +1489,13 @@ async def upsert_issue_notice(
         except httpx.HTTPError:
             return "unavailable"
         return "written" if edited.status_code == 200 else "unavailable"
-    posted = await _post(client, f"{api}{comments_path}", headers, body)
+    posted = await _post(
+        client,
+        f"{api}{comments_path}",
+        headers,
+        body,
+        path_template="/repos/{owner}/{repo}/issues/{issue_number}/comments",
+    )
     if posted is None or posted[0] != "posted":
         return "unavailable"
     return "written"

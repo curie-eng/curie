@@ -2,7 +2,8 @@
 
 Review round 2: a relabel must not move the base under a running execution, a
 refused readmission must not write a base, and an ignored relabel must reach a
-finalized status comment.
+finalized status comment, including one that arrives while a status pass
+holds GitHub open between its claim and its writeback (#4167).
 
 GitHub issue label event identities follow:
 https://docs.github.com/en/rest/issues/events
@@ -10,29 +11,45 @@ https://docs.github.com/en/rest/issues/events
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import uuid
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
-from test_factory_status_comment import _marked
+from curie_api.factory_notices import FINAL_MARKER
+from test_factory_status_comment import _blocked_status_sync, _marked
 from test_factory_terminus import (  # noqa: F401  (fixtures)
+    _LABELS,
     REPO,
+    _attach_publication,
+    _label,
+    _notices,
     _observe_termination,
+    _patches,
     _published_issue,
     _reconcile,
+    _request,
     _rows,
     _start_running,
     admitted,
     comments,
 )
-from test_github_factory_ingress import LABEL, REPO_ID, _code, _issue_event, _post
+from test_github_factory_ingress import (
+    LABEL,
+    REPO_ID,
+    _code,
+    _issue_event,
+    _post,
+    _signature,
+)
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -224,7 +241,171 @@ def test_an_ignored_relabel_re_renders_a_finalized_status_comment(
 
     (comment,) = _marked(sink, first["id"])
     assert (
-        "Base: `main` (deployment default) "
-        "Label now says `base:next`; the recorded base is kept."
+        "Base: `main` (deployment default) Label now says `base:next`; the recorded base is kept."
     ) in comment["body"]
     assert any(method == "PATCH" for method, _path, _body in sink.requests)
+
+
+NOTE = "Base: `main` (deployment default) Label now says `base:next`; the recorded base is kept."
+
+
+def _completed_run(client: Any, github: Any, number: int, pr: int) -> uuid.UUID:
+    """A run that opened its pull request and completed; no status pass has run yet."""
+
+    github.labels = [LABEL]
+    _label(client, github, number)
+    first = _request(number)
+    _start_running(first["id"])
+    _attach_publication(first["work_item_id"], status="succeeded", pr=pr)
+    client.portal.call(client.app.state.work_item_reconciler.run_once)
+    done = _request(number)
+    assert (done["status"], done["terminal_cause"]) == ("completed", "completed")
+    (notice,) = _notices(first["id"])
+    assert (notice["posted_at"], notice["finalized_at"]) == (None, None)
+    return first["id"]
+
+
+def _finalized_with_label_due(
+    client: Any, github: Any, sink: Any, number: int, pr: int
+) -> uuid.UUID:
+    """A final status comment whose state label write failed, so the row is due again."""
+
+    request_id = _completed_run(client, github, number, pr)
+    sink.label_page_statuses[(number, 1)] = 500
+    _reconcile()
+    sink.label_page_statuses.clear()
+    (notice,) = _notices(request_id)
+    assert notice["finalized_at"] is not None
+    assert notice["applied_label"] not in {"", "curie-factory:pr-open"}
+    (comment,) = _marked(sink, request_id)
+    assert FINAL_MARKER in comment["body"]
+    assert "Label now says" not in comment["body"]
+    return request_id
+
+
+def _held_status_sync(
+    client: Any, github: Any, sink: Any, number: int, *, path: str | None, relabel: bool
+) -> None:
+    """One status pass held open on GitHub, with an ignored `base:next` relabel meanwhile."""
+
+    async def go() -> None:
+        async with _blocked_status_sync(client, sink, number, path=path) as (sync, _released):
+            if relabel:
+                github.labels = [LABEL, "base:next"]
+                body = json.dumps(
+                    _issue_event("labeled", number, label={"name": "base:next"})
+                ).encode()
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+                ) as api:
+                    changed = await asyncio.wait_for(
+                        api.post(
+                            "/github/webhook",
+                            content=body,
+                            headers={
+                                "X-GitHub-Delivery": str(uuid.uuid4()),
+                                "X-GitHub-Event": "issues",
+                                "X-Hub-Signature-256": _signature(body),
+                                "Content-Type": "application/json",
+                            },
+                        ),
+                        5,
+                    )
+                assert _code(changed) == "base_label_recorded"
+            assert not sync.done(), "GitHub must still be blocked when the relabel returns"
+
+    client.portal.call(go)
+
+
+def _assert_note_reaches_the_comment(sink: Any, request_id: uuid.UUID) -> None:
+    sink.requests.clear()
+    _reconcile()
+    (comment,) = _marked(sink, request_id)
+    assert NOTE in comment["body"], comment["body"]
+    assert FINAL_MARKER in comment["body"]
+    assert any(NOTE in (body or "") for _path, body in _patches(sink))
+    (notice,) = _notices(request_id)
+    assert notice["finalized_at"] is not None
+
+
+def test_an_ignored_relabel_during_a_held_label_sync_still_reaches_the_final_comment(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#4167: the fenced writeback must not restore the finalization the relabel cleared."""
+
+    client, github, sink = admitted
+    _train(monkeypatch)
+    sink.by_path = True
+    number = 30963
+    request_id = _finalized_with_label_due(client, github, sink, number, pr=41963)
+
+    _held_status_sync(
+        client,
+        github,
+        sink,
+        number,
+        path=f"/repos/{REPO}/issues/{number}/labels",
+        relabel=True,
+    )
+
+    _assert_note_reaches_the_comment(sink, request_id)
+
+
+def test_an_ignored_relabel_during_the_held_finalizing_sync_still_reaches_the_comment(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#4167: a body rendered before the relabel must not be the one finalized."""
+
+    client, github, sink = admitted
+    _train(monkeypatch)
+    sink.by_path = True
+    number = 30964
+    request_id = _completed_run(client, github, number, pr=41964)
+
+    _held_status_sync(client, github, sink, number, path=None, relabel=True)
+
+    (comment,) = _marked(sink, request_id)
+    assert "Label now says" not in comment["body"]
+    _assert_note_reaches_the_comment(sink, request_id)
+
+
+@pytest.mark.parametrize("held", ["label_sync", "finalizing_sync"])
+def test_a_held_sync_without_a_relabel_finalizes_and_the_next_pass_is_quiet(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    held: str,
+) -> None:
+    client, github, sink = admitted
+    _train(monkeypatch)
+    sink.by_path = True
+    number = 30965 if held == "label_sync" else 30966
+    if held == "label_sync":
+        request_id = _finalized_with_label_due(client, github, sink, number, pr=41965)
+        path: str | None = f"/repos/{REPO}/issues/{number}/labels"
+    else:
+        request_id = _completed_run(client, github, number, pr=41966)
+        path = None
+
+    _held_status_sync(client, github, sink, number, path=path, relabel=False)
+
+    (row,) = _rows(
+        "SELECT finalized_at, applied_label, sync_owner, sync_lease_expires_at "
+        "FROM curie.factory_terminal_notices WHERE execution_request_id = :id",
+        {"id": request_id},
+    )
+    assert row["finalized_at"] is not None
+    assert row["applied_label"] == "curie-factory:pr-open"
+    assert (row["sync_owner"], row["sync_lease_expires_at"]) == (None, None)
+    (comment,) = _marked(sink, request_id)
+    assert FINAL_MARKER in comment["body"]
+    before = comment["body"]
+
+    sink.requests.clear()
+    _reconcile()
+
+    assert _patches(sink) == []
+    assert [r for r in sink.requests if r[0] in {"POST", "DELETE"} and _LABELS.match(r[1])] == []
+    (comment,) = _marked(sink, request_id)
+    assert comment["body"] == before
