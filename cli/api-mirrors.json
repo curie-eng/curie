@@ -895,6 +895,24 @@
           "why": "Hook configuration has its own operator command. The overrides command changes model behavior only."
         }
       ]
+    },
+    {
+      "output": "ActionsOutput",
+      "struct": "ActionExecution",
+      "omissions": [
+        {
+          "field": "id",
+          "why": "The receipt names the execution as execution_id, the same key actions undo prints, so a script reads one key from the ruling and its receipt."
+        },
+        {
+          "field": "refusal_code",
+          "why": "Folded into the receipt's code (ACTION-EXECUTOR-18): a refused execution's code is its refusal code. At most one of refusal_code and failure_code is set, so code names it without a second key."
+        },
+        {
+          "field": "failure_code",
+          "why": "Folded into the receipt's code (ACTION-EXECUTOR-18): a failed or indeterminate execution's code is its failure code; code is null only for a confirmed one."
+        }
+      ]
     }
   ]
 }
