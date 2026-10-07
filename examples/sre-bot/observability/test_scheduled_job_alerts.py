@@ -100,6 +100,8 @@ class ScheduledJobAlertsPromtoolTests(unittest.TestCase):
         cases = self._promtool_cases(suspension_alert, unsuccessful_alert)
         with tempfile.TemporaryDirectory(prefix="scheduled-job-alerts-") as temp_dir:
             fixture_dir = Path(temp_dir)
+            # The evaluator image runs as nobody on native Linux bind mounts.
+            fixture_dir.chmod(0o755)
             rules_path = fixture_dir / "scheduled_job_alerts.rules.json"
             cases_path = fixture_dir / "scheduled_job_alerts.test.json"
             rules_path.write_text(json.dumps({"groups": groups}), encoding="utf-8")
